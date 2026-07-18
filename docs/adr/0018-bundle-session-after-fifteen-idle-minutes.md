@@ -1,0 +1,11 @@
+# Bundle a Session fifteen minutes after its Turn ends
+
+After a Codex Turn reaches any terminal state, its Session remains online with app-server and local files intact for fifteen minutes. A new Turn accepted during that window cancels the idle timer and reuses the online Session; when that Turn ends, a fresh fifteen-minute timer begins. Only a full fifteen minutes with no active or pending Turn allows the runtime to stop app-server, create and upload the Session Bundle, and release the Session's local directory. An open browser page alone does not keep the Session online, and an active Turn is never stopped by this idle policy.
+
+The online Session directory resides on persistent local storage, so an app-server or runtime-process restart does not by itself lose the waiting Session. Agent Hub deliberately accepts that permanent loss of the assigned runtime node or its disk before the Bundle upload can lose Workspace and native conversation changes made after the last successful Bundle.
+
+If permanent node loss leaves Hub Session History newer than the last successful Bundle, Agent Hub does not restore that stale Bundle and present it as current. The Session becomes a Recovery-Failed Session: its available history and last immutable Bundle remain viewable, the interface reports the last successful Bundle time, and further execution is disabled.
+
+Once the runtime has stopped app-server and begun creating a Bundle, a newly accepted user message does not cancel or mutate that checkpoint. Agent Hub durably queues the message and reports that the Session is being saved. After the Bundle upload succeeds, the runtime reuses the still-present local Session directory, starts app-server, and processes the queued message without downloading the Bundle it just uploaded.
+
+If Bundle creation or upload fails, the runtime retains the latest local Session directory and does not replace the last successful S3 Bundle. With no pending message it retries automatically; with a pending message it ends the failed save attempt, restarts app-server from the local directory, and continues the conversation. The next fifteen-minute idle boundary starts a new save attempt, so an object-storage outage does not block user work indefinitely while the accepted local-disk risk remains visible.

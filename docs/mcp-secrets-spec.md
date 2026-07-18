@@ -1,0 +1,27 @@
+# MCP Secret 注入功能链 Spec
+
+## 范围
+
+1. Agent MCP allowlist 继续使用显式 JSON 数组，空数组表示无 MCP，但管理台不再暴露原始 JSON 编辑器。
+2. 管理台以表格显示 MCP entries，通过新建、编辑子表单和带确认的删除操作维护原数组。
+3. MCP entry 可包含 `secrets` 对象；Hub 在控制面 API 和 UI 中返回脱敏值。
+4. 用户保存从 UI 读回的脱敏占位符时不覆盖原 secret，新 secret 只在表单提交中短暂存在。
+5. Runtime 在 Session 专属 `CODEX_HOME` 中使用完整 MCP 配置，secret 只写入权限 `0600` 的 `config.toml`。
+6. `mcp-allowlist.json` 只写脱敏版本，Session Bundle、Workspace、日志、argv 和浏览器快照不得包含 secret。
+
+## 非目标
+
+- 不接入外部 secret manager，不实现字段级权限模型。
+- 不修改现有 MCP 执行协议或 allowlist 存储格式。
+
+## 验收标准
+
+- Agent 详情中 MCP 以 table 展示，只有点击新建/编辑后才出现子表单。
+- `GET /api/agents/{id}` 和列表不返回 MCP secret 明文；脱敏占位符 round-trip 保留原 secret。
+- Session 配置中 `config.toml` 含必要 secret 且权限为 `0600`；脱敏文件不含明文。
+
+## 测试计划
+
+- Rust：覆盖 MCP secret 脱敏、占位符 merge 和 Runtime config 渲染。
+- TypeScript：前端构建通过。
+- 浏览器：覆盖 MCP 表格新建/编辑/删除、secret 脱敏与运行后文件断言。

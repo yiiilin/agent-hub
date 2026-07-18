@@ -1,0 +1,3 @@
+# Interrupt Codex Turns without rollback
+
+Stopping active work sends a native Codex Turn interruption immediately instead of waiting for a running command to finish naturally. Agent Hub preserves the Turn's existing history, completed command and tool events, and every Workspace or external effect produced before cancellation, including partial effects from the command being terminated. Hub marks the Turn and its execution record as interrupted but never treats stop as undo, deletes partial history, or automatically restores an earlier Workspace snapshot. Any future rollback capability must be a separate explicit operation.

@@ -1,0 +1,5 @@
+# Roll Codex without interrupting active Runs
+
+Agent Hub maintains one Active Codex Version across runtime architectures. Administrators select a concrete Target Codex Version; Agent Hub downloads the architecture-specific package, verifies its integrity, and runs a bounded compatibility check before promotion. Version promotion does not terminate work already in progress: in-flight Runs finish with the Codex process they started, while every newly started Run uses the newly active version. Agent Hub does not activate a mutable `latest` alias directly.
+
+Because an online Session may retain app-server between Turns, promotion marks every old-version Session for a process switch. An active Turn finishes with its existing binary; immediately afterward, or immediately for an already idle Session, the Runtime stops the old app-server and creates a Bundle recording the old producing version. The Session's next Turn resumes with the new Active Codex Version. This version boundary overrides the ordinary fifteen-minute idle window and never mixes two Codex versions within one Turn.

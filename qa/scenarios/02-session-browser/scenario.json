@@ -1,0 +1,5 @@
+{
+  "name": "Browser conversation completes through fake Codex",
+  "type": "browser",
+  "timeout_ms": 120000
+}

@@ -1,0 +1,3 @@
+# Keep historical model token usage immutable
+
+Recorded Model Token Usage remains in historical totals after its related Hub User, Agent, Session, Run, or Model Connection is deleted, because deleting operational objects must not rewrite actual model consumption. Deletion still removes credentials, executable configuration, conversation content, and user attribution; the ledger retains only the token measurements, time, purpose, and non-secret model and workload snapshots needed for historical statistics, using anonymous deleted-subject labels where necessary. Sanitized Model Call Errors follow the same immutable retention and anonymization lifecycle without contributing unknown Token amounts to usage totals.

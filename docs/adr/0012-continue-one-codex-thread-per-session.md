@@ -1,0 +1,3 @@
+# Continue one Codex Thread per Session
+
+An executable Hub Session continues through one native Codex app-server Thread, and each new user round starts a Turn on that Thread. Hub Runs remain internal scheduling and audit records rather than Codex conversation primitives, so retries, runtime assignment, and event delivery do not require creating a fresh Thread for every Run. Agent Hub still owns Session identity, access control, and a durable history copy, while Codex retains its native Thread, Turn, Item, compaction, and Skill behavior. This supersedes ADR-0005's disposable-Thread-per-Run design.

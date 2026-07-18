@@ -1,0 +1,44 @@
+[workspace]
+members = [
+  "crates/shared",
+  "crates/backend",
+  "crates/runtime",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.88"
+
+[workspace.dependencies]
+aes-gcm = { version = "0.11", features = ["zeroize"] }
+anyhow = "1"
+argon2 = "0.5"
+async-trait = "0.1"
+async-stream = "0.3"
+axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+hmac = "0.12"
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "macros", "migrate"] }
+tempfile = "3"
+thiserror = "2"
+tar = "0.4"
+toml = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "fs", "signal", "net"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+url = "2"
+walkdir = "2"
+libc = "0.2"
+zstd = "0.13"
+zeroize = "1"

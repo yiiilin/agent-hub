@@ -1,0 +1,5 @@
+# SQLx 0.8 的锁文件元数据包含未启用的 sqlx-mysql -> rsa 可选依赖闭包。
+# `cargo tree --workspace --all-features --target all -i rsa` 无输出，确认生产解析图不可达。
+# 该公告目前没有修复版本；SQLx/Cargo 不再锁定此闭包后应移除本例外。
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]

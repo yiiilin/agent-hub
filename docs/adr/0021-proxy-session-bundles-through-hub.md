@@ -1,0 +1,7 @@
+# Proxy Session Bundles through Hub
+
+Runtimes never connect to S3-compatible storage directly. For a checkpoint, the owning Runtime sends its Session Bundle to an authenticated Hub endpoint and Hub writes the object; for restoration, Hub reads the current object and sends it to the newly assigned Runtime. S3 credentials, bucket locations, and signed object URLs remain inside Hub and are never exposed to a Runtime or Codex app-server. This centralizes authorization and storage auditing while deliberately making Hub carry all Bundle upload and download traffic.
+
+The Bundle is a `tar.zst` stream. Runtime retains the local archive until Hub acknowledges a committed upload; Hub forwards upload and download bodies incrementally without buffering the complete archive in memory or unpacking it. A failed transfer restarts from the beginning. The default compressed Bundle limit is 10 GiB and is administrator-configurable.
+
+The S3-compatible endpoint may use HTTP or HTTPS, and server-side encryption is optional deployment configuration rather than a Hub requirement. On upload, Hub authenticates the Runtime, checks the Session ownership generation and declared size limit, and forwards bytes without scanning the archive or computing its checksum. Runtime calculates the compressed archive checksum while creating it and records the declaration with Hub; a restoring Runtime verifies that checksum before extraction. This keeps content-processing cost off Hub while accepting the deployment's chosen S3 transport and encryption boundary.

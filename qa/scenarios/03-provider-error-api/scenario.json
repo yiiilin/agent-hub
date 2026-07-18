@@ -1,0 +1,5 @@
+{
+  "name": "Provider failure records deterministic usage and error",
+  "type": "api",
+  "timeout_ms": 90000
+}
