@@ -90,8 +90,9 @@ test('Session history exposes queued work, explicit stop, recovery failure, and 
   });
 
   await page.goto('/sessions');
-  await expect(page.getByRole('heading', { name: 'Sessions' })).toBeVisible();
-  await expect(page.getByRole('button', { name: /Checkpoint agent/ })).toContainText('saving');
+  await expect(page.getByRole('heading', { name: 'Sessions', exact: true, level: 1 })).toBeVisible();
+  const savingRow = page.getByRole('button', { name: /Checkpoint agent/ });
+  await expect(savingRow.locator('.session-row-status.saving')).toHaveAttribute('aria-label', 'saving');
   await page.getByRole('button', { name: /Release agent/ }).click();
   const detail = page.getByRole('region', { name: 'Session details' });
   await expect(detail.getByText('Inspect the rollout.')).toBeVisible();
@@ -122,8 +123,10 @@ test('Session workspace is localized and has no horizontal overflow at 390px', a
   await page.route(/\/api\/sessions\/[^/]+\/messages$/, (route) => route.fulfill({ json: [] }));
 
   await page.goto('/sessions');
-  await expect(page.getByRole('heading', { name: '会话' })).toBeVisible();
-  await expect(page.getByRole('button', { name: /保存中的智能体/ })).toContainText('保存中');
+  await expect(page.getByRole('heading', { name: '会话', exact: true, level: 1 })).toBeVisible();
+  await page.getByRole('button', { name: '会话列表', exact: true }).click();
+  const savingRow = page.getByRole('button', { name: /保存中的智能体/ });
+  await expect(savingRow.locator('.session-row-status.saving')).toHaveAttribute('aria-label', '保存中');
   await page.getByRole('button', { name: /恢复失败的智能体/ }).click();
   await expect(page.getByRole('region', { name: '会话详情' })).toContainText('恢复失败');
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
@@ -208,7 +211,7 @@ async function mockAdministration(page: Page, user = superAdmin) {
 test('Super Administrator manages identity policy, trusted channels, user erasure, and exact Codex rollout', async ({ page }) => {
   const bodies = await mockAdministration(page);
   await page.goto('/administration');
-  await expect(page.getByRole('heading', { name: 'Administration' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Administration', exact: true, level: 1 })).toBeVisible();
 
   await page.getByLabel('Password registration').uncheck();
   await page.getByRole('button', { name: 'Save authentication policy' }).click();
@@ -255,7 +258,7 @@ test('Administration navigation is Super Administrator-only', async ({ page }) =
   await page.goto('/agents');
   await expect(page.getByRole('button', { name: 'Administration' })).toHaveCount(0);
   await page.goto('/administration');
-  await expect(page.getByRole('heading', { name: 'Page not found' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Page not found', exact: true, level: 1 })).toBeVisible();
 });
 
 test('Administration remains operable in Chinese at 390px without browser or network failures', async ({ page }) => {
@@ -270,16 +273,16 @@ test('Administration remains operable in Chinese at 390px without browser or net
   await mockAdministration(page);
 
   await page.goto('/administration');
-  await expect(page.getByRole('heading', { name: '管理' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: '认证策略' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '管理', exact: true, level: 1 })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '认证策略', exact: true, level: 2 })).toBeVisible();
   const platformsTab = page.getByRole('tab', { name: '外部平台' });
   await platformsTab.click();
   await expect(platformsTab).toHaveAttribute('aria-selected', 'true');
   await expect(page.getByRole('table', { name: '外部平台' })).toBeVisible();
   await page.getByRole('tab', { name: '用户管理' }).click();
-  await expect(page.getByRole('heading', { name: '用户管理' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '用户管理', exact: true, level: 2 })).toBeVisible();
   await page.getByRole('tab', { name: 'Codex 版本' }).click();
-  await expect(page.getByRole('heading', { name: 'Codex 版本发布' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Codex 版本发布', exact: true, level: 2 })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
   expect(pageErrors).toEqual([]);
   expect(consoleErrors).toEqual([]);

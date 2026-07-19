@@ -127,7 +127,7 @@ provider_section=no
 responses_wire=no
 loopback_base_url=no
 zero_port=no
-grep -F "[model_providers.hub-proxy]" "$config" >/dev/null && provider_section=yes
+grep -F '[model_providers.agent_hub_' "$config" >/dev/null && provider_section=yes
 grep -F 'wire_api = "responses"' "$config" >/dev/null && responses_wire=yes
 grep -E 'base_url = "http://127\\.0\\.0\\.1:[0-9]+/v1"' "$config" >/dev/null && loopback_base_url=yes
 grep -F 'base_url = "http://127.0.0.1:0/v1"' "$config" >/dev/null && zero_port=yes
@@ -418,7 +418,8 @@ WITH RECURSIVE lock_waiters AS (
 )
 SELECT json_build_object(
   'archive', COUNT(*) FILTER (
-    WHERE query LIKE '%SELECT owner_id, deleted_at%'
+    WHERE (query LIKE '%SELECT owner_id, deleted_at%'
+        OR query LIKE '%SELECT agents.owner_id, agents.deleted_at%')
       AND query LIKE '%FOR UPDATE%'
   ),
   'automationCreate', COUNT(*) FILTER (
@@ -1147,13 +1148,14 @@ test('archiving an agent wins queued manual triggers and serializes with Automat
 
     const automationName = `Archive race manual automation ${nonce}`;
     await page.goto('/automations');
-    await expect(page.getByText('Create Automation', { exact: true })).toBeVisible();
-    await page.getByLabel('Agent').selectOption({ label: agentName });
-    await page.getByLabel('Name', { exact: true }).fill(automationName);
-    await page.getByLabel('Trigger').selectOption('manual');
-    await page.getByLabel('Prompt').fill('Manual trigger that races Agent archival.');
-    await page.getByRole('button', { name: 'Create automation' }).click();
-    await expect(page.getByText(automationName)).toBeVisible();
+    await page.getByRole('button', { name: 'New automation' }).click();
+    const automationDialog = page.getByRole('dialog', { name: 'Create Automation' });
+    await automationDialog.getByLabel('Agent').selectOption({ label: agentName });
+    await automationDialog.getByLabel('Name', { exact: true }).fill(automationName);
+    await automationDialog.getByLabel('Trigger').selectOption('manual');
+    await automationDialog.getByRole('textbox', { name: 'Prompt' }).fill('Manual trigger that races Agent archival.');
+    await automationDialog.getByRole('button', { name: 'Create automation' }).click();
+    await expect(page.locator('.automation-list-row').filter({ hasText: automationName })).toBeVisible();
 
     const listedAutomationsResponse = await page.request.get('/api/automations');
     expect(listedAutomationsResponse.ok()).toBeTruthy();
@@ -1531,15 +1533,17 @@ test('archive queued before a due scheduler leaves zero scheduled runs', async (
     await expect(page).toHaveURL(new RegExp(`/agents/${currentAgentId}$`));
 
     await page.goto('/automations');
-    await page.getByLabel('Agent').selectOption({ label: agentName });
-    await page.getByLabel('Name', { exact: true }).fill(`Archive-first due scheduler ${nonce}`);
-    await page.getByLabel('Trigger').selectOption('interval');
-    await page.getByLabel('Schedule', { exact: true }).fill('1s');
-    await page.getByLabel('Prompt').fill(`Archive-first scheduler must not run ${nonce}`);
-    await page.getByRole('checkbox', { name: 'Enabled' }).uncheck();
+    await page.getByRole('button', { name: 'New automation' }).click();
+    const automationDialog = page.getByRole('dialog', { name: 'Create Automation' });
+    await automationDialog.getByLabel('Agent').selectOption({ label: agentName });
+    await automationDialog.getByLabel('Name', { exact: true }).fill(`Archive-first due scheduler ${nonce}`);
+    await automationDialog.getByLabel('Trigger').selectOption('interval');
+    await automationDialog.getByLabel('Schedule', { exact: true }).fill('1s');
+    await automationDialog.getByRole('textbox', { name: 'Prompt' }).fill(`Archive-first scheduler must not run ${nonce}`);
+    await automationDialog.getByRole('checkbox', { name: 'Enabled' }).uncheck();
     const createAutomationResponse = page.waitForResponse((response) => response.request().method() === 'POST'
       && new URL(response.url()).pathname === '/api/automations');
-    await page.getByRole('button', { name: 'Create automation' }).click();
+    await automationDialog.getByRole('button', { name: 'Create automation' }).click();
     const automationResponse = await createAutomationResponse;
     expect(automationResponse.ok()).toBeTruthy();
     const automation = await automationResponse.json() as { id: string };
@@ -1634,15 +1638,17 @@ test('a due scheduler queued before archive creates exactly one run before archi
 
     const schedulerMessage = `Scheduler run that races Agent archival ${nonce}`;
     await page.goto('/automations');
-    await page.getByLabel('Agent').selectOption({ label: agentName });
-    await page.getByLabel('Name', { exact: true }).fill(`Due scheduler ${nonce}`);
-    await page.getByLabel('Trigger').selectOption('interval');
-    await page.getByLabel('Schedule', { exact: true }).fill('1s');
-    await page.getByLabel('Prompt').fill(schedulerMessage);
-    await page.getByRole('checkbox', { name: 'Enabled' }).uncheck();
+    await page.getByRole('button', { name: 'New automation' }).click();
+    const automationDialog = page.getByRole('dialog', { name: 'Create Automation' });
+    await automationDialog.getByLabel('Agent').selectOption({ label: agentName });
+    await automationDialog.getByLabel('Name', { exact: true }).fill(`Due scheduler ${nonce}`);
+    await automationDialog.getByLabel('Trigger').selectOption('interval');
+    await automationDialog.getByLabel('Schedule', { exact: true }).fill('1s');
+    await automationDialog.getByRole('textbox', { name: 'Prompt' }).fill(schedulerMessage);
+    await automationDialog.getByRole('checkbox', { name: 'Enabled' }).uncheck();
     const createAutomationResponse = page.waitForResponse((response) => response.request().method() === 'POST'
       && new URL(response.url()).pathname === '/api/automations');
-    await page.getByRole('button', { name: 'Create automation' }).click();
+    await automationDialog.getByRole('button', { name: 'Create automation' }).click();
     const automationResponse = await createAutomationResponse;
     expect(automationResponse.ok()).toBeTruthy();
     const automation = await automationResponse.json() as { id: string };

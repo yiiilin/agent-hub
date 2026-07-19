@@ -1,6 +1,6 @@
 import { CirclePause, Monitor, Plus, RotateCcw, Search, ShieldAlert, Trash2 } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
-import type { Agent, HubSession, Runtime, RuntimeEnrollmentToken, User } from './api/client';
+import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import type { Agent, HubSession, Runtime, RuntimeDeletionImpact, RuntimeEnrollmentToken, User } from './api/client';
 import { api } from './api/client';
 import { FormDialog } from './components/form-dialog';
 import { useI18n } from './i18n';
@@ -27,6 +27,11 @@ function isAvailableEnrollment(enrollment: RuntimeEnrollmentToken, now: number) 
     && new Date(enrollment.expires_at).getTime() > now;
 }
 
+type RuntimeActionPreview = {
+  action: 'drain' | 'delete' | 'force-delete';
+  impact: RuntimeDeletionImpact;
+};
+
 export function RuntimesPage({ user }: { user: User }) {
   const { locale, t } = useI18n();
   const [runtimes, setRuntimes] = useState<Runtime[]>([]);
@@ -46,7 +51,11 @@ export function RuntimesPage({ user }: { user: User }) {
   const [adminNotice, setAdminNotice] = useState<TranslationKey | null>(null);
   const [affectedSessions, setAffectedSessions] = useState<HubSession[]>([]);
   const [forceDeleteResult, setForceDeleteResult] = useState<{ recoverable: string[]; failed: string[] } | null>(null);
-  const isSuperAdmin = user.role === 'super_admin';
+  const [actionPreview, setActionPreview] = useState<RuntimeActionPreview | null>(null);
+  const [actionConfirmation, setActionConfirmation] = useState('');
+  const previewController = useRef<AbortController | null>(null);
+  const previewGeneration = useRef(0);
+  const canAdminister = user.role === 'admin' || user.role === 'super_admin';
 
   useEffect(() => {
     let active = true;
@@ -82,7 +91,7 @@ export function RuntimesPage({ user }: { user: User }) {
   }, [retryGeneration]);
 
   useEffect(() => {
-    if (!isSuperAdmin) return;
+    if (!canAdminister) return;
     const controller = new AbortController();
     api.runtimeEnrollmentTokens(controller.signal)
       .then((response) => {
@@ -91,7 +100,7 @@ export function RuntimesPage({ user }: { user: User }) {
       })
       .catch(() => { if (!controller.signal.aborted) setAdminError(true); });
     return () => controller.abort();
-  }, [isSuperAdmin]);
+  }, [canAdminister]);
 
   useEffect(() => {
     const nextExpiry = enrollments
@@ -104,6 +113,11 @@ export function RuntimesPage({ user }: { user: User }) {
     const timer = window.setTimeout(() => setEnrollmentClock(Date.now()), delay);
     return () => window.clearTimeout(timer);
   }, [enrollmentClock, enrollments]);
+
+  useEffect(() => () => {
+    previewGeneration.current += 1;
+    previewController.current?.abort();
+  }, []);
 
   const counts = useMemo(() => ({
     all: runtimes.length,
@@ -142,6 +156,26 @@ export function RuntimesPage({ user }: { user: User }) {
   function closeEnrollment() {
     setEnrollmentOpen(false);
     setCreatedEnrollment(null);
+  }
+
+  function clearActionPreview(clearResults = true) {
+    previewGeneration.current += 1;
+    if (previewController.current) {
+      previewController.current.abort();
+      previewController.current = null;
+      setAdminBusy(false);
+    }
+    setActionPreview(null);
+    setActionConfirmation('');
+    if (clearResults) {
+      setAffectedSessions([]);
+      setForceDeleteResult(null);
+    }
+  }
+
+  function selectRuntime(runtimeId: string) {
+    if (runtimeId !== selectedId) clearActionPreview();
+    setSelectedId(runtimeId);
   }
 
   async function createEnrollment() {
@@ -191,17 +225,61 @@ export function RuntimesPage({ user }: { user: User }) {
     }
   }
 
-  async function drain(runtime: Runtime) {
-    if (boundAgents.length === 0 || !window.confirm(t('confirmDrainRuntime').replace('{hostname}', runtime.hostname))) return;
+  async function previewRuntimeAction(action: RuntimeActionPreview['action'], runtime: Runtime) {
+    if (adminBusy || (action === 'drain' && boundAgents.length === 0)) return;
+    const generation = previewGeneration.current + 1;
+    previewGeneration.current = generation;
+    previewController.current?.abort();
+    const controller = new AbortController();
+    previewController.current = controller;
     setAdminBusy(true);
     setAdminError(false);
     setAdminNotice(null);
+    setActionPreview(null);
+    setActionConfirmation('');
+    setAffectedSessions([]);
     setForceDeleteResult(null);
     try {
-      const response = await api.drainRuntime(runtime.id, runtime.hostname);
-      replaceRuntime(response.runtime);
-      setAffectedSessions(response.owned_sessions);
-      setAdminNotice('runtimeDrainStarted');
+      const impact = await api.runtimeDeletionImpact(runtime.id, controller.signal);
+      if (controller.signal.aborted || generation !== previewGeneration.current) return;
+      setActionPreview({ action, impact });
+    } catch {
+      if (!controller.signal.aborted && generation === previewGeneration.current) setAdminError(true);
+    } finally {
+      if (previewController.current === controller) previewController.current = null;
+      if (generation === previewGeneration.current) setAdminBusy(false);
+    }
+  }
+
+  async function submitRuntimeAction(event: FormEvent) {
+    event.preventDefault();
+    if (!actionPreview || adminBusy || actionConfirmation !== actionPreview.impact.hostname) return;
+    const { action, impact } = actionPreview;
+    const hostname = actionConfirmation;
+    setAdminBusy(true);
+    setAdminError(false);
+    setAdminNotice(null);
+    try {
+      if (action === 'drain') {
+        const response = await api.drainRuntime(impact.runtime_id, hostname);
+        replaceRuntime(response.runtime);
+        setAffectedSessions(response.owned_sessions);
+        setAdminNotice('runtimeDrainStarted');
+      } else if (action === 'delete') {
+        await api.deleteRuntime(impact.runtime_id, hostname);
+        setRuntimes((current) => current.filter((item) => item.id !== impact.runtime_id));
+        setSelectedId((current) => current === impact.runtime_id ? null : current);
+        setAffectedSessions([]);
+        setAdminNotice('runtimeDeleted');
+      } else {
+        const response = await api.forceDeleteRuntime(impact.runtime_id, hostname);
+        setRuntimes((current) => current.filter((item) => item.id !== impact.runtime_id));
+        setSelectedId((current) => current === impact.runtime_id ? null : current);
+        setAffectedSessions([]);
+        setForceDeleteResult({ recoverable: response.recoverable_session_ids, failed: response.recovery_failed_session_ids });
+        setAdminNotice('runtimeForceDeleted');
+      }
+      clearActionPreview(false);
     } catch {
       setAdminError(true);
     } finally {
@@ -225,45 +303,8 @@ export function RuntimesPage({ user }: { user: User }) {
     }
   }
 
-  async function deleteRuntime(runtime: Runtime) {
-    if (!window.confirm(t('confirmDeleteRuntime').replace('{hostname}', runtime.hostname))) return;
-    setAdminBusy(true);
-    setAdminError(false);
-    setAdminNotice(null);
-    try {
-      await api.deleteRuntime(runtime.id, runtime.hostname);
-      setRuntimes((current) => current.filter((item) => item.id !== runtime.id));
-      setSelectedId((current) => current === runtime.id ? null : current);
-      setAffectedSessions([]);
-      setAdminNotice('runtimeDeleted');
-    } catch {
-      setAdminError(true);
-    } finally {
-      setAdminBusy(false);
-    }
-  }
-
-  async function forceDelete(runtime: Runtime) {
-    if (!window.confirm(t('confirmForceDeleteRuntime').replace('{hostname}', runtime.hostname))) return;
-    setAdminBusy(true);
-    setAdminError(false);
-    setAdminNotice(null);
-    try {
-      const response = await api.forceDeleteRuntime(runtime.id, runtime.hostname);
-      setRuntimes((current) => current.filter((item) => item.id !== runtime.id));
-      setSelectedId((current) => current === runtime.id ? null : current);
-      setAffectedSessions([]);
-      setForceDeleteResult({ recoverable: response.recoverable_session_ids, failed: response.recovery_failed_session_ids });
-      setAdminNotice('runtimeForceDeleted');
-    } catch {
-      setAdminError(true);
-    } finally {
-      setAdminBusy(false);
-    }
-  }
-
   return (
-    <section className={`runtime-workspace${isSuperAdmin ? ' runtime-admin-workspace' : ''}`} aria-labelledby="runtime-page-title">
+    <section className={`runtime-workspace${canAdminister ? ' runtime-admin-workspace' : ''}`} aria-labelledby="runtime-page-title">
       <header className="runtime-page-header">
         <div>
           <h1 id="runtime-page-title"><Monitor size={19} /> {t('runtimeNodes')}</h1>
@@ -271,7 +312,7 @@ export function RuntimesPage({ user }: { user: User }) {
         </div>
         <div className="runtime-header-actions">
           {!loading && <span className="runtime-count">{counts.all}</span>}
-          {isSuperAdmin && <button type="button" className="secondary compact-action" disabled={adminBusy} onClick={() => { setCreatedEnrollment(null); setEnrollmentOpen(true); }}><Plus size={15} /> {t('addRuntimeNode')}</button>}
+          {canAdminister && <button type="button" className="secondary compact-action" disabled={adminBusy} onClick={() => { setCreatedEnrollment(null); setEnrollmentOpen(true); }}><Plus size={15} /> {t('addRuntimeNode')}</button>}
         </div>
       </header>
 
@@ -282,7 +323,7 @@ export function RuntimesPage({ user }: { user: User }) {
         {forceDeleteResult && <div className="runtime-notice force-result"><span>{t('recoverableSessions')}: {forceDeleteResult.recoverable.join(', ') || t('none')}</span><span>{t('recoveryFailedSessions')}: {forceDeleteResult.failed.join(', ') || t('none')}</span></div>}
       </div>
 
-      {isSuperAdmin && <section className="runtime-enrollment-panel" aria-label={t('enrollmentHistory')}>
+      {canAdminister && <section className="runtime-enrollment-panel" aria-label={t('enrollmentHistory')}>
         <div className="runtime-enrollment-heading">
           <h2>{t('enrollmentHistory')}</h2>
         </div>
@@ -329,7 +370,7 @@ export function RuntimesPage({ user }: { user: User }) {
                 key={runtime.id}
                 type="button"
                 aria-pressed={runtime.id === selectedId}
-                onClick={() => setSelectedId(runtime.id)}
+                onClick={() => selectRuntime(runtime.id)}
               >
                 <span className="runtime-row-heading"><strong>{runtime.hostname}</strong><span className={`status ${runtime.status}`}>{localizedStatus(runtime.status, t)}</span></span>
                 <span className="runtime-row-meta"><span>{t('lastHeartbeat')}: {new Date(runtime.last_heartbeat_at).toLocaleString(locale)}</span><span>{runtime.codex_version}</span></span>
@@ -380,15 +421,15 @@ export function RuntimesPage({ user }: { user: User }) {
                   <h3>{t('boundAgents')}</h3>
                   {boundAgents.length > 0 ? <div className="runtime-agent-list">{boundAgents.map((agent) => <a key={agent.id} href={`/agents/${agent.id}`}>{agent.name}</a>)}</div> : <p className="runtime-muted">{t('noBoundAgents')}</p>}
                 </section>
-                {isSuperAdmin && <section className="runtime-detail-section runtime-administration">
+                {canAdminister && <section className="runtime-detail-section runtime-administration">
                   <h3>{t('runtimeAdministration')}</h3>
                   <div className="runtime-admin-actions">
                     <button type="button" className="secondary" disabled={adminBusy || Boolean(selectedRuntime.credential_rotation_requested_at)} onClick={() => rotateCredential(selectedRuntime)}><RotateCcw size={15} /> {t('rotateCredential')}</button>
                     {selectedRuntime.status === 'draining'
                       ? <button type="button" className="secondary" disabled={adminBusy} onClick={() => cancelDrain(selectedRuntime)}><RotateCcw size={15} /> {t('cancelDrain')}</button>
-                      : <button type="button" className="secondary" disabled={adminBusy || boundAgents.length === 0} onClick={() => drain(selectedRuntime)}><CirclePause size={15} /> {t('drainRuntime')}</button>}
-                    {selectedRuntime.status === 'draining' && <button type="button" className="secondary danger" disabled={adminBusy} onClick={() => deleteRuntime(selectedRuntime)}><Trash2 size={15} /> {t('deleteRuntime')}</button>}
-                    <button type="button" className="secondary danger" disabled={adminBusy} onClick={() => forceDelete(selectedRuntime)}><ShieldAlert size={15} /> {t('forceDeleteRuntime')}</button>
+                      : <button type="button" className="secondary" disabled={adminBusy || boundAgents.length === 0} onClick={() => previewRuntimeAction('drain', selectedRuntime)}><CirclePause size={15} /> {t('drainRuntime')}</button>}
+                    {selectedRuntime.status === 'draining' && <button type="button" className="secondary danger" disabled={adminBusy} onClick={() => previewRuntimeAction('delete', selectedRuntime)}><Trash2 size={15} /> {t('deleteRuntime')}</button>}
+                    <button type="button" className="secondary danger" disabled={adminBusy} onClick={() => previewRuntimeAction('force-delete', selectedRuntime)}><ShieldAlert size={15} /> {t('forceDeleteRuntime')}</button>
                   </div>
                   {selectedRuntime.credential_rotation_requested_at && <p className="runtime-muted">{t('runtimeRotationPending')}</p>}
                   {affectedSessions.length > 0 && <div className="affected-sessions"><strong>{t('affectedSessions')}</strong>{affectedSessions.map((session) => <a key={session.id} href="/sessions"><span>{session.agent_name}</span><span className={`status ${session.lifecycle_status}`}>{localizedStatus(session.lifecycle_status, t)}</span></a>)}</div>}
@@ -399,6 +440,37 @@ export function RuntimesPage({ user }: { user: User }) {
           )}
         </section>
       </div>
+
+      {actionPreview && <FormDialog
+        title={t(actionPreview.action === 'drain' ? 'drainRuntime' : actionPreview.action === 'delete' ? 'deleteRuntime' : 'forceDeleteRuntime')}
+        eyebrow={actionPreview.impact.hostname}
+        onClose={() => clearActionPreview()}
+        busy={adminBusy}
+        className="runtime-action-dialog"
+        footer={<>
+          <button className="secondary" type="button" disabled={adminBusy} onClick={() => clearActionPreview()}>{t('cancel')}</button>
+          <button className={actionPreview.action === 'drain' ? 'primary' : 'secondary danger'} type="submit" form="runtime-action-confirmation-form" disabled={adminBusy || actionConfirmation !== actionPreview.impact.hostname}>
+            {actionPreview.action === 'drain' ? <CirclePause size={15} /> : actionPreview.action === 'delete' ? <Trash2 size={15} /> : <ShieldAlert size={15} />}
+            {adminBusy ? t(actionPreview.action === 'drain' ? 'saving' : 'deleting') : t(actionPreview.action === 'drain' ? 'drainRuntime' : actionPreview.action === 'delete' ? 'deleteRuntime' : 'forceDeleteRuntime')}
+          </button>
+        </>}
+      >
+        <form id="runtime-action-confirmation-form" className="runtime-action-confirmation" onSubmit={submitRuntimeAction}>
+          <p>{t('runtimeActionPreviewHelp')}</p>
+          <div className="runtime-impact-heading"><strong>{t('affectedSessions')}</strong><code>{actionPreview.impact.hostname}</code></div>
+          {actionPreview.impact.affected_sessions.length === 0
+            ? <p className="runtime-muted">{t('noAffectedSessions')}</p>
+            : <div className="runtime-impact-list" role="list">
+              {actionPreview.impact.affected_sessions.map((session) => <div className={`runtime-impact-row${actionPreview.action === 'force-delete' ? ' with-disposition' : ''}`} role="listitem" key={session.session_id}>
+                <span><strong>{session.agent_name}</strong><code>{session.session_id}</code></span>
+                <span className={`status ${session.lifecycle_status}`}>{localizedStatus(session.lifecycle_status, t)}</span>
+                {actionPreview.action === 'force-delete' && <span className={`status ${session.force_delete_disposition}`}>{t(session.force_delete_disposition === 'recoverable' ? 'recoverableSessions' : 'recoveryFailedSessions')}</span>}
+              </div>)}
+            </div>}
+          <p className="runtime-muted">{t('runtimeHostnameConfirmationHelp')}</p>
+          <label>{t('confirmRuntimeHostname')}<input autoComplete="off" value={actionConfirmation} onChange={(event) => setActionConfirmation(event.target.value)} /></label>
+        </form>
+      </FormDialog>}
 
       {enrollmentOpen && <FormDialog
         title={t('addRuntimeNode')}

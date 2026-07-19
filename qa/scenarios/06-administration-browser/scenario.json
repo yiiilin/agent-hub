@@ -1,0 +1,14 @@
+{
+  "name": "Administration browser lifecycle",
+  "type": "browser",
+  "timeout_ms": 180000,
+  "covers": [
+    "ADM-001",
+    "ADM-002",
+    "ADM-003",
+    "ADM-004"
+  ],
+  "restores": [
+    "auth_policy"
+  ]
+}

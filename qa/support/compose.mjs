@@ -15,7 +15,12 @@ export class ComposeHarness {
     this.repoRoot = repoRoot;
     this.project = project;
     this.composeFile = resolve(repoRoot, 'deploy/docker-compose.yml');
-    this.environment = { ...process.env, FRONTEND_PORT: '0' };
+    this.environment = {
+      ...process.env,
+      FRONTEND_PORT: '0',
+      HUB_CODEX_GITHUB_API_BASE: 'http://fake-model-provider:8080/codex',
+      HUB_CODEX_GITHUB_ALLOW_HTTP: 'true'
+    };
   }
 
   composeArgs(args) {

@@ -44,6 +44,10 @@ function agent(id: string, name: string, runtimeId: string | null) {
   };
 }
 
+test.beforeEach(async ({ page }) => {
+  await page.route('**/api/admin/runtime-enrollment-tokens', (route) => route.fulfill({ json: [] }));
+});
+
 async function mockRuntimePage(page: Page, runtimeResponses: Array<ReturnType<typeof runtime>[]>) {
   let requestCount = 0;
   await page.route('**/api/auth/me', (route) => route.fulfill({ json: user }));
@@ -317,6 +321,20 @@ test('Super Administrator enrolls, rotates, drains, and deletes Runtime nodes wi
     runtimes = runtimes.map((item) => item.id === 'runtime-a' ? { ...item, credential_rotation_requested_at: '2026-07-15T10:00:00.000Z' } : item);
     return route.fulfill({ json: runtimes[0] });
   });
+  await page.route('**/api/admin/runtimes/*/deletion-impact', (route) => {
+    const runtimeId = new URL(route.request().url()).pathname.split('/').at(-2)!;
+    calls.push(`preview:${runtimeId}`);
+    return route.fulfill({ json: {
+      runtime_id: runtimeId,
+      hostname: runtimeId === 'runtime-a' ? 'alpha-runner' : 'beta-runner',
+      affected_sessions: runtimeId === 'runtime-a' ? [{
+        session_id: 'session-a',
+        agent_name: 'Affected agent',
+        lifecycle_status: 'saving',
+        force_delete_disposition: 'recoverable'
+      }] : []
+    } });
+  });
   await page.route('**/api/admin/runtimes/runtime-a/drain', (route) => {
     calls.push('drain');
     runtimes = runtimes.map((item) => item.id === 'runtime-a' ? { ...item, status: 'draining' } : item);
@@ -344,8 +362,6 @@ test('Super Administrator enrolls, rotates, drains, and deletes Runtime nodes wi
     runtimes = runtimes.filter((item) => item.id !== 'runtime-b');
     return route.fulfill({ status: 204, body: '' });
   });
-  page.on('dialog', (dialog) => dialog.accept());
-
   await page.goto('/runtimes');
   await page.getByRole('button', { name: 'Add runtime node' }).click();
   const enrollmentDialog = page.getByRole('dialog', { name: 'Add runtime node' });
@@ -358,16 +374,25 @@ test('Super Administrator enrolls, rotates, drains, and deletes Runtime nodes wi
   const detail = page.getByRole('region', { name: 'Runtime details' });
   await detail.getByRole('button', { name: 'Rotate credential' }).click();
   await detail.getByRole('button', { name: 'Drain runtime' }).click();
+  let actionDialog = page.getByRole('dialog', { name: 'Drain runtime' });
+  await actionDialog.getByLabel('Confirm Runtime hostname').fill('alpha-runner');
+  await actionDialog.getByRole('button', { name: 'Drain runtime' }).click();
   await expect(detail.getByText('Affected agent')).toBeVisible();
   await expect(detail.getByText('saving', { exact: true })).toBeVisible();
   await detail.getByRole('button', { name: 'Cancel drain' }).click();
   await detail.getByRole('button', { name: 'Force-delete runtime', exact: true }).click();
+  actionDialog = page.getByRole('dialog', { name: 'Force-delete runtime' });
+  await actionDialog.getByLabel('Confirm Runtime hostname').fill('alpha-runner');
+  await actionDialog.getByRole('button', { name: 'Force-delete runtime' }).click();
   const forceResult = page.locator('.force-result');
   await expect(forceResult).toContainText('session-recoverable');
   await expect(forceResult).toContainText('session-failed');
 
   await page.getByRole('button', { name: /beta-runner/ }).click();
   await detail.getByRole('button', { name: 'Delete runtime', exact: true }).click();
+  actionDialog = page.getByRole('dialog', { name: 'Delete runtime' });
+  await actionDialog.getByLabel('Confirm Runtime hostname').fill('beta-runner');
+  await actionDialog.getByRole('button', { name: 'Delete runtime' }).click();
   await expect(page.getByRole('button', { name: /beta-runner/ })).toHaveCount(0);
-  expect(calls).toEqual(['enroll', 'revoke', 'rotate', 'drain', 'cancel-drain', 'force-delete', 'delete']);
+  expect(calls).toEqual(['enroll', 'revoke', 'rotate', 'preview:runtime-a', 'drain', 'cancel-drain', 'preview:runtime-a', 'force-delete', 'preview:runtime-b', 'delete']);
 });

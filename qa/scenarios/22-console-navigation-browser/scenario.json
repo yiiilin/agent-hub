@@ -1,0 +1,6 @@
+{
+  "name": "Public OpenAPI and complete console navigation",
+  "type": "browser",
+  "timeout_ms": 180000,
+  "covers": ["SYS-002", "SYS-003"]
+}

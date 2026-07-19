@@ -65,6 +65,7 @@ test('MCP secrets are redacted in the console and injected into the per-run runt
     const createAgentDialog = page.getByRole('dialog', { name: 'Create Agent' });
     await createAgentDialog.getByLabel('Name', { exact: true }).fill(agentName);
     await createAgentDialog.getByLabel('Instructions').fill('Validate MCP secret redaction and runtime injection.');
+    await expect(createAgentDialog.getByLabel('Default model connection')).not.toHaveValue('');
     const createAgentResponsePromise = page.waitForResponse((response) => response.request().method() === 'POST'
       && new URL(response.url()).pathname === '/api/agents');
     await createAgentDialog.getByRole('button', { name: 'Create agent' }).click();
@@ -80,42 +81,41 @@ test('MCP secrets are redacted in the console and injected into the per-run runt
     if (runtimeValue) await runtimeSelect.selectOption(runtimeValue);
     if (runtimeValue) await page.getByRole('tabpanel', { name: 'Access' }).getByRole('button', { name: 'Save agent' }).click();
     await page.getByRole('tab', { name: 'MCP' }).click();
-    await page.getByLabel('MCP allowlist').fill(JSON.stringify([
-      {
-        name: 'filesystem',
-        command: 'fs',
-        secrets: { API_TOKEN: '********' }
-      }
-    ], null, 2));
-    await page.getByRole('button', { name: 'Save agent' }).click();
-    await expect(page.getByText('MCP redacted secret cannot be saved without an existing value')).toBeVisible();
+    const mcpPanel = page.getByRole('tabpanel', { name: 'MCP' });
+    const mcpTable = mcpPanel.getByRole('table', { name: 'MCP allowlist' });
+    await mcpPanel.getByRole('button', { name: 'Add MCP entry' }).click();
+    const addMcpDialog = page.getByRole('dialog', { name: 'Add MCP entry' });
+    await addMcpDialog.getByLabel('Name', { exact: true }).fill('filesystem');
+    await addMcpDialog.getByLabel('Command').fill('fs');
+    await addMcpDialog.getByLabel('Arguments').fill('--root\n/workspace');
+    await addMcpDialog.getByRole('button', { name: 'Add secret' }).click();
+    await addMcpDialog.getByLabel('Secret name 1').fill('API_TOKEN');
+    await addMcpDialog.getByLabel('Secret value 1').fill('********');
+    await addMcpDialog.getByRole('button', { name: 'Save changes' }).click();
+    await expect(addMcpDialog.getByRole('alert')).toContainText('Enter secret values again after renaming an MCP entry or secret.');
 
-    await page.getByLabel('MCP allowlist').fill(JSON.stringify([
-      {
-        name: 'filesystem',
-        command: 'fs',
-        args: ['--root', '/workspace'],
-        secrets: { API_TOKEN: secret }
-      }
-    ], null, 2));
-    await page.getByRole('button', { name: 'Save agent' }).click();
-
-    const mcpField = page.getByLabel('MCP allowlist');
-    await expect(mcpField).toHaveValue(/"\*{8}"/);
-    await expect(mcpField).not.toHaveValue(new RegExp(secret));
+    await addMcpDialog.getByLabel('Secret value 1').fill(secret);
+    await addMcpDialog.getByRole('button', { name: 'Save changes' }).click();
+    await expect(addMcpDialog).toHaveCount(0);
+    await expect(mcpTable).toContainText('filesystem');
+    await expect(mcpTable).toContainText('API_TOKEN=********');
+    await expect(mcpTable).not.toContainText(secret);
 
     const currentUrl = page.url();
     await page.reload();
     await page.goto(currentUrl);
     await page.getByRole('tab', { name: 'MCP' }).click();
-    await expect(mcpField).toHaveValue(/"\*{8}"/);
-    await expect(mcpField).not.toHaveValue(new RegExp(secret));
+    await expect(mcpTable).toContainText('API_TOKEN=********');
+    await expect(mcpTable).not.toContainText(secret);
 
-    const redactedAllowlist = JSON.parse(await mcpField.inputValue()) as Array<Record<string, unknown>>;
-    redactedAllowlist[0].args = ['--root', '/workspace', '--readonly'];
-    await mcpField.fill(JSON.stringify(redactedAllowlist, null, 2));
-    await page.getByRole('button', { name: 'Save agent' }).click();
-    await expect(mcpField).toHaveValue(/"\*{8}"/);
+    await mcpTable.getByRole('button', { name: 'Edit MCP entry: filesystem' }).click();
+    const editMcpDialog = page.getByRole('dialog', { name: 'Edit MCP entry: filesystem' });
+    await expect(editMcpDialog.getByLabel('Secret value 1')).toHaveValue('********');
+    await editMcpDialog.getByLabel('Arguments').fill('--root\n/workspace\n--readonly');
+    await editMcpDialog.getByRole('button', { name: 'Save changes' }).click();
+    await expect(editMcpDialog).toHaveCount(0);
+    await expect(mcpTable).toContainText('--root /workspace --readonly');
+    await expect(mcpTable).toContainText('API_TOKEN=********');
 
     await page.getByRole('tab', { name: 'Activity' }).click();
     await page.getByLabel('Message').fill('Run with preserved MCP secret from Playwright');

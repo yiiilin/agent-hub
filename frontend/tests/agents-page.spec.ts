@@ -401,10 +401,12 @@ type DetailApiOptions = {
   onPatch?: (route: Route, body: Record<string, unknown>) => Promise<void>;
   onDelete?: (route: Route) => Promise<void>;
   onRun?: (route: Route, body: Record<string, unknown>) => Promise<void>;
+  onRuns?: (route: Route, requestCount: number) => Promise<void>;
 };
 
 async function installDetailApi(page: Page, options: DetailApiOptions = {}) {
   let agent = options.agent ?? ownerDetail();
+  let runsRequestCount = 0;
   await page.route('**/api/**', async (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
@@ -423,7 +425,11 @@ async function installDetailApi(page: Page, options: DetailApiOptions = {}) {
       if (options.onDelete) return options.onDelete(route);
       return route.fulfill({ status: 204 });
     }
-    if (path === `/api/agents/${agent.id}/runs` && request.method() === 'GET') return route.fulfill({ json: options.runs ?? [] });
+    if (path === `/api/agents/${agent.id}/runs` && request.method() === 'GET') {
+      runsRequestCount += 1;
+      if (options.onRuns) return options.onRuns(route, runsRequestCount);
+      return route.fulfill({ json: options.runs ?? [] });
+    }
     if (path === `/api/agents/${agent.id}/runs` && request.method() === 'POST') {
       const body = request.postDataJSON() as Record<string, unknown>;
       if (options.onRun) return options.onRun(route, body);
@@ -658,13 +664,21 @@ test('agent deletion confirms and sends DELETE without viewport regressions', as
   const consoleErrors: string[] = [];
   const requestFailures: string[] = [];
   const deleteMethods: string[] = [];
+  let deleteStarted = false;
+  let staleRunRequests = 0;
   page.on('pageerror', (error) => pageErrors.push(error.message));
   page.on('console', (message) => { if (message.type() === 'error') consoleErrors.push(message.text()); });
   page.on('requestfailed', (request) => requestFailures.push(`${request.method()} ${new URL(request.url()).pathname}: ${request.failure()?.errorText ?? 'unknown'}`));
+  page.on('request', (request) => {
+    if (deleteStarted && request.method() === 'GET'
+      && new URL(request.url()).pathname === `/api/agents/${agent.id}/runs`) staleRunRequests += 1;
+  });
   await installDetailApi(page, {
     agent,
     onDelete: async (route) => {
       deleteMethods.push(route.request().method());
+      deleteStarted = true;
+      await new Promise((resolve) => setTimeout(resolve, 2_100));
       await route.fulfill({ status: 204, body: '' });
     }
   });
@@ -687,9 +701,44 @@ test('agent deletion confirms and sends DELETE without viewport regressions', as
   expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0);
 
   expect(deleteMethods).toEqual(['DELETE']);
+  expect(staleRunRequests).toBe(0);
   expect(pageErrors).toEqual([]);
   expect(consoleErrors).toEqual([]);
   expect(requestFailures.filter((failure) => failure !== `DELETE /api/agents/${agent.id}: net::ERR_ABORTED`)).toEqual([]);
+});
+
+test('agent deletion aborts a stalled Run refresh before sending DELETE', async ({ page }) => {
+  const agent = ownerDetail({ id: '50000000-0000-0000-0000-000000000058' });
+  let releaseRefresh!: () => void;
+  const heldRefresh = new Promise<void>((resolve) => { releaseRefresh = resolve; });
+  let refreshStarted!: () => void;
+  const refreshRequest = new Promise<void>((resolve) => { refreshStarted = resolve; });
+  let deleteStarted = false;
+  await installDetailApi(page, {
+    agent,
+    onRuns: async (route, requestCount) => {
+      if (requestCount === 1) return route.fulfill({ json: [] });
+      refreshStarted();
+      await heldRefresh;
+      if (!route.request().failure()) await route.fulfill({ json: [] });
+    },
+    onDelete: async (route) => {
+      deleteStarted = true;
+      releaseRefresh();
+      await route.fulfill({ status: 204, body: '' });
+    }
+  });
+
+  await page.goto(`/agents/${agent.id}`);
+  await refreshRequest;
+  page.once('dialog', (dialog) => dialog.accept());
+  try {
+    await page.getByRole('button', { name: 'Delete agent', exact: true }).click();
+    await expect.poll(() => deleteStarted, { timeout: 1_000 }).toBe(true);
+    await expect(page).toHaveURL('/agents');
+  } finally {
+    releaseRefresh();
+  }
 });
 
 test('agent detail keeps tab drafts mounted and blocks dirty or pending navigation', async ({ page }) => {

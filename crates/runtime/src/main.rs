@@ -2354,20 +2354,13 @@ async fn execute_managed_app_server_with_streaming(
     loop {
         tokio::select! {
             Some(event) = event_rx.recv() => {
-                if event.event_type == "turn_started" {
-                    let native_thread_id = event
-                        .payload
-                        .get("native_thread_id")
-                        .and_then(serde_json::Value::as_str)
-                        .context("turn_started event is missing native Thread id")?;
-                    manager
-                        .update_native_thread_id(
-                            session_id,
-                            ownership_generation,
-                            Some(native_thread_id),
-                        )
-                        .await?;
-                }
+                let turn_started = event.event_type == "turn_started";
+                persist_managed_native_thread_from_event(
+                    &manager,
+                    session_id,
+                    ownership_generation,
+                    &event,
+                ).await?;
                 if let Some(event) = defer_tool_request(event, &mut deferred_tool_requests) {
                     if let Err(error) = append_streamed_event(
                         client,
@@ -2380,6 +2373,9 @@ async fn execute_managed_app_server_with_streaming(
                         manager.cancel_session(session_id, error.to_string());
                         let _ = driver.await;
                         return Err(error);
+                    }
+                    if turn_started {
+                        manager.acknowledge_model_proxy_turn(session_id, run_id)?;
                     }
                 }
             }
@@ -2397,6 +2393,13 @@ async fn execute_managed_app_server_with_streaming(
             result = &mut driver => {
                 let mut result = result??;
                 while let Ok(event) = event_rx.try_recv() {
+                    let turn_started = event.event_type == "turn_started";
+                    persist_managed_native_thread_from_event(
+                        &manager,
+                        session_id,
+                        ownership_generation,
+                        &event,
+                    ).await?;
                     if let Some(event) = defer_tool_request(event, &mut deferred_tool_requests) {
                         append_streamed_event(
                             client,
@@ -2405,6 +2408,9 @@ async fn execute_managed_app_server_with_streaming(
                             event,
                             last_heartbeat,
                         ).await?;
+                        if turn_started {
+                            manager.acknowledge_model_proxy_turn(session_id, run_id)?;
+                        }
                     }
                 }
                 if result.final_status == "waiting_tool" {
@@ -2414,6 +2420,25 @@ async fn execute_managed_app_server_with_streaming(
             }
         }
     }
+}
+
+async fn persist_managed_native_thread_from_event(
+    manager: &SessionSupervisorManager,
+    session_id: Uuid,
+    ownership_generation: i64,
+    event: &AppendRunEventRequest,
+) -> anyhow::Result<()> {
+    if event.event_type != "turn_started" {
+        return Ok(());
+    }
+    let native_thread_id = event
+        .payload
+        .get("native_thread_id")
+        .and_then(serde_json::Value::as_str)
+        .context("turn_started event is missing native Thread id")?;
+    manager
+        .update_native_thread_id(session_id, ownership_generation, Some(native_thread_id))
+        .await
 }
 
 async fn execute_app_server_with_streaming(
@@ -2610,7 +2635,21 @@ impl LocalModelProxy {
         *self.state.active_run.write().unwrap() = LocalModelProxyRunAuth {
             model_proxy_token: model_proxy_token.to_owned(),
             run_id,
+            turn_acknowledged: false,
         };
+        self.state.turn_acknowledged.notify_waiters();
+    }
+
+    fn acknowledge_turn(&self, run_id: Uuid) -> anyhow::Result<()> {
+        let mut active_run = self.state.active_run.write().unwrap();
+        anyhow::ensure!(
+            active_run.run_id == run_id,
+            "model proxy Run changed before Turn acknowledgement"
+        );
+        active_run.turn_acknowledged = true;
+        drop(active_run);
+        self.state.turn_acknowledged.notify_waiters();
+        Ok(())
     }
 }
 
@@ -2624,12 +2663,14 @@ impl Drop for LocalModelProxy {
 struct LocalModelProxyRunAuth {
     model_proxy_token: String,
     run_id: Uuid,
+    turn_acknowledged: bool,
 }
 
 struct LocalModelProxyState {
     http: reqwest::Client,
     hub_url: String,
     active_run: std::sync::RwLock<LocalModelProxyRunAuth>,
+    turn_acknowledged: Notify,
 }
 
 async fn start_model_proxy(
@@ -2654,7 +2695,9 @@ async fn start_model_proxy(
         active_run: std::sync::RwLock::new(LocalModelProxyRunAuth {
             model_proxy_token: model_proxy_token.to_owned(),
             run_id,
+            turn_acknowledged: false,
         }),
+        turn_acknowledged: Notify::new(),
     });
     let app = Router::new()
         .route("/v1/{*path}", post(local_model_proxy_request))
@@ -2678,7 +2721,22 @@ async fn local_model_proxy_request(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let active_run = state.active_run.read().unwrap().clone();
+    let requested_run_id = state.active_run.read().unwrap().run_id;
+    let active_run = loop {
+        let acknowledged = state.turn_acknowledged.notified();
+        let active_run = state.active_run.read().unwrap().clone();
+        if active_run.run_id != requested_run_id {
+            return (
+                AxumStatusCode::CONFLICT,
+                Json(json!({ "error": "model proxy Run changed before Turn acknowledgement" })),
+            )
+                .into_response();
+        }
+        if active_run.turn_acknowledged {
+            break active_run;
+        }
+        acknowledged.await;
+    };
     let mut upstream_url = format!("{}/api/runtime/model-proxy/v1/{}", state.hub_url, path);
     if let Some(query) = query.filter(|query| !query.is_empty()) {
         upstream_url.push('?');
@@ -5559,6 +5617,11 @@ impl SessionSupervisorManager {
                 "Session ownership changed before native thread persistence"
             );
             let mut metadata = match &record.status {
+                ManagedSessionStatus::Ready { metadata, .. }
+                    if metadata.native_thread_id.as_deref() == Some(native_thread_id) =>
+                {
+                    return Ok(())
+                }
                 ManagedSessionStatus::Ready { metadata, .. } => metadata.clone(),
                 ManagedSessionStatus::Starting => {
                     anyhow::bail!("Session supervisor is still starting")
@@ -5700,6 +5763,12 @@ impl SessionSupervisorManager {
             .unwrap()
             .get(&session_id)
             .and_then(|record| record.model_proxy.as_ref().map(Arc::clone))
+    }
+
+    fn acknowledge_model_proxy_turn(&self, session_id: Uuid, run_id: Uuid) -> anyhow::Result<()> {
+        self.model_proxy(session_id)
+            .context("Session model proxy is unavailable")?
+            .acknowledge_turn(run_id)
     }
 
     fn refresh_failed_supervisors(&self) {
@@ -10845,6 +10914,74 @@ done
     }
 
     #[tokio::test]
+    async fn managed_turn_started_event_persists_native_thread_before_hub_upload() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("managed-turn-started-codex");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) echo '{"id":1,"result":{}}' ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        make_executable(&script);
+        let runtime_id = Uuid::new_v4();
+        let mut claim = test_claim();
+        let session_id = Uuid::new_v4();
+        claim.run.hub_session_id = Some(session_id);
+        claim.run.session_ownership_generation = Some(5);
+        let run_env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
+        let manager = SessionSupervisorManager::new(temp.path().to_path_buf(), runtime_id, 1);
+        manager
+            .ensure_app_server(
+                session_supervisor_metadata_for_claim(runtime_id, &claim, "test-codex").unwrap(),
+                script.display().to_string(),
+                run_env,
+                Duration::from_secs(2),
+                None,
+            )
+            .await
+            .unwrap();
+        let event = AppendRunEventRequest {
+            event_type: "turn_started".into(),
+            role: None,
+            content: None,
+            payload: json!({
+                "native_thread_id": "managed-thread",
+                "native_turn_id": "managed-turn"
+            }),
+            waiting_tool: None,
+        };
+
+        persist_managed_native_thread_from_event(&manager, session_id, 5, &event)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager.records.lock().unwrap()[&session_id]
+                .snapshot
+                .native_thread_id
+                .as_deref(),
+            Some("managed-thread")
+        );
+        let metadata: SessionSupervisorMetadata = serde_json::from_slice(
+            &std::fs::read(
+                SessionPaths::for_session(temp.path(), session_id)
+                    .supervisor
+                    .join(SESSION_SUPERVISOR_METADATA_FILE),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata.native_thread_id.as_deref(), Some("managed-thread"));
+        manager.shutdown();
+    }
+
+    #[tokio::test]
     async fn heartbeat_native_thread_mismatch_blocks_session_and_releases_live_resources() {
         let temp = tempfile::tempdir().unwrap();
         let pid_file = temp.path().join("thread-mismatch-pid");
@@ -11470,6 +11607,7 @@ done
         )
         .await
         .unwrap();
+        proxy.acknowledge_turn(run_id).unwrap();
         let request_body = br#"{"model":"gpt-main","input":"keep bytes"}"#;
 
         let response = reqwest::Client::new()
@@ -11568,14 +11706,16 @@ Transfer-Encoding: chunked\r\n\
             runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
             protocol_capabilities: HashSet::new(),
         };
+        let run_id = Uuid::new_v4();
         let proxy = start_model_proxy(
             &client,
-            Uuid::new_v4(),
+            run_id,
             "scoped-model-token",
             Duration::from_millis(150),
         )
         .await
         .unwrap();
+        proxy.acknowledge_turn(run_id).unwrap();
         let http = reqwest::Client::new();
 
         let response = tokio::time::timeout(
@@ -11638,14 +11778,16 @@ Transfer-Encoding: chunked\r\n\
             runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
             protocol_capabilities: HashSet::new(),
         };
+        let run_id = Uuid::new_v4();
         let proxy = start_model_proxy(
             &client,
-            Uuid::new_v4(),
+            run_id,
             "scoped-model-token",
             Duration::from_millis(75),
         )
         .await
         .unwrap();
+        proxy.acknowledge_turn(run_id).unwrap();
         let mut response = reqwest::Client::new()
             .post(format!("{}/responses", proxy.base_url))
             .body("{}")
@@ -11715,6 +11857,7 @@ Transfer-Encoding: chunked\r\n\
         )
         .await
         .unwrap();
+        proxy.acknowledge_turn(first_run_id).unwrap();
         let stable_base_url = proxy.base_url.clone();
         let http = reqwest::Client::new();
 
@@ -11728,6 +11871,7 @@ Transfer-Encoding: chunked\r\n\
             StatusCode::OK
         );
         proxy.activate_run(second_run_id, "second-model-token");
+        proxy.acknowledge_turn(second_run_id).unwrap();
         assert_eq!(proxy.base_url, stable_base_url);
         assert_eq!(
             http.post(format!("{stable_base_url}/responses"))
@@ -13788,7 +13932,7 @@ done
     }
 
     #[tokio::test]
-    async fn managed_session_reuses_app_server_and_proxy_while_switching_run_auth() {
+    async fn managed_session_waits_for_turn_ack_and_reuses_proxy_while_switching_run_auth() {
         let temp = tempfile::tempdir().unwrap();
         let pid_log = temp.path().join("managed-pids");
         let base_url_log = temp.path().join("managed-base-urls");
@@ -13805,6 +13949,9 @@ while IFS= read -r line; do
       echo $$ >> {}
       base_url=$(sed -n 's/^base_url = "\(.*\)"$/\1/p' "$CODEX_HOME/config.toml" | head -n 1)
       echo "$base_url" >> {}
+      request_id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      printf '{{"id":%s,"result":{{"turn":{{"id":"managed-turn-%s","status":"inProgress","items":[]}}}}}}\n' "$request_id" "$request_id"
+      printf '{{"method":"turn/started","params":{{"threadId":"managed-thread","turn":{{"id":"managed-turn-%s","status":"inProgress","items":[]}}}}}}\n' "$request_id"
       curl --fail --silent --show-error -X POST "$base_url/responses" -H 'content-type: application/json' -d '{{}}' >/dev/null || exit 42
       echo '{{"method":"turn/completed","params":{{"thread":{{"id":"managed-thread"}},"turn":{{"status":"completed","items":[{{"type":"agentMessage","text":"done"}}]}}}}}}'
       ;;
@@ -13819,14 +13966,21 @@ done
         make_executable(&script);
 
         let forwarded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let acknowledged_turns = Arc::new(AtomicUsize::new(0));
         let app = Router::new()
             .route(
                 "/api/runtime/model-proxy/v1/{*path}",
                 post({
                     let forwarded = Arc::clone(&forwarded);
+                    let acknowledged_turns = Arc::clone(&acknowledged_turns);
                     move |headers: HeaderMap| {
                         let forwarded = Arc::clone(&forwarded);
+                        let acknowledged_turns = Arc::clone(&acknowledged_turns);
                         async move {
+                            let forwarded_count = forwarded.lock().unwrap().len();
+                            if acknowledged_turns.load(Ordering::SeqCst) <= forwarded_count {
+                                return AxumStatusCode::UNAUTHORIZED.into_response();
+                            }
                             forwarded.lock().unwrap().push((
                                 headers
                                     .get(header::AUTHORIZATION)
@@ -13848,7 +14002,23 @@ done
             )
             .route(
                 "/api/runtime/runs/{run_id}/events",
-                post(|| async { AxumStatusCode::OK }),
+                post({
+                    let acknowledged_turns = Arc::clone(&acknowledged_turns);
+                    move |Json(request): Json<Value>| {
+                        let acknowledged_turns = Arc::clone(&acknowledged_turns);
+                        async move {
+                            if request
+                                .pointer("/payload/event_type")
+                                .and_then(Value::as_str)
+                                == Some("turn_started")
+                            {
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                acknowledged_turns.fetch_add(1, Ordering::SeqCst);
+                            }
+                            AxumStatusCode::OK
+                        }
+                    }
+                }),
             )
             .route(
                 "/api/runtime/runs/{run_id}/complete",
@@ -15009,6 +15179,25 @@ done
             }),
             json!({
                 "jsonrpc": "2.0",
+                "id": "unsubscribe-request",
+                "method": "thread/unsubscribe",
+                "params": { "threadId": thread_id }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": "refresh-resume-request",
+                "method": "thread/resume",
+                "params": {
+                    "threadId": thread_id,
+                    "cwd": temp.path(),
+                    "approvalPolicy": "never",
+                    "developerInstructions": "refreshed fixture protocol",
+                    "excludeTurns": true,
+                    "config": {}
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
                 "id": "start-request",
                 "method": "turn/start",
                 "params": {
@@ -15077,6 +15266,11 @@ done
         );
         assert_eq!(
             response("resume-request")["result"]["thread"]["id"],
+            thread_id
+        );
+        assert_eq!(response("unsubscribe-request")["result"], json!({}));
+        assert_eq!(
+            response("refresh-resume-request")["result"]["thread"]["id"],
             thread_id
         );
         assert_eq!(response("start-request")["result"]["turn"]["id"], turn_id);

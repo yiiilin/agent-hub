@@ -687,6 +687,7 @@ export function AgentPage({
   const mutationController = useRef<AbortController | null>(null);
   const runController = useRef<AbortController | null>(null);
   const refreshController = useRef<AbortController | null>(null);
+  const refreshPromise = useRef<Promise<void> | null>(null);
   const configPendingRef = useRef(false);
   const runPendingRef = useRef(false);
   const firstSkillRef = useRef<HTMLInputElement>(null);
@@ -738,13 +739,16 @@ export function AgentPage({
     setSubagentDialog(null);
     setLoadError(false);
     setError('');
+    const agentRequest = api.agent(agentId, controller.signal);
     Promise.all([
-      api.agent(agentId, controller.signal),
+      agentRequest,
       api.runs(agentId, controller.signal),
       api.runtimes(controller.signal),
       api.skills(controller.signal),
       api.users(controller.signal),
-      api.agentModelConnectionOptions(agentId, controller.signal)
+      agentRequest.then((loadedAgent) => loadedAgent.can_manage
+        ? api.agentModelConnectionOptions(agentId, controller.signal)
+        : { items: [], system_default_model_connection_id: null })
     ]).then(([loadedAgent, loadedRuns, loadedRuntimes, loadedSkills, loadedUsers, loadedModelOptions]) => {
       if (controller.signal.aborted || !mounted.current || generation !== loadGeneration.current) return;
       applyLoadedAgent(loadedAgent);
@@ -785,7 +789,7 @@ export function AgentPage({
     if (!loadedAgentId) return;
     let active = true;
     const refresh = async () => {
-      if (refreshController.current) return;
+      if (refreshController.current || configPendingRef.current) return;
       const controller = new AbortController();
       refreshController.current = controller;
       const generation = runGeneration.current;
@@ -801,7 +805,14 @@ export function AgentPage({
         if (refreshController.current === controller) refreshController.current = null;
       }
     };
-    const timer = window.setInterval(refresh, 2000);
+    const launchRefresh = () => {
+      const pending = refresh();
+      refreshPromise.current = pending;
+      void pending.finally(() => {
+        if (refreshPromise.current === pending) refreshPromise.current = null;
+      });
+    };
+    const timer = window.setInterval(launchRefresh, 2000);
     return () => {
       active = false;
       refreshController.current?.abort();
@@ -1017,6 +1028,11 @@ export function AgentPage({
     if (!window.confirm(t('confirmDeleteAgent').replace('{name}', agent.name))) return;
     const operation = beginConfigMutation();
     if (!operation) return;
+    runGeneration.current += 1;
+    const pendingRefresh = refreshPromise.current;
+    refreshController.current?.abort();
+    refreshController.current = null;
+    if (pendingRefresh) await pendingRefresh;
     try {
       await api.deleteAgent(agentId, operation.controller.signal);
       if (operation.controller.signal.aborted || !mounted.current || operation.generation !== mutationGeneration.current) return;

@@ -1,0 +1,16 @@
+{
+  "name": "Integration App OAuth, External Session, tool, SSE, and revocation lifecycle",
+  "type": "api",
+  "timeout_ms": 420000,
+  "covers": [
+    "IAP-001",
+    "IAP-002",
+    "OAUTH-001",
+    "OAUTH-002",
+    "INT-001",
+    "INT-002",
+    "INT-003",
+    "INT-004",
+    "INT-005"
+  ]
+}

@@ -37,6 +37,9 @@ V1 保留以下可浏览器验证的产品链路；其执行和存储边界已�
 
 ## 测试计划
 
+- `qa/features.json` 是 V1 可验收行为与自动化证据的权威目录；`docs/qa-spec.md` 定义覆盖层级、场景隔离、诊断和 secret 安全契约。
+- 每个 OpenAPI operation、管理台页面和关键 Widget/Runtime 协议都必须映射到稳定 Feature ID；场景通过 manifest 的 `covers` 声明自己直接验证的行为。
+- 每个核心功能域至少保留一条真实 Compose API 或 Browser QA 链路；并发、持久化约束和协议状态机可继续由 Rust 测试承担，不在浏览器重复所有分支。
 - 后端：覆盖凭据脱敏、Session/origin 授权、消息顺序、Run 关联和数据库迁移。
 - Runtime：覆盖 Session 目录隔离、native Thread 多 Turn 继续、ownership fencing 和 fake app-server 事件。
 - Frontend：TypeScript 构建校验。

@@ -1,5 +1,6 @@
 {
   "name": "Fresh control plane is ready and seeded",
   "type": "api",
-  "timeout_ms": 60000
+  "timeout_ms": 60000,
+  "covers": ["SYS-001"]
 }

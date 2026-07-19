@@ -173,6 +173,19 @@ export type RuntimeDrainResponse = {
   owned_sessions: HubSession[];
 };
 
+export type RuntimeDeletionImpactSession = {
+  session_id: string;
+  agent_name: string;
+  lifecycle_status: string;
+  force_delete_disposition: 'recoverable' | 'recovery_failed';
+};
+
+export type RuntimeDeletionImpact = {
+  runtime_id: string;
+  hostname: string;
+  affected_sessions: RuntimeDeletionImpactSession[];
+};
+
 export type ForceDeleteRuntimeResponse = {
   runtime_id: string;
   recoverable_session_ids: string[];
@@ -972,6 +985,8 @@ export const api = {
     request<Runtime>(`/api/admin/runtimes/${runtimeId}/credential-rotation`, {
       method: 'POST'
     }),
+  runtimeDeletionImpact: (runtimeId: string, signal?: AbortSignal) =>
+    request<RuntimeDeletionImpact>(`/api/admin/runtimes/${runtimeId}/deletion-impact`, { signal }),
   drainRuntime: (runtimeId: string, hostname: string) =>
     request<RuntimeDrainResponse>(`/api/admin/runtimes/${runtimeId}/drain`, {
       method: 'POST',

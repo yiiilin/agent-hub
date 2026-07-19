@@ -1,0 +1,6 @@
+{
+  "name": "Browser authentication and API key lifecycle",
+  "type": "browser",
+  "timeout_ms": 180000,
+  "covers": ["AUTH-002", "AUTH-003", "AUTH-004"]
+}

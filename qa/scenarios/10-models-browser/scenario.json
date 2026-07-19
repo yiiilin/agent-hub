@@ -1,0 +1,15 @@
+{
+  "name": "Model Connections and usage browser workflows",
+  "type": "browser",
+  "timeout_ms": 240000,
+  "covers": [
+    "MDL-001",
+    "MDL-002",
+    "MDL-003",
+    "MDL-004",
+    "MDL-006"
+  ],
+  "restores": [
+    "system_default_model_connection"
+  ]
+}

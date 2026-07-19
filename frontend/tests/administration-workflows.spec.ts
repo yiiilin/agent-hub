@@ -21,7 +21,14 @@ type RequestState = {
   bodies: Record<string, unknown[]>;
 };
 
-async function installAdministrationApi(page: Page) {
+type AdministrationApiOptions = {
+  prepareRolloutStatus?: 'ready' | 'distributing';
+  readyAfterPolls?: number;
+  rolloutPollFailures?: number;
+  rolloutPollGate?: Promise<void>;
+};
+
+async function installAdministrationApi(page: Page, options: AdministrationApiOptions = {}) {
   const state: RequestState = { counts: {}, bodies: {} };
   const count = (key: string) => { state.counts[key] = (state.counts[key] ?? 0) + 1; };
   const record = async (route: Route, key: string) => {
@@ -83,6 +90,7 @@ async function installAdministrationApi(page: Page) {
     }],
     updated_at: '2026-07-15T09:00:00.000Z'
   };
+  let rolloutPollsAfterPrepare = 0;
 
   await page.route('**/api/auth/me', (route) => route.fulfill({ json: superAdmin }));
   await page.route('**/api/admin/auth-policy', async (route) => {
@@ -165,8 +173,22 @@ async function installAdministrationApi(page: Page) {
     count('erasures');
     return route.fulfill({ json: erasures });
   });
-  await page.route('**/api/admin/codex-version-rollout', (route) => {
+  await page.route('**/api/admin/codex-version-rollout', async (route) => {
     count('rollout');
+    if (rollout.status === 'distributing') {
+      rolloutPollsAfterPrepare += 1;
+      await options.rolloutPollGate;
+      if (rolloutPollsAfterPrepare <= (options.rolloutPollFailures ?? 0)) {
+        return route.fulfill({ status: 500, json: { error: 'temporary failure' } });
+      }
+      if (rolloutPollsAfterPrepare >= (options.readyAfterPolls ?? Number.POSITIVE_INFINITY)) {
+        rollout = {
+          ...rollout,
+          status: 'ready',
+          runtimes: rollout.runtimes.map((runtime) => ({ ...runtime, status: 'ready' }))
+        };
+      }
+    }
     return route.fulfill({ json: rollout });
   });
   await page.route('**/api/admin/codex-version-rollout/target', async (route) => {
@@ -174,8 +196,12 @@ async function installAdministrationApi(page: Page) {
     rollout = {
       ...rollout,
       target_version: body.version,
-      status: 'ready',
-      runtimes: rollout.runtimes.map((runtime) => ({ ...runtime, target_version: body.version, status: 'ready' }))
+      status: options.prepareRolloutStatus ?? 'ready',
+      runtimes: rollout.runtimes.map((runtime) => ({
+        ...runtime,
+        target_version: body.version,
+        status: options.prepareRolloutStatus ?? 'ready'
+      }))
     };
     return route.fulfill({ json: rollout });
   });
@@ -187,6 +213,75 @@ async function installAdministrationApi(page: Page) {
 
   return state;
 }
+
+test('Codex rollout refreshes a distributing target until it is ready and then stops polling', async ({ page }) => {
+  const state = await installAdministrationApi(page, { prepareRolloutStatus: 'distributing', readyAfterPolls: 1 });
+  await page.clock.install();
+  await page.goto('/administration');
+  await page.getByRole('tab', { name: 'Codex version' }).click();
+  await expect(page.getByRole('heading', { name: 'Codex version rollout' })).toBeVisible();
+
+  await page.getByLabel('Target Codex version').fill('0.31.0');
+  await page.getByRole('button', { name: 'Prepare version' }).click();
+  await expect(page.locator('.admin-summary').getByText('distributing', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Promote ready version' })).toHaveCount(0);
+
+  await page.clock.fastForward(2_100);
+  await expect(page.getByRole('button', { name: 'Promote ready version' })).toBeVisible();
+  expect(state.counts.rollout).toBe(2);
+
+  await page.clock.fastForward(10_000);
+  expect(state.counts.rollout).toBe(2);
+});
+
+test('Codex rollout keeps one refresh in flight and stops it when the tab unmounts', async ({ page }) => {
+  let releasePoll!: () => void;
+  const pollGate = new Promise<void>((resolve) => { releasePoll = resolve; });
+  const state = await installAdministrationApi(page, {
+    prepareRolloutStatus: 'distributing',
+    readyAfterPolls: 1,
+    rolloutPollGate: pollGate
+  });
+  await page.clock.install();
+  await page.goto('/administration');
+  await page.getByRole('tab', { name: 'Codex version' }).click();
+  await expect(page.getByRole('heading', { name: 'Codex version rollout' })).toBeVisible();
+  await page.getByLabel('Target Codex version').fill('0.31.0');
+  await page.getByRole('button', { name: 'Prepare version' }).click();
+
+  await page.clock.fastForward(2_100);
+  await expect.poll(() => state.counts.rollout).toBe(2);
+  await page.clock.fastForward(10_000);
+  expect(state.counts.rollout).toBe(2);
+
+  await page.getByRole('tab', { name: 'Authentication' }).click();
+  await expect(page.getByRole('heading', { name: 'Authentication policy' })).toBeVisible();
+  releasePoll();
+  await page.clock.fastForward(10_000);
+  expect(state.counts.rollout).toBe(2);
+});
+
+test('Codex rollout preserves refresh errors and retries while distribution is pending', async ({ page }) => {
+  const state = await installAdministrationApi(page, {
+    prepareRolloutStatus: 'distributing',
+    rolloutPollFailures: 1,
+    readyAfterPolls: 2
+  });
+  await page.clock.install();
+  await page.goto('/administration');
+  await page.getByRole('tab', { name: 'Codex version' }).click();
+  await page.getByLabel('Target Codex version').fill('0.31.0');
+  await page.getByRole('button', { name: 'Prepare version' }).click();
+
+  await page.clock.fastForward(2_100);
+  await expect(page.getByRole('alert')).toContainText('Administration action failed.');
+  expect(state.counts.rollout).toBe(2);
+
+  await page.clock.fastForward(2_100);
+  await expect(page.getByRole('button', { name: 'Promote ready version' })).toBeVisible();
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  expect(state.counts.rollout).toBe(3);
+});
 
 test('Administration tabs render one lazy-loaded workflow and retain the Codex rollout flow', async ({ page }) => {
   const state = await installAdministrationApi(page);

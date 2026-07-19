@@ -1,0 +1,13 @@
+{
+  "name": "Automation creation, triggers, scheduler, and Run Console browser workflows",
+  "type": "browser",
+  "timeout_ms": 420000,
+  "covers": [
+    "AUT-001",
+    "AUT-002",
+    "AUT-003",
+    "AUT-004",
+    "AUT-006",
+    "SYS-004"
+  ]
+}

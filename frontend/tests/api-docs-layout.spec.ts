@@ -25,7 +25,7 @@ async function login(page: import('@playwright/test').Page) {
   await page.getByLabel('Email').fill('admin@example.com');
   await page.getByLabel('Password').fill('admin123');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
-  await expect(page).toHaveURL(/\/agents$/);
+  await expect(page).toHaveURL(/\/sessions$/);
 }
 
 test('OpenAPI is public and API Docs is reachable from the sidebar', async ({ page, request }) => {
@@ -47,9 +47,14 @@ test('OpenAPI is public and API Docs is reachable from the sidebar', async ({ pa
   await page.getByRole('button', { name: 'API Docs' }).click();
   await expect(page).toHaveURL(/\/docs$/);
   await expect(page.getByRole('button', { name: 'API Docs' })).toHaveAttribute('aria-current', 'page');
-  await expect(page.getByRole('heading', { name: 'Agent Hub API' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Agent Hub API', exact: true, level: 1 })).toBeVisible();
   await expect(page.getByText('Authorization: Bearer')).toBeVisible();
-  await expect(page.getByText('/api/agents/{agent_id}/runs', { exact: true }).first()).toBeVisible();
+  const agentRunEndpoints = page.locator('.endpoint-row').filter({
+    has: page.getByText('/api/agents/{agent_id}/runs', { exact: true })
+  });
+  await expect(agentRunEndpoints).toHaveCount(2);
+  await expect(agentRunEndpoints.filter({ hasText: 'GET' })).toBeVisible();
+  await expect(agentRunEndpoints.filter({ hasText: 'POST' })).toBeVisible();
   const loadedRequestCount = docsRequests;
   await page.getByLabel('Language').selectOption('zh-CN');
   await expect(page.getByText('API 参考', { exact: true })).toBeVisible();
@@ -104,7 +109,7 @@ test('mobile sticky sidebar stays in document flow without covering docs content
   expect(sidebarBox).not.toBeNull();
   expect(mainBox).not.toBeNull();
   expect(mainBox!.y).toBeGreaterThanOrEqual(sidebarBox!.y + sidebarBox!.height - 1);
-  await expect(page.getByRole('heading', { name: 'Agent Hub API' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Agent Hub API', exact: true, level: 1 })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
   await page.screenshot({ path: 'test-results/api-docs-mobile.png', fullPage: true });
   expect(browser.errors).toEqual([]);
@@ -117,8 +122,10 @@ test('API Docs ignores an older retry that settles after a newer request', async
   let attempt = 0;
   let releaseOlderRetry!: () => void;
   let markOlderRetryStarted!: () => void;
+  let markOlderRetrySettled!: () => void;
   const olderRetryGate = new Promise<void>((resolve) => { releaseOlderRetry = resolve; });
   const olderRetryStarted = new Promise<void>((resolve) => { markOlderRetryStarted = resolve; });
+  const olderRetrySettled = new Promise<void>((resolve) => { markOlderRetrySettled = resolve; });
   await page.route('**/openapi.json', async (route) => {
     attempt += 1;
     if (attempt === 1) return route.fulfill({ status: 200, contentType: 'text/html', body: '<html>not json</html>' });
@@ -127,25 +134,30 @@ test('API Docs ignores an older retry that settles after a newer request', async
       await olderRetryGate;
       const stale = largeOpenApiDocument(2);
       stale.paths['/api/stale-generation'] = { get: { summary: 'Must not replace newer docs' } };
-      return route.fulfill({ json: stale });
+      await route.fulfill({ json: stale }).catch(() => undefined);
+      markOlderRetrySettled();
+      return;
     }
     return route.fulfill({ json: largeOpenApiDocument(4) });
   });
   await page.goto('/docs');
+  const endpointsSection = page.locator('.docs-section').filter({
+    has: page.getByRole('heading', { name: 'Endpoints', exact: true, level: 2 })
+  });
   await expect(page.getByRole('alert')).toContainText('Unable to load API documentation');
   await page.getByRole('button', { name: 'Retry' }).click();
   await olderRetryStarted;
   const loading = page.getByRole('status');
   await expect(loading).toContainText('Loading API documentation...');
-  await expect(page.locator('.docs-section').last()).toHaveAttribute('aria-busy', 'true');
+  await expect(endpointsSection).toHaveAttribute('aria-busy', 'true');
   await loading.getByRole('button', { name: 'Retry' }).click();
   await expect(page.getByText('/api/test/resources/3/{resource_id}', { exact: true })).toBeVisible();
   releaseOlderRetry();
-  await page.waitForTimeout(100);
+  await olderRetrySettled;
   await expect(page.getByText('/api/test/resources/3/{resource_id}', { exact: true })).toBeVisible();
   await expect(page.getByText('/api/stale-generation', { exact: true })).toHaveCount(0);
   await expect(page.getByText('Loading API documentation...')).toHaveCount(0);
-  await expect(page.locator('.docs-section').last()).toHaveAttribute('aria-busy', 'false');
+  await expect(endpointsSection).toHaveAttribute('aria-busy', 'false');
   await expect(page.getByRole('alert')).toHaveCount(0);
   expect(browser.errors).toEqual([]);
   expect(browser.serverErrors).toEqual([]);

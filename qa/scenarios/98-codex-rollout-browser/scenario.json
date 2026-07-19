@@ -1,0 +1,8 @@
+{
+  "name": "Codex rollout preserves an in-flight browser Session",
+  "type": "browser",
+  "timeout_ms": 300000,
+  "covers": [
+    "ROL-002"
+  ]
+}

@@ -10,7 +10,7 @@ import {
   UserX,
   Users
 } from 'lucide-react';
-import { FormEvent, KeyboardEvent, useEffect, useState } from 'react';
+import { FormEvent, KeyboardEvent, useEffect, useRef, useState } from 'react';
 import {
   api,
   type AdminUserDetail,
@@ -34,6 +34,12 @@ const emptyPolicy: AuthPolicy = {
 type AdministrationTab = 'authentication' | 'platforms' | 'users' | 'codex';
 type PlatformDialogState = { mode: 'create' } | { mode: 'edit'; platform: ExternalPlatform };
 type UserDialogState = { kind: 'details' | 'password' | 'erase'; detail: AdminUserDetail };
+
+const CODEX_ROLLOUT_POLL_INTERVAL_MS = 2_000;
+
+function isCodexRolloutPending(status: string) {
+  return status === 'downloading' || status === 'distributing';
+}
 
 function Feedback({ error, notice }: { error: boolean; notice: string }) {
   const { t } = useI18n();
@@ -495,6 +501,9 @@ function CodexVersionTab() {
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState(false);
   const [notice, setNotice] = useState('');
+  const [pollStartGeneration, setPollStartGeneration] = useState(0);
+  const rolloutGeneration = useRef(0);
+  const pollController = useRef<AbortController | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -505,8 +514,48 @@ function CodexVersionTab() {
       })
       .catch(() => { if (!controller.signal.aborted) setLoadError(true); })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
-    return () => controller.abort();
+    return () => {
+      rolloutGeneration.current += 1;
+      pollController.current?.abort();
+      controller.abort();
+    };
   }, []);
+
+  useEffect(() => {
+    if (!rollout || !isCodexRolloutPending(rollout.status)) return;
+    const generation = rolloutGeneration.current;
+    let active = true;
+    let timer: number | undefined;
+
+    const poll = async () => {
+      if (!active || generation !== rolloutGeneration.current) return;
+      const controller = new AbortController();
+      pollController.current = controller;
+      try {
+        const response = await api.codexVersionRollout(controller.signal);
+        if (!active || controller.signal.aborted || generation !== rolloutGeneration.current) return;
+        setActionError(false);
+        setRollout(response);
+        if (isCodexRolloutPending(response.status)) {
+          timer = window.setTimeout(poll, CODEX_ROLLOUT_POLL_INTERVAL_MS);
+        }
+      } catch {
+        if (active && !controller.signal.aborted && generation === rolloutGeneration.current) {
+          setActionError(true);
+          timer = window.setTimeout(poll, CODEX_ROLLOUT_POLL_INTERVAL_MS);
+        }
+      } finally {
+        if (pollController.current === controller) pollController.current = null;
+      }
+    };
+
+    timer = window.setTimeout(poll, CODEX_ROLLOUT_POLL_INTERVAL_MS);
+    return () => {
+      active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+      pollController.current?.abort();
+    };
+  }, [pollStartGeneration, rollout?.status, rollout?.target_version]);
 
   async function prepareVersion(event: FormEvent) {
     event.preventDefault();
@@ -515,14 +564,22 @@ function CodexVersionTab() {
     setBusy(true);
     setActionError(false);
     setNotice('');
+    const generation = rolloutGeneration.current + 1;
+    rolloutGeneration.current = generation;
+    pollController.current?.abort();
     try {
-      setRollout(await api.setCodexTargetVersion(version));
+      const response = await api.setCodexTargetVersion(version);
+      if (generation !== rolloutGeneration.current) return;
+      setRollout(response);
       setTargetVersion('');
       setNotice(t('codexVersionPrepared'));
     } catch {
-      setActionError(true);
+      if (generation === rolloutGeneration.current) setActionError(true);
     } finally {
-      setBusy(false);
+      if (generation === rolloutGeneration.current) {
+        setPollStartGeneration(generation);
+        setBusy(false);
+      }
     }
   }
 
@@ -531,13 +588,21 @@ function CodexVersionTab() {
     setBusy(true);
     setActionError(false);
     setNotice('');
+    const generation = rolloutGeneration.current + 1;
+    rolloutGeneration.current = generation;
+    pollController.current?.abort();
     try {
-      setRollout(await api.promoteCodexTargetVersion());
+      const response = await api.promoteCodexTargetVersion();
+      if (generation !== rolloutGeneration.current) return;
+      setRollout(response);
       setNotice(t('codexVersionPromoted'));
     } catch {
-      setActionError(true);
+      if (generation === rolloutGeneration.current) setActionError(true);
     } finally {
-      setBusy(false);
+      if (generation === rolloutGeneration.current) {
+        setPollStartGeneration(generation);
+        setBusy(false);
+      }
     }
   }
 

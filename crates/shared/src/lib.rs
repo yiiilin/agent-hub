@@ -1506,6 +1506,21 @@ pub struct RuntimeDrainResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeDeletionImpactDto {
+    pub runtime_id: Uuid,
+    pub hostname: String,
+    pub affected_sessions: Vec<RuntimeDeletionImpactSessionDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeDeletionImpactSessionDto {
+    pub session_id: Uuid,
+    pub agent_name: String,
+    pub lifecycle_status: String,
+    pub force_delete_disposition: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ForceDeleteRuntimeResponse {
     pub runtime_id: Uuid,
     pub recoverable_session_ids: Vec<Uuid>,
@@ -1585,6 +1600,38 @@ mod tests {
         let register_value = serde_json::to_value(register).unwrap();
         assert_eq!(register_value["capabilities"]["model_proxy"], true);
         assert!(register_value.get("direct_model_enabled").is_none());
+    }
+
+    #[test]
+    fn runtime_deletion_impact_contract_is_narrow_and_serializes_stably() {
+        let impact = RuntimeDeletionImpactDto {
+            runtime_id: Uuid::from_u128(1),
+            hostname: "runtime-1".into(),
+            affected_sessions: vec![RuntimeDeletionImpactSessionDto {
+                session_id: Uuid::from_u128(2),
+                agent_name: "Agent One".into(),
+                lifecycle_status: "online".into(),
+                force_delete_disposition: "recoverable".into(),
+            }],
+        };
+        let value = serde_json::to_value(&impact).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "runtime_id": Uuid::from_u128(1),
+                "hostname": "runtime-1",
+                "affected_sessions": [{
+                    "session_id": Uuid::from_u128(2),
+                    "agent_name": "Agent One",
+                    "lifecycle_status": "online",
+                    "force_delete_disposition": "recoverable"
+                }]
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<RuntimeDeletionImpactDto>(value).unwrap(),
+            impact
+        );
     }
 
     #[test]

@@ -1,0 +1,7 @@
+{
+  "name": "Identity and administration API lifecycle",
+  "type": "api",
+  "timeout_ms": 180000,
+  "covers": ["AUTH-001", "AUTH-002", "AUTH-003", "AUTH-004", "ADM-001", "ADM-002", "ADM-003", "ADM-004"],
+  "restores": ["auth_policy"]
+}

@@ -1,0 +1,6 @@
+{
+  "name": "Automation API and scheduler lifecycle",
+  "type": "api",
+  "timeout_ms": 240000,
+  "covers": ["AUT-001", "AUT-002", "AUT-003", "AUT-004", "AUT-005", "AUT-006"]
+}

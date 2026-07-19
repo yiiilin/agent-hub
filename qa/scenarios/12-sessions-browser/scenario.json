@@ -1,0 +1,12 @@
+{
+  "name": "Session steering, interruption, continuation, and historical browser workflows",
+  "type": "browser",
+  "timeout_ms": 180000,
+  "covers": [
+    "SES-004",
+    "SES-005",
+    "SES-006",
+    "SES-007",
+    "UI-SES-001"
+  ]
+}

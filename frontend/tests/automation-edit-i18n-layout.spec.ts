@@ -1,5 +1,65 @@
 import { expect, request, test } from '@playwright/test';
 
+type OwnedAgentFixture = {
+  agent: { id: string; name: string; owner_id: string; [key: string]: unknown };
+  modelConnectionId: string;
+};
+
+async function createOwnedAgentFixture(page: import('@playwright/test').Page, label: string): Promise<OwnedAgentFixture> {
+  const suffix = `${Date.now()}-${test.info().workerIndex}`;
+  const modelResponse = await page.request.post('/api/model-connections', { data: {
+    scope: 'personal',
+    name: `${label} model ${suffix}`,
+    base_url: 'http://fake-model-provider:8080',
+    model_id: 'hub-proxy-smoke',
+    api_key: 'dev-model-provider-api-key'
+  } });
+  expect(modelResponse.ok()).toBeTruthy();
+  const model = await modelResponse.json() as { id: string };
+  const agentResponse = await page.request.post('/api/agents', { data: {
+    name: `${label} agent ${suffix}`,
+    instructions: 'Own the Automation test fixtures.',
+    visibility: 'private',
+    public_to: [],
+    default_model_connection_id: model.id,
+    reasoning_effort: 'default',
+    codex_subagents: []
+  } });
+  expect(agentResponse.ok()).toBeTruthy();
+  return {
+    agent: await agentResponse.json() as OwnedAgentFixture['agent'],
+    modelConnectionId: model.id
+  };
+}
+
+async function cleanupOwnedAgentFixture(page: import('@playwright/test').Page, fixture: OwnedAgentFixture | null) {
+  if (!fixture) return;
+  const agentResponse = await page.request.delete(`/api/agents/${fixture.agent.id}`);
+  expect.soft([204, 404]).toContain(agentResponse.status());
+  const modelResponse = await page.request.delete(`/api/model-connections/${fixture.modelConnectionId}`);
+  expect.soft([204, 404]).toContain(modelResponse.status());
+}
+
+async function createAutomationFixture(
+  page: import('@playwright/test').Page,
+  agentId: string,
+  name: string,
+  triggerType: 'manual' | 'webhook' | 'interval' | 'cron',
+  schedule: string | null = null
+) {
+  const response = await page.request.post('/api/automations', { data: {
+    agent_id: agentId,
+    name,
+    trigger_type: triggerType,
+    prompt: `${name} prompt`,
+    schedule,
+    enabled: true
+  } });
+  const body = await response.text();
+  expect(response.ok(), `create automation failed: ${response.status()} ${body}`).toBeTruthy();
+  return JSON.parse(body) as { id: string };
+}
+
 function deferred() {
   let resolve!: () => void;
   const promise = new Promise<void>((done) => { resolve = done; });
@@ -110,6 +170,7 @@ test('automation history polling is serial and ignores a delayed previous select
   const automationB = '60000000-0000-4000-8000-000000000002';
   const pollStarted = deferred();
   const releasePoll = deferred();
+  const pollCompleted = deferred();
   let aRequests = 0;
   let aInFlight = 0;
   let maxAInFlight = 0;
@@ -124,14 +185,16 @@ test('automation history polling is serial and ignores a delayed previous select
     if (automationId === automationB) return route.fulfill({ json: { items: [], total: 0, page: 1, page_size: 20 } });
     aInFlight += 1;
     maxAInFlight = Math.max(maxAInFlight, aInFlight);
+    aRequests += 1;
+    const requestNumber = aRequests;
     try {
-      aRequests += 1;
-      if (aRequests === 2) {
+      if (requestNumber === 2) {
         pollStarted.resolve();
         await releasePoll.promise;
       }
-      return await route.fulfill({ json: { items: [automationRun(`70000000-0000-4000-8000-00000000000${aRequests}`, automationA, 'running', `A request ${aRequests}`)], total: 1, page: 1, page_size: 20 } });
+      return await route.fulfill({ json: { items: [automationRun(`70000000-0000-4000-8000-00000000000${requestNumber}`, automationA, 'running', `A request ${requestNumber}`)], total: 1, page: 1, page_size: 20 } });
     } finally {
+      if (requestNumber === 2) pollCompleted.resolve();
       aInFlight -= 1;
     }
   });
@@ -143,7 +206,7 @@ test('automation history polling is serial and ignores a delayed previous select
   await page.getByRole('button', { name: /^Polling B\b/ }).click();
   await expect(page.getByRole('region', { name: 'Run history' })).toContainText('No runs yet.');
   releasePoll.resolve();
-  await page.waitForTimeout(100);
+  await pollCompleted.promise;
   await expect(page.getByRole('region', { name: 'Run history' })).not.toContainText('A request 2');
   expect(maxAInFlight).toBe(1);
 });
@@ -263,7 +326,6 @@ test('canceling an edit restores form fields without clearing terminal history o
   await editDialog.getByRole('button', { name: 'Cancel', exact: true }).click();
   await expect(historyRow).toContainText('Discard history');
   await expect(page.getByRole('region', { name: 'Run events' })).toContainText('Discard console event');
-  await page.waitForTimeout(100);
   expect(historyRequests).toBe(1);
 });
 
@@ -345,6 +407,7 @@ test('a delayed B trigger does not close or replace the New automation draft', a
 test('edits automations, protects webhook tokens, and localizes the operations workspace', async ({ page, baseURL }) => {
   const browserErrors: string[] = [];
   const serverErrors: string[] = [];
+  let fixture: OwnedAgentFixture | null = null;
   await page.goto('/login');
   await page.getByLabel('Email').fill('admin@example.com');
   await page.getByLabel('Password').fill('admin123');
@@ -354,130 +417,181 @@ test('edits automations, protects webhook tokens, and localizes the operations w
   page.on('pageerror', (error) => browserErrors.push(error.message));
   page.on('response', (response) => { if (response.status() >= 500) serverErrors.push(`${response.status()} ${response.url()}`); });
 
-  const agents = await (await page.request.get('/api/agents')).json() as Array<{ id: string; owner_id: string }>;
-  const me = await (await page.request.get('/api/auth/me')).json() as { id: string };
-  const agent = agents.find((item) => item.owner_id === me.id);
-  expect(agent).toBeTruthy();
+  try {
+    fixture = await createOwnedAgentFixture(page, 'Automation workspace');
+    const suffix = Date.now();
+    const manualName = `Manual fixture ${suffix}`;
+    const webhookName = `Webhook fixture ${suffix}`;
+    const intervalName = `Interval fixture ${suffix}`;
+    const cronName = `Cron fixture ${suffix}`;
+    const webhook = await createAutomationFixture(page, fixture.agent.id, webhookName, 'webhook');
+    const interval = await createAutomationFixture(page, fixture.agent.id, intervalName, 'interval', '5m');
+    const cron = await createAutomationFixture(page, fixture.agent.id, cronName, 'cron', '0 9 * * 1');
 
-  const suffix = Date.now();
-  const createdResponse = await page.request.post('/api/automations', { data: {
-    agent_id: agent!.id,
-    name: `Editable ${suffix}`,
-    trigger_type: 'manual',
-    prompt: 'Original prompt',
-    schedule: null,
-    enabled: true
-  } });
-  expect(createdResponse.ok()).toBeTruthy();
-  const created = await createdResponse.json() as { id: string };
+    await page.goto('/automations');
+    const list = page.getByRole('region', { name: 'List' });
+    await expect(list).toBeVisible();
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await page.getByRole('button', { name: 'New automation' }).click();
+    const createDialog = page.getByRole('dialog', { name: 'Create Automation' });
+    await expect(createDialog).toBeVisible();
+    await expect(list).toBeVisible();
+    await createDialog.getByLabel('Agent').selectOption(fixture.agent.id);
+    await expect(createDialog.getByLabel('Agent')).toHaveValue(fixture.agent.id);
+    await createDialog.getByLabel('Name').fill(manualName);
+    await createDialog.getByRole('textbox', { name: 'Prompt' }).fill('Original prompt');
+    const createResponse = page.waitForResponse((response) => response.request().method() === 'POST'
+      && new URL(response.url()).pathname === '/api/automations');
+    await createDialog.getByRole('button', { name: 'Create automation' }).click();
+    const createdResponse = await createResponse;
+    expect(createdResponse.ok()).toBeTruthy();
+    const created = await createdResponse.json() as { id: string };
+    await expect(createDialog).toHaveCount(0);
+    await expect(page.getByText('Changes saved')).toBeVisible();
 
-  await page.goto('/automations');
-  await page.getByRole('button', { name: `Edit Automation Editable ${suffix}` }).click();
-  let editDialog = page.getByRole('dialog', { name: 'Edit Automation' });
-  await editDialog.getByLabel('Name').fill(`Edited ${suffix}`);
-  await editDialog.getByRole('textbox', { name: 'Prompt' }).fill('Edited prompt from browser');
-  await editDialog.getByLabel('Trigger').selectOption('interval');
-  await editDialog.getByLabel('Schedule').fill('5m');
-  await editDialog.getByLabel('Enabled').uncheck();
-  await editDialog.getByRole('button', { name: 'Save changes' }).click();
-  await expect(page.getByText('Changes saved')).toBeVisible();
-  await page.reload();
-  await page.getByRole('button', { name: `Edit Automation Edited ${suffix}` }).click();
-  editDialog = page.getByRole('dialog', { name: 'Edit Automation' });
-  await expect(editDialog.getByRole('textbox', { name: 'Prompt' })).toContainText('Edited prompt from browser');
-  await expect(editDialog.getByLabel('Schedule')).toHaveValue('5m');
-  await expect(editDialog.getByLabel('Enabled')).not.toBeChecked();
+    const manualRow = page.locator(`[data-automation-id="${created.id}"]`);
+    const webhookRow = page.locator(`[data-automation-id="${webhook.id}"]`);
+    const intervalRow = page.locator(`[data-automation-id="${interval.id}"]`);
+    const cronRow = page.locator(`[data-automation-id="${cron.id}"]`);
+    await expect(manualRow).toContainText('Manual');
+    await expect(webhookRow).toContainText('Webhook');
+    await expect(intervalRow).toContainText('Interval');
+    await expect(cronRow).toContainText('Cron');
+    await expect(manualRow.locator('.automation-trigger-config')).toContainText('None');
+    await expect(webhookRow.locator('.automation-trigger-config')).toContainText('/api/automations/webhook');
+    await expect(intervalRow.locator('.automation-trigger-config')).toContainText('5m');
+    await expect(cronRow.locator('.automation-trigger-config')).toContainText('0 9 * * 1');
+    await expect(manualRow.getByRole('button', { name: 'Run now' })).toBeVisible();
+    for (const row of [webhookRow, intervalRow, cronRow]) {
+      await expect(row.getByRole('button', { name: 'Run now' })).toHaveCount(0);
+    }
 
-  await editDialog.getByLabel('Enabled').check();
-  await editDialog.getByLabel('Trigger').selectOption('webhook');
-  await editDialog.getByRole('button', { name: 'Save changes' }).click();
-  const secretDialog = page.getByRole('dialog', { name: 'One-time webhook token' });
-  const token = await secretDialog.getByTestId('webhook-token').textContent();
-  expect(token).toMatch(/^ahw_/);
-  const listed = await (await page.request.get('/api/automations')).json() as Array<{ id: string; webhook_token: string | null }>;
-  expect(listed.find((item) => item.id === created.id)?.webhook_token).toBeNull();
-  await secretDialog.locator('.modal-actions').getByRole('button', { name: 'Close', exact: true }).click();
-  await page.getByRole('button', { name: `Edit Automation Edited ${suffix}` }).click();
-  await page.getByRole('dialog', { name: 'Edit Automation' }).getByRole('button', { name: 'Save changes' }).click();
-  await expect(page.getByTestId('webhook-token')).toHaveCount(0);
-  const anonymous = await request.newContext({ baseURL });
-  expect((await anonymous.post('/api/automations/webhook', {
-    headers: { 'X-Agent-Hub-Webhook-Token': token! }, data: {}
-  })).ok()).toBeTruthy();
+    await page.setViewportSize({ width: 1440, height: 960 });
+    const rowMeasurements = await Promise.all([manualRow, webhookRow, intervalRow, cronRow].map(async (row) => {
+      const box = await row.boundingBox();
+      expect(box).not.toBeNull();
+      return box!;
+    }));
+    expect(Math.max(...rowMeasurements.map((box) => box.height)) - Math.min(...rowMeasurements.map((box) => box.height))).toBeLessThanOrEqual(1);
+    expect(Math.max(...rowMeasurements.map((box) => box.width)) - Math.min(...rowMeasurements.map((box) => box.width))).toBeLessThanOrEqual(1);
 
-  const foreign = await request.newContext({ baseURL });
-  const oidc = await foreign.get(`/api/auth/oidc/mock/start?email=foreign-${suffix}%40example.com&sub=foreign-${suffix}`);
-  expect(oidc.ok()).toBeTruthy();
-  const foreignUpdate = await foreign.patch(`/api/automations/${created.id}`, { data: {
-    name: 'Foreign', trigger_type: 'manual', prompt: 'Foreign', schedule: null, enabled: true
-  } });
-  expect(foreignUpdate.status()).toBe(404);
-  await foreign.dispose();
-  await anonymous.dispose();
+    await manualRow.getByRole('button', { name: `Edit Automation ${manualName}` }).click();
+    let editDialog = page.getByRole('dialog', { name: 'Edit Automation' });
+    await expect(editDialog.getByLabel('Agent')).toBeDisabled();
+    await editDialog.getByLabel('Name').fill(`Edited ${suffix}`);
+    await editDialog.getByRole('textbox', { name: 'Prompt' }).fill('Edited prompt from browser');
+    await editDialog.getByLabel('Trigger').selectOption('interval');
+    await editDialog.getByLabel('Schedule').fill('15m');
+    await editDialog.getByLabel('Enabled').uncheck();
+    await editDialog.getByRole('button', { name: 'Save changes' }).click();
+    await expect(page.getByText('Changes saved')).toBeVisible();
+    await page.reload();
+    await page.getByRole('button', { name: `Edit Automation Edited ${suffix}` }).click();
+    editDialog = page.getByRole('dialog', { name: 'Edit Automation' });
+    await expect(editDialog.getByRole('textbox', { name: 'Prompt' })).toContainText('Edited prompt from browser');
+    await expect(editDialog.getByLabel('Schedule')).toHaveValue('15m');
+    await expect(editDialog.getByLabel('Enabled')).not.toBeChecked();
 
-  let languageSwitchLoads = 0;
-  await page.route('**/api/automations', async (route) => {
-    if (route.request().method() === 'GET') languageSwitchLoads += 1;
-    await route.continue();
-  });
-  await page.getByLabel('Language').selectOption('zh-CN');
-  await expect(page.getByRole('heading', { name: '自动化', exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'API 密钥' })).toBeVisible();
-  await expect(page.getByText('更改已保存', { exact: true })).toBeVisible();
-  await page.waitForTimeout(100);
-  expect(languageSwitchLoads).toBe(0);
-  await page.unroute('**/api/automations');
-  await page.reload();
-  await expect(page.getByLabel('语言')).toHaveValue('zh-CN');
-  await page.getByLabel('语言').selectOption('en');
-  await expect(page.getByRole('heading', { name: 'Automations' })).toBeVisible();
+    await editDialog.getByLabel('Enabled').check();
+    await editDialog.getByLabel('Trigger').selectOption('webhook');
+    await editDialog.getByRole('button', { name: 'Save changes' }).click();
+    const secretDialog = page.getByRole('dialog', { name: 'One-time webhook token' });
+    const token = await secretDialog.getByTestId('webhook-token').textContent();
+    expect(token).toMatch(/^ahw_/);
+    const listed = await (await page.request.get('/api/automations')).json() as Array<{ id: string; webhook_token: string | null }>;
+    expect(listed.find((item) => item.id === created.id)?.webhook_token).toBeNull();
+    await secretDialog.locator('.modal-actions').getByRole('button', { name: 'Close', exact: true }).click();
+    await page.getByRole('button', { name: `Edit Automation Edited ${suffix}` }).click();
+    await page.getByRole('dialog', { name: 'Edit Automation' }).getByRole('button', { name: 'Save changes' }).click();
+    await expect(page.getByTestId('webhook-token')).toHaveCount(0);
+    const anonymous = await request.newContext({ baseURL });
+    try {
+      expect((await anonymous.post('/api/automations/webhook', {
+        headers: { 'X-Agent-Hub-Webhook-Token': token! }, data: {}
+      })).ok()).toBeTruthy();
+    } finally {
+      await anonymous.dispose();
+    }
 
-  await page.setViewportSize({ width: 1440, height: 960 });
-  await page.screenshot({ path: 'test-results/automation-workspace-1440.png', fullPage: true });
-  await page.setViewportSize({ width: 1280, height: 800 });
-  await page.screenshot({ path: 'test-results/automation-workspace-1280.png', fullPage: true });
-  await page.setViewportSize({ width: 390, height: 844 });
-  await expect(page.getByLabel('Language')).toBeVisible();
-  const overflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
-  expect(overflow).toBe(false);
-  await page.screenshot({ path: 'test-results/automation-workspace-mobile.png', fullPage: true });
-  expect(browserErrors).toEqual([]);
-  expect(serverErrors).toEqual([]);
+    const foreign = await request.newContext({ baseURL });
+    try {
+      const oidc = await foreign.get(`/api/auth/oidc/mock/start?email=foreign-${suffix}%40example.com&sub=foreign-${suffix}`);
+      expect(oidc.ok()).toBeTruthy();
+      const foreignUpdate = await foreign.patch(`/api/automations/${created.id}`, { data: {
+        name: 'Foreign', trigger_type: 'manual', prompt: 'Foreign', schedule: null, enabled: true
+      } });
+      expect(foreignUpdate.status()).toBe(404);
+    } finally {
+      await foreign.dispose();
+    }
+
+    let languageSwitchLoads = 0;
+    await page.route('**/api/automations', async (route) => {
+      if (route.request().method() === 'GET') languageSwitchLoads += 1;
+      await route.continue();
+    });
+    await page.getByLabel('Language').selectOption('zh-CN');
+    await expect(page.getByRole('heading', { name: '自动化', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'API 密钥' })).toBeVisible();
+    await expect(page.getByText('更改已保存', { exact: true })).toBeVisible();
+    await expect(intervalRow).toContainText('间隔');
+    await expect(cronRow.locator('.automation-trigger-config')).toContainText('0 9 * * 1');
+    expect(languageSwitchLoads).toBe(0);
+    await page.unroute('**/api/automations');
+    await page.reload();
+    await expect(page.getByLabel('语言')).toHaveValue('zh-CN');
+    await page.getByLabel('语言').selectOption('en');
+    await expect(page.getByRole('heading', { name: 'Automations' })).toBeVisible();
+
+    await page.screenshot({ path: 'test-results/automation-workspace-1440.png', fullPage: true });
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await page.screenshot({ path: 'test-results/automation-workspace-1280.png', fullPage: true });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(page.getByLabel('Language')).toBeVisible();
+    const overflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
+    expect(overflow).toBe(false);
+    await page.screenshot({ path: 'test-results/automation-workspace-mobile.png', fullPage: true });
+    expect(browserErrors).toEqual([]);
+    expect(serverErrors).toEqual([]);
+  } finally {
+    await cleanupOwnedAgentFixture(page, fixture);
+  }
 });
 
 test('automation edit dialog serializes submission until a delayed PATCH completes', async ({ page }) => {
-  await page.request.post('/api/auth/login', { data: { email: 'admin@example.com', password: 'admin123' } });
-  const me = await (await page.request.get('/api/auth/me')).json() as { id: string };
-  const agents = await (await page.request.get('/api/agents')).json() as Array<{ id: string; owner_id: string }>;
-  const agent = agents.find((item) => item.owner_id === me.id)!;
-  const suffix = Date.now();
-  const created = await (await page.request.post('/api/automations', { data: {
-    agent_id: agent.id, name: `Delayed edit ${suffix}`, trigger_type: 'manual', prompt: 'Before', schedule: null, enabled: true
-  } })).json() as { id: string };
-  await page.request.post('/api/automations', { data: {
-    agent_id: agent.id, name: `Other automation ${suffix}`, trigger_type: 'manual', prompt: 'Other', schedule: null, enabled: true
-  } });
+  const login = await page.request.post('/api/auth/login', { data: { email: 'admin@example.com', password: 'admin123' } });
+  expect(login.ok()).toBeTruthy();
   const gate = deferred();
+  let fixture: OwnedAgentFixture | null = null;
   let patchRequests = 0;
-  await page.route(`**/api/automations/${created.id}`, async (route) => {
-    if (route.request().method() !== 'PATCH') return route.continue();
-    patchRequests += 1;
-    await gate.promise;
-    await route.continue();
-  });
-  await page.goto('/automations');
-  await page.getByRole('button', { name: `Edit Automation Delayed edit ${suffix}` }).click();
-  const editDialog = page.getByRole('dialog', { name: 'Edit Automation' });
-  await editDialog.getByLabel('Name').fill(`Saved delayed ${suffix}`);
-  await editDialog.getByRole('button', { name: 'Save changes' }).dblclick();
-  await expect.poll(() => patchRequests).toBe(1);
-  await expect(editDialog).toHaveAttribute('aria-busy', 'true');
-  await expect(editDialog.getByLabel('Name')).toBeDisabled();
-  await expect(editDialog.getByRole('button', { name: 'Cancel', exact: true })).toBeDisabled();
-  await expect(editDialog.getByLabel('Name')).toHaveValue(`Saved delayed ${suffix}`);
-  gate.resolve();
-  await expect(page.getByText('Changes saved')).toBeVisible();
-  await expect(editDialog).toHaveCount(0);
+  try {
+    fixture = await createOwnedAgentFixture(page, 'Delayed edit');
+    const suffix = Date.now();
+    const created = await createAutomationFixture(page, fixture.agent.id, `Delayed edit ${suffix}`, 'manual');
+    await createAutomationFixture(page, fixture.agent.id, `Other automation ${suffix}`, 'manual');
+    await page.route(`**/api/automations/${created.id}`, async (route) => {
+      if (route.request().method() !== 'PATCH') return route.continue();
+      patchRequests += 1;
+      await gate.promise;
+      await route.continue();
+    });
+    await page.goto('/automations');
+    await page.getByRole('button', { name: `Edit Automation Delayed edit ${suffix}` }).click();
+    const editDialog = page.getByRole('dialog', { name: 'Edit Automation' });
+    await editDialog.getByLabel('Name').fill(`Saved delayed ${suffix}`);
+    await editDialog.getByRole('button', { name: 'Save changes' }).dblclick();
+    await expect.poll(() => patchRequests).toBe(1);
+    await expect(editDialog).toHaveAttribute('aria-busy', 'true');
+    await expect(editDialog.getByLabel('Name')).toBeDisabled();
+    await expect(editDialog.getByRole('button', { name: 'Cancel', exact: true })).toBeDisabled();
+    await expect(editDialog.getByLabel('Name')).toHaveValue(`Saved delayed ${suffix}`);
+    gate.resolve();
+    await expect(page.getByText('Changes saved')).toBeVisible();
+    await expect(editDialog).toHaveCount(0);
+  } finally {
+    gate.resolve();
+    await cleanupOwnedAgentFixture(page, fixture);
+  }
 });
 
 test('storage failures do not prevent language switching and unknown triggers have a fallback', async ({ page }) => {
@@ -485,42 +599,56 @@ test('storage failures do not prevent language switching and unknown triggers ha
     Object.defineProperty(Storage.prototype, 'getItem', { configurable: true, value: () => { throw new DOMException('blocked', 'SecurityError'); } });
     Object.defineProperty(Storage.prototype, 'setItem', { configurable: true, value: () => { throw new DOMException('blocked', 'SecurityError'); } });
   });
-  await page.request.post('/api/auth/login', { data: { email: 'admin@example.com', password: 'admin123' } });
-  await page.route('**/api/automations', async (route) => {
-    if (route.request().method() !== 'GET') return route.continue();
-    const response = await route.fetch();
-    const body = await response.json() as Array<Record<string, unknown>>;
-    await route.fulfill({ response, json: body.length ? [{ ...body[0], trigger_type: 'future-trigger' }, ...body.slice(1)] : [] });
-  });
-  await page.goto('/automations');
-  await expect(page.getByLabel('Language')).toBeVisible();
-  await page.getByLabel('Language').selectOption('zh-CN');
-  await expect(page.getByRole('heading', { name: '自动化', exact: true })).toBeVisible();
-  await expect(page.getByText('未知触发方式').first()).toBeVisible();
-  await expect(page.locator('html')).toHaveAttribute('lang', 'zh-CN');
+  const login = await page.request.post('/api/auth/login', { data: { email: 'admin@example.com', password: 'admin123' } });
+  expect(login.ok()).toBeTruthy();
+  let fixture: OwnedAgentFixture | null = null;
+  try {
+    fixture = await createOwnedAgentFixture(page, 'Unknown trigger');
+    const automation = await createAutomationFixture(page, fixture.agent.id, `Unknown trigger ${Date.now()}`, 'manual');
+    await page.route('**/api/automations', async (route) => {
+      if (route.request().method() !== 'GET') return route.continue();
+      const response = await route.fetch();
+      const body = await response.json() as Array<Record<string, unknown>>;
+      await route.fulfill({ response, json: body.map((item) => item.id === automation.id
+        ? { ...item, trigger_type: 'future-trigger' }
+        : item) });
+    });
+    await page.goto('/automations');
+    await expect(page.getByLabel('Language')).toBeVisible();
+    await page.getByLabel('Language').selectOption('zh-CN');
+    await expect(page.getByRole('heading', { name: '自动化', exact: true })).toBeVisible();
+    await expect(page.locator(`[data-automation-id="${automation.id}"]`)).toContainText('未知触发方式');
+    await expect(page.locator('html')).toHaveAttribute('lang', 'zh-CN');
+  } finally {
+    await cleanupOwnedAgentFixture(page, fixture);
+  }
 });
 
 test('agent visibility uses localized labels and a visible fallback', async ({ page }) => {
-  await page.request.post('/api/auth/login', { data: { email: 'admin@example.com', password: 'admin123' } });
-  await page.route('**/api/agents', async (route) => {
-    if (route.request().method() !== 'GET') return route.continue();
-    const response = await route.fetch();
-    const body = await response.json() as Array<Record<string, unknown>>;
-    expect(body.length).toBeGreaterThan(0);
-    await route.fulfill({ response, json: [
-      { ...body[0], id: 'localized-private-agent', name: 'Localized known agent', visibility: 'private' },
-      { ...body[0], id: 'localized-unknown-agent', name: 'Localized unknown agent', visibility: 'future_visibility' }
-    ] });
-  });
+  const login = await page.request.post('/api/auth/login', { data: { email: 'admin@example.com', password: 'admin123' } });
+  expect(login.ok()).toBeTruthy();
+  let fixture: OwnedAgentFixture | null = null;
+  try {
+    fixture = await createOwnedAgentFixture(page, 'Localized visibility');
+    await page.route('**/api/agents', async (route) => {
+      if (route.request().method() !== 'GET') return route.continue();
+      await route.fulfill({ json: [
+        { ...fixture!.agent, id: 'localized-private-agent', name: 'Localized known agent', visibility: 'private' },
+        { ...fixture!.agent, id: 'localized-unknown-agent', name: 'Localized unknown agent', visibility: 'future_visibility' }
+      ] });
+    });
 
-  await page.goto('/agents');
-  await page.getByLabel('Language').selectOption('zh-CN');
-  const knownAgentRow = page.locator('[data-agent-id="localized-private-agent"]');
-  const unknownAgentRow = page.locator('[data-agent-id="localized-unknown-agent"]');
-  await expect(knownAgentRow).toContainText('私有');
-  await expect(unknownAgentRow).toContainText('未知可见范围');
-  await expect(knownAgentRow).not.toContainText('private');
-  await expect(unknownAgentRow).not.toContainText('future_visibility');
+    await page.goto('/agents');
+    await page.getByLabel('Language').selectOption('zh-CN');
+    const knownAgentRow = page.locator('[data-agent-id="localized-private-agent"]');
+    const unknownAgentRow = page.locator('[data-agent-id="localized-unknown-agent"]');
+    await expect(knownAgentRow).toContainText('私有');
+    await expect(unknownAgentRow).toContainText('未知可见范围');
+    await expect(knownAgentRow).not.toContainText('private');
+    await expect(unknownAgentRow).not.toContainText('future_visibility');
+  } finally {
+    await cleanupOwnedAgentFixture(page, fixture);
+  }
 });
 
 test('login and automation status messages retranslate after language changes', async ({ page }) => {
@@ -536,57 +664,59 @@ test('login and automation status messages retranslate after language changes', 
   await expect(page).toHaveURL(/\/sessions$/);
   await page.getByLabel('语言').selectOption('en');
 
-  const me = await (await page.request.get('/api/auth/me')).json() as { id: string };
-  const agents = await (await page.request.get('/api/agents')).json() as Array<{ id: string; owner_id: string }>;
-  const agent = agents.find((item) => item.owner_id === me.id)!;
-  const suffix = Date.now();
-  const automation = await (await page.request.post('/api/automations', { data: {
-    agent_id: agent.id, name: `Localized status ${suffix}`, trigger_type: 'manual', prompt: 'Status test', schedule: null, enabled: true
-  } })).json() as { id: string };
+  let fixture: OwnedAgentFixture | null = null;
+  try {
+    fixture = await createOwnedAgentFixture(page, 'Localized status');
+    const suffix = Date.now();
+    const automation = await createAutomationFixture(page, fixture.agent.id, `Localized status ${suffix}`, 'manual');
 
-  let failLoad = true;
-  await page.route('**/api/automations', async (route) => {
-    if (route.request().method() === 'GET' && failLoad) return route.fulfill({ status: 503, json: { error: 'private load detail' } });
-    await route.continue();
-  });
-  await page.goto('/automations');
-  await expect(page.getByRole('alert')).toContainText('Unable to load automations. Retry.');
-  await page.getByLabel('Language').selectOption('zh-CN');
-  await expect(page.getByRole('alert')).toContainText('无法加载自动化，请重试。');
-  failLoad = false;
-  await page.getByRole('button', { name: '重试', exact: true }).click();
-  await page.getByRole('button', { name: `Localized status ${suffix}` }).click();
-  await page.getByLabel('语言').selectOption('en');
+    let failLoad = true;
+    await page.route('**/api/automations', async (route) => {
+      if (route.request().method() === 'GET' && failLoad) return route.fulfill({ status: 503, json: { error: 'private load detail' } });
+      await route.continue();
+    });
+    await page.goto('/automations');
+    await expect(page.getByRole('alert')).toContainText('Unable to load automations. Retry.');
+    await page.getByLabel('Language').selectOption('zh-CN');
+    await expect(page.getByRole('alert')).toContainText('无法加载自动化，请重试。');
+    failLoad = false;
+    await page.getByRole('button', { name: '重试', exact: true }).click();
+    await page.locator(`[data-automation-id="${automation.id}"]`).locator('button.automation-select').click();
+    await page.getByLabel('语言').selectOption('en');
 
-  await page.route(`**/api/automations/${automation.id}`, async (route) => {
-    if (route.request().method() === 'PATCH') return route.fulfill({ status: 500, json: { error: 'private save detail' } });
-    await route.continue();
-  });
-  await page.getByRole('button', { name: 'Edit Automation', exact: true }).click();
-  const editDialog = page.getByRole('dialog', { name: 'Edit Automation' });
-  await editDialog.getByRole('button', { name: 'Save changes' }).click();
-  await expect(editDialog.getByRole('alert')).toContainText('Unable to save automation. Check the fields and retry.');
-  await page.getByLabel('Language').selectOption('zh-CN', { force: true });
-  await expect(editDialog.getByRole('alert')).toContainText('无法保存自动化，请检查字段后重试。');
-  await page.unroute(`**/api/automations/${automation.id}`);
-  await page.getByLabel('语言').selectOption('en', { force: true });
-  await editDialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await page.route(`**/api/automations/${automation.id}`, async (route) => {
+      if (route.request().method() === 'PATCH') return route.fulfill({ status: 500, json: { error: 'private save detail' } });
+      await route.continue();
+    });
+    await page.getByRole('button', { name: 'Edit Automation', exact: true }).click();
+    const editDialog = page.locator('.automation-form-dialog');
+    await editDialog.getByRole('button', { name: 'Save changes' }).click();
+    await expect(editDialog.getByRole('alert')).toContainText('Unable to save automation. Check the fields and retry.');
+    await page.getByLabel('Language').selectOption('zh-CN', { force: true });
+    await expect(editDialog.getByRole('alert')).toContainText('无法保存自动化，请检查字段后重试。');
+    await page.unroute(`**/api/automations/${automation.id}`);
+    await page.getByLabel('语言').selectOption('en', { force: true });
+    await editDialog.getByRole('button', { name: 'Cancel', exact: true }).click();
 
-  await page.route(`**/api/automations/${automation.id}/trigger`, (route) => route.fulfill({ status: 500, json: { error: 'private run detail' } }));
-  await page.locator('.automation-list-row').filter({ hasText: `Localized status ${suffix}` }).getByRole('button', { name: 'Run now' }).click();
-  await expect(page.getByRole('alert')).toContainText('Unable to run automation. Retry.');
-  await page.getByLabel('Language').selectOption('zh-CN');
-  await expect(page.getByRole('alert')).toContainText('无法运行自动化，请重试。');
+    await page.route(`**/api/automations/${automation.id}/trigger`, (route) => route.fulfill({ status: 500, json: { error: 'private run detail' } }));
+    await page.locator(`[data-automation-id="${automation.id}"]`).getByRole('button', { name: 'Run now' }).click();
+    await expect(page.getByRole('alert')).toContainText('Unable to run automation. Retry.');
+    await page.getByLabel('Language').selectOption('zh-CN');
+    await expect(page.getByRole('alert')).toContainText('无法运行自动化，请重试。');
+  } finally {
+    await cleanupOwnedAgentFixture(page, fixture);
+  }
 });
 
 test('agent load errors and creation defaults are localized on first entry', async ({ page }) => {
-  await page.request.post('/api/auth/login', { data: { email: 'admin@example.com', password: 'admin123' } });
-  const me = await (await page.request.get('/api/auth/me')).json() as { id: string };
-  const agents = await (await page.request.get('/api/agents')).json() as Array<{ id: string; owner_id: string }>;
-  const ownedAgent = agents.find((agent) => agent.owner_id === me.id)!;
-  expect(ownedAgent).toBeTruthy();
-  await page.route(`**/api/agents/${ownedAgent.id}`, (route) => route.fulfill({ status: 500, json: { error: 'private agent detail' } }));
-  await page.goto(`/agents/${ownedAgent.id}`);
+  const login = await page.request.post('/api/auth/login', { data: { email: 'admin@example.com', password: 'admin123' } });
+  expect(login.ok()).toBeTruthy();
+  let fixture: OwnedAgentFixture | null = null;
+  try {
+    fixture = await createOwnedAgentFixture(page, 'Localized defaults');
+    const ownedAgent = fixture.agent;
+    await page.route(`**/api/agents/${ownedAgent.id}`, (route) => route.fulfill({ status: 500, json: { error: 'private agent detail' } }));
+    await page.goto(`/agents/${ownedAgent.id}`);
   await expect(page.getByText('Unable to load agent. Try again.', { exact: true })).toBeVisible();
   await page.getByLabel('Language').selectOption('zh-CN');
   await expect(page.getByText('无法加载智能体，请重试。', { exact: true })).toBeVisible();
@@ -647,7 +777,10 @@ test('agent load errors and creation defaults are localized on first entry', asy
   await expect(page.getByRole('dialog', { name: 'Create Integration App' }).getByRole('textbox', { name: 'Name', exact: true })).toHaveValue('用户自定义集成应用');
   await page.getByRole('dialog', { name: 'Create Integration App' }).getByRole('button', { name: 'Close', exact: true }).click();
 
-  await page.getByLabel('Language').selectOption('zh-CN');
-  await page.goto('/widget');
-  await expect(page.locator('.widget-form textarea')).toHaveValue('来自嵌入式组件的问候。');
+    await page.getByLabel('Language').selectOption('zh-CN');
+    await page.goto('/widget');
+    await expect(page.locator('.widget-form textarea')).toHaveValue('来自嵌入式组件的问候。');
+  } finally {
+    await cleanupOwnedAgentFixture(page, fixture);
+  }
 });

@@ -17,7 +17,7 @@ function session(id: string, agentId: string, agentName: string, origin: 'hub_na
       : { kind: 'external', platform_id: 'platform-one', tenant_id: 'tenant-one', external_identity_id: 'identity-one' },
     lifecycle_status: 'online',
     native_thread_id: `thread-${id}`,
-    active_turn_id: null,
+    active_turn_id: null as string | null,
     history_checkpoint: 2,
     configuration_fingerprint: null,
     runtime_owner_id: 'runtime-one',
@@ -59,6 +59,12 @@ async function installSessionApi(page: Page) {
     native_thread_id: null,
     runtime_owner_id: null
   });
+  let created = session('new-session', newAgentId, 'New Agent', 'hub_native', {
+    lifecycle_status: 'waiting_for_runtime',
+    active_turn_id: null,
+    updated_at: '2026-07-17T11:00:00.000Z'
+  });
+  let newSessionStreamCount = 0;
   let sessions = [active, external, historical];
   const messages: Record<string, Array<Record<string, unknown>>> = {
     active: [
@@ -93,7 +99,6 @@ async function installSessionApi(page: Page) {
     if (path === '/api/sessions' && request.method() === 'GET') return route.fulfill({ json: sessions });
     if (path === `/api/agents/${newAgentId}/runs` && request.method() === 'POST') {
       createBody = request.postDataJSON() as Record<string, unknown>;
-      const created = session('new-session', newAgentId, 'New Agent', 'hub_native', { lifecycle_status: 'waiting_for_runtime', active_turn_id: 'turn-new', updated_at: '2026-07-17T11:00:00.000Z' });
       sessions = [created, ...sessions];
       messages['new-session'] = [message('new-session', 1, 'user', String(createBody.message), { run_id: 'run-new', delivery_state: 'queued' })];
       return route.fulfill({ json: {
@@ -101,6 +106,9 @@ async function installSessionApi(page: Page) {
         hub_turn_id: 'turn-new', session_ownership_generation: 0, parent_run_id: null, runtime_id: null, status: 'pending', initial_message: createBody.message,
         session_id: null, work_dir_ref: null, source: 'console', created_at: now, updated_at: now
       } });
+    }
+    if (path === '/api/sessions/new-session' && request.method() === 'GET') {
+      return route.fulfill({ json: created });
     }
     const messageMatch = path.match(/^\/api\/sessions\/([^/]+)\/messages$/);
     if (messageMatch && request.method() === 'GET') return route.fulfill({ json: messages[messageMatch[1]] ?? [] });
@@ -112,6 +120,17 @@ async function installSessionApi(page: Page) {
     }
     const streamMatch = path.match(/^\/api\/runs\/([^/]+)\/events\/stream$/);
     if (streamMatch) {
+      if (streamMatch[1] === 'run-new') {
+        newSessionStreamCount += 1;
+        if (newSessionStreamCount === 1) {
+          created = { ...created, lifecycle_status: 'online', active_turn_id: 'turn-new' };
+          const turnStarted = { seq: 1, run_id: 'run-new', event_type: 'turn_started', role: null, content: null, payload: { native_turn_id: 'native-turn-new' }, created_at: now };
+          return route.fulfill({ contentType: 'text/event-stream', body: `event: run_event\ndata: ${JSON.stringify(turnStarted)}\n\n` });
+        }
+        created = { ...created, active_turn_id: null };
+        const completed = { seq: 2, run_id: 'run-new', event_type: 'status', role: null, content: 'completed', payload: { status: 'completed' }, created_at: now };
+        return route.fulfill({ contentType: 'text/event-stream', body: `event: run_event\ndata: ${JSON.stringify(completed)}\n\n` });
+      }
       if (streamMatch[1] !== 'run-active') return route.fulfill({ contentType: 'text/event-stream', body: '' });
       const liveMessage = { seq: 3, run_id: 'run-active', event_type: 'message', role: 'assistant', content: 'Live assistant response.', payload: {}, created_at: '2026-07-17T10:00:05.000Z' };
       const liveTool = { seq: 4, run_id: 'run-active', event_type: 'tool_request', role: null, content: null, payload: { tool_name: 'shell' }, created_at: '2026-07-17T10:00:06.000Z' };
@@ -155,6 +174,70 @@ test('Session list filters by source and starts a conversation with an Agent cho
   expect(fixture.createBody()).toEqual({ message: 'Start a focused review.', hub_session_id: null, parent_run_id: null });
   await expect(page.getByRole('region', { name: 'Session details' })).toContainText('New Agent');
   await expect(page.getByText('Start a focused review.', { exact: true })).toBeVisible();
+});
+
+test('new conversation follows SSE active and terminal Session state without reload', async ({ page }) => {
+  await installSessionApi(page);
+  await page.goto('/sessions');
+
+  await page.getByRole('button', { name: 'New conversation' }).click();
+  const dialog = page.getByRole('dialog', { name: 'New conversation' });
+  await dialog.getByRole('combobox', { name: 'Agent' }).selectOption(newAgentId);
+  await dialog.getByRole('textbox', { name: 'Initial message' }).fill('Hold this conversation.');
+  await dialog.getByRole('button', { name: 'Start conversation' }).click();
+
+  const detail = page.getByRole('region', { name: 'Session details' });
+  await expect(detail.getByRole('heading', { name: 'New Agent' })).toBeVisible();
+  await expect(detail.getByText('Hold this conversation.', { exact: true })).toBeVisible();
+  await expect(detail.getByRole('button', { name: 'Stop current run' })).toBeVisible();
+  await expect(detail.getByText('Guiding the current turn.', { exact: true })).toBeVisible();
+  await expect(detail.getByRole('textbox', { name: 'Message' })).toHaveAttribute('placeholder', 'Guide the active turn...');
+
+  await page.getByRole('button', { name: /External Agent/ }).click();
+  await page.getByRole('button', { name: /New Agent/ }).click();
+
+  await expect(detail.getByRole('button', { name: 'Stop current run' })).toHaveCount(0);
+  await expect(detail.getByText('Guiding the current turn.', { exact: true })).toHaveCount(0);
+  await expect(detail.getByRole('textbox', { name: 'Message' })).toHaveAttribute('placeholder', 'Message the agent...');
+});
+
+test('switching Sessions does not leak the previous transcript or Run stream while messages load', async ({ page }) => {
+  await installSessionApi(page);
+  let releaseExternalMessages = () => {};
+  const externalMessagesGate = new Promise<void>((resolve) => { releaseExternalMessages = resolve; });
+  let markExternalMessagesRequested = () => {};
+  const externalMessagesRequested = new Promise<void>((resolve) => { markExternalMessagesRequested = resolve; });
+  const streamedRunIds: string[] = [];
+  page.on('request', (request) => {
+    const match = new URL(request.url()).pathname.match(/^\/api\/runs\/([^/]+)\/events\/stream$/);
+    if (match) streamedRunIds.push(match[1]);
+  });
+  await page.route('**/api/sessions/external/messages', async (route) => {
+    markExternalMessagesRequested();
+    await externalMessagesGate;
+    await route.fallback();
+  });
+  await page.goto('/sessions');
+
+  const detail = page.getByRole('region', { name: 'Session details' });
+  await expect(detail.getByText('Inspect the deployment.', { exact: true })).toBeVisible();
+  await expect(detail.locator('.session-technical-events')).toBeVisible();
+  const oldStreamCount = streamedRunIds.filter((runId) => runId === 'run-active').length;
+
+  await page.getByRole('button', { name: /External Agent/ }).click();
+  await externalMessagesRequested;
+  await page.evaluate(() => new Promise((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  }));
+  try {
+    await expect(detail.getByRole('heading', { name: 'External Agent' })).toBeVisible();
+    await expect(detail.getByText('Inspect the deployment.', { exact: true })).toHaveCount(0);
+    await expect(detail.locator('.session-technical-events')).toHaveCount(0);
+    expect(streamedRunIds.filter((runId) => runId === 'run-active')).toHaveLength(oldStreamCount);
+  } finally {
+    releaseExternalMessages();
+  }
+  await expect(detail.getByText('External request', { exact: true })).toBeVisible();
 });
 
 test('conversation streams replies, folds technical events, steers, stops, and keeps history read-only', async ({ page }) => {

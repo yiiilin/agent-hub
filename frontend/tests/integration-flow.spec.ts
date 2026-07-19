@@ -191,7 +191,9 @@ type AgentConfiguration = {
   visibility: string;
   public_to: string[];
   runtime_id: string | null;
-  model_policy: Record<string, unknown>;
+  default_model_connection_id: string | null;
+  reasoning_effort: string;
+  codex_subagents: unknown[];
   sandbox_policy: Record<string, unknown>;
   managed_skill_ids: string[];
   mcp_allowlist: unknown[];
@@ -208,7 +210,9 @@ async function setAgentRuntime(api: APIRequestContext, agentId: string, runtimeI
       visibility: current.visibility,
       public_to: current.public_to,
       runtime_id: runtimeId,
-      model_policy: current.model_policy,
+      default_model_connection_id: current.default_model_connection_id,
+      reasoning_effort: current.reasoning_effort,
+      codex_subagents: current.codex_subagents,
       sandbox_policy: current.sandbox_policy,
       managed_skill_ids: current.managed_skill_ids,
       mcp_allowlist: current.mcp_allowlist
@@ -319,6 +323,7 @@ test('Integration App OAuth API runs messages, attachments, and tool results', a
     const createAgentDialog = page.getByRole('dialog', { name: 'Create Agent' });
     await createAgentDialog.getByLabel('Name', { exact: true }).fill(agentName);
     await createAgentDialog.getByLabel('Instructions').fill('Handle external integration messages.');
+    await expect(createAgentDialog.getByLabel('Default model connection')).not.toHaveValue('');
     const createAgentResponse = page.waitForResponse((response) => response.request().method() === 'POST'
       && new URL(response.url()).pathname === '/api/agents');
     await createAgentDialog.getByRole('button', { name: 'Create agent' }).click();

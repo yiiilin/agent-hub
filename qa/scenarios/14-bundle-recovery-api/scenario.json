@@ -1,0 +1,10 @@
+{
+  "name": "Bundle upload, current pointer, release, and recovery API",
+  "type": "api",
+  "timeout_ms": 240000,
+  "covers": [
+    "BND-002",
+    "BND-003",
+    "REC-001"
+  ]
+}

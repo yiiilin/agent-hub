@@ -1,0 +1,15 @@
+{
+  "name": "Model Connection, Responses accounting, and deletion lifecycle",
+  "type": "api",
+  "timeout_ms": 300000,
+  "covers": [
+    "MDL-001",
+    "MDL-002",
+    "MDL-003",
+    "MDL-004",
+    "MDL-005",
+    "MDL-006",
+    "MDL-007"
+  ],
+  "restores": ["system_default_model_connection"]
+}

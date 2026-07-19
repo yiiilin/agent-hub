@@ -103,6 +103,53 @@ function waitForBrowserFrame(page: Page) {
   return page.evaluate(() => new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve())));
 }
 
+const emptyModelOptions = { items: [], system_default_model_connection_id: null };
+
+type AgentConfiguration = {
+  id: string;
+  owner_id: string;
+  name: string;
+  instructions: string;
+  visibility: string;
+  public_to: string[];
+  runtime_id: string | null;
+  default_model_connection_id: string | null;
+  reasoning_effort: string;
+  codex_subagents: unknown[];
+  sandbox_policy: Record<string, unknown>;
+  managed_skill_ids: string[];
+  mcp_allowlist: unknown[];
+};
+
+function createAgentRequest(name: string, instructions: string) {
+  return {
+    name,
+    instructions,
+    visibility: 'private',
+    public_to: [],
+    default_model_connection_id: null,
+    reasoning_effort: 'default',
+    codex_subagents: []
+  };
+}
+
+function updateAgentRequest(agent: AgentConfiguration, changes: Partial<AgentConfiguration> = {}) {
+  const updated = { ...agent, ...changes };
+  return {
+    name: updated.name,
+    instructions: updated.instructions,
+    visibility: updated.visibility,
+    public_to: updated.public_to,
+    runtime_id: updated.runtime_id,
+    default_model_connection_id: updated.default_model_connection_id,
+    reasoning_effort: updated.reasoning_effort,
+    codex_subagents: updated.codex_subagents,
+    sandbox_policy: updated.sandbox_policy,
+    managed_skill_ids: updated.managed_skill_ids,
+    mcp_allowlist: updated.mcp_allowlist
+  };
+}
+
 function consoleAgentFixture(agentId: string, ownerId: string, now: string) {
   return {
     id: agentId,
@@ -116,9 +163,11 @@ function consoleAgentFixture(agentId: string, ownerId: string, now: string) {
     can_manage: false,
     can_administer: false,
     can_invoke: true,
+    default_model_connection_id: null,
+    reasoning_effort: 'default',
+    codex_subagents: [],
     model_policy: {},
     sandbox_policy: {},
-    skills_manifest: [],
     managed_skill_ids: [],
     mcp_allowlist: [],
     created_at: now,
@@ -130,9 +179,14 @@ function runFixture(runId: string, agentId: string, now: string, status: string,
   return {
     id: runId,
     agent_id: agentId,
+    automation_id: null,
     integration_session_id: null,
     parent_run_id: null,
     runtime_id: null,
+    hub_session_id: null,
+    hub_message_id: null,
+    hub_turn_id: null,
+    session_ownership_generation: null,
     status,
     initial_message: initialMessage,
     session_id: null,
@@ -165,6 +219,7 @@ async function createAgentThroughUi(page: Page, name: string, instructions: stri
   const dialog = page.getByRole('dialog', { name: 'Create Agent' });
   await dialog.getByLabel('Name', { exact: true }).fill(name);
   await dialog.getByLabel('Instructions').fill(instructions);
+  await expect(dialog.getByLabel('Default model connection')).not.toHaveValue('');
   await dialog.getByLabel('Visibility').selectOption(visibility);
   if (sharedWith) await dialog.getByRole('checkbox', { name: sharedWith }).check();
   const responsePromise = page.waitForResponse((response) => response.request().method() === 'POST'
@@ -179,6 +234,8 @@ test('owner, admin, public, and public_to permissions stay isolated', async ({ b
   const memberPage = await memberContext.newPage();
   const adminContext = await browser.newContext({ baseURL });
   const adminPage = await adminContext.newPage();
+  const publicAdminContext = await browser.newContext({ baseURL });
+  const publicAdminPage = await publicAdminContext.newPage();
   let outsiderContext: import('@playwright/test').BrowserContext | null = null;
   let memberPrivateId: string | null = null;
   let publicAgentId: string | null = null;
@@ -186,26 +243,19 @@ test('owner, admin, public, and public_to permissions stay isolated', async ({ b
   try {
     await signInWithMockOidc(memberPage, memberEmail);
     const privateResponse = await memberPage.request.post('/api/agents', {
-      data: { name: `Member Private ${Date.now()}`, instructions: 'Owner-only private controls.', visibility: 'private' }
+      data: createAgentRequest(`Member Private ${Date.now()}`, 'Owner-only private controls.')
     });
     expect(privateResponse.ok()).toBeTruthy();
-    let memberPrivate = await privateResponse.json() as {
-      id: string;
-      instructions: string;
-      name: string;
-    };
+    let memberPrivate = await privateResponse.json() as AgentConfiguration;
     memberPrivateId = memberPrivate.id;
     const memberRuntimes = await (await memberPage.request.get('/api/runtimes')).json();
     const configuredPrivateResponse = await memberPage.request.patch(`/api/agents/${memberPrivate.id}`, {
-      data: {
-        ...memberPrivate,
+      data: updateAgentRequest(memberPrivate, {
         runtime_id: memberRuntimes[0]?.id ?? null,
-        model_policy: { provider: 'hub-proxy', private_marker: 'model-secret' },
+        reasoning_effort: 'high',
         sandbox_policy: { mode: 'workspace-write', network_access: true, private_marker: 'sandbox-secret' },
-        skills_manifest: [{ name: 'private-skill', content: 'private skill content' }],
-        managed_skill_ids: [],
         mcp_allowlist: [{ name: 'private-mcp', command: 'private-command' }]
-      }
+      })
     });
     expect(configuredPrivateResponse.ok()).toBeTruthy();
     memberPrivate = await configuredPrivateResponse.json();
@@ -217,66 +267,95 @@ test('owner, admin, public, and public_to permissions stay isolated', async ({ b
     await adminPage.getByRole('button', { name: 'Sign in', exact: true }).click();
     await expect(adminPage.getByText('admin@example.com')).toBeVisible();
 
+    await signInWithMockOidc(publicAdminPage, `public-admin-${Date.now()}@example.com`);
+    const publicAdminUser = await (await publicAdminPage.request.get('/api/auth/me')).json() as { id: string };
+    const promoteResponse = await adminPage.request.put(`/api/admin/users/${publicAdminUser.id}/role`, {
+      data: { role: 'admin' }
+    });
+    expect(promoteResponse.ok()).toBeTruthy();
+
     await adminPage.goto(`/agents/${memberPrivate.id}`);
     await expect(adminPage.getByRole('heading', { name: memberPrivate.name, level: 1 })).toBeVisible();
     await expect(adminPage.getByRole('button', { name: 'Delete agent' })).toBeVisible();
     await expect(adminPage.getByRole('button', { name: 'Start run' })).toHaveCount(0);
-    await expect(adminPage.getByLabel('Name', { exact: true })).toHaveCount(0);
-    const adminPrivateView = await (await adminPage.request.get(`/api/agents/${memberPrivate.id}`)).json();
+    await adminPage.getByRole('tab', { name: 'Instructions' }).click();
+    await expect(adminPage.getByLabel('Name', { exact: true })).toBeVisible();
+    const adminPrivateView = await (await adminPage.request.get(`/api/agents/${memberPrivate.id}`)).json() as AgentConfiguration & {
+      can_administer: boolean;
+      can_manage: boolean;
+      can_invoke: boolean;
+    };
     expect(adminPrivateView.can_administer).toBe(true);
-    expect(adminPrivateView.can_manage).toBe(false);
+    expect(adminPrivateView.can_manage).toBe(true);
     expect(adminPrivateView.can_invoke).toBe(false);
-    expect(adminPrivateView.runtime_id).toBeNull();
-    expect(adminPrivateView.model_policy).toEqual({});
-    expect(adminPrivateView.sandbox_policy).toEqual({});
-    expect(adminPrivateView.skills_manifest).toEqual([]);
+    expect(adminPrivateView.runtime_id).toBe(memberRuntimes[0]?.id ?? null);
+    expect(adminPrivateView.default_model_connection_id).toBe(memberPrivate.default_model_connection_id);
+    expect(adminPrivateView.reasoning_effort).toBe('high');
+    expect(adminPrivateView.codex_subagents).toEqual([]);
+    expect(adminPrivateView.sandbox_policy).toMatchObject({ private_marker: 'sandbox-secret' });
     expect(adminPrivateView.managed_skill_ids).toEqual([]);
-    expect(adminPrivateView.mcp_allowlist).toEqual([]);
+    expect(adminPrivateView.mcp_allowlist).toEqual([{ name: 'private-mcp', command: 'private-command' }]);
     const forbiddenPrivateRun = await adminPage.request.post(`/api/agents/${memberPrivate.id}/runs`, {
-      data: { message: 'Admin must not borrow private connections.' }
+      data: { message: 'Admin must not borrow private connections.', hub_session_id: null, parent_run_id: null }
     });
     expect(forbiddenPrivateRun.status()).toBe(404);
 
-    await adminPage.goto('/agents');
+    await publicAdminPage.goto('/agents');
     const publicName = `Admin Public ${Date.now()}`;
     const publicResponse = await createAgentThroughUi(
-      adminPage,
+      publicAdminPage,
       publicName,
       'Public invocation without control-plane disclosure.',
       'public'
     );
     expect(publicResponse.ok()).toBeTruthy();
-    publicAgentId = (await publicResponse.json() as { id: string }).id;
-    await expect(adminPage).toHaveURL(/\/agents\/[0-9a-f-]{36}$/);
+    const publicAgent = await publicResponse.json() as AgentConfiguration;
+    expect(publicAgent.visibility).toBe('public');
+    expect(publicAgent.owner_id).toBe(publicAdminUser.id);
+    publicAgentId = publicAgent.id;
+    await expect(publicAdminPage).toHaveURL(/\/agents\/[0-9a-f-]{36}$/);
 
-    await adminPage.goto('/agents');
+    await publicAdminPage.goto('/agents');
     const sharedName = `Admin Shared ${Date.now()}`;
     const sharedResponse = await createAgentThroughUi(
-      adminPage,
+      publicAdminPage,
       sharedName,
       'Shared with one member.',
       'public_to',
       new RegExp(memberEmail)
     );
     expect(sharedResponse.ok()).toBeTruthy();
-    sharedAgentId = (await sharedResponse.json() as { id: string }).id;
-    await expect(adminPage).toHaveURL(/\/agents\/[0-9a-f-]{36}$/);
+    const sharedAgent = await sharedResponse.json() as AgentConfiguration;
+    expect(sharedAgent.visibility).toBe('public_to');
+    sharedAgentId = sharedAgent.id;
+    await expect(publicAdminPage).toHaveURL(/\/agents\/[0-9a-f-]{36}$/);
 
     await memberPage.goto(`/agents/${publicAgentId}`);
     await expect(memberPage.getByRole('button', { name: 'Start run' })).toBeVisible();
     await expect(memberPage.getByLabel('Name', { exact: true })).toHaveCount(0);
-    const publicView = await (await memberPage.request.get(`/api/agents/${publicAgentId}`)).json();
+    const publicView = await (await memberPage.request.get(`/api/agents/${publicAgentId}`)).json() as AgentConfiguration & {
+      can_invoke: boolean;
+      can_manage: boolean;
+    };
     expect(publicView.can_invoke).toBe(true);
     expect(publicView.can_manage).toBe(false);
-    expect(publicView.model_policy).toEqual({});
-    expect(publicView.skills_manifest).toEqual([]);
+    expect(publicView.default_model_connection_id).toBeNull();
+    expect(publicView.reasoning_effort).toBe('default');
+    expect(publicView.codex_subagents).toEqual([]);
+    expect(publicView.sandbox_policy).toEqual({});
+    expect(publicView.managed_skill_ids).toEqual([]);
     expect(publicView.mcp_allowlist).toEqual([]);
     const forbiddenPatch = await memberPage.request.patch(`/api/agents/${publicAgentId}`, {
-      data: { ...publicView, name: 'Unauthorized rename' }
+      data: updateAgentRequest(publicView, { name: 'Unauthorized rename' })
     });
-    expect(forbiddenPatch.status()).toBe(403);
+    expect(forbiddenPatch.status()).toBe(404);
     await memberPage.getByLabel('Message').fill('Public Agent run from member');
+    const publicRunResponse = memberPage.waitForResponse((response) => response.request().method() === 'POST'
+      && new URL(response.url()).pathname === `/api/agents/${publicAgentId}/runs`);
     await memberPage.getByRole('button', { name: 'Start run' }).click();
+    const publicRun = await publicRunResponse;
+    expect(publicRun.ok()).toBeTruthy();
+    expect((await publicRun.json() as { hub_session_id: string | null }).hub_session_id).toBeTruthy();
     await expect(memberPage.getByText('Fake Codex completed run')).toBeVisible({ timeout: 30_000 });
 
     await memberPage.goto(`/agents/${sharedAgentId}`);
@@ -285,8 +364,14 @@ test('owner, admin, public, and public_to permissions stay isolated', async ({ b
     await expect(memberPage.getByRole('checkbox', { name: 'Continue selected thread' })).toBeDisabled();
     await expect(memberPage.getByText('Public Agent run from member')).toHaveCount(0);
     await memberPage.getByLabel('Message').fill('Shared Agent run from selected member');
+    const sharedRunResponse = memberPage.waitForResponse((response) => response.request().method() === 'POST'
+      && new URL(response.url()).pathname === `/api/agents/${sharedAgentId}/runs`);
     await memberPage.getByRole('button', { name: 'Start run' }).click();
+    const sharedRun = await sharedRunResponse;
+    expect(sharedRun.ok()).toBeTruthy();
+    expect((await sharedRun.json() as { hub_session_id: string | null }).hub_session_id).toBeTruthy();
     await expect(memberPage.getByText('Fake Codex completed run')).toBeVisible({ timeout: 30_000 });
+    await expect(memberPage.getByRole('checkbox', { name: 'Continue selected thread' })).toBeEnabled();
 
     outsiderContext = await browser.newContext({ baseURL });
     const outsiderPage = await outsiderContext.newPage();
@@ -305,6 +390,7 @@ test('owner, admin, public, and public_to permissions stay isolated', async ({ b
       if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, 'Failed to delete permission test agents');
     } finally {
       await outsiderContext?.close();
+      await publicAdminContext.close();
       await adminContext.close();
       await memberContext.close();
     }
@@ -325,14 +411,14 @@ test('agent navigation ignores a stale detail response', async ({ page }) => {
   const releaseFirst = deferred();
   try {
     const first = await page.request.post('/api/agents', {
-      data: { name: `Stale source ${Date.now()}`, instructions: 'Delayed source.', visibility: 'private' }
+      data: createAgentRequest(`Stale source ${Date.now()}`, 'Delayed source.')
     });
     expect(first.ok()).toBeTruthy();
     const sourceAgent = await first.json() as { id: string; instructions: string; name: string };
     firstAgent = sourceAgent;
 
     const second = await page.request.post('/api/agents', {
-      data: { name: `Stale target ${Date.now()}`, instructions: 'Current target.', visibility: 'private' }
+      data: createAgentRequest(`Stale target ${Date.now()}`, 'Current target.')
     });
     expect(second.ok()).toBeTruthy();
     const targetAgent = await second.json() as { id: string; instructions: string; name: string };
@@ -443,6 +529,8 @@ test('agent initial load failure is handled and recovers on retry', async ({ pag
       await route.fulfill({ json: agent });
     } else if (path === `/api/agents/${agentId}/runs`) {
       await route.fulfill({ json: [] });
+    } else if (path === `/api/agents/${agentId}/model-options`) {
+      await route.fulfill({ json: emptyModelOptions });
     } else if (path === '/api/runtimes') {
       runtimeRequests += 1;
       if (runtimeRequests === 1) {
@@ -485,14 +573,14 @@ test('agent route change hides stale controls and runs while the next agent load
   const releaseSecond = deferred();
   try {
     const first = await page.request.post('/api/agents', {
-      data: { name: `Stale UI source ${Date.now()}`, instructions: 'Visible only before navigation.', visibility: 'private' }
+      data: createAgentRequest(`Stale UI source ${Date.now()}`, 'Visible only before navigation.')
     });
     expect(first.ok()).toBeTruthy();
     const sourceAgent = await first.json() as { id: string; name: string };
     firstAgent = sourceAgent;
 
     const second = await page.request.post('/api/agents', {
-      data: { name: `Stale UI target ${Date.now()}`, instructions: 'Navigation target.', visibility: 'private' }
+      data: createAgentRequest(`Stale UI target ${Date.now()}`, 'Navigation target.')
     });
     expect(second.ok()).toBeTruthy();
     const targetAgent = await second.json() as { id: string; name: string };
@@ -500,7 +588,7 @@ test('agent route change hides stale controls and runs while the next agent load
 
     const runMessage = `Old run must not stay actionable ${Date.now()}`;
     const run = await page.request.post(`/api/agents/${sourceAgent.id}/runs`, {
-      data: { message: runMessage }
+      data: { message: runMessage, hub_session_id: null, parent_run_id: null }
     });
     expect(run.ok()).toBeTruthy();
 
@@ -578,39 +666,11 @@ test('run switch ignores delayed history and SSE from the previous run', async (
     role: 'member'
   };
   const agent = {
-    id: agentId,
+    ...consoleAgentFixture(agentId, user.id, now),
     name: 'Run switch agent',
-    instructions: 'Exercise run transcript switching.',
-    visibility: 'private',
-    public_to: [],
-    runtime_id: null,
-    owner_id: user.id,
-    is_owner: false,
-    can_manage: false,
-    can_administer: false,
-    can_invoke: true,
-    model_policy: {},
-    sandbox_policy: {},
-    skills_manifest: [],
-    managed_skill_ids: [],
-    mcp_allowlist: [],
-    created_at: now,
-    updated_at: now
+    instructions: 'Exercise run transcript switching.'
   };
-  const runA = {
-    id: runAId,
-    agent_id: agentId,
-    integration_session_id: null,
-    parent_run_id: null,
-    runtime_id: null,
-    status: 'running',
-    initial_message: 'Run A',
-    session_id: null,
-    work_dir_ref: null,
-    source: 'console',
-    created_at: now,
-    updated_at: now
-  };
+  const runA = runFixture(runAId, agentId, now, 'running', 'Run A');
   const runB = { ...runA, id: runBId, status: 'completed', initial_message: 'Run B' };
   const eventA = {
     seq: 1,
@@ -643,6 +703,8 @@ test('run switch ignores delayed history and SSE from the previous run', async (
       } else if (path === `/api/agents/${agentId}/runs`) {
         runListRequests += 1;
         await route.fulfill({ json: [{ ...runA, status: runListRequests === 1 ? 'running' : 'completed' }, runB] });
+      } else if (path === `/api/agents/${agentId}/model-options`) {
+        await route.fulfill({ json: emptyModelOptions });
       } else if (path === '/api/runtimes' || path === '/api/skills' || path === '/api/users') {
         await route.fulfill({ json: [] });
       } else if (path === `/api/runs/${runAId}/events`) {
@@ -767,6 +829,8 @@ test('a stale run-list poll cannot replace a newly created run or continuation p
           return;
         }
         await route.fulfill({ json: continuedRun });
+      } else if (path === `/api/agents/${agentId}/model-options`) {
+        await route.fulfill({ json: emptyModelOptions });
       } else if (path === '/api/runtimes' || path === '/api/skills' || path === '/api/users') {
         await route.fulfill({ json: [] });
       } else if (/^\/api\/runs\/[^/]+\/events$/.test(path)) {
@@ -905,6 +969,8 @@ test('older run history cannot regress a newer live terminal event', async ({ pa
         await route.fulfill({ json: agent });
       } else if (path === `/api/agents/${agentId}/runs`) {
         await route.fulfill({ json: [run] });
+      } else if (path === `/api/agents/${agentId}/model-options`) {
+        await route.fulfill({ json: emptyModelOptions });
       } else if (path === '/api/runtimes' || path === '/api/skills' || path === '/api/users') {
         await route.fulfill({ json: [] });
       } else if (path === `/api/runs/${runId}/events`) {
@@ -971,6 +1037,8 @@ test('run history rejection is handled without an unhandled promise', async ({ p
         await route.fulfill({ json: agent });
       } else if (path === `/api/agents/${agentId}/runs`) {
         await route.fulfill({ json: [run] });
+      } else if (path === `/api/agents/${agentId}/model-options`) {
+        await route.fulfill({ json: emptyModelOptions });
       } else if (path === '/api/runtimes' || path === '/api/skills' || path === '/api/users') {
         await route.fulfill({ json: [] });
       } else if (path === `/api/runs/${runId}/events`) {
@@ -1011,6 +1079,7 @@ test('RunConsole ignores malformed SSE JSON and continues processing valid event
     if (path === '/api/auth/me') return route.fulfill({ json: user });
     if (path === `/api/agents/${agentId}`) return route.fulfill({ json: agent });
     if (path === `/api/agents/${agentId}/runs`) return route.fulfill({ json: [run] });
+    if (path === `/api/agents/${agentId}/model-options`) return route.fulfill({ json: emptyModelOptions });
     if (path === `/api/runs/${runId}/events`) return route.fulfill({ json: [] });
     if (path === '/api/runtimes' || path === '/api/skills' || path === '/api/users') return route.fulfill({ json: [] });
     return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });

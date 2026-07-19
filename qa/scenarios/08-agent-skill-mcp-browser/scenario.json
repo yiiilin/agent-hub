@@ -1,0 +1,15 @@
+{
+  "name": "Agent, Skill, and MCP browser workflows",
+  "type": "browser",
+  "timeout_ms": 240000,
+  "covers": [
+    "AGT-001",
+    "AGT-002",
+    "AGT-003",
+    "AGT-004",
+    "AGT-005",
+    "SKL-001",
+    "SKL-002",
+    "MCP-001"
+  ]
+}

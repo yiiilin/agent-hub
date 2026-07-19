@@ -1,5 +1,6 @@
 {
   "name": "Browser conversation completes through fake Codex",
   "type": "browser",
-  "timeout_ms": 120000
+  "timeout_ms": 120000,
+  "covers": ["SES-006", "UI-SES-001"]
 }

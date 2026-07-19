@@ -39,7 +39,7 @@ test('API keys can be created with validity, renewed in place, and deleted', asy
   await page.getByRole('button', { name: 'Create key' }).click();
   await expect(page.getByRole('dialog', { name: 'One-time API key' })).toBeVisible();
   const oldToken = await page.locator('.secret-token').innerText();
-  await page.getByRole('dialog', { name: 'One-time API key' }).getByRole('button', { name: 'Close', exact: true }).last().click();
+  await page.getByRole('dialog', { name: 'One-time API key' }).locator('footer').getByRole('button', { name: 'Close', exact: true }).click();
   await expect(page.locator('.secret-token')).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Create API key' })).toBeFocused();
   expect(/^ahk_[A-Za-z0-9]+$/.test(oldToken)).toBe(true);
@@ -119,11 +119,10 @@ test('API key mutations are serialized across create and key rows', async ({ pag
   await expect.poll(() => renewRequests).toBe(1);
   await expect(rows[1].getByRole('button', { name: 'Renew' })).toBeDisabled();
   await rows[1].getByRole('button', { name: 'Renew' }).click({ force: true });
-  await page.waitForTimeout(100);
-  expect(renewRequests).toBe(1);
   releaseRenew();
   await expect(renewDialog).toHaveCount(0);
   await expect(page.getByText('API key expiration updated.')).toBeVisible();
+  expect(renewRequests).toBe(1);
   await expect(page.getByText('This token is shown once.')).toHaveCount(0);
 
   let createRequests = 0;
@@ -149,10 +148,10 @@ test('API key mutations are serialized across create and key rows', async ({ pag
   await expect(createDialog.getByRole('alert')).toContainText('The request could not be completed. Retry.');
   await expect(createDialog).toBeFocused();
   await page.keyboard.press('Tab');
-  await expect(createDialog.getByRole('button', { name: 'Close', exact: true }).first()).toBeFocused();
+  await expect(createDialog.locator('header').getByRole('button', { name: 'Close', exact: true })).toBeFocused();
   await createDialog.focus();
   await page.keyboard.press('Shift+Tab');
-  await expect(createDialog.getByRole('button', { name: 'Create key' })).toBeFocused();
+  await expect(createDialog.getByRole('button', { name: 'Create key', exact: true })).toBeFocused();
 });
 
 test('API key list load failure is redacted and recovers on retry', async ({ page }) => {
@@ -185,7 +184,9 @@ test('only the latest API key page request can update the list', async ({ page }
   let delayPageOne = false;
   let delayedPageOneStarted = 0;
   let releasePageOne!: () => void;
+  let markDelayedPageOneSettled!: () => void;
   const pageOneGate = new Promise<void>((resolve) => { releasePageOne = resolve; });
+  const delayedPageOneSettled = new Promise<void>((resolve) => { markDelayedPageOneSettled = resolve; });
   const item = (pageNumber: number) => ({
     id: `00000000-0000-0000-0000-00000000000${pageNumber}`,
     name: `Mock page ${pageNumber}`,
@@ -199,6 +200,9 @@ test('only the latest API key page request can update the list', async ({ page }
     if (requestedPage === 1 && delayPageOne) {
       delayedPageOneStarted += 1;
       await pageOneGate;
+      await route.fulfill({ json: { items: [item(requestedPage)], total: 60, page: requestedPage, page_size: 20 } }).catch(() => undefined);
+      markDelayedPageOneSettled();
+      return;
     }
     await route.fulfill({ json: { items: [item(requestedPage)], total: 60, page: requestedPage, page_size: 20 } });
   });
@@ -214,7 +218,7 @@ test('only the latest API key page request can update the list', async ({ page }
   await page.getByRole('button', { name: 'Next' }).click();
   await expect(page.getByText('Mock page 3', { exact: true })).toBeVisible();
   releasePageOne();
-  await page.waitForTimeout(100);
+  await delayedPageOneSettled;
   await expect(page.getByText('Mock page 3', { exact: true })).toBeVisible();
   await expect(page.getByText('Mock page 1', { exact: true })).toHaveCount(0);
 });
@@ -223,7 +227,9 @@ test('a successful mutation force-refreshes over an older same-page request', as
   await page.request.post('/api/auth/login', { data: { email: 'admin@example.com', password: 'admin123' } });
   let listRequests = 0;
   let releaseOldList!: () => void;
+  let markOldListSettled!: () => void;
   const oldListGate = new Promise<void>((resolve) => { releaseOldList = resolve; });
+  const oldListSettled = new Promise<void>((resolve) => { markOldListSettled = resolve; });
   const listItem = (name: string, id: string) => ({
     id,
     name,
@@ -237,6 +243,7 @@ test('a successful mutation force-refreshes over an older same-page request', as
     if (listRequests === 1) {
       await oldListGate;
       await route.fulfill({ json: { items: [listItem('Old response', '00000000-0000-0000-0000-000000000001')], total: 1, page: 1, page_size: 20 } }).catch(() => undefined);
+      markOldListSettled();
       return;
     }
     await route.fulfill({ json: { items: [listItem('Forced new key', '00000000-0000-0000-0000-000000000002')], total: 1, page: 1, page_size: 20 } });
@@ -254,7 +261,7 @@ test('a successful mutation force-refreshes over an older same-page request', as
   await expect.poll(() => listRequests).toBe(2);
   await expect(page.locator('.api-key-row').getByText('Forced new key', { exact: true })).toBeVisible();
   releaseOldList();
-  await page.waitForTimeout(100);
+  await oldListSettled;
   await expect(page.locator('.api-key-row').getByText('Forced new key', { exact: true })).toBeVisible();
   await expect(page.locator('.api-key-row').getByText('Old response', { exact: true })).toHaveCount(0);
 });
@@ -289,9 +296,9 @@ test('API key modals, pagination, cross-tab deletion fallback, and mobile layout
     const createDialog = page.getByRole('dialog', { name: 'Create API key' });
     await expect(createDialog.getByLabel('Name', { exact: true })).toBeFocused();
     await page.keyboard.press('Shift+Tab');
-    await expect(createDialog.getByRole('button', { name: 'Close', exact: true }).first()).toBeFocused();
+    await expect(createDialog.locator('header').getByRole('button', { name: 'Close', exact: true })).toBeFocused();
     await page.keyboard.press('Shift+Tab');
-    await expect(createDialog.getByRole('button', { name: 'Create key' })).toBeFocused();
+    await expect(createDialog.getByRole('button', { name: 'Create key', exact: true })).toBeFocused();
     await page.keyboard.press('Escape');
     await expect(createDialog).toHaveCount(0);
     await expect(page.getByRole('button', { name: 'Create API key' })).toBeFocused();
@@ -327,7 +334,8 @@ test('Mock OIDC signs into the console', async ({ page }) => {
   await page.getByRole('button', { name: 'Sign in with Mock OIDC' }).click();
 
   await expect(page.getByText(email)).toBeVisible();
-  await expect(page.getByText('Create Agent', { exact: true })).toBeVisible();
+  await expect(page).toHaveURL(/\/sessions$/);
+  await expect(page.getByRole('heading', { name: 'Sessions', exact: true, level: 1 })).toBeVisible();
 });
 
 test('Embed JWT exchanges into a widget session through postMessage', async ({ page }) => {
@@ -412,11 +420,10 @@ test('Embed JWT exchanges into a widget session through postMessage', async ({ p
     (iframe as HTMLIFrameElement).contentWindow?.postMessage({ type: 'agent-hub:session-select', channelId: data.channelId, token: data.token }, '*');
     (iframe as HTMLIFrameElement).contentWindow?.postMessage({ type: 'agent-hub:message-submit', channelId: data.channelId, message: 'Duplicate host submission' }, '*');
   }, { channelId, token: exchangedSession.token });
-  await page.waitForTimeout(100);
-  expect(widgetRunPosts).toBe(1);
   await expect(frame.getByRole('button', { name: 'Sending...' })).toBeDisabled();
   releaseWidgetRun();
   await expect(frame.getByText('Fake Codex completed run')).toBeVisible({ timeout: 30_000 });
+  expect(widgetRunPosts).toBe(1);
   await expect(frame.getByRole('button', { name: 'Send' })).toBeEnabled();
   await expect.poll(() => page.evaluate(() => (window as unknown as { widgetMessages: Record<string, unknown>[] }).widgetMessages.map((message) => message.type))).toContain('agent-hub:run-started');
   await expect.poll(() => page.evaluate(() => (window as unknown as { widgetMessages: Record<string, unknown>[] }).widgetMessages.map((message) => message.type))).toContain('agent-hub:run-event');

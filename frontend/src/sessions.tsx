@@ -23,6 +23,8 @@ const deliveryKeys: Record<string, TranslationKey> = {
   failed: 'statusFailed'
 };
 
+const terminalRunStatuses = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
+
 type TimelineEntry =
   | { kind: 'message'; id: string; sequence: number; occurredAt: number; role: string; content: string; state?: string; mode?: string }
   | { kind: 'live'; id: string; sequence: number; occurredAt: number; role: string; content: string }
@@ -60,6 +62,13 @@ function mergeRunEvents(current: RunEvent[], incoming: RunEvent[]) {
   const merged = new Map(current.map((event) => [`${event.run_id}:${event.seq}`, event]));
   for (const event of incoming) merged.set(`${event.run_id}:${event.seq}`, event);
   return [...merged.values()].sort((left, right) => left.seq - right.seq);
+}
+
+function eventRefreshesSession(event: RunEvent) {
+  if (event.event_type === 'turn_started') return true;
+  if (event.event_type !== 'status') return false;
+  const status = event.content ?? (typeof event.payload.status === 'string' ? event.payload.status : null);
+  return status !== null && terminalRunStatuses.has(status);
 }
 
 function NewConversationDialog({ agents, onClose, onCreated }: {
@@ -121,6 +130,7 @@ export function SessionsPage() {
   const sessionLoadGeneration = useRef(0);
   const messageLoadGeneration = useRef(0);
   const streamGeneration = useRef(0);
+  const sessionRefreshGeneration = useRef(0);
   const [sessions, setSessions] = useState<HubSession[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -184,6 +194,7 @@ export function SessionsPage() {
   useEffect(() => {
     const generation = ++messageLoadGeneration.current;
     const controller = new AbortController();
+    setMessages([]);
     setEvents([]);
     setActionError(false);
     setStopRequestedRunId(null);
@@ -205,7 +216,19 @@ export function SessionsPage() {
   }, [selectedId]);
 
   const selectedSession = sessions.find((session) => session.id === selectedId) ?? null;
-  const activeRunId = useMemo(() => [...messages].reverse().find((message) => message.run_id)?.run_id ?? null, [messages]);
+  const sessionMessages = useMemo(
+    () => messages.filter((message) => message.session_id === selectedId),
+    [messages, selectedId]
+  );
+  const sessionRunIds = useMemo(
+    () => new Set(sessionMessages.flatMap((message) => message.run_id ? [message.run_id] : [])),
+    [sessionMessages]
+  );
+  const sessionEvents = useMemo(
+    () => events.filter((event) => sessionRunIds.has(event.run_id)),
+    [events, sessionRunIds]
+  );
+  const activeRunId = useMemo(() => [...sessionMessages].reverse().find((message) => message.run_id)?.run_id ?? null, [sessionMessages]);
   const readOnly = selectedSession?.lifecycle_status === 'historical'
     || selectedSession?.lifecycle_status === 'recovery_failed'
     || Boolean(selectedSession?.agent_deleted_at);
@@ -214,6 +237,17 @@ export function SessionsPage() {
     const generation = ++streamGeneration.current;
     const controller = new AbortController();
     if (!activeRunId || !selectedSession || readOnly) return () => controller.abort();
+    const refreshSelectedSession = () => {
+      const refreshGeneration = ++sessionRefreshGeneration.current;
+      void api.session(selectedSession.id, controller.signal).then((refreshed) => {
+        if (!mountedRef.current
+          || generation !== streamGeneration.current
+          || refreshGeneration !== sessionRefreshGeneration.current) return;
+        setSessions((current) => current.map((session) => (
+          session.id === refreshed.id ? refreshed : session
+        )));
+      }).catch(() => { /* Run events remain usable if Session refresh fails. */ });
+    };
     api.runEvents(activeRunId, controller.signal).then((loaded) => {
       if (mountedRef.current && generation === streamGeneration.current) {
         setEvents((current) => mergeRunEvents(current, loaded));
@@ -222,6 +256,7 @@ export function SessionsPage() {
     void api.streamRunEvents(activeRunId, controller.signal, (event) => {
       if (!mountedRef.current || generation !== streamGeneration.current) return;
       setEvents((current) => mergeRunEvents(current, [event]));
+      if (eventRefreshesSession(event)) refreshSelectedSession();
     }).catch((error) => {
       if ((error as Error)?.name !== 'AbortError') setActionError(true);
     });
@@ -239,7 +274,7 @@ export function SessionsPage() {
   }, [locale, originFilter, search, sessions]);
 
   const timeline = useMemo(() => {
-    const entries: TimelineEntry[] = messages.filter((message) => Boolean(message.content)).map((message) => ({
+    const entries: TimelineEntry[] = sessionMessages.filter((message) => Boolean(message.content)).map((message) => ({
       kind: 'message' as const,
       id: message.id,
       sequence: message.sequence * 1000,
@@ -250,7 +285,7 @@ export function SessionsPage() {
       mode: message.delivery_mode
     }));
     const messageContents = new Set(entries.flatMap((entry) => entry.kind === 'technical' ? [] : [entry.content]));
-    for (const event of events) {
+    for (const event of sessionEvents) {
       if (event.event_type === 'message' && event.content && !messageContents.has(event.content)) {
         entries.push({ kind: 'live', id: `event-message-${event.run_id}-${event.seq}`, sequence: event.seq * 1000 + 1, occurredAt: eventTimestamp(event.created_at), role: event.role ?? 'assistant', content: event.content });
         messageContents.add(event.content);
@@ -259,7 +294,7 @@ export function SessionsPage() {
       }
     }
     return entries.sort((left, right) => left.occurredAt - right.occurredAt || left.sequence - right.sequence);
-  }, [events, messages]);
+  }, [sessionEvents, sessionMessages]);
   const timelineItems = useMemo(() => {
     const eventsByRun = new Map<string, RunEvent[]>();
     for (const entry of timeline) {

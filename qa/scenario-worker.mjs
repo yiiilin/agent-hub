@@ -1,7 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { ComposeHarness } from './support/compose.mjs';
+import {
+  assertArtifactTreeSafe,
+  redactSecrets,
+  sanitizeArtifactTree
+} from './support/secrets.mjs';
 
 const required = [
   'QA_REPO_ROOT',
@@ -42,11 +47,31 @@ try {
     }
   });
 } catch (error) {
-  const failure = {
+  let failure = redactSecrets({
     message: error instanceof Error ? error.message : String(error),
     stack: error instanceof Error ? error.stack : undefined
-  };
-  await writeFile(`${artifactsDir}/failure.json`, `${JSON.stringify(failure, null, 2)}\n`);
+  });
+  try {
+    await writeFile(`${artifactsDir}/failure.json`, `${JSON.stringify(failure, null, 2)}\n`);
+    await sanitizeArtifactTree(artifactsDir);
+    await assertArtifactTreeSafe(artifactsDir);
+  } catch (artifactError) {
+    await rm(artifactsDir, { recursive: true, force: true }).catch(() => undefined);
+    await mkdir(artifactsDir, { recursive: true });
+    failure = redactSecrets({
+      ...failure,
+      artifact_error: artifactError instanceof Error ? artifactError.message : String(artifactError)
+    });
+    try {
+      await writeFile(`${artifactsDir}/failure.json`, `${JSON.stringify(failure, null, 2)}\n`);
+      await assertArtifactTreeSafe(artifactsDir);
+    } catch (diagnosticError) {
+      await rm(artifactsDir, { recursive: true, force: true }).catch(() => undefined);
+      console.error(redactSecrets(
+        diagnosticError instanceof Error ? diagnosticError.message : String(diagnosticError)
+      ));
+    }
+  }
   console.error(failure.stack ?? failure.message);
   process.exitCode = 1;
 }

@@ -28,12 +28,34 @@ ensure_transcript() {
 
 model_content() {
   prompt="${1:-fake codex smoke}"
-  base_url="$(sed -n 's/^base_url = "\(.*\)"$/\1/p' "${CODEX_HOME}/config.toml" | head -n 1)"
+  config_path="${CODEX_HOME}/config.toml"
+  model_provider="$(sed -n 's/^model_provider = "\(.*\)"$/\1/p' "$config_path" | head -n 1)"
+  if [ -z "$model_provider" ]; then
+    echo "missing default model provider" >&2
+    return 1
+  fi
+  provider_value() {
+    awk -v provider="model_providers.${model_provider}" -v key="$1" '
+      /^\[/ {
+        section = substr($0, 2, length($0) - 2)
+        in_provider = section == provider || index(section, provider ".") == 1
+        next
+      }
+      in_provider && index($0, key " = \"") == 1 {
+        value = $0
+        sub("^[^=]*= \"", "", value)
+        sub("\"$", "", value)
+        print value
+        exit
+      }
+    ' "$config_path"
+  }
+  base_url="$(provider_value base_url)"
   if [ -z "$base_url" ]; then
     echo "missing model proxy base_url" >&2
     return 1
   fi
-  connection_id="$(sed -n 's/^x-agent-hub-model-connection-id = "\(.*\)"$/\1/p' "${CODEX_HOME}/config.toml" | head -n 1)"
+  connection_id="$(provider_value x-agent-hub-model-connection-id)"
   if [ -z "$connection_id" ]; then
     echo "missing model proxy connection id" >&2
     return 1
@@ -79,10 +101,12 @@ emit_agent_completion() {
     }
   }'
   active_turn_id=""
+  held_console_turn="false"
 }
 
 thread_id="fake-app-server-thread"
 active_turn_id=""
+held_console_turn="false"
 turn_sequence=0
 while IFS= read -r line; do
   method="$(printf '%s\n' "$line" | jq -er '
@@ -104,6 +128,17 @@ while IFS= read -r line; do
       }'
       ;;
     initialized)
+      ;;
+    thread/unsubscribe)
+      printf '%s\n' "$line" | jq -e --arg thread "$thread_id" '
+        .params.threadId == $thread
+      ' >/dev/null 2>&1 || protocol_error
+      request_id="$(printf '%s\n' "$line" | jq -ce '.id' 2>/dev/null)" || protocol_error
+      jq -cn --argjson id "$request_id" '{
+        jsonrpc: "2.0",
+        id: $id,
+        result: {}
+      }'
       ;;
     thread/start|thread/resume)
       printf '%s\n' "$line" | jq -e '
@@ -157,6 +192,7 @@ while IFS= read -r line; do
       else
         active_turn_id="fake-app-server-turn-${turn_sequence}"
       fi
+      held_console_turn="false"
 
       jq -cn --argjson id "$request_id" --arg turn "$active_turn_id" '{
         jsonrpc: "2.0",
@@ -169,15 +205,29 @@ while IFS= read -r line; do
         params: {threadId: $thread, turn: {id: $turn, status: "inProgress", items: []}}
       }'
 
+      if [ "$source" = "console" ]; then
+        hold_turn="$(printf '%s\n' "$line" | jq -r '
+          any(.params.input[]; .type == "text" and .text == "fixture:hold")
+        ' 2>/dev/null)" || protocol_error
+        if [ "$hold_turn" = "true" ]; then
+          held_console_turn="true"
+          continue
+        fi
+      fi
+
       if [ "$source" = "fixture:protocol" ]; then
         continue
       elif [ "$source" = "integration:message" ]; then
-        wants_tool="$(printf '%s\n' "$line" | jq -er '
+        wants_tool="$(printf '%s\n' "$line" | jq -r '
           [.params.input[] | select(.type == "text") | .text]
           | join("\n")
           | ascii_downcase
           | contains("tool")
         ' 2>/dev/null)" || protocol_error
+        case "$wants_tool" in
+          true|false) ;;
+          *) protocol_error ;;
+        esac
       else
         wants_tool="false"
       fi
@@ -239,6 +289,12 @@ while IFS= read -r line; do
         id: $id,
         result: {turnId: $turn}
       }'
+      release_turn="$(printf '%s\n' "$line" | jq -r '
+        any(.params.input[]; .type == "text" and .text == "fixture:release")
+      ' 2>/dev/null)" || protocol_error
+      if [ "$held_console_turn" = "true" ] && [ "$release_turn" = "true" ]; then
+        emit_agent_completion "Fake Codex released held console turn."
+      fi
       ;;
     turn/interrupt)
       printf '%s\n' "$line" | jq -e --arg thread "$thread_id" --arg turn "$active_turn_id" '
@@ -259,6 +315,7 @@ while IFS= read -r line; do
         params: {threadId: $thread, turn: {id: $turn, status: "interrupted", items: []}}
       }'
       active_turn_id=""
+      held_console_turn="false"
       ;;
     *)
       protocol_error

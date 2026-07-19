@@ -16,6 +16,7 @@ const skills = [
 const agents = [{
   id: agentId, name: 'Attached agent', instructions: 'Fixture', visibility: 'private', public_to: [], runtime_id: null,
   owner_id: ownerId, is_owner: true, can_manage: true, can_administer: true, can_invoke: true,
+  default_model_connection_id: null, reasoning_effort: 'default', codex_subagents: [],
   model_policy: {}, sandbox_policy: {}, managed_skill_ids: [alphaId], mcp_allowlist: [],
   created_at: now, updated_at: now
 }];
@@ -363,9 +364,23 @@ test('skills and managed assignments enforce the real owner boundary', async ({ 
     const skillResponse = await owner.post('/api/skills', { data: { name: `Owner skill ${suffix}`, description: 'Owner only', content: 'Owner content' } });
     expect(skillResponse.ok()).toBeTruthy();
     const skill = await skillResponse.json() as { id: string };
-    const agentResponse = await outsider.post('/api/agents', { data: { name: `Outsider agent ${suffix}`, instructions: 'Owner boundary fixture', visibility: 'private', public_to: [] } });
+    const agentResponse = await outsider.post('/api/agents', { data: {
+      name: `Outsider agent ${suffix}`,
+      instructions: 'Owner boundary fixture',
+      visibility: 'private',
+      public_to: [],
+      default_model_connection_id: null,
+      reasoning_effort: 'default',
+      codex_subagents: []
+    } });
     expect(agentResponse.ok()).toBeTruthy();
-    const agent = await agentResponse.json() as Record<string, unknown> & { id: string; managed_skill_ids: string[] };
+    const agent = await agentResponse.json() as Record<string, unknown> & {
+      id: string;
+      default_model_connection_id: string | null;
+      reasoning_effort: string;
+      codex_subagents: unknown[];
+      managed_skill_ids: string[];
+    };
 
     const outsiderSkills = await (await outsider.get('/api/skills')).json() as Array<{ id: string }>;
     expect(outsiderSkills.map((item) => item.id)).not.toContain(skill.id);
@@ -379,7 +394,9 @@ test('skills and managed assignments enforce the real owner boundary', async ({ 
       visibility: agent.visibility,
       public_to: agent.public_to,
       runtime_id: agent.runtime_id,
-      model_policy: agent.model_policy,
+      default_model_connection_id: agent.default_model_connection_id,
+      reasoning_effort: agent.reasoning_effort,
+      codex_subagents: agent.codex_subagents,
       sandbox_policy: agent.sandbox_policy,
       managed_skill_ids: [skill.id],
       mcp_allowlist: agent.mcp_allowlist

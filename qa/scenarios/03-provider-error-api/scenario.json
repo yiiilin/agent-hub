@@ -1,5 +1,6 @@
 {
   "name": "Provider failure records deterministic usage and error",
   "type": "api",
-  "timeout_ms": 90000
+  "timeout_ms": 90000,
+  "covers": ["MDL-007"]
 }

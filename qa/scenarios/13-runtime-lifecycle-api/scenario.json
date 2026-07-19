@@ -1,0 +1,13 @@
+{
+  "name": "Runtime enrollment, credentials, ownership, drain, and deletion lifecycle",
+  "type": "api",
+  "timeout_ms": 240000,
+  "covers": [
+    "RT-ENR-001",
+    "RT-CRED-001",
+    "RT-OWN-001",
+    "RT-RUN-001",
+    "RT-DRN-001",
+    "RT-DEL-001"
+  ]
+}

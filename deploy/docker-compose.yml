@@ -146,79 +146,9 @@ services:
     user: "65532:65532"
     environment:
       FAKE_MODEL_PROVIDER_API_KEY: ${FAKE_MODEL_PROVIDER_API_KEY:-dev-model-provider-api-key}
-    command:
-      - python
-      - -c
-      - |
-        from http.server import BaseHTTPRequestHandler, HTTPServer
-        import json
-        import os
-
-        api_key = os.environ["FAKE_MODEL_PROVIDER_API_KEY"]
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_POST(self):
-                if self.path != "/v1/responses":
-                    self.send_response(404)
-                    self.end_headers()
-                    return
-                if self.headers.get("authorization") != f"Bearer {api_key}":
-                    self.send_response(401)
-                    self.end_headers()
-                    return
-                length = int(self.headers.get("content-length", "0"))
-                try:
-                    request = json.loads(self.rfile.read(length) if length else b"{}")
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    self.send_response(400)
-                    self.end_headers()
-                    return
-                request_text = json.dumps(request, separators=(",", ":")).lower()
-                failed = request.get("model") == "hub-proxy-error" or "fixture:model-error" in request_text
-                if failed:
-                    response = {
-                        "id": "resp_proxy_fake_error",
-                        "object": "response",
-                        "model": request.get("model", "hub-proxy-smoke"),
-                        "status": "failed",
-                        "error": {
-                            "code": "fake_model_error",
-                            "message": "Deterministic fake provider failure."
-                        },
-                        "usage": {
-                            "input_tokens": 5,
-                            "output_tokens": 2,
-                            "total_tokens": 7,
-                            "input_tokens_details": {"cached_tokens": 1},
-                            "output_tokens_details": {"reasoning_tokens": 1}
-                        }
-                    }
-                else:
-                    response = {
-                        "id": "resp_proxy_fake_completed",
-                        "object": "response",
-                        "model": request.get("model", "hub-proxy-smoke"),
-                        "status": "completed",
-                        "output_text": "Fake Codex completed run through the Hub model proxy.",
-                        "usage": {
-                            "input_tokens": 11,
-                            "output_tokens": 7,
-                            "total_tokens": 18,
-                            "input_tokens_details": {"cached_tokens": 3},
-                            "output_tokens_details": {"reasoning_tokens": 5}
-                        }
-                    }
-                body = json.dumps(response).encode()
-                self.send_response(200)
-                self.send_header("content-type", "application/json")
-                self.send_header("content-length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, *_):
-                return
-
-        HTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+    command: ["python", "/app/fake-model-provider.py"]
+    volumes:
+      - ./fake-model-provider.py:/app/fake-model-provider.py:ro
 
   frontend:
     labels: *development-labels

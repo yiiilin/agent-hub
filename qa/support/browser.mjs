@@ -1,8 +1,30 @@
 import { existsSync } from 'node:fs';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, rename, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  assertArtifactTreeSafe,
+  redactSecrets,
+  sanitizeArtifactTree
+} from './secrets.mjs';
 
 const PLAYWRIGHT_MODULE = new URL('../../frontend/node_modules/playwright/index.mjs', import.meta.url);
+const FAILURE_MASK_SELECTOR = [
+  'input',
+  'textarea',
+  'select',
+  'code',
+  '[data-secret]',
+  '[data-sensitive]',
+  '[class*="secret" i]',
+  '[id*="secret" i]',
+  '[name*="token" i]',
+  '[name*="password" i]',
+  '[name*="api-key" i]',
+  '[aria-label*="secret" i]',
+  '[aria-label*="token" i]',
+  '[aria-label*="password" i]'
+].join(', ');
 
 function matchesHttpError(response, allowance) {
   const request = response.request();
@@ -32,7 +54,13 @@ export async function withBrowser(scenarioContext, options, run) {
     locale: 'en-US',
     viewport: { width: 1280, height: 800 }
   });
-  await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
+  const startTracing = context.tracing.start.bind(context.tracing);
+  // Scenarios may pause and restart tracing; never allow pixel screenshots into trace.zip.
+  context.tracing.start = (tracingOptions = {}) => startTracing({
+    ...tracingOptions,
+    screenshots: false
+  });
+  await context.tracing.start({ snapshots: true, sources: true });
   const page = await context.newPage();
   const browserErrors = [];
   const baseOrigin = new URL(scenarioContext.baseURL).origin;
@@ -73,16 +101,43 @@ export async function withBrowser(scenarioContext, options, run) {
     tracingStopped = true;
     return result;
   } catch (error) {
-    await page.screenshot({
-      path: `${scenarioContext.artifactsDir}/failure.png`,
-      fullPage: true
-    }).catch(() => undefined);
-    await writeFile(
-      `${scenarioContext.artifactsDir}/browser-errors.json`,
-      `${JSON.stringify(browserErrors, null, 2)}\n`
-    );
-    await context.tracing.stop({ path: `${scenarioContext.artifactsDir}/trace.zip` }).catch(() => undefined);
-    tracingStopped = true;
+    const temporaryScreenshot = join(scenarioContext.artifactsDir, '.failure.tmp.png');
+    const temporaryErrors = join(scenarioContext.artifactsDir, '.browser-errors.json.tmp');
+    const temporaryTrace = join(scenarioContext.artifactsDir, '.trace.zip.tmp');
+    const targetScreenshot = join(scenarioContext.artifactsDir, 'failure.png');
+    const targetErrors = join(scenarioContext.artifactsDir, 'browser-errors.json');
+    const targetTrace = join(scenarioContext.artifactsDir, 'trace.zip');
+    let screenshotSaved = false;
+    try {
+      screenshotSaved = await page.screenshot({
+        path: temporaryScreenshot,
+        type: 'png',
+        fullPage: true,
+        mask: [page.locator(FAILURE_MASK_SELECTOR)],
+        maskColor: '#000000'
+      }).then(() => true, () => false);
+      await writeFile(
+        temporaryErrors,
+        `${JSON.stringify(redactSecrets(browserErrors), null, 2)}\n`
+      );
+      await context.tracing.stop({ path: temporaryTrace });
+      tracingStopped = true;
+      await sanitizeArtifactTree(scenarioContext.artifactsDir);
+      await assertArtifactTreeSafe(scenarioContext.artifactsDir);
+      if (screenshotSaved) await rename(temporaryScreenshot, targetScreenshot);
+      await rename(temporaryErrors, targetErrors);
+      await rename(temporaryTrace, targetTrace);
+    } catch {
+      await Promise.all([
+        temporaryScreenshot,
+        temporaryErrors,
+        temporaryTrace,
+        targetScreenshot,
+        targetErrors,
+        targetTrace
+      ].map((path) => rm(path, { force: true }).catch(() => undefined)));
+      throw new Error('Browser failure artifact sanitization failed; unsafe artifacts were removed');
+    }
     throw error;
   } finally {
     if (!tracingStopped) await context.tracing.stop().catch(() => undefined);

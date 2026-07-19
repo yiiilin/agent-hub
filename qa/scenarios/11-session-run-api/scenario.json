@@ -1,0 +1,15 @@
+{
+  "name": "Session Run API lifecycle, steering, SSE, interruption, and isolation",
+  "type": "api",
+  "timeout_ms": 240000,
+  "covers": [
+    "SES-001",
+    "SES-002",
+    "SES-003",
+    "SES-004",
+    "SES-005",
+    "SES-006",
+    "SES-007",
+    "SES-008"
+  ]
+}

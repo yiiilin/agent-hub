@@ -496,6 +496,10 @@ fn build_router(state: AppState) -> Router {
             delete(delete_drained_runtime),
         )
         .route(
+            "/api/admin/runtimes/{runtime_id}/deletion-impact",
+            get(get_runtime_deletion_impact),
+        )
+        .route(
             "/api/admin/runtimes/{runtime_id}/force-delete",
             post(force_delete_runtime),
         )
@@ -708,7 +712,7 @@ fn openapi_document() -> Value {
                 "patch": { "summary": "Update authentication channel", "parameters": [id("channel_id")], "requestBody": body("UpdateAuthenticationChannelRequest"), "responses": { "200": response("AuthenticationChannel"), "400": { "$ref": "#/components/responses/BadRequest" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" } } }
             },
             "/api/auth/oidc/mock/start": { "get": { "summary": "Start mock OIDC login", "security": [], "parameters": [{ "name": "email", "in": "query", "required": false, "schema": { "type": "string", "format": "email" } }, { "name": "sub", "in": "query", "required": false, "schema": { "type": "string" } }], "responses": { "303": { "description": "Redirect to mock callback" }, "400": { "$ref": "#/components/responses/BadRequest" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
-            "/api/auth/oidc/mock/callback": { "get": { "summary": "Complete mock OIDC login", "security": [], "parameters": [{ "name": "state", "in": "query", "required": true, "schema": { "type": "string" } }], "responses": { "303": { "description": "Set session cookie and redirect to Agents" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
+            "/api/auth/oidc/mock/callback": { "get": { "summary": "Complete mock OIDC login", "security": [], "parameters": [{ "name": "state", "in": "query", "required": true, "schema": { "type": "string" } }], "responses": { "303": { "description": "Set session cookie and redirect to Sessions" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/auth/api-keys": {
                 "get": { "summary": "List API keys", "parameters": [
                     { "name": "page", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "default": 1 } },
@@ -829,6 +833,7 @@ fn openapi_document() -> Value {
             "/api/admin/runtimes/{runtime_id}/drain": { "post": { "summary": "Drain a Runtime after exact hostname confirmation", "parameters": [id("runtime_id")], "requestBody": body("ConfirmRuntimeHostnameRequest"), "responses": { "200": response("RuntimeDrainResponse"), "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/admin/runtimes/{runtime_id}/cancel-drain": { "post": { "summary": "Cancel Runtime drain without reacquiring released Sessions", "parameters": [id("runtime_id")], "responses": { "200": response("RuntimeDrainResponse"), "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/admin/runtimes/{runtime_id}": { "delete": { "summary": "Delete a fully drained Runtime after exact hostname confirmation", "parameters": [id("runtime_id")], "requestBody": body("ConfirmRuntimeHostnameRequest"), "responses": { "204": no_content(), "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
+            "/api/admin/runtimes/{runtime_id}/deletion-impact": { "get": { "summary": "Preview the current force-delete disposition of every owned Session", "parameters": [id("runtime_id")], "responses": { "200": response("RuntimeDeletionImpact"), "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/admin/runtimes/{runtime_id}/force-delete": { "post": { "summary": "Force delete a Runtime and invalidate owned Session generations", "parameters": [id("runtime_id")], "requestBody": body("ConfirmRuntimeHostnameRequest"), "responses": { "200": response("ForceDeleteRuntimeResponse"), "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/runtime/register": { "post": { "summary": "Consume a one-time enrollment token and create an immutable Runtime identity", "security": [{ "runtimeEnrollmentBearer": [] }], "requestBody": body("RuntimeRegisterRequest"), "responses": { "200": response("RuntimeRegisterResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" } } } },
             "/api/runtime/heartbeat": { "post": { "summary": "Heartbeat and complete staged Runtime credential rotation", "security": [{ "runtimeBearer": [] }], "requestBody": body("RuntimeHeartbeatRequest"), "responses": { "200": response("RuntimeHeartbeatResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
@@ -1070,6 +1075,8 @@ fn openapi_schemas() -> Value {
         "RuntimeSessionCheckpointDisposition": { "type": "object", "additionalProperties": false, "required": ["checkpoint_attempt_id", "disposition", "has_queued_work"], "properties": { "checkpoint_attempt_id": uuid(), "disposition": { "type": "string", "enum": ["resume", "retry"] }, "has_queued_work": { "type": "boolean" } } },
         "ConfirmRuntimeHostnameRequest": { "type": "object", "additionalProperties": false, "required": ["hostname"], "properties": { "hostname": { "type": "string" } } },
         "RuntimeDrainResponse": { "type": "object", "required": ["runtime", "owned_sessions"], "properties": { "runtime": { "$ref": "#/components/schemas/Runtime" }, "owned_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/HubSession" } } } },
+        "RuntimeDeletionImpactSession": { "type": "object", "additionalProperties": false, "required": ["session_id", "agent_name", "lifecycle_status", "force_delete_disposition"], "properties": { "session_id": uuid(), "agent_name": { "type": "string" }, "lifecycle_status": { "type": "string" }, "force_delete_disposition": { "type": "string", "enum": ["recoverable", "recovery_failed"] } } },
+        "RuntimeDeletionImpact": { "type": "object", "additionalProperties": false, "required": ["runtime_id", "hostname", "affected_sessions"], "properties": { "runtime_id": uuid(), "hostname": { "type": "string" }, "affected_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeDeletionImpactSession" } } } },
         "ForceDeleteRuntimeResponse": { "type": "object", "required": ["runtime_id", "recoverable_session_ids", "recovery_failed_session_ids"], "properties": { "runtime_id": uuid(), "recoverable_session_ids": { "type": "array", "items": uuid() }, "recovery_failed_session_ids": { "type": "array", "items": uuid() } } },
         "CreateEmbedSessionRequest": { "type": "object", "required": ["agent_id"], "properties": { "agent_id": uuid() } },
         "EmbedExchangeRequest": { "type": "object", "required": ["jwt"], "properties": { "jwt": { "type": "string" } } },
@@ -2368,7 +2375,7 @@ async fn oidc_mock_callback(
     )
     .await?;
     let headers = state.session_issuer.issue(&state, user.id).await?;
-    Ok((headers, Redirect::to("/agents")))
+    Ok((headers, Redirect::to("/sessions")))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -4336,6 +4343,19 @@ async fn delete_agent(
         .bind(agent_id)
         .execute(&mut *tx)
         .await?;
+        // Runtime writes lock Runtime before Session; keep the same order before
+        // the cleanup obligation foreign key and owned Session row locks below.
+        sqlx::query(
+            "SELECT runtimes.id
+             FROM runtimes
+             JOIN hub_sessions AS sessions ON sessions.runtime_owner_id = runtimes.id
+             WHERE sessions.agent_id = $1
+             ORDER BY runtimes.id
+             FOR UPDATE OF runtimes",
+        )
+        .bind(agent_id)
+        .fetch_all(&mut *tx)
+        .await?;
         let owned_sessions = sqlx::query(
             "SELECT id, runtime_owner_id, ownership_generation
              FROM hub_sessions
@@ -5635,7 +5655,7 @@ async fn drain_runtime(
     Path(runtime_id): Path<Uuid>,
     Json(req): Json<ConfirmRuntimeHostnameRequest>,
 ) -> Result<Json<RuntimeDrainResponse>, ApiError> {
-    require_administrator(&state, &headers).await?;
+    let administrator = require_administrator(&state, &headers).await?;
     let mut tx = state.pool.begin().await?;
     let runtime = sqlx::query("SELECT hostname FROM runtimes WHERE id = $1 FOR UPDATE")
         .bind(runtime_id)
@@ -5643,6 +5663,7 @@ async fn drain_runtime(
         .await?
         .ok_or(ApiError::not_found("runtime not found"))?;
     confirm_runtime_hostname(runtime.get("hostname"), &req.hostname)?;
+    require_runtime_session_authority_tx(&mut tx, runtime_id, &administrator).await?;
     sqlx::query("UPDATE runtimes SET status = 'draining' WHERE id = $1")
         .bind(runtime_id)
         .execute(&mut *tx)
@@ -5685,8 +5706,14 @@ async fn cancel_runtime_drain(
     headers: HeaderMap,
     Path(runtime_id): Path<Uuid>,
 ) -> Result<Json<RuntimeDrainResponse>, ApiError> {
-    require_administrator(&state, &headers).await?;
+    let administrator = require_administrator(&state, &headers).await?;
     let mut tx = state.pool.begin().await?;
+    sqlx::query("SELECT id FROM runtimes WHERE id = $1 FOR UPDATE")
+        .bind(runtime_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(ApiError::not_found("runtime not found"))?;
+    require_runtime_session_authority_tx(&mut tx, runtime_id, &administrator).await?;
     let updated = sqlx::query(
         "UPDATE runtimes
          SET status = CASE
@@ -5700,16 +5727,7 @@ async fn cancel_runtime_drain(
     .fetch_optional(&mut *tx)
     .await?;
     if updated.is_none() {
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM runtimes WHERE id = $1)")
-                .bind(runtime_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        return Err(if exists {
-            ApiError::conflict("runtime is not draining")
-        } else {
-            ApiError::not_found("runtime not found")
-        });
+        return Err(ApiError::conflict("runtime is not draining"));
     }
     let response = load_runtime_drain_response_tx(&mut tx, runtime_id).await?;
     tx.commit().await?;
@@ -5765,36 +5783,105 @@ async fn delete_drained_runtime(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn force_delete_runtime(
+struct RuntimeDeletionImpactSessionState {
+    impact: RuntimeDeletionImpactSessionDto,
+    ownership_generation: i64,
+    active_turn_id: Option<Uuid>,
+    recoverable: bool,
+}
+
+async fn require_runtime_session_authority_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    runtime_id: Uuid,
+    administrator: &UserDto,
+) -> Result<(), ApiError> {
+    if administrator.role == "super_admin" {
+        return Ok(());
+    }
+    let has_protected_sessions: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM hub_sessions AS sessions
+             LEFT JOIN users AS session_owner ON session_owner.id = sessions.owner_id
+             LEFT JOIN agents ON agents.id = sessions.agent_id
+             LEFT JOIN users AS agent_owner ON agent_owner.id = agents.owner_id
+             WHERE sessions.runtime_owner_id = $1
+               AND (session_owner.role = 'super_admin'
+                    OR agent_owner.role = 'super_admin')
+         )",
+    )
+    .bind(runtime_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if has_protected_sessions {
+        return Err(ApiError::forbidden(
+            "super administrator permission is required for a Runtime that owns protected Sessions",
+        ));
+    }
+    Ok(())
+}
+
+async fn get_runtime_deletion_impact(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(runtime_id): Path<Uuid>,
-    Json(req): Json<ConfirmRuntimeHostnameRequest>,
-) -> Result<Json<ForceDeleteRuntimeResponse>, ApiError> {
-    require_administrator(&state, &headers).await?;
+) -> Result<Json<RuntimeDeletionImpactDto>, ApiError> {
+    let administrator = require_administrator(&state, &headers).await?;
     let mut tx = state.pool.begin().await?;
-    let runtime = sqlx::query("SELECT hostname FROM runtimes WHERE id = $1 FOR UPDATE")
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let runtime = sqlx::query("SELECT hostname FROM runtimes WHERE id = $1")
         .bind(runtime_id)
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(ApiError::not_found("runtime not found"))?;
-    confirm_runtime_hostname(runtime.get("hostname"), &req.hostname)?;
-    let owned_sessions = sqlx::query(
-        "SELECT id, lifecycle_status, current_bundle_history_checkpoint,
-                ownership_generation, active_turn_id
-         FROM hub_sessions
-         WHERE runtime_owner_id = $1
-         ORDER BY created_at, id
-         FOR UPDATE",
-    )
-    .bind(runtime_id)
-    .fetch_all(&mut *tx)
-    .await?;
-    let mut recoverable_session_ids = Vec::new();
-    let mut recovery_failed_session_ids = Vec::new();
-    for session in owned_sessions {
-        let session_id: Uuid = session.get("id");
-        let bundle_checkpoint: Option<i64> = session.get("current_bundle_history_checkpoint");
+    require_runtime_session_authority_tx(&mut tx, runtime_id, &administrator).await?;
+    let affected_sessions = load_runtime_deletion_impact_sessions_tx(&mut tx, runtime_id, false)
+        .await?
+        .into_iter()
+        .map(|session| session.impact)
+        .collect();
+    let impact = RuntimeDeletionImpactDto {
+        runtime_id,
+        hostname: runtime.get("hostname"),
+        affected_sessions,
+    };
+    tx.commit().await?;
+    Ok(Json(impact))
+}
+
+async fn load_runtime_deletion_impact_sessions_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    runtime_id: Uuid,
+    lock_for_update: bool,
+) -> Result<Vec<RuntimeDeletionImpactSessionState>, ApiError> {
+    let query = if lock_for_update {
+        "SELECT sessions.id,
+                (SELECT name FROM agents WHERE agents.id = sessions.agent_id) AS agent_name,
+                sessions.lifecycle_status, sessions.current_bundle_history_checkpoint,
+                sessions.ownership_generation, sessions.active_turn_id
+         FROM hub_sessions AS sessions
+         WHERE sessions.runtime_owner_id = $1
+         ORDER BY sessions.created_at, sessions.id
+         FOR UPDATE OF sessions"
+    } else {
+        "SELECT sessions.id,
+                (SELECT name FROM agents WHERE agents.id = sessions.agent_id) AS agent_name,
+                sessions.lifecycle_status, sessions.current_bundle_history_checkpoint,
+                sessions.ownership_generation, sessions.active_turn_id
+         FROM hub_sessions AS sessions
+         WHERE sessions.runtime_owner_id = $1
+         ORDER BY sessions.created_at, sessions.id"
+    };
+    let rows = sqlx::query(query)
+        .bind(runtime_id)
+        .fetch_all(&mut **tx)
+        .await?;
+    let mut sessions = Vec::with_capacity(rows.len());
+    for row in rows {
+        let session_id: Uuid = row.get("id");
+        let bundle_checkpoint: Option<i64> = row.get("current_bundle_history_checkpoint");
         let has_unreplayable_history = if let Some(bundle_checkpoint) = bundle_checkpoint {
             sqlx::query_scalar(
                 "SELECT EXISTS(
@@ -5806,14 +5893,55 @@ async fn force_delete_runtime(
             )
             .bind(session_id)
             .bind(bundle_checkpoint)
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?
         } else {
             true
         };
         let recoverable = bundle_checkpoint.is_some() && !has_unreplayable_history;
-        if recoverable && session.get::<String, _>("lifecycle_status") == "restoring" {
-            let released_ownership_generation = session.get::<i64, _>("ownership_generation") + 1;
+        sessions.push(RuntimeDeletionImpactSessionState {
+            impact: RuntimeDeletionImpactSessionDto {
+                session_id,
+                agent_name: row.get("agent_name"),
+                lifecycle_status: row.get("lifecycle_status"),
+                force_delete_disposition: if recoverable {
+                    "recoverable".into()
+                } else {
+                    "recovery_failed".into()
+                },
+            },
+            ownership_generation: row.get("ownership_generation"),
+            active_turn_id: row.get("active_turn_id"),
+            recoverable,
+        });
+    }
+    Ok(sessions)
+}
+
+async fn force_delete_runtime(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(runtime_id): Path<Uuid>,
+    Json(req): Json<ConfirmRuntimeHostnameRequest>,
+) -> Result<Json<ForceDeleteRuntimeResponse>, ApiError> {
+    let administrator = require_administrator(&state, &headers).await?;
+    let mut tx = state.pool.begin().await?;
+    let runtime = sqlx::query("SELECT hostname FROM runtimes WHERE id = $1 FOR UPDATE")
+        .bind(runtime_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(ApiError::not_found("runtime not found"))?;
+    confirm_runtime_hostname(runtime.get("hostname"), &req.hostname)?;
+    require_runtime_session_authority_tx(&mut tx, runtime_id, &administrator).await?;
+    let owned_sessions =
+        load_runtime_deletion_impact_sessions_tx(&mut tx, runtime_id, true).await?;
+    let mut recoverable_session_ids = Vec::new();
+    let mut recovery_failed_session_ids = Vec::new();
+    for session in owned_sessions {
+        let session_id = session.impact.session_id;
+        let recoverable = session.recoverable;
+        if recoverable && session.impact.lifecycle_status == "restoring" {
+            let released_ownership_generation = session.ownership_generation + 1;
             let requeued_runs = sqlx::query(
                 "UPDATE runs AS recoverable_runs
                  SET status = 'pending', runtime_id = NULL,
@@ -5884,7 +6012,7 @@ async fn force_delete_runtime(
             )
             .await?;
         }
-        if let Some(active_turn_id) = session.get::<Option<Uuid>, _>("active_turn_id") {
+        if let Some(active_turn_id) = session.active_turn_id {
             sqlx::query(
                 "UPDATE hub_session_turns
                  SET status = 'failed', ended_at = COALESCE(ended_at, now()), updated_at = now()
@@ -8091,11 +8219,19 @@ async fn runtime_release_session(
     validate_ownership_generation(req.ownership_generation)?;
     let runtime_id = require_runtime(&state, &headers).await?;
     let mut tx = state.pool.begin().await?;
+    sqlx::query("SELECT id FROM runtimes WHERE id = $1 FOR UPDATE")
+        .bind(runtime_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(ApiError::unauthorized(
+            "runtime is not active or its credential is invalid",
+        ))?;
     let session = sqlx::query(
         "SELECT runtime_owner_id, ownership_generation, lifecycle_status, active_turn_id,
+                saving_history_checkpoint, saving_ownership_generation,
                 saving_checkpoint_attempt_id, current_bundle_history_checkpoint,
                 current_bundle_ownership_generation,
-                current_bundle_checkpoint_attempt_id
+                current_bundle_checkpoint_attempt_id, current_bundle_runtime_id
          FROM hub_sessions
          WHERE id = $1
          FOR UPDATE",
@@ -8133,14 +8269,28 @@ async fn runtime_release_session(
     let bundle_checkpoint: Option<i64> = session.get("current_bundle_history_checkpoint");
     let bundle_ownership_generation: Option<i64> =
         session.get("current_bundle_ownership_generation");
-    if session.get::<String, _>("lifecycle_status") != "saving"
-        || bundle_checkpoint.is_none()
+    let lifecycle_status: String = session.get("lifecycle_status");
+    let release_state_is_current = match lifecycle_status.as_str() {
+        "online" => true,
+        "saving" => {
+            session.get::<Option<i64>, _>("saving_history_checkpoint") == bundle_checkpoint
+                && session.get::<Option<i64>, _>("saving_ownership_generation")
+                    == Some(req.ownership_generation)
+                && session
+                    .get::<Option<Uuid>, _>("saving_checkpoint_attempt_id")
+                    .is_some()
+                && session.get::<Option<Uuid>, _>("current_bundle_checkpoint_attempt_id")
+                    == session.get::<Option<Uuid>, _>("saving_checkpoint_attempt_id")
+        }
+        _ => false,
+    };
+    if bundle_checkpoint.is_none()
         || bundle_ownership_generation != Some(req.ownership_generation)
-        || session.get::<Option<Uuid>, _>("current_bundle_checkpoint_attempt_id")
-            != session.get::<Option<Uuid>, _>("saving_checkpoint_attempt_id")
+        || session.get::<Option<Uuid>, _>("current_bundle_runtime_id") != Some(runtime_id)
+        || !release_state_is_current
     {
         return Err(ApiError::conflict(
-            "current Session Bundle does not cover this saving attempt and ownership generation",
+            "current Session Bundle does not cover this ownership state and generation",
         ));
     }
     let has_unreplayable_history: bool = sqlx::query_scalar(
@@ -16836,6 +16986,7 @@ mod tests {
             "/api/admin/runtimes/{runtime_id}/drain",
             "/api/admin/runtimes/{runtime_id}/cancel-drain",
             "/api/admin/runtimes/{runtime_id}",
+            "/api/admin/runtimes/{runtime_id}/deletion-impact",
             "/api/admin/runtimes/{runtime_id}/force-delete",
             "/api/runtime/register",
             "/api/runtime/heartbeat",
@@ -16898,6 +17049,28 @@ mod tests {
         assert_eq!(
             document["paths"]["/api/runtime/heartbeat"]["post"]["security"],
             json!([{ "runtimeBearer": [] }])
+        );
+        let deletion_impact =
+            &document["paths"]["/api/admin/runtimes/{runtime_id}/deletion-impact"]["get"];
+        assert_eq!(
+            deletion_impact["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/RuntimeDeletionImpact"
+        );
+        for status in ["200", "403", "404"] {
+            assert!(
+                deletion_impact["responses"].get(status).is_some(),
+                "missing Runtime deletion impact response {status}"
+            );
+        }
+        assert_eq!(
+            document["components"]["schemas"]["RuntimeDeletionImpactSession"]["properties"]
+                ["force_delete_disposition"]["enum"],
+            json!(["recoverable", "recovery_failed"])
+        );
+        assert_eq!(
+            document["components"]["schemas"]["RuntimeDeletionImpact"]["properties"]
+                ["affected_sessions"]["items"]["$ref"],
+            "#/components/schemas/RuntimeDeletionImpactSession"
         );
         assert_eq!(
             document["paths"]["/api/runtime/sessions/{session_id}/release"]["post"]["security"],
@@ -20978,6 +21151,86 @@ mod tests {
             runtime_claim_run_state(&fixture.state.pool, fixture.run_id).await,
             ("failed".into(), None, None)
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn deleting_agent_locks_runtime_before_owned_session_without_heartbeat_deadlock(
+        pool: PgPool,
+    ) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM agents WHERE id = $1")
+            .bind(fixture.agent_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        let session_token = format!("ahs_{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO sessions (token_hash, user_id, expires_at)
+             VALUES ($1, $2, now() + interval '1 hour')",
+        )
+        .bind(sha256_hex(&session_token))
+        .bind(owner_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET runtime_owner_id = $1, ownership_generation = 1,
+                 lifecycle_status = 'online'
+             WHERE id = $2",
+        )
+        .bind(fixture.runtime_id)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        let mut heartbeat_tx = fixture.state.pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM runtimes WHERE id = $1 FOR UPDATE")
+            .bind(fixture.runtime_id)
+            .fetch_one(&mut *heartbeat_tx)
+            .await
+            .unwrap();
+
+        let delete_application = format!("agent-delete-runtime-{}", Uuid::new_v4().simple());
+        let delete_state = Arc::new(test_state_with_browser_session_auth(
+            postgres_test_pool_with_application_name(&fixture.state.pool, &delete_application)
+                .await,
+        ));
+        let agent_id = fixture.agent_id;
+        let delete_headers = session_headers(&session_token);
+        let mut delete_task = tokio::spawn(async move {
+            delete_agent(State(delete_state), delete_headers, Path(agent_id)).await
+        });
+        assert!(
+            wait_for_application_lock(&fixture.state.pool, &delete_application, "").await,
+            "Agent deletion must wait while heartbeat holds the Runtime lock"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut delete_task)
+                .await
+                .is_err(),
+            "Agent deletion must remain pending until heartbeat releases the Runtime"
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            sqlx::query("UPDATE hub_sessions SET updated_at = now() WHERE id = $1")
+                .bind(fixture.hub_session_id)
+                .execute(&mut *heartbeat_tx),
+        )
+        .await
+        .expect("heartbeat Session update should not deadlock with Agent deletion")
+        .expect("heartbeat Session update should succeed");
+        heartbeat_tx.commit().await.unwrap();
+
+        let deleted = tokio::time::timeout(Duration::from_secs(3), &mut delete_task)
+            .await
+            .expect("Agent deletion should not deadlock with heartbeat")
+            .expect("Agent deletion task should not panic")
+            .expect("Agent deletion should complete normally");
+        assert_eq!(deleted, StatusCode::NO_CONTENT);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -25200,6 +25453,17 @@ mod tests {
         .await
         .unwrap()
         .0;
+        sqlx::query(
+            "INSERT INTO hub_session_messages
+                 (id, session_id, role, message_kind, content, delivery_mode, delivery_state)
+             VALUES ($1, $2, 'user', 'message', 'queued after Bundle checkpoint',
+                     'next_turn', 'queued')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
         let _ = insert_pending_session_run(&fixture.state.pool, fixture.hub_session_id).await;
 
         let put_count = Arc::new(AtomicU64::new(0));
@@ -25289,8 +25553,18 @@ mod tests {
         assert_eq!(replayed, committed);
         assert_eq!(put_count.load(Ordering::SeqCst), 1);
         assert_eq!(delete_count.load(Ordering::SeqCst), 0);
-        let session: (Option<Uuid>, String, Option<i64>) = sqlx::query_as(
-            "SELECT runtime_owner_id, lifecycle_status, current_bundle_generation
+        type SessionBundleRow = (
+            Option<Uuid>,
+            String,
+            Option<Uuid>,
+            Option<i64>,
+            Option<i64>,
+            Option<Uuid>,
+        );
+        let session: SessionBundleRow = sqlx::query_as(
+            "SELECT runtime_owner_id, lifecycle_status, saving_checkpoint_attempt_id,
+                        current_bundle_generation, current_bundle_ownership_generation,
+                        current_bundle_runtime_id
              FROM hub_sessions WHERE id = $1",
         )
         .bind(fixture.hub_session_id)
@@ -25299,7 +25573,168 @@ mod tests {
         .unwrap();
         assert_eq!(
             session,
-            (Some(fixture.runtime_id), "online".into(), Some(1))
+            (
+                Some(fixture.runtime_id),
+                "online".into(),
+                None,
+                Some(1),
+                Some(1),
+                Some(fixture.runtime_id)
+            )
+        );
+        let stale_generation = runtime_release_session(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(fixture.hub_session_id),
+            Json(ReleaseRuntimeSessionRequest {
+                ownership_generation: 2,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale_generation.status, StatusCode::FORBIDDEN);
+
+        let foreign_runtime_id = Uuid::new_v4();
+        let foreign_runtime_token = format!("ahrt_{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO runtimes
+                 (id, token_hash, hostname, labels, codex_version, capabilities,
+                  sandbox_mode, status)
+             VALUES ($1, $2, $3, '{}', 'test', '{}'::jsonb,
+                     'workspace-write', 'online')",
+        )
+        .bind(foreign_runtime_id)
+        .bind(sha256_hex(&foreign_runtime_token))
+        .bind(format!("release-foreign-{}", Uuid::new_v4().simple()))
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let stale_owner = runtime_release_session(
+            State(fixture.state.clone()),
+            bearer_headers(&foreign_runtime_token),
+            Path(fixture.hub_session_id),
+            Json(ReleaseRuntimeSessionRequest {
+                ownership_generation: 1,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale_owner.status, StatusCode::FORBIDDEN);
+
+        sqlx::query(
+            "UPDATE hub_sessions SET current_bundle_ownership_generation = 2 WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let stale_bundle_generation = runtime_release_session(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(fixture.hub_session_id),
+            Json(ReleaseRuntimeSessionRequest {
+                ownership_generation: 1,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale_bundle_generation.status, StatusCode::CONFLICT);
+        sqlx::query(
+            "UPDATE hub_sessions SET current_bundle_ownership_generation = 1 WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        sqlx::query("UPDATE hub_sessions SET active_turn_id = $1 WHERE id = $2")
+            .bind(fixture.turn_id)
+            .bind(fixture.hub_session_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        let active_turn = runtime_release_session(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(fixture.hub_session_id),
+            Json(ReleaseRuntimeSessionRequest {
+                ownership_generation: 1,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(active_turn.status, StatusCode::CONFLICT);
+        sqlx::query("UPDATE hub_sessions SET active_turn_id = NULL WHERE id = $1")
+            .bind(fixture.hub_session_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+
+        let unreplayable_message_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO hub_session_messages
+                 (id, session_id, role, message_kind, content, delivery_mode, delivery_state)
+             VALUES ($1, $2, 'user', 'message', 'delivered after Bundle checkpoint',
+                     'record_only', 'delivered')",
+        )
+        .bind(unreplayable_message_id)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let unreplayable = runtime_release_session(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(fixture.hub_session_id),
+            Json(ReleaseRuntimeSessionRequest {
+                ownership_generation: 1,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unreplayable.status, StatusCode::CONFLICT);
+        sqlx::query("UPDATE hub_session_messages SET delivery_state = 'failed' WHERE id = $1")
+            .bind(unreplayable_message_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM runtime_session_cleanup_obligations
+                 WHERE runtime_id = $1 AND session_id = $2 AND ownership_generation = 1",
+            )
+            .bind(fixture.runtime_id)
+            .bind(fixture.hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            0
+        );
+        let released = runtime_release_session(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(fixture.hub_session_id),
+            Json(ReleaseRuntimeSessionRequest {
+                ownership_generation: 1,
+            }),
+        )
+        .await
+        .expect("a retained owner can explicitly release its current Bundle generation")
+        .0;
+        assert_eq!(released.runtime_owner_id, None);
+        assert_eq!(released.ownership_generation, 1);
+        assert_eq!(released.lifecycle_status, "waiting_for_runtime");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM runtime_session_cleanup_obligations
+                 WHERE runtime_id = $1 AND session_id = $2 AND ownership_generation = 1",
+            )
+            .bind(fixture.runtime_id)
+            .bind(fixture.hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            1
         );
         server.abort();
     }
@@ -26359,6 +26794,58 @@ mod tests {
         .unwrap_err();
         assert_eq!(stale_owner.status, StatusCode::CONFLICT);
         stale_owner_tx.rollback().await.unwrap();
+
+        sqlx::query(
+            "UPDATE hub_session_messages SET delivery_state = 'failed'
+             WHERE session_id = $1 AND sequence = $2",
+        )
+        .bind(fixture.hub_session_id)
+        .bind(new_checkpoint)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE hub_session_messages SET delivery_state = 'failed'
+             WHERE session_id = $1 AND delivery_state = 'queued'",
+        )
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE runs SET status = 'failed'
+             WHERE hub_session_id = $1 AND status = 'pending'",
+        )
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let released = runtime_release_session(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(fixture.hub_session_id),
+            Json(ReleaseRuntimeSessionRequest {
+                ownership_generation: 1,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(released.runtime_owner_id, None);
+        assert_eq!(released.ownership_generation, 1);
+        assert_eq!(released.lifecycle_status, "offline");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM runtime_session_cleanup_obligations
+                 WHERE runtime_id = $1 AND session_id = $2 AND ownership_generation = 1",
+            )
+            .bind(fixture.runtime_id)
+            .bind(fixture.hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            1
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -27495,6 +27982,43 @@ mod tests {
         .await
         .unwrap();
 
+        let cleanup_blocked = delete_drained_runtime(
+            State(admin_state.clone()),
+            session_headers(&admin_token),
+            Path(fixture.runtime_id),
+            Json(ConfirmRuntimeHostnameRequest {
+                hostname: hostname.clone(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(cleanup_blocked.status, StatusCode::CONFLICT);
+        let cleanup = RuntimeOwnedSessionGenerationDto {
+            session_id: fixture.hub_session_id,
+            ownership_generation: 1,
+        };
+        let dispatched = runtime_heartbeat(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Json(RuntimeHeartbeatRequest::default()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(dispatched.cleanup_sessions, vec![cleanup.clone()]);
+        let acknowledged = runtime_heartbeat(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Json(RuntimeHeartbeatRequest {
+                cleaned_sessions: vec![cleanup],
+                ..RuntimeHeartbeatRequest::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(acknowledged.cleanup_sessions.is_empty());
+
         assert_eq!(
             delete_drained_runtime(
                 State(admin_state),
@@ -27521,6 +28045,237 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(old_credential.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn explicit_release_locks_runtime_before_session_and_force_delete_does_not_deadlock(
+        pool: PgPool,
+    ) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let checkpoint_attempt_id = Uuid::new_v4();
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET runtime_owner_id = $1, ownership_generation = 1,
+                 lifecycle_status = 'online', active_turn_id = NULL,
+                 current_bundle_generation = 1,
+                 current_bundle_object_key = 'hub/bundles/release-force-delete.tar.zst',
+                 current_bundle_checksum_sha256 = $2, current_bundle_size_bytes = 1,
+                 current_bundle_history_checkpoint = history_checkpoint,
+                 current_bundle_ownership_generation = 1,
+                 current_bundle_producing_codex_version = 'test',
+                 current_bundle_created_at = now(),
+                 current_bundle_checkpoint_attempt_id = $3,
+                 current_bundle_runtime_id = $1
+             WHERE id = $4",
+        )
+        .bind(fixture.runtime_id)
+        .bind("a".repeat(64))
+        .bind(checkpoint_attempt_id)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let hostname: String = sqlx::query_scalar("SELECT hostname FROM runtimes WHERE id = $1")
+            .bind(fixture.runtime_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        let admin_token = create_super_admin_session(&fixture.state.pool).await;
+
+        let mut session_gate = fixture.state.pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM hub_sessions WHERE id = $1 FOR UPDATE")
+            .bind(fixture.hub_session_id)
+            .fetch_one(&mut *session_gate)
+            .await
+            .unwrap();
+
+        let release_application = format!("release-force-delete-{}", Uuid::new_v4().simple());
+        let release_state = Arc::new(test_state_with_pool(
+            postgres_test_pool_with_application_name(&fixture.state.pool, &release_application)
+                .await,
+        ));
+        let runtime_token = fixture.runtime_token.clone();
+        let session_id = fixture.hub_session_id;
+        let mut release_task = tokio::spawn(async move {
+            runtime_release_session(
+                State(release_state),
+                bearer_headers(&runtime_token),
+                Path(session_id),
+                Json(ReleaseRuntimeSessionRequest {
+                    ownership_generation: 1,
+                }),
+            )
+            .await
+        });
+        let release_waited_for_session = wait_for_application_lock(
+            &fixture.state.pool,
+            &release_application,
+            "SELECT runtime_owner_id, ownership_generation, lifecycle_status",
+        )
+        .await;
+
+        let delete_application = format!("force-delete-release-{}", Uuid::new_v4().simple());
+        let delete_state = Arc::new(test_state_with_browser_session_auth(
+            postgres_test_pool_with_application_name(&fixture.state.pool, &delete_application)
+                .await,
+        ));
+        let runtime_id = fixture.runtime_id;
+        let mut delete_task = tokio::spawn(async move {
+            force_delete_runtime(
+                State(delete_state),
+                session_headers(&admin_token),
+                Path(runtime_id),
+                Json(ConfirmRuntimeHostnameRequest { hostname }),
+            )
+            .await
+        });
+        let force_delete_waited_for_runtime = wait_for_application_lock(
+            &fixture.state.pool,
+            &delete_application,
+            "SELECT hostname FROM runtimes",
+        )
+        .await;
+
+        session_gate.commit().await.unwrap();
+        let release = tokio::time::timeout(Duration::from_secs(5), &mut release_task)
+            .await
+            .expect("explicit release should not deadlock with force delete")
+            .expect("explicit release task should not panic")
+            .expect("explicit release should complete normally")
+            .0;
+        let deleted = tokio::time::timeout(Duration::from_secs(5), &mut delete_task)
+            .await
+            .expect("force delete should not deadlock with explicit release")
+            .expect("force delete task should not panic")
+            .expect("force delete should complete normally")
+            .0;
+
+        assert!(
+            release_waited_for_session,
+            "explicit release must reach and wait for the locked Session"
+        );
+        assert!(
+            force_delete_waited_for_runtime,
+            "force delete must wait for Runtime while explicit release waits for Session"
+        );
+        assert_eq!(release.runtime_owner_id, None);
+        assert_eq!(release.ownership_generation, 1);
+        assert!(deleted.recoverable_session_ids.is_empty());
+        assert!(deleted.recovery_failed_session_ids.is_empty());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn ordinary_administrator_cannot_affect_runtime_with_super_admin_session(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        sqlx::query(
+            "UPDATE users
+             SET role = 'super_admin'
+             WHERE id = (SELECT owner_id FROM hub_sessions WHERE id = $1)",
+        )
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET runtime_owner_id = $1, lifecycle_status = 'online', ownership_generation = 1
+             WHERE id = $2",
+        )
+        .bind(fixture.runtime_id)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let hostname: String = sqlx::query_scalar("SELECT hostname FROM runtimes WHERE id = $1")
+            .bind(fixture.runtime_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        let admin_token = create_user_session_with_role(&fixture.state.pool, "admin").await;
+        let state = Arc::new(test_state_with_browser_session_auth(
+            fixture.state.pool.clone(),
+        ));
+
+        let preview_forbidden = get_runtime_deletion_impact(
+            State(state.clone()),
+            session_headers(&admin_token),
+            Path(fixture.runtime_id),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(preview_forbidden.status, StatusCode::FORBIDDEN);
+
+        let drain_forbidden = drain_runtime(
+            State(state.clone()),
+            session_headers(&admin_token),
+            Path(fixture.runtime_id),
+            Json(ConfirmRuntimeHostnameRequest {
+                hostname: hostname.clone(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(drain_forbidden.status, StatusCode::FORBIDDEN);
+
+        sqlx::query("UPDATE runtimes SET status = 'draining' WHERE id = $1")
+            .bind(fixture.runtime_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        let cancel_forbidden = cancel_runtime_drain(
+            State(state.clone()),
+            session_headers(&admin_token),
+            Path(fixture.runtime_id),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(cancel_forbidden.status, StatusCode::FORBIDDEN);
+
+        let force_forbidden = force_delete_runtime(
+            State(state.clone()),
+            session_headers(&admin_token),
+            Path(fixture.runtime_id),
+            Json(ConfirmRuntimeHostnameRequest { hostname }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(force_forbidden.status, StatusCode::FORBIDDEN);
+
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM runtimes WHERE id = $1")
+                .bind(fixture.runtime_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap(),
+            "draining"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<Uuid>>(
+                "SELECT runtime_owner_id FROM hub_sessions WHERE id = $1",
+            )
+            .bind(fixture.hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            Some(fixture.runtime_id)
+        );
+
+        let super_admin_token = create_super_admin_session(&fixture.state.pool).await;
+        let impact = get_runtime_deletion_impact(
+            State(state),
+            session_headers(&super_admin_token),
+            Path(fixture.runtime_id),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(impact.affected_sessions.len(), 1);
+        assert_eq!(
+            impact.affected_sessions[0].session_id,
+            fixture.hub_session_id
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -27653,7 +28408,111 @@ mod tests {
         .await
         .unwrap();
 
-        let admin_token = create_super_admin_session(&fixture.state.pool).await;
+        let foreign_owner_id = Uuid::new_v4();
+        let foreign_agent_id = Uuid::new_v4();
+        let foreign_unique = Uuid::new_v4().simple().to_string();
+        sqlx::query(
+            "INSERT INTO users
+                 (id, username, email, password, email_verified, display_name, role)
+             VALUES ($1, $2, $3, 'unused', true, 'Deletion Impact Foreign Owner', 'member')",
+        )
+        .bind(foreign_owner_id)
+        .bind(format!("deletion-impact-{foreign_unique}"))
+        .bind(format!("deletion-impact-{foreign_unique}@example.com"))
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agents (id, owner_id, name, instructions, visibility)
+             VALUES ($1, $2, 'Deletion Impact Foreign Agent', 'test', 'private')",
+        )
+        .bind(foreign_agent_id)
+        .bind(foreign_owner_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let delivering_session_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO hub_sessions
+                 (id, owner_id, agent_id, origin_kind, lifecycle_status,
+                  runtime_owner_id, ownership_generation)
+             VALUES ($1, $2, $3, 'hub_native', 'online', $4, 1)",
+        )
+        .bind(delivering_session_id)
+        .bind(foreign_owner_id)
+        .bind(foreign_agent_id)
+        .bind(fixture.runtime_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let delivering_attempt = runtime_begin_session_checkpoint(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(delivering_session_id),
+            Json(BeginRuntimeSessionCheckpointRequest {
+                ownership_generation: 1,
+                reason: "idle".into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let mut delivering_commit_tx = fixture.state.pool.begin().await.unwrap();
+        commit_session_bundle_metadata_tx(
+            &mut delivering_commit_tx,
+            fixture.runtime_id,
+            delivering_session_id,
+            1,
+            "hub/bundles/force-delete-delivering.tar.zst",
+            &SessionBundleCommitMetadata {
+                checkpoint_attempt_id: delivering_attempt.checkpoint_attempt_id,
+                bundle_generation: 1,
+                checksum_sha256: "force-delete-delivering".into(),
+                size_bytes: 1,
+                history_checkpoint: 0,
+                producing_codex_version: "test".into(),
+                created_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        delivering_commit_tx.commit().await.unwrap();
+        let delivering_history_checkpoint: i64 = sqlx::query_scalar(
+            "INSERT INTO hub_session_messages
+                 (id, session_id, role, message_kind, content, delivery_mode, delivery_state)
+             VALUES ($1, $2, 'user', 'message', 'delivering after Bundle',
+                     'record_only', 'delivering')
+             RETURNING sequence",
+        )
+        .bind(Uuid::new_v4())
+        .bind(delivering_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET history_checkpoint = $1
+             WHERE id = $2",
+        )
+        .bind(delivering_history_checkpoint)
+        .bind(delivering_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE hub_sessions SET created_at = '2026-07-18T00:00:00Z'
+             WHERE id IN ($1, $2, $3, $4)",
+        )
+        .bind(fixture.hub_session_id)
+        .bind(checkpointed_session_id)
+        .bind(stale_bundle_session_id)
+        .bind(delivering_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        let admin_token = create_user_session_with_role(&fixture.state.pool, "admin").await;
+        let member_token = create_user_session_with_role(&fixture.state.pool, "member").await;
         let admin_state = Arc::new(test_state_with_browser_session_auth(
             fixture.state.pool.clone(),
         ));
@@ -27662,6 +28521,171 @@ mod tests {
             .fetch_one(&fixture.state.pool)
             .await
             .unwrap();
+        let forbidden = get_runtime_deletion_impact(
+            State(admin_state.clone()),
+            session_headers(&member_token),
+            Path(fixture.runtime_id),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(forbidden.status, StatusCode::FORBIDDEN);
+        let missing = get_runtime_deletion_impact(
+            State(admin_state.clone()),
+            session_headers(&admin_token),
+            Path(Uuid::new_v4()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing.status, StatusCode::NOT_FOUND);
+
+        let runtime_state_before: Value = sqlx::query_scalar(
+            "SELECT jsonb_build_object(
+                 'hostname', hostname, 'status', status,
+                 'last_heartbeat_at', last_heartbeat_at,
+                 'rotation_requested_at', rotation_requested_at)
+             FROM runtimes WHERE id = $1",
+        )
+        .bind(fixture.runtime_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        let session_state_before: Value = sqlx::query_scalar(
+            "SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                 'id', id, 'lifecycle_status', lifecycle_status,
+                 'runtime_owner_id', runtime_owner_id,
+                 'ownership_generation', ownership_generation,
+                 'active_turn_id', active_turn_id,
+                 'history_checkpoint', history_checkpoint,
+                 'current_bundle_history_checkpoint', current_bundle_history_checkpoint)
+                 ORDER BY created_at, id), '[]'::jsonb)
+             FROM hub_sessions WHERE runtime_owner_id = $1",
+        )
+        .bind(fixture.runtime_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        let run_state_before: Value = sqlx::query_scalar(
+            "SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                 'id', id, 'status', status, 'runtime_id', runtime_id,
+                 'session_ownership_generation', session_ownership_generation)
+                 ORDER BY id), '[]'::jsonb)
+             FROM runs WHERE runtime_id = $1",
+        )
+        .bind(fixture.runtime_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        let impact = get_runtime_deletion_impact(
+            State(admin_state.clone()),
+            session_headers(&admin_token),
+            Path(fixture.runtime_id),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(impact.runtime_id, fixture.runtime_id);
+        assert_eq!(impact.hostname, hostname);
+        let mut expected_session_ids = vec![
+            fixture.hub_session_id,
+            checkpointed_session_id,
+            stale_bundle_session_id,
+            delivering_session_id,
+        ];
+        expected_session_ids.sort_unstable();
+        assert_eq!(
+            impact
+                .affected_sessions
+                .iter()
+                .map(|session| session.session_id)
+                .collect::<Vec<_>>(),
+            expected_session_ids
+        );
+        let dispositions = impact
+            .affected_sessions
+            .iter()
+            .map(|session| {
+                (
+                    session.session_id,
+                    session.force_delete_disposition.as_str(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(dispositions[&fixture.hub_session_id], "recovery_failed");
+        assert_eq!(dispositions[&checkpointed_session_id], "recoverable");
+        assert_eq!(dispositions[&stale_bundle_session_id], "recovery_failed");
+        assert_eq!(dispositions[&delivering_session_id], "recovery_failed");
+        assert_eq!(
+            impact
+                .affected_sessions
+                .iter()
+                .find(|session| session.session_id == delivering_session_id)
+                .unwrap()
+                .agent_name,
+            "Deletion Impact Foreign Agent"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(DISTINCT owner_id) FROM hub_sessions WHERE runtime_owner_id = $1",
+            )
+            .bind(fixture.runtime_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            2
+        );
+        let runtime_state_after: Value = sqlx::query_scalar(
+            "SELECT jsonb_build_object(
+                 'hostname', hostname, 'status', status,
+                 'last_heartbeat_at', last_heartbeat_at,
+                 'rotation_requested_at', rotation_requested_at)
+             FROM runtimes WHERE id = $1",
+        )
+        .bind(fixture.runtime_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        let session_state_after: Value = sqlx::query_scalar(
+            "SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                 'id', id, 'lifecycle_status', lifecycle_status,
+                 'runtime_owner_id', runtime_owner_id,
+                 'ownership_generation', ownership_generation,
+                 'active_turn_id', active_turn_id,
+                 'history_checkpoint', history_checkpoint,
+                 'current_bundle_history_checkpoint', current_bundle_history_checkpoint)
+                 ORDER BY created_at, id), '[]'::jsonb)
+             FROM hub_sessions WHERE runtime_owner_id = $1",
+        )
+        .bind(fixture.runtime_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        let run_state_after: Value = sqlx::query_scalar(
+            "SELECT COALESCE(jsonb_agg(jsonb_build_object(
+                 'id', id, 'status', status, 'runtime_id', runtime_id,
+                 'session_ownership_generation', session_ownership_generation)
+                 ORDER BY id), '[]'::jsonb)
+             FROM runs WHERE runtime_id = $1",
+        )
+        .bind(fixture.runtime_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(runtime_state_after, runtime_state_before);
+        assert_eq!(session_state_after, session_state_before);
+        assert_eq!(run_state_after, run_state_before);
+
+        let preview_recoverable_session_ids = impact
+            .affected_sessions
+            .iter()
+            .filter(|session| session.force_delete_disposition == "recoverable")
+            .map(|session| session.session_id)
+            .collect::<Vec<_>>();
+        let preview_recovery_failed_session_ids = impact
+            .affected_sessions
+            .iter()
+            .filter(|session| session.force_delete_disposition == "recovery_failed")
+            .map(|session| session.session_id)
+            .collect::<Vec<_>>();
         let mismatch = force_delete_runtime(
             State(admin_state.clone()),
             session_headers(&admin_token),
@@ -27685,25 +28709,23 @@ mod tests {
         .0;
         assert_eq!(
             deleted.recoverable_session_ids,
-            vec![checkpointed_session_id]
+            preview_recoverable_session_ids
         );
-        assert_eq!(deleted.recovery_failed_session_ids.len(), 2);
-        assert!(deleted
-            .recovery_failed_session_ids
-            .contains(&fixture.hub_session_id));
-        assert!(deleted
-            .recovery_failed_session_ids
-            .contains(&stale_bundle_session_id));
+        assert_eq!(
+            deleted.recovery_failed_session_ids,
+            preview_recovery_failed_session_ids
+        );
 
         let rows = sqlx::query(
             "SELECT id, lifecycle_status, runtime_owner_id, ownership_generation,
                     active_turn_id, recovery_error, current_bundle_generation
              FROM hub_sessions
-             WHERE id IN ($1, $2, $3)",
+             WHERE id IN ($1, $2, $3, $4)",
         )
         .bind(fixture.hub_session_id)
         .bind(checkpointed_session_id)
         .bind(stale_bundle_session_id)
+        .bind(delivering_session_id)
         .fetch_all(&fixture.state.pool)
         .await
         .unwrap();
@@ -27734,10 +28756,10 @@ mod tests {
                 assert!(row.get::<Option<String>, _>("recovery_error").is_some());
                 assert_eq!(
                     row.get::<Option<i64>, _>("current_bundle_generation"),
-                    if session_id == stale_bundle_session_id {
-                        Some(1)
-                    } else {
+                    if session_id == fixture.hub_session_id {
                         None
+                    } else {
+                        Some(1)
                     }
                 );
             }

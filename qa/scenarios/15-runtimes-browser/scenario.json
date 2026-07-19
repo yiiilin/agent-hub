@@ -1,0 +1,12 @@
+{
+  "name": "Runtime enrollment, administration, deletion impact, and recovery browser workflows",
+  "type": "browser",
+  "timeout_ms": 420000,
+  "covers": [
+    "RT-ENR-001",
+    "RT-DRN-001",
+    "RT-DEL-001",
+    "REC-001",
+    "UI-RT-001"
+  ]
+}

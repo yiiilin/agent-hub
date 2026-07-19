@@ -1,12 +1,4 @@
-const SECRET_PATTERNS = [
-  /\bahk_[A-Za-z0-9._-]+\b/g,
-  /\bahr_[A-Za-z0-9._-]+\b/g,
-  /\bBearer\s+[^\s"']+/gi
-];
-
-function redact(value) {
-  return SECRET_PATTERNS.reduce((current, pattern) => current.replace(pattern, '[REDACTED]'), value);
-}
+import { redactSecrets } from './secrets.mjs';
 
 function expectedStatusMatches(status, expectedStatus) {
   if (expectedStatus === undefined) return status >= 200 && status < 300;
@@ -65,8 +57,10 @@ export class ApiClient {
       }
     }
     if (!expectedStatusMatches(response.status, expectedStatus)) {
-      const detail = redact(typeof data === 'string' ? data : JSON.stringify(data));
-      throw new Error(`${method} ${path} returned ${response.status}: ${detail.slice(0, 2_000)}`);
+      const detail = redactSecrets(typeof data === 'string' ? data : JSON.stringify(data));
+      throw new Error(redactSecrets(
+        `${method} ${path} returned ${response.status}: ${detail.slice(0, 2_000)}`
+      ));
     }
     return { status: response.status, headers: response.headers, data };
   }
@@ -104,7 +98,9 @@ export async function poll(check, accept, {
     if (accept(lastValue)) return lastValue;
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
-  throw new Error(`Timed out waiting for ${description}; last value: ${JSON.stringify(lastValue)}`);
+  throw new Error(redactSecrets(
+    `Timed out waiting for ${description}; last value: ${JSON.stringify(lastValue)}`
+  ));
 }
 
 export async function waitForRunStatus(client, agentId, runId, expectedStatuses, timeoutMs = 45_000) {
