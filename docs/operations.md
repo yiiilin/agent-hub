@@ -2,29 +2,57 @@
 
 本文说明 Native Codex Session Runtime 的部署配置、持久化边界和故障处理。协议与状态机的权威定义仍在 `docs/session-runtime-spec.md` 和 ADR-0001 至 ADR-0027。
 
-## Compose 启动
+## 生产 Compose
 
-默认启动命令：
+根目录 `compose.yml` 是默认生产编排。它启动 PostgreSQL、私有 MinIO、Hub backend 和 frontend，不启用 Mock OIDC、开发用户、开发 Model Connection、fake provider 或 fake Codex。先以 `.env.example` 为清单配置 `.env` 并执行 `chmod 600 .env`；关键值为空时 Compose 会在创建容器前拒绝启动。`.env` 已同时被 Git 和 Docker build context 排除。
+
+至少需要设置：
+
+- `POSTGRES_PASSWORD` 和与其一致的 `DATABASE_URL`。建议密码使用 URL-safe 随机值，避免连接串编码歧义。
+- `HUB_MODEL_SECRET_KEY`，使用 `openssl rand -base64 32` 生成并纳入独立备份。
+- `EMBED_JWT_SECRET`，使用部署专属随机值。
+- `HUB_BUNDLE_S3_ACCESS_KEY_ID` 和 `HUB_BUNDLE_S3_SECRET_ACCESS_KEY`，只用于 Compose 内部、不对宿主机发布端口的 MinIO。
+
+默认启动生产 Hub：
 
 ```bash
-docker compose -p agent-hub-dev -f deploy/docker-compose.yml up -d --build
+docker compose up -d --build
+docker compose ps
+```
+
+frontend 默认只发布到 `127.0.0.1:8080`，应由宿主机反向代理终止 TLS。只有明确由外部负载均衡器保护时才修改 `FRONTEND_BIND_ADDRESS`；生产环境保持 `SESSION_COOKIE_SECURE=true`。
+
+生产 Runtime 是可选 profile，因为 Runtime 可以部署在其他节点。若要在同一台机器运行，先把可执行的真实 Codex CLI 放到 `CODEX_BIN_PATH`，在管理台创建一次性 Enrollment Token，并设置 `RUNTIME_ENROLLMENT_TOKEN`、实际 `RUNTIME_CODEX_VERSION` 和稳定的 `RUNTIME_HOSTNAME`，然后启动：
+
+```bash
+docker compose --profile runtime up -d --build
+```
+
+该 Codex CLI 是 Runtime 首次注册和兼容性检查所需的 bootstrap 版本；后续精确版本仍由 Hub 下载、校验并分发。`runtime-data` 已包含 Runtime credential、Workspace 和 Hub 分发的 Codex 版本，不得当作无状态缓存删除。
+
+## 开发 Compose
+
+`compose.dev.yml` 保留 Mock OIDC、开发种子、fake model provider 和 fake Codex，只用于本地开发及自动化测试：
+
+```bash
+docker compose -p agent-hub-dev -f compose.dev.yml up -d --build
 ```
 
 前端默认发布到宿主机 `15173`。端口冲突时必须在启动和后续 Playwright 命令中使用同一个 Compose project：
 
 ```bash
-FRONTEND_PORT=15183 docker compose -p agent-hub-dev -f deploy/docker-compose.yml up -d --build
+FRONTEND_PORT=15183 docker compose -p agent-hub-dev -f compose.dev.yml up -d --build
 E2E_COMPOSE_PROJECT=agent-hub-dev npm --prefix frontend run test:e2e
 ```
 
-Compose 使用四个持久卷：
+两个 Compose 文件使用相同的四类持久卷，但不同 project name 会创建彼此隔离的实际卷：
 
 | Volume | 容器路径 | 内容 |
 | --- | --- | --- |
 | `postgres-data` | `/var/lib/postgresql/data` | Hub 数据库 |
 | `hub-data` | `/var/lib/agent-hub` | Hub 已校验的 Codex CLI 版本文件 |
 | `runtime-data` | `/var/lib/agent-hub-runtime` | Runtime credential、在线 Session 目录、已下载的 Codex CLI 和暂存文件 |
-| `bundle-store-data` | `/data` | 开发环境 MinIO 中的 Session Bundle 对象 |
+| `bundle-store-data` | `/data` | Compose 内置 MinIO 中的 Session Bundle 对象 |
 
 不要在 Runtime 尚有 Session 时删除 `runtime-data`。其中可能有尚未成功写入 Session Bundle 的最新 Workspace 状态。
 

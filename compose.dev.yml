@@ -22,7 +22,7 @@ services:
   backend:
     labels: *development-labels
     build:
-      context: ..
+      context: .
       dockerfile: deploy/backend.Dockerfile
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgres://agent_hub:agent_hub@postgres:5432/agent_hub}
@@ -101,7 +101,7 @@ services:
   runtime-init:
     labels: *development-labels
     build:
-      context: ..
+      context: .
       dockerfile: deploy/runtime.Dockerfile
     user: "0:0"
     command: ["chown", "-R", "10001:10001", "/var/lib/agent-hub-runtime"]
@@ -111,7 +111,7 @@ services:
   runtime:
     labels: *development-labels
     build:
-      context: ..
+      context: .
       dockerfile: deploy/runtime.Dockerfile
     environment:
       HUB_URL: ${HUB_URL:-http://backend:8080}
@@ -148,12 +148,12 @@ services:
       FAKE_MODEL_PROVIDER_API_KEY: ${FAKE_MODEL_PROVIDER_API_KEY:-dev-model-provider-api-key}
     command: ["python", "/app/fake-model-provider.py"]
     volumes:
-      - ./fake-model-provider.py:/app/fake-model-provider.py:ro
+      - ./deploy/fake-model-provider.py:/app/fake-model-provider.py:ro
 
   frontend:
     labels: *development-labels
     build:
-      context: ..
+      context: .
       dockerfile: deploy/frontend.Dockerfile
     ports:
       - "${FRONTEND_PORT:-15173}:5173"

@@ -2,7 +2,7 @@
 set -eu
 
 project=${E2E_COMPOSE_PROJECT:-agent-hub-audit}
-compose_file=${E2E_COMPOSE_FILE:-deploy/docker-compose.yml}
+compose_file=${E2E_COMPOSE_FILE:-compose.dev.yml}
 base_url=${E2E_BASE_URL:-http://localhost:15173}
 blocker_name="${project}-backend-dns-blocker"
 wait_timeout_secs=${DNS_RECOVERY_WAIT_TIMEOUT_SECS:-60}

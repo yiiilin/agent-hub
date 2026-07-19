@@ -4,7 +4,7 @@ import { expect, request, test, type APIRequestContext, type Page, type Route } 
 
 function composeArgs() {
   const project = process.env.E2E_COMPOSE_PROJECT?.trim() || 'agent-hub-dev';
-  return ['compose', '-p', project, '-f', '../deploy/docker-compose.yml'] as const;
+  return ['compose', '-p', project, '-f', '../compose.dev.yml'] as const;
 }
 
 function completeWithin<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {

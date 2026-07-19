@@ -14,7 +14,7 @@ export class ComposeHarness {
     }
     this.repoRoot = repoRoot;
     this.project = project;
-    this.composeFile = resolve(repoRoot, 'deploy/docker-compose.yml');
+    this.composeFile = resolve(repoRoot, 'compose.dev.yml');
     this.environment = {
       ...process.env,
       FRONTEND_PORT: '0',

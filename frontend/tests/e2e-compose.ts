@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 
 export const DEFAULT_E2E_COMPOSE_PROJECT = 'agent-hub-dev';
 const DISCOVERY_BASE_URL = 'http://127.0.0.1:9';
-const COMPOSE_FILE = fileURLToPath(new URL('../../deploy/docker-compose.yml', import.meta.url));
+const COMPOSE_FILE = fileURLToPath(new URL('../../compose.dev.yml', import.meta.url));
 
 export function e2eComposeProject(env: NodeJS.ProcessEnv = process.env) {
   return env.E2E_COMPOSE_PROJECT?.trim() || DEFAULT_E2E_COMPOSE_PROJECT;

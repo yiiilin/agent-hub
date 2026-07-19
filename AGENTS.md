@@ -10,7 +10,8 @@ Agent Hub 是 Rust 控制面、独立 Rust runtime 与 React 管理台组成的�
 - `crates/runtime/`：runtime 注册、任务领取、Codex app-server 驱动和本地运行隔离。
 - `crates/shared/`：后端与 runtime 共用的序列化 DTO 和协议类型。
 - `frontend/`：React 控制台、API client、样式和 Playwright 测试。
-- `deploy/`：后端、runtime、前端镜像及 Docker Compose 开发环境。
+- `compose.yml`：默认生产部署；`compose.dev.yml`：本地开发和测试环境。
+- `deploy/`：后端、runtime、前端镜像及部署辅助脚本。
 - `qa/`：无人值守的 API 与浏览器场景；每个 `qa/scenarios/` 子目录是一个独立场景。
 - `docs/`：项目规范和功能文档入口。新增架构、接口、运行手册或设计说明放在此目录；Automation 行为见 `docs/automation-spec.md`，认证见 `docs/auth-spec.md`，整体范围见 `docs/v1-spec.md`。
 
@@ -19,10 +20,10 @@ Agent Hub 是 Rust 控制面、独立 Rust runtime 与 React 管理台组成的�
 工作区声明 Rust 1.88+；Docker 构建镜像使用 Rust 1.91 和 Node 24。启动完整开发环境：
 
 ```bash
-docker compose -p agent-hub-dev -f deploy/docker-compose.yml up -d --build
+docker compose -p agent-hub-dev -f compose.dev.yml up -d --build
 ```
 
-Compose 默认将前端容器的 5173 端口发布到宿主机 15173，可用 `FRONTEND_PORT` 改写宿主机端口。默认控制台 URL 为 `http://localhost:15173`。可用 `-p` 或 `E2E_COMPOSE_PROJECT` 使用其他 Compose project name；Playwright 必须指向同一个正在运行的项目。
+开发 Compose 默认将前端容器的 5173 端口发布到宿主机 15173，可用 `FRONTEND_PORT` 改写宿主机端口。默认控制台 URL 为 `http://localhost:15173`。可用 `-p` 或 `E2E_COMPOSE_PROJECT` 使用其他 Compose project name；Playwright 必须指向同一个正在运行的项目。根目录 `compose.yml` 是生产配置，不得用于 E2E。
 
 ## 构建与测试
 

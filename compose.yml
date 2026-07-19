@@ -1,0 +1,168 @@
+name: agent-hub
+
+x-service-logging: &service-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-agent_hub}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-agent_hub}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    logging: *service-logging
+
+  bundle-store:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    restart: unless-stopped
+    command: ["server", "/data"]
+    environment:
+      MINIO_ROOT_USER: ${HUB_BUNDLE_S3_ACCESS_KEY_ID:?Set HUB_BUNDLE_S3_ACCESS_KEY_ID in .env}
+      MINIO_ROOT_PASSWORD: ${HUB_BUNDLE_S3_SECRET_ACCESS_KEY:?Set HUB_BUNDLE_S3_SECRET_ACCESS_KEY in .env}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - bundle-store-data:/data
+    logging: *service-logging
+
+  bundle-store-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mc alias set local http://bundle-store:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"
+        mc mb --ignore-existing "local/$${HUB_BUNDLE_S3_BUCKET}"
+    environment:
+      MINIO_ROOT_USER: ${HUB_BUNDLE_S3_ACCESS_KEY_ID:?Set HUB_BUNDLE_S3_ACCESS_KEY_ID in .env}
+      MINIO_ROOT_PASSWORD: ${HUB_BUNDLE_S3_SECRET_ACCESS_KEY:?Set HUB_BUNDLE_S3_SECRET_ACCESS_KEY in .env}
+      HUB_BUNDLE_S3_BUCKET: ${HUB_BUNDLE_S3_BUCKET:-agent-hub-sessions}
+    depends_on:
+      bundle-store:
+        condition: service_healthy
+    logging: *service-logging
+
+  backend:
+    build:
+      context: .
+      dockerfile: deploy/backend.Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
+      BIND_ADDR: 0.0.0.0:8080
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-true}
+      EMBED_JWT_SECRET: ${EMBED_JWT_SECRET:?Set EMBED_JWT_SECRET in .env}
+      EMBED_JWT_ISSUER: ${EMBED_JWT_ISSUER:-agent-hub}
+      EMBED_JWT_AUDIENCE: ${EMBED_JWT_AUDIENCE:-agent-hub-widget}
+      OIDC_MOCK_ENABLED: "false"
+      SEED_DEV_USER: "false"
+      SEED_DEV_MODEL_CONNECTION: "false"
+      HUB_MODEL_SECRET_KEY: ${HUB_MODEL_SECRET_KEY:?Set HUB_MODEL_SECRET_KEY in .env}
+      HUB_MODEL_PROXY_TIMEOUT_SECS: ${HUB_MODEL_PROXY_TIMEOUT_SECS:-300}
+      HUB_SESSION_BUNDLE_MAX_BYTES: ${HUB_SESSION_BUNDLE_MAX_BYTES:-10737418240}
+      HUB_BUNDLE_S3_ENDPOINT: ${HUB_BUNDLE_S3_ENDPOINT:-http://bundle-store:9000}
+      HUB_BUNDLE_S3_BUCKET: ${HUB_BUNDLE_S3_BUCKET:-agent-hub-sessions}
+      HUB_BUNDLE_S3_REGION: ${HUB_BUNDLE_S3_REGION:-us-east-1}
+      HUB_BUNDLE_S3_ACCESS_KEY_ID: ${HUB_BUNDLE_S3_ACCESS_KEY_ID:?Set HUB_BUNDLE_S3_ACCESS_KEY_ID in .env}
+      HUB_BUNDLE_S3_SECRET_ACCESS_KEY: ${HUB_BUNDLE_S3_SECRET_ACCESS_KEY:?Set HUB_BUNDLE_S3_SECRET_ACCESS_KEY in .env}
+      HUB_BUNDLE_S3_SESSION_TOKEN: ${HUB_BUNDLE_S3_SESSION_TOKEN:-}
+      HUB_BUNDLE_S3_SERVER_SIDE_ENCRYPTION: ${HUB_BUNDLE_S3_SERVER_SIDE_ENCRYPTION:-}
+      HUB_BUNDLE_S3_KMS_KEY_ID: ${HUB_BUNDLE_S3_KMS_KEY_ID:-}
+      HUB_BUNDLE_S3_ALLOW_HTTP: ${HUB_BUNDLE_S3_ALLOW_HTTP:-true}
+      HUB_CODEX_GITHUB_API_BASE: ${HUB_CODEX_GITHUB_API_BASE:-https://api.github.com/repos/openai/codex}
+      HUB_CODEX_GITHUB_ALLOW_HTTP: "false"
+      HUB_CODEX_ARTIFACT_ROOT: /var/lib/agent-hub/codex-artifacts
+      RUST_LOG: ${BACKEND_RUST_LOG:-agent_hub_backend=info,tower_http=info}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/readyz"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    depends_on:
+      postgres:
+        condition: service_healthy
+      bundle-store-init:
+        condition: service_completed_successfully
+    volumes:
+      - hub-data:/var/lib/agent-hub
+    logging: *service-logging
+
+  frontend:
+    build:
+      context: .
+      dockerfile: deploy/frontend.Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_BIND_ADDRESS:-127.0.0.1}:${FRONTEND_PORT:-8080}:5173"
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging: *service-logging
+
+  runtime-init:
+    profiles: ["runtime"]
+    build:
+      context: .
+      dockerfile: deploy/runtime.Dockerfile
+    user: "0:0"
+    command: ["chown", "-R", "10001:10001", "/var/lib/agent-hub-runtime"]
+    volumes:
+      - runtime-data:/var/lib/agent-hub-runtime
+
+  runtime:
+    profiles: ["runtime"]
+    build:
+      context: .
+      dockerfile: deploy/runtime.Dockerfile
+    restart: unless-stopped
+    environment:
+      HUB_URL: http://backend:8080
+      RUNTIME_ENROLLMENT_TOKEN: ${RUNTIME_ENROLLMENT_TOKEN:-}
+      RUNTIME_CREDENTIAL_FILE: /var/lib/agent-hub-runtime/runtime-credential.json
+      RUNTIME_WORK_ROOT: /var/lib/agent-hub-runtime
+      RUNTIME_SESSION_IDLE_TIMEOUT_SECS: ${RUNTIME_SESSION_IDLE_TIMEOUT_SECS:-900}
+      RUNTIME_MAX_ONLINE_SESSIONS: ${RUNTIME_MAX_ONLINE_SESSIONS:-4}
+      RUNTIME_HOSTNAME: ${RUNTIME_HOSTNAME:-compose-runtime-1}
+      RUNTIME_CODEX_DRIVER: app-server
+      RUNTIME_CODEX_SOURCE: path
+      RUNTIME_CODEX_VERSION: ${RUNTIME_CODEX_VERSION:-unmanaged}
+      RUNTIME_HEALTH_BIND_ADDR: 0.0.0.0:8081
+      CODEX_BIN: /usr/local/bin/codex
+      RUST_LOG: ${RUNTIME_RUST_LOG:-agent_hub_runtime=info}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - runtime-data:/var/lib/agent-hub-runtime
+      - type: bind
+        source: ${CODEX_BIN_PATH:-/opt/agent-hub/codex}
+        target: /usr/local/bin/codex
+        read_only: true
+    depends_on:
+      backend:
+        condition: service_healthy
+      runtime-init:
+        condition: service_completed_successfully
+    logging: *service-logging
+
+volumes:
+  postgres-data:
+  hub-data:
+  runtime-data:
+  bundle-store-data:
