@@ -27,7 +27,7 @@ V1 保留以下可浏览器验证的产品链路；其执行和存储边界已�
 ## 验收标准
 
 - `docker compose up` 使用根目录 `compose.yml` 启动生产 Hub；可选的同机 Runtime 通过 `runtime` profile 启动。
-- `docker compose -f compose.dev.yml up` 启动 PostgreSQL、backend、fake provider、runtime 和 frontend 的完整开发环境。
+- `docker compose -f compose.dev.yml up` 启动 PostgreSQL、包含前端静态资源的 Hub backend、fake provider 和 runtime 的完整开发环境。
 - 用户能登录管理台、创建 Agent、创建 Session、启动 Turn，并看到关联 Run 从 pending/running 进入终态。
 - 登录和根路径默认进入 Session 页，可按 Hub-native/External Platform 来源筛选并选择 Agent 新建对话。
 - `/runtimes` 能看到 Runtime 身份、状态、labels 和 heartbeat 时间。

@@ -30,7 +30,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Redirect, Response,
     },
-    routing::{delete, get, post, put},
+    routing::{any, delete, get, post, put},
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -41,7 +41,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Row, Transaction};
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{
+    cors::CorsLayer,
+    services::{ServeDir, ServeFile},
+    trace::TraceLayer,
+};
 use tracing::{info, warn};
 use url::Url;
 use uuid::Uuid;
@@ -64,6 +68,7 @@ const MODEL_PROXY_OBSERVER_MAX_BYTES: usize = 2 * 1024 * 1024;
 const MODEL_PROXY_SSE_LINE_MAX_BYTES: usize = 64 * 1024;
 const DATABASE_READINESS_TIMEOUT: Duration = Duration::from_millis(500);
 const DEFAULT_SESSION_BUNDLE_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+const DEFAULT_FRONTEND_DIST_DIR: &str = "frontend/dist";
 const TOOL_REQUEST_BATCH_FINGERPRINT_KEY: &str = "tool_request_batch_fingerprint";
 const RUNTIME_CAPABILITY_SQL: &str = "
            AND (
@@ -328,7 +333,7 @@ fn build_router(state: AppState) -> Router {
         ])
         .allow_credentials(true);
 
-    Router::new()
+    let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readiness))
         .route("/openapi.json", get(openapi))
@@ -609,10 +614,30 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/runtime/model-proxy/v1/{*path}",
             post(runtime_model_proxy),
-        )
+        );
+
+    with_frontend(router, PathBuf::from(DEFAULT_FRONTEND_DIST_DIR))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(Arc::new(state))
+}
+
+fn with_frontend<S>(router: Router<S>, frontend_dist_dir: PathBuf) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router
+        .route("/api", any(api_not_found))
+        .route("/api/", any(api_not_found))
+        .route("/api/{*path}", any(api_not_found))
+        .fallback_service(
+            ServeDir::new(&frontend_dist_dir)
+                .fallback(ServeFile::new(frontend_dist_dir.join("index.html"))),
+        )
+}
+
+async fn api_not_found() -> StatusCode {
+    StatusCode::NOT_FOUND
 }
 
 async fn healthz() -> Json<Value> {
@@ -16829,6 +16854,93 @@ impl From<sqlx::Error> for ApiError {
 mod tests {
     use super::*;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn frontend_files_and_spa_fallback_do_not_capture_unknown_api_routes() {
+        let frontend = tempfile::tempdir().unwrap();
+        std::fs::create_dir(frontend.path().join("assets")).unwrap();
+        std::fs::write(
+            frontend.path().join("index.html"),
+            b"<main>Agent Hub</main>",
+        )
+        .unwrap();
+        std::fs::write(
+            frontend.path().join("assets/app.js"),
+            b"console.log('hub');",
+        )
+        .unwrap();
+
+        let app = with_frontend(
+            Router::new().route("/api/known", get(|| async { StatusCode::NO_CONTENT })),
+            frontend.path().to_path_buf(),
+        );
+
+        let asset = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/assets/app.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(asset.status(), StatusCode::OK);
+        assert!(asset.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .contains("javascript"));
+        assert_eq!(
+            axum::body::to_bytes(asset.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            Bytes::from_static(b"console.log('hub');")
+        );
+
+        let deep_link = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/sessions/example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deep_link.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(deep_link.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            Bytes::from_static(b"<main>Agent Hub</main>")
+        );
+
+        let known_api = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/known")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(known_api.status(), StatusCode::NO_CONTENT);
+
+        for path in ["/api", "/api/", "/api/not-a-route"] {
+            let unknown_api = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(unknown_api.status(), StatusCode::NOT_FOUND);
+        }
+    }
 
     #[test]
     fn extracts_session_cookie() {

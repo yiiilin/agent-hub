@@ -61,6 +61,8 @@ services:
       context: .
       dockerfile: deploy/backend.Dockerfile
     restart: unless-stopped
+    ports:
+      - "${FRONTEND_BIND_ADDRESS:-127.0.0.1}:${FRONTEND_PORT:-8080}:8080"
     environment:
       DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
       BIND_ADDR: 0.0.0.0:8080
@@ -99,18 +101,6 @@ services:
         condition: service_completed_successfully
     volumes:
       - hub-data:/var/lib/agent-hub
-    logging: *service-logging
-
-  frontend:
-    build:
-      context: .
-      dockerfile: deploy/frontend.Dockerfile
-    restart: unless-stopped
-    ports:
-      - "${FRONTEND_BIND_ADDRESS:-127.0.0.1}:${FRONTEND_PORT:-8080}:5173"
-    depends_on:
-      backend:
-        condition: service_healthy
     logging: *service-logging
 
   runtime-init:

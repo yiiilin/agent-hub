@@ -57,7 +57,7 @@ export function parseComposePort(output: string) {
     return `http://${hostForURL(host)}:${port}`;
   }));
   if (origins.size !== 1) {
-    throw new Error(`Expected one frontend port mapping, received: ${output.trim() || '<empty>'}`);
+    throw new Error(`Expected one Hub port mapping, received: ${output.trim() || '<empty>'}`);
   }
   return [...origins][0];
 }
@@ -75,8 +75,8 @@ function dockerOutput(args: readonly string[], failureMessage: string) {
 
 export function resolveComposeFrontendURL(project = e2eComposeProject()) {
   const output = dockerOutput(
-    [...composeArgs(project), 'port', 'frontend', '5173'],
-    `Unable to resolve frontend port for Compose project "${project}". Start that project before running Playwright.`
+    [...composeArgs(project), 'port', 'backend', '8080'],
+    `Unable to resolve Hub port for Compose project "${project}". Start that project before running Playwright.`
   );
   return parseComposePort(output);
 }
@@ -117,22 +117,22 @@ export function assertComposeFrontendTarget(project: string, configuredBaseURL: 
   }
 
   const containerIDs = dockerOutput(
-    [...composeArgs(project), 'ps', '-q', 'frontend'],
-    `Unable to find the frontend container for Compose project "${project}".`
+    [...composeArgs(project), 'ps', '-q', 'backend'],
+    `Unable to find the Hub container for Compose project "${project}".`
   ).split('\n').map((line) => line.trim()).filter(Boolean);
   if (containerIDs.length !== 1) {
-    throw new Error(`Expected one running frontend container for Compose project "${project}", found ${containerIDs.length}.`);
+    throw new Error(`Expected one running Hub container for Compose project "${project}", found ${containerIDs.length}.`);
   }
 
   const inspection = dockerOutput(
     ['inspect', '--format', '{{.State.Running}}|{{ index .Config.Labels "com.docker.compose.project" }}', containerIDs[0]],
-    `Unable to inspect the frontend container for Compose project "${project}".`
+    `Unable to inspect the Hub container for Compose project "${project}".`
   );
   const [running, actualProject] = inspection.split('|');
   if (running !== 'true') {
-    throw new Error(`Frontend container for Compose project "${project}" is not running.`);
+    throw new Error(`Hub container for Compose project "${project}" is not running.`);
   }
   if (actualProject !== project) {
-    throw new Error(`Frontend container belongs to Compose project "${actualProject}", expected "${project}".`);
+    throw new Error(`Hub container belongs to Compose project "${actualProject}", expected "${project}".`);
   }
 }

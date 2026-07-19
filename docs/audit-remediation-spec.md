@@ -4,7 +4,7 @@
 
 本轮以仓库根目录 `plan.md` 为验收基线，补齐首轮实现中发现的安全、权限、
 runtime 生命周期、Widget/Integration 协议和测试缺口。修复保持现有 Rust/Axum、
-React/Vite、Postgres 和 Docker Compose 架构，不引入与 V1 无关的产品能力。
+React/Vite、Postgres 和 Docker Compose 架构，前端构建产物由 backend 镜像直接托管，不引入与 V1 无关的产品能力。
 
 ## 功能批次与验收标准
 
@@ -18,7 +18,7 @@ React/Vite、Postgres 和 Docker Compose 架构，不引入与 V1 无关的产�
 - password、session、API Key、Embed JWT 通过统一 `AuthProvider` / `SessionIssuer`
   边界接入；Integration token 仍不能进入用户控制面。
 - OIDC mock callback 使用受控的 `email` 和 `sub` 参数创建或复用 member 用户。
-- Widget token 只放 URL fragment 或授权 header，不进入 path、query 和 nginx access log。
+- Widget token 只放 URL fragment 或授权 header，不进入 path、query 和 HTTP access log。
 
 ### 2. Agent 权限与 Runtime/Codex
 
@@ -56,7 +56,7 @@ React/Vite、Postgres 和 Docker Compose 架构，不引入与 V1 无关的产�
 
 ### 5. 部署与可维护性
 
-- backend、runtime、frontend 和 fake provider 容器以非 root 用户运行。
+- Hub backend、runtime 和 fake provider 容器以非 root 用户运行。
 - `cargo fmt --check`、严格 Clippy、workspace tests、frontend build、npm audit 和完整
   Playwright 全部通过。
 - 浏览器逐条验收 Auth、Agent/权限、Skills、MCP、Runtime/Codex、Model Proxy、Automation、

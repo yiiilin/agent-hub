@@ -4,7 +4,7 @@
 
 ## 生产 Compose
 
-根目录 `compose.yml` 是默认生产编排。它启动 PostgreSQL、私有 MinIO、Hub backend 和 frontend，不启用 Mock OIDC、开发用户、开发 Model Connection、fake provider 或 fake Codex。先以 `.env.example` 为清单配置 `.env` 并执行 `chmod 600 .env`；关键值为空时 Compose 会在创建容器前拒绝启动。`.env` 已同时被 Git 和 Docker build context 排除。
+根目录 `compose.yml` 是默认生产编排。它启动 PostgreSQL、私有 MinIO 和 Hub；Hub backend 镜像同时包含并直接托管 React/Vite 静态资源，不需要独立 frontend 或 Nginx 容器。生产配置不启用 Mock OIDC、开发用户、开发 Model Connection、fake provider 或 fake Codex。先以 `.env.example` 为清单配置 `.env` 并执行 `chmod 600 .env`；关键值为空时 Compose 会在创建容器前拒绝启动。`.env` 已同时被 Git 和 Docker build context 排除。
 
 至少需要设置：
 
@@ -20,7 +20,7 @@ docker compose up -d --build
 docker compose ps
 ```
 
-frontend 默认只发布到 `127.0.0.1:8080`，应由宿主机反向代理终止 TLS。只有明确由外部负载均衡器保护时才修改 `FRONTEND_BIND_ADDRESS`；生产环境保持 `SESSION_COOKIE_SECURE=true`。
+Hub 默认只发布到 `127.0.0.1:8080`，应由宿主机反向代理终止 TLS。只有明确由外部负载均衡器保护时才修改 `FRONTEND_BIND_ADDRESS`；生产环境保持 `SESSION_COOKIE_SECURE=true`。
 
 生产 Runtime 是可选 profile，因为 Runtime 可以部署在其他节点。若要在同一台机器运行，先把可执行的真实 Codex CLI 放到 `CODEX_BIN_PATH`，在管理台创建一次性 Enrollment Token，并设置 `RUNTIME_ENROLLMENT_TOKEN`、实际 `RUNTIME_CODEX_VERSION` 和稳定的 `RUNTIME_HOSTNAME`，然后启动：
 
@@ -32,7 +32,7 @@ docker compose --profile runtime up -d --build
 
 ## 开发 Compose
 
-`compose.dev.yml` 保留 Mock OIDC、开发种子、fake model provider 和 fake Codex，只用于本地开发及自动化测试：
+`compose.dev.yml` 保留 Mock OIDC、开发种子、fake model provider 和 fake Codex，只用于本地开发及自动化测试。它同样由 backend 直接提供构建后的前端资源：
 
 ```bash
 docker compose -p agent-hub-dev -f compose.dev.yml up -d --build

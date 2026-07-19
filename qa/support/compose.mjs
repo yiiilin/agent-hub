@@ -59,17 +59,17 @@ export class ComposeHarness {
   }
 
   frontendURL() {
-    const output = this.run(['port', 'frontend', '5173']).stdout.trim();
+    const output = this.run(['port', 'backend', '8080']).stdout.trim();
     const ports = new Set(output.split('\n').map((line) => line.trim()).filter(Boolean).map((endpoint) => {
       const separator = endpoint.lastIndexOf(':');
       const port = Number(endpoint.slice(separator + 1));
       if (separator < 1 || !Number.isInteger(port) || port < 1 || port > 65_535) {
-        throw new Error(`Unexpected frontend port mapping: ${endpoint}`);
+        throw new Error(`Unexpected Hub port mapping: ${endpoint}`);
       }
       return port;
     }));
     if (ports.size !== 1) {
-      throw new Error(`Expected one frontend port, received: ${output || '<empty>'}`);
+      throw new Error(`Expected one Hub port, received: ${output || '<empty>'}`);
     }
     return `http://127.0.0.1:${[...ports][0]}`;
   }

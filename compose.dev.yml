@@ -24,6 +24,8 @@ services:
     build:
       context: .
       dockerfile: deploy/backend.Dockerfile
+    ports:
+      - "${FRONTEND_PORT:-15173}:8080"
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgres://agent_hub:agent_hub@postgres:5432/agent_hub}
       BIND_ADDR: ${BIND_ADDR:-0.0.0.0:8080}
@@ -149,16 +151,6 @@ services:
     command: ["python", "/app/fake-model-provider.py"]
     volumes:
       - ./deploy/fake-model-provider.py:/app/fake-model-provider.py:ro
-
-  frontend:
-    labels: *development-labels
-    build:
-      context: .
-      dockerfile: deploy/frontend.Dockerfile
-    ports:
-      - "${FRONTEND_PORT:-15173}:5173"
-    depends_on:
-      - backend
 
 volumes:
   postgres-data:

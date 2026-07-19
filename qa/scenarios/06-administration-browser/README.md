@@ -2,7 +2,7 @@
 
 Type: `browser`
 
-This scenario uses the real Compose frontend, backend, and PostgreSQL database.
+This scenario uses the real Compose backend-hosted frontend and PostgreSQL database.
 It registers a unique member through the public password API, signs in as the
 seeded Super Administrator through the browser, and verifies all four
 Administration tabs without mutating the Codex rollout.

@@ -2,7 +2,7 @@
 
 Type: `browser`
 
-Uses the real frontend, backend, and PostgreSQL services. Before login, the
+Uses the real Hub backend-hosted frontend and PostgreSQL services. Before login, the
 scenario requests `/openapi.json` and verifies its public JSON contract. After
 login, it follows the primary sidebar through Sessions, Agents, Integration
 Apps, Automations, Skills, Models, API Keys, Runtimes, Administration, and API
