@@ -17,6 +17,7 @@ function session(id: string, agentName: string, lifecycleStatus: string, overrid
     agent_id: `agent-${id}`,
     agent_name: agentName,
     agent_deleted_at: null,
+    origin_platform_name: null,
     origin: { kind: 'hub_native' },
     lifecycle_status: lifecycleStatus,
     native_thread_id: `thread-${id}`,
@@ -79,6 +80,11 @@ test('Session history exposes queued work, explicit stop, recovery failure, and 
   };
   let stopRequests = 0;
   await routeMe(page);
+  await page.route('**/api/agents', (route) => route.fulfill({ json: [active, saving, failed].map((item) => ({
+    id: item.agent_id,
+    name: item.agent_name,
+    can_invoke: true
+  })) }));
   await page.route('**/api/sessions', (route) => route.fulfill({ json: sessions }));
   await page.route(/\/api\/sessions\/[^/]+\/messages$/, (route) => {
     const id = new URL(route.request().url()).pathname.split('/')[3];
@@ -91,8 +97,11 @@ test('Session history exposes queued work, explicit stop, recovery failure, and 
 
   await page.goto('/sessions');
   await expect(page.getByRole('heading', { name: 'Sessions', exact: true, level: 1 })).toBeVisible();
+  const agentFilter = page.getByRole('combobox', { name: 'Agent' });
+  await agentFilter.selectOption(saving.agent_id);
   const savingRow = page.getByRole('button', { name: /Checkpoint agent/ });
   await expect(savingRow.locator('.session-row-status.saving')).toHaveAttribute('aria-label', 'saving');
+  await agentFilter.selectOption(active.agent_id);
   await page.getByRole('button', { name: /Release agent/ }).click();
   const detail = page.getByRole('region', { name: 'Session details' });
   await expect(detail.getByText('Inspect the rollout.')).toBeVisible();
@@ -102,31 +111,40 @@ test('Session history exposes queued work, explicit stop, recovery failure, and 
   await expect(detail.getByText('Stop requested. Completed actions are retained.')).toBeVisible();
   expect(stopRequests).toBe(1);
 
+  await agentFilter.selectOption(failed.agent_id);
   await page.getByRole('button', { name: /Recovery agent/ }).click();
   await expect(detail).toContainText('native thread could not resume');
   await expect(detail.getByRole('textbox', { name: 'Message' })).toHaveCount(0);
 
+  await agentFilter.selectOption(historical.agent_id);
   await page.getByRole('button', { name: /Deleted agent/ }).click();
   await expect(detail).toContainText('Historical Session');
   await expect(detail.getByText('Retained historical answer.')).toBeVisible();
   await expect(detail.getByRole('button', { name: 'Send' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'New conversation' })).toBeDisabled();
 });
 
 test('Session workspace is localized and has no horizontal overflow at 390px', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.addInitScript(() => localStorage.setItem('agent-hub-language', 'zh-CN'));
   await routeMe(page);
-  await page.route('**/api/sessions', (route) => route.fulfill({ json: [
-    session('saving', '保存中的智能体', 'saving'),
-    session('failed', '恢复失败的智能体', 'recovery_failed', { recovery_error: '无法恢复原生线程' })
-  ] }));
+  const saving = session('saving', '保存中的智能体', 'saving');
+  const failed = session('failed', '恢复失败的智能体', 'recovery_failed', { recovery_error: '无法恢复原生线程' });
+  await page.route('**/api/agents', (route) => route.fulfill({ json: [saving, failed].map((item) => ({
+    id: item.agent_id,
+    name: item.agent_name,
+    can_invoke: true
+  })) }));
+  await page.route('**/api/sessions', (route) => route.fulfill({ json: [saving, failed] }));
   await page.route(/\/api\/sessions\/[^/]+\/messages$/, (route) => route.fulfill({ json: [] }));
 
   await page.goto('/sessions');
   await expect(page.getByRole('heading', { name: '会话', exact: true, level: 1 })).toBeVisible();
   await page.getByRole('button', { name: '会话列表', exact: true }).click();
+  const agentFilter = page.getByRole('combobox', { name: '智能体' });
   const savingRow = page.getByRole('button', { name: /保存中的智能体/ });
   await expect(savingRow.locator('.session-row-status.saving')).toHaveAttribute('aria-label', '保存中');
+  await agentFilter.selectOption(failed.agent_id);
   await page.getByRole('button', { name: /恢复失败的智能体/ }).click();
   await expect(page.getByRole('region', { name: '会话详情' })).toContainText('恢复失败');
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);

@@ -810,7 +810,7 @@ fn openapi_document() -> Value {
             "/api/integration-apps/{app_id}/agents/{agent_id}/widget-session": { "post": { "summary": "Issue a one-hour Widget session for a delegated Agent", "security": [{ "sessionCookie": [] }], "parameters": [id("app_id"), id("agent_id")], "responses": { "200": response("TokenResponse"), "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/agents/{agent_id}/runs": {
                 "get": { "summary": "List agent run history", "parameters": [id("agent_id")], "responses": { "200": list_response("Run"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } },
-                "post": { "summary": "Create agent run", "parameters": [id("agent_id")], "requestBody": body("CreateRunRequest"), "responses": { "200": response("Run"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } }
+                "post": { "summary": "Create agent run", "parameters": [id("agent_id")], "requestBody": body("CreateRunRequest"), "responses": { "200": response("Run"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } }
             },
             "/api/sessions": { "get": { "summary": "List owned sessions", "responses": { "200": list_response("HubSession"), "401": { "$ref": "#/components/responses/Unauthorized" } } } },
             "/api/sessions/{session_id}": { "get": { "summary": "Get owned session", "parameters": [id("session_id")], "responses": { "200": response("HubSession"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
@@ -1036,7 +1036,7 @@ fn openapi_schemas() -> Value {
             { "type": "object", "additionalProperties": false, "required": ["kind", "platform_id", "tenant_id", "external_identity_id"], "properties": { "kind": { "type": "string", "const": "external" }, "platform_id": uuid(), "tenant_id": { "type": "string" }, "external_identity_id": uuid() } }
         ] },
         "CurrentSessionBundle": { "type": "object", "required": ["generation", "object_key", "checksum_sha256", "size_bytes", "history_checkpoint", "ownership_generation", "producing_codex_version", "created_at"], "properties": { "generation": { "type": "integer" }, "object_key": { "type": "string" }, "checksum_sha256": { "type": "string" }, "size_bytes": { "type": "integer", "minimum": 0 }, "history_checkpoint": { "type": "integer", "minimum": 0 }, "ownership_generation": { "type": "integer", "minimum": 0 }, "producing_codex_version": { "type": "string" }, "created_at": { "type": "string", "format": "date-time" } } },
-        "HubSession": { "type": "object", "required": ["id", "owner_id", "agent_id", "agent_name", "agent_deleted_at", "origin", "lifecycle_status", "native_thread_id", "active_turn_id", "history_checkpoint", "configuration_fingerprint", "runtime_owner_id", "ownership_generation", "recovery_error", "current_bundle", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": uuid(), "agent_id": uuid(), "agent_name": { "type": "string" }, "agent_deleted_at": { "type": ["string", "null"], "format": "date-time" }, "origin": { "$ref": "#/components/schemas/HubSessionOrigin" }, "lifecycle_status": { "type": "string" }, "native_thread_id": { "type": ["string", "null"] }, "active_turn_id": { "anyOf": [uuid(), { "type": "null" }] }, "history_checkpoint": { "type": "integer", "minimum": 0 }, "configuration_fingerprint": { "type": ["string", "null"] }, "runtime_owner_id": { "anyOf": [uuid(), { "type": "null" }] }, "ownership_generation": { "type": "integer", "minimum": 0 }, "recovery_error": { "type": ["string", "null"] }, "current_bundle": { "anyOf": [{ "$ref": "#/components/schemas/CurrentSessionBundle" }, { "type": "null" }] }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
+        "HubSession": { "type": "object", "required": ["id", "owner_id", "agent_id", "agent_name", "agent_deleted_at", "origin_platform_name", "origin", "lifecycle_status", "native_thread_id", "active_turn_id", "history_checkpoint", "configuration_fingerprint", "runtime_owner_id", "ownership_generation", "recovery_error", "current_bundle", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": uuid(), "agent_id": uuid(), "agent_name": { "type": "string" }, "agent_deleted_at": { "type": ["string", "null"], "format": "date-time" }, "origin_platform_name": { "type": ["string", "null"] }, "origin": { "$ref": "#/components/schemas/HubSessionOrigin" }, "lifecycle_status": { "type": "string" }, "native_thread_id": { "type": ["string", "null"] }, "active_turn_id": { "anyOf": [uuid(), { "type": "null" }] }, "history_checkpoint": { "type": "integer", "minimum": 0 }, "configuration_fingerprint": { "type": ["string", "null"] }, "runtime_owner_id": { "anyOf": [uuid(), { "type": "null" }] }, "ownership_generation": { "type": "integer", "minimum": 0 }, "recovery_error": { "type": ["string", "null"] }, "current_bundle": { "anyOf": [{ "$ref": "#/components/schemas/CurrentSessionBundle" }, { "type": "null" }] }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
         "HubSessionMessage": { "type": "object", "required": ["id", "session_id", "sequence", "role", "message_kind", "content", "payload", "delivery_mode", "delivery_state", "client_message_key", "expected_native_turn_id", "turn_id", "run_id", "accepted_at"], "properties": { "id": uuid(), "session_id": uuid(), "sequence": { "type": "integer", "minimum": 1 }, "role": { "type": "string" }, "message_kind": { "type": "string" }, "content": { "type": ["string", "null"] }, "payload": {}, "delivery_mode": { "type": "string" }, "delivery_state": { "type": "string" }, "client_message_key": { "type": ["string", "null"] }, "expected_native_turn_id": { "type": ["string", "null"] }, "turn_id": { "anyOf": [uuid(), { "type": "null" }] }, "run_id": { "anyOf": [uuid(), { "type": "null" }] }, "accepted_at": { "type": "string", "format": "date-time" } } },
         "CreateHubSessionMessageRequest": { "type": "object", "required": ["content"], "properties": { "content": { "type": "string" }, "payload": {}, "delivery_mode": { "type": ["string", "null"] }, "client_message_key": { "type": ["string", "null"] }, "parent_run_id": { "anyOf": [uuid(), { "type": "null" }] } } },
         "SessionMessageAcceptance": { "type": "object", "required": ["message", "run"], "properties": { "message": { "$ref": "#/components/schemas/HubSessionMessage" }, "run": { "anyOf": [{ "$ref": "#/components/schemas/Run" }, { "type": "null" }] } } },
@@ -5012,25 +5012,88 @@ async fn create_run(
     Json(req): Json<CreateRunRequest>,
 ) -> Result<Json<RunDto>, ApiError> {
     let user = require_user(&state, &headers).await?;
+    let requested_origin_kind: Option<String> = match req.hub_session_id {
+        Some(session_id) => {
+            sqlx::query_scalar(
+                "SELECT origin_kind
+             FROM hub_sessions
+             WHERE id = $1 AND owner_id = $2 AND agent_id = $3",
+            )
+            .bind(session_id)
+            .bind(user.id)
+            .bind(agent_id)
+            .fetch_optional(&state.pool)
+            .await?
+        }
+        None => match req.parent_run_id {
+            Some(parent_run_id) => {
+                sqlx::query_scalar(
+                    "SELECT sessions.origin_kind
+                 FROM runs
+                 JOIN hub_sessions AS sessions ON sessions.id = runs.hub_session_id
+                 WHERE runs.id = $1 AND runs.owner_id = $2 AND runs.agent_id = $3
+                   AND sessions.owner_id = $2 AND sessions.agent_id = $3",
+                )
+                .bind(parent_run_id)
+                .bind(user.id)
+                .bind(agent_id)
+                .fetch_optional(&state.pool)
+                .await?
+            }
+            None => None,
+        },
+    };
+    if requested_origin_kind
+        .as_deref()
+        .is_some_and(|origin_kind| origin_kind != "hub_native")
+    {
+        return Err(ApiError::conflict(
+            "External Sessions are read-only in the Hub console",
+        ));
+    }
     let agent = load_agent_for_user(&state.pool, agent_id, &user).await?;
     let mut tx = state.pool.begin().await?;
-    ensure_agent_can_start_run_tx(&mut tx, agent.id, user.id).await?;
-    let session_id = match req.hub_session_id {
-        Some(session_id) => session_id,
+    let existing_session_id = match req.hub_session_id {
+        Some(session_id) => Some(session_id),
         None => match req.parent_run_id {
-            Some(parent_run_id) => sqlx::query_scalar(
-                "SELECT hub_session_id
+            Some(parent_run_id) => Some(
+                sqlx::query_scalar(
+                    "SELECT hub_session_id
                  FROM runs
                  WHERE id = $1 AND owner_id = $2 AND agent_id = $3",
-            )
-            .bind(parent_run_id)
-            .bind(user.id)
-            .bind(agent.id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(ApiError::bad_request("resume parent run is not available"))?,
-            None => insert_hub_native_session_tx(&mut tx, user.id, agent.id).await?,
+                )
+                .bind(parent_run_id)
+                .bind(user.id)
+                .bind(agent.id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(ApiError::bad_request("resume parent run is not available"))?,
+            ),
+            None => None,
         },
+    };
+    let session_id = if let Some(session_id) = existing_session_id {
+        let origin_kind: String = sqlx::query_scalar(
+            "SELECT origin_kind
+             FROM hub_sessions
+             WHERE id = $1 AND owner_id = $2 AND agent_id = $3",
+        )
+        .bind(session_id)
+        .bind(user.id)
+        .bind(agent.id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(ApiError::bad_request("Session is not available"))?;
+        if origin_kind != "hub_native" {
+            return Err(ApiError::conflict(
+                "External Sessions are read-only in the Hub console",
+            ));
+        }
+        ensure_agent_can_start_run_tx(&mut tx, agent.id, user.id).await?;
+        session_id
+    } else {
+        ensure_agent_can_start_run_tx(&mut tx, agent.id, user.id).await?;
+        insert_hub_native_session_tx(&mut tx, user.id, agent.id).await?
     };
     let accepted = accept_session_message_tx(
         &mut tx,
@@ -5073,6 +5136,9 @@ async fn list_hub_sessions(
                 (SELECT deleted_at FROM agents WHERE agents.id = hub_sessions.agent_id)
                     AS agent_deleted_at,
                 origin_kind, origin_platform_id,
+                (SELECT name FROM external_platforms
+                 WHERE external_platforms.id = hub_sessions.origin_platform_id)
+                    AS origin_platform_name,
                 origin_tenant_id, origin_external_identity_id, lifecycle_status,
                 native_thread_id, active_turn_id, history_checkpoint,
                 configuration_fingerprint, runtime_owner_id, ownership_generation,
@@ -5104,6 +5170,9 @@ async fn get_hub_session(
                 (SELECT deleted_at FROM agents WHERE agents.id = hub_sessions.agent_id)
                     AS agent_deleted_at,
                 origin_kind, origin_platform_id,
+                (SELECT name FROM external_platforms
+                 WHERE external_platforms.id = hub_sessions.origin_platform_id)
+                    AS origin_platform_name,
                 origin_tenant_id, origin_external_identity_id, lifecycle_status,
                 native_thread_id, active_turn_id, history_checkpoint,
                 configuration_fingerprint, runtime_owner_id, ownership_generation,
@@ -5163,13 +5232,22 @@ async fn create_hub_session_message(
     Json(req): Json<CreateHubSessionMessageRequest>,
 ) -> Result<Json<SessionMessageAcceptanceDto>, ApiError> {
     let user = require_user(&state, &headers).await?;
-    let agent_id: Uuid =
-        sqlx::query_scalar("SELECT agent_id FROM hub_sessions WHERE id = $1 AND owner_id = $2")
-            .bind(session_id)
-            .bind(user.id)
-            .fetch_optional(&state.pool)
-            .await?
-            .ok_or(ApiError::not_found("session not found"))?;
+    let session = sqlx::query(
+        "SELECT agent_id, origin_kind
+         FROM hub_sessions
+         WHERE id = $1 AND owner_id = $2",
+    )
+    .bind(session_id)
+    .bind(user.id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(ApiError::not_found("session not found"))?;
+    if session.get::<String, _>("origin_kind") != "hub_native" {
+        return Err(ApiError::conflict(
+            "External Sessions are read-only in the Hub console",
+        ));
+    }
+    let agent_id: Uuid = session.get("agent_id");
     let mut tx = state.pool.begin().await?;
     ensure_agent_can_start_run_tx(&mut tx, agent_id, user.id).await?;
     let accepted = accept_session_message_tx(
@@ -5215,8 +5293,8 @@ async fn stop_hub_run(
 ) -> Result<Json<RunDto>, ApiError> {
     let user = require_user(&state, &headers).await?;
     let mut tx = state.pool.begin().await?;
-    let hub_session_id: Uuid = sqlx::query_scalar(
-        "SELECT runs.hub_session_id
+    let session = sqlx::query(
+        "SELECT runs.hub_session_id, sessions.origin_kind
          FROM runs
          JOIN hub_sessions AS sessions ON sessions.id = runs.hub_session_id
          WHERE runs.id = $1 AND sessions.owner_id = $2",
@@ -5226,6 +5304,12 @@ async fn stop_hub_run(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(ApiError::not_found("run not found"))?;
+    if session.get::<String, _>("origin_kind") != "hub_native" {
+        return Err(ApiError::conflict(
+            "External Sessions are read-only in the Hub console",
+        ));
+    }
+    let hub_session_id: Uuid = session.get("hub_session_id");
     let run = request_run_interrupt_tx(&mut tx, run_id, hub_session_id).await?;
     tx.commit().await?;
     Ok(Json(run))
@@ -14670,6 +14754,9 @@ async fn load_claim_session_context_tx(
                 (SELECT deleted_at FROM agents WHERE agents.id = hub_sessions.agent_id)
                     AS agent_deleted_at,
                 origin_kind, origin_platform_id,
+                (SELECT name FROM external_platforms
+                 WHERE external_platforms.id = hub_sessions.origin_platform_id)
+                    AS origin_platform_name,
                 origin_tenant_id, origin_external_identity_id, lifecycle_status,
                 native_thread_id, active_turn_id, history_checkpoint,
                 configuration_fingerprint, runtime_owner_id, ownership_generation,
@@ -14729,6 +14816,9 @@ async fn load_hub_session_tx(
                 (SELECT deleted_at FROM agents WHERE agents.id = hub_sessions.agent_id)
                     AS agent_deleted_at,
                 origin_kind, origin_platform_id,
+                (SELECT name FROM external_platforms
+                 WHERE external_platforms.id = hub_sessions.origin_platform_id)
+                    AS origin_platform_name,
                 origin_tenant_id, origin_external_identity_id, lifecycle_status,
                 native_thread_id, active_turn_id, history_checkpoint,
                 configuration_fingerprint, runtime_owner_id, ownership_generation,
@@ -16684,6 +16774,7 @@ fn hub_session_from_row(row: sqlx::postgres::PgRow) -> HubSessionDto {
         agent_id: row.get("agent_id"),
         agent_name: row.get("agent_name"),
         agent_deleted_at: row.get("agent_deleted_at"),
+        origin_platform_name: row.get("origin_platform_name"),
         origin,
         lifecycle_status: row.get("lifecycle_status"),
         native_thread_id: row.get("native_thread_id"),
@@ -17409,6 +17500,29 @@ mod tests {
             document["paths"]["/api/sessions/{session_id}/messages"]["post"]["responses"]["200"]
                 ["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/SessionMessageAcceptance"
+        );
+        assert!(
+            !document["components"]["schemas"]["HubSessionOrigin"]["oneOf"][1]["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&json!("platform_name")))
+        );
+        assert!(document["components"]["schemas"]["HubSession"]["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&json!("origin_platform_name"))));
+        assert!(
+            document["paths"]["/api/agents/{agent_id}/runs"]["post"]["responses"]
+                .get("409")
+                .is_some()
+        );
+        assert!(
+            document["paths"]["/api/sessions/{session_id}/messages"]["post"]["responses"]
+                .get("409")
+                .is_some()
+        );
+        assert!(
+            document["paths"]["/api/runs/{run_id}/stop"]["post"]["responses"]
+                .get("409")
+                .is_some()
         );
         assert_eq!(
             document["paths"]["/api/integrations/sessions/{session_id}/messages"]["get"]
@@ -22360,7 +22474,7 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn hub_stop_allows_the_owner_for_native_and_external_sessions(pool: PgPool) {
+    async fn hub_stop_allows_native_owner_but_rejects_external_session_in_console(pool: PgPool) {
         let fixture =
             runtime_claim_fixture(pool.clone(), "workspace-write", "workspace-write").await;
         let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM hub_sessions WHERE id = $1")
@@ -22480,11 +22594,204 @@ mod tests {
                 .status(),
             StatusCode::NOT_FOUND
         );
-        assert_eq!(
-            app.oneshot(external_stop_request(external_owner_token))
+        let rejected = app
+            .oneshot(external_stop_request(external_owner_token))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        let rejected: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(rejected.into_body(), usize::MAX)
                 .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            rejected["error"],
+            "External Sessions are read-only in the Hub console"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn hub_console_rejects_messages_for_external_sessions(pool: PgPool) {
+        let fixture = integration_runtime_fixture(pool).await;
+        let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM hub_sessions WHERE id = $1")
+            .bind(fixture.hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        let visibility: String = sqlx::query_scalar("SELECT visibility FROM agents WHERE id = $1")
+            .bind(fixture.agent_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        assert_eq!(visibility, "private");
+        let owner_token = "hub-console-external-message-owner";
+        sqlx::query(
+            "INSERT INTO sessions (token_hash, user_id, expires_at)
+             VALUES ($1, $2, now() + interval '1 hour')",
+        )
+        .bind(sha256_hex(owner_token))
+        .bind(owner_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let app = build_router(test_state_with_browser_session_auth(
+            fixture.state.pool.clone(),
+        ));
+
+        let get_session = axum::http::Request::builder()
+            .uri(format!("/api/sessions/{}", fixture.hub_session_id))
+            .header(header::COOKIE, format!("agent_hub_session={owner_token}"))
+            .body(Body::empty())
+            .unwrap();
+        let visible = app.clone().oneshot(get_session).await.unwrap();
+        assert_eq!(visible.status(), StatusCode::OK);
+        let visible: HubSessionDto = serde_json::from_slice(
+            &axum::body::to_bytes(visible.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            visible.origin,
+            HubSessionOriginDto::External { .. }
+        ));
+        assert_eq!(
+            visible.origin_platform_name.as_deref(),
+            Some(fixture.platform_name.as_str())
+        );
+
+        let list_messages = || {
+            axum::http::Request::builder()
+                .uri(format!("/api/sessions/{}/messages", fixture.hub_session_id))
+                .header(header::COOKIE, format!("agent_hub_session={owner_token}"))
+                .body(Body::empty())
                 .unwrap()
-                .status(),
+        };
+        let before = app.clone().oneshot(list_messages()).await.unwrap();
+        assert_eq!(before.status(), StatusCode::OK);
+        let before: Vec<HubSessionMessageDto> = serde_json::from_slice(
+            &axum::body::to_bytes(before.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        let send = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/sessions/{}/messages", fixture.hub_session_id))
+            .header(header::COOKIE, format!("agent_hub_session={owner_token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"content":"must stay external-only"}"#))
+            .unwrap();
+        let rejected = app.clone().oneshot(send).await.unwrap();
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        let rejected: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(rejected.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            rejected["error"],
+            "External Sessions are read-only in the Hub console"
+        );
+
+        let parent_continue = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/agents/{}/runs", fixture.agent_id))
+            .header(header::COOKIE, format!("agent_hub_session={owner_token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(
+                r#"{{"message":"parent must stay external-only","parent_run_id":"{}"}}"#,
+                fixture.run_id
+            )))
+            .unwrap();
+        let rejected = app.clone().oneshot(parent_continue).await.unwrap();
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        let rejected: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(rejected.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            rejected["error"],
+            "External Sessions are read-only in the Hub console"
+        );
+
+        let legacy_continue = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/agents/{}/runs", fixture.agent_id))
+            .header(header::COOKIE, format!("agent_hub_session={owner_token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(
+                r#"{{"message":"must also stay external-only","hub_session_id":"{}"}}"#,
+                fixture.hub_session_id
+            )))
+            .unwrap();
+        let rejected = app.clone().oneshot(legacy_continue).await.unwrap();
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        let rejected: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(rejected.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            rejected["error"],
+            "External Sessions are read-only in the Hub console"
+        );
+
+        let after = app.clone().oneshot(list_messages()).await.unwrap();
+        assert_eq!(after.status(), StatusCode::OK);
+        let after: Vec<HubSessionMessageDto> = serde_json::from_slice(
+            &axum::body::to_bytes(after.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(after.len(), before.len());
+
+        let external_continue = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri(format!(
+                "/api/integrations/sessions/{}/messages",
+                fixture.session_id
+            ))
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", fixture.integration_token),
+            )
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"content":"continue through the trusted integration","attachments":[],"client_message_key":"external-continue"}"#,
+            ))
+            .unwrap();
+        let continued = app.clone().oneshot(external_continue).await.unwrap();
+        assert_eq!(continued.status(), StatusCode::OK);
+        let continued: IntegrationMessageResponse = serde_json::from_slice(
+            &axum::body::to_bytes(continued.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        let external_stop = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri(format!(
+                "/api/integrations/sessions/{}/runs/{}/stop",
+                fixture.session_id, continued.run.id
+            ))
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", fixture.integration_token),
+            )
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(external_stop).await.unwrap().status(),
             StatusCode::OK
         );
     }
@@ -36409,6 +36716,7 @@ mod tests {
     struct IntegrationRuntimeFixture {
         state: Arc<AppState>,
         agent_id: Uuid,
+        platform_name: String,
         runtime_id: Uuid,
         runtime_token: String,
         other_runtime_id: Uuid,
@@ -36447,6 +36755,7 @@ mod tests {
         let second_integration_token = format!("aho_{}", Uuid::new_v4().simple());
         let foreign_integration_token = format!("aho_{}", Uuid::new_v4().simple());
         let unique = Uuid::new_v4().simple().to_string();
+        let platform_name = format!("integration-{unique}");
 
         sqlx::query(
             "INSERT INTO users
@@ -36510,7 +36819,7 @@ mod tests {
         .await
         .unwrap();
         for (platform, channel, key) in [
-            (platform_id, channel_id, format!("integration-{unique}")),
+            (platform_id, channel_id, platform_name.clone()),
             (
                 foreign_platform_id,
                 foreign_channel_id,
@@ -36700,6 +37009,7 @@ mod tests {
         IntegrationRuntimeFixture {
             state: Arc::new(test_state_with_pool(pool)),
             agent_id,
+            platform_name,
             runtime_id,
             runtime_token,
             other_runtime_id,

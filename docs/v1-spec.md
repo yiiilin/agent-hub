@@ -7,7 +7,7 @@ V1 保留以下可浏览器验证的产品链路；其执行和存储边界已�
 1. 用户登录并获取 Hub 登录会话。
 2. 创建 Agent，保存 Markdown instructions、visibility、owner、managed Skills、MCP、Runtime 约束、默认 Model Connection、reasoning effort 和 Codex Subagent Definitions；sandbox policy 仍参与执行但不在管理台展示。
 3. Runtime 通过管理员签发的一次性 Enrollment Token 建立身份，之后使用自己的可撤销 Runtime Credential heartbeat。
-4. 用户选择 Agent 后进入未持久化的 Conversation Draft；首条消息原子创建 Hub Session、Message 和 Run，后续消息继续该 Session，且每条消息独立持久化。
+4. 用户选择 Agent 后进入当前浏览器保留的 Conversation Draft；首条消息原子创建 Hub Session、Message 和 Run，后续消息继续该 Session，且每条消息独立持久化。
 5. Runtime 获得 Session 的排他 ownership generation，在该 Session 独立的 `workspace/` 和 Codex 目录中继续同一个 native Codex Thread。
 6. Hub 保存消息、Run 和 native Item 映射事件，并通过 SSE 推送给管理台和 widget。
 7. 管理台以 Session 为登录后默认页和第一导航，使用对话主视图展示消息、SSE 回复、按时间线折叠的 Codex 可读活动与历史状态；Hub 内部状态、用量和 delta 事件不直接展示。
@@ -28,8 +28,10 @@ V1 保留以下可浏览器验证的产品链路；其执行和存储边界已�
 
 - `docker compose up` 使用根目录 `compose.yml` 启动生产 Hub；可选的同机 Runtime 通过 `runtime` profile 启动。
 - `docker compose -f compose.dev.yml up` 启动 PostgreSQL、包含前端静态资源的 Hub backend、fake provider 和 runtime 的完整开发环境。
-- 用户能登录管理台、创建 Agent、进入空白 Conversation Draft，并从主对话输入框发送首条消息创建 Session 和启动 Turn，看到关联 Run 从 pending/running 进入终态。
-- 登录和根路径默认进入 Session 页，可按 Hub-native/External Platform 来源筛选；选择 Agent 新建对话后直接进入空白主对话区，不展示初始消息表单。
+- 用户能登录管理台、创建 Agent、进入空白 Conversation Draft，并从主对话输入框发送首条消息创建 Session 和启动 Turn，看到关联 Run 从 pending/running 进入终态。失败的首条消息、刷新和关闭浏览器保留 Draft；成功发送、显式丢弃或退出登录按约定清除 Draft。
+- 登录和根路径默认进入 Session 页；侧栏依次使用平台、具体 Agent 和搜索筛选，平台默认为“本平台”并可选择“全部平台”或某个具名 External Platform。所选可调用 Agent 同时过滤列表并决定新建对话使用的 Draft，不提供“全部智能体”；已删除或不可调用 Agent 只为已有 Session 保留历史筛选入口，不能新建 Draft。
+- 点击“新建会话”直接打开所选 Agent 的空白或已有本地 Draft，不展示初始消息表单，也不在首条消息被接受前创建或列出 Session；从外部平台视图发起时自动切回“本平台”。
+- External Session 在 Hub 管理台可查看完整消息和活动历史，但不能发送消息、立即引导或停止 Turn；对应 Hub console API 同样拒绝写操作，匹配来源的外部集成接口不受影响。
 - 会话输入框使用 `Enter` 发送、`Shift+Enter` 换行，并在 2 到 5 行间自动增高；重进多 Turn Session 后仍展示所有 Run 的回答。
 - `/runtimes` 能看到 Runtime 身份、状态、labels 和 heartbeat 时间。
 - widget 能创建或选择受其 origin 约束的 Session，发送消息并看到 fake Codex 回复。

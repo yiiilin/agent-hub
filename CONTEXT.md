@@ -113,7 +113,7 @@ A durable, sanitized record of a failed model request or an invalid Responses AP
 _Avoid_: Raw provider response, application log, Token Usage
 
 **Conversation Draft**:
-A Hub console state with a selected Agent but no accepted message. It is not persisted and owns no Session, Run, Workspace, Runtime ownership, or Codex Thread; the first accepted message creates those durable records as needed.
+A Hub console state belonging to one Hub User and one selected Agent but with no accepted message. Each Agent may retain one local Conversation Draft for that Hub User until its first message is accepted, the Draft is discarded, or the Hub User signs out. It owns no Session, Run, Workspace, Runtime ownership, or Codex Thread.
 _Avoid_: Empty Session, draft Session, initial Run
 
 **Session Origin**:

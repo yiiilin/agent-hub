@@ -1,9 +1,9 @@
-import { ArrowUp, Bot, Brain, ChevronDown, ChevronRight, FilePenLine, ImageIcon, ListChecks, Minimize2, PanelLeft, Plus, Search, Square, Terminal, Users, Wrench, X } from 'lucide-react';
+import { ArrowUp, Bot, Brain, ChevronDown, ChevronRight, FilePenLine, ImageIcon, ListChecks, Minimize2, PanelLeft, Plus, Search, Square, Terminal, Trash2, Users, Wrench, X } from 'lucide-react';
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, type Agent, type HubSession, type HubSessionMessage, type RunEvent } from './api/client';
-import { FormDialog } from './components/form-dialog';
 import { useI18n } from './i18n';
 import type { TranslationKey } from './i18n';
+import { discardConversationDraft, loadConversationDraft, loadSelectedSessionAgent, saveConversationDraft, saveSelectedSessionAgent } from './session-drafts';
 
 const lifecycleKeys: Record<string, TranslationKey> = {
   waiting_for_runtime: 'sessionStatusWaitingRuntime',
@@ -52,6 +52,8 @@ type ConversationDraft = {
   agentId: string;
   agentName: string;
 };
+
+type PlatformFilter = 'hub_native' | 'all' | `external:${string}`;
 
 function eventTimestamp(value: string) {
   const timestamp = Date.parse(value);
@@ -272,39 +274,7 @@ function eventRefreshesSession(event: RunEvent) {
   return status !== null && terminalRunStatuses.has(status);
 }
 
-function NewConversationDialog({ agents, onClose, onSelected }: {
-  agents: Agent[];
-  onClose: () => void;
-  onSelected: (draft: ConversationDraft) => void;
-}) {
-  const { t } = useI18n();
-  const availableAgents = agents.filter((agent) => agent.can_invoke);
-  const [agentId, setAgentId] = useState(availableAgents[0]?.id ?? '');
-  const agentRef = useRef<HTMLSelectElement>(null);
-
-  function submit(event: FormEvent) {
-    event.preventDefault();
-    const agent = availableAgents.find((candidate) => candidate.id === agentId);
-    if (!agent) return;
-    onSelected({ agentId: agent.id, agentName: agent.name });
-  }
-
-  return <FormDialog
-    title={t('newConversation')}
-    eyebrow={t('sessions')}
-    onClose={onClose}
-    initialFocusRef={agentRef}
-    className="session-create-dialog"
-    footer={<><button className="secondary" type="button" onClick={onClose}>{t('cancel')}</button><button className="primary" form="new-conversation-form" type="submit" disabled={!agentId}>{t('startConversation')}</button></>}
-  >
-    <form id="new-conversation-form" className="stack" onSubmit={submit}>
-      <label>{t('agent')}<select ref={agentRef} aria-label={t('agent')} required value={agentId} onChange={(event) => setAgentId(event.target.value)}>{availableAgents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select></label>
-      {availableAgents.length === 0 && <div className="warning" role="alert">{t('noInvocableAgents')}</div>}
-    </form>
-  </FormDialog>;
-}
-
-export function SessionsPage() {
+export function SessionsPage({ currentUserId }: { currentUserId: string }) {
   const { locale, t } = useI18n();
   const mountedRef = useRef(true);
   const sessionLoadGeneration = useRef(0);
@@ -316,12 +286,13 @@ export function SessionsPage() {
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const [sessions, setSessions] = useState<HubSession[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(() => loadSelectedSessionAgent(currentUserId));
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [conversationDraft, setConversationDraft] = useState<ConversationDraft | null>(null);
   const [messages, setMessages] = useState<HubSessionMessage[]>([]);
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [search, setSearch] = useState('');
-  const [originFilter, setOriginFilter] = useState<'all' | 'hub_native' | 'external'>('all');
+  const [platformFilter, setPlatformFilter] = useState<PlatformFilter>('hub_native');
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
   const [messagesLoading, setMessagesLoading] = useState(false);
@@ -332,7 +303,6 @@ export function SessionsPage() {
   const [stopRequestedRunId, setStopRequestedRunId] = useState<string | null>(null);
   const [actionError, setActionError] = useState(false);
   const [conversationCreateError, setConversationCreateError] = useState(false);
-  const [createOpen, setCreateOpen] = useState(false);
   const [sessionListOpen, setSessionListOpen] = useState(false);
 
   const loadSessions = useCallback(async (
@@ -354,6 +324,17 @@ export function SessionsPage() {
       if (!mountedRef.current || generation !== sessionLoadGeneration.current) return;
       setSessions(loadedSessions);
       setAgents(loadedAgents);
+      const invocableAgents = loadedAgents.filter((agent) => agent.can_invoke);
+      const sessionAgentIds = new Set(loadedSessions.map((session) => session.agent_id));
+      setSelectedAgentId((current) => {
+        const next = current && (
+          invocableAgents.some((agent) => agent.id === current) || sessionAgentIds.has(current)
+        )
+          ? current
+          : invocableAgents[0]?.id ?? loadedSessions[0]?.agent_id ?? null;
+        if (next) saveSelectedSessionAgent(currentUserId, next);
+        return next;
+      });
       setSelectedId((current) => {
         const requested = preferredId !== undefined
           && (!shouldSelectPreferred || shouldSelectPreferred())
@@ -369,7 +350,7 @@ export function SessionsPage() {
       if (mountedRef.current && generation === sessionLoadGeneration.current) setLoading(false);
     }
     return () => controller.abort();
-  }, []);
+  }, [currentUserId]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -452,9 +433,12 @@ export function SessionsPage() {
     && (Boolean(selectedSession?.active_turn_id)
       || activeRunStarted
       || Boolean(activeRunUserMessage && ['queued', 'deferred', 'delivering'].includes(activeRunUserMessage.delivery_state)));
-  const readOnly = selectedSession?.lifecycle_status === 'historical'
+  const historyReadOnly = selectedSession?.lifecycle_status === 'historical'
     || selectedSession?.lifecycle_status === 'recovery_failed'
     || Boolean(selectedSession?.agent_deleted_at);
+  const canMutate = Boolean(conversationDraft) || Boolean(
+    selectedSession && !historyReadOnly && selectedSession.origin.kind === 'hub_native'
+  );
 
   useEffect(() => {
     const generation = ++eventLoadGeneration.current;
@@ -471,7 +455,7 @@ export function SessionsPage() {
   useEffect(() => {
     const generation = ++streamGeneration.current;
     const controller = new AbortController();
-    if (!activeRunId || !selectedSession || readOnly) return () => controller.abort();
+    if (!activeRunId || !selectedSession || historyReadOnly) return () => controller.abort();
     const refreshSelectedSession = () => {
       const refreshGeneration = ++sessionRefreshGeneration.current;
       void Promise.allSettled([
@@ -502,21 +486,57 @@ export function SessionsPage() {
       if ((error as Error)?.name !== 'AbortError') setActionError(true);
     });
     return () => controller.abort();
-  }, [activeRunId, readOnly, selectedSession?.id]);
+  }, [activeRunId, historyReadOnly, selectedSession?.id]);
 
   useEffect(() => {
     resizeComposer(composerRef.current);
   }, [conversationDraft, draft, selectedId]);
 
+  const sessionAgentOptions = useMemo(() => {
+    const options = new Map<string, string>();
+    for (const agent of agents) {
+      if (agent.can_invoke) options.set(agent.id, agent.name);
+    }
+    for (const session of sessions) {
+      if (!options.has(session.agent_id)) options.set(session.agent_id, session.agent_name);
+    }
+    return [...options].map(([id, name]) => ({ id, name }));
+  }, [agents, sessions]);
+  const selectedAgentCanInvoke = agents.some((agent) => (
+    agent.id === selectedAgentId && agent.can_invoke
+  ));
+
+  const externalPlatforms = useMemo(() => {
+    const platforms = new Map<string, string>();
+    for (const session of sessions) {
+      if (session.origin.kind === 'external') {
+        platforms.set(session.origin.platform_id, session.origin_platform_name ?? t('external'));
+      }
+    }
+    return [...platforms].map(([id, name]) => ({ id, name })).sort((left, right) => (
+      left.name.localeCompare(right.name, locale) || left.id.localeCompare(right.id)
+    ));
+  }, [locale, sessions, t]);
+
   const filteredSessions = useMemo(() => {
     const query = search.trim().toLocaleLowerCase(locale);
     return sessions.filter((session) => {
-      const originMatches = originFilter === 'all' || session.origin.kind === originFilter;
-      const searchMatches = !query || [session.agent_name, session.id, session.lifecycle_status]
+      const platformMatches = platformFilter === 'all'
+        || (platformFilter === 'hub_native' && session.origin.kind === 'hub_native')
+        || (session.origin.kind === 'external' && platformFilter === `external:${session.origin.platform_id}`);
+      const agentMatches = session.agent_id === selectedAgentId;
+      const platformName = session.origin.kind === 'external' ? session.origin_platform_name ?? t('external') : t('hubNative');
+      const searchMatches = !query || [session.agent_name, session.id, session.lifecycle_status, platformName]
         .join(' ').toLocaleLowerCase(locale).includes(query);
-      return originMatches && searchMatches;
+      return platformMatches && agentMatches && searchMatches;
     });
-  }, [locale, originFilter, search, sessions]);
+  }, [locale, platformFilter, search, selectedAgentId, sessions, t]);
+
+  useEffect(() => {
+    if (conversationDraft) return;
+    if (selectedId && filteredSessions.some((session) => session.id === selectedId)) return;
+    setSelectedId(filteredSessions[0]?.id ?? null);
+  }, [conversationDraft, filteredSessions, selectedId]);
 
   const timeline = useMemo(() => {
     const entries: TimelineEntry[] = sessionMessages.filter((message) => Boolean(message.content)).map((message) => ({
@@ -599,7 +619,7 @@ export function SessionsPage() {
     const content = draft.trim();
     const pendingConversationDraft = conversationDraft;
     const pendingDraftGeneration = conversationDraftGeneration.current;
-    if ((!selectedSession && !pendingConversationDraft) || !content || readOnly || sending) return;
+    if ((!selectedSession && !pendingConversationDraft) || !content || !canMutate || sending) return;
     setSending(true);
     setActionError(false);
     setConversationCreateError(false);
@@ -607,6 +627,7 @@ export function SessionsPage() {
       if (pendingConversationDraft) {
         const run = await api.createRun(pendingConversationDraft.agentId, content);
         if (!run.hub_session_id) throw new Error('new conversation did not return a Session id');
+        discardConversationDraft(currentUserId, pendingConversationDraft.agentId);
         if (!mountedRef.current) return;
         if (pendingDraftGeneration !== conversationDraftGeneration.current) {
           await loadSessions();
@@ -642,18 +663,53 @@ export function SessionsPage() {
     }
   }
 
+  function selectAgent(agentId: string) {
+    saveSelectedSessionAgent(currentUserId, agentId);
+    setSelectedAgentId(agentId);
+    conversationDraftGeneration.current += 1;
+    setConversationDraft(null);
+    setConversationCreateError(false);
+    setDraft('');
+  }
+
+  function openConversationDraft() {
+    const agent = agents.find((candidate) => candidate.id === selectedAgentId && candidate.can_invoke);
+    if (!agent) return;
+    const stored = loadConversationDraft(currentUserId, agent.id);
+    if (!stored) saveConversationDraft(currentUserId, agent.id, '');
+    setPlatformFilter('hub_native');
+    setSearch('');
+    conversationDraftGeneration.current += 1;
+    setConversationDraft({ agentId: agent.id, agentName: agent.name });
+    setConversationCreateError(false);
+    setActionError(false);
+    setSelectedId(null);
+    setDraft(stored?.content ?? '');
+    setSessionListOpen(false);
+  }
+
+  function discardCurrentDraft() {
+    if (!conversationDraft) return;
+    discardConversationDraft(currentUserId, conversationDraft.agentId);
+    conversationDraftGeneration.current += 1;
+    setConversationDraft(null);
+    setConversationCreateError(false);
+    setDraft('');
+  }
+
   return <section className="session-workspace session-chat-workspace" aria-labelledby="session-page-title">
     <h1 className="sr-only" id="session-page-title">{t('sessions')}</h1>
     {loadError && <div className="operation-alert" role="alert"><span>{t('sessionsLoadFailed')}</span><button type="button" onClick={() => void loadSessions()}>{t('retry')}</button></div>}
     <div className="session-layout">
       <aside className={`session-master${sessionListOpen ? ' open' : ''}`} aria-label={t('sessionList')}>
         <div className="session-master-header">
-          <button className="session-new-conversation" type="button" disabled={loading || loadError || sending} onClick={() => setCreateOpen(true)}><Plus size={17} /> <span>{t('newConversation')}</span></button>
+          <button className="session-new-conversation" type="button" disabled={loading || loadError || sending || !selectedAgentCanInvoke} onClick={openConversationDraft}><Plus size={17} /> <span>{t('newConversation')}</span></button>
           <button className="icon-button session-close-list" type="button" aria-label={t('close')} title={t('close')} onClick={() => setSessionListOpen(false)}><X size={18} /></button>
         </div>
         <div className="session-list-controls">
+          <label className="session-origin-filter"><span className="sr-only">{t('sessionOrigin')}</span><select aria-label={t('sessionOrigin')} value={platformFilter} onChange={(event) => setPlatformFilter(event.target.value as PlatformFilter)}><option value="hub_native">{t('hubNative')}</option><option value="all">{t('allOrigins')}</option>{externalPlatforms.map((platform) => <option key={platform.id} value={`external:${platform.id}`}>{platform.name}</option>)}</select><ChevronDown size={14} aria-hidden="true" /></label>
+          <label className="session-agent-filter"><span className="sr-only">{t('agent')}</span><select aria-label={t('agent')} value={selectedAgentId ?? ''} disabled={sessionAgentOptions.length === 0} onChange={(event) => selectAgent(event.target.value)}>{sessionAgentOptions.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select><ChevronDown size={14} aria-hidden="true" /></label>
           <label className="operation-search"><span className="sr-only">{t('searchSessions')}</span><Search size={16} aria-hidden="true" /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder={t('searchSessions')} /></label>
-          <label className="session-origin-filter"><span className="sr-only">{t('sessionOrigin')}</span><select aria-label={t('sessionOrigin')} value={originFilter} onChange={(event) => setOriginFilter(event.target.value as typeof originFilter)}><option value="all">{t('allOrigins')}</option><option value="hub_native">{t('hubNative')}</option><option value="external">{t('external')}</option></select><ChevronDown size={14} aria-hidden="true" /></label>
         </div>
         <div className="session-list" aria-live="polite" aria-busy={loading}>
           {loading && <div className="operation-state" role="status">{t('loadingSessions')}</div>}
@@ -668,7 +724,7 @@ export function SessionsPage() {
             setSessionListOpen(false);
           }}>
             <span className="session-row-heading"><strong>{session.agent_name}</strong><span className={`session-row-status ${session.lifecycle_status}`} aria-label={lifecycleLabel(session.lifecycle_status)} title={lifecycleLabel(session.lifecycle_status)} /></span>
-            <span className="session-row-preview"><span>{session.origin.kind === 'hub_native' ? t('hubNative') : t('external')}</span><time>{new Date(session.updated_at).toLocaleString(locale)}</time></span>
+            <span className="session-row-preview"><span>{session.origin.kind === 'hub_native' ? t('hubNative') : session.origin_platform_name ?? t('external')}</span><time>{new Date(session.updated_at).toLocaleString(locale)}</time></span>
           </button>)}
         </div>
       </aside>
@@ -684,8 +740,9 @@ export function SessionsPage() {
           <header className="session-detail-header session-chat-header">
             <div className="session-chat-title">
               <button className="icon-button session-list-toggle" type="button" aria-label={t('sessionList')} title={t('sessionList')} onClick={() => setSessionListOpen(true)}><PanelLeft size={18} /></button>
-              <div><h2>{conversationAgentName}</h2><span>{conversationDraft || selectedSession?.origin.kind === 'hub_native' ? t('hubNative') : t('external')}</span></div>
+              <div><h2>{conversationAgentName}</h2><span>{conversationDraft || selectedSession?.origin.kind === 'hub_native' ? t('hubNative') : selectedSession?.origin_platform_name ?? t('external')}</span></div>
             </div>
+            {conversationDraft && <button className="icon-button session-discard-draft" type="button" aria-label={t('discardDraft')} title={t('discardDraft')} onClick={discardCurrentDraft}><Trash2 size={16} /></button>}
             {selectedSession && <span className={`status ${selectedSession.lifecycle_status}`}>{lifecycleLabel(selectedSession.lifecycle_status)}</span>}
           </header>
           <div className="session-chat-scroll">
@@ -721,8 +778,11 @@ export function SessionsPage() {
               </article>}
             </div>
           </div>
-          {!readOnly && <form className="session-composer session-chat-composer" onSubmit={submitMessage}>
-            <label><span className="sr-only">{t('message')}</span><textarea ref={composerRef} rows={2} aria-label={t('message')} value={draft} onChange={(event) => setDraft(event.target.value)} onInput={(event) => resizeComposer(event.currentTarget)} onKeyDown={(event) => {
+          {canMutate && <form className="session-composer session-chat-composer" onSubmit={submitMessage}>
+            <label><span className="sr-only">{t('message')}</span><textarea ref={composerRef} rows={2} aria-label={t('message')} value={draft} onChange={(event) => {
+              setDraft(event.target.value);
+              if (conversationDraft) saveConversationDraft(currentUserId, conversationDraft.agentId, event.target.value);
+            }} onInput={(event) => resizeComposer(event.currentTarget)} onKeyDown={(event) => {
               if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return;
               event.preventDefault();
               event.currentTarget.form?.requestSubmit();
@@ -732,15 +792,5 @@ export function SessionsPage() {
         </>}
       </section>
     </div>
-    {createOpen && <NewConversationDialog agents={agents} onClose={() => setCreateOpen(false)} onSelected={(nextDraft) => {
-      setCreateOpen(false);
-      conversationDraftGeneration.current += 1;
-      setConversationDraft(nextDraft);
-      setConversationCreateError(false);
-      setActionError(false);
-      setSelectedId(null);
-      setDraft('');
-      setSessionListOpen(false);
-    }} />}
   </section>;
 }

@@ -154,6 +154,7 @@ export type HubSession = {
   agent_id: string;
   agent_name: string;
   agent_deleted_at: string | null;
+  origin_platform_name: string | null;
   origin: HubSessionOrigin;
   lifecycle_status: string;
   native_thread_id: string | null;

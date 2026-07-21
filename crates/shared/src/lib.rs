@@ -143,6 +143,8 @@ pub struct HubSessionDto {
     pub agent_id: Uuid,
     pub agent_name: String,
     pub agent_deleted_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub origin_platform_name: Option<String>,
     pub origin: HubSessionOriginDto,
     pub lifecycle_status: String,
     pub native_thread_id: Option<String>,
@@ -2271,6 +2273,7 @@ mod tests {
             agent_id: Uuid::from_u128(5),
             agent_name: "Test Agent".into(),
             agent_deleted_at: None,
+            origin_platform_name: Some("Trusted Platform".into()),
             origin: HubSessionOriginDto::External {
                 platform_id: Uuid::from_u128(6),
                 tenant_id: "workspace-1".into(),
@@ -2299,6 +2302,8 @@ mod tests {
         };
         let value = serde_json::to_value(session).unwrap();
         assert_eq!(value["origin"]["kind"], "external");
+        assert!(value["origin"].get("platform_name").is_none());
+        assert_eq!(value["origin_platform_name"], "Trusted Platform");
         assert_eq!(value["origin"]["tenant_id"], "workspace-1");
         assert_eq!(value["current_bundle"]["generation"], 2);
         assert_eq!(value["history_checkpoint"], 12);
@@ -2324,6 +2329,7 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(native.origin, HubSessionOriginDto::HubNative));
+        assert!(native.origin_platform_name.is_none());
 
         let turn = HubSessionTurnDto {
             id: turn_id,

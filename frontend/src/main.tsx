@@ -14,6 +14,7 @@ import { IntegrationAppsPage } from './integrations';
 import { AutomationsPage as AutomationsWorkspacePage } from './automations';
 import { RuntimesPage as RuntimesWorkspacePage } from './runtimes';
 import { ModelsPage } from './models';
+import { clearConversationDrafts } from './session-drafts';
 import './styles.css';
 
 type Route = { name: 'login' } | { name: 'agents' } | { name: 'agent'; agentId: string } | { name: 'sessions' } | { name: 'integrations' } | { name: 'skills' } | { name: 'skill'; skillId: string } | { name: 'models' } | { name: 'apiKeys' } | { name: 'docs' } | { name: 'automations' } | { name: 'runtimes' } | { name: 'administration' } | { name: 'widget'; token?: string } | { name: 'notFound' };
@@ -103,7 +104,7 @@ function App() {
   return (
     <Shell user={user}>
       {route.name === 'agents' && <AgentsPage currentUser={user} navigate={navigate} />}
-      {route.name === 'sessions' && <SessionsPage />}
+      {route.name === 'sessions' && <SessionsPage currentUserId={user.id} />}
       {route.name === 'integrations' && <IntegrationAppsPage />}
       {/* agentId 变化时重建详情页，避免旧 Agent 的表单、运行列表和 controls 在新路由加载期间残留。 */}
       {route.name === 'agent' && <AgentDetailPage key={route.agentId} agentId={route.agentId} currentUser={user} navigate={navigate} setNavigationBlocker={setNavigationBlocker} RunConsole={RunConsole} />}
@@ -126,6 +127,7 @@ function Shell({ user, children }: { user: User | null; children: React.ReactNod
   const current = (name: Route['name']) => currentRoute === name || (name === 'skills' && currentRoute === 'skill') ? 'page' as const : undefined;
   async function logout() {
     if (!canNavigate()) return;
+    if (user) clearConversationDrafts(user.id);
     await api.logout();
     setNavigationBlocker(null);
     navigate('/login', true);

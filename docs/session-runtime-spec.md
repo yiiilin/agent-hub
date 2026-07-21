@@ -17,9 +17,18 @@ Hub Session 1 --- 1 Workspace
 
 - Hub-native Session 的 external origin 全部为空。
 - External Session 的 External Platform、Tenant 和 Identity 全部固定且不可部分为空。
-- Session owner 可通过 Hub 控制面管理自己的 Session；外部 token 只能访问与自身完整 origin 相同的 Session。
+- Hub 管理台可查看当前用户拥有的全部 Session 历史，但只允许在 Hub-native Session 中发送消息、立即引导和停止 Turn。External Session 在管理台始终只读；与其完整 origin 匹配的外部 token 仍可通过外部集成接口继续对话。
 - Session 创建后不能更换 owner 或 Agent。
-- 管理台选择 Agent 后先进入未持久化的 Conversation Draft；只有首条消息被接受时，Hub 才在同一事务中创建 Hub-native Session、Message 和 Run。未发送消息就离开的 Draft 不进入 Session 列表，也不分配 Runtime、Workspace 或 Codex Thread。
+- 管理台为每个 Hub User 与可调用 Agent 组合最多保留一个 Conversation Draft。Draft 及输入内容只保存在当前浏览器的 `localStorage`，刷新和关闭浏览器后仍保留；显式丢弃只删除当前 Draft，显式退出登录清除该用户在当前浏览器中的全部 Draft。
+- “新建会话”不打开表单，也不创建后端记录，而是切回 Hub-native 来源并打开所选 Agent 已有的 Draft，或创建一个空 Draft。只有首条消息被接受时，Hub 才在同一事务中创建 Hub-native Session、Message 和 Run；成功后清除该 Draft，失败时保留 Draft 及输入内容。
+- Conversation Draft 不进入 Session 列表，也不分配 Session、Run、Runtime、Workspace、Runtime ownership 或 Codex Thread。
+
+## 管理台会话导航
+
+- 会话侧栏控件固定按“平台、Agent、搜索”排列。平台默认选择“本平台”，另提供“全部平台”，并按名称逐个列出有 Session 的 External Platform；不使用笼统的“外部平台”选项。
+- Agent 始终选择一个具体 Agent，不提供“全部智能体”。可调用 Agent 同时过滤 Session 列表并决定“新建会话”打开哪个 Conversation Draft；只存在于已有 Session 的已删除或不可调用 Agent 仍作为仅查看选项保留，但不能新建 Draft。管理台按 Hub User 恢复上次有效选择，失效时优先回退到第一个可调用 Agent，否则回退到已有 Session 的 Agent。
+- 平台筛选仅影响正式 Session 列表，不把 Conversation Draft 插入列表。查看 External Platform 时点击“新建会话”，平台自动切回“本平台”。
+- External Session 继续按消息和活动事件的原始顺序展示历史，但不展示消息输入框、立即引导或停止操作。Hub 的 console message 与 stop API 也必须拒绝 External Session，不能只依赖前端隐藏控件。
 
 ## Session 状态机
 

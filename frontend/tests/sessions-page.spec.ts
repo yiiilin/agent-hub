@@ -3,7 +3,10 @@ import { expect, test, type Page, type Route } from '@playwright/test';
 const ownerId = '10000000-0000-4000-8000-000000000001';
 const activeAgentId = '20000000-0000-4000-8000-000000000001';
 const newAgentId = '20000000-0000-4000-8000-000000000002';
+const deletedAgentId = '20000000-0000-4000-8000-000000000003';
 const now = '2026-07-17T10:00:00.000Z';
+const draftStorageKey = `agent-hub:conversation-drafts:${ownerId}`;
+const selectedAgentStorageKey = `agent-hub:selected-session-agent:${ownerId}`;
 
 function session(id: string, agentId: string, agentName: string, origin: 'hub_native' | 'external', overrides: Record<string, unknown> = {}) {
   return {
@@ -12,6 +15,7 @@ function session(id: string, agentId: string, agentName: string, origin: 'hub_na
     agent_id: agentId,
     agent_name: agentName,
     agent_deleted_at: null,
+    origin_platform_name: origin === 'external' ? 'Support Desk' : null,
     origin: origin === 'hub_native'
       ? { kind: 'hub_native' }
       : { kind: 'external', platform_id: 'platform-one', tenant_id: 'tenant-one', external_identity_id: 'identity-one' },
@@ -52,8 +56,8 @@ function message(sessionId: string, sequence: number, role: string, content: str
 
 async function installSessionApi(page: Page) {
   const active = session('active', activeAgentId, 'Active Agent', 'hub_native', { active_turn_id: 'turn-active' });
-  const external = session('external', activeAgentId, 'External Agent', 'external');
-  const historical = session('historical', activeAgentId, 'Deleted Agent', 'hub_native', {
+  const external = session('external', activeAgentId, 'External Agent', 'external', { active_turn_id: 'turn-external' });
+  const historical = session('historical', deletedAgentId, 'Deleted Agent', 'hub_native', {
     lifecycle_status: 'historical',
     agent_deleted_at: now,
     native_thread_id: null,
@@ -66,6 +70,7 @@ async function installSessionApi(page: Page) {
     updated_at: '2026-07-17T11:00:00.000Z'
   });
   let newSessionStreamCount = 0;
+  let externalStreamCount = 0;
   let sessions = [active, external, historical, multiTurn];
   const messages: Record<string, Array<Record<string, unknown>>> = {
     active: [
@@ -113,6 +118,7 @@ async function installSessionApi(page: Page) {
     const path = new URL(request.url()).pathname;
     if (!path.startsWith('/api/')) return route.continue();
     if (path === '/api/auth/me') return route.fulfill({ json: { id: ownerId, username: 'session-owner', email: 'session@example.com', display_name: 'Session owner', role: 'member' } });
+    if (path === '/api/auth/logout' && request.method() === 'POST') return route.fulfill({ status: 204 });
     if (path === '/api/agents' && request.method() === 'GET') return route.fulfill({ json: agents });
     if (path === '/api/sessions' && request.method() === 'GET') return route.fulfill({ json: sessions });
     if (path === `/api/agents/${newAgentId}/runs` && request.method() === 'POST') {
@@ -145,6 +151,12 @@ async function installSessionApi(page: Page) {
     }
     const streamMatch = path.match(/^\/api\/runs\/([^/]+)\/events\/stream$/);
     if (streamMatch) {
+      if (streamMatch[1] === 'run-external') {
+        externalStreamCount += 1;
+        const activity = { seq: 1, run_id: 'run-external', event_type: 'item', role: null, content: null, payload: { item_id: 'external-reasoning', item_type: 'reasoning', phase: 'completed', summary: ['Handled by the external platform.'] }, created_at: '2026-07-17T10:00:02.000Z' };
+        const reply = { seq: 2, run_id: 'run-external', event_type: 'message', role: 'assistant', content: 'External live response.', payload: {}, created_at: '2026-07-17T10:00:03.000Z' };
+        return route.fulfill({ contentType: 'text/event-stream', body: `event: run_event\ndata: ${JSON.stringify(activity)}\n\nevent: run_event\ndata: ${JSON.stringify(reply)}\n\n` });
+      }
       if (streamMatch[1] === 'run-second-persisted') {
         messages['multi-turn'][1] = {
           ...messages['multi-turn'][1],
@@ -199,48 +211,83 @@ async function installSessionApi(page: Page) {
     createBody: () => createBody,
     steerBody: () => steerBody,
     stopCount: () => stopCount,
+    externalStreamCount: () => externalStreamCount,
     waitForDelayedCreate: () => delayedCreateStarted,
     releaseDelayedCreate
   };
 }
 
-test('Session list filters by source and starts a conversation with an Agent chooser', async ({ page }) => {
+test('Session list uses platform-first and Agent-aware navigation for new Drafts', async ({ page }) => {
   const fixture = await installSessionApi(page);
   await page.goto('/sessions');
 
   const list = page.getByRole('complementary', { name: 'Session list' });
-  await list.getByRole('combobox', { name: 'Origin' }).selectOption('external');
+  const controls = list.locator('.session-list-controls').locator('select, input');
+  await expect(controls).toHaveCount(3);
+  await expect(controls.nth(0)).toHaveAccessibleName('Platform');
+  await expect(controls.nth(1)).toHaveAccessibleName('Agent');
+  await expect(controls.nth(2)).toHaveAccessibleName('Search sessions');
+
+  const platform = list.getByRole('combobox', { name: 'Platform' });
+  const agent = list.getByRole('combobox', { name: 'Agent' });
+  await expect(platform).toHaveValue('hub_native');
+  await expect(platform.locator('option')).toHaveText(['Hub native', 'All platforms', 'Support Desk']);
+  await expect(agent).toHaveValue(activeAgentId);
+  await expect(agent.locator('option')).toHaveText(['Active Agent', 'New Agent', 'Deleted Agent']);
+  await expect(list.getByRole('button', { name: /External Agent/ })).toHaveCount(0);
+
+  await platform.selectOption({ label: 'Support Desk' });
   await expect(list.getByRole('button', { name: /External Agent/ })).toBeVisible();
   await expect(list.getByRole('button', { name: /Active Agent/ })).toHaveCount(0);
-  await list.getByRole('combobox', { name: 'Origin' }).selectOption('all');
+  await platform.selectOption('all');
+  await expect(list.getByRole('button', { name: /External Agent/ })).toBeVisible();
+  await expect(list.getByRole('button', { name: /Active Agent/ })).toBeVisible();
+  await agent.selectOption(newAgentId);
+  await expect(list.getByRole('button', { name: /External Agent/ })).toHaveCount(0);
+  await expect(list.getByRole('button', { name: /Active Agent/ })).toHaveCount(0);
+  await agent.selectOption(activeAgentId);
 
+  await agent.selectOption(deletedAgentId);
+  await expect(list.getByRole('button', { name: /Deleted Agent/ })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'New conversation' })).toBeDisabled();
+  await agent.selectOption(activeAgentId);
+
+  await platform.selectOption({ label: 'Support Desk' });
+  const search = list.getByRole('textbox', { name: 'Search sessions' });
+  await search.fill('old Session query');
   await page.getByRole('button', { name: 'New conversation' }).click();
-  const dialog = page.getByRole('dialog', { name: 'New conversation' });
-  await dialog.getByRole('combobox', { name: 'Agent' }).selectOption(newAgentId);
-  await expect(dialog.getByRole('textbox', { name: 'Initial message' })).toHaveCount(0);
-  await dialog.getByRole('button', { name: 'Start conversation' }).click();
+  await expect(platform).toHaveValue('hub_native');
+  await expect(search).toBeEmpty();
 
   const detail = page.getByRole('region', { name: 'Session details' });
-  await expect(detail.getByRole('heading', { name: 'New Agent' })).toBeVisible();
+  await expect(detail.getByRole('heading', { name: 'Active Agent' })).toBeVisible();
   await expect(detail.getByRole('textbox', { name: 'Message' })).toBeEmpty();
-  await expect(list.getByRole('button', { name: /New Agent/ })).toHaveCount(0);
   expect(fixture.createBody()).toBeNull();
 
+  await agent.selectOption(newAgentId);
+  await expect(list.getByRole('button', { name: /Active Agent/ })).toHaveCount(0);
+  await page.getByRole('button', { name: 'New conversation' }).click();
+  await expect(detail.getByRole('heading', { name: 'New Agent' })).toBeVisible();
   await detail.getByRole('textbox', { name: 'Message' }).fill('Start a focused review.');
   await detail.getByRole('button', { name: 'Send' }).click();
   expect(fixture.createBody()).toEqual({ message: 'Start a focused review.', hub_session_id: null, parent_run_id: null });
   await expect(list.getByRole('button', { name: /New Agent/ })).toBeVisible();
   await expect(detail.getByText('Start a focused review.', { exact: true })).toBeVisible();
+
+  await page.reload();
+  await expect(list.getByRole('combobox', { name: 'Agent' })).toHaveValue(newAgentId);
+  await page.evaluate((key) => localStorage.setItem(key, 'agent-that-no-longer-exists'), selectedAgentStorageKey);
+  await page.reload();
+  await expect(page.getByRole('complementary', { name: 'Session list' }).getByRole('combobox', { name: 'Agent' })).toHaveValue(activeAgentId);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 });
 
 test('failed first message keeps the Conversation Draft and composer content', async ({ page }) => {
   const fixture = await installSessionApi(page);
   await page.goto('/sessions');
 
+  await page.getByRole('complementary', { name: 'Session list' }).getByRole('combobox', { name: 'Agent' }).selectOption(newAgentId);
   await page.getByRole('button', { name: 'New conversation' }).click();
-  const dialog = page.getByRole('dialog', { name: 'New conversation' });
-  await dialog.getByRole('combobox', { name: 'Agent' }).selectOption(newAgentId);
-  await dialog.getByRole('button', { name: 'Start conversation' }).click();
 
   const detail = page.getByRole('region', { name: 'Session details' });
   const composer = detail.getByRole('textbox', { name: 'Message' });
@@ -252,16 +299,75 @@ test('failed first message keeps the Conversation Draft and composer content', a
   await expect(detail.getByRole('heading', { name: 'New Agent' })).toBeVisible();
   await expect(page.getByRole('complementary', { name: 'Session list' }).getByRole('button', { name: /New Agent/ })).toHaveCount(0);
   expect(fixture.createBody()).toEqual({ message: 'Keep this failed first message.', hub_session_id: null, parent_run_id: null });
+
+  await page.reload();
+  await page.getByRole('button', { name: 'New conversation' }).click();
+  await expect(page.getByRole('region', { name: 'Session details' }).getByRole('textbox', { name: 'Message' }))
+    .toHaveValue('Keep this failed first message.');
+});
+
+test('Conversation Drafts persist per user and Agent and explicit logout clears only that user', async ({ page }) => {
+  const fixture = await installSessionApi(page);
+  await page.goto('/sessions');
+
+  const list = page.getByRole('complementary', { name: 'Session list' });
+  const agentSelect = list.getByRole('combobox', { name: 'Agent' });
+  await agentSelect.selectOption(newAgentId);
+  await page.getByRole('button', { name: 'New conversation' }).click();
+  await expect(page.getByRole('dialog', { name: 'New conversation' })).toHaveCount(0);
+  expect(fixture.createBody()).toBeNull();
+
+  let composer = page.getByRole('region', { name: 'Session details' }).getByRole('textbox', { name: 'Message' });
+  await composer.fill('Draft for New Agent.');
+  await page.reload();
+  await page.getByRole('button', { name: 'New conversation' }).click();
+  composer = page.getByRole('region', { name: 'Session details' }).getByRole('textbox', { name: 'Message' });
+  await expect(composer).toHaveValue('Draft for New Agent.');
+
+  await agentSelect.selectOption(activeAgentId);
+  await page.getByRole('button', { name: 'New conversation' }).click();
+  await composer.fill('Draft for Active Agent.');
+  await agentSelect.selectOption(newAgentId);
+  await page.getByRole('button', { name: 'New conversation' }).click();
+  await expect(composer).toHaveValue('Draft for New Agent.');
+
+  await page.getByRole('button', { name: 'Discard draft' }).click();
+  await page.getByRole('button', { name: 'New conversation' }).click();
+  await expect(composer).toBeEmpty();
+  await agentSelect.selectOption(activeAgentId);
+  await page.getByRole('button', { name: 'New conversation' }).click();
+  await expect(composer).toHaveValue('Draft for Active Agent.');
+
+  const otherUserKey = 'agent-hub:conversation-drafts:10000000-0000-4000-8000-000000000099';
+  await page.evaluate((key) => localStorage.setItem(key, JSON.stringify({ other: { content: 'keep' } })), otherUserKey);
+  await page.getByRole('button', { name: 'Log out' }).click();
+  await expect(page).toHaveURL(/\/login$/);
+  await expect.poll(() => page.evaluate((key) => localStorage.getItem(key), draftStorageKey)).toBeNull();
+  expect(await page.evaluate((key) => localStorage.getItem(key), otherUserKey)).not.toBeNull();
+});
+
+test('successful first message clears the Agent Conversation Draft', async ({ page }) => {
+  const fixture = await installSessionApi(page);
+  await page.goto('/sessions');
+
+  const list = page.getByRole('complementary', { name: 'Session list' });
+  await list.getByRole('combobox', { name: 'Agent' }).selectOption(newAgentId);
+  await page.getByRole('button', { name: 'New conversation' }).click();
+  const detail = page.getByRole('region', { name: 'Session details' });
+  await detail.getByRole('textbox', { name: 'Message' }).fill('Accepted first message.');
+  await detail.getByRole('button', { name: 'Send' }).click();
+  await expect.poll(() => fixture.createBody()).toEqual({ message: 'Accepted first message.', hub_session_id: null, parent_run_id: null });
+  await expect.poll(() => page.evaluate((key) => localStorage.getItem(key), draftStorageKey)).toBeNull();
+  await page.getByRole('button', { name: 'New conversation' }).click();
+  await expect(detail.getByRole('textbox', { name: 'Message' })).toBeEmpty();
 });
 
 test('composer sends with Enter and inserts a newline with Shift+Enter', async ({ page }) => {
   const fixture = await installSessionApi(page);
   await page.goto('/sessions');
 
+  await page.getByRole('complementary', { name: 'Session list' }).getByRole('combobox', { name: 'Agent' }).selectOption(newAgentId);
   await page.getByRole('button', { name: 'New conversation' }).click();
-  const dialog = page.getByRole('dialog', { name: 'New conversation' });
-  await dialog.getByRole('combobox', { name: 'Agent' }).selectOption(newAgentId);
-  await dialog.getByRole('button', { name: 'Start conversation' }).click();
 
   const composer = page.getByRole('region', { name: 'Session details' }).getByRole('textbox', { name: 'Message' });
   await composer.fill('Line one');
@@ -320,34 +426,34 @@ test('opening an existing Session is not overwritten by a pending Conversation D
   const fixture = await installSessionApi(page);
   await page.goto('/sessions');
 
+  const list = page.getByRole('complementary', { name: 'Session list' });
+  await list.getByRole('combobox', { name: 'Agent' }).selectOption(newAgentId);
   await page.getByRole('button', { name: 'New conversation' }).click();
-  const dialog = page.getByRole('dialog', { name: 'New conversation' });
-  await dialog.getByRole('combobox', { name: 'Agent' }).selectOption(newAgentId);
-  await dialog.getByRole('button', { name: 'Start conversation' }).click();
 
   const detail = page.getByRole('region', { name: 'Session details' });
   await detail.getByRole('textbox', { name: 'Message' }).fill('Create while viewing another Session.');
   await detail.getByRole('button', { name: 'Send' }).click();
   await fixture.waitForDelayedCreate();
 
-  const list = page.getByRole('complementary', { name: 'Session list' });
+  await list.getByRole('combobox', { name: 'Agent' }).selectOption(activeAgentId);
   await list.getByRole('button', { name: /Active Agent/ }).click();
   await expect(detail.getByRole('heading', { name: 'Active Agent' })).toBeVisible();
   fixture.releaseDelayedCreate();
 
-  await expect(list.getByRole('button', { name: /New Agent/ })).toBeVisible();
   await expect(detail.getByRole('heading', { name: 'Active Agent' })).toBeVisible();
   await expect(detail.getByText('Unable to start the conversation. Retry.')).toHaveCount(0);
+  await list.getByRole('combobox', { name: 'Agent' }).selectOption(newAgentId);
+  await expect(list.getByRole('button', { name: /New Agent/ })).toBeVisible();
+  await expect.poll(() => page.evaluate((key) => localStorage.getItem(key), draftStorageKey)).toBeNull();
 });
 
 test('new conversation follows SSE active and terminal Session state without reload', async ({ page }) => {
   await installSessionApi(page);
   await page.goto('/sessions');
 
+  const list = page.getByRole('complementary', { name: 'Session list' });
+  await list.getByRole('combobox', { name: 'Agent' }).selectOption(newAgentId);
   await page.getByRole('button', { name: 'New conversation' }).click();
-  const dialog = page.getByRole('dialog', { name: 'New conversation' });
-  await dialog.getByRole('combobox', { name: 'Agent' }).selectOption(newAgentId);
-  await dialog.getByRole('button', { name: 'Start conversation' }).click();
 
   const detail = page.getByRole('region', { name: 'Session details' });
   await expect(detail.getByRole('heading', { name: 'New Agent' })).toBeVisible();
@@ -361,12 +467,16 @@ test('new conversation follows SSE active and terminal Session state without rel
   await expect(detail.getByText('Guiding the current turn.', { exact: true })).toBeVisible();
   await expect(detail.getByRole('textbox', { name: 'Message' })).toHaveAttribute('placeholder', 'Guide the active turn...');
 
-  await page.getByRole('button', { name: /External Agent/ }).click();
-  await page.getByRole('button', { name: /New Agent/ }).click();
+  await list.getByRole('combobox', { name: 'Agent' }).selectOption(activeAgentId);
+  await list.getByRole('combobox', { name: 'Platform' }).selectOption({ label: 'Support Desk' });
 
   await expect(detail.getByRole('button', { name: 'Stop current run' })).toHaveCount(0);
   await expect(detail.getByText('Guiding the current turn.', { exact: true })).toHaveCount(0);
   await expect(thinking).toHaveCount(0);
+  await expect(detail.getByRole('textbox', { name: 'Message' })).toHaveCount(0);
+
+  await list.getByRole('combobox', { name: 'Platform' }).selectOption('hub_native');
+  await list.getByRole('combobox', { name: 'Agent' }).selectOption(newAgentId);
   await expect(detail.getByRole('textbox', { name: 'Message' })).toHaveAttribute('placeholder', 'Message the agent...');
 });
 
@@ -393,7 +503,7 @@ test('switching Sessions does not leak the previous transcript or Run stream whi
   await expect(detail.locator('.session-activity-events')).toBeVisible();
   const oldStreamCount = streamedRunIds.filter((runId) => runId === 'run-active').length;
 
-  await page.getByRole('button', { name: /External Agent/ }).click();
+  await page.getByRole('complementary', { name: 'Session list' }).getByRole('combobox', { name: 'Platform' }).selectOption({ label: 'Support Desk' });
   await externalMessagesRequested;
   await page.evaluate(() => new Promise((resolve) => {
     requestAnimationFrame(() => requestAnimationFrame(resolve));
@@ -407,6 +517,32 @@ test('switching Sessions does not leak the previous transcript or Run stream whi
     releaseExternalMessages();
   }
   await expect(detail.getByText('External request', { exact: true })).toBeVisible();
+});
+
+test('External Session is view-only in Hub while live history continues streaming', async ({ page }) => {
+  const fixture = await installSessionApi(page);
+  await page.goto('/sessions');
+
+  const list = page.getByRole('complementary', { name: 'Session list' });
+  await list.getByRole('combobox', { name: 'Platform' }).selectOption({ label: 'Support Desk' });
+  await list.getByRole('button', { name: /External Agent/ }).click();
+
+  const detail = page.getByRole('region', { name: 'Session details' });
+  await expect(detail.getByText('External request', { exact: true })).toBeVisible();
+  await expect(detail.getByText('External live response.', { exact: true })).toBeVisible();
+  await expect(detail.getByText('Support Desk', { exact: true })).toBeVisible();
+  const timeline = detail.locator('.session-transcript > *');
+  await expect(timeline).toHaveCount(3);
+  await expect(timeline.nth(0)).toContainText('External request');
+  await expect(timeline.nth(1)).toHaveClass(/session-activity-events/);
+  await expect(timeline.nth(2)).toContainText('External live response.');
+  const activity = detail.locator('details.session-activity-events');
+  await expect(activity).toBeVisible();
+  await activity.locator('summary').click();
+  await expect(activity).toContainText('Handled by the external platform.');
+  await expect(detail.getByRole('textbox', { name: 'Message' })).toHaveCount(0);
+  await expect(detail.getByRole('button', { name: 'Stop current run' })).toHaveCount(0);
+  expect(fixture.externalStreamCount()).toBeGreaterThan(0);
 });
 
 test('conversation streams replies, folds readable activity, steers, stops, and keeps history read-only', async ({ page }) => {
@@ -449,6 +585,7 @@ test('conversation streams replies, folds readable activity, steers, stops, and 
   await detail.getByRole('button', { name: 'Stop current run' }).click();
   expect(fixture.stopCount()).toBe(1);
 
+  await page.getByRole('complementary', { name: 'Session list' }).getByRole('combobox', { name: 'Agent' }).selectOption(deletedAgentId);
   await page.getByRole('button', { name: /Deleted Agent/ }).click();
   await expect(detail.getByText('Retained answer.', { exact: true })).toBeVisible();
   await expect(detail.getByRole('textbox', { name: 'Message' })).toHaveCount(0);
@@ -456,6 +593,17 @@ test('conversation streams replies, folds readable activity, steers, stops, and 
 
 test('mobile conversation keeps the Session list in a dismissible drawer', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
+  const diagnostics: string[] = [];
+  page.on('pageerror', (error) => diagnostics.push(`page: ${error.message}`));
+  page.on('console', (message) => {
+    if (message.type() === 'error') diagnostics.push(`console: ${message.text()}`);
+  });
+  page.on('response', (response) => {
+    const path = new URL(response.url()).pathname;
+    if (path.startsWith('/api/') && response.status() >= 400) {
+      diagnostics.push(`api: ${response.status()} ${path}`);
+    }
+  });
   await installSessionApi(page);
   await page.goto('/sessions');
 
@@ -466,9 +614,12 @@ test('mobile conversation keeps the Session list in a dismissible drawer', async
 
   await detail.getByRole('button', { name: 'Session list' }).click();
   await expect(list).toBeVisible();
+  expect(await list.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+  await list.getByRole('combobox', { name: 'Platform' }).selectOption({ label: 'Support Desk' });
   await list.getByRole('button', { name: /External Agent/ }).click();
 
   await expect(list).toBeHidden();
   await expect(detail.getByText('External request', { exact: true })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  expect(diagnostics).toEqual([]);
 });

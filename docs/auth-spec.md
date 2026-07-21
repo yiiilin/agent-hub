@@ -23,6 +23,7 @@
 ## 验收标准
 
 - `/api/auth/me` 同时支持有效 session cookie 和未到期 API Key。
+- 用户显式退出登录时，管理台清除当前浏览器中归属于该 Hub User 的全部 Conversation Draft；刷新、关闭浏览器和登录会话自然过期不主动清除 Draft。
 - API Key 明文只在创建响应中返回一次，管理台单行显示并在 hover/focus 时显示复制按钮。
 - `ApiKeyDto` 包含 nullable `expires_at`而不包含 `revoked_at`；过期 key 返回 401。
 - 续期保留 id、name、prefix、token hash、created/last-used 记录，并拒绝相同或更早日期。

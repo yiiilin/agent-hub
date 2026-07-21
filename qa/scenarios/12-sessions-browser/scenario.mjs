@@ -72,11 +72,10 @@ async function assertComposerKeyboardAndSizing(composer) {
 async function createConversation(page, request, agentId, message, { verifyComposer = false } = {}) {
   const sessionsBeforeDraft = await getJson(request, '/api/sessions', 'Sessions before Conversation Draft');
   const sessionIdsBeforeDraft = sessionsBeforeDraft.map((session) => session.id).sort();
+  const list = page.getByRole('complementary', { name: 'Session list' });
+  await list.getByRole('combobox', { name: 'Agent' }).selectOption(agentId);
   await page.getByRole('button', { name: 'New conversation' }).click();
-  const dialog = page.getByRole('dialog', { name: 'New conversation' });
-  await dialog.getByRole('combobox', { name: 'Agent' }).selectOption(agentId);
-  assert.equal(await dialog.getByRole('textbox', { name: 'Initial message' }).count(), 0);
-  await dialog.getByRole('button', { name: 'Start conversation' }).click();
+  assert.equal(await page.getByRole('dialog', { name: 'New conversation' }).count(), 0);
   const composer = page.getByRole('region', { name: 'Session details' }).getByRole('textbox', { name: 'Message' });
   await composer.waitFor();
   if (verifyComposer) await assertComposerKeyboardAndSizing(composer);
@@ -349,15 +348,15 @@ export default async function sessionsBrowserScenario(scenarioContext) {
       );
 
       const search = list.getByRole('textbox', { name: 'Search sessions' });
-      const origin = list.getByRole('combobox', { name: 'Origin' });
+      const platform = list.getByRole('combobox', { name: 'Platform' });
       await search.fill(agentName);
       assert.equal(await list.locator('.session-row').count(), 2, 'Search must isolate the two Sessions for this Agent');
-      await origin.selectOption('external');
-      await list.getByText('No Sessions match this view.', { exact: true }).waitFor();
-      assert.equal(await list.locator('.session-row').count(), 0, 'Origin filter must exclude Hub-native Sessions');
-      await origin.selectOption('hub_native');
-      assert.equal(await list.locator('.session-row').count(), 2, 'Hub-native Origin filter must restore both Sessions');
-      await origin.selectOption('all');
+      assert.equal(await platform.inputValue(), 'hub_native', 'Platform must default to Hub native');
+      assert.deepEqual(await platform.locator('option').allTextContents(), ['Hub native', 'All platforms']);
+      await platform.selectOption('all');
+      assert.equal(await list.locator('.session-row').count(), 2, 'All platforms must retain both Hub-native Sessions');
+      await platform.selectOption('hub_native');
+      assert.equal(await list.locator('.session-row').count(), 2, 'Hub-native Platform filter must retain both Sessions');
       await search.fill('');
 
       const stopResponsePromise = page.waitForResponse((response) => (
