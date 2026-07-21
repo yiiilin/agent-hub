@@ -36,17 +36,63 @@ async function waitForMessage(request, sessionId, content, accept = () => true) 
   });
 }
 
-async function createConversation(page, agentId, message) {
+async function assertComposerKeyboardAndSizing(composer) {
+  const metrics = async () => composer.evaluate((element) => {
+    const style = getComputedStyle(element);
+    const lineHeight = Number.parseFloat(style.lineHeight);
+    const chrome = Number.parseFloat(style.paddingTop) + Number.parseFloat(style.paddingBottom)
+      + Number.parseFloat(style.borderTopWidth) + Number.parseFloat(style.borderBottomWidth);
+    return {
+      height: element.getBoundingClientRect().height,
+      minimum: lineHeight * 2 + chrome,
+      maximum: lineHeight * 5 + chrome,
+      overflowY: style.overflowY
+    };
+  });
+
+  const initial = await metrics();
+  assert.ok(Math.abs(initial.height - initial.minimum) <= 1, `Composer minimum height: ${JSON.stringify(initial)}`);
+
+  await composer.fill('first line');
+  await composer.press('Shift+Enter');
+  assert.equal(await composer.inputValue(), 'first line\n', 'Shift+Enter must insert a newline');
+
+  await composer.fill('one\ntwo\nthree');
+  const middle = await metrics();
+  assert.ok(middle.height > initial.height && middle.height < middle.maximum,
+    `Composer must grow between two and five lines: ${JSON.stringify(middle)}`);
+
+  await composer.fill('one\ntwo\nthree\nfour\nfive\nsix');
+  const maximum = await metrics();
+  assert.ok(Math.abs(maximum.height - maximum.maximum) <= 1, `Composer maximum height: ${JSON.stringify(maximum)}`);
+  assert.equal(maximum.overflowY, 'auto', 'Composer must scroll after five lines');
+  await composer.fill('');
+}
+
+async function createConversation(page, request, agentId, message, { verifyComposer = false } = {}) {
+  const sessionsBeforeDraft = await getJson(request, '/api/sessions', 'Sessions before Conversation Draft');
+  const sessionIdsBeforeDraft = sessionsBeforeDraft.map((session) => session.id).sort();
   await page.getByRole('button', { name: 'New conversation' }).click();
   const dialog = page.getByRole('dialog', { name: 'New conversation' });
   await dialog.getByRole('combobox', { name: 'Agent' }).selectOption(agentId);
-  await dialog.getByRole('textbox', { name: 'Initial message' }).fill(message);
-  assert.equal(await dialog.getByRole('textbox', { name: 'Initial message' }).inputValue(), message);
+  assert.equal(await dialog.getByRole('textbox', { name: 'Initial message' }).count(), 0);
+  await dialog.getByRole('button', { name: 'Start conversation' }).click();
+  const composer = page.getByRole('region', { name: 'Session details' }).getByRole('textbox', { name: 'Message' });
+  await composer.waitFor();
+  if (verifyComposer) await assertComposerKeyboardAndSizing(composer);
+  const sessionsDuringDraft = await getJson(request, '/api/sessions', 'Sessions during Conversation Draft');
+  assert.deepEqual(
+    sessionsDuringDraft.map((session) => session.id).sort(),
+    sessionIdsBeforeDraft,
+    'Selecting an Agent must not persist a Session before the first message'
+  );
+  await composer.fill(message);
+  assert.equal(await composer.inputValue(), message);
   const responsePromise = page.waitForResponse((response) => (
     response.request().method() === 'POST'
     && new URL(response.url()).pathname === `/api/agents/${agentId}/runs`
   ));
-  await dialog.getByRole('button', { name: 'Start conversation' }).click();
+  await composer.press('Enter');
   const response = await responsePromise;
   return responseJson(response, `Create conversation for Agent ${agentId}`);
 }
@@ -108,7 +154,7 @@ export default async function sessionsBrowserScenario(scenarioContext) {
       await list.getByRole('button', { name: 'New conversation' }).waitFor();
 
       const independentMessage = scenarioContext.unique('QA independent Session');
-      const independentRun = await createConversation(page, agent.id, independentMessage);
+      const independentRun = await createConversation(page, request, agent.id, independentMessage, { verifyComposer: true });
       assert.ok(independentRun.id, 'Independent conversation must return a Run id');
       assert.ok(independentRun.hub_session_id, 'Independent conversation must return a Session id');
       await assertMessageVisible(detail, independentMessage);
@@ -129,8 +175,66 @@ export default async function sessionsBrowserScenario(scenarioContext) {
         description: `SSE request ${independentStreamUrl}`
       });
 
+      const deliveredIndependentMessage = await waitForMessage(
+        request,
+        independentRun.hub_session_id,
+        independentMessage,
+        (message) => message.delivery_state === 'delivered'
+      );
+      assert.equal(deliveredIndependentMessage.run_id, independentRun.id);
+      await poll(async () => detail.locator('.session-bubble.role-user')
+        .filter({ hasText: independentMessage }).locator('.message-state').count(),
+      (count) => count === 0, {
+        timeoutMs: 10_000,
+        description: 'Delivered user message state to disappear from the transcript'
+      });
+      const independentAssistantMessages = detail.locator('.session-bubble.role-assistant .session-message-text');
+      assert.equal(await independentAssistantMessages.count(), 1, 'First completed Run must render one assistant answer');
+
+      const independentFollowUp = scenarioContext.unique('QA independent follow-up');
+      const independentComposer = detail.getByRole('textbox', { name: 'Message' });
+      await independentComposer.fill(independentFollowUp);
+      const independentFollowUpResponse = page.waitForResponse((response) => (
+        response.request().method() === 'POST'
+        && new URL(response.url()).pathname === `/api/sessions/${independentRun.hub_session_id}/messages`
+      ));
+      await independentComposer.press('Enter');
+      const independentFollowUpAcceptance = await responseJson(
+        await independentFollowUpResponse,
+        'Create independent follow-up Turn'
+      );
+      assert.ok(independentFollowUpAcceptance.run?.id, 'Follow-up message must schedule a Run');
+      await waitForRun(request, independentFollowUpAcceptance.run.id, 'completed');
+      await independentAssistantMessages.nth(1).waitFor();
+      assert.equal(await independentAssistantMessages.count(), 2, 'Two completed Runs must render both assistant answers');
+
+      const independentFollowUpStreamUrl = new URL(
+        `/api/runs/${independentFollowUpAcceptance.run.id}/events/stream`,
+        scenarioContext.baseURL
+      ).href;
+      await poll(() => openedStreamUrls.has(independentFollowUpStreamUrl), Boolean, {
+        timeoutMs: 10_000,
+        description: `SSE request ${independentFollowUpStreamUrl}`
+      });
       allowedOldStreamUrls.add(independentStreamUrl);
-      const holdRun = await createConversation(page, agent.id, HOLD_MESSAGE);
+      allowedOldStreamUrls.add(independentFollowUpStreamUrl);
+
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      const independentReloadList = page.getByRole('complementary', { name: 'Session list' });
+      await independentReloadList.getByRole('textbox', { name: 'Search sessions' }).fill(independentRun.hub_session_id);
+      const independentReloadRow = independentReloadList.locator('.session-row');
+      assert.equal(await independentReloadRow.count(), 1, 'Reloaded list must contain the two-Run Session');
+      await independentReloadRow.click();
+      await assertMessageVisible(detail, independentMessage);
+      await assertMessageVisible(detail, independentFollowUp);
+      await detail.locator('.session-bubble.role-assistant .session-message-text').nth(1).waitFor();
+      assert.equal(
+        await detail.locator('.session-bubble.role-assistant .session-message-text').count(),
+        2,
+        'Reloading a two-Run Session must retain both assistant answers'
+      );
+
+      const holdRun = await createConversation(page, request, agent.id, HOLD_MESSAGE);
       assert.ok(holdRun.id, 'Hold conversation must return a Run id');
       assert.ok(holdRun.hub_session_id, 'Hold conversation must return a Session id');
       assert.notEqual(holdRun.hub_session_id, independentRun.hub_session_id);
@@ -175,42 +279,37 @@ export default async function sessionsBrowserScenario(scenarioContext) {
         description: `SSE request ${holdStreamUrl}`
       });
 
-      const technicalEvents = await poll(async () => {
+      const activityEvents = await poll(async () => {
         const events = await getJson(request, `/api/runs/${holdRun.id}/events`, 'Hold Run events');
-        return events.filter((event) => event.event_type !== 'message');
-      }, (events) => events.some((event) => event.event_type === 'turn_started'), {
+        return events.filter((event) => event.event_type === 'item');
+      }, (events) => events.some((event) => event.payload?.item_type === 'reasoning'), {
         timeoutMs: 30_000,
-        description: `Hold Run ${holdRun.id} technical events`
+        description: `Hold Run ${holdRun.id} readable activity`
       });
-      assert.ok(technicalEvents.every((event, index) => index === 0 || event.seq > technicalEvents[index - 1].seq));
+      assert.ok(activityEvents.every((event, index) => index === 0 || event.seq > activityEvents[index - 1].seq));
 
-      const technical = detail.locator('.session-technical-events').first();
-      const technicalSummary = technical.locator('summary');
-      await technicalSummary.waitFor();
-      assert.equal(await technical.getAttribute('open'), null, 'Technical events must be collapsed by default');
-      assert.match(await technicalSummary.innerText(), /^Technical events · .+$/);
-      assert.ok((await technicalSummary.locator('.session-technical-chevron').getAttribute('class')).includes('lucide-chevron-right'));
-      assert.equal(await technicalSummary.locator('.session-technical-chevron').evaluate((element) => getComputedStyle(element).transform), 'none');
+      const activity = detail.locator('.session-activity-events').first();
+      const activitySummary = activity.locator('summary');
+      await activitySummary.waitFor();
+      assert.equal(await activity.getAttribute('open'), null, 'Agent activity must be collapsed by default');
+      assert.match(await activitySummary.innerText(), /^Worked for .+$/);
+      assert.ok((await activitySummary.locator('.session-activity-chevron').getAttribute('class')).includes('lucide-chevron-right'));
+      assert.equal(await activitySummary.locator('.session-activity-chevron').evaluate((element) => getComputedStyle(element).transform), 'none');
 
       const initialTimelineOrder = await detail.locator('.session-transcript > *').evaluateAll((elements, holdMessage) => ({
         message: elements.findIndex((element) => element.textContent?.includes(holdMessage)),
-        technical: elements.findIndex((element) => element.classList.contains('session-technical-events'))
+        activity: elements.findIndex((element) => element.classList.contains('session-activity-events'))
       }), HOLD_MESSAGE);
-      assert.ok(initialTimelineOrder.message >= 0 && initialTimelineOrder.technical > initialTimelineOrder.message,
-        `Technical events must follow the initial message: ${JSON.stringify(initialTimelineOrder)}`);
+      assert.ok(initialTimelineOrder.message >= 0 && initialTimelineOrder.activity > initialTimelineOrder.message,
+        `Agent activity must follow the initial message: ${JSON.stringify(initialTimelineOrder)}`);
 
-      await technicalSummary.click();
-      assert.notEqual(await technical.getAttribute('open'), null, 'Technical events must expand');
-      assert.notEqual(await technicalSummary.locator('.session-technical-chevron').evaluate((element) => getComputedStyle(element).transform), 'none');
-      await poll(async () => {
-        const rows = await technical.locator('.session-technical-row code').allTextContents();
-        return rows.length >= technicalEvents.length ? rows : null;
-      }, Boolean, {
-        timeoutMs: 10_000,
-        description: 'ordered technical rows to render'
-      });
-      const displayedTechnicalTypes = await technical.locator('.session-technical-row code').allTextContents();
-      assert.deepEqual(displayedTechnicalTypes, technicalEvents.map((event) => event.event_type));
+      await activitySummary.click();
+      assert.notEqual(await activity.getAttribute('open'), null, 'Agent activity must expand');
+      assert.notEqual(await activitySummary.locator('.session-activity-chevron').evaluate((element) => getComputedStyle(element).transform), 'none');
+      const displayedActivityLabels = await activity.locator('.session-activity-row strong').allTextContents();
+      assert.ok(displayedActivityLabels.includes('Thought'));
+      await activity.getByText('Preparing the response.', { exact: true }).waitFor();
+      assert.equal(await activity.getByText('turn_started', { exact: true }).count(), 0);
 
       const steerMessage = scenarioContext.unique('QA steer current Turn');
       await detail.getByRole('textbox', { name: 'Message' }).fill(steerMessage);
@@ -239,14 +338,14 @@ export default async function sessionsBrowserScenario(scenarioContext) {
 
       const steeredTimelineOrder = await detail.locator('.session-transcript > *').evaluateAll((elements, values) => ({
         initial: elements.findIndex((element) => element.textContent?.includes(values.initial)),
-        technical: elements.findIndex((element) => element.classList.contains('session-technical-events')),
+        activity: elements.findIndex((element) => element.classList.contains('session-activity-events')),
         steer: elements.findIndex((element) => element.textContent?.includes(values.steer))
       }), { initial: HOLD_MESSAGE, steer: steerMessage });
       assert.ok(
         steeredTimelineOrder.initial >= 0
-        && steeredTimelineOrder.technical > steeredTimelineOrder.initial
-        && steeredTimelineOrder.steer > steeredTimelineOrder.technical,
-        `Technical events must remain between initial and steer messages: ${JSON.stringify(steeredTimelineOrder)}`
+        && steeredTimelineOrder.activity > steeredTimelineOrder.initial
+        && steeredTimelineOrder.steer > steeredTimelineOrder.activity,
+        `Agent activity must remain between initial and steer messages: ${JSON.stringify(steeredTimelineOrder)}`
       );
 
       const search = list.getByRole('textbox', { name: 'Search sessions' });

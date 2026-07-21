@@ -10913,15 +10913,30 @@ async fn proxy_model_request_to_upstream_with_options(
         .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/event-stream"));
     let pool = state.pool.clone();
     let body = Body::from_stream(stream! {
-        let mut observer = ModelResponseObserver::new(is_sse);
+        let mut observer = Some(ModelResponseObserver::new(is_sse));
         loop {
             match upstream.chunk().await {
                 Ok(Some(chunk)) => {
-                    observer.push(&chunk);
+                    if let Some(active_observer) = observer.as_mut() {
+                        active_observer.push(&chunk);
+                    }
+                    if observer.as_ref().is_some_and(ModelResponseObserver::has_terminal) {
+                        let completed_observer = observer.take().expect("terminal observer exists");
+                        if let Some(accounting) = accounting.as_ref() {
+                            let observation = completed_observer.finish(
+                                status,
+                                None,
+                                api_key.as_deref().map(|api_key| api_key.as_str()),
+                            );
+                            persist_model_proxy_observation(&pool, accounting, observation).await;
+                        }
+                    }
                     yield Ok::<Bytes, std::io::Error>(chunk);
                 }
                 Ok(None) => {
-                    if let Some(accounting) = accounting.as_ref() {
+                    if let (Some(accounting), Some(observer)) =
+                        (accounting.as_ref(), observer.take())
+                    {
                         let observation = observer.finish(
                             status,
                             None,
@@ -10933,7 +10948,9 @@ async fn proxy_model_request_to_upstream_with_options(
                 }
                 Err(error) => {
                     warn!(error = %error, "model upstream response stream failed");
-                    if let Some(accounting) = accounting.as_ref() {
+                    if let (Some(accounting), Some(observer)) =
+                        (accounting.as_ref(), observer.take())
+                    {
                         let failure_kind = if error.is_timeout() { "timeout" } else { "transport" };
                         let observation = observer.finish(
                             status,
@@ -11097,6 +11114,10 @@ impl ModelResponseObserver {
                 self.overflowed = true;
             }
         }
+    }
+
+    fn has_terminal(&self) -> bool {
+        self.terminal.is_some()
     }
 
     fn push_sse(&mut self, chunk: &[u8]) {
@@ -31253,6 +31274,7 @@ mod tests {
                             yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
                                 b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":11,\"output_tokens\":7,\"total_tokens\":18,\"input_tokens_details\":{\"cached_tokens\":3},\"output_tokens_details\":{\"reasoning_tokens\":5}}}}\n\n",
                             ));
+                            std::future::pending::<()>().await;
                         };
                         let mut response = Response::new(Body::from_stream(stream));
                         response.headers_mut().insert(
@@ -31376,7 +31398,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(second.starts_with(b"event: response.completed"));
-        assert!(body.next().await.is_none());
+        drop(body);
 
         let captured = captured.lock().unwrap().clone().unwrap();
         assert_eq!(captured.uri, "/provider/v1/responses?include=usage&trace=1");

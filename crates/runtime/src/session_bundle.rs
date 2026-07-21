@@ -309,6 +309,9 @@ where
             .to_path_buf();
         validate_relative_path(&relative)?;
         let file_type = entry.file_type();
+        if !include(&relative, file_type) {
+            continue;
+        }
         anyhow::ensure!(
             file_type.is_dir() || file_type.is_file() || file_type.is_symlink(),
             "Session Bundle source contains a special file: {}",
@@ -318,12 +321,10 @@ where
             let target = fs::read_link(entry.path()).context("read Bundle symbolic link")?;
             validate_symlink_target(&relative, &target)?;
         }
-        if include(&relative, file_type) {
-            entries.push(BundleSourceEntry {
-                source: entry.path().to_path_buf(),
-                relative,
-            });
-        }
+        entries.push(BundleSourceEntry {
+            source: entry.path().to_path_buf(),
+            relative,
+        });
     }
     Ok(entries)
 }
@@ -686,6 +687,15 @@ mod tests {
         )
         .unwrap();
         fs::write(codex_home.join("log/codex.log"), "secret log\n").unwrap();
+        #[cfg(unix)]
+        {
+            fs::create_dir_all(codex_home.join("tmp/tool-wrapper")).unwrap();
+            std::os::unix::fs::symlink(
+                "/var/lib/agent-hub-runtime/bin/0.144.6/codex",
+                codex_home.join("tmp/tool-wrapper/codex"),
+            )
+            .unwrap();
+        }
 
         let session_id = Uuid::new_v4();
         let archive = temp.path().join("staging/session.tar.zst");
@@ -747,6 +757,7 @@ mod tests {
         assert!(!restored.join("codex/config.toml").exists());
         assert!(!restored.join("codex/skills").exists());
         assert!(!restored.join("codex/log").exists());
+        assert!(!restored.join("codex/tmp").exists());
     }
 
     #[test]

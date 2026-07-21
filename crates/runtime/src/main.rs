@@ -2913,7 +2913,7 @@ fn app_server_thread_start_request(
     let mut params = json!({
         "cwd": run_env.workdir,
         "approvalPolicy": "never",
-        "sandbox": codex_sandbox_name(&claim.agent),
+        "sandbox": codex_thread_sandbox_name(&claim.agent),
         "developerInstructions": claim.agent.instructions
     });
     if let Some((model, provider)) = app_server_default_model_configuration(claim) {
@@ -6434,9 +6434,32 @@ impl AppServerState {
                     self.push_assistant_message(content, params.clone());
                 }
             }
+            "item/started" => {
+                let item = params.get("item").unwrap_or(params);
+                if let Some(event) = app_server_activity_event_from_item(item, "started") {
+                    self.push_item_event(event);
+                }
+            }
             "item/completed" => {
                 let item = params.get("item").unwrap_or(params);
                 if let Some(event) = app_server_event_from_item(self.run_id, item, params.clone()) {
+                    self.push_item_event(event);
+                }
+            }
+            "item/commandExecution/outputDelta" => {
+                if let Some(event) = app_server_activity_delta_event(
+                    params,
+                    "commandExecution",
+                    "output_delta",
+                    "output",
+                ) {
+                    self.push_item_event(event);
+                }
+            }
+            "item/reasoning/summaryTextDelta" => {
+                if let Some(event) =
+                    app_server_activity_delta_event(params, "reasoning", "summary_delta", "summary")
+                {
                     self.push_item_event(event);
                 }
             }
@@ -6726,6 +6749,9 @@ fn app_server_event_from_item(
             waiting_tool: None,
         });
     }
+    if let Some(event) = app_server_activity_event_from_item(item, "completed") {
+        return Some(event);
+    }
     let item_type = item
         .get("type")
         .or_else(|| item.get("item_type"))
@@ -6764,6 +6790,148 @@ fn app_server_event_from_item(
     })
 }
 
+fn app_server_activity_event_from_item(
+    item: &serde_json::Value,
+    phase: &str,
+) -> Option<AppendRunEventRequest> {
+    let item_type = item
+        .get("type")
+        .or_else(|| item.get("item_type"))
+        .and_then(|value| value.as_str())?;
+    let canonical_type = match item_type {
+        "plan" => "plan",
+        "reasoning" => "reasoning",
+        "commandExecution" | "command_execution" => "commandExecution",
+        "fileChange" | "file_change" => "fileChange",
+        "mcpToolCall" | "mcp_tool_call" => "mcpToolCall",
+        "dynamicToolCall" | "dynamic_tool_call" => "dynamicToolCall",
+        "collabAgentToolCall" | "collabToolCall" | "collab_tool_call" => "collabAgentToolCall",
+        "subAgentActivity" | "sub_agent_activity" => "subAgentActivity",
+        "webSearch" | "web_search" => "webSearch",
+        "imageView" | "image_view" => "imageView",
+        "imageGeneration" | "image_generation" => "imageGeneration",
+        "sleep" => "sleep",
+        "enteredReviewMode" | "entered_review_mode" => "enteredReviewMode",
+        "exitedReviewMode" | "exited_review_mode" => "exitedReviewMode",
+        "contextCompaction" | "context_compaction" => "contextCompaction",
+        _ => return None,
+    };
+
+    let mut activity = serde_json::Map::new();
+    activity.insert("item_type".into(), json!(canonical_type));
+    activity.insert("phase".into(), json!(phase));
+    copy_activity_field(&mut activity, item, "id", "item_id");
+    copy_activity_field(&mut activity, item, "status", "status");
+    copy_activity_field(&mut activity, item, "durationMs", "duration_ms");
+
+    match canonical_type {
+        "plan" => copy_activity_field(&mut activity, item, "text", "text"),
+        "reasoning" => {
+            let summary = match item.get("summary") {
+                Some(Value::String(summary)) => vec![json!(summary)],
+                Some(Value::Array(parts)) => parts
+                    .iter()
+                    .filter_map(|part| part.as_str().map(|part| json!(part)))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            activity.insert("summary".into(), Value::Array(summary));
+        }
+        "commandExecution" => {
+            copy_activity_field(&mut activity, item, "command", "command");
+            copy_activity_field(&mut activity, item, "cwd", "cwd");
+            copy_activity_field(&mut activity, item, "aggregatedOutput", "output");
+            copy_activity_field(&mut activity, item, "exitCode", "exit_code");
+        }
+        "fileChange" => {
+            let changes = item
+                .get("changes")
+                .and_then(Value::as_array)
+                .map(|changes| {
+                    changes
+                        .iter()
+                        .filter_map(|change| {
+                            let path = change.get("path")?.as_str()?;
+                            Some(json!({
+                                "path": path,
+                                "kind": change.get("kind").cloned().unwrap_or(Value::Null)
+                            }))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            activity.insert("changes".into(), Value::Array(changes));
+        }
+        "mcpToolCall" => {
+            copy_activity_field(&mut activity, item, "server", "server");
+            copy_activity_field(&mut activity, item, "tool", "tool");
+        }
+        "dynamicToolCall" => {
+            copy_activity_field(&mut activity, item, "namespace", "namespace");
+            copy_activity_field(&mut activity, item, "tool", "tool");
+            copy_activity_field(&mut activity, item, "success", "success");
+        }
+        "collabAgentToolCall" => {
+            copy_activity_field(&mut activity, item, "tool", "tool");
+            copy_activity_field(&mut activity, item, "model", "model");
+        }
+        "subAgentActivity" => {
+            copy_activity_field(&mut activity, item, "kind", "kind");
+            copy_activity_field(&mut activity, item, "agentPath", "agent_path");
+        }
+        "webSearch" => copy_activity_field(&mut activity, item, "query", "query"),
+        "imageView" => copy_activity_field(&mut activity, item, "path", "path"),
+        "imageGeneration" => {
+            copy_activity_field(&mut activity, item, "savedPath", "path");
+        }
+        "sleep" | "enteredReviewMode" | "exitedReviewMode" | "contextCompaction" => {}
+        _ => unreachable!(),
+    }
+
+    Some(AppendRunEventRequest {
+        event_type: "item".into(),
+        role: Some("assistant".into()),
+        content: None,
+        payload: Value::Object(activity),
+        waiting_tool: None,
+    })
+}
+
+fn app_server_activity_delta_event(
+    params: &serde_json::Value,
+    item_type: &str,
+    phase: &str,
+    field: &str,
+) -> Option<AppendRunEventRequest> {
+    let item_id = params.get("itemId")?.as_str()?;
+    let delta = params.get("delta")?.as_str()?;
+    Some(AppendRunEventRequest {
+        event_type: "item".into(),
+        role: Some("assistant".into()),
+        content: None,
+        payload: json!({
+            "item_id": item_id,
+            "item_type": item_type,
+            "phase": phase,
+            (field): delta
+        }),
+        waiting_tool: None,
+    })
+}
+
+fn copy_activity_field(
+    target: &mut serde_json::Map<String, Value>,
+    source: &serde_json::Value,
+    source_key: &str,
+    target_key: &str,
+) {
+    if let Some(value) = source.get(source_key) {
+        if !value.is_null() {
+            target.insert(target_key.into(), value.clone());
+        }
+    }
+}
+
 fn stable_tool_request_uuid(
     run_id: Uuid,
     tool_name: &str,
@@ -6792,6 +6960,15 @@ fn codex_sandbox_name(agent: &AgentDto) -> &'static str {
         "workspace-write" | "workspaceWrite" => "workspaceWrite",
         "danger-full-access" | "dangerFullAccess" => "dangerFullAccess",
         _ => "readOnly",
+    }
+}
+
+fn codex_thread_sandbox_name(agent: &AgentDto) -> &'static str {
+    // Thread settings use config-style names; Turn sandboxPolicy uses protocol camelCase.
+    match codex_sandbox_name(agent) {
+        "workspaceWrite" => "workspace-write",
+        "dangerFullAccess" => "danger-full-access",
+        _ => "read-only",
     }
 }
 
@@ -14717,6 +14894,109 @@ done
     }
 
     #[test]
+    fn app_server_items_map_safe_user_visible_activity() {
+        let reasoning = app_server_event_from_item(
+            Uuid::from_u128(1),
+            &json!({
+                "type": "reasoning",
+                "id": "reasoning-1",
+                "summary": ["Checked the deployment state."],
+                "content": ["raw private reasoning"]
+            }),
+            json!({ "method": "item/completed" }),
+        )
+        .unwrap();
+        assert_eq!(reasoning.event_type, "item");
+        assert_eq!(reasoning.payload["item_type"], "reasoning");
+        assert_eq!(reasoning.payload["item_id"], "reasoning-1");
+        assert_eq!(
+            reasoning.payload["summary"][0],
+            "Checked the deployment state."
+        );
+        assert!(reasoning.payload.get("content").is_none());
+
+        let command = app_server_event_from_item(
+            Uuid::from_u128(1),
+            &json!({
+                "type": "commandExecution",
+                "id": "command-1",
+                "command": "cargo test -p agent-hub-runtime",
+                "cwd": "/workspace",
+                "status": "completed",
+                "aggregatedOutput": "test result: ok",
+                "exitCode": 0,
+                "durationMs": 1250
+            }),
+            json!({ "method": "item/completed" }),
+        )
+        .unwrap();
+        assert_eq!(command.event_type, "item");
+        assert_eq!(command.payload["item_type"], "commandExecution");
+        assert_eq!(
+            command.payload["command"],
+            "cargo test -p agent-hub-runtime"
+        );
+        assert_eq!(command.payload["output"], "test result: ok");
+        assert_eq!(command.payload["duration_ms"], 1250);
+
+        let mcp = app_server_event_from_item(
+            Uuid::from_u128(1),
+            &json!({
+                "type": "mcpToolCall",
+                "id": "mcp-1",
+                "server": "issues",
+                "tool": "search",
+                "status": "completed",
+                "arguments": { "token": "must-not-persist" },
+                "result": { "secret": "must-not-persist" }
+            }),
+            json!({ "method": "item/completed" }),
+        )
+        .unwrap();
+        assert_eq!(mcp.event_type, "item");
+        assert_eq!(mcp.payload["item_type"], "mcpToolCall");
+        assert_eq!(mcp.payload["server"], "issues");
+        assert_eq!(mcp.payload["tool"], "search");
+        assert!(mcp.payload.get("arguments").is_none());
+        assert!(mcp.payload.get("result").is_none());
+    }
+
+    #[test]
+    fn app_server_state_streams_started_items_and_command_output() {
+        let mut state = AppServerState::new(Uuid::new_v4());
+        state
+            .handle_value(&json!({
+                "method": "item/started",
+                "params": {
+                    "item": {
+                        "type": "commandExecution",
+                        "id": "command-1",
+                        "command": "cargo test",
+                        "cwd": "/workspace",
+                        "status": "inProgress"
+                    }
+                }
+            }))
+            .unwrap();
+        state
+            .handle_value(&json!({
+                "method": "item/commandExecution/outputDelta",
+                "params": { "itemId": "command-1", "delta": "running tests\n" }
+            }))
+            .unwrap();
+
+        let activity = state
+            .events
+            .iter()
+            .filter(|event| event.event_type == "item")
+            .collect::<Vec<_>>();
+        assert_eq!(activity.len(), 2);
+        assert_eq!(activity[0].payload["phase"], "started");
+        assert_eq!(activity[1].payload["phase"], "output_delta");
+        assert_eq!(activity[1].payload["output"], "running tests\n");
+    }
+
+    #[test]
     fn streamed_tool_request_is_deferred_until_driver_finishes() {
         let event = test_tool_request_event();
         let mut deferred = Vec::new();
@@ -15129,6 +15409,7 @@ done
         assert_eq!(requests[2]["method"], "thread/start");
         assert_eq!(requests[2]["jsonrpc"], "2.0");
         assert_eq!(requests[2]["params"]["approvalPolicy"], "never");
+        assert_eq!(requests[2]["params"]["sandbox"], "workspace-write");
         assert_eq!(requests[2]["params"]["model"], "gpt-main");
         assert_eq!(
             requests[2]["params"]["modelProvider"],
@@ -15139,6 +15420,14 @@ done
         assert_eq!(requests[3]["params"]["input"][0]["type"], "text");
         assert_eq!(requests[3]["params"]["model"], "gpt-main");
         assert_eq!(requests[3]["params"]["effort"], "ultra");
+        assert_eq!(
+            requests[3]["params"]["sandboxPolicy"]["type"],
+            "workspaceWrite"
+        );
+        assert_eq!(
+            requests[3]["params"]["sandboxPolicy"]["networkAccess"],
+            true
+        );
     }
 
     #[test]

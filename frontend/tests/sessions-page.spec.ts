@@ -59,24 +59,42 @@ async function installSessionApi(page: Page) {
     native_thread_id: null,
     runtime_owner_id: null
   });
+  const multiTurn = session('multi-turn', activeAgentId, 'Multi-turn Agent', 'hub_native');
   let created = session('new-session', newAgentId, 'New Agent', 'hub_native', {
     lifecycle_status: 'waiting_for_runtime',
     active_turn_id: null,
     updated_at: '2026-07-17T11:00:00.000Z'
   });
   let newSessionStreamCount = 0;
-  let sessions = [active, external, historical];
+  let sessions = [active, external, historical, multiTurn];
   const messages: Record<string, Array<Record<string, unknown>>> = {
     active: [
       message('active', 1, 'user', 'Inspect the deployment.', { accepted_at: '2026-07-17T10:00:00.000Z' }),
       message('active', 2, 'assistant', 'The deployment is running.', { run_id: 'run-active', accepted_at: '2026-07-17T10:00:04.000Z' })
     ],
     external: [message('external', 1, 'user', 'External request')],
-    historical: [message('historical', 1, 'assistant', 'Retained answer.')]
+    historical: [message('historical', 1, 'assistant', 'Retained answer.')],
+    'multi-turn': [
+      message('multi-turn', 1, 'user', 'First persisted question.', {
+        run_id: 'run-first-persisted',
+        turn_id: 'turn-first-persisted',
+        accepted_at: '2026-07-17T09:00:00.000Z'
+      }),
+      message('multi-turn', 2, 'user', 'Second persisted question.', {
+        run_id: 'run-second-persisted',
+        turn_id: 'turn-second-persisted',
+        delivery_state: 'queued',
+        accepted_at: '2026-07-17T09:01:00.000Z'
+      })
+    ]
   };
   let createBody: Record<string, unknown> | null = null;
   let steerBody: Record<string, unknown> | null = null;
   let stopCount = 0;
+  let releaseDelayedCreate!: () => void;
+  let markDelayedCreateStarted!: () => void;
+  const delayedCreate = new Promise<void>((resolve) => { releaseDelayedCreate = resolve; });
+  const delayedCreateStarted = new Promise<void>((resolve) => { markDelayedCreateStarted = resolve; });
   const agents = [
     {
       id: activeAgentId, name: 'Active Agent', instructions: '', visibility: 'private', public_to: [], runtime_id: null,
@@ -99,6 +117,13 @@ async function installSessionApi(page: Page) {
     if (path === '/api/sessions' && request.method() === 'GET') return route.fulfill({ json: sessions });
     if (path === `/api/agents/${newAgentId}/runs` && request.method() === 'POST') {
       createBody = request.postDataJSON() as Record<string, unknown>;
+      if (createBody.message === 'Keep this failed first message.') {
+        return route.fulfill({ status: 502, json: { error: 'Model unavailable' } });
+      }
+      if (createBody.message === 'Create while viewing another Session.') {
+        markDelayedCreateStarted();
+        await delayedCreate;
+      }
       sessions = [created, ...sessions];
       messages['new-session'] = [message('new-session', 1, 'user', String(createBody.message), { run_id: 'run-new', delivery_state: 'queued' })];
       return route.fulfill({ json: {
@@ -120,6 +145,14 @@ async function installSessionApi(page: Page) {
     }
     const streamMatch = path.match(/^\/api\/runs\/([^/]+)\/events\/stream$/);
     if (streamMatch) {
+      if (streamMatch[1] === 'run-second-persisted') {
+        messages['multi-turn'][1] = {
+          ...messages['multi-turn'][1],
+          delivery_state: 'delivered'
+        };
+        const completed = { seq: 2, run_id: 'run-second-persisted', event_type: 'status', role: null, content: 'completed', payload: { status: 'completed' }, created_at: '2026-07-17T09:01:04.000Z' };
+        return route.fulfill({ contentType: 'text/event-stream', body: `event: run_event\ndata: ${JSON.stringify(completed)}\n\n` });
+      }
       if (streamMatch[1] === 'run-new') {
         newSessionStreamCount += 1;
         if (newSessionStreamCount === 1) {
@@ -132,15 +165,29 @@ async function installSessionApi(page: Page) {
         return route.fulfill({ contentType: 'text/event-stream', body: `event: run_event\ndata: ${JSON.stringify(completed)}\n\n` });
       }
       if (streamMatch[1] !== 'run-active') return route.fulfill({ contentType: 'text/event-stream', body: '' });
-      const liveMessage = { seq: 3, run_id: 'run-active', event_type: 'message', role: 'assistant', content: 'Live assistant response.', payload: {}, created_at: '2026-07-17T10:00:05.000Z' };
-      const liveTool = { seq: 4, run_id: 'run-active', event_type: 'tool_request', role: null, content: null, payload: { tool_name: 'shell' }, created_at: '2026-07-17T10:00:06.000Z' };
+      const liveMessage = { seq: 6, run_id: 'run-active', event_type: 'message', role: 'assistant', content: 'Live assistant response.', payload: {}, created_at: '2026-07-17T10:00:05.000Z' };
+      const liveTool = { seq: 7, run_id: 'run-active', event_type: 'tool_request', role: null, content: null, payload: { tool_request_id: 'tool-one', tool_name: 'shell' }, created_at: '2026-07-17T10:00:03.500Z' };
       return route.fulfill({ contentType: 'text/event-stream', body: `event: run_event\ndata: ${JSON.stringify(liveMessage)}\n\nevent: run_event\ndata: ${JSON.stringify(liveTool)}\n\n` });
     }
     const eventsMatch = path.match(/^\/api\/runs\/([^/]+)\/events$/);
-    if (eventsMatch) return route.fulfill({ json: eventsMatch[1] === 'run-active' ? [
-      { seq: 1, run_id: 'run-active', event_type: 'status', role: null, content: null, payload: { status: 'running' }, created_at: '2026-07-17T10:00:01.000Z' },
-      { seq: 2, run_id: 'run-active', event_type: 'item', role: null, content: 'Command started', payload: {}, created_at: '2026-07-17T10:00:03.000Z' }
-    ] : [] });
+    if (eventsMatch) {
+      const persistedAnswers: Record<string, Array<Record<string, unknown>>> = {
+        'run-first-persisted': [
+          { seq: 1, run_id: 'run-first-persisted', event_type: 'message', role: 'assistant', content: 'First persisted answer.', payload: {}, created_at: '2026-07-17T09:00:04.000Z' }
+        ],
+        'run-second-persisted': [
+          { seq: 1, run_id: 'run-second-persisted', event_type: 'message', role: 'assistant', content: 'Second persisted answer.', payload: {}, created_at: '2026-07-17T09:01:03.000Z' }
+        ]
+      };
+      return route.fulfill({ json: eventsMatch[1] === 'run-active' ? [
+        { seq: 1, run_id: 'run-active', event_type: 'status', role: null, content: null, payload: { status: 'running' }, created_at: '2026-07-17T10:00:01.000Z' },
+        { seq: 2, run_id: 'run-active', event_type: 'item', role: null, content: null, payload: { item_id: 'reasoning-1', item_type: 'reasoning', phase: 'started', summary: [] }, created_at: '2026-07-17T10:00:01.000Z' },
+        { seq: 3, run_id: 'run-active', event_type: 'item', role: null, content: null, payload: { item_id: 'reasoning-1', item_type: 'reasoning', phase: 'completed', summary: ['Checked the deployment state.'] }, created_at: '2026-07-17T10:00:02.000Z' },
+        { seq: 4, run_id: 'run-active', event_type: 'item', role: null, content: null, payload: { item_id: 'command-1', item_type: 'commandExecution', phase: 'completed', command: 'kubectl get deployment', output: 'deployment/api ready', status: 'completed', duration_ms: 2000 }, created_at: '2026-07-17T10:00:03.000Z' },
+        { seq: 5, run_id: 'run-active', event_type: 'usage', role: null, content: null, payload: { input_tokens: 12 }, created_at: '2026-07-17T10:00:03.500Z' },
+        { seq: 8, run_id: 'run-active', event_type: 'tool_result', role: 'tool', content: 'Tool result for shell: {"api_key":"must-not-render"}', payload: { tool_request_id: 'tool-one', message: { result: { api_key: 'must-not-render' } } }, created_at: '2026-07-17T10:00:03.500Z' }
+      ] : persistedAnswers[eventsMatch[1]] ?? [] });
+    }
     if (path === '/api/runs/run-active/stop' && request.method() === 'POST') {
       stopCount += 1;
       return route.fulfill({ json: { id: 'run-active', status: 'running' } });
@@ -151,7 +198,9 @@ async function installSessionApi(page: Page) {
   return {
     createBody: () => createBody,
     steerBody: () => steerBody,
-    stopCount: () => stopCount
+    stopCount: () => stopCount,
+    waitForDelayedCreate: () => delayedCreateStarted,
+    releaseDelayedCreate
   };
 }
 
@@ -168,12 +217,127 @@ test('Session list filters by source and starts a conversation with an Agent cho
   await page.getByRole('button', { name: 'New conversation' }).click();
   const dialog = page.getByRole('dialog', { name: 'New conversation' });
   await dialog.getByRole('combobox', { name: 'Agent' }).selectOption(newAgentId);
-  await dialog.getByRole('textbox', { name: 'Initial message' }).fill('Start a focused review.');
+  await expect(dialog.getByRole('textbox', { name: 'Initial message' })).toHaveCount(0);
   await dialog.getByRole('button', { name: 'Start conversation' }).click();
 
+  const detail = page.getByRole('region', { name: 'Session details' });
+  await expect(detail.getByRole('heading', { name: 'New Agent' })).toBeVisible();
+  await expect(detail.getByRole('textbox', { name: 'Message' })).toBeEmpty();
+  await expect(list.getByRole('button', { name: /New Agent/ })).toHaveCount(0);
+  expect(fixture.createBody()).toBeNull();
+
+  await detail.getByRole('textbox', { name: 'Message' }).fill('Start a focused review.');
+  await detail.getByRole('button', { name: 'Send' }).click();
   expect(fixture.createBody()).toEqual({ message: 'Start a focused review.', hub_session_id: null, parent_run_id: null });
-  await expect(page.getByRole('region', { name: 'Session details' })).toContainText('New Agent');
-  await expect(page.getByText('Start a focused review.', { exact: true })).toBeVisible();
+  await expect(list.getByRole('button', { name: /New Agent/ })).toBeVisible();
+  await expect(detail.getByText('Start a focused review.', { exact: true })).toBeVisible();
+});
+
+test('failed first message keeps the Conversation Draft and composer content', async ({ page }) => {
+  const fixture = await installSessionApi(page);
+  await page.goto('/sessions');
+
+  await page.getByRole('button', { name: 'New conversation' }).click();
+  const dialog = page.getByRole('dialog', { name: 'New conversation' });
+  await dialog.getByRole('combobox', { name: 'Agent' }).selectOption(newAgentId);
+  await dialog.getByRole('button', { name: 'Start conversation' }).click();
+
+  const detail = page.getByRole('region', { name: 'Session details' });
+  const composer = detail.getByRole('textbox', { name: 'Message' });
+  await composer.fill('Keep this failed first message.');
+  await detail.getByRole('button', { name: 'Send' }).click();
+
+  await expect(detail.getByRole('alert')).toContainText('Unable to start the conversation. Retry.');
+  await expect(composer).toHaveValue('Keep this failed first message.');
+  await expect(detail.getByRole('heading', { name: 'New Agent' })).toBeVisible();
+  await expect(page.getByRole('complementary', { name: 'Session list' }).getByRole('button', { name: /New Agent/ })).toHaveCount(0);
+  expect(fixture.createBody()).toEqual({ message: 'Keep this failed first message.', hub_session_id: null, parent_run_id: null });
+});
+
+test('composer sends with Enter and inserts a newline with Shift+Enter', async ({ page }) => {
+  const fixture = await installSessionApi(page);
+  await page.goto('/sessions');
+
+  await page.getByRole('button', { name: 'New conversation' }).click();
+  const dialog = page.getByRole('dialog', { name: 'New conversation' });
+  await dialog.getByRole('combobox', { name: 'Agent' }).selectOption(newAgentId);
+  await dialog.getByRole('button', { name: 'Start conversation' }).click();
+
+  const composer = page.getByRole('region', { name: 'Session details' }).getByRole('textbox', { name: 'Message' });
+  await composer.fill('Line one');
+  await composer.press('Shift+Enter');
+  await composer.type('Line two');
+  await expect(composer).toHaveValue('Line one\nLine two');
+  expect(fixture.createBody()).toBeNull();
+
+  await composer.fill('Send this with Enter.');
+  await composer.press('Enter');
+  await expect.poll(() => fixture.createBody()).toEqual({ message: 'Send this with Enter.', hub_session_id: null, parent_run_id: null });
+});
+
+test('composer grows from two lines to at most five lines', async ({ page }) => {
+  await installSessionApi(page);
+  await page.goto('/sessions');
+
+  const composer = page.getByRole('region', { name: 'Session details' }).getByRole('textbox', { name: 'Message' });
+  await expect(composer).toHaveAttribute('rows', '2');
+  await composer.fill('1');
+  const twoLineHeight = await composer.evaluate((element) => element.getBoundingClientRect().height);
+  await composer.fill('1\n2\n3\n4\n5');
+  const fiveLineHeight = await composer.evaluate((element) => element.getBoundingClientRect().height);
+  await composer.fill('1\n2\n3\n4\n5\n6');
+  const sixLineHeight = await composer.evaluate((element) => element.getBoundingClientRect().height);
+  expect(fiveLineHeight).toBeGreaterThan(twoLineHeight);
+  expect(Math.abs(sixLineHeight - fiveLineHeight)).toBeLessThanOrEqual(1);
+});
+
+test('a terminal Run refreshes a queued user message to its durable delivery state', async ({ page }) => {
+  await installSessionApi(page);
+  await page.goto('/sessions');
+
+  const detail = page.getByRole('region', { name: 'Session details' });
+  await page.getByRole('button', { name: /Multi-turn Agent/ }).click();
+  await expect(detail.getByText('Second persisted answer.', { exact: true })).toBeVisible();
+  await expect(detail.getByText('queued', { exact: true })).toHaveCount(0);
+});
+
+test('reloading a two-turn Session keeps every assistant answer', async ({ page }) => {
+  await installSessionApi(page);
+  await page.goto('/sessions');
+
+  const detail = page.getByRole('region', { name: 'Session details' });
+  await page.getByRole('button', { name: /Multi-turn Agent/ }).click();
+  await expect(detail.getByText('First persisted answer.', { exact: true })).toBeVisible();
+  await expect(detail.getByText('Second persisted answer.', { exact: true })).toBeVisible();
+
+  await page.reload();
+  await page.getByRole('button', { name: /Multi-turn Agent/ }).click();
+  await expect(detail.getByText('First persisted answer.', { exact: true })).toBeVisible();
+  await expect(detail.getByText('Second persisted answer.', { exact: true })).toBeVisible();
+});
+
+test('opening an existing Session is not overwritten by a pending Conversation Draft request', async ({ page }) => {
+  const fixture = await installSessionApi(page);
+  await page.goto('/sessions');
+
+  await page.getByRole('button', { name: 'New conversation' }).click();
+  const dialog = page.getByRole('dialog', { name: 'New conversation' });
+  await dialog.getByRole('combobox', { name: 'Agent' }).selectOption(newAgentId);
+  await dialog.getByRole('button', { name: 'Start conversation' }).click();
+
+  const detail = page.getByRole('region', { name: 'Session details' });
+  await detail.getByRole('textbox', { name: 'Message' }).fill('Create while viewing another Session.');
+  await detail.getByRole('button', { name: 'Send' }).click();
+  await fixture.waitForDelayedCreate();
+
+  const list = page.getByRole('complementary', { name: 'Session list' });
+  await list.getByRole('button', { name: /Active Agent/ }).click();
+  await expect(detail.getByRole('heading', { name: 'Active Agent' })).toBeVisible();
+  fixture.releaseDelayedCreate();
+
+  await expect(list.getByRole('button', { name: /New Agent/ })).toBeVisible();
+  await expect(detail.getByRole('heading', { name: 'Active Agent' })).toBeVisible();
+  await expect(detail.getByText('Unable to start the conversation. Retry.')).toHaveCount(0);
 });
 
 test('new conversation follows SSE active and terminal Session state without reload', async ({ page }) => {
@@ -183,12 +347,16 @@ test('new conversation follows SSE active and terminal Session state without rel
   await page.getByRole('button', { name: 'New conversation' }).click();
   const dialog = page.getByRole('dialog', { name: 'New conversation' });
   await dialog.getByRole('combobox', { name: 'Agent' }).selectOption(newAgentId);
-  await dialog.getByRole('textbox', { name: 'Initial message' }).fill('Hold this conversation.');
   await dialog.getByRole('button', { name: 'Start conversation' }).click();
 
   const detail = page.getByRole('region', { name: 'Session details' });
   await expect(detail.getByRole('heading', { name: 'New Agent' })).toBeVisible();
+  await detail.getByRole('textbox', { name: 'Message' }).fill('Hold this conversation.');
+  await detail.getByRole('button', { name: 'Send' }).click();
   await expect(detail.getByText('Hold this conversation.', { exact: true })).toBeVisible();
+  const thinking = detail.getByRole('status', { name: 'Thinking...' });
+  await expect(thinking).toBeVisible();
+  await expect(thinking.locator('span[aria-hidden="true"]').first()).toHaveCSS('animation-name', 'session-thinking-pulse');
   await expect(detail.getByRole('button', { name: 'Stop current run' })).toBeVisible();
   await expect(detail.getByText('Guiding the current turn.', { exact: true })).toBeVisible();
   await expect(detail.getByRole('textbox', { name: 'Message' })).toHaveAttribute('placeholder', 'Guide the active turn...');
@@ -198,6 +366,7 @@ test('new conversation follows SSE active and terminal Session state without rel
 
   await expect(detail.getByRole('button', { name: 'Stop current run' })).toHaveCount(0);
   await expect(detail.getByText('Guiding the current turn.', { exact: true })).toHaveCount(0);
+  await expect(thinking).toHaveCount(0);
   await expect(detail.getByRole('textbox', { name: 'Message' })).toHaveAttribute('placeholder', 'Message the agent...');
 });
 
@@ -221,7 +390,7 @@ test('switching Sessions does not leak the previous transcript or Run stream whi
 
   const detail = page.getByRole('region', { name: 'Session details' });
   await expect(detail.getByText('Inspect the deployment.', { exact: true })).toBeVisible();
-  await expect(detail.locator('.session-technical-events')).toBeVisible();
+  await expect(detail.locator('.session-activity-events')).toBeVisible();
   const oldStreamCount = streamedRunIds.filter((runId) => runId === 'run-active').length;
 
   await page.getByRole('button', { name: /External Agent/ }).click();
@@ -232,7 +401,7 @@ test('switching Sessions does not leak the previous transcript or Run stream whi
   try {
     await expect(detail.getByRole('heading', { name: 'External Agent' })).toBeVisible();
     await expect(detail.getByText('Inspect the deployment.', { exact: true })).toHaveCount(0);
-    await expect(detail.locator('.session-technical-events')).toHaveCount(0);
+    await expect(detail.locator('.session-activity-events')).toHaveCount(0);
     expect(streamedRunIds.filter((runId) => runId === 'run-active')).toHaveLength(oldStreamCount);
   } finally {
     releaseExternalMessages();
@@ -240,7 +409,7 @@ test('switching Sessions does not leak the previous transcript or Run stream whi
   await expect(detail.getByText('External request', { exact: true })).toBeVisible();
 });
 
-test('conversation streams replies, folds technical events, steers, stops, and keeps history read-only', async ({ page }) => {
+test('conversation streams replies, folds readable activity, steers, stops, and keeps history read-only', async ({ page }) => {
   const fixture = await installSessionApi(page);
   await page.goto('/sessions');
 
@@ -250,20 +419,28 @@ test('conversation streams replies, folds technical events, steers, stops, and k
   const timeline = detail.locator('.session-transcript > *');
   await expect(timeline).toHaveCount(4);
   await expect(timeline.nth(0)).toContainText('Inspect the deployment.');
-  await expect(timeline.nth(1)).toHaveClass(/session-technical-events/);
+  await expect(timeline.nth(1)).toHaveClass(/session-activity-events/);
   await expect(timeline.nth(2)).toContainText('The deployment is running.');
   await expect(timeline.nth(3)).toContainText('Live assistant response.');
 
-  const technical = detail.locator('details.session-technical-events').first();
-  await expect(technical).not.toHaveAttribute('open', '');
-  await expect(technical.locator('summary')).toContainText('Technical events · 5 sec');
-  await expect(technical.locator('.session-technical-chevron')).toHaveCSS('transform', 'none');
-  await technical.locator('summary').click();
-  await expect(technical).toHaveAttribute('open', '');
-  await expect(technical.locator('.session-technical-chevron')).not.toHaveCSS('transform', 'none');
-  await expect(technical.locator('.session-technical-row')).toHaveCount(3);
-  await expect(technical).toContainText('Command started');
-  await expect(technical).toContainText('tool_request');
+  const activity = detail.locator('details.session-activity-events').first();
+  await expect(activity).not.toHaveAttribute('open', '');
+  await expect(activity.locator('summary')).toContainText('Worked for 2.5 sec');
+  await expect(activity.locator('.session-activity-chevron')).toHaveCSS('transform', 'none');
+  await activity.locator('summary').click();
+  await expect(activity).toHaveAttribute('open', '');
+  await expect(activity.locator('.session-activity-chevron')).not.toHaveCSS('transform', 'none');
+  await expect(activity.locator('.session-activity-row')).toHaveCount(3);
+  await expect(activity).toContainText('Thought');
+  await expect(activity).toContainText('Checked the deployment state.');
+  await expect(activity).toContainText('Ran command');
+  await expect(activity).toContainText('kubectl get deployment');
+  await expect(activity).toContainText('deployment/api ready');
+  await expect(activity).toContainText('Used tool');
+  await expect(activity).toContainText('shell');
+  await expect(detail.getByText(/must-not-render/)).toHaveCount(0);
+  await expect(detail.getByText('status', { exact: true })).toHaveCount(0);
+  await expect(detail.getByText('usage', { exact: true })).toHaveCount(0);
 
   await detail.getByRole('textbox', { name: 'Message' }).fill('Guide the running turn now.');
   await detail.getByRole('button', { name: 'Send' }).click();

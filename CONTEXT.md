@@ -112,12 +112,16 @@ _Avoid_: Agent owner usage, estimated billing, Session ownership
 A durable, sanitized record of a failed model request or an invalid Responses API result. It follows the same retention and anonymization lifecycle as Model Token Usage but contains no prompt, model output, request or response headers, or credential.
 _Avoid_: Raw provider response, application log, Token Usage
 
+**Conversation Draft**:
+A Hub console state with a selected Agent but no accepted message. It is not persisted and owns no Session, Run, Workspace, Runtime ownership, or Codex Thread; the first accepted message creates those durable records as needed.
+_Avoid_: Empty Session, draft Session, initial Run
+
 **Session Origin**:
 The trust boundary through which a Session was created. It is either Hub-native, with no external identity, or external, scoped to one External Platform, External Tenant, and External Identity.
 _Avoid_: Fake Hub platform, channel, unscoped source
 
 **Session**:
-A conversation owned by one Hub User, permanently assigned to one Agent, and created with one Session Origin. While executable, it continues through one native Codex Thread; an external integration cannot access a Hub-native Session or a Session from another external origin without an explicit transfer or sharing grant.
+A durable conversation owned by one Hub User, permanently assigned to one Agent, and created with one Session Origin after its first message is accepted. While executable, it continues through one native Codex Thread; an external integration cannot access a Hub-native Session or a Session from another external origin without an explicit transfer or sharing grant.
 _Avoid_: Run, Codex Thread, unscoped integration session
 
 **Historical Session**:

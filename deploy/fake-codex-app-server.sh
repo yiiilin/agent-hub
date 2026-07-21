@@ -204,6 +204,25 @@ while IFS= read -r line; do
         method: "turn/started",
         params: {threadId: $thread, turn: {id: $turn, status: "inProgress", items: []}}
       }'
+      activity_item_id="fake-app-server-reasoning-${active_turn_id}"
+      jq -cn --arg thread "$thread_id" --arg turn "$active_turn_id" --arg item "$activity_item_id" '{
+        jsonrpc: "2.0",
+        method: "item/started",
+        params: {
+          threadId: $thread,
+          turnId: $turn,
+          item: {type: "reasoning", id: $item, summary: []}
+        }
+      }'
+      jq -cn --arg thread "$thread_id" --arg turn "$active_turn_id" --arg item "$activity_item_id" '{
+        jsonrpc: "2.0",
+        method: "item/completed",
+        params: {
+          threadId: $thread,
+          turnId: $turn,
+          item: {type: "reasoning", id: $item, summary: ["Preparing the response."]}
+        }
+      }'
 
       if [ "$source" = "console" ]; then
         hold_turn="$(printf '%s\n' "$line" | jq -r '

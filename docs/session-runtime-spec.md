@@ -19,6 +19,7 @@ Hub Session 1 --- 1 Workspace
 - External Session 的 External Platform、Tenant 和 Identity 全部固定且不可部分为空。
 - Session owner 可通过 Hub 控制面管理自己的 Session；外部 token 只能访问与自身完整 origin 相同的 Session。
 - Session 创建后不能更换 owner 或 Agent。
+- 管理台选择 Agent 后先进入未持久化的 Conversation Draft；只有首条消息被接受时，Hub 才在同一事务中创建 Hub-native Session、Message 和 Run。未发送消息就离开的 Draft 不进入 Session 列表，也不分配 Runtime、Workspace 或 Codex Thread。
 
 ## Session 状态机
 
@@ -61,6 +62,8 @@ restoring|saving    -> recovery_failed            # only the specified unrecover
 5. 显式停止立即发送 `turn/interrupt(threadId, turnId)`。已完成命令、工具事件、Workspace 修改和外部副作用不撤销；最终以 interrupted 记录。
 6. 在 `restoring` 或 `saving` 中接受的消息先持久化再排队；恢复完成前的普通消息按顺序进入同一个 upcoming Turn。
 7. 一个 Session 同时最多有一个 active Turn 和一个执行它的 Runtime owner；Run 重试不得造成双 Turn。
+8. 管理台恢复 Session 历史时必须加载该 Session 消息所关联的全部 Run 事件，不得只加载最后一个 Run；Run 进入终态后重新读取持久化消息状态，避免继续显示已经送达的 `queued` 状态。
+9. Runtime 将 Codex `reasoning`、命令执行、文件修改、工具调用、网页搜索等 native Item 映射为可读活动事件。Reasoning 只持久化 summary；MCP 和动态工具活动不持久化完整 arguments 或 result。管理台不把 `status`、`usage`、`turn_started`、message delta 等内部事件原样展示给用户。
 
 ## Runtime Ownership
 
@@ -130,4 +133,4 @@ codex-thread/    # resume 该 Thread 所需的最小 native transcript 与 index
 - Runtime：目录隔离、一个 Thread 多 Turn、steer/interrupt race、进程重启恢复、idle/drain/version 时序、Skill refresh 空闲/活动/过期命令和安全 tar.zst。
 - Hub streaming：认证、generation、size limit、backpressure、中断传输和 S3-compatible HTTP/HTTPS 配置。
 - 版本：架构映射、artifact 完整性、基础检查、全平台 readiness 和 active Turn 不受 promotion 干扰。
-- 浏览器：desktop 与 390px 下的会话列表和来源筛选、Agent 选择新建对话、SSE 实时回复、技术事件折叠、Historical Session 只读、立即引导、显式停止和 Runtime drain/delete。
+- 浏览器：desktop 与 390px 下的会话列表和来源筛选、Agent 选择新建对话、SSE 实时回复、可读 Codex 活动折叠、多 Turn 历史恢复、Historical Session 只读、立即引导、显式停止和 Runtime drain/delete。

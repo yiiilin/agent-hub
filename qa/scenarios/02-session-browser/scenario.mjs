@@ -52,10 +52,12 @@ export default async function sessionBrowserScenario(scenarioContext) {
       await page.locator('.session-message-text').filter({ hasText: message }).waitFor();
       await page.locator('.session-message-text').filter({ hasText: 'Fake Codex completed run' }).waitFor();
 
-      const technicalSummary = page.locator('.session-technical-events > summary').first();
-      await technicalSummary.waitFor();
-      await technicalSummary.click();
-      assert.ok(await page.locator('.session-technical-row').count() > 0);
+      const activitySummary = page.locator('.session-activity-events > summary').first();
+      await activitySummary.waitFor();
+      assert.match(await activitySummary.innerText(), /^Worked for .+$/);
+      await activitySummary.click();
+      assert.ok(await page.locator('.session-activity-row').count() > 0);
+      await page.getByText('Thought', { exact: true }).waitFor();
 
       const desktopOverflow = await page.evaluate(() => (
         document.documentElement.scrollWidth - document.documentElement.clientWidth
