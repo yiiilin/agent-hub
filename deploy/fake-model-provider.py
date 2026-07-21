@@ -5,6 +5,7 @@ import json
 import os
 import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlsplit
 
 
 API_KEY = os.environ["FAKE_MODEL_PROVIDER_API_KEY"]
@@ -55,29 +56,41 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(404)
         self.end_headers()
 
-    def send_json(self, response):
+    def send_json(self, response, status=200):
         body = json.dumps(response).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def do_POST(self):
-        if self.path != "/v1/responses":
-            self.send_response(404)
-            self.end_headers()
+        path = urlsplit(self.path).path
+        if path == "/v1/responses":
+            self.handle_responses()
             return
+        if path == "/v1/messages":
+            self.handle_anthropic_messages()
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def read_request_json(self):
+        length = int(self.headers.get("content-length", "0"))
+        try:
+            return json.loads(self.rfile.read(length) if length else b"{}")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self.send_response(400)
+            self.end_headers()
+            return None
+
+    def handle_responses(self):
         if self.headers.get("authorization") != f"Bearer {API_KEY}":
             self.send_response(401)
             self.end_headers()
             return
-        length = int(self.headers.get("content-length", "0"))
-        try:
-            request = json.loads(self.rfile.read(length) if length else b"{}")
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            self.send_response(400)
-            self.end_headers()
+        request = self.read_request_json()
+        if request is None:
             return
         request_text = json.dumps(request, separators=(",", ":")).lower()
         failed = (
@@ -117,9 +130,115 @@ class Handler(BaseHTTPRequestHandler):
                     "output_tokens_details": {"reasoning_tokens": 5},
                 },
             }
-        body = json.dumps(response).encode()
+        self.send_json(response)
+
+    def handle_anthropic_messages(self):
+        if (
+            self.headers.get("x-api-key") != API_KEY
+            or self.headers.get("anthropic-version") != "2023-06-01"
+        ):
+            self.send_response(401)
+            self.end_headers()
+            return
+        request = self.read_request_json()
+        if request is None:
+            return
+        request_text = json.dumps(request, separators=(",", ":")).lower()
+        if (
+            request.get("model") == "hub-proxy-error"
+            or "fixture:model-error" in request_text
+        ):
+            self.send_json(
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "rate_limit_error",
+                        "message": "Deterministic fake provider failure.",
+                    },
+                },
+                status=429,
+            )
+            return
+        if request.get("stream") is True:
+            self.send_anthropic_stream(request)
+            return
+        self.send_json(
+            {
+                "id": "msg_proxy_fake_completed",
+                "type": "message",
+                "role": "assistant",
+                "model": request.get("model", "hub-proxy-smoke"),
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Fake Anthropic completed run through the Hub model gateway.",
+                    }
+                ],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 13, "output_tokens": 8},
+            }
+        )
+
+    def send_anthropic_stream(self, request):
+        model = request.get("model", "hub-proxy-smoke")
+        events = (
+            (
+                "message_start",
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_proxy_fake_stream",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": model,
+                        "content": [],
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {"input_tokens": 13, "output_tokens": 0},
+                    },
+                },
+            ),
+            (
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            ),
+            (
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {
+                        "type": "text_delta",
+                        "text": "Fake Anthropic streamed through the Hub model gateway.",
+                    },
+                },
+            ),
+            (
+                "content_block_stop",
+                {"type": "content_block_stop", "index": 0},
+            ),
+            (
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": 8},
+                },
+            ),
+            ("message_stop", {"type": "message_stop"}),
+        )
+        body = "".join(
+            f"event: {event}\ndata: {json.dumps(payload)}\n\n"
+            for event, payload in events
+        ).encode()
         self.send_response(200)
-        self.send_header("content-type", "application/json")
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("cache-control", "no-cache")
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

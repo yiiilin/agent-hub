@@ -15,6 +15,7 @@ const personalConnection = {
   name: 'Personal GPT',
   base_url: 'https://personal.example.test/provider',
   model_id: 'personal-model',
+  upstream_protocol: 'openai_responses',
   status: 'enabled',
   is_system_default: false,
   created_at: '2026-07-18T01:00:00.000Z',
@@ -28,6 +29,7 @@ const globalConnection = {
   name: 'Global Responses',
   base_url: 'https://global.example.test',
   model_id: 'global-model',
+  upstream_protocol: 'anthropic_messages',
   status: 'enabled',
   is_system_default: true,
   created_at: '2026-07-18T01:00:00.000Z',
@@ -78,7 +80,7 @@ const usageItem = {
   id: '40000000-0000-0000-0000-000000000001',
   occurred_at: '2026-07-18T05:00:00.123Z',
   response_status: 'completed',
-  model: { id: globalConnection.id, scope: 'global', name: globalConnection.name, model_id: globalConnection.model_id },
+  model: { id: globalConnection.id, scope: 'global', name: globalConnection.name, model_id: globalConnection.model_id, upstream_protocol: globalConnection.upstream_protocol },
   agent: { id: agent.id, name: agent.name },
   subject: { kind: 'user', id: currentUser.id, display_name: currentUser.display_name },
   ...totals
@@ -128,6 +130,7 @@ async function installModelsApi(page: Page, role = 'admin') {
         name: body.name,
         base_url: body.base_url,
         model_id: body.model_id,
+        upstream_protocol: body.upstream_protocol,
         status: 'enabled',
         is_system_default: false,
         created_at: '2026-07-18T06:00:00.000Z',
@@ -225,6 +228,7 @@ for (const [role, expectedTabs] of [['member', 3], ['admin', 4], ['super_admin',
     const available = page.getByRole('table', { name: 'Available model list' });
     await expect(available).toContainText('Personal GPT');
     await expect(available).toContainText('Global Responses');
+    await expect(available).toContainText('Anthropic Messages');
     await expect(available).not.toContainText('Disabled Global');
   });
 }
@@ -238,23 +242,28 @@ test('connection action dialogs serialize CRUD, test, status, default, and force
   await dialog.getByLabel('Connection name').fill('Created Personal');
   await dialog.getByLabel('Base URL').fill('https://created.example.test/base');
   await dialog.getByLabel('Model ID').fill('created-model');
+  await expect(dialog.getByLabel('Upstream protocol')).toHaveValue('openai_responses');
+  await dialog.getByLabel('Upstream protocol').selectOption('anthropic_messages');
   await dialog.getByLabel('API key').fill('one-time-provider-secret');
   await dialog.getByRole('button', { name: 'Create model connection' }).click();
   await expect(page.getByRole('table', { name: 'Personal model connection list' })).toContainText('Created Personal');
   expect(stats.requests.at(-1)).toMatchObject({
     method: 'POST',
     path: '/api/model-connections',
-    body: { scope: 'personal', name: 'Created Personal', base_url: 'https://created.example.test/base', model_id: 'created-model', api_key: 'one-time-provider-secret' }
+    body: { scope: 'personal', name: 'Created Personal', base_url: 'https://created.example.test/base', model_id: 'created-model', upstream_protocol: 'anthropic_messages', api_key: 'one-time-provider-secret' }
   });
   await expect(page.getByText('one-time-provider-secret')).toHaveCount(0);
 
   await page.getByRole('button', { name: 'Edit Personal GPT' }).click();
   dialog = page.getByRole('dialog', { name: 'Edit model connection' });
   await expect(dialog.getByLabel('API key')).toHaveValue('');
+  await expect(dialog.getByLabel('Upstream protocol')).toHaveValue('openai_responses');
   await dialog.getByLabel('Connection name').fill('Personal GPT Updated');
+  await dialog.getByLabel('Upstream protocol').selectOption('anthropic_messages');
   await dialog.getByRole('button', { name: 'Save changes' }).click();
   const update = stats.requests.at(-1)!;
   expect(update).toMatchObject({ method: 'PATCH', path: `/api/model-connections/${personalConnection.id}` });
+  expect(update.body).toMatchObject({ upstream_protocol: 'anthropic_messages' });
   expect(update.body).not.toHaveProperty('api_key');
 
   await page.getByRole('button', { name: 'Test Personal GPT Updated' }).click();
@@ -366,6 +375,9 @@ test('Models tabs, ledgers, and dialogs stay inside a 390px viewport', async ({ 
 
   await page.getByRole('tab', { name: 'Global Models' }).click();
   await page.getByRole('button', { name: 'Create global model' }).click();
-  await expect(page.getByRole('dialog', { name: 'Create model connection' })).toBeVisible();
+  const dialog = page.getByRole('dialog', { name: 'Create model connection' });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByLabel('Upstream protocol')).toBeVisible();
+  await expect(dialog.getByLabel('Upstream protocol').locator('option')).toHaveCount(2);
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
 });

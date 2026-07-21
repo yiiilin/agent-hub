@@ -50,6 +50,9 @@ async function createConnection(page, browserContext, scope, fields, apiKey) {
   await dialog.getByLabel('Connection name').fill(fields.name);
   await dialog.getByLabel('Base URL').fill(fields.baseUrl);
   await dialog.getByLabel('Model ID').fill(fields.modelId);
+  if (fields.protocol) {
+    await dialog.getByLabel('Upstream protocol').selectOption(fields.protocol);
+  }
 
   let connection;
   await browserContext.tracing.stop();
@@ -71,12 +74,15 @@ async function createConnection(page, browserContext, scope, fields, apiKey) {
   return connection;
 }
 
-async function editConnection(page, connection, { name, modelId }) {
+async function editConnection(page, connection, { name, modelId, protocol }) {
   await page.getByRole('button', { name: `Edit ${connection.name}` }).click();
   const dialog = page.getByRole('dialog', { name: 'Edit model connection' });
   assert.equal(await dialog.getByLabel('API key').inputValue(), '', 'Edit must not load the stored API key');
   await dialog.getByLabel('Connection name').fill(name);
   await dialog.getByLabel('Model ID').fill(modelId);
+  if (protocol) {
+    await dialog.getByLabel('Upstream protocol').selectOption(protocol);
+  }
   const responsePromise = page.waitForResponse((response) => (
     response.request().method() === 'PATCH'
     && new URL(response.url()).pathname === `/api/model-connections/${connection.id}`
@@ -375,13 +381,22 @@ export default async function modelsBrowserScenario(scenarioContext) {
       const adminTabs = page.getByRole('tablist', { name: 'Models' });
       assert.equal(await adminTabs.getByRole('tab').count(), 4, 'admin must see the Global tab');
       await adminTabs.getByRole('tab', { name: 'Global Models' }).click();
-      const globalName = scenarioContext.unique('QA Global Responses');
-      const globalConnection = await createConnection(page, context, 'global', {
+      const globalName = scenarioContext.unique('QA Global Anthropic');
+      let globalConnection = await createConnection(page, context, 'global', {
         name: globalName,
         baseUrl: seedGlobal.base_url,
         modelId: seedGlobal.model_id
       }, providerKey);
+      globalConnection = await editConnection(page, globalConnection, {
+        name: globalName,
+        modelId: seedGlobal.model_id,
+        protocol: 'anthropic_messages'
+      });
       createdGlobalId = globalConnection.id;
+      const globalTable = page.getByRole('table', { name: 'Global model connection list' });
+      const globalRow = globalTable.getByRole('row').filter({ hasText: globalName });
+      assert.ok((await globalRow.innerText()).includes('Anthropic Messages'));
+      await testConnection(page, globalConnection, true);
       await changeSystemDefault(page, globalConnection, true);
 
       const adminAgentName = scenarioContext.unique('QA Default Copy Agent');
@@ -420,6 +435,7 @@ export default async function modelsBrowserScenario(scenarioContext) {
       await assertNoHorizontalOverflow(page, 'admin desktop Global Models');
       await page.setViewportSize({ width: 390, height: 844 });
       await assertNoHorizontalOverflow(page, 'admin 390px Global Models');
+      assert.ok((await globalRow.innerText()).includes('Anthropic Messages'));
 
       await page.getByRole('button', { name: `Delete ${globalName}`, exact: true }).click();
       dialog = page.getByRole('dialog', { name: 'Delete model connection' });

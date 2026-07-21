@@ -37,7 +37,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Timelike, Utc};
 use futures_util::{Stream, StreamExt};
 use hmac::{Hmac, Mac};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Row, Transaction};
@@ -125,6 +125,8 @@ struct AppState {
     oidc_mock_enabled: bool,
     model_secret_cipher: ModelSecretCipher,
     model_proxy_http: reqwest::Client,
+    model_gateway_url: String,
+    model_gateway_auth_token: Arc<Zeroizing<String>>,
     session_bundle_store: Option<Arc<S3BundleStore>>,
     session_bundle_max_bytes: u64,
     codex_release_client: Arc<CodexReleaseClient>,
@@ -250,6 +252,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let model_proxy_timeout = model_proxy_timeout_from_env()?;
+    let (model_gateway_url, model_gateway_auth_token) = model_gateway_config_from_env()?;
     let model_proxy_http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10).min(model_proxy_timeout))
         .timeout(model_proxy_timeout)
@@ -279,6 +282,8 @@ async fn main() -> anyhow::Result<()> {
         oidc_mock_enabled,
         model_secret_cipher,
         model_proxy_http,
+        model_gateway_url,
+        model_gateway_auth_token,
         session_bundle_store,
         session_bundle_max_bytes,
         codex_release_client,
@@ -864,7 +869,7 @@ fn openapi_document() -> Value {
             "/api/runtime/heartbeat": { "post": { "summary": "Heartbeat and complete staged Runtime credential rotation", "security": [{ "runtimeBearer": [] }], "requestBody": body("RuntimeHeartbeatRequest"), "responses": { "200": response("RuntimeHeartbeatResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/runtime/codex/artifacts/{version}/{os}/{architecture}": { "get": { "summary": "Download the authenticated Runtime's verified Codex artifact", "security": [{ "runtimeBearer": [] }], "parameters": [{ "name": "version", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "os", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "architecture", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "Verified zstd-compressed Codex binary", "content": { "application/zstd": { "schema": { "type": "string", "format": "binary" } } } }, "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/runtime/runs/claim": { "post": { "summary": "Claim one capacity-fenced Run and its exclusive Session ownership generation", "security": [{ "runtimeBearer": [] }], "requestBody": body("RuntimeClaimRunRequest"), "responses": { "200": response("ClaimRunResponse"), "204": no_content(), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" } } } },
-            "/api/runtime/model-proxy/v1/responses": { "post": { "summary": "Transparently proxy one run-scoped Responses API request through its selected Model Connection", "security": [{ "modelProxyBearer": [] }], "parameters": [required_header("x-agent-hub-run-id", json!({ "type": "string", "format": "uuid" })), required_header("x-agent-hub-model-connection-id", json!({ "type": "string", "format": "uuid" }))], "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } }, "responses": { "200": { "description": "Transparent upstream JSON or SSE response" }, "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" }, "502": { "description": "Model upstream transport failed" }, "504": { "description": "Model upstream timed out" } } } },
+            "/api/runtime/model-proxy/v1/responses": { "post": { "summary": "Proxy one run-scoped Responses API request through its selected Model Connection", "security": [{ "modelProxyBearer": [] }], "parameters": [required_header("x-agent-hub-run-id", json!({ "type": "string", "format": "uuid" })), required_header("x-agent-hub-model-connection-id", json!({ "type": "string", "format": "uuid" }))], "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } }, "responses": { "200": { "description": "Responses JSON or SSE from the selected upstream protocol" }, "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" }, "502": { "description": "Model upstream transport failed" }, "504": { "description": "Model upstream timed out" } } } },
             "/api/runtime/runs/{run_id}/turn/begin": { "post": { "summary": "Bind synchronized configuration and begin generation-fenced Turn delivery", "security": [{ "runtimeBearer": [] }], "parameters": [id("run_id")], "requestBody": body("RuntimeBeginTurnRequest"), "responses": { "200": response("BeginRuntimeTurnResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/runtime/sessions/{session_id}/commands/{command_id}/complete": { "post": { "summary": "Acknowledge one generation-fenced Session command outcome", "security": [{ "runtimeBearer": [] }], "parameters": [id("session_id"), id("command_id")], "requestBody": body("RuntimeCompleteSessionCommandRequest"), "responses": { "200": response("CompleteRuntimeSessionCommandResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/runtime/sessions/{session_id}/release": { "post": { "summary": "Release Session ownership after a current Hub-committed Bundle", "security": [{ "runtimeBearer": [] }], "parameters": [id("session_id")], "requestBody": body("ReleaseRuntimeSessionRequest"), "responses": { "200": response("HubSession"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
@@ -1001,16 +1006,17 @@ fn openapi_schemas() -> Value {
         "RenewApiKeyRequest": { "type": "object", "additionalProperties": false, "required": ["validity"], "properties": { "validity": { "$ref": "#/components/schemas/ApiKeyValidity" } } },
         "ModelConnectionScope": { "type": "string", "enum": ["global", "personal"] },
         "ModelConnectionStatus": { "type": "string", "enum": ["enabled", "disabled"] },
-        "ModelConnection": { "type": "object", "additionalProperties": false, "required": ["id", "owner_id", "scope", "name", "base_url", "model_id", "status", "is_system_default", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": { "anyOf": [uuid(), { "type": "null" }] }, "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "name": { "type": "string" }, "base_url": { "type": "string", "format": "uri" }, "model_id": { "type": "string" }, "status": { "$ref": "#/components/schemas/ModelConnectionStatus" }, "is_system_default": { "type": "boolean" }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
-        "CreateModelConnectionRequest": { "type": "object", "additionalProperties": false, "required": ["scope", "name", "base_url", "model_id", "api_key"], "properties": { "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "name": { "type": "string", "minLength": 1, "maxLength": 128 }, "base_url": { "type": "string", "format": "uri" }, "model_id": { "type": "string", "minLength": 1, "maxLength": 256 }, "api_key": { "type": "string", "minLength": 1, "format": "password", "writeOnly": true } } },
-        "UpdateModelConnectionRequest": { "type": "object", "additionalProperties": false, "required": ["name", "base_url", "model_id"], "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 128 }, "base_url": { "type": "string", "format": "uri" }, "model_id": { "type": "string", "minLength": 1, "maxLength": 256 }, "api_key": { "type": "string", "minLength": 1, "format": "password", "writeOnly": true } } },
+        "ModelUpstreamProtocol": { "type": "string", "enum": ["openai_responses", "anthropic_messages"], "default": "openai_responses" },
+        "ModelConnection": { "type": "object", "additionalProperties": false, "required": ["id", "owner_id", "scope", "name", "base_url", "model_id", "upstream_protocol", "status", "is_system_default", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": { "anyOf": [uuid(), { "type": "null" }] }, "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "name": { "type": "string" }, "base_url": { "type": "string", "format": "uri" }, "model_id": { "type": "string" }, "upstream_protocol": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "status": { "$ref": "#/components/schemas/ModelConnectionStatus" }, "is_system_default": { "type": "boolean" }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
+        "CreateModelConnectionRequest": { "type": "object", "additionalProperties": false, "required": ["scope", "name", "base_url", "model_id", "api_key"], "properties": { "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "name": { "type": "string", "minLength": 1, "maxLength": 128 }, "base_url": { "type": "string", "format": "uri" }, "model_id": { "type": "string", "minLength": 1, "maxLength": 256 }, "upstream_protocol": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "api_key": { "type": "string", "minLength": 1, "format": "password", "writeOnly": true } } },
+        "UpdateModelConnectionRequest": { "type": "object", "additionalProperties": false, "required": ["name", "base_url", "model_id"], "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 128 }, "base_url": { "type": "string", "format": "uri" }, "model_id": { "type": "string", "minLength": 1, "maxLength": 256 }, "upstream_protocol": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "api_key": { "type": "string", "minLength": 1, "format": "password", "writeOnly": true } } },
         "UpdateModelConnectionStatusRequest": { "type": "object", "additionalProperties": false, "required": ["status"], "properties": { "status": { "$ref": "#/components/schemas/ModelConnectionStatus" } } },
-        "ModelConnectionOption": { "type": "object", "additionalProperties": false, "required": ["id", "name", "model_id", "scope", "status"], "properties": { "id": uuid(), "name": { "type": "string" }, "model_id": { "type": "string" }, "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "status": { "$ref": "#/components/schemas/ModelConnectionStatus" } } },
+        "ModelConnectionOption": { "type": "object", "additionalProperties": false, "required": ["id", "name", "model_id", "upstream_protocol", "scope", "status"], "properties": { "id": uuid(), "name": { "type": "string" }, "model_id": { "type": "string" }, "upstream_protocol": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "status": { "$ref": "#/components/schemas/ModelConnectionStatus" } } },
         "ModelConnectionOptions": { "type": "object", "additionalProperties": false, "required": ["items", "system_default_model_connection_id"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/ModelConnectionOption" } }, "system_default_model_connection_id": { "anyOf": [uuid(), { "type": "null" }] } } },
         "ModelConnectionTestResult": { "type": "object", "additionalProperties": false, "required": ["success", "status_code", "error_code", "message"], "properties": { "success": { "type": "boolean" }, "status_code": { "type": ["integer", "null"], "minimum": 100, "maximum": 599 }, "error_code": { "type": ["string", "null"] }, "message": { "type": ["string", "null"] } } },
         "SystemDefaultModelConnection": { "type": "object", "additionalProperties": false, "required": ["model_connection_id"], "properties": { "model_connection_id": { "anyOf": [uuid(), { "type": "null" }] } } },
         "SetSystemDefaultModelConnectionRequest": { "type": "object", "additionalProperties": false, "required": ["model_connection_id"], "properties": { "model_connection_id": { "anyOf": [uuid(), { "type": "null" }] } } },
-        "ModelConnectionSnapshot": { "type": "object", "additionalProperties": false, "required": ["id", "scope", "name", "model_id"], "properties": { "id": { "anyOf": [uuid(), { "type": "null" }] }, "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "name": { "type": "string" }, "model_id": { "type": "string" } } },
+        "ModelConnectionSnapshot": { "type": "object", "additionalProperties": false, "required": ["id", "scope", "name", "model_id", "upstream_protocol"], "properties": { "id": { "anyOf": [uuid(), { "type": "null" }] }, "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "name": { "type": "string" }, "model_id": { "type": "string" }, "upstream_protocol": { "$ref": "#/components/schemas/ModelUpstreamProtocol" } } },
         "ModelAgentSnapshot": { "type": "object", "additionalProperties": false, "required": ["id", "name"], "properties": { "id": { "anyOf": [uuid(), { "type": "null" }] }, "name": { "type": "string" } } },
         "ModelUsageSubject": { "type": "object", "additionalProperties": false, "required": ["kind", "id", "display_name"], "properties": { "kind": { "type": "string", "enum": ["user", "integration_app", "system"] }, "id": { "anyOf": [uuid(), { "type": "null" }] }, "display_name": { "type": ["string", "null"] } } },
         "ModelTokenUsageTotals": { "type": "object", "additionalProperties": false, "required": ["input_tokens", "output_tokens", "total_tokens", "cached_tokens", "reasoning_tokens"], "properties": { "input_tokens": { "type": "integer", "minimum": 0 }, "output_tokens": { "type": "integer", "minimum": 0 }, "total_tokens": { "type": "integer", "minimum": 0 }, "cached_tokens": { "type": "integer", "minimum": 0 }, "reasoning_tokens": { "type": "integer", "minimum": 0 } } },
@@ -2591,6 +2597,7 @@ async fn list_model_connections(
     let user = require_user(&state, &headers).await?;
     let rows = sqlx::query(
         "SELECT c.id, c.owner_id, c.scope, c.name, c.base_url, c.model_id,
+                c.upstream_protocol,
                 c.enabled, c.created_at, c.updated_at,
                 EXISTS(
                     SELECT 1 FROM system_default_model_connection d
@@ -2623,6 +2630,7 @@ async fn get_model_connection_options(
             id: connection.id,
             name: connection.name,
             model_id: connection.model_id,
+            upstream_protocol: connection.upstream_protocol,
             scope: connection.scope,
             status: connection.status,
         })
@@ -2666,9 +2674,9 @@ async fn create_model_connection(
     };
     sqlx::query(
         "INSERT INTO model_connections
-             (id, scope, owner_id, name, base_url, model_id,
+             (id, scope, owner_id, name, base_url, model_id, upstream_protocol,
               api_key_ciphertext, api_key_nonce, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(id)
     .bind(scope)
@@ -2676,6 +2684,7 @@ async fn create_model_connection(
     .bind(fields.name)
     .bind(fields.base_url)
     .bind(fields.model_id)
+    .bind(model_upstream_protocol_name(req.upstream_protocol))
     .bind(encrypted.ciphertext)
     .bind(encrypted.nonce)
     .bind(user.id)
@@ -2719,22 +2728,29 @@ async fn update_model_connection(
         .map_err(|_| ApiError::internal("model secret encryption failed"))?;
     let mut tx = state.pool.begin().await?;
     load_mutable_model_connection_tx(&mut tx, model_connection_id, &user).await?;
-    let previous: (String, String) =
-        sqlx::query_as("SELECT name, model_id FROM model_connections WHERE id = $1 FOR UPDATE")
-            .bind(model_connection_id)
-            .fetch_one(&mut *tx)
-            .await?;
+    let previous: (String, String, String) = sqlx::query_as(
+        "SELECT name, model_id, upstream_protocol
+         FROM model_connections WHERE id = $1 FOR UPDATE",
+    )
+    .bind(model_connection_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let upstream_protocol = req
+        .upstream_protocol
+        .unwrap_or_else(|| model_upstream_protocol_from_name(&previous.2));
+    let upstream_protocol_name = model_upstream_protocol_name(upstream_protocol);
     let updated = if let Some(encrypted) = encrypted {
         sqlx::query(
             "UPDATE model_connections
-             SET name = $1, base_url = $2, model_id = $3,
-                 api_key_ciphertext = $4, api_key_nonce = $5,
+             SET name = $1, base_url = $2, model_id = $3, upstream_protocol = $4,
+                 api_key_ciphertext = $5, api_key_nonce = $6,
                  updated_at = CURRENT_TIMESTAMP(3)
-             WHERE id = $6 AND deleted_at IS NULL",
+             WHERE id = $7 AND deleted_at IS NULL",
         )
         .bind(&fields.name)
         .bind(&fields.base_url)
         .bind(&fields.model_id)
+        .bind(upstream_protocol_name)
         .bind(encrypted.ciphertext)
         .bind(encrypted.nonce)
         .bind(model_connection_id)
@@ -2743,13 +2759,14 @@ async fn update_model_connection(
     } else {
         sqlx::query(
             "UPDATE model_connections
-             SET name = $1, base_url = $2, model_id = $3,
+             SET name = $1, base_url = $2, model_id = $3, upstream_protocol = $4,
                  updated_at = CURRENT_TIMESTAMP(3)
-             WHERE id = $4 AND deleted_at IS NULL",
+             WHERE id = $5 AND deleted_at IS NULL",
         )
         .bind(&fields.name)
         .bind(&fields.base_url)
         .bind(&fields.model_id)
+        .bind(upstream_protocol_name)
         .bind(model_connection_id)
         .execute(&mut *tx)
         .await
@@ -2758,7 +2775,10 @@ async fn update_model_connection(
     if updated.rows_affected() == 0 {
         return Err(ApiError::not_found("model connection not found"));
     }
-    if previous.0 != fields.name || previous.1 != fields.model_id {
+    if previous.0 != fields.name
+        || previous.1 != fields.model_id
+        || previous.2 != upstream_protocol_name
+    {
         bump_agents_for_model_connection_tx(&mut tx, model_connection_id).await?;
     }
     tx.commit().await?;
@@ -3008,22 +3028,33 @@ async fn test_model_connection(
     let user = require_user(&state, &headers).await?;
     let connection =
         load_model_connection_secret_for_test(&state.pool, model_connection_id, &user).await?;
-    let api_key = state
-        .model_secret_cipher
-        .decrypt(&connection.ciphertext, &connection.nonce)
-        .map_err(|_| ApiError::internal("model secret decryption failed"))?;
+    let api_key = Zeroizing::new(
+        state
+            .model_secret_cipher
+            .decrypt(&connection.ciphertext, &connection.nonce)
+            .map_err(|_| ApiError::internal("model secret decryption failed"))?,
+    );
     let request_id = Uuid::new_v4();
-    let response = state
-        .model_proxy_http
-        .post(format!("{}/v1/responses", connection.dto.base_url))
-        .bearer_auth(&api_key)
-        .json(&json!({
-            "model": connection.dto.model_id,
-            "input": "Respond with one token.",
-            "max_output_tokens": 1
-        }))
-        .send()
-        .await;
+    let request_body = serde_json::to_vec(&json!({
+    "model": connection.dto.model_id,
+    "input": "Respond with one token.",
+    "max_output_tokens": 1
+    }))
+    .map_err(|_| ApiError::internal("failed to encode Model Connection test request"))?;
+    let request_headers = HeaderMap::new();
+    let response = send_model_gateway_request(
+        &state,
+        ModelGatewayForwardRequest {
+            request_id,
+            upstream_protocol: connection.dto.upstream_protocol,
+            upstream_url: &connection.dto.base_url,
+            query: None,
+            headers: &request_headers,
+            body: &request_body,
+            api_key: &api_key,
+        },
+    )
+    .await;
     let response = match response {
         Ok(response) => response,
         Err(_) => {
@@ -3227,6 +3258,9 @@ fn model_connection_from_row(row: &sqlx::postgres::PgRow) -> ModelConnectionDto 
         name: row.get("name"),
         base_url: row.get("base_url"),
         model_id: row.get("model_id"),
+        upstream_protocol: model_upstream_protocol_from_name(
+            &row.get::<String, _>("upstream_protocol"),
+        ),
         status: if row.get("enabled") {
             ModelConnectionStatus::Enabled
         } else {
@@ -3245,6 +3279,7 @@ async fn load_visible_model_connection(
 ) -> Result<ModelConnectionDto, ApiError> {
     let row = sqlx::query(
         "SELECT c.id, c.owner_id, c.scope, c.name, c.base_url, c.model_id,
+                c.upstream_protocol,
                 c.enabled, c.created_at, c.updated_at,
                 EXISTS(
                     SELECT 1 FROM system_default_model_connection d
@@ -3324,6 +3359,7 @@ async fn load_model_connection_secret_for_test(
     authorize_model_connection_mutation(pool, model_connection_id, user).await?;
     let row = sqlx::query(
         "SELECT c.id, c.owner_id, c.scope, c.name, c.base_url, c.model_id,
+                c.upstream_protocol,
                 c.enabled, c.created_at, c.updated_at,
                 c.api_key_ciphertext, c.api_key_nonce,
                 EXISTS(
@@ -3417,12 +3453,13 @@ async fn record_model_test_usage(
         "INSERT INTO model_token_usage
              (id, request_id, response_status, model_connection_id,
               model_connection_scope_snapshot, model_connection_name_snapshot,
-              model_id_snapshot, agent_id, agent_name_snapshot,
+              model_id_snapshot, upstream_protocol_snapshot,
+              agent_id, agent_name_snapshot,
               subject_type, subject_user_id, subject_display_name_snapshot,
               input_tokens, output_tokens, total_tokens, cached_tokens,
               reasoning_tokens)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, NULL,
-                 'user', $8, $9, $10, $11, $12, $13, $14)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NULL,
+                 'user', $9, $10, $11, $12, $13, $14, $15)",
     )
     .bind(Uuid::new_v4())
     .bind(request_id)
@@ -3431,6 +3468,7 @@ async fn record_model_test_usage(
     .bind(model_connection_scope_name(connection.scope))
     .bind(&connection.name)
     .bind(&connection.model_id)
+    .bind(model_upstream_protocol_name(connection.upstream_protocol))
     .bind(user.id)
     .bind(&user.display_name)
     .bind(usage.input_tokens)
@@ -3460,10 +3498,11 @@ async fn record_model_test_error(
              (id, request_id, response_status, upstream_http_status,
               error_kind, error_code, message, model_connection_id,
               model_connection_scope_snapshot, model_connection_name_snapshot,
-              model_id_snapshot, agent_id, agent_name_snapshot,
+              model_id_snapshot, upstream_protocol_snapshot,
+              agent_id, agent_name_snapshot,
               subject_type, subject_user_id, subject_display_name_snapshot)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                 NULL, NULL, 'user', $12, $13)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                 NULL, NULL, 'user', $13, $14)",
     )
     .bind(Uuid::new_v4())
     .bind(request_id)
@@ -3476,6 +3515,7 @@ async fn record_model_test_error(
     .bind(model_connection_scope_name(connection.scope))
     .bind(&connection.name)
     .bind(&connection.model_id)
+    .bind(model_upstream_protocol_name(connection.upstream_protocol))
     .bind(user.id)
     .bind(&user.display_name)
     .execute(pool)
@@ -3487,6 +3527,21 @@ fn model_connection_scope_name(scope: ModelConnectionScope) -> &'static str {
     match scope {
         ModelConnectionScope::Global => "global",
         ModelConnectionScope::Personal => "personal",
+    }
+}
+
+fn model_upstream_protocol_name(protocol: ModelUpstreamProtocol) -> &'static str {
+    match protocol {
+        ModelUpstreamProtocol::OpenaiResponses => "openai_responses",
+        ModelUpstreamProtocol::AnthropicMessages => "anthropic_messages",
+    }
+}
+
+fn model_upstream_protocol_from_name(value: &str) -> ModelUpstreamProtocol {
+    match value {
+        "openai_responses" => ModelUpstreamProtocol::OpenaiResponses,
+        "anthropic_messages" => ModelUpstreamProtocol::AnthropicMessages,
+        _ => unreachable!("model upstream protocol is constrained"),
     }
 }
 
@@ -3694,6 +3749,7 @@ async fn get_model_usage_summary(
                 ledger.model_connection_scope_snapshot,
                 ledger.model_connection_name_snapshot,
                 ledger.model_id_snapshot,
+                ledger.upstream_protocol_snapshot,
                 sum(ledger.input_tokens)::bigint AS input_tokens,
                 sum(ledger.output_tokens)::bigint AS output_tokens,
                 sum(ledger.total_tokens)::bigint AS total_tokens,
@@ -3703,7 +3759,8 @@ async fn get_model_usage_summary(
          GROUP BY ledger.model_connection_id,
                   ledger.model_connection_scope_snapshot,
                   ledger.model_connection_name_snapshot,
-                  ledger.model_id_snapshot
+                  ledger.model_id_snapshot,
+                  ledger.upstream_protocol_snapshot
          ORDER BY total_tokens DESC, ledger.model_connection_name_snapshot,
                   ledger.model_id_snapshot, ledger.model_connection_id NULLS LAST"
     );
@@ -3822,6 +3879,7 @@ async fn list_model_token_usage(
                 ledger.model_connection_id,
                 ledger.model_connection_scope_snapshot,
                 ledger.model_connection_name_snapshot, ledger.model_id_snapshot,
+                ledger.upstream_protocol_snapshot,
                 ledger.agent_id, ledger.agent_name_snapshot,
                 ledger.subject_type, ledger.subject_user_id,
                 ledger.subject_display_name_snapshot,
@@ -3880,6 +3938,7 @@ async fn list_model_call_errors(
                 ledger.model_connection_id,
                 ledger.model_connection_scope_snapshot,
                 ledger.model_connection_name_snapshot, ledger.model_id_snapshot,
+                ledger.upstream_protocol_snapshot,
                 ledger.agent_id, ledger.agent_name_snapshot,
                 ledger.subject_type, ledger.subject_user_id,
                 ledger.subject_display_name_snapshot,
@@ -3945,6 +4004,9 @@ fn model_connection_snapshot_from_row(row: &sqlx::postgres::PgRow) -> ModelConne
         },
         name: row.get("model_connection_name_snapshot"),
         model_id: row.get("model_id_snapshot"),
+        upstream_protocol: model_upstream_protocol_from_name(
+            &row.get::<String, _>("upstream_protocol_snapshot"),
+        ),
     }
 }
 
@@ -4119,7 +4181,7 @@ async fn get_agent_model_connection_options(
     let user = require_user(&state, &headers).await?;
     let agent = load_agent_manageable_by_user(&state.pool, agent_id, &user).await?;
     let rows = sqlx::query(
-        "SELECT id, name, model_id, scope, enabled
+        "SELECT id, name, model_id, upstream_protocol, scope, enabled
          FROM model_connections
          WHERE deleted_at IS NULL
            AND (scope = 'global' OR owner_id = $1)
@@ -4134,6 +4196,9 @@ async fn get_agent_model_connection_options(
             id: row.get("id"),
             name: row.get("name"),
             model_id: row.get("model_id"),
+            upstream_protocol: model_upstream_protocol_from_name(
+                &row.get::<String, _>("upstream_protocol"),
+            ),
             scope: if row.get::<String, _>("scope") == "global" {
                 ModelConnectionScope::Global
             } else {
@@ -9857,17 +9922,23 @@ async fn runtime_claim_run(
         .iter()
         .map(|connection| connection.model_id.clone())
         .collect::<Vec<_>>();
+    let selected_upstream_protocols = execution_configuration
+        .model_connections
+        .iter()
+        .map(|connection| model_upstream_protocol_name(connection.upstream_protocol))
+        .collect::<Vec<_>>();
     sqlx::query(
         "INSERT INTO run_model_connection_snapshots
-             (run_id, model_connection_id, model_id)
-         SELECT $1, selected.model_connection_id, selected.model_id
-         FROM unnest($2::uuid[], $3::text[])
-              AS selected(model_connection_id, model_id)
+             (run_id, model_connection_id, model_id, upstream_protocol)
+         SELECT $1, selected.model_connection_id, selected.model_id, selected.upstream_protocol
+         FROM unnest($2::uuid[], $3::text[], $4::text[])
+              AS selected(model_connection_id, model_id, upstream_protocol)
          ON CONFLICT (run_id, model_connection_id) DO NOTHING",
     )
     .bind(run_id)
     .bind(&selected_model_connection_ids)
     .bind(&selected_model_ids)
+    .bind(&selected_upstream_protocols)
     .execute(&mut *tx)
     .await?;
     let expected_configuration_fingerprint =
@@ -10760,11 +10831,12 @@ async fn runtime_model_proxy(
         &state,
         ModelProxyForwardRequest {
             upstream_url: resolved.upstream_url,
+            upstream_protocol: resolved.accounting.upstream_protocol,
             path,
             query: uri.query().map(str::to_owned),
             headers,
             body,
-            api_key: Some(resolved.api_key),
+            api_key: resolved.api_key,
             accounting: Some(resolved.accounting),
         },
     )
@@ -10785,6 +10857,7 @@ struct ModelProxyAccountingContext {
     model_connection_scope: String,
     model_connection_name: String,
     model_id: String,
+    upstream_protocol: ModelUpstreamProtocol,
     agent_id: Uuid,
     agent_name: String,
     subject_type: String,
@@ -10804,7 +10877,7 @@ async fn resolve_model_proxy_request(
     let row = sqlx::query(
         "SELECT c.id AS model_connection_id, c.scope AS model_connection_scope,
                 c.name AS model_connection_name, c.base_url,
-                selected_model.model_id,
+                selected_model.model_id, selected_model.upstream_protocol,
                 c.api_key_ciphertext, c.api_key_nonce,
                 a.id AS agent_id, a.name AS agent_name,
                 r.model_subject_type,
@@ -10868,6 +10941,8 @@ async fn resolve_model_proxy_request(
             .map_err(|_| ApiError::internal("Model Connection credential is unavailable"))?,
     );
     let model_id: String = row.get("model_id");
+    let upstream_protocol_name: String = row.get("upstream_protocol");
+    let upstream_protocol = model_upstream_protocol_from_name(&upstream_protocol_name);
     Ok(ResolvedModelProxyRequest {
         upstream_url: row.get("base_url"),
         model_id: model_id.clone(),
@@ -10878,6 +10953,7 @@ async fn resolve_model_proxy_request(
             model_connection_scope: row.get("model_connection_scope"),
             model_connection_name: row.get("model_connection_name"),
             model_id,
+            upstream_protocol,
             agent_id: row.get("agent_id"),
             agent_name: row.get("agent_name"),
             subject_type: row.get("model_subject_type"),
@@ -10895,12 +10971,76 @@ fn model_proxy_path_supported(path: &str) -> bool {
 
 struct ModelProxyForwardRequest {
     upstream_url: String,
+    upstream_protocol: ModelUpstreamProtocol,
     path: String,
     query: Option<String>,
     headers: HeaderMap,
     body: Bytes,
-    api_key: Option<Zeroizing<String>>,
+    api_key: Zeroizing<String>,
     accounting: Option<ModelProxyAccountingContext>,
+}
+
+#[derive(Serialize)]
+struct ModelGatewayRequestEnvelope<'a> {
+    request_id: String,
+    protocol: ModelUpstreamProtocol,
+    endpoint: &'a str,
+    api_key: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    query: Option<&'a str>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    headers: BTreeMap<String, Vec<String>>,
+    body_base64: String,
+}
+
+struct ModelGatewayForwardRequest<'a> {
+    request_id: Uuid,
+    upstream_protocol: ModelUpstreamProtocol,
+    upstream_url: &'a str,
+    query: Option<&'a str>,
+    headers: &'a HeaderMap,
+    body: &'a [u8],
+    api_key: &'a str,
+}
+
+async fn send_model_gateway_request(
+    state: &AppState,
+    request: ModelGatewayForwardRequest<'_>,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let ModelGatewayForwardRequest {
+        request_id,
+        upstream_protocol,
+        upstream_url,
+        query,
+        headers,
+        body,
+        api_key,
+    } = request;
+    let mut serialized_headers = BTreeMap::<String, Vec<String>>::new();
+    for (name, value) in headers {
+        if let Ok(value) = value.to_str() {
+            serialized_headers
+                .entry(name.as_str().to_owned())
+                .or_default()
+                .push(value.to_owned());
+        }
+    }
+    let envelope = ModelGatewayRequestEnvelope {
+        request_id: request_id.to_string(),
+        protocol: upstream_protocol,
+        endpoint: upstream_url,
+        api_key,
+        query: query.filter(|query| !query.is_empty()),
+        headers: serialized_headers,
+        body_base64: base64::engine::general_purpose::STANDARD.encode(body),
+    };
+    state
+        .model_proxy_http
+        .post(format!("{}/internal/v1/responses", state.model_gateway_url))
+        .bearer_auth(state.model_gateway_auth_token.as_str())
+        .json(&envelope)
+        .send()
+        .await
 }
 
 #[cfg(test)]
@@ -10914,11 +11054,12 @@ async fn proxy_model_request_to_upstream(
         state,
         ModelProxyForwardRequest {
             upstream_url: upstream_url.to_owned(),
+            upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
             path: path.to_owned(),
             query: None,
             headers: HeaderMap::new(),
             body: request_body,
-            api_key: None,
+            api_key: Zeroizing::new("test-provider-secret".into()),
             accounting: None,
         },
     )
@@ -10931,6 +11072,7 @@ async fn proxy_model_request_to_upstream_with_options(
 ) -> Result<Response, ApiError> {
     let ModelProxyForwardRequest {
         upstream_url,
+        upstream_protocol,
         path,
         query,
         headers,
@@ -10938,10 +11080,8 @@ async fn proxy_model_request_to_upstream_with_options(
         api_key,
         accounting,
     } = request;
-    let mut url = format!("{}/v1/{}", upstream_url.trim_end_matches('/'), path);
-    if let Some(query) = query.as_deref().filter(|query| !query.is_empty()) {
-        url.push('?');
-        url.push_str(query);
+    if !model_proxy_path_supported(&path) {
+        return Err(ApiError::not_found("unsupported model proxy path"));
     }
     let mut upstream_headers = filtered_model_request_headers(&headers);
     if !upstream_headers.contains_key(header::CONTENT_TYPE) {
@@ -10950,15 +11090,24 @@ async fn proxy_model_request_to_upstream_with_options(
             HeaderValue::from_static("application/json"),
         );
     }
-    let mut request = state
-        .model_proxy_http
-        .post(url)
-        .headers(upstream_headers)
-        .body(body);
-    if let Some(api_key) = api_key.as_deref() {
-        request = request.bearer_auth(api_key);
-    }
-    let mut upstream = match request.send().await {
+    let request_id = accounting
+        .as_ref()
+        .map(|accounting| accounting.request_id)
+        .unwrap_or_else(Uuid::new_v4);
+    let mut upstream = match send_model_gateway_request(
+        state,
+        ModelGatewayForwardRequest {
+            request_id,
+            upstream_protocol,
+            upstream_url: &upstream_url,
+            query: query.as_deref(),
+            headers: &upstream_headers,
+            body: &body,
+            api_key: &api_key,
+        },
+    )
+    .await
+    {
         Ok(upstream) => upstream,
         Err(error) => {
             if let Some(accounting) = accounting.as_ref() {
@@ -11010,7 +11159,7 @@ async fn proxy_model_request_to_upstream_with_options(
                             let observation = completed_observer.finish(
                                 status,
                                 None,
-                                api_key.as_deref().map(|api_key| api_key.as_str()),
+                                Some(api_key.as_str()),
                             );
                             persist_model_proxy_observation(&pool, accounting, observation).await;
                         }
@@ -11024,7 +11173,7 @@ async fn proxy_model_request_to_upstream_with_options(
                         let observation = observer.finish(
                             status,
                             None,
-                            api_key.as_deref().map(|api_key| api_key.as_str()),
+                            Some(api_key.as_str()),
                         );
                         persist_model_proxy_observation(&pool, accounting, observation).await;
                     }
@@ -11039,7 +11188,7 @@ async fn proxy_model_request_to_upstream_with_options(
                         let observation = observer.finish(
                             status,
                             Some(failure_kind),
-                            api_key.as_deref().map(|api_key| api_key.as_str()),
+                            Some(api_key.as_str()),
                         );
                         persist_model_proxy_observation(&pool, accounting, observation).await;
                     }
@@ -11391,6 +11540,8 @@ fn model_proxy_terminal_from_value(
                 .and_then(model_response_status_from_event)
         })
         .or_else(|| fallback_status.and_then(normalized_model_response_status))?;
+    let is_error_event =
+        event_type == Some("error") || value.get("type").and_then(Value::as_str) == Some("error");
     let error = response
         .get("error")
         .filter(|error| !error.is_null())
@@ -11404,6 +11555,11 @@ fn model_proxy_terminal_from_value(
                 .pointer("/incomplete_details/reason")
                 .and_then(Value::as_str)
                 .map(str::to_owned)
+        })
+        .or_else(|| {
+            is_error_event
+                .then(|| value.get("code").and_then(Value::as_str).map(str::to_owned))
+                .flatten()
         });
     let error_message = error
         .and_then(|error| {
@@ -11412,7 +11568,17 @@ fn model_proxy_terminal_from_value(
                 .and_then(Value::as_str)
                 .or_else(|| error.as_str())
         })
-        .map(str::to_owned);
+        .map(str::to_owned)
+        .or_else(|| {
+            is_error_event
+                .then(|| {
+                    value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .flatten()
+        });
     Some(ModelProxyTerminal {
         response_status: status.into(),
         usage: extract_model_usage(response).or_else(|| extract_model_usage(value)),
@@ -11437,6 +11603,7 @@ fn model_response_status_from_event(value: &str) -> Option<&'static str> {
         "response.failed" => Some("failed"),
         "response.incomplete" => Some("incomplete"),
         "response.cancelled" => Some("cancelled"),
+        "error" => Some("failed"),
         _ => None,
     }
 }
@@ -11495,7 +11662,8 @@ async fn try_persist_model_proxy_observation(
             "INSERT INTO model_token_usage
                  (id, request_id, response_status, model_connection_id,
                   model_connection_scope_snapshot, model_connection_name_snapshot,
-                  model_id_snapshot, agent_id, agent_name_snapshot,
+                  model_id_snapshot, upstream_protocol_snapshot,
+                  agent_id, agent_name_snapshot,
                   subject_type, subject_user_id, subject_display_name_snapshot,
                   source_integration_app_id, source_integration_app_name_snapshot,
                   input_tokens, output_tokens, total_tokens, cached_tokens,
@@ -11503,11 +11671,11 @@ async fn try_persist_model_proxy_observation(
              VALUES (
                  $1, $2, $3,
                  (SELECT id FROM model_connections WHERE id = $4),
-                 $5, $6, $7,
-                 (SELECT id FROM agents WHERE id = $8), $9,
-                 $10, (SELECT id FROM users WHERE id = $11), $12,
-                 (SELECT id FROM oauth_apps WHERE id = $13), $14,
-                 $15, $16, $17, $18, $19
+                 $5, $6, $7, $8,
+                 (SELECT id FROM agents WHERE id = $9), $10,
+                 $11, (SELECT id FROM users WHERE id = $12), $13,
+                 (SELECT id FROM oauth_apps WHERE id = $14), $15,
+                 $16, $17, $18, $19, $20
              )
              ON CONFLICT (request_id) DO NOTHING",
         )
@@ -11518,6 +11686,7 @@ async fn try_persist_model_proxy_observation(
         .bind(&context.model_connection_scope)
         .bind(&context.model_connection_name)
         .bind(&context.model_id)
+        .bind(model_upstream_protocol_name(context.upstream_protocol))
         .bind(context.agent_id)
         .bind(&context.agent_name)
         .bind(&context.subject_type)
@@ -11539,16 +11708,17 @@ async fn try_persist_model_proxy_observation(
                  (id, request_id, response_status, upstream_http_status,
                   error_kind, error_code, message, model_connection_id,
                   model_connection_scope_snapshot, model_connection_name_snapshot,
-                  model_id_snapshot, agent_id, agent_name_snapshot,
+                  model_id_snapshot, upstream_protocol_snapshot,
+                  agent_id, agent_name_snapshot,
                   subject_type, subject_user_id, subject_display_name_snapshot,
                   source_integration_app_id, source_integration_app_name_snapshot)
              VALUES (
                  $1, $2, $3, $4, $5, $6, $7,
                  (SELECT id FROM model_connections WHERE id = $8),
-                 $9, $10, $11,
-                 (SELECT id FROM agents WHERE id = $12), $13,
-                 $14, (SELECT id FROM users WHERE id = $15), $16,
-                 (SELECT id FROM oauth_apps WHERE id = $17), $18
+                 $9, $10, $11, $12,
+                 (SELECT id FROM agents WHERE id = $13), $14,
+                 $15, (SELECT id FROM users WHERE id = $16), $17,
+                 (SELECT id FROM oauth_apps WHERE id = $18), $19
              )
              ON CONFLICT (request_id) DO NOTHING",
         )
@@ -11563,6 +11733,7 @@ async fn try_persist_model_proxy_observation(
         .bind(&context.model_connection_scope)
         .bind(&context.model_connection_name)
         .bind(&context.model_id)
+        .bind(model_upstream_protocol_name(context.upstream_protocol))
         .bind(context.agent_id)
         .bind(&context.agent_name)
         .bind(&context.subject_type)
@@ -14203,6 +14374,9 @@ fn build_agent_execution_configuration(
             id: row.get("id"),
             name: row.get("name"),
             model_id: row.get("model_id"),
+            upstream_protocol: model_upstream_protocol_from_name(
+                &row.get::<String, _>("upstream_protocol"),
+            ),
             scope: if row.get::<String, _>("scope") == "global" {
                 ModelConnectionScope::Global
             } else {
@@ -14280,7 +14454,7 @@ async fn load_execution_model_connections_tx(
     }
     let ids = ids.into_iter().collect::<Vec<_>>();
     let rows = sqlx::query(
-        "SELECT id, name, model_id, scope
+        "SELECT id, name, model_id, upstream_protocol, scope
          FROM model_connections
          WHERE id = ANY($1) AND enabled = true AND deleted_at IS NULL
            AND (scope = 'global' OR owner_id = $2)
@@ -16104,6 +16278,52 @@ fn model_proxy_timeout_from_env() -> anyhow::Result<Duration> {
     parse_model_proxy_timeout(env::var("HUB_MODEL_PROXY_TIMEOUT_SECS").ok().as_deref())
 }
 
+fn model_gateway_config_from_env() -> anyhow::Result<(String, Arc<Zeroizing<String>>)> {
+    let url = env::var("HUB_MODEL_GATEWAY_URL").context("HUB_MODEL_GATEWAY_URL is required")?;
+    let auth_token = env::var("HUB_MODEL_GATEWAY_AUTH_TOKEN")
+        .context("HUB_MODEL_GATEWAY_AUTH_TOKEN is required")?;
+    validate_model_gateway_config(&url, &auth_token)
+}
+
+fn validate_model_gateway_config(
+    url: &str,
+    auth_token: &str,
+) -> anyhow::Result<(String, Arc<Zeroizing<String>>)> {
+    let mut parsed = Url::parse(url).context("HUB_MODEL_GATEWAY_URL must be a valid URL")?;
+    anyhow::ensure!(
+        matches!(parsed.scheme(), "http" | "https"),
+        "HUB_MODEL_GATEWAY_URL must use http or https"
+    );
+    anyhow::ensure!(
+        parsed.host_str().is_some(),
+        "HUB_MODEL_GATEWAY_URL must include a host"
+    );
+    anyhow::ensure!(
+        parsed.username().is_empty()
+            && parsed.password().is_none()
+            && parsed.query().is_none()
+            && parsed.fragment().is_none(),
+        "HUB_MODEL_GATEWAY_URL must not include credentials, query, or fragment"
+    );
+    anyhow::ensure!(
+        parsed.path().is_empty() || parsed.path() == "/",
+        "HUB_MODEL_GATEWAY_URL must not include a path"
+    );
+    anyhow::ensure!(
+        !auth_token.is_empty()
+            && auth_token.len() <= 4096
+            && auth_token
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() && !byte.is_ascii_whitespace()),
+        "HUB_MODEL_GATEWAY_AUTH_TOKEN must be a non-empty visible ASCII token"
+    );
+    parsed.set_path("");
+    Ok((
+        parsed.as_str().trim_end_matches('/').to_owned(),
+        Arc::new(Zeroizing::new(auth_token.to_owned())),
+    ))
+}
+
 fn session_bundle_max_bytes_from_env() -> anyhow::Result<u64> {
     let value = env::var("HUB_SESSION_BUNDLE_MAX_BYTES")
         .ok()
@@ -16967,6 +17187,26 @@ mod tests {
     use super::*;
     use tower::ServiceExt;
 
+    #[derive(Clone, Debug, Deserialize)]
+    struct TestModelGatewayEnvelope {
+        request_id: String,
+        protocol: ModelUpstreamProtocol,
+        endpoint: String,
+        api_key: String,
+        query: Option<String>,
+        #[serde(default)]
+        headers: BTreeMap<String, Vec<String>>,
+        body_base64: String,
+    }
+
+    fn decode_gateway_body(envelope: &TestModelGatewayEnvelope) -> Bytes {
+        Bytes::from(
+            base64::engine::general_purpose::STANDARD
+                .decode(&envelope.body_base64)
+                .unwrap(),
+        )
+    }
+
     #[tokio::test]
     async fn frontend_files_and_spa_fallback_do_not_capture_unknown_api_routes() {
         let frontend = tempfile::tempdir().unwrap();
@@ -17256,6 +17496,24 @@ mod tests {
                 ["api_key"]["writeOnly"],
             true
         );
+        assert_eq!(
+            document["components"]["schemas"]["ModelUpstreamProtocol"]["enum"],
+            json!(["openai_responses", "anthropic_messages"])
+        );
+        for schema in [
+            "ModelConnection",
+            "CreateModelConnectionRequest",
+            "UpdateModelConnectionRequest",
+            "ModelConnectionOption",
+            "ModelConnectionSnapshot",
+        ] {
+            assert_eq!(
+                document["components"]["schemas"][schema]["properties"]["upstream_protocol"]
+                    ["$ref"],
+                "#/components/schemas/ModelUpstreamProtocol",
+                "missing upstream protocol from {schema}"
+            );
+        }
         let update_agent = &document["components"]["schemas"]["UpdateAgentRequest"];
         assert_eq!(update_agent["additionalProperties"], false);
         assert!(update_agent["required"]
@@ -18394,6 +18652,28 @@ mod tests {
         assert!(parse_model_proxy_timeout(Some("0")).is_err());
         assert!(parse_model_proxy_timeout(Some("901")).is_err());
         assert!(parse_model_proxy_timeout(Some("forever")).is_err());
+    }
+
+    #[test]
+    fn model_gateway_configuration_is_explicit_and_validated() {
+        let (url, token) =
+            validate_model_gateway_config("http://model-gateway:8090/", "gateway-token").unwrap();
+        assert_eq!(url, "http://model-gateway:8090");
+        assert_eq!(token.as_str(), "gateway-token");
+
+        for invalid_url in [
+            "ftp://model-gateway:8090",
+            "http://model-gateway:8090/internal",
+            "http://user@model-gateway:8090",
+            "http://model-gateway:8090?token=secret",
+        ] {
+            assert!(validate_model_gateway_config(invalid_url, "gateway-token").is_err());
+        }
+        for invalid_token in ["", "with space", "line\nbreak"] {
+            assert!(
+                validate_model_gateway_config("http://model-gateway:8090", invalid_token).is_err()
+            );
+        }
     }
 
     #[tokio::test]
@@ -31555,7 +31835,7 @@ mod tests {
         struct CapturedRequest {
             uri: String,
             headers: HeaderMap,
-            body: Bytes,
+            envelope: TestModelGatewayEnvelope,
         }
 
         let captured = Arc::new(std::sync::Mutex::new(None::<CapturedRequest>));
@@ -31564,14 +31844,14 @@ mod tests {
         let captured_request = Arc::clone(&captured);
         let server = tokio::spawn(async move {
             let app = Router::new().route(
-                "/provider/v1/responses",
-                post(move |uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
+                "/internal/v1/responses",
+                post(move |uri: axum::http::Uri, headers: HeaderMap, Json(envelope): Json<TestModelGatewayEnvelope>| {
                     let captured_request = Arc::clone(&captured_request);
                     async move {
                         *captured_request.lock().unwrap() = Some(CapturedRequest {
                             uri: uri.to_string(),
                             headers,
-                            body,
+                            envelope,
                         });
                         let stream = async_stream::stream! {
                             yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
@@ -31651,7 +31931,9 @@ mod tests {
         let original = Bytes::from_static(
             br#" { "model": "runtime-claim-model", "input": [], "stream": true } "#,
         );
-        let app = build_router((*fixture.state).clone());
+        let mut state = (*fixture.state).clone();
+        state.model_gateway_url = format!("http://{address}");
+        let app = build_router(state);
         let response = app
             .oneshot(
                 axum::http::Request::builder()
@@ -31708,23 +31990,40 @@ mod tests {
         drop(body);
 
         let captured = captured.lock().unwrap().clone().unwrap();
-        assert_eq!(captured.uri, "/provider/v1/responses?include=usage&trace=1");
-        assert_eq!(captured.body, original);
+        assert_eq!(captured.uri, "/internal/v1/responses");
         assert_eq!(
             captured.headers[header::AUTHORIZATION],
-            "Bearer runtime-claim-secret"
+            "Bearer test-gateway-token"
         );
-        assert_eq!(captured.headers["x-client-feature"], "preserve-me");
-        assert!(captured.headers.get(header::COOKIE).is_none());
-        assert!(captured.headers.get("x-agent-hub-run-id").is_none());
-        assert!(captured
-            .headers
-            .get("x-agent-hub-model-connection-id")
-            .is_none());
-        assert!(captured.headers.get("x-client-hop").is_none());
+        assert_eq!(
+            captured.envelope.protocol,
+            ModelUpstreamProtocol::OpenaiResponses
+        );
+        assert_eq!(
+            captured.envelope.endpoint,
+            format!("http://{address}/provider")
+        );
+        assert_eq!(captured.envelope.api_key, "runtime-claim-secret");
+        assert_eq!(
+            captured.envelope.query.as_deref(),
+            Some("include=usage&trace=1")
+        );
+        assert_eq!(decode_gateway_body(&captured.envelope), original);
+        assert_eq!(
+            captured.envelope.headers.get("x-client-feature"),
+            Some(&vec!["preserve-me".into()])
+        );
+        for filtered in [
+            "cookie",
+            "x-agent-hub-run-id",
+            "x-agent-hub-model-connection-id",
+            "x-client-hop",
+        ] {
+            assert!(!captured.envelope.headers.contains_key(filtered));
+        }
 
-        let usage: (String, i64, i64, i64, i64, i64, Uuid) = sqlx::query_as(
-            "SELECT response_status, input_tokens, output_tokens, total_tokens,
+        let usage: (Uuid, String, i64, i64, i64, i64, i64, Uuid) = sqlx::query_as(
+            "SELECT request_id, response_status, input_tokens, output_tokens, total_tokens,
                     cached_tokens, reasoning_tokens, agent_id
              FROM model_token_usage WHERE model_connection_id = $1",
         )
@@ -31734,7 +32033,16 @@ mod tests {
         .unwrap();
         assert_eq!(
             usage,
-            ("completed".into(), 11, 7, 18, 3, 5, fixture.agent_id)
+            (
+                Uuid::parse_str(&captured.envelope.request_id).unwrap(),
+                "completed".into(),
+                11,
+                7,
+                18,
+                3,
+                5,
+                fixture.agent_id
+            )
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -31755,12 +32063,27 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let app = Router::new().route(
-                "/provider/v1/responses",
-                post(|uri: Uri| async move {
-                    let case = uri
-                        .query()
+                "/internal/v1/responses",
+                post(|Json(envelope): Json<TestModelGatewayEnvelope>| async move {
+                    if envelope.protocol != ModelUpstreamProtocol::AnthropicMessages {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    }
+                    let case = envelope
+                        .query
+                        .as_deref()
                         .and_then(|query| query.strip_prefix("case="))
                         .unwrap_or("retry");
+                    if case == "stream_error" {
+                        let mut response = Response::new(Body::from(
+                            "event: response.created\ndata: {\"type\":\"response.created\"}\n\n\
+                             event: error\ndata: {\"type\":\"error\",\"code\":\"stream_overloaded\",\"message\":\"provider stream failed\"}\n\n",
+                        ));
+                        response.headers_mut().insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("text/event-stream"),
+                        );
+                        return response;
+                    }
                     let (status, value) = match case {
                         "failed" => (
                             StatusCode::OK,
@@ -31830,12 +32153,16 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        sqlx::query("UPDATE model_connections SET base_url = $1 WHERE id = $2")
-            .bind(format!("http://{address}/provider"))
-            .bind(fixture.model_connection_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE model_connections
+             SET base_url = $1, upstream_protocol = 'anthropic_messages'
+             WHERE id = $2",
+        )
+        .bind(format!("http://{address}/provider"))
+        .bind(fixture.model_connection_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
         let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
         sqlx::query(
             "UPDATE hub_sessions
@@ -31847,7 +32174,9 @@ mod tests {
         .execute(&fixture.state.pool)
         .await
         .unwrap();
-        let app = build_router((*fixture.state).clone());
+        let mut state = (*fixture.state).clone();
+        state.model_gateway_url = format!("http://{address}");
+        let app = build_router(state);
 
         for (case, expected_status) in [
             ("failed", StatusCode::OK),
@@ -31855,6 +32184,7 @@ mod tests {
             ("cancelled", StatusCode::OK),
             ("no_usage", StatusCode::OK),
             ("rate", StatusCode::TOO_MANY_REQUESTS),
+            ("stream_error", StatusCode::OK),
             ("retry", StatusCode::OK),
             ("retry", StatusCode::OK),
         ] {
@@ -31908,7 +32238,7 @@ mod tests {
             errors,
             vec![
                 ("cancelled".into(), 1),
-                ("failed".into(), 2),
+                ("failed".into(), 3),
                 ("incomplete".into(), 1),
                 ("protocol_error".into(), 1),
             ]
@@ -31933,6 +32263,24 @@ mod tests {
         .await
         .unwrap();
         assert!(!persisted_errors.contains("runtime-claim-secret"));
+        assert!(persisted_errors.contains("stream_overloaded provider stream failed"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM (
+                     SELECT upstream_protocol_snapshot FROM model_token_usage
+                     WHERE model_connection_id = $1
+                     UNION ALL
+                     SELECT upstream_protocol_snapshot FROM model_call_errors
+                     WHERE model_connection_id = $1
+                 ) AS snapshots
+                 WHERE upstream_protocol_snapshot <> 'anthropic_messages'",
+            )
+            .bind(fixture.model_connection_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            0
+        );
         server.abort();
     }
 
@@ -32123,17 +32471,20 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     async fn model_proxy_uses_turn_selection_snapshot_and_fresh_connection_secret(pool: PgPool) {
-        let captured = Arc::new(std::sync::Mutex::new(None::<(HeaderMap, Value)>));
+        let captured = Arc::new(std::sync::Mutex::new(
+            None::<(HeaderMap, TestModelGatewayEnvelope)>,
+        ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let captured_request = Arc::clone(&captured);
-        let server = tokio::spawn(async move {
-            let app = Router::new().route(
-                "/rotated/v1/responses",
-                post(move |headers: HeaderMap, Json(body): Json<Value>| {
+        let server =
+            tokio::spawn(async move {
+                let app = Router::new().route(
+                "/internal/v1/responses",
+                post(move |headers: HeaderMap, Json(envelope): Json<TestModelGatewayEnvelope>| {
                     let captured_request = Arc::clone(&captured_request);
                     async move {
-                        *captured_request.lock().unwrap() = Some((headers, body));
+                        *captured_request.lock().unwrap() = Some((headers, envelope));
                         Json(json!({
                             "status": "completed",
                             "usage": {
@@ -32145,8 +32496,8 @@ mod tests {
                     }
                 }),
             );
-            axum::serve(listener, app).await.unwrap();
-        });
+                axum::serve(listener, app).await.unwrap();
+            });
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
         let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
         sqlx::query(
@@ -32187,7 +32538,9 @@ mod tests {
         .execute(&fixture.state.pool)
         .await
         .unwrap();
-        let app = build_router((*fixture.state).clone());
+        let mut state = (*fixture.state).clone();
+        state.model_gateway_url = format!("http://{address}");
+        let app = build_router(state);
 
         let current_turn = model_proxy_test_http_request(
             &app,
@@ -32202,11 +32555,11 @@ mod tests {
         let _ = axum::body::to_bytes(current_turn.into_body(), usize::MAX)
             .await
             .unwrap();
-        let (headers, request_body) = captured.lock().unwrap().clone().unwrap();
-        assert_eq!(
-            headers[header::AUTHORIZATION],
-            "Bearer rotated-provider-secret"
-        );
+        let (headers, envelope) = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(headers[header::AUTHORIZATION], "Bearer test-gateway-token");
+        assert_eq!(envelope.api_key, "rotated-provider-secret");
+        assert_eq!(envelope.endpoint, format!("http://{address}/rotated"));
+        let request_body: Value = serde_json::from_slice(&decode_gateway_body(&envelope)).unwrap();
         assert_eq!(request_body["model"], "runtime-claim-model");
         assert_eq!(
             sqlx::query_scalar::<_, String>(
@@ -32239,8 +32592,8 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let app = Router::new().route(
-                "/subagent/v1/responses",
-                post(|| async {
+                "/internal/v1/responses",
+                post(|Json(_envelope): Json<TestModelGatewayEnvelope>| async {
                     Json(json!({
                         "status": "completed",
                         "usage": {
@@ -32293,7 +32646,9 @@ mod tests {
         .execute(&fixture.state.pool)
         .await
         .unwrap();
-        let app = build_router((*fixture.state).clone());
+        let mut state = (*fixture.state).clone();
+        state.model_gateway_url = format!("http://{address}");
+        let app = build_router(state);
 
         let response = model_proxy_test_http_request(
             &app,
@@ -32343,14 +32698,12 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let app = Router::new()
-                .route(
-                    "/header/v1/responses",
-                    post(|| async { std::future::pending::<Response>().await }),
-                )
-                .route(
-                    "/body/v1/responses",
-                    post(|| async {
+            let app = Router::new().route(
+                "/internal/v1/responses",
+                post(|Json(envelope): Json<TestModelGatewayEnvelope>| async move {
+                    if envelope.endpoint.ends_with("/header") {
+                        std::future::pending::<Response>().await
+                    } else {
                         let stream = async_stream::stream! {
                             yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
                                 b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n",
@@ -32363,8 +32716,9 @@ mod tests {
                             HeaderValue::from_static("text/event-stream"),
                         );
                         response
-                    }),
-                );
+                    }
+                }),
+            );
             axum::serve(listener, app).await.unwrap();
         });
 
@@ -32395,6 +32749,7 @@ mod tests {
             .read_timeout(Duration::from_millis(100))
             .build()
             .unwrap();
+        header_state.model_gateway_url = format!("http://{address}");
         let header_app = build_router(header_state);
         let header_timeout = model_proxy_test_http_request(
             &header_app,
@@ -32446,6 +32801,7 @@ mod tests {
             .read_timeout(Duration::from_millis(100))
             .build()
             .unwrap();
+        body_state.model_gateway_url = format!("http://{address}");
         let body_app = build_router(body_state);
         let body_timeout = model_proxy_test_http_request(
             &body_app,
@@ -32500,12 +32856,13 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
-                Router::new().route("/v1/responses", post(slow_sse_model_upstream)),
+                Router::new().route("/internal/v1/responses", post(slow_sse_model_upstream)),
             )
             .await
             .unwrap();
         });
-        let state = test_model_proxy_state();
+        let mut state = test_model_proxy_state();
+        state.model_gateway_url = format!("http://{address}");
 
         let response = proxy_model_request_to_upstream(
             &state,
@@ -32556,12 +32913,13 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
-                Router::new().route("/v1/responses", post(model_upstream_rate_limited)),
+                Router::new().route("/internal/v1/responses", post(model_upstream_rate_limited)),
             )
             .await
             .unwrap();
         });
-        let state = test_model_proxy_state();
+        let mut state = test_model_proxy_state();
+        state.model_gateway_url = format!("http://{address}");
 
         let response = proxy_model_request_to_upstream(
             &state,
@@ -32593,12 +32951,16 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
-                Router::new().route("/v1/responses", post(model_upstream_never_sends_headers)),
+                Router::new().route(
+                    "/internal/v1/responses",
+                    post(model_upstream_never_sends_headers),
+                ),
             )
             .await
             .unwrap();
         });
-        let state = test_model_proxy_state_with_timeout(Duration::from_millis(100));
+        let mut state = test_model_proxy_state_with_timeout(Duration::from_millis(100));
+        state.model_gateway_url = format!("http://{address}");
 
         let error = proxy_model_request_to_upstream(
             &state,
@@ -32619,7 +32981,8 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
-        let state = test_model_proxy_state_with_timeout(Duration::from_millis(100));
+        let mut state = test_model_proxy_state_with_timeout(Duration::from_millis(100));
+        state.model_gateway_url = format!("http://{address}");
 
         let error = proxy_model_request_to_upstream(
             &state,
@@ -32644,14 +33007,15 @@ mod tests {
             axum::serve(
                 listener,
                 Router::new().route(
-                    "/v1/responses",
+                    "/internal/v1/responses",
                     post(model_upstream_stalls_after_first_chunk),
                 ),
             )
             .await
             .unwrap();
         });
-        let state = test_model_proxy_state_with_timeout(Duration::from_millis(150));
+        let mut state = test_model_proxy_state_with_timeout(Duration::from_millis(150));
+        state.model_gateway_url = format!("http://{address}");
         let response = proxy_model_request_to_upstream(
             &state,
             &format!("http://{address}"),
@@ -32680,22 +33044,39 @@ mod tests {
     async fn model_proxy_forwards_original_json_bytes_to_upstream() {
         use axum::response::IntoResponse;
 
+        let captured = Arc::new(std::sync::Mutex::new(None));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let captured_request = Arc::clone(&captured);
         let server = tokio::spawn(async move {
+            let handler =
+                move |headers: HeaderMap, Json(envelope): Json<TestModelGatewayEnvelope>| {
+                    let captured_request = Arc::clone(&captured_request);
+                    async move {
+                        let body = decode_gateway_body(&envelope);
+                        *captured_request.lock().unwrap() = Some((headers, envelope));
+                        let mut response = Response::new(Body::from(body));
+                        response.headers_mut().insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("application/json"),
+                        );
+                        response
+                    }
+                };
             axum::serve(
                 listener,
-                Router::new().route("/v1/responses", post(echo_model_request_body)),
+                Router::new().route("/internal/v1/responses", post(handler)),
             )
             .await
             .unwrap();
         });
-        let state = test_model_proxy_state();
+        let mut state = test_model_proxy_state();
+        state.model_gateway_url = format!("http://{address}");
         let original = Bytes::from_static(br#" { "model": "test-model", "input": [] } "#);
 
         let response = proxy_model_request_to_upstream(
             &state,
-            &format!("http://{address}"),
+            "https://provider.example/custom",
             "responses",
             original.clone(),
         )
@@ -32707,6 +33088,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(body, original);
+        let (headers, envelope) = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(headers[header::AUTHORIZATION], "Bearer test-gateway-token");
+        assert!(Uuid::parse_str(&envelope.request_id).is_ok());
+        assert_eq!(envelope.protocol, ModelUpstreamProtocol::OpenaiResponses);
+        assert_eq!(envelope.endpoint, "https://provider.example/custom");
+        assert_eq!(envelope.api_key, "test-provider-secret");
+        assert_eq!(envelope.query, None);
+        assert_eq!(
+            envelope.headers.get("content-type"),
+            Some(&vec!["application/json".into()])
+        );
         server.abort();
     }
 
@@ -36331,7 +36723,9 @@ mod tests {
         }
     }
 
-    async fn slow_sse_model_upstream() -> axum::response::Response {
+    async fn slow_sse_model_upstream(
+        Json(_envelope): Json<TestModelGatewayEnvelope>,
+    ) -> axum::response::Response {
         let stream = async_stream::stream! {
             yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: first\n\n"));
             tokio::time::sleep(Duration::from_millis(300)).await;
@@ -36354,11 +36748,15 @@ mod tests {
         response
     }
 
-    async fn model_upstream_never_sends_headers() -> axum::response::Response {
+    async fn model_upstream_never_sends_headers(
+        Json(_envelope): Json<TestModelGatewayEnvelope>,
+    ) -> axum::response::Response {
         std::future::pending().await
     }
 
-    async fn model_upstream_stalls_after_first_chunk() -> axum::response::Response {
+    async fn model_upstream_stalls_after_first_chunk(
+        Json(_envelope): Json<TestModelGatewayEnvelope>,
+    ) -> axum::response::Response {
         let stream = async_stream::stream! {
             yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: first\n\n"));
             std::future::pending::<()>().await;
@@ -36371,22 +36769,15 @@ mod tests {
         response
     }
 
-    async fn model_upstream_rate_limited() -> axum::response::Response {
+    async fn model_upstream_rate_limited(
+        Json(_envelope): Json<TestModelGatewayEnvelope>,
+    ) -> axum::response::Response {
         let mut response =
             axum::response::Response::new(axum::body::Body::from("provider rate limit"));
         *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
         response
             .headers_mut()
             .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
-        response
-    }
-
-    async fn echo_model_request_body(body: Bytes) -> axum::response::Response {
-        let mut response = axum::response::Response::new(axum::body::Body::from(body));
-        response.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
         response
     }
 
@@ -37235,6 +37626,7 @@ mod tests {
                 name: default_connection.name.clone(),
                 base_url: default_connection.base_url.clone(),
                 model_id: updated_model_id.clone(),
+                upstream_protocol: None,
                 api_key: None,
             }),
         )
@@ -37408,6 +37800,7 @@ mod tests {
                 name: "Local Responses".into(),
                 base_url: "http://169.254.169.254/latest".into(),
                 model_id: "local-model".into(),
+                upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
                 api_key: "personal-secret".into(),
             }),
         )
@@ -37416,6 +37809,10 @@ mod tests {
         .0;
         assert_eq!(personal.scope, ModelConnectionScope::Personal);
         assert_eq!(personal.status, ModelConnectionStatus::Enabled);
+        assert_eq!(
+            personal.upstream_protocol,
+            ModelUpstreamProtocol::OpenaiResponses
+        );
         assert!(!serde_json::to_string(&personal)
             .unwrap()
             .contains("personal-secret"));
@@ -37439,6 +37836,7 @@ mod tests {
                 name: "Local Responses Updated".into(),
                 base_url: "https://models.internal.example/business".into(),
                 model_id: "local-model-2".into(),
+                upstream_protocol: Some(ModelUpstreamProtocol::AnthropicMessages),
                 api_key: None,
             }),
         )
@@ -37446,6 +37844,29 @@ mod tests {
         .unwrap()
         .0;
         assert_eq!(updated.name, "Local Responses Updated");
+        assert_eq!(
+            updated.upstream_protocol,
+            ModelUpstreamProtocol::AnthropicMessages
+        );
+        let preserved = update_model_connection(
+            State(state.clone()),
+            member_headers.clone(),
+            Path(personal.id),
+            Json(UpdateModelConnectionRequest {
+                name: "Local Anthropic Updated".into(),
+                base_url: updated.base_url.clone(),
+                model_id: updated.model_id.clone(),
+                upstream_protocol: None,
+                api_key: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            preserved.upstream_protocol,
+            ModelUpstreamProtocol::AnthropicMessages
+        );
         let stored_after: (Vec<u8>, Vec<u8>) = sqlx::query_as(
             "SELECT api_key_ciphertext, api_key_nonce
              FROM model_connections WHERE id = $1",
@@ -37464,6 +37885,7 @@ mod tests {
                 name: "Forbidden Global".into(),
                 base_url: "https://example.com".into(),
                 model_id: "global-model".into(),
+                upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
                 api_key: "global-secret".into(),
             }),
         )
@@ -37479,6 +37901,7 @@ mod tests {
                 name: "Global Responses".into(),
                 base_url: "https://example.com/provider".into(),
                 model_id: "global-model".into(),
+                upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
                 api_key: "global-secret".into(),
             }),
         )
@@ -37556,6 +37979,7 @@ mod tests {
                     name: "Invalid URL".into(),
                     base_url: invalid_url.into(),
                     model_id: "local-model".into(),
+                    upstream_protocol: None,
                     api_key: None,
                 }),
             )
@@ -37581,6 +38005,7 @@ mod tests {
                 name: "Referenced Global".into(),
                 base_url: "http://127.0.0.1:1".into(),
                 model_id: "referenced-model".into(),
+                upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
                 api_key: "referenced-secret".into(),
             }),
         )
@@ -37698,55 +38123,58 @@ mod tests {
     async fn model_connection_test_calls_responses_and_attributes_usage_and_errors(pool: PgPool) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let upstream = Router::new()
-            .route(
-                "/ok/v1/responses",
-                post(|headers: HeaderMap, Json(body): Json<Value>| async move {
+        let upstream = Router::new().route(
+            "/internal/v1/responses",
+            post(
+                |headers: HeaderMap, Json(envelope): Json<TestModelGatewayEnvelope>| async move {
                     if headers
                         .get(header::AUTHORIZATION)
-                        .and_then(|v| v.to_str().ok())
-                        != Some("Bearer provider-secret")
-                        || body.get("model").and_then(Value::as_str) != Some("test-model")
+                        .and_then(|value| value.to_str().ok())
+                        != Some("Bearer test-gateway-token")
                     {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(json!({ "error": { "code": "bad_test_request" } })),
-                        );
+                        return StatusCode::UNAUTHORIZED.into_response();
                     }
-                    (
-                        StatusCode::OK,
-                        Json(json!({
-                            "id": "resp_test",
-                            "object": "response",
-                            "status": "completed",
-                            "usage": {
-                                "input_tokens": 11,
-                                "output_tokens": 7,
-                                "total_tokens": 18,
-                                "input_tokens_details": { "cached_tokens": 3 },
-                                "output_tokens_details": { "reasoning_tokens": 5 }
-                            }
-                        })),
-                    )
-                }),
-            )
-            .route(
-                "/fail/v1/responses",
-                post(|| async {
-                    (
-                        StatusCode::TOO_MANY_REQUESTS,
-                        Json(json!({
-                            "error": {
-                                "code": "rate_provider-secret_limit",
-                                "message": "provider provider-secret rejected the request"
-                            }
-                        })),
-                    )
-                }),
-            )
-            .route(
-                "/broken/v1/responses",
-                post(|| async {
+                    if envelope.endpoint.ends_with("/ok") {
+                        let body: Value =
+                            serde_json::from_slice(&decode_gateway_body(&envelope)).unwrap();
+                        if envelope.api_key != "provider-secret"
+                            || body.get("model").and_then(Value::as_str) != Some("test-model")
+                        {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({ "error": { "code": "bad_test_request" } })),
+                            )
+                                .into_response();
+                        }
+                        return (
+                            StatusCode::OK,
+                            Json(json!({
+                                "id": "resp_test",
+                                "object": "response",
+                                "status": "completed",
+                                "usage": {
+                                    "input_tokens": 11,
+                                    "output_tokens": 7,
+                                    "total_tokens": 18,
+                                    "input_tokens_details": { "cached_tokens": 3 },
+                                    "output_tokens_details": { "reasoning_tokens": 5 }
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    if envelope.endpoint.ends_with("/fail") {
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            Json(json!({
+                                "error": {
+                                    "code": "rate_provider-secret_limit",
+                                    "message": "provider provider-secret rejected the request"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
                     let stream = async_stream::stream! {
                         yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
                             br#"{"id":"partial""#,
@@ -37760,13 +38188,16 @@ mod tests {
                         HeaderValue::from_static("application/json"),
                     );
                     response
-                }),
-            );
+                },
+            ),
+        );
         let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
 
         let member_token = create_user_session_with_role(&pool, "member").await;
         let member_headers = session_headers(&member_token);
-        let state = Arc::new(test_state_with_browser_session_auth(pool.clone()));
+        let mut test_state = test_state_with_browser_session_auth(pool.clone());
+        test_state.model_gateway_url = format!("http://{address}");
+        let state = Arc::new(test_state);
         let member = require_user(&state, &member_headers).await.unwrap();
         let successful = create_model_connection(
             State(state.clone()),
@@ -37776,6 +38207,7 @@ mod tests {
                 name: "Test Success".into(),
                 base_url: format!("http://{address}/ok"),
                 model_id: "test-model".into(),
+                upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
                 api_key: "provider-secret".into(),
             }),
         )
@@ -37811,6 +38243,7 @@ mod tests {
                 name: "Test Failure".into(),
                 base_url: format!("http://{address}/fail"),
                 model_id: "test-model".into(),
+                upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
                 api_key: "provider-secret".into(),
             }),
         )
@@ -37880,6 +38313,7 @@ mod tests {
                 name: "Test Broken Body".into(),
                 base_url: format!("http://{address}/broken"),
                 model_id: "test-model".into(),
+                upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
                 api_key: "provider-secret".into(),
             }),
         )
@@ -38557,6 +38991,7 @@ mod tests {
                 name: name.into(),
                 base_url: format!("http://127.0.0.1:1/{}", Uuid::new_v4()),
                 model_id: format!("model-{}", Uuid::new_v4().simple()),
+                upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
                 api_key: "test-provider-secret".into(),
             }),
         )
@@ -38608,6 +39043,8 @@ mod tests {
             ))
             .unwrap(),
             model_proxy_http: reqwest::Client::new(),
+            model_gateway_url: "http://127.0.0.1:1".into(),
+            model_gateway_auth_token: Arc::new(Zeroizing::new("test-gateway-token".into())),
             session_bundle_store: None,
             session_bundle_max_bytes: DEFAULT_SESSION_BUNDLE_MAX_BYTES,
             codex_release_client: test_codex_release_client(),
@@ -39346,6 +39783,8 @@ mod tests {
                 .read_timeout(timeout)
                 .build()
                 .unwrap(),
+            model_gateway_url: "http://127.0.0.1:1".into(),
+            model_gateway_auth_token: Arc::new(Zeroizing::new("test-gateway-token".into())),
             session_bundle_store: None,
             session_bundle_max_bytes: DEFAULT_SESSION_BUNDLE_MAX_BYTES,
             codex_release_client: test_codex_release_client(),

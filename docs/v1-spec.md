@@ -15,7 +15,7 @@ V1 保留以下可浏览器验证的产品链路；其执行和存储边界已�
 9. Session 离线时由 Runtime 生成最小 `tar.zst` Bundle，经 Hub 流式写入对象存储；恢复也只经过 Hub。
 10. Integration App 统一 OAuth、外部 Session API 和 Widget，可委托多个 Agent，并通过应用级或用户级 Application Token 使用显式 Agent scopes。
 11. Automation、Skill、API Key、Runtime 和 Administration 均以列表或专用 Tab 为主体，新建/编辑表单只在点击操作按钮后打开。
-12. Model Connection 以独立一级菜单管理 Global/Personal Responses 连接、系统默认模型和不可删减的 Token usage/error ledgers；Runtime 只通过 Hub 透明代理访问 provider。
+12. Model Connection 以独立一级菜单管理 Global/Personal 模型连接、上游协议、系统默认模型和不可删减的 Token usage/error ledgers；Runtime 只使用 Hub 的 Responses 入口，Hub 经内部无状态 Model Gateway 访问 OpenAI Responses 或 Anthropic Messages provider。
 
 ## 兼容边界
 
@@ -26,8 +26,9 @@ V1 保留以下可浏览器验证的产品链路；其执行和存储边界已�
 
 ## 验收标准
 
-- `docker compose up` 使用根目录 `compose.yml` 启动生产 Hub；可选的同机 Runtime 通过 `runtime` profile 启动。
-- `docker compose -f compose.dev.yml up` 启动 PostgreSQL、包含前端静态资源的 Hub backend、fake provider 和 runtime 的完整开发环境。
+- `docker compose up` 使用根目录 `compose.yml` 启动生产 Hub 与内部 Model Gateway；可选的同机 Runtime 通过 `runtime` profile 启动。
+- `docker compose -f compose.dev.yml up` 启动 PostgreSQL、包含前端静态资源的 Hub backend、Model Gateway、同时支持 Responses/Messages 的 fake provider 和 runtime 的完整开发环境。
+- Model Connection 可选择 `openai_responses` 或 `anthropic_messages`；两种协议的连接测试和 Runtime Responses 调用均经过 Gateway，Runtime 不获得 provider endpoint/API Key，历史 usage/error 保留调用时协议快照。
 - 用户能登录管理台、创建 Agent、进入空白 Conversation Draft，并从主对话输入框发送首条消息创建 Session 和启动 Turn，看到关联 Run 从 pending/running 进入终态。失败的首条消息、刷新和关闭浏览器保留 Draft；成功发送、显式丢弃或退出登录按约定清除 Draft。
 - 登录和根路径默认进入 Session 页；侧栏依次使用平台、具体 Agent 和搜索筛选，平台默认为“本平台”并可选择“全部平台”或某个具名 External Platform。所选可调用 Agent 同时过滤列表并决定新建对话使用的 Draft，不提供“全部智能体”；已删除或不可调用 Agent 只为已有 Session 保留历史筛选入口，不能新建 Draft。
 - 点击“新建会话”直接打开所选 Agent 的空白或已有本地 Draft，不展示初始消息表单，也不在首条消息被接受前创建或列出 Session；从外部平台视图发起时自动切回“本平台”。

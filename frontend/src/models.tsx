@@ -32,6 +32,7 @@ import {
   type ModelConnection,
   type ModelLedgerQuery,
   type ModelTokenUsagePage,
+  type ModelUpstreamProtocol,
   type ModelUsageSummary,
   type UpdateModelConnectionRequest,
   type User
@@ -65,6 +66,9 @@ type ModelTranslationKey =
   | 'globalModelConnectionList'
   | 'modelBaseUrl'
   | 'modelId'
+  | 'modelUpstreamProtocol'
+  | 'protocolOpenaiResponses'
+  | 'protocolAnthropicMessages'
   | 'modelScope'
   | 'systemDefault'
   | 'modelConnectionActions'
@@ -193,6 +197,7 @@ function ConnectionFormDialog({
   const [name, setName] = useState(connection?.name ?? '');
   const [baseUrl, setBaseUrl] = useState(connection?.base_url ?? '');
   const [modelId, setModelId] = useState(connection?.model_id ?? '');
+  const [upstreamProtocol, setUpstreamProtocol] = useState<ModelUpstreamProtocol>(connection?.upstream_protocol ?? 'openai_responses');
   const [apiKey, setApiKey] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(false);
@@ -209,6 +214,7 @@ function ConnectionFormDialog({
           name: name.trim(),
           base_url: baseUrl.trim(),
           model_id: modelId.trim(),
+          upstream_protocol: upstreamProtocol,
           ...(apiKey.trim() ? { api_key: apiKey } : {})
         };
         onSaved(await api.updateModelConnection(state.connection.id, request));
@@ -218,6 +224,7 @@ function ConnectionFormDialog({
           name: name.trim(),
           base_url: baseUrl.trim(),
           model_id: modelId.trim(),
+          upstream_protocol: upstreamProtocol,
           api_key: apiKey
         };
         onSaved(await api.createModelConnection(request));
@@ -244,6 +251,7 @@ function ConnectionFormDialog({
       <label>{mt('modelConnectionName')}<input autoComplete="off" required value={name} onChange={(event) => setName(event.target.value)} /></label>
       <label>{mt('modelBaseUrl')}<input type="url" inputMode="url" autoComplete="url" required value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} /></label>
       <label>{mt('modelId')}<input autoComplete="off" required value={modelId} onChange={(event) => setModelId(event.target.value)} /></label>
+      <label>{mt('modelUpstreamProtocol')}<select required value={upstreamProtocol} onChange={(event) => setUpstreamProtocol(event.target.value as ModelUpstreamProtocol)}><option value="openai_responses">{mt('protocolOpenaiResponses')}</option><option value="anthropic_messages">{mt('protocolAnthropicMessages')}</option></select></label>
       <label>{mt('modelApiKey')}<input type="password" autoComplete="new-password" required={!connection} value={apiKey} onChange={(event) => setApiKey(event.target.value)} /><small>{connection ? mt('modelApiKeyEditHelp') : mt('modelApiKeyCreateHelp')}</small></label>
       {error && <div className="model-alert error" role="alert">{mt('modelSaveFailed')}</div>}
     </form>
@@ -382,8 +390,8 @@ function ConnectionsTable({
     </div>
     <div className="models-table-wrap">
       <table className="models-table" aria-label={tableLabel}>
-        <thead><tr><th>{t('name')}</th><th>{mt('modelId')}</th><th>{mt('modelBaseUrl')}</th><th>{mt('modelScope')}</th><th>{t('status')}</th><th>{mt('systemDefault')}</th>{managementScope && <th>{mt('modelConnectionActions')}</th>}</tr></thead>
-        <tbody>{connections.length === 0 ? <tr><td className="models-empty-cell" colSpan={managementScope ? 7 : 6}>{emptyMessage}</td></tr> : connections.map((connection) => {
+        <thead><tr><th>{t('name')}</th><th>{mt('modelId')}</th><th>{mt('modelUpstreamProtocol')}</th><th>{mt('modelBaseUrl')}</th><th>{mt('modelScope')}</th><th>{t('status')}</th><th>{mt('systemDefault')}</th>{managementScope && <th>{mt('modelConnectionActions')}</th>}</tr></thead>
+        <tbody>{connections.length === 0 ? <tr><td className="models-empty-cell" colSpan={managementScope ? 8 : 7}>{emptyMessage}</td></tr> : connections.map((connection) => {
           const editLabel = actionLabel(mt('editModelConnectionAria'), connection);
           const testLabel = actionLabel(mt('testModelConnectionAria'), connection);
           const statusLabel = actionLabel(connection.status === 'enabled' ? mt('disableModelConnectionAria') : mt('enableModelConnectionAria'), connection);
@@ -393,6 +401,7 @@ function ConnectionsTable({
           return <tr key={connection.id}>
             <td><strong>{connection.name}</strong></td>
             <td><code>{connection.model_id}</code></td>
+            <td>{connection.upstream_protocol === 'anthropic_messages' ? mt('protocolAnthropicMessages') : mt('protocolOpenaiResponses')}</td>
             <td><code className="model-url">{connection.base_url}</code></td>
             <td><span className={`model-scope ${connection.scope}`}>{t((connection.scope === 'global' ? 'modelScopeGlobal' : 'modelScopePersonal') as TranslationKey)}</span></td>
             <td><span className={`status ${connection.status}`}>{connection.status === 'enabled' ? t('enabled') : t('disabled')}</span></td>

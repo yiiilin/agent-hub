@@ -206,6 +206,14 @@ pub enum ModelConnectionStatus {
     Disabled,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelUpstreamProtocol {
+    #[default]
+    OpenaiResponses,
+    AnthropicMessages,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConnectionDto {
@@ -215,6 +223,8 @@ pub struct ModelConnectionDto {
     pub name: String,
     pub base_url: String,
     pub model_id: String,
+    #[serde(default)]
+    pub upstream_protocol: ModelUpstreamProtocol,
     pub status: ModelConnectionStatus,
     pub is_system_default: bool,
     pub created_at: DateTime<Utc>,
@@ -228,6 +238,8 @@ pub struct CreateModelConnectionRequest {
     pub name: String,
     pub base_url: String,
     pub model_id: String,
+    #[serde(default)]
+    pub upstream_protocol: ModelUpstreamProtocol,
     pub api_key: String,
 }
 
@@ -237,6 +249,8 @@ pub struct UpdateModelConnectionRequest {
     pub name: String,
     pub base_url: String,
     pub model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_protocol: Option<ModelUpstreamProtocol>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
 }
@@ -253,6 +267,8 @@ pub struct ModelConnectionOptionDto {
     pub id: Uuid,
     pub name: String,
     pub model_id: String,
+    #[serde(default)]
+    pub upstream_protocol: ModelUpstreamProtocol,
     pub scope: ModelConnectionScope,
     pub status: ModelConnectionStatus,
 }
@@ -341,6 +357,8 @@ pub struct ModelConnectionSnapshotDto {
     pub scope: ModelConnectionScope,
     pub name: String,
     pub model_id: String,
+    #[serde(default)]
+    pub upstream_protocol: ModelUpstreamProtocol,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1678,6 +1696,10 @@ mod tests {
         .unwrap();
         assert_eq!(create.scope, ModelConnectionScope::Personal);
         assert_eq!(create.api_key, "create-secret");
+        assert_eq!(
+            create.upstream_protocol,
+            ModelUpstreamProtocol::OpenaiResponses
+        );
 
         let update: UpdateModelConnectionRequest = serde_json::from_value(json!({
             "name": "Updated Responses",
@@ -1686,10 +1708,23 @@ mod tests {
         }))
         .unwrap();
         assert!(update.api_key.is_none());
+        assert!(update.upstream_protocol.is_none());
         assert!(serde_json::to_value(update)
             .unwrap()
             .get("api_key")
             .is_none());
+
+        let anthropic_update: UpdateModelConnectionRequest = serde_json::from_value(json!({
+            "name": "Updated Anthropic",
+            "base_url": "https://models.example.test",
+            "model_id": "claude-test",
+            "upstream_protocol": "anthropic_messages"
+        }))
+        .unwrap();
+        assert_eq!(
+            anthropic_update.upstream_protocol,
+            Some(ModelUpstreamProtocol::AnthropicMessages)
+        );
 
         let connection = ModelConnectionDto {
             id: connection_id,
@@ -1698,6 +1733,7 @@ mod tests {
             name: "Local Responses".into(),
             base_url: "http://127.0.0.1:8080/provider".into(),
             model_id: "gpt-test".into(),
+            upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
             status: ModelConnectionStatus::Enabled,
             is_system_default: false,
             created_at: now,
@@ -1706,6 +1742,7 @@ mod tests {
         let read_value = serde_json::to_value(&connection).unwrap();
         assert_eq!(read_value["scope"], "personal");
         assert_eq!(read_value["status"], "enabled");
+        assert_eq!(read_value["upstream_protocol"], "openai_responses");
         assert!(read_value.get("api_key").is_none());
         assert!(serde_json::from_value::<ModelConnectionDto>(json!({
             "id": connection_id,
@@ -1728,6 +1765,7 @@ mod tests {
                     id: connection_id,
                     name: "Local Responses".into(),
                     model_id: "gpt-test".into(),
+                    upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
                     scope: ModelConnectionScope::Personal,
                     status: ModelConnectionStatus::Enabled,
                 }],
@@ -1887,6 +1925,7 @@ mod tests {
             scope: ModelConnectionScope::Global,
             name: "Global Responses".into(),
             model_id: "gpt-test".into(),
+            upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
         };
         let agent = ModelAgentSnapshotDto {
             id: Some(agent_id),
@@ -2793,6 +2832,7 @@ mod tests {
                     id: Uuid::from_u128(21),
                     name: "Agent Default".into(),
                     model_id: "gpt-test".into(),
+                    upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
                     scope: ModelConnectionScope::Personal,
                     status: ModelConnectionStatus::Enabled,
                 },
@@ -2800,6 +2840,7 @@ mod tests {
                     id: Uuid::from_u128(22),
                     name: "Reviewer Override".into(),
                     model_id: "gpt-review".into(),
+                    upstream_protocol: ModelUpstreamProtocol::AnthropicMessages,
                     scope: ModelConnectionScope::Global,
                     status: ModelConnectionStatus::Enabled,
                 },
@@ -2887,6 +2928,7 @@ mod tests {
                 id: connection_id,
                 name: "Agent Default".into(),
                 model_id: "gpt-test".into(),
+                upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
                 scope: ModelConnectionScope::Personal,
                 status: ModelConnectionStatus::Enabled,
             }],

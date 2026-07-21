@@ -360,6 +360,8 @@ export type ModelConnectionScope = 'global' | 'personal';
 
 export type ModelConnectionStatus = 'enabled' | 'disabled';
 
+export type ModelUpstreamProtocol = 'openai_responses' | 'anthropic_messages';
+
 export type ModelConnection = {
   id: string;
   owner_id: string | null;
@@ -367,6 +369,7 @@ export type ModelConnection = {
   name: string;
   base_url: string;
   model_id: string;
+  upstream_protocol: ModelUpstreamProtocol;
   status: ModelConnectionStatus;
   is_system_default: boolean;
   created_at: string;
@@ -378,6 +381,7 @@ export type CreateModelConnectionRequest = {
   name: string;
   base_url: string;
   model_id: string;
+  upstream_protocol: ModelUpstreamProtocol;
   api_key: string;
 };
 
@@ -393,12 +397,12 @@ export type CreateConfiguredAgentRequest = {
 
 export type UpdateModelConnectionRequest = Pick<
   CreateModelConnectionRequest,
-  'name' | 'base_url' | 'model_id'
+  'name' | 'base_url' | 'model_id' | 'upstream_protocol'
 > & { api_key?: string };
 
 export type ModelConnectionOption = Pick<
   ModelConnection,
-  'id' | 'name' | 'model_id' | 'scope' | 'status'
+  'id' | 'name' | 'model_id' | 'upstream_protocol' | 'scope' | 'status'
 >;
 
 export type ModelConnectionOptions = {
@@ -422,6 +426,7 @@ export type ModelConnectionSnapshot = {
   scope: ModelConnectionScope;
   name: string;
   model_id: string;
+  upstream_protocol: ModelUpstreamProtocol;
 };
 
 export type ModelAgentSnapshot = {

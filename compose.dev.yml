@@ -18,6 +18,21 @@ services:
       retries: 30
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    networks:
+      - hub-network
+
+  model-gateway:
+    labels: *development-labels
+    build:
+      context: .
+      dockerfile: deploy/gateway.Dockerfile
+    environment:
+      MODEL_GATEWAY_AUTH_TOKEN: ${HUB_MODEL_GATEWAY_AUTH_TOKEN:-dev-model-gateway-auth-token}
+      MODEL_GATEWAY_LISTEN_ADDR: 0.0.0.0:8090
+      MODEL_GATEWAY_UPSTREAM_TIMEOUT: ${MODEL_GATEWAY_UPSTREAM_TIMEOUT:-300s}
+      MODEL_GATEWAY_STREAM_IDLE_TIMEOUT: ${MODEL_GATEWAY_STREAM_IDLE_TIMEOUT:-120s}
+    networks:
+      - model-network
 
   backend:
     labels: *development-labels
@@ -42,6 +57,8 @@ services:
       DEV_MODEL_PROVIDER_API_KEY: ${DEV_MODEL_PROVIDER_API_KEY:-dev-model-provider-api-key}
       DEV_RUNTIME_ENROLLMENT_TOKEN: ${DEV_RUNTIME_ENROLLMENT_TOKEN:-dev-runtime-enrollment-token}
       HUB_MODEL_PROXY_TIMEOUT_SECS: ${HUB_MODEL_PROXY_TIMEOUT_SECS:-300}
+      HUB_MODEL_GATEWAY_URL: ${HUB_MODEL_GATEWAY_URL:-http://model-gateway:8090}
+      HUB_MODEL_GATEWAY_AUTH_TOKEN: ${HUB_MODEL_GATEWAY_AUTH_TOKEN:-dev-model-gateway-auth-token}
       HUB_SESSION_BUNDLE_MAX_BYTES: ${HUB_SESSION_BUNDLE_MAX_BYTES:-10737418240}
       HUB_BUNDLE_S3_ENDPOINT: ${HUB_BUNDLE_S3_ENDPOINT:-http://bundle-store:9000}
       HUB_BUNDLE_S3_BUCKET: ${HUB_BUNDLE_S3_BUCKET:-agent-hub-sessions}
@@ -66,8 +83,13 @@ services:
         condition: service_healthy
       bundle-store-init:
         condition: service_completed_successfully
+      model-gateway:
+        condition: service_healthy
     volumes:
       - hub-data:/var/lib/agent-hub
+    networks:
+      - hub-network
+      - model-network
 
   bundle-store:
     image: minio/minio:RELEASE.2025-04-22T22-12-26Z
@@ -83,6 +105,8 @@ services:
       retries: 30
     volumes:
       - bundle-store-data:/data
+    networks:
+      - hub-network
 
   bundle-store-init:
     image: minio/mc:RELEASE.2025-04-16T18-13-26Z
@@ -99,6 +123,8 @@ services:
     depends_on:
       bundle-store:
         condition: service_healthy
+    networks:
+      - hub-network
 
   runtime-init:
     labels: *development-labels
@@ -109,6 +135,8 @@ services:
     command: ["chown", "-R", "10001:10001", "/var/lib/agent-hub-runtime"]
     volumes:
       - runtime-data:/var/lib/agent-hub-runtime
+    networks:
+      - hub-network
 
   runtime:
     labels: *development-labels
@@ -137,10 +165,10 @@ services:
     depends_on:
       backend:
         condition: service_healthy
-      fake-model-provider:
-        condition: service_started
       runtime-init:
         condition: service_completed_successfully
+    networks:
+      - hub-network
 
   fake-model-provider:
     image: python:3.12-slim
@@ -151,6 +179,12 @@ services:
     command: ["python", "/app/fake-model-provider.py"]
     volumes:
       - ./deploy/fake-model-provider.py:/app/fake-model-provider.py:ro
+    networks:
+      - model-network
+
+networks:
+  hub-network:
+  model-network:
 
 volumes:
   postgres-data:

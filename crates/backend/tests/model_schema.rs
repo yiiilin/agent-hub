@@ -83,6 +83,34 @@ async fn model_schema_enforces_scope_defaults_and_reasoning(pool: PgPool) {
     let global_id = insert_connection(&pool, "global", None).await;
     let personal_id = insert_connection(&pool, "personal", Some(owner_id)).await;
 
+    let default_protocol: String =
+        sqlx::query_scalar("SELECT upstream_protocol FROM model_connections WHERE id = $1")
+            .bind(global_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(default_protocol, "openai_responses");
+
+    sqlx::query(
+        "UPDATE model_connections
+         SET upstream_protocol = 'anthropic_messages'
+         WHERE id = $1",
+    )
+    .bind(personal_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let invalid_protocol = sqlx::query(
+        "UPDATE model_connections
+         SET upstream_protocol = 'unsupported_protocol'
+         WHERE id = $1",
+    )
+    .bind(personal_id)
+    .execute(&pool)
+    .await;
+    assert!(invalid_protocol.is_err());
+
     let invalid_personal = sqlx::query(
         "INSERT INTO model_connections
              (id, scope, name, base_url, model_id, api_key_ciphertext, api_key_nonce)
@@ -275,7 +303,8 @@ async fn model_ledgers_are_precise_append_only_and_anonymized(pool: PgPool) {
         .unwrap();
 
     let row = sqlx::query(
-        "SELECT subject_user_id, subject_display_name_snapshot, total_tokens
+        "SELECT subject_user_id, subject_display_name_snapshot, total_tokens,
+                upstream_protocol_snapshot
          FROM model_token_usage WHERE id = $1",
     )
     .bind(usage_id)
@@ -292,6 +321,20 @@ async fn model_ledgers_are_precise_append_only_and_anonymized(pool: PgPool) {
         None
     );
     assert_eq!(row.get::<i64, _>("total_tokens"), 14);
+    assert_eq!(
+        row.get::<String, _>("upstream_protocol_snapshot"),
+        "openai_responses"
+    );
+
+    let mutate_protocol = sqlx::query(
+        "UPDATE model_token_usage
+         SET upstream_protocol_snapshot = 'anthropic_messages'
+         WHERE id = $1",
+    )
+    .bind(usage_id)
+    .execute(&pool)
+    .await;
+    assert!(mutate_protocol.is_err());
 
     let error_identity = sqlx::query(
         "SELECT subject_user_id, subject_display_name_snapshot

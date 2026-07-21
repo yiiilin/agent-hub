@@ -21,6 +21,8 @@ services:
       retries: 20
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    networks:
+      - hub-network
     logging: *service-logging
 
   bundle-store:
@@ -37,6 +39,8 @@ services:
       retries: 20
     volumes:
       - bundle-store-data:/data
+    networks:
+      - hub-network
     logging: *service-logging
 
   bundle-store-init:
@@ -54,6 +58,22 @@ services:
     depends_on:
       bundle-store:
         condition: service_healthy
+    networks:
+      - hub-network
+    logging: *service-logging
+
+  model-gateway:
+    build:
+      context: .
+      dockerfile: deploy/gateway.Dockerfile
+    restart: unless-stopped
+    environment:
+      MODEL_GATEWAY_AUTH_TOKEN: ${HUB_MODEL_GATEWAY_AUTH_TOKEN:?Set HUB_MODEL_GATEWAY_AUTH_TOKEN in .env}
+      MODEL_GATEWAY_LISTEN_ADDR: 0.0.0.0:8090
+      MODEL_GATEWAY_UPSTREAM_TIMEOUT: ${MODEL_GATEWAY_UPSTREAM_TIMEOUT:-300s}
+      MODEL_GATEWAY_STREAM_IDLE_TIMEOUT: ${MODEL_GATEWAY_STREAM_IDLE_TIMEOUT:-120s}
+    networks:
+      - model-network
     logging: *service-logging
 
   backend:
@@ -75,6 +95,8 @@ services:
       SEED_DEV_MODEL_CONNECTION: "false"
       HUB_MODEL_SECRET_KEY: ${HUB_MODEL_SECRET_KEY:?Set HUB_MODEL_SECRET_KEY in .env}
       HUB_MODEL_PROXY_TIMEOUT_SECS: ${HUB_MODEL_PROXY_TIMEOUT_SECS:-300}
+      HUB_MODEL_GATEWAY_URL: http://model-gateway:8090
+      HUB_MODEL_GATEWAY_AUTH_TOKEN: ${HUB_MODEL_GATEWAY_AUTH_TOKEN:?Set HUB_MODEL_GATEWAY_AUTH_TOKEN in .env}
       HUB_SESSION_BUNDLE_MAX_BYTES: ${HUB_SESSION_BUNDLE_MAX_BYTES:-10737418240}
       HUB_BUNDLE_S3_ENDPOINT: ${HUB_BUNDLE_S3_ENDPOINT:-http://bundle-store:9000}
       HUB_BUNDLE_S3_BUCKET: ${HUB_BUNDLE_S3_BUCKET:-agent-hub-sessions}
@@ -99,8 +121,13 @@ services:
         condition: service_healthy
       bundle-store-init:
         condition: service_completed_successfully
+      model-gateway:
+        condition: service_healthy
     volumes:
       - hub-data:/var/lib/agent-hub
+    networks:
+      - hub-network
+      - model-network
     logging: *service-logging
 
   runtime-init:
@@ -112,6 +139,8 @@ services:
     command: ["chown", "-R", "10001:10001", "/var/lib/agent-hub-runtime"]
     volumes:
       - runtime-data:/var/lib/agent-hub-runtime
+    networks:
+      - hub-network
 
   runtime:
     profiles: ["runtime"]
@@ -149,7 +178,13 @@ services:
         condition: service_healthy
       runtime-init:
         condition: service_completed_successfully
+    networks:
+      - hub-network
     logging: *service-logging
+
+networks:
+  hub-network:
+  model-network:
 
 volumes:
   postgres-data:

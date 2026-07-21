@@ -4,12 +4,13 @@
 
 ## 生产 Compose
 
-根目录 `compose.yml` 是默认生产编排。它启动 PostgreSQL、私有 MinIO 和 Hub；Hub backend 镜像同时包含并直接托管 React/Vite 静态资源，不需要独立 frontend 或 Nginx 容器。生产配置不启用 Mock OIDC、开发用户、开发 Model Connection、fake provider 或 fake Codex。先以 `.env.example` 为清单配置 `.env` 并执行 `chmod 600 .env`；关键值为空时 Compose 会在创建容器前拒绝启动。`.env` 已同时被 Git 和 Docker build context 排除。
+根目录 `compose.yml` 是默认生产编排。它启动 PostgreSQL、私有 MinIO、Hub 和无状态 Model Gateway；Hub backend 镜像同时包含并直接托管 React/Vite 静态资源，不需要独立 frontend 或 Nginx 容器。生产配置不启用 Mock OIDC、开发用户、开发 Model Connection、fake provider 或 fake Codex。先以 `.env.example` 为清单配置 `.env` 并执行 `chmod 600 .env`；关键值为空时 Compose 会在创建容器前拒绝启动。`.env` 已同时被 Git 和 Docker build context 排除。
 
 至少需要设置：
 
 - `POSTGRES_PASSWORD` 和与其一致的 `DATABASE_URL`。建议密码使用 URL-safe 随机值，避免连接串编码歧义。
 - `HUB_MODEL_SECRET_KEY`，使用 `openssl rand -base64 32` 生成并纳入独立备份。
+- `HUB_MODEL_GATEWAY_AUTH_TOKEN`，使用 `openssl rand -hex 32` 生成，只供 Hub 和 Model Gateway 之间鉴权。
 - `EMBED_JWT_SECRET`，使用部署专属随机值。
 - `HUB_BUNDLE_S3_ACCESS_KEY_ID` 和 `HUB_BUNDLE_S3_SECRET_ACCESS_KEY`，只用于 Compose 内部、不对宿主机发布端口的 MinIO。
 
@@ -21,6 +22,8 @@ docker compose ps
 ```
 
 Hub 默认只发布到 `127.0.0.1:8080`，应由宿主机反向代理终止 TLS。只有明确由外部负载均衡器保护时才修改 `FRONTEND_BIND_ADDRESS`；生产环境保持 `SESSION_COOKIE_SECURE=true`。
+
+Model Gateway 不发布宿主机端口，只连接 `model-network`；Runtime 只连接 `hub-network`，不是 `model-network` 成员，不能访问 Compose 中的 gateway/provider 服务地址。Backend 同时连接两个网络，并等待 gateway `/readyz` 健康后启动。Gateway 不接收数据库、S3、OAuth 或 provider 的持久凭据，provider key 只在单次 Hub 请求中传入。
 
 生产 Runtime 是可选 profile，因为 Runtime 可以部署在其他节点。若要在同一台机器运行，先把可执行的真实 Codex CLI 放到 `CODEX_BIN_PATH`，在管理台创建一次性 Enrollment Token，并设置 `RUNTIME_ENROLLMENT_TOKEN`、实际 `RUNTIME_CODEX_VERSION` 和稳定的 `RUNTIME_HOSTNAME`，然后启动：
 
@@ -99,9 +102,13 @@ Runtime 创建压缩包并计算压缩文件的 SHA-256。Hub 只校验身份、
 
 Hub 启动必须提供 `HUB_MODEL_SECRET_KEY`，用于加密数据库中的 Model Connection API Key。该值是部署 secret，不得写入镜像、源码、日志、浏览器响应或 Runtime 配置；Compose 中的固定开发值只能用于本地测试。第一版没有 key rotation，修改或丢失该值会导致既有模型密钥无法解密。
 
-Runtime 和 per-Session `CODEX_HOME` 只包含指向 loopback/Hub proxy 的 provider 配置，不包含真实 provider URL credential。`HUB_MODEL_PROXY_UPSTREAM_URL`、`HUB_MODEL_PROXY_API_KEY` 和全部 `RUNTIME_DIRECT_MODEL_*` 已废弃且不迁移；管理员必须在管理台创建 Global/Personal Model Connection。连接的服务根地址不带 `/v1`，Hub 透明代理到 `<base>/v1/responses`。
+Runtime 和 per-Session `CODEX_HOME` 只包含指向 loopback/Hub proxy 的 provider 配置，不包含真实 provider URL credential。`HUB_MODEL_PROXY_UPSTREAM_URL`、`HUB_MODEL_PROXY_API_KEY` 和全部 `RUNTIME_DIRECT_MODEL_*` 已废弃且不迁移；管理员必须在管理台创建 Global/Personal Model Connection。连接的服务根地址不带 `/v1`。Hub 完成 Run 授权、密钥解密和账本归属后，把单次请求交给内部 Model Gateway；Gateway 根据连接协议调用 provider，并把规范化 Responses JSON/SSE 返回 Hub。
 
-Personal Model Connection 地址按 ADR-0024 不做公网或内网限制。允许普通用户使 Hub 访问其网络可达的 HTTP/HTTPS 地址是明确接受的部署风险；需要隔离时必须在 Hub 所在网络或外部 egress 层实施，而不是依赖本应用过滤。HTTPS 始终使用标准证书和 hostname 校验；自签名 endpoint 应使用受控 HTTP 或在部署信任库中正确安装 CA，应用不提供跳过 TLS 校验的开关。
+`HUB_MODEL_GATEWAY_URL` 和 `HUB_MODEL_GATEWAY_AUTH_TOKEN` 是 Hub 启动必需配置。Compose 固定 URL 为 `http://model-gateway:8090`，共享令牌由 `.env` 注入 Hub 和 Gateway。`MODEL_GATEWAY_UPSTREAM_TIMEOUT` 与 `MODEL_GATEWAY_STREAM_IDLE_TIMEOUT` 使用 Go duration 语法；默认分别为 `300s` 和 `120s`。Gateway 不保存 provider key、请求、响应、用量或错误历史，重启不需要持久卷。
+
+Gateway 提供内部 `GET /healthz` 和 `GET /readyz`，两者只表示进程已可接收请求，不主动探测任意动态 provider。可用 `docker compose ps` 检查 Compose 健康状态，用 `docker compose logs model-gateway` 查看仅含 request ID、协议和进程生命周期错误的日志；日志不应出现 endpoint credential、prompt 或 output。Gateway 不重试模型调用，故故障恢复后由上层明确发起新请求，不会在 Gateway 内重复计费。
+
+Personal Model Connection 地址按 ADR-0024 不做公网或内网限制。允许普通用户使 Hub 访问其网络可达的 HTTP/HTTPS 地址是明确接受的部署风险；需要隔离时必须在 Hub 所在网络或外部 egress 层实施，而不是依赖本应用过滤。HTTPS 始终使用标准证书和 hostname 校验；自签名 endpoint 应使用受控 HTTP 或在部署信任库中正确安装 CA，应用不提供跳过 TLS 校验的开关。Global 连接的 Administrator 与 Personal 连接的 owner 还必须信任 provider 接收 API Key 并生成响应；OpenAI 字节透明 body 不做 credential 内容扫描，Hub/Gateway 只保证自身生成的数据和转发 header 不泄露 key。
 
 ## S3-compatible 对象存储
 

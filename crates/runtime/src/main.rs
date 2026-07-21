@@ -8747,6 +8747,7 @@ mod tests {
                 id: override_connection_id,
                 name: "Review model".into(),
                 model_id: "gpt-review".into(),
+                upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
                 scope: ModelConnectionScope::Personal,
                 status: ModelConnectionStatus::Enabled,
             });
@@ -11455,6 +11456,7 @@ done
                 id: override_connection_id,
                 name: "Review model".into(),
                 model_id: "gpt-review".into(),
+                upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
                 scope: ModelConnectionScope::Personal,
                 status: ModelConnectionStatus::Enabled,
             });
@@ -13236,6 +13238,7 @@ done
             id: updated_connection_id,
             name: "Updated model".into(),
             model_id: "gpt-updated".into(),
+            upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
             scope: ModelConnectionScope::Global,
             status: ModelConnectionStatus::Enabled,
         }];
@@ -17077,6 +17080,7 @@ done
                 id: default_model_connection_id,
                 name: "Main model".into(),
                 model_id: "gpt-main".into(),
+                upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
                 scope: ModelConnectionScope::Global,
                 status: ModelConnectionStatus::Enabled,
             }],

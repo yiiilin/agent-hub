@@ -33,12 +33,18 @@ function assertWriteOnly(value, label) {
   assert.equal(serialized.includes('"api_key"'), false, `${label} must not expose an api_key field`);
 }
 
-function connectionRequest(scope, name, modelId = SUCCESS_MODEL_ID) {
+function connectionRequest(
+  scope,
+  name,
+  modelId = SUCCESS_MODEL_ID,
+  upstreamProtocol = 'openai_responses'
+) {
   return {
     scope,
     name,
     base_url: PROVIDER_BASE_URL,
     model_id: modelId,
+    upstream_protocol: upstreamProtocol,
     api_key: PROVIDER_API_KEY
   };
 }
@@ -184,6 +190,12 @@ export default async function modelConnectionsApiScenario(context) {
       context.unique('QA Global Error'),
       ERROR_MODEL_ID
     ));
+    const anthropicGlobal = await createConnection(administrator.client, connectionRequest(
+      'global',
+      context.unique('QA Global Anthropic'),
+      SUCCESS_MODEL_ID,
+      'anthropic_messages'
+    ));
 
     assert.equal(superPersonal.owner_id, superAdmin.id);
     assert.equal(ownerPersonal.owner_id, owner.user.id);
@@ -274,6 +286,29 @@ export default async function modelConnectionsApiScenario(context) {
       total_tokens: 18,
       cached_tokens: 3,
       reasoning_tokens: 5
+    });
+    const anthropicTest = (await administrator.client.post(
+      `/api/model-connections/${anthropicGlobal.id}/test`
+    )).data;
+    assert.deepEqual(anthropicTest, {
+      success: true,
+      status_code: 200,
+      error_code: null,
+      message: null
+    });
+    const anthropicUsage = await waitForLedgerItems(
+      administrator.client,
+      '/api/model-usage',
+      { model_connection_id: anthropicGlobal.id },
+      1
+    );
+    assert.equal(anthropicUsage[0].model.upstream_protocol, 'anthropic_messages');
+    assert.deepEqual(usageTotals(anthropicUsage), {
+      input_tokens: 13,
+      output_tokens: 8,
+      total_tokens: 21,
+      cached_tokens: 0,
+      reasoning_tokens: 0
     });
     const hiddenSuperUsage = (await administrator.client.get(ledgerPath('/api/model-usage', {
       model_connection_id: superPersonal.id,

@@ -80,6 +80,10 @@ _Avoid_: Agent profile, user credentials, active Turn snapshot
 A reusable connection to one Responses API-compatible model endpoint, including the model identity and the credential needed to invoke it. A Model Connection is either Global or Personal and may be assigned only to Agents within that scope.
 _Avoid_: Model policy, provider environment variables, Agent credential
 
+**Model Gateway**:
+The stateless internal data-plane process that receives one Hub-authorized Responses request with its request-scoped endpoint, protocol, and credential, then transparently forwards OpenAI Responses or converts Anthropic Messages back to Responses JSON/SSE. It owns no Model Connections, provider keys, authorization policy, usage ledger, retry, or persistent state.
+_Avoid_: Model Connection manager, business control plane, provider key store, Runtime proxy
+
 **Global Model Connection**:
 A system-wide Model Connection managed by an Administrator and available for assignment to every Agent in Agent Hub.
 _Avoid_: Shared personal model, default model
