@@ -71,11 +71,12 @@ func encodedBody(body string) string {
 
 func openAIEnvelope(endpoint, body string) proxyEnvelope {
 	return proxyEnvelope{
-		RequestID: "req-openai",
-		Protocol:  protocolOpenAIResponses,
-		Endpoint:  endpoint,
-		APIKey:    "provider-secret",
-		Query:     "include=usage%2Edetails&trace=one",
+		RequestID:         "req-openai",
+		Protocol:          protocolOpenAIResponses,
+		RequestParameters: modelRequestParameters{Protocol: protocolOpenAIResponses},
+		Endpoint:          endpoint,
+		APIKey:            "provider-secret",
+		Query:             "include=usage%2Edetails&trace=one",
 		Headers: map[string][]string{
 			"Accept":                       {"text/event-stream"},
 			"Content-Type":                 {"application/json"},
@@ -92,14 +93,40 @@ func openAIEnvelope(endpoint, body string) proxyEnvelope {
 func anthropicEnvelope(endpoint string, stream bool) proxyEnvelope {
 	body := fmt.Sprintf(`{"model":"claude-test","input":[{"role":"user","content":[{"type":"input_text","text":"private prompt"}]}],"max_output_tokens":64,"stream":%t}`, stream)
 	return proxyEnvelope{
-		RequestID: "req-anthropic",
-		Protocol:  protocolAnthropicMessages,
-		Endpoint:  endpoint,
-		APIKey:    "shared-anthropic-secret",
+		RequestID:         "req-anthropic",
+		Protocol:          protocolAnthropicMessages,
+		RequestParameters: modelRequestParameters{Protocol: protocolAnthropicMessages},
+		Endpoint:          endpoint,
+		APIKey:            "shared-anthropic-secret",
 		Headers: map[string][]string{
 			"Accept":       {"application/json"},
 			"Content-Type": {"application/json"},
 			"X-Trace-Id":   {"anthropic-trace"},
+		},
+		BodyBase64: encodedBody(body),
+	}
+}
+
+func chatEnvelope(endpoint, body string) proxyEnvelope {
+	temperature := 0.3
+	topP := 0.8
+	maxCompletionTokens := uint32(321)
+	return proxyEnvelope{
+		RequestID: "req-chat",
+		Protocol:  protocolOpenAIChatCompletions,
+		RequestParameters: modelRequestParameters{
+			Protocol:            protocolOpenAIChatCompletions,
+			Temperature:         &temperature,
+			TopP:                &topP,
+			MaxCompletionTokens: &maxCompletionTokens,
+		},
+		Endpoint: endpoint,
+		APIKey:   "chat-provider-secret",
+		Headers: map[string][]string{
+			"Accept":        {"application/json"},
+			"Content-Type":  {"application/json"},
+			"X-Trace-Id":    {"chat-trace"},
+			"Authorization": {"Bearer runtime-secret"},
 		},
 		BodyBase64: encodedBody(body),
 	}
@@ -666,6 +693,312 @@ func TestAnthropicErrorPreservesStatusDoesNotRetryOrLogSecrets(t *testing.T) {
 	}
 }
 
+func TestOpenAIChatCompletionsConvertsResponsesAndMergesConnectionParameters(t *testing.T) {
+	var received map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/tenant/v1/chat/completions" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer chat-provider-secret" {
+			t.Errorf("Authorization = %q", got)
+		}
+		if got := r.Header.Get("X-Trace-Id"); got != "chat-trace" {
+			t.Errorf("X-Trace-Id = %q", got)
+		}
+		if got := r.Header.Get("Cookie"); got != "" {
+			t.Errorf("Cookie = %q", got)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Errorf("decode chat request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl_1","object":"chat.completion","created":1710000000,"model":"chat-model","choices":[{"index":0,"message":{"role":"assistant","content":"chat answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":6,"total_tokens":10}}`)
+	}))
+	defer upstream.Close()
+	gatewayServer := httptest.NewServer(newTestHandler(t, io.Discard))
+	defer gatewayServer.Close()
+
+	body := `{"model":"chat-model","instructions":"follow the policy","input":[{"role":"user","content":[{"type":"input_text","text":"hello"}]}],"max_output_tokens":99,"stream":false}`
+	envelope := chatEnvelope(upstream.URL+"/tenant", body)
+	req := proxyRequest(t, context.Background(), gatewayServer.URL, envelope, testGatewayToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	responseBody, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d: %s", resp.StatusCode, responseBody)
+	}
+
+	if received["model"] != "chat-model" {
+		t.Fatalf("model = %#v", received["model"])
+	}
+	if received["temperature"] != 0.3 || received["top_p"] != 0.8 || received["max_completion_tokens"] != float64(321) {
+		t.Fatalf("connection parameters were not merged: %#v", received)
+	}
+	messages, _ := received["messages"].([]any)
+	if len(messages) != 2 {
+		t.Fatalf("messages = %#v", messages)
+	}
+	if messages[0].(map[string]any)["role"] != "system" || messages[0].(map[string]any)["content"] != "follow the policy" {
+		t.Fatalf("instructions were not preserved as system message: %#v", messages[0])
+	}
+
+	var converted map[string]any
+	if err := json.Unmarshal(responseBody, &converted); err != nil {
+		t.Fatalf("decode converted response: %v", err)
+	}
+	if converted["object"] != "response" || converted["status"] != "completed" {
+		t.Fatalf("converted response = %s", responseBody)
+	}
+	if _, ok := converted["output"].([]any); !ok {
+		t.Fatalf("converted response has no output: %s", responseBody)
+	}
+	usage, _ := converted["usage"].(map[string]any)
+	if usage["input_tokens"] != float64(4) || usage["output_tokens"] != float64(6) || usage["total_tokens"] != float64(10) {
+		t.Fatalf("converted usage = %#v", usage)
+	}
+}
+
+func TestOpenAIChatCompletionsConvertsStreamingResponses(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode chat stream request: %v", err)
+		}
+		if request["stream"] != true {
+			t.Errorf("stream = %#v", request["stream"])
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, event := range []string{
+			`{"id":"chatcmpl_stream","object":"chat.completion.chunk","created":1710000000,"model":"chat-model","choices":[{"index":0,"delta":{"role":"assistant","content":"hello"},"finish_reason":null}]}`,
+			`{"id":"chatcmpl_stream","object":"chat.completion.chunk","created":1710000000,"model":"chat-model","choices":[{"index":0,"delta":{"content":" stream"},"finish_reason":null}]}`,
+			`{"id":"chatcmpl_stream","object":"chat.completion.chunk","created":1710000000,"model":"chat-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+			`{"id":"chatcmpl_stream","object":"chat.completion.chunk","created":1710000000,"model":"chat-model","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}`,
+		} {
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", event)
+		}
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+	gatewayServer := httptest.NewServer(newTestHandler(t, io.Discard))
+	defer gatewayServer.Close()
+
+	body := `{"model":"chat-model","input":"hello","stream":true}`
+	req := proxyRequest(t, context.Background(), gatewayServer.URL, chatEnvelope(upstream.URL, body), testGatewayToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("stream request: %v", err)
+	}
+	streamBody, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read converted stream: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d: %s", resp.StatusCode, streamBody)
+	}
+	stream := string(streamBody)
+	for _, expected := range []string{
+		`"type":"response.output_text.delta"`,
+		`"delta":"hello"`,
+		`"delta":" stream"`,
+		`"type":"response.completed"`,
+		`"input_tokens":5`,
+		`"output_tokens":3`,
+	} {
+		if !strings.Contains(stream, expected) {
+			t.Errorf("converted stream missing %s: %s", expected, stream)
+		}
+	}
+}
+
+func TestGatewayRejectsNonRepresentableResponsesFeaturesBeforeUpstream(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+	}))
+	defer upstream.Close()
+	gatewayServer := httptest.NewServer(newTestHandler(t, io.Discard))
+	defer gatewayServer.Close()
+
+	for name, body := range map[string]string{
+		"previous response": `{"model":"chat-model","input":"hello","previous_response_id":"resp_1"}`,
+		"non-function tool": `{"model":"chat-model","input":"hello","tools":[{"type":"web_search"}]}`,
+		"unknown field":     `{"model":"chat-model","input":"hello","new_responses_feature":true}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			envelope := chatEnvelope(upstream.URL, body)
+			req := proxyRequest(t, context.Background(), gatewayServer.URL, envelope, testGatewayToken)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("proxy request: %v", err)
+			}
+			payload, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d: %s", resp.StatusCode, payload)
+			}
+			if !strings.Contains(string(payload), `"unsupported_protocol_feature"`) {
+				t.Fatalf("error code missing: %s", payload)
+			}
+		})
+	}
+	t.Run("Anthropic instructions and system history", func(t *testing.T) {
+		envelope := anthropicEnvelope(upstream.URL, false)
+		envelope.BodyBase64 = encodedBody(`{"model":"claude-test","instructions":"policy","input":[{"role":"system","content":"older policy"},{"role":"user","content":"hello"}]}`)
+		req := proxyRequest(t, context.Background(), gatewayServer.URL, envelope, testGatewayToken)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("proxy request: %v", err)
+		}
+		payload, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(payload), `"unsupported_protocol_feature"`) {
+			t.Fatalf("status = %d: %s", resp.StatusCode, payload)
+		}
+	})
+	if calls.Load() != 0 {
+		t.Fatalf("unsupported requests reached upstream %d times", calls.Load())
+	}
+}
+
+func TestGatewayRejectsLossyResponsesHistoryBeforeUpstream(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+	}))
+	defer upstream.Close()
+	gatewayServer := httptest.NewServer(newTestHandler(t, io.Discard))
+	defer gatewayServer.Close()
+
+	protocols := []struct {
+		name     string
+		envelope func(string) proxyEnvelope
+	}{
+		{
+			name: "Chat Completions",
+			envelope: func(body string) proxyEnvelope {
+				return chatEnvelope(upstream.URL, body)
+			},
+		},
+		{
+			name: "Anthropic Messages",
+			envelope: func(body string) proxyEnvelope {
+				envelope := anthropicEnvelope(upstream.URL, false)
+				envelope.BodyBase64 = encodedBody(body)
+				return envelope
+			},
+		},
+	}
+	for name, body := range map[string]string{
+		"message identifier": `{"model":"history-model","input":[{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"answer"}]}]}`,
+		"message status":     `{"model":"history-model","input":[{"type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"answer"}]}]}`,
+		"text annotations":   `{"model":"history-model","input":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer","annotations":[{"type":"url_citation","url":"https://example.test"}]}]}]}`,
+	} {
+		for _, protocol := range protocols {
+			t.Run(protocol.name+"/"+name, func(t *testing.T) {
+				req := proxyRequest(t, context.Background(), gatewayServer.URL, protocol.envelope(body), testGatewayToken)
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Fatalf("proxy request: %v", err)
+				}
+				payload, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(payload), `"unsupported_protocol_feature"`) {
+					t.Fatalf("status = %d: %s", resp.StatusCode, payload)
+				}
+			})
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("lossy history reached upstream %d times", calls.Load())
+	}
+}
+
+func TestGatewayValidatesProtocolSpecificRequestParameters(t *testing.T) {
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+	}))
+	defer upstream.Close()
+	gatewayServer := httptest.NewServer(newTestHandler(t, io.Discard))
+	defer gatewayServer.Close()
+
+	tests := map[string]proxyEnvelope{}
+	missing := chatEnvelope(upstream.URL, `{"model":"chat-model","input":"hello"}`)
+	missing.RequestParameters = modelRequestParameters{}
+	tests["missing protocol"] = missing
+	mismatch := chatEnvelope(upstream.URL, `{"model":"chat-model","input":"hello"}`)
+	mismatch.RequestParameters.Protocol = protocolOpenAIResponses
+	tests["mismatched protocol"] = mismatch
+	anthropicBoth := anthropicEnvelope(upstream.URL, false)
+	temperature := 0.2
+	topP := 0.8
+	anthropicBoth.RequestParameters.Temperature = &temperature
+	anthropicBoth.RequestParameters.TopP = &topP
+	tests["anthropic sampling conflict"] = anthropicBoth
+
+	for name, envelope := range tests {
+		t.Run(name, func(t *testing.T) {
+			req := proxyRequest(t, context.Background(), gatewayServer.URL, envelope, testGatewayToken)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("proxy request: %v", err)
+			}
+			payload, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d: %s", resp.StatusCode, payload)
+			}
+		})
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("invalid parameter requests reached upstream %d times", calls.Load())
+	}
+}
+
+func TestAnthropicRequestParametersOverrideConvertedResponsesParameters(t *testing.T) {
+	var received map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Errorf("decode Anthropic request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"msg_parameters","type":"message","role":"assistant","model":"claude-test","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":1}}`)
+	}))
+	defer upstream.Close()
+	gatewayServer := httptest.NewServer(newTestHandler(t, io.Discard))
+	defer gatewayServer.Close()
+
+	envelope := anthropicEnvelope(upstream.URL, false)
+	temperature := 0.4
+	maxTokens := uint32(777)
+	envelope.RequestParameters.Temperature = &temperature
+	envelope.RequestParameters.MaxTokens = &maxTokens
+	envelope.BodyBase64 = encodedBody(`{"model":"claude-test","input":"hello","top_p":0.7,"max_output_tokens":99}`)
+	req := proxyRequest(t, context.Background(), gatewayServer.URL, envelope, testGatewayToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d: %s", resp.StatusCode, body)
+	}
+	if received["temperature"] != 0.4 || received["max_tokens"] != float64(777) {
+		t.Fatalf("connection parameters missing: %#v", received)
+	}
+	if _, present := received["top_p"]; present {
+		t.Fatalf("overridden top_p reached Anthropic: %#v", received)
+	}
+}
+
 func TestGatewayRejectsInvalidEnvelopesBeforeCallingUpstream(t *testing.T) {
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
@@ -687,12 +1020,22 @@ func TestGatewayRejectsInvalidEnvelopesBeforeCallingUpstream(t *testing.T) {
 	invalidBody := valid
 	invalidBody.BodyBase64 = "%%%"
 	invalidBodyJSON, _ := json.Marshal(invalidBody)
+	var unknownRequestParameters map[string]any
+	if err := json.Unmarshal(validJSON, &unknownRequestParameters); err != nil {
+		t.Fatalf("decode valid envelope: %v", err)
+	}
+	unknownRequestParameters["request_parameters"] = map[string]any{
+		"protocol":    protocolOpenAIResponses,
+		"temperature": 0.4,
+	}
+	unknownRequestParametersJSON, _ := json.Marshal(unknownRequestParameters)
 	tests := []struct {
 		name string
 		body []byte
 	}{
 		{name: "malformed JSON", body: []byte(`{"request_id":`)},
 		{name: "unknown field", body: append(validJSON[:len(validJSON)-1], []byte(`,"unexpected":true}`)...)},
+		{name: "unknown protocol parameter", body: unknownRequestParametersJSON},
 		{name: "unknown protocol", body: unknownProtocolJSON},
 		{name: "unsupported endpoint", body: invalidEndpointJSON},
 		{name: "invalid body encoding", body: invalidBodyJSON},

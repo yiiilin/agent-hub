@@ -1,5 +1,20 @@
+use serde_json::{json, Value};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
+
+#[derive(sqlx::FromRow)]
+struct ModelConnectionParameterDefaults {
+    reasoning_effort: String,
+    reasoning_summary: String,
+    verbosity: String,
+    context_window_tokens: Option<i64>,
+    auto_compact_token_limit: Option<i64>,
+    reasoning_summary_support: String,
+    service_tier: Option<String>,
+    request_max_retries: Option<i32>,
+    stream_max_retries: Option<i32>,
+    stream_idle_timeout_ms: Option<i64>,
+}
 
 async fn insert_user(pool: &PgPool, role: &str) -> Uuid {
     let id = Uuid::new_v4();
@@ -90,10 +105,66 @@ async fn model_schema_enforces_scope_defaults_and_reasoning(pool: PgPool) {
             .await
             .unwrap();
     assert_eq!(default_protocol, "openai_responses");
+    let default_request_parameters: Value =
+        sqlx::query_scalar("SELECT request_parameters FROM model_connections WHERE id = $1")
+            .bind(global_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        default_request_parameters,
+        json!({ "protocol": "openai_responses" })
+    );
 
     sqlx::query(
         "UPDATE model_connections
-         SET upstream_protocol = 'anthropic_messages'
+         SET upstream_protocol = 'anthropic_messages',
+             request_parameters = '{
+                 \"protocol\": \"anthropic_messages\",
+                 \"temperature\": 0.4,
+                 \"max_tokens\": 8192
+             }'::jsonb
+         WHERE id = $1",
+    )
+    .bind(personal_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mismatched_request_parameters = sqlx::query(
+        "UPDATE model_connections
+         SET request_parameters = '{\"protocol\":\"openai_responses\"}'::jsonb
+         WHERE id = $1",
+    )
+    .bind(personal_id)
+    .execute(&pool)
+    .await;
+    assert!(mismatched_request_parameters.is_err());
+
+    let mutually_exclusive_anthropic_sampling = sqlx::query(
+        "UPDATE model_connections
+         SET request_parameters = '{
+             \"protocol\": \"anthropic_messages\",
+             \"temperature\": 0.4,
+             \"top_p\": 0.9,
+             \"max_tokens\": 8192
+         }'::jsonb
+         WHERE id = $1",
+    )
+    .bind(personal_id)
+    .execute(&pool)
+    .await;
+    assert!(mutually_exclusive_anthropic_sampling.is_err());
+
+    sqlx::query(
+        "UPDATE model_connections
+         SET upstream_protocol = 'openai_chat_completions',
+             request_parameters = '{
+                 \"protocol\": \"openai_chat_completions\",
+                 \"temperature\": 0.7,
+                 \"top_p\": 0.8,
+                 \"max_completion_tokens\": 4096
+             }'::jsonb
          WHERE id = $1",
     )
     .bind(personal_id)
@@ -190,6 +261,67 @@ async fn model_schema_enforces_scope_defaults_and_reasoning(pool: PgPool) {
     .execute(&pool)
     .await
     .unwrap();
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn model_connection_parameter_schema_defaults_and_constraints(pool: PgPool) {
+    let owner_id = insert_user(&pool, "member").await;
+    let connection_id = insert_connection(&pool, "personal", Some(owner_id)).await;
+
+    let defaults: ModelConnectionParameterDefaults = sqlx::query_as(
+        "SELECT reasoning_effort, reasoning_summary, verbosity,
+                context_window_tokens, auto_compact_token_limit,
+                reasoning_summary_support, service_tier,
+                request_max_retries, stream_max_retries,
+                stream_idle_timeout_ms
+         FROM model_connections WHERE id = $1",
+    )
+    .bind(connection_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(defaults.reasoning_effort, "default");
+    assert_eq!(defaults.reasoning_summary, "default");
+    assert_eq!(defaults.verbosity, "default");
+    assert_eq!(defaults.context_window_tokens, None);
+    assert_eq!(defaults.auto_compact_token_limit, None);
+    assert_eq!(defaults.reasoning_summary_support, "auto");
+    assert_eq!(defaults.service_tier, None);
+    assert_eq!(defaults.request_max_retries, None);
+    assert_eq!(defaults.stream_max_retries, None);
+    assert_eq!(defaults.stream_idle_timeout_ms, None);
+
+    sqlx::query(
+        "UPDATE model_connections
+         SET reasoning_effort = 'high', reasoning_summary = 'detailed',
+             verbosity = 'low', context_window_tokens = 200000,
+             auto_compact_token_limit = 160000,
+             reasoning_summary_support = 'supported', service_tier = 'priority',
+             request_max_retries = 7, stream_max_retries = 9,
+             stream_idle_timeout_ms = 420000
+         WHERE id = $1",
+    )
+    .bind(connection_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let excessive_retries =
+        sqlx::query("UPDATE model_connections SET request_max_retries = 101 WHERE id = $1")
+            .bind(connection_id)
+            .execute(&pool)
+            .await;
+    assert!(excessive_retries.is_err());
+
+    let compact_beyond_context = sqlx::query(
+        "UPDATE model_connections
+         SET context_window_tokens = 100000, auto_compact_token_limit = 100001
+         WHERE id = $1",
+    )
+    .bind(connection_id)
+    .execute(&pool)
+    .await;
+    assert!(compact_beyond_context.is_err());
 }
 
 #[sqlx::test(migrations = "./migrations")]

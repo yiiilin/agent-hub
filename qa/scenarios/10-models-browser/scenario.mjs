@@ -7,6 +7,55 @@ const LEDGER_PATHS = [
   '/api/model-usage',
   '/api/model-call-errors'
 ];
+const AUTOMATIC_MODEL_PARAMETERS = {
+  reasoning_effort: 'default',
+  reasoning_summary: 'default',
+  verbosity: 'default',
+  context_window_tokens: null,
+  auto_compact_token_limit: null,
+  reasoning_summary_support: 'auto',
+  service_tier: null,
+  request_max_retries: null,
+  stream_max_retries: null,
+  stream_idle_timeout_ms: null
+};
+const DETAILED_MODEL_PARAMETERS = {
+  reasoning_effort: 'medium',
+  reasoning_summary: 'concise',
+  verbosity: 'high',
+  context_window_tokens: 128_000,
+  auto_compact_token_limit: 96_000,
+  reasoning_summary_support: 'supported',
+  service_tier: 'flex',
+  request_max_retries: 3,
+  stream_max_retries: 5,
+  stream_idle_timeout_ms: 300_000
+};
+const RESPONSES_REQUEST_PARAMETERS = { protocol: 'openai_responses' };
+const AUTOMATIC_CHAT_REQUEST_PARAMETERS = {
+  protocol: 'openai_chat_completions',
+  temperature: null,
+  top_p: null,
+  max_completion_tokens: null
+};
+const CHAT_REQUEST_PARAMETERS = {
+  protocol: 'openai_chat_completions',
+  temperature: 0.3,
+  top_p: 0.8,
+  max_completion_tokens: 321
+};
+const AUTOMATIC_ANTHROPIC_REQUEST_PARAMETERS = {
+  protocol: 'anthropic_messages',
+  temperature: null,
+  top_p: null,
+  max_tokens: null
+};
+const ANTHROPIC_REQUEST_PARAMETERS = {
+  protocol: 'anthropic_messages',
+  temperature: 0.4,
+  top_p: null,
+  max_tokens: 8_192
+};
 
 function uniqueSlug(context, prefix) {
   return context.unique(prefix)
@@ -42,6 +91,83 @@ async function closeRedactedConnectionDialog(dialog) {
   await dialog.getByRole('button', { name: 'Cancel' }).click().catch(() => undefined);
 }
 
+function parameterInputValue(value) {
+  return value === null ? '' : String(value);
+}
+
+function automaticRequestParameters(protocol) {
+  if (protocol === 'openai_chat_completions') return AUTOMATIC_CHAT_REQUEST_PARAMETERS;
+  if (protocol === 'anthropic_messages') return AUTOMATIC_ANTHROPIC_REQUEST_PARAMETERS;
+  return RESPONSES_REQUEST_PARAMETERS;
+}
+
+async function assertConnectionParameterValues(dialog, parameters) {
+  assert.equal(await dialog.getByLabel('Reasoning effort').inputValue(), parameters.reasoning_effort);
+  assert.equal(
+    await dialog.getByLabel('Reasoning summary', { exact: true }).inputValue(),
+    parameters.reasoning_summary
+  );
+  assert.equal(await dialog.getByLabel('Verbosity').inputValue(), parameters.verbosity);
+  assert.equal(
+    await dialog.getByLabel('Reasoning summary support', { exact: true }).inputValue(),
+    parameters.reasoning_summary_support
+  );
+  assert.equal(await dialog.getByLabel('Service tier').inputValue(), parameterInputValue(parameters.service_tier));
+  assert.equal(await dialog.getByLabel('Context window tokens').inputValue(), parameterInputValue(parameters.context_window_tokens));
+  assert.equal(await dialog.getByLabel('Auto-compact token limit').inputValue(), parameterInputValue(parameters.auto_compact_token_limit));
+  assert.equal(await dialog.getByLabel('Request max retries').inputValue(), parameterInputValue(parameters.request_max_retries));
+  assert.equal(await dialog.getByLabel('Stream max retries').inputValue(), parameterInputValue(parameters.stream_max_retries));
+  assert.equal(await dialog.getByLabel('Stream idle timeout (ms)').inputValue(), parameterInputValue(parameters.stream_idle_timeout_ms));
+}
+
+async function fillConnectionParameterValues(dialog, parameters) {
+  await dialog.getByLabel('Reasoning effort').selectOption(parameters.reasoning_effort);
+  await dialog.getByLabel('Reasoning summary', { exact: true }).selectOption(parameters.reasoning_summary);
+  await dialog.getByLabel('Verbosity').selectOption(parameters.verbosity);
+  await dialog.getByLabel('Reasoning summary support', { exact: true }).selectOption(parameters.reasoning_summary_support);
+  await dialog.getByLabel('Service tier').fill(parameterInputValue(parameters.service_tier));
+  await dialog.getByLabel('Context window tokens').fill(parameterInputValue(parameters.context_window_tokens));
+  await dialog.getByLabel('Auto-compact token limit').fill(parameterInputValue(parameters.auto_compact_token_limit));
+  await dialog.getByLabel('Request max retries').fill(parameterInputValue(parameters.request_max_retries));
+  await dialog.getByLabel('Stream max retries').fill(parameterInputValue(parameters.stream_max_retries));
+  await dialog.getByLabel('Stream idle timeout (ms)').fill(parameterInputValue(parameters.stream_idle_timeout_ms));
+}
+
+async function assertRequestParameterValues(dialog, parameters) {
+  assert.equal(await dialog.getByLabel('Upstream protocol').inputValue(), parameters.protocol);
+  if (parameters.protocol === 'openai_responses') {
+    assert.equal(await dialog.getByLabel('temperature').count(), 0);
+    assert.equal(await dialog.getByLabel('top_p').count(), 0);
+    assert.equal(await dialog.getByLabel('max_completion_tokens').count(), 0);
+    assert.equal(await dialog.getByLabel('max_tokens').count(), 0);
+    return;
+  }
+  assert.equal(await dialog.getByLabel('temperature').inputValue(), parameterInputValue(parameters.temperature));
+  assert.equal(await dialog.getByLabel('top_p').inputValue(), parameterInputValue(parameters.top_p));
+  if (parameters.protocol === 'openai_chat_completions') {
+    assert.equal(
+      await dialog.getByLabel('max_completion_tokens').inputValue(),
+      parameterInputValue(parameters.max_completion_tokens)
+    );
+    assert.equal(await dialog.getByLabel('max_tokens').count(), 0);
+    return;
+  }
+  assert.equal(await dialog.getByLabel('max_tokens').inputValue(), parameterInputValue(parameters.max_tokens));
+  assert.equal(await dialog.getByLabel('max_completion_tokens').count(), 0);
+}
+
+async function fillRequestParameterValues(dialog, parameters) {
+  await assertRequestParameterValues(dialog, automaticRequestParameters(parameters.protocol));
+  if (parameters.protocol === 'openai_responses') return;
+  await dialog.getByLabel('temperature').fill(parameterInputValue(parameters.temperature));
+  await dialog.getByLabel('top_p').fill(parameterInputValue(parameters.top_p));
+  if (parameters.protocol === 'openai_chat_completions') {
+    await dialog.getByLabel('max_completion_tokens').fill(parameterInputValue(parameters.max_completion_tokens));
+    return;
+  }
+  await dialog.getByLabel('max_tokens').fill(parameterInputValue(parameters.max_tokens));
+}
+
 async function createConnection(page, browserContext, scope, fields, apiKey) {
   await page.getByRole('button', {
     name: scope === 'personal' ? 'Create personal model' : 'Create global model'
@@ -50,8 +176,17 @@ async function createConnection(page, browserContext, scope, fields, apiKey) {
   await dialog.getByLabel('Connection name').fill(fields.name);
   await dialog.getByLabel('Base URL').fill(fields.baseUrl);
   await dialog.getByLabel('Model ID').fill(fields.modelId);
+  await assertConnectionParameterValues(dialog, AUTOMATIC_MODEL_PARAMETERS);
+  await assertRequestParameterValues(dialog, RESPONSES_REQUEST_PARAMETERS);
   if (fields.protocol) {
     await dialog.getByLabel('Upstream protocol').selectOption(fields.protocol);
+    await assertRequestParameterValues(dialog, automaticRequestParameters(fields.protocol));
+  }
+  if (fields.parameters) {
+    await fillConnectionParameterValues(dialog, fields.parameters);
+  }
+  if (fields.requestParameters) {
+    await fillRequestParameterValues(dialog, fields.requestParameters);
   }
 
   let connection;
@@ -71,17 +206,31 @@ async function createConnection(page, browserContext, scope, fields, apiKey) {
   }
   assert.equal(Object.hasOwn(connection, 'api_key'), false, 'Create response must keep API keys write-only');
   assert.equal(JSON.stringify(connection).includes(apiKey), false, 'Create response must not expose the API key');
+  assert.deepEqual(connection.parameters, fields.parameters ?? AUTOMATIC_MODEL_PARAMETERS);
+  assert.deepEqual(
+    connection.request_parameters,
+    fields.requestParameters ?? automaticRequestParameters(fields.protocol ?? 'openai_responses')
+  );
   return connection;
 }
 
-async function editConnection(page, connection, { name, modelId, protocol }) {
+async function editConnection(page, connection, { name, modelId, protocol, parameters, requestParameters }) {
   await page.getByRole('button', { name: `Edit ${connection.name}` }).click();
   const dialog = page.getByRole('dialog', { name: 'Edit model connection' });
   assert.equal(await dialog.getByLabel('API key').inputValue(), '', 'Edit must not load the stored API key');
+  await assertConnectionParameterValues(dialog, connection.parameters);
+  await assertRequestParameterValues(dialog, connection.request_parameters);
   await dialog.getByLabel('Connection name').fill(name);
   await dialog.getByLabel('Model ID').fill(modelId);
   if (protocol) {
     await dialog.getByLabel('Upstream protocol').selectOption(protocol);
+    await assertRequestParameterValues(dialog, automaticRequestParameters(protocol));
+  }
+  if (parameters) {
+    await fillConnectionParameterValues(dialog, parameters);
+  }
+  if (requestParameters) {
+    await fillRequestParameterValues(dialog, requestParameters);
   }
   const responsePromise = page.waitForResponse((response) => (
     response.request().method() === 'PATCH'
@@ -90,6 +239,13 @@ async function editConnection(page, connection, { name, modelId, protocol }) {
   await dialog.getByRole('button', { name: 'Save changes' }).click();
   const updated = await responseJson(await responsePromise, 'Model Connection update');
   assert.equal(Object.hasOwn(updated, 'api_key'), false, 'Update response must keep API keys write-only');
+  assert.deepEqual(updated.parameters, parameters ?? connection.parameters);
+  assert.deepEqual(
+    updated.request_parameters,
+    requestParameters ?? (protocol && protocol !== connection.upstream_protocol
+      ? automaticRequestParameters(protocol)
+      : connection.request_parameters)
+  );
   return updated;
 }
 
@@ -239,12 +395,21 @@ export default async function modelsBrowserScenario(scenarioContext) {
       let personal = await createConnection(page, context, 'personal', {
         name: personalName,
         baseUrl: seedGlobal.base_url,
-        modelId: seedGlobal.model_id
+        modelId: seedGlobal.model_id,
+        parameters: DETAILED_MODEL_PARAMETERS
       }, providerKey);
       const updatedPersonalName = `${personalName} Updated`;
+      const updatedPersonalParameters = {
+        ...DETAILED_MODEL_PARAMETERS,
+        reasoning_summary: 'none',
+        auto_compact_token_limit: null,
+        service_tier: 'priority',
+        request_max_retries: 0
+      };
       personal = await editConnection(page, personal, {
         name: updatedPersonalName,
-        modelId: seedGlobal.model_id
+        modelId: seedGlobal.model_id,
+        parameters: updatedPersonalParameters
       });
       await testConnection(page, personal, true);
       for (let index = 0; index < 20; index += 1) {
@@ -277,6 +442,7 @@ export default async function modelsBrowserScenario(scenarioContext) {
       personal = await setConnectionStatus(page, personal, 'enabled');
       await tabs.getByRole('tab', { name: 'Available Models' }).click();
       await availableTable.getByText(updatedPersonalName, { exact: true }).waitFor();
+      assert.ok((await availableTable.innerText()).includes('openai_responses'));
       await assertNoHorizontalOverflow(page, 'member desktop Available Models');
 
       const memberAgentName = scenarioContext.unique('QA Member Model Agent');
@@ -385,17 +551,23 @@ export default async function modelsBrowserScenario(scenarioContext) {
       let globalConnection = await createConnection(page, context, 'global', {
         name: globalName,
         baseUrl: seedGlobal.base_url,
-        modelId: seedGlobal.model_id
-      }, providerKey);
-      globalConnection = await editConnection(page, globalConnection, {
-        name: globalName,
         modelId: seedGlobal.model_id,
-        protocol: 'anthropic_messages'
-      });
+        protocol: 'openai_chat_completions',
+        parameters: DETAILED_MODEL_PARAMETERS,
+        requestParameters: CHAT_REQUEST_PARAMETERS
+      }, providerKey);
       createdGlobalId = globalConnection.id;
       const globalTable = page.getByRole('table', { name: 'Global model connection list' });
       const globalRow = globalTable.getByRole('row').filter({ hasText: globalName });
-      assert.ok((await globalRow.innerText()).includes('Anthropic Messages'));
+      assert.ok((await globalRow.innerText()).includes('openai_chat_completions'));
+      await testConnection(page, globalConnection, true);
+      globalConnection = await editConnection(page, globalConnection, {
+        name: globalName,
+        modelId: seedGlobal.model_id,
+        protocol: 'anthropic_messages',
+        requestParameters: ANTHROPIC_REQUEST_PARAMETERS
+      });
+      assert.ok((await globalRow.innerText()).includes('anthropic_messages'));
       await testConnection(page, globalConnection, true);
       await changeSystemDefault(page, globalConnection, true);
 
@@ -435,7 +607,17 @@ export default async function modelsBrowserScenario(scenarioContext) {
       await assertNoHorizontalOverflow(page, 'admin desktop Global Models');
       await page.setViewportSize({ width: 390, height: 844 });
       await assertNoHorizontalOverflow(page, 'admin 390px Global Models');
-      assert.ok((await globalRow.innerText()).includes('Anthropic Messages'));
+      assert.ok((await globalRow.innerText()).includes('anthropic_messages'));
+      await page.getByRole('button', { name: `Edit ${globalName}` }).click();
+      dialog = page.getByRole('dialog', { name: 'Edit model connection' });
+      await assertConnectionParameterValues(dialog, globalConnection.parameters);
+      await assertRequestParameterValues(dialog, globalConnection.request_parameters);
+      assert.equal(await dialog.getByRole('group', { name: 'Model request parameters' }).isVisible(), true);
+      assert.equal(await dialog.getByRole('group', { name: 'Generation and reasoning' }).isVisible(), true);
+      assert.equal(await dialog.getByRole('group', { name: 'Context' }).isVisible(), true);
+      assert.equal(await dialog.getByRole('group', { name: 'Connection reliability' }).isVisible(), true);
+      await assertNoHorizontalOverflow(page, 'admin 390px detailed Model Connection dialog');
+      await dialog.getByRole('button', { name: 'Cancel' }).click();
 
       await page.getByRole('button', { name: `Delete ${globalName}`, exact: true }).click();
       dialog = page.getByRole('dialog', { name: 'Delete model connection' });

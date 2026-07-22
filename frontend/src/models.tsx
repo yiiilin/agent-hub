@@ -30,10 +30,16 @@ import {
   type CreateModelConnectionRequest,
   type ModelCallErrorPage,
   type ModelConnection,
+  type ModelConnectionParameters,
+  type ModelConnectionRequestParameters,
   type ModelLedgerQuery,
+  type ModelReasoningSummary,
+  type ModelReasoningSummarySupport,
   type ModelTokenUsagePage,
   type ModelUpstreamProtocol,
   type ModelUsageSummary,
+  type ModelVerbosity,
+  type ReasoningEffort,
   type UpdateModelConnectionRequest,
   type User
 } from './api/client';
@@ -83,6 +89,28 @@ type ModelTranslationKey =
   | 'modelApiKey'
   | 'modelApiKeyCreateHelp'
   | 'modelApiKeyEditHelp'
+  | 'modelParameterGenerationGroup'
+  | 'modelParameterContextGroup'
+  | 'modelParameterReliabilityGroup'
+  | 'codexParametersGroup'
+  | 'modelRequestParametersGroup'
+  | 'modelRequestParametersResponses'
+  | 'modelRequestParameterSamplingExclusive'
+  | 'reasoningSummary'
+  | 'verbosity'
+  | 'reasoningSummarySupport'
+  | 'serviceTier'
+  | 'contextWindowTokens'
+  | 'autoCompactTokenLimit'
+  | 'requestMaxRetries'
+  | 'streamMaxRetries'
+  | 'streamIdleTimeoutMs'
+  | 'modelParameterAutomatic'
+  | 'reasoningSummaryAuto'
+  | 'reasoningSummaryConcise'
+  | 'reasoningSummaryDetailed'
+  | 'reasoningSummarySupported'
+  | 'reasoningSummaryUnsupported'
   | 'modelSaveFailed'
   | 'editModelConnectionAria'
   | 'testModelConnectionAria'
@@ -183,6 +211,95 @@ function modelRange(range: UsageRange, now = new Date()): Pick<ModelLedgerQuery,
   return { from_ms: start.getTime(), to_ms: now.getTime() };
 }
 
+const automaticModelParameters: ModelConnectionParameters = {
+  reasoning_effort: 'default',
+  reasoning_summary: 'default',
+  verbosity: 'default',
+  context_window_tokens: null,
+  auto_compact_token_limit: null,
+  reasoning_summary_support: 'auto',
+  service_tier: null,
+  request_max_retries: null,
+  stream_max_retries: null,
+  stream_idle_timeout_ms: null
+};
+
+const reasoningEffortOptions: Array<{ value: ReasoningEffort; label: TranslationKey }> = [
+  { value: 'default', label: 'reasoningDefault' },
+  { value: 'none', label: 'reasoningNone' },
+  { value: 'minimal', label: 'reasoningMinimal' },
+  { value: 'low', label: 'reasoningLow' },
+  { value: 'medium', label: 'reasoningMedium' },
+  { value: 'high', label: 'reasoningHigh' },
+  { value: 'xhigh', label: 'reasoningXhigh' },
+  { value: 'max', label: 'reasoningMax' },
+  { value: 'ultra', label: 'reasoningUltra' }
+];
+
+const reasoningSummaryOptions: Array<{ value: ModelReasoningSummary; label: TranslationKey }> = [
+  { value: 'default', label: 'reasoningDefault' },
+  { value: 'auto', label: 'reasoningSummaryAuto' },
+  { value: 'concise', label: 'reasoningSummaryConcise' },
+  { value: 'detailed', label: 'reasoningSummaryDetailed' },
+  { value: 'none', label: 'reasoningNone' }
+];
+
+const verbosityOptions: Array<{ value: ModelVerbosity; label: TranslationKey }> = [
+  { value: 'default', label: 'reasoningDefault' },
+  { value: 'low', label: 'reasoningLow' },
+  { value: 'medium', label: 'reasoningMedium' },
+  { value: 'high', label: 'reasoningHigh' }
+];
+
+const reasoningSummarySupportOptions: Array<{ value: ModelReasoningSummarySupport; label: TranslationKey }> = [
+  { value: 'auto', label: 'modelParameterAutomatic' },
+  { value: 'supported', label: 'reasoningSummarySupported' },
+  { value: 'unsupported', label: 'reasoningSummaryUnsupported' }
+];
+
+function numericDraft(value: number | null | undefined) {
+  return value === null || value === undefined ? '' : String(value);
+}
+
+function optionalInteger(value: string) {
+  return value.trim() ? Number(value) : null;
+}
+
+function optionalNumber(value: string) {
+  return value.trim() ? Number(value) : null;
+}
+
+function requestParametersForProtocol(protocol: ModelUpstreamProtocol): ModelConnectionRequestParameters {
+  if (protocol === 'openai_chat_completions') {
+    return { protocol, temperature: null, top_p: null, max_completion_tokens: null };
+  }
+  if (protocol === 'anthropic_messages') {
+    return { protocol, temperature: null, top_p: null, max_tokens: null };
+  }
+  return { protocol: 'openai_responses' };
+}
+
+function compatibleRequestParameters(
+  parameters: ModelConnectionRequestParameters | undefined,
+  protocol: ModelUpstreamProtocol
+) {
+  return parameters?.protocol === protocol ? parameters : requestParametersForProtocol(protocol);
+}
+
+function requestNumberDraft(parameters: ModelConnectionRequestParameters, key: 'temperature' | 'top_p') {
+  return 'temperature' in parameters && key in parameters ? numericDraft(parameters[key]) : '';
+}
+
+function requestTokenDraft(parameters: ModelConnectionRequestParameters, protocol: ModelUpstreamProtocol) {
+  if (protocol === 'openai_chat_completions' && parameters.protocol === protocol) {
+    return numericDraft(parameters.max_completion_tokens);
+  }
+  if (protocol === 'anthropic_messages' && parameters.protocol === protocol) {
+    return numericDraft(parameters.max_tokens);
+  }
+  return '';
+}
+
 function ConnectionFormDialog({
   state,
   onClose,
@@ -198,10 +315,34 @@ function ConnectionFormDialog({
   const [baseUrl, setBaseUrl] = useState(connection?.base_url ?? '');
   const [modelId, setModelId] = useState(connection?.model_id ?? '');
   const [upstreamProtocol, setUpstreamProtocol] = useState<ModelUpstreamProtocol>(connection?.upstream_protocol ?? 'openai_responses');
+  const initialParameters = connection?.parameters ?? automaticModelParameters;
+  const initialRequestParameters = compatibleRequestParameters(connection?.request_parameters, upstreamProtocol);
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>(initialParameters.reasoning_effort);
+  const [reasoningSummary, setReasoningSummary] = useState<ModelReasoningSummary>(initialParameters.reasoning_summary);
+  const [verbosity, setVerbosity] = useState<ModelVerbosity>(initialParameters.verbosity);
+  const [reasoningSummarySupport, setReasoningSummarySupport] = useState<ModelReasoningSummarySupport>(initialParameters.reasoning_summary_support);
+  const [serviceTier, setServiceTier] = useState(initialParameters.service_tier ?? '');
+  const [contextWindowTokens, setContextWindowTokens] = useState(numericDraft(initialParameters.context_window_tokens));
+  const [autoCompactTokenLimit, setAutoCompactTokenLimit] = useState(numericDraft(initialParameters.auto_compact_token_limit));
+  const [requestMaxRetries, setRequestMaxRetries] = useState(numericDraft(initialParameters.request_max_retries));
+  const [streamMaxRetries, setStreamMaxRetries] = useState(numericDraft(initialParameters.stream_max_retries));
+  const [streamIdleTimeoutMs, setStreamIdleTimeoutMs] = useState(numericDraft(initialParameters.stream_idle_timeout_ms));
+  const [temperature, setTemperature] = useState(requestNumberDraft(initialRequestParameters, 'temperature'));
+  const [topP, setTopP] = useState(requestNumberDraft(initialRequestParameters, 'top_p'));
+  const [requestTokenLimit, setRequestTokenLimit] = useState(requestTokenDraft(initialRequestParameters, upstreamProtocol));
   const [apiKey, setApiKey] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(false);
-  const valid = Boolean(name.trim() && baseUrl.trim() && modelId.trim() && (connection || apiKey.trim()));
+  const samplingConflict = upstreamProtocol === 'anthropic_messages' && temperature.trim() !== '' && topP.trim() !== '';
+  const valid = Boolean(name.trim() && baseUrl.trim() && modelId.trim() && (connection || apiKey.trim()) && !samplingConflict);
+
+  function changeProtocol(next: ModelUpstreamProtocol) {
+    if (next === upstreamProtocol) return;
+    setUpstreamProtocol(next);
+    setTemperature('');
+    setTopP('');
+    setRequestTokenLimit('');
+  }
 
   async function save(event: FormEvent) {
     event.preventDefault();
@@ -209,12 +350,41 @@ function ConnectionFormDialog({
     setBusy(true);
     setError(false);
     try {
+      const parameters: ModelConnectionParameters = {
+        reasoning_effort: reasoningEffort,
+        reasoning_summary: reasoningSummary,
+        verbosity,
+        context_window_tokens: optionalInteger(contextWindowTokens),
+        auto_compact_token_limit: optionalInteger(autoCompactTokenLimit),
+        reasoning_summary_support: reasoningSummarySupport,
+        service_tier: serviceTier.trim() || null,
+        request_max_retries: optionalInteger(requestMaxRetries),
+        stream_max_retries: optionalInteger(streamMaxRetries),
+        stream_idle_timeout_ms: optionalInteger(streamIdleTimeoutMs)
+      };
+      const requestParameters = upstreamProtocol === 'openai_chat_completions'
+        ? {
+            protocol: upstreamProtocol,
+            temperature: optionalNumber(temperature),
+            top_p: optionalNumber(topP),
+            max_completion_tokens: optionalInteger(requestTokenLimit)
+          }
+        : upstreamProtocol === 'anthropic_messages'
+          ? {
+              protocol: upstreamProtocol,
+              temperature: optionalNumber(temperature),
+              top_p: optionalNumber(topP),
+              max_tokens: optionalInteger(requestTokenLimit)
+            }
+          : { protocol: 'openai_responses' as const };
       if (state.kind === 'edit') {
         const request: UpdateModelConnectionRequest = {
           name: name.trim(),
           base_url: baseUrl.trim(),
           model_id: modelId.trim(),
           upstream_protocol: upstreamProtocol,
+          parameters,
+          request_parameters: requestParameters,
           ...(apiKey.trim() ? { api_key: apiKey } : {})
         };
         onSaved(await api.updateModelConnection(state.connection.id, request));
@@ -225,6 +395,8 @@ function ConnectionFormDialog({
           base_url: baseUrl.trim(),
           model_id: modelId.trim(),
           upstream_protocol: upstreamProtocol,
+          parameters,
+          request_parameters: requestParameters,
           api_key: apiKey
         };
         onSaved(await api.createModelConnection(request));
@@ -248,11 +420,48 @@ function ConnectionFormDialog({
     </>}
   >
     <form id="model-connection-form" className="model-connection-form" onSubmit={save}>
-      <label>{mt('modelConnectionName')}<input autoComplete="off" required value={name} onChange={(event) => setName(event.target.value)} /></label>
-      <label>{mt('modelBaseUrl')}<input type="url" inputMode="url" autoComplete="url" required value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} /></label>
-      <label>{mt('modelId')}<input autoComplete="off" required value={modelId} onChange={(event) => setModelId(event.target.value)} /></label>
-      <label>{mt('modelUpstreamProtocol')}<select required value={upstreamProtocol} onChange={(event) => setUpstreamProtocol(event.target.value as ModelUpstreamProtocol)}><option value="openai_responses">{mt('protocolOpenaiResponses')}</option><option value="anthropic_messages">{mt('protocolAnthropicMessages')}</option></select></label>
-      <label>{mt('modelApiKey')}<input type="password" autoComplete="new-password" required={!connection} value={apiKey} onChange={(event) => setApiKey(event.target.value)} /><small>{connection ? mt('modelApiKeyEditHelp') : mt('modelApiKeyCreateHelp')}</small></label>
+      <div className="model-connection-fields">
+        <label>{mt('modelConnectionName')}<input autoComplete="off" required value={name} onChange={(event) => setName(event.target.value)} /></label>
+        <label>{mt('modelId')}<input autoComplete="off" required value={modelId} onChange={(event) => setModelId(event.target.value)} /></label>
+        <label className="model-wide-field">{mt('modelBaseUrl')}<input type="url" inputMode="url" autoComplete="url" required value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} /></label>
+        <label className="model-wide-field">{mt('modelUpstreamProtocol')}<select required value={upstreamProtocol} onChange={(event) => changeProtocol(event.target.value as ModelUpstreamProtocol)}><option value="openai_responses">openai_responses</option><option value="openai_chat_completions">openai_chat_completions</option><option value="anthropic_messages">anthropic_messages</option></select></label>
+        <label className="model-wide-field">{mt('modelApiKey')}<input type="password" autoComplete="new-password" required={!connection} value={apiKey} onChange={(event) => setApiKey(event.target.value)} /><small>{connection ? mt('modelApiKeyEditHelp') : mt('modelApiKeyCreateHelp')}</small></label>
+      </div>
+      {upstreamProtocol !== 'openai_responses' && <fieldset className="model-parameter-group model-request-parameter-group">
+        <legend>{mt('modelRequestParametersGroup')}</legend>
+        <div className="model-parameter-fields">
+          <label><code>temperature</code><input aria-label="temperature" type="number" inputMode="decimal" min={0} max={upstreamProtocol === 'anthropic_messages' ? 1 : 2} step="any" value={temperature} onChange={(event) => { setTemperature(event.target.value); if (upstreamProtocol === 'anthropic_messages' && event.target.value.trim()) setTopP(''); }} /></label>
+          <label><code>top_p</code><input aria-label="top_p" type="number" inputMode="decimal" min={0} max={1} step="any" value={topP} onChange={(event) => { setTopP(event.target.value); if (upstreamProtocol === 'anthropic_messages' && event.target.value.trim()) setTemperature(''); }} /></label>
+          <label><code>{upstreamProtocol === 'openai_chat_completions' ? 'max_completion_tokens' : 'max_tokens'}</code><input aria-label={upstreamProtocol === 'openai_chat_completions' ? 'max_completion_tokens' : 'max_tokens'} type="number" inputMode="numeric" min={1} max={4294967295} step={1} value={requestTokenLimit} onChange={(event) => setRequestTokenLimit(event.target.value)} /></label>
+        </div>
+        {upstreamProtocol === 'anthropic_messages' && <small>{mt('modelRequestParameterSamplingExclusive')}</small>}
+      </fieldset>}
+      <h3 className="model-parameter-section-heading">{mt('codexParametersGroup')}</h3>
+      <fieldset className="model-parameter-group">
+        <legend>{mt('modelParameterGenerationGroup')}</legend>
+        <div className="model-parameter-fields">
+          <label>{t('reasoningEffort')}<select aria-label={t('reasoningEffort')} value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}>{reasoningEffortOptions.map((option) => <option key={option.value} value={option.value}>{option.value}</option>)}</select></label>
+          <label>{mt('reasoningSummary')}<select aria-label={mt('reasoningSummary')} value={reasoningSummary} onChange={(event) => setReasoningSummary(event.target.value as ModelReasoningSummary)}>{reasoningSummaryOptions.map((option) => <option key={option.value} value={option.value}>{option.value}</option>)}</select></label>
+          <label>{mt('verbosity')}<select aria-label={mt('verbosity')} value={verbosity} onChange={(event) => setVerbosity(event.target.value as ModelVerbosity)}>{verbosityOptions.map((option) => <option key={option.value} value={option.value}>{option.value}</option>)}</select></label>
+          <label>{mt('reasoningSummarySupport')}<select aria-label={mt('reasoningSummarySupport')} value={reasoningSummarySupport} onChange={(event) => setReasoningSummarySupport(event.target.value as ModelReasoningSummarySupport)}>{reasoningSummarySupportOptions.map((option) => <option key={option.value} value={option.value}>{option.value}</option>)}</select></label>
+          <label>{mt('serviceTier')}<input list="model-service-tier-options" maxLength={64} placeholder={mt('modelParameterAutomatic')} value={serviceTier} onChange={(event) => setServiceTier(event.target.value)} /><datalist id="model-service-tier-options"><option value="fast" /><option value="flex" /></datalist></label>
+        </div>
+      </fieldset>
+      <fieldset className="model-parameter-group">
+        <legend>{mt('modelParameterContextGroup')}</legend>
+        <div className="model-parameter-fields">
+          <label>{mt('contextWindowTokens')}<input type="number" inputMode="numeric" min={1} max={Number.MAX_SAFE_INTEGER} step={1} placeholder={mt('modelParameterAutomatic')} value={contextWindowTokens} onChange={(event) => setContextWindowTokens(event.target.value)} /></label>
+          <label>{mt('autoCompactTokenLimit')}<input type="number" inputMode="numeric" min={1} max={optionalInteger(contextWindowTokens) ?? Number.MAX_SAFE_INTEGER} step={1} placeholder={mt('modelParameterAutomatic')} value={autoCompactTokenLimit} onChange={(event) => setAutoCompactTokenLimit(event.target.value)} /></label>
+        </div>
+      </fieldset>
+      <fieldset className="model-parameter-group">
+        <legend>{mt('modelParameterReliabilityGroup')}</legend>
+        <div className="model-parameter-fields">
+          <label>{mt('requestMaxRetries')}<input type="number" inputMode="numeric" min={0} max={100} step={1} placeholder={mt('modelParameterAutomatic')} value={requestMaxRetries} onChange={(event) => setRequestMaxRetries(event.target.value)} /></label>
+          <label>{mt('streamMaxRetries')}<input type="number" inputMode="numeric" min={0} max={100} step={1} placeholder={mt('modelParameterAutomatic')} value={streamMaxRetries} onChange={(event) => setStreamMaxRetries(event.target.value)} /></label>
+          <label>{mt('streamIdleTimeoutMs')}<input type="number" inputMode="numeric" min={1} max={Number.MAX_SAFE_INTEGER} step={1} placeholder={mt('modelParameterAutomatic')} value={streamIdleTimeoutMs} onChange={(event) => setStreamIdleTimeoutMs(event.target.value)} /></label>
+        </div>
+      </fieldset>
       {error && <div className="model-alert error" role="alert">{mt('modelSaveFailed')}</div>}
     </form>
   </FormDialog>;
@@ -401,7 +610,7 @@ function ConnectionsTable({
           return <tr key={connection.id}>
             <td><strong>{connection.name}</strong></td>
             <td><code>{connection.model_id}</code></td>
-            <td>{connection.upstream_protocol === 'anthropic_messages' ? mt('protocolAnthropicMessages') : mt('protocolOpenaiResponses')}</td>
+            <td><code>{connection.upstream_protocol}</code></td>
             <td><code className="model-url">{connection.base_url}</code></td>
             <td><span className={`model-scope ${connection.scope}`}>{t((connection.scope === 'global' ? 'modelScopeGlobal' : 'modelScopePersonal') as TranslationKey)}</span></td>
             <td><span className={`status ${connection.status}`}>{connection.status === 'enabled' ? t('enabled') : t('disabled')}</span></td>

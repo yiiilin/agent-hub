@@ -24,8 +24,9 @@ const (
 	readinessPath = "/readyz"
 	proxyPath     = "/internal/v1/responses"
 
-	protocolOpenAIResponses   = "openai_responses"
-	protocolAnthropicMessages = "anthropic_messages"
+	protocolOpenAIResponses       = "openai_responses"
+	protocolOpenAIChatCompletions = "openai_chat_completions"
+	protocolAnthropicMessages     = "anthropic_messages"
 )
 
 type Config struct {
@@ -37,13 +38,14 @@ type Config struct {
 }
 
 type proxyEnvelope struct {
-	RequestID  string              `json:"request_id"`
-	Protocol   string              `json:"protocol"`
-	Endpoint   string              `json:"endpoint"`
-	APIKey     string              `json:"api_key"`
-	Query      string              `json:"query,omitempty"`
-	Headers    map[string][]string `json:"headers,omitempty"`
-	BodyBase64 string              `json:"body_base64"`
+	RequestID         string                 `json:"request_id"`
+	Protocol          string                 `json:"protocol"`
+	RequestParameters modelRequestParameters `json:"request_parameters"`
+	Endpoint          string                 `json:"endpoint"`
+	APIKey            string                 `json:"api_key"`
+	Query             string                 `json:"query,omitempty"`
+	Headers           map[string][]string    `json:"headers,omitempty"`
+	BodyBase64        string                 `json:"body_base64"`
 }
 
 type server struct {
@@ -147,6 +149,8 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch envelope.Protocol {
 	case protocolOpenAIResponses:
 		s.proxyOpenAI(w, r, envelope, body, upstreamURL)
+	case protocolOpenAIChatCompletions:
+		s.proxyOpenAIChat(w, r, envelope, body, upstreamURL)
 	case protocolAnthropicMessages:
 		s.proxyAnthropic(w, r, envelope, body, upstreamURL)
 	default:
@@ -177,8 +181,13 @@ func validateEnvelope(envelope proxyEnvelope) ([]byte, *url.URL, error) {
 	if !validRequestID(envelope.RequestID) {
 		return nil, nil, errors.New("invalid request id")
 	}
-	if envelope.Protocol != protocolOpenAIResponses && envelope.Protocol != protocolAnthropicMessages {
+	if envelope.Protocol != protocolOpenAIResponses &&
+		envelope.Protocol != protocolOpenAIChatCompletions &&
+		envelope.Protocol != protocolAnthropicMessages {
 		return nil, nil, errors.New("unsupported upstream protocol")
+	}
+	if err := envelope.RequestParameters.validate(envelope.Protocol); err != nil {
+		return nil, nil, err
 	}
 	if envelope.APIKey == "" {
 		return nil, nil, errors.New("provider credential is required")

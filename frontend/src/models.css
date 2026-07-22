@@ -217,7 +217,7 @@
 }
 
 .model-connection-dialog {
-  width: min(100%, 620px);
+  width: min(100%, 840px);
 }
 
 .model-action-dialog {
@@ -226,11 +226,34 @@
 
 .model-connection-form {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
+  gap: 16px;
 }
 
-.model-connection-form label {
+.model-parameter-section-heading {
+  margin: 2px 0 -6px;
+  color: #263446;
+  font-size: 14px;
+}
+
+.model-request-parameter-group {
+  background: #f4f8f7;
+}
+
+.model-request-parameter-group code {
+  color: #355267;
+  font: 12px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.model-connection-fields,
+.model-parameter-fields {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 14px;
+}
+
+.model-connection-form label,
+.model-parameter-group label {
   min-width: 0;
   display: grid;
   gap: 6px;
@@ -239,13 +262,28 @@
   font-weight: 700;
 }
 
-.model-connection-form label:nth-child(2),
-.model-connection-form label:last-of-type,
-.model-connection-form .model-alert {
+.model-connection-form .model-wide-field {
   grid-column: 1 / -1;
 }
 
-.model-connection-form input {
+.model-parameter-group {
+  min-width: 0;
+  margin: 0;
+  border: 1px solid #d5dee8;
+  border-radius: 4px;
+  padding: 12px;
+  background: #fafbfd;
+}
+
+.model-parameter-group legend {
+  padding: 0 6px;
+  color: #3f5064;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.model-connection-form input,
+.model-connection-form select {
   width: 100%;
   min-width: 0;
 }
@@ -528,15 +566,18 @@
     padding-inline: 10px;
   }
 
-  .model-connection-form,
+  .model-connection-fields,
+  .model-parameter-fields,
   .model-usage-filters {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .model-connection-form label:nth-child(2),
-  .model-connection-form label:last-of-type,
-  .model-connection-form .model-alert {
+  .model-connection-form .model-wide-field {
     grid-column: auto;
+  }
+
+  .model-parameter-group {
+    padding: 10px;
   }
 
   .model-overall-totals {

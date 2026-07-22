@@ -7789,8 +7789,17 @@ fn render_codex_agent(
             "model_provider".into(),
             toml::Value::String(model_provider_name(connection.id)),
         );
-    }
-    if let Some(effort) = subagent.reasoning_effort.and_then(codex_reasoning_effort) {
+        let reasoning_effort = effective_reasoning_effort(
+            connection.parameters.reasoning_effort,
+            configuration.reasoning_effort,
+            subagent.reasoning_effort,
+        );
+        apply_model_parameters(&mut root, &connection.parameters, reasoning_effort)?;
+    } else if let Some(effort) = subagent
+        .reasoning_effort
+        .filter(|effort| *effort != ReasoningEffort::Default)
+        .and_then(codex_reasoning_effort)
+    {
         root.insert(
             "model_reasoning_effort".into(),
             toml::Value::String(effort.into()),
@@ -7841,12 +7850,12 @@ fn render_codex_config(
         "model_provider".into(),
         toml::Value::String(model_provider_name(default_connection.id)),
     );
-    if let Some(effort) = codex_reasoning_effort(configuration.reasoning_effort) {
-        root.insert(
-            "model_reasoning_effort".into(),
-            toml::Value::String(effort.into()),
-        );
-    }
+    let reasoning_effort = effective_reasoning_effort(
+        default_connection.parameters.reasoning_effort,
+        configuration.reasoning_effort,
+        None,
+    );
+    apply_model_parameters(&mut root, &default_connection.parameters, reasoning_effort)?;
 
     let mut model_providers = toml::map::Map::new();
     for connection in &configuration.model_connections {
@@ -7861,6 +7870,27 @@ fn render_codex_config(
                 toml::Value::String(connection.id.to_string()),
             )])),
         );
+        if let Some(retries) = connection.parameters.request_max_retries {
+            provider_config.insert(
+                "request_max_retries".into(),
+                toml::Value::Integer(i64::from(retries)),
+            );
+        }
+        if let Some(retries) = connection.parameters.stream_max_retries {
+            provider_config.insert(
+                "stream_max_retries".into(),
+                toml::Value::Integer(i64::from(retries)),
+            );
+        }
+        if let Some(timeout_ms) = connection.parameters.stream_idle_timeout_ms {
+            provider_config.insert(
+                "stream_idle_timeout_ms".into(),
+                toml::Value::Integer(
+                    i64::try_from(timeout_ms)
+                        .context("stream idle timeout exceeds TOML integer")?,
+                ),
+            );
+        }
         model_providers.insert(
             model_provider_name(connection.id),
             toml::Value::Table(provider_config),
@@ -7902,6 +7932,99 @@ fn model_connection(
 
 fn model_provider_name(connection_id: Uuid) -> String {
     format!("agent_hub_{}", connection_id.simple())
+}
+
+fn effective_reasoning_effort(
+    connection_default: ReasoningEffort,
+    agent_override: ReasoningEffort,
+    subagent_override: Option<ReasoningEffort>,
+) -> ReasoningEffort {
+    subagent_override
+        .filter(|effort| *effort != ReasoningEffort::Default)
+        .or((agent_override != ReasoningEffort::Default).then_some(agent_override))
+        .unwrap_or(connection_default)
+}
+
+fn apply_model_parameters(
+    root: &mut toml::map::Map<String, toml::Value>,
+    parameters: &ModelConnectionParameters,
+    reasoning_effort: ReasoningEffort,
+) -> anyhow::Result<()> {
+    if let Some(effort) = codex_reasoning_effort(reasoning_effort) {
+        root.insert(
+            "model_reasoning_effort".into(),
+            toml::Value::String(effort.into()),
+        );
+    }
+    if let Some(summary) = codex_reasoning_summary(parameters.reasoning_summary) {
+        root.insert(
+            "model_reasoning_summary".into(),
+            toml::Value::String(summary.into()),
+        );
+    }
+    if let Some(verbosity) = codex_model_verbosity(parameters.verbosity) {
+        root.insert(
+            "model_verbosity".into(),
+            toml::Value::String(verbosity.into()),
+        );
+    }
+    if let Some(tokens) = parameters.context_window_tokens {
+        root.insert(
+            "model_context_window".into(),
+            toml::Value::Integer(
+                i64::try_from(tokens).context("model context window exceeds TOML integer")?,
+            ),
+        );
+    }
+    if let Some(tokens) = parameters.auto_compact_token_limit {
+        root.insert(
+            "model_auto_compact_token_limit".into(),
+            toml::Value::Integer(
+                i64::try_from(tokens).context("model compact limit exceeds TOML integer")?,
+            ),
+        );
+    }
+    match parameters.reasoning_summary_support {
+        ModelReasoningSummarySupport::Auto => {}
+        ModelReasoningSummarySupport::Supported => {
+            root.insert(
+                "model_supports_reasoning_summaries".into(),
+                toml::Value::Boolean(true),
+            );
+        }
+        ModelReasoningSummarySupport::Unsupported => {
+            root.insert(
+                "model_supports_reasoning_summaries".into(),
+                toml::Value::Boolean(false),
+            );
+        }
+    }
+    if let Some(service_tier) = &parameters.service_tier {
+        root.insert(
+            "service_tier".into(),
+            toml::Value::String(service_tier.clone()),
+        );
+    }
+    Ok(())
+}
+
+fn codex_reasoning_summary(summary: ModelReasoningSummary) -> Option<&'static str> {
+    match summary {
+        ModelReasoningSummary::Default => None,
+        ModelReasoningSummary::Auto => Some("auto"),
+        ModelReasoningSummary::Concise => Some("concise"),
+        ModelReasoningSummary::Detailed => Some("detailed"),
+        ModelReasoningSummary::None => Some("none"),
+    }
+}
+
+fn codex_model_verbosity(verbosity: ModelVerbosity) -> Option<&'static str> {
+    match verbosity {
+        ModelVerbosity::Default => None,
+        ModelVerbosity::Low => Some("low"),
+        ModelVerbosity::Medium => Some("medium"),
+        ModelVerbosity::High => Some("high"),
+    }
 }
 
 fn codex_reasoning_effort(effort: ReasoningEffort) -> Option<&'static str> {
@@ -8748,6 +8871,17 @@ mod tests {
                 name: "Review model".into(),
                 model_id: "gpt-review".into(),
                 upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
+                parameters: ModelConnectionParameters {
+                    reasoning_effort: ReasoningEffort::Medium,
+                    reasoning_summary: ModelReasoningSummary::Concise,
+                    verbosity: ModelVerbosity::High,
+                    context_window_tokens: Some(128_000),
+                    auto_compact_token_limit: Some(96_000),
+                    reasoning_summary_support: ModelReasoningSummarySupport::Unsupported,
+                    service_tier: Some("flex".into()),
+                    ..ModelConnectionParameters::default()
+                },
+                request_parameters: ModelConnectionRequestParameters::default(),
                 scope: ModelConnectionScope::Personal,
                 status: ModelConnectionStatus::Enabled,
             });
@@ -8800,6 +8934,47 @@ mod tests {
         assert!(researcher.get("model_reasoning_effort").is_none());
         assert_eq!(reviewer["model"].as_str(), Some("gpt-review"));
         assert_eq!(reviewer["model_reasoning_effort"].as_str(), Some("ultra"));
+        assert_eq!(
+            reviewer["model_reasoning_summary"].as_str(),
+            Some("concise")
+        );
+        assert_eq!(reviewer["model_verbosity"].as_str(), Some("high"));
+        assert_eq!(reviewer["model_context_window"].as_integer(), Some(128_000));
+        assert_eq!(
+            reviewer["model_auto_compact_token_limit"].as_integer(),
+            Some(96_000)
+        );
+        assert_eq!(
+            reviewer["model_supports_reasoning_summaries"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(reviewer["service_tier"].as_str(), Some("flex"));
+        let mut inherited_reasoning = claim.execution_configuration.clone();
+        inherited_reasoning.reasoning_effort = ReasoningEffort::Low;
+        inherited_reasoning.codex_subagents[1].reasoning_effort = None;
+        let reviewer_with_agent_default = render_codex_agent(
+            &inherited_reasoning,
+            &inherited_reasoning.codex_subagents[1],
+        )
+        .unwrap()
+        .parse::<toml::Value>()
+        .unwrap();
+        assert_eq!(
+            reviewer_with_agent_default["model_reasoning_effort"].as_str(),
+            Some("low")
+        );
+        inherited_reasoning.reasoning_effort = ReasoningEffort::Default;
+        let reviewer_with_connection_default = render_codex_agent(
+            &inherited_reasoning,
+            &inherited_reasoning.codex_subagents[1],
+        )
+        .unwrap()
+        .parse::<toml::Value>()
+        .unwrap();
+        assert_eq!(
+            reviewer_with_connection_default["model_reasoning_effort"].as_str(),
+            Some("medium")
+        );
         assert!(!agents_dir.join("disabled.toml").exists());
         assert_eq!(
             fs::metadata(&reviewer_path)
@@ -11448,6 +11623,24 @@ done
             .execution_configuration
             .default_model_connection_id
             .unwrap();
+        claim
+            .execution_configuration
+            .model_connections
+            .iter_mut()
+            .find(|connection| connection.id == default_connection_id)
+            .unwrap()
+            .parameters = ModelConnectionParameters {
+            reasoning_effort: ReasoningEffort::High,
+            reasoning_summary: ModelReasoningSummary::Detailed,
+            verbosity: ModelVerbosity::Low,
+            context_window_tokens: Some(200_000),
+            auto_compact_token_limit: Some(160_000),
+            reasoning_summary_support: ModelReasoningSummarySupport::Supported,
+            service_tier: Some("priority".into()),
+            request_max_retries: Some(7),
+            stream_max_retries: Some(9),
+            stream_idle_timeout_ms: Some(420_000),
+        };
         let override_connection_id = Uuid::from_u128(0x202);
         claim
             .execution_configuration
@@ -11457,6 +11650,19 @@ done
                 name: "Review model".into(),
                 model_id: "gpt-review".into(),
                 upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
+                parameters: ModelConnectionParameters {
+                    reasoning_effort: ReasoningEffort::Medium,
+                    reasoning_summary: ModelReasoningSummary::Concise,
+                    verbosity: ModelVerbosity::High,
+                    context_window_tokens: Some(128_000),
+                    auto_compact_token_limit: Some(96_000),
+                    reasoning_summary_support: ModelReasoningSummarySupport::Unsupported,
+                    service_tier: Some("flex".into()),
+                    request_max_retries: Some(2),
+                    stream_max_retries: Some(3),
+                    stream_idle_timeout_ms: Some(300_000),
+                },
+                request_parameters: ModelConnectionRequestParameters::default(),
                 scope: ModelConnectionScope::Personal,
                 status: ModelConnectionStatus::Enabled,
             });
@@ -11484,7 +11690,19 @@ done
             parsed["model_provider"].as_str(),
             Some(default_provider.as_str())
         );
-        assert!(parsed.get("model_reasoning_effort").is_none());
+        assert_eq!(parsed["model_reasoning_effort"].as_str(), Some("high"));
+        assert_eq!(parsed["model_reasoning_summary"].as_str(), Some("detailed"));
+        assert_eq!(parsed["model_verbosity"].as_str(), Some("low"));
+        assert_eq!(parsed["model_context_window"].as_integer(), Some(200_000));
+        assert_eq!(
+            parsed["model_auto_compact_token_limit"].as_integer(),
+            Some(160_000)
+        );
+        assert_eq!(
+            parsed["model_supports_reasoning_summaries"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(parsed["service_tier"].as_str(), Some("priority"));
         assert_eq!(parsed["agents"]["max_threads"].as_integer(), Some(6));
         assert_eq!(parsed["agents"]["max_depth"].as_integer(), Some(1));
         for (connection_id, provider) in [
@@ -11502,10 +11720,27 @@ done
                 Some(connection_id.to_string().as_str())
             );
             assert!(provider.get("env_key").is_none());
+            let expected_transport = if connection_id == default_connection_id {
+                (7, 9, 420_000)
+            } else {
+                (2, 3, 300_000)
+            };
+            assert_eq!(
+                provider["request_max_retries"].as_integer(),
+                Some(expected_transport.0)
+            );
+            assert_eq!(
+                provider["stream_max_retries"].as_integer(),
+                Some(expected_transport.1)
+            );
+            assert_eq!(
+                provider["stream_idle_timeout_ms"].as_integer(),
+                Some(expected_transport.2)
+            );
         }
 
         let efforts = [
-            (ReasoningEffort::Default, None),
+            (ReasoningEffort::Default, Some("high")),
             (ReasoningEffort::None, Some("none")),
             (ReasoningEffort::Minimal, Some("minimal")),
             (ReasoningEffort::Low, Some("low")),
@@ -11531,6 +11766,43 @@ done
                 expected
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires the installed Codex CLI"]
+    fn installed_codex_strictly_accepts_detailed_model_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut claim = test_claim();
+        claim.execution_configuration.model_connections[0].parameters = ModelConnectionParameters {
+            reasoning_effort: ReasoningEffort::High,
+            reasoning_summary: ModelReasoningSummary::Detailed,
+            verbosity: ModelVerbosity::Low,
+            context_window_tokens: Some(200_000),
+            auto_compact_token_limit: Some(160_000),
+            reasoning_summary_support: ModelReasoningSummarySupport::Supported,
+            service_tier: Some("flex".into()),
+            request_max_retries: Some(7),
+            stream_max_retries: Some(9),
+            stream_idle_timeout_ms: Some(420_000),
+        };
+        let config = render_codex_config(
+            &claim.execution_configuration,
+            Some("http://127.0.0.1:4567/v1"),
+        )
+        .unwrap();
+        stdfs::write(temp.path().join("config.toml"), config).unwrap();
+        let codex_bin = env::var("CODEX_BIN").unwrap_or_else(|_| "codex".into());
+        let output = Command::new(codex_bin)
+            .env("CODEX_HOME", temp.path())
+            .args(["app-server", "--strict-config", "--listen", "stdio://"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "Codex rejected generated config: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[tokio::test]
@@ -13239,6 +13511,8 @@ done
             name: "Updated model".into(),
             model_id: "gpt-updated".into(),
             upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
+            parameters: ModelConnectionParameters::default(),
+            request_parameters: ModelConnectionRequestParameters::default(),
             scope: ModelConnectionScope::Global,
             status: ModelConnectionStatus::Enabled,
         }];
@@ -17081,6 +17355,8 @@ done
                 name: "Main model".into(),
                 model_id: "gpt-main".into(),
                 upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
+                parameters: ModelConnectionParameters::default(),
+                request_parameters: ModelConnectionRequestParameters::default(),
                 scope: ModelConnectionScope::Global,
                 status: ModelConnectionStatus::Enabled,
             }],

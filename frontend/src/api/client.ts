@@ -360,7 +360,44 @@ export type ModelConnectionScope = 'global' | 'personal';
 
 export type ModelConnectionStatus = 'enabled' | 'disabled';
 
-export type ModelUpstreamProtocol = 'openai_responses' | 'anthropic_messages';
+export type ModelUpstreamProtocol =
+  | 'openai_responses'
+  | 'openai_chat_completions'
+  | 'anthropic_messages';
+
+export type ModelReasoningSummary = 'default' | 'auto' | 'concise' | 'detailed' | 'none';
+
+export type ModelVerbosity = 'default' | 'low' | 'medium' | 'high';
+
+export type ModelReasoningSummarySupport = 'auto' | 'supported' | 'unsupported';
+
+export type ModelConnectionParameters = {
+  reasoning_effort: ReasoningEffort;
+  reasoning_summary: ModelReasoningSummary;
+  verbosity: ModelVerbosity;
+  context_window_tokens: number | null;
+  auto_compact_token_limit: number | null;
+  reasoning_summary_support: ModelReasoningSummarySupport;
+  service_tier: string | null;
+  request_max_retries: number | null;
+  stream_max_retries: number | null;
+  stream_idle_timeout_ms: number | null;
+};
+
+export type ModelConnectionRequestParameters =
+  | { protocol: 'openai_responses' }
+  | {
+      protocol: 'openai_chat_completions';
+      temperature: number | null;
+      top_p: number | null;
+      max_completion_tokens: number | null;
+    }
+  | {
+      protocol: 'anthropic_messages';
+      temperature: number | null;
+      top_p: number | null;
+      max_tokens: number | null;
+    };
 
 export type ModelConnection = {
   id: string;
@@ -370,6 +407,8 @@ export type ModelConnection = {
   base_url: string;
   model_id: string;
   upstream_protocol: ModelUpstreamProtocol;
+  parameters: ModelConnectionParameters;
+  request_parameters: ModelConnectionRequestParameters;
   status: ModelConnectionStatus;
   is_system_default: boolean;
   created_at: string;
@@ -382,6 +421,8 @@ export type CreateModelConnectionRequest = {
   base_url: string;
   model_id: string;
   upstream_protocol: ModelUpstreamProtocol;
+  parameters: ModelConnectionParameters;
+  request_parameters: ModelConnectionRequestParameters;
   api_key: string;
 };
 
@@ -397,12 +438,24 @@ export type CreateConfiguredAgentRequest = {
 
 export type UpdateModelConnectionRequest = Pick<
   CreateModelConnectionRequest,
-  'name' | 'base_url' | 'model_id' | 'upstream_protocol'
+  | 'name'
+  | 'base_url'
+  | 'model_id'
+  | 'upstream_protocol'
+  | 'parameters'
+  | 'request_parameters'
 > & { api_key?: string };
 
 export type ModelConnectionOption = Pick<
   ModelConnection,
-  'id' | 'name' | 'model_id' | 'upstream_protocol' | 'scope' | 'status'
+  | 'id'
+  | 'name'
+  | 'model_id'
+  | 'upstream_protocol'
+  | 'parameters'
+  | 'request_parameters'
+  | 'scope'
+  | 'status'
 >;
 
 export type ModelConnectionOptions = {

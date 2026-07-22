@@ -69,6 +69,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/responses":
             self.handle_responses()
             return
+        if path == "/v1/chat/completions":
+            self.handle_chat_completions()
+            return
         if path == "/v1/messages":
             self.handle_anthropic_messages()
             return
@@ -131,6 +134,108 @@ class Handler(BaseHTTPRequestHandler):
                 },
             }
         self.send_json(response)
+
+    def handle_chat_completions(self):
+        if self.headers.get("authorization") != f"Bearer {API_KEY}":
+            self.send_response(401)
+            self.end_headers()
+            return
+        request = self.read_request_json()
+        if request is None:
+            return
+        request_text = json.dumps(request, separators=(",", ":")).lower()
+        if (
+            request.get("model") == "hub-proxy-error"
+            or "fixture:model-error" in request_text
+        ):
+            self.send_json(
+                {
+                    "error": {
+                        "code": "fake_model_error",
+                        "message": "Deterministic fake provider failure.",
+                    }
+                },
+                status=429,
+            )
+            return
+        if request.get("stream") is True:
+            self.send_chat_stream(request)
+            return
+        self.send_json(
+            {
+                "id": "chatcmpl_proxy_fake_completed",
+                "object": "chat.completion",
+                "created": 1_710_000_000,
+                "model": request.get("model", "hub-proxy-smoke"),
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "Fake Chat Completions run through the Hub model gateway.",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 14,
+                    "completion_tokens": 9,
+                    "total_tokens": 23,
+                },
+            }
+        )
+
+    def send_chat_stream(self, request):
+        model = request.get("model", "hub-proxy-smoke")
+        chunks = (
+            {
+                "id": "chatcmpl_proxy_fake_stream",
+                "object": "chat.completion.chunk",
+                "created": 1_710_000_000,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "content": "Fake Chat Completions streamed through the Hub model gateway.",
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "id": "chatcmpl_proxy_fake_stream",
+                "object": "chat.completion.chunk",
+                "created": 1_710_000_000,
+                "model": model,
+                "choices": [
+                    {"index": 0, "delta": {}, "finish_reason": "stop"}
+                ],
+            },
+            {
+                "id": "chatcmpl_proxy_fake_stream",
+                "object": "chat.completion.chunk",
+                "created": 1_710_000_000,
+                "model": model,
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 14,
+                    "completion_tokens": 9,
+                    "total_tokens": 23,
+                },
+            },
+        )
+        body = "".join(
+            f"data: {json.dumps(chunk)}\n\n" for chunk in chunks
+        ) + "data: [DONE]\n\n"
+        encoded = body.encode()
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("cache-control", "no-cache")
+        self.send_header("content-length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
 
     def handle_anthropic_messages(self):
         if (

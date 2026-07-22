@@ -6,6 +6,49 @@ const PROVIDER_BASE_URL = 'http://fake-model-provider:8080';
 const PROVIDER_API_KEY = 'dev-model-provider-api-key';
 const SUCCESS_MODEL_ID = 'hub-proxy-smoke';
 const ERROR_MODEL_ID = 'hub-proxy-error';
+const AUTOMATIC_MODEL_PARAMETERS = {
+  reasoning_effort: 'default',
+  reasoning_summary: 'default',
+  verbosity: 'default',
+  context_window_tokens: null,
+  auto_compact_token_limit: null,
+  reasoning_summary_support: 'auto',
+  service_tier: null,
+  request_max_retries: null,
+  stream_max_retries: null,
+  stream_idle_timeout_ms: null
+};
+const DETAILED_MODEL_PARAMETERS = {
+  reasoning_effort: 'medium',
+  reasoning_summary: 'concise',
+  verbosity: 'high',
+  context_window_tokens: 128_000,
+  auto_compact_token_limit: 96_000,
+  reasoning_summary_support: 'supported',
+  service_tier: 'flex',
+  request_max_retries: 3,
+  stream_max_retries: 5,
+  stream_idle_timeout_ms: 300_000
+};
+const RESPONSES_REQUEST_PARAMETERS = { protocol: 'openai_responses' };
+const AUTOMATIC_CHAT_REQUEST_PARAMETERS = {
+  protocol: 'openai_chat_completions',
+  temperature: null,
+  top_p: null,
+  max_completion_tokens: null
+};
+const CHAT_REQUEST_PARAMETERS = {
+  protocol: 'openai_chat_completions',
+  temperature: 0.3,
+  top_p: 0.8,
+  max_completion_tokens: 321
+};
+const ANTHROPIC_REQUEST_PARAMETERS = {
+  protocol: 'anthropic_messages',
+  temperature: 0.4,
+  top_p: null,
+  max_tokens: 8_192
+};
 
 function uniqueSlug(context, prefix) {
   return context.unique(prefix)
@@ -37,9 +80,11 @@ function connectionRequest(
   scope,
   name,
   modelId = SUCCESS_MODEL_ID,
-  upstreamProtocol = 'openai_responses'
+  upstreamProtocol = 'openai_responses',
+  parameters,
+  requestParameters
 ) {
-  return {
+  const request = {
     scope,
     name,
     base_url: PROVIDER_BASE_URL,
@@ -47,6 +92,9 @@ function connectionRequest(
     upstream_protocol: upstreamProtocol,
     api_key: PROVIDER_API_KEY
   };
+  if (parameters !== undefined) request.parameters = parameters;
+  if (requestParameters !== undefined) request.request_parameters = requestParameters;
+  return request;
 }
 
 async function manualRedirect(client, path) {
@@ -157,6 +205,20 @@ export default async function modelConnectionsApiScenario(context) {
     const { data: openapi } = await superClient.get('/openapi.json');
     assert.equal(openapi.components.schemas.CreateModelConnectionRequest.properties.api_key.writeOnly, true);
     assert.equal(Object.hasOwn(openapi.components.schemas.ModelConnection.properties, 'api_key'), false);
+    assert.deepEqual(
+      openapi.components.schemas.ModelReasoningSummary.enum,
+      ['default', 'auto', 'concise', 'detailed', 'none']
+    );
+    assert.equal(
+      openapi.components.schemas.ModelConnectionParameters.properties.request_max_retries.maximum,
+      100
+    );
+    assert.deepEqual(openapi.components.schemas.ModelUpstreamProtocol.enum, [
+      'openai_responses',
+      'openai_chat_completions',
+      'anthropic_messages'
+    ]);
+    assert.equal(openapi.components.schemas.ModelConnectionRequestParameters.oneOf.length, 3);
     assert.deepEqual(Object.keys(openapi.paths['/api/model-usage']), ['get']);
     assert.deepEqual(Object.keys(openapi.paths['/api/model-call-errors']), ['get']);
 
@@ -171,7 +233,10 @@ export default async function modelConnectionsApiScenario(context) {
     ));
     const ownerPersonal = await createConnection(owner.client, connectionRequest(
       'personal',
-      context.unique('QA owner Personal')
+      context.unique('QA owner Personal'),
+      SUCCESS_MODEL_ID,
+      'openai_responses',
+      DETAILED_MODEL_PARAMETERS
     ));
     const outsiderPersonal = await createConnection(outsider.client, connectionRequest(
       'personal',
@@ -194,13 +259,23 @@ export default async function modelConnectionsApiScenario(context) {
       'global',
       context.unique('QA Global Anthropic'),
       SUCCESS_MODEL_ID,
-      'anthropic_messages'
+      'anthropic_messages',
+      undefined,
+      ANTHROPIC_REQUEST_PARAMETERS
     ));
 
     assert.equal(superPersonal.owner_id, superAdmin.id);
     assert.equal(ownerPersonal.owner_id, owner.user.id);
+    assert.deepEqual(ownerPersonal.parameters, DETAILED_MODEL_PARAMETERS);
     assert.equal(globalA.owner_id, null);
     assert.equal(globalA.scope, 'global');
+    assert.deepEqual(globalA.parameters, AUTOMATIC_MODEL_PARAMETERS);
+    assert.deepEqual(globalA.request_parameters, RESPONSES_REQUEST_PARAMETERS);
+    assert.deepEqual(anthropicGlobal.request_parameters, ANTHROPIC_REQUEST_PARAMETERS);
+    assert.deepEqual(
+      (await owner.client.get(`/api/model-connections/${ownerPersonal.id}`)).data.parameters,
+      DETAILED_MODEL_PARAMETERS
+    );
     await administrator.client.get(`/api/model-connections/${superPersonal.id}`, { expectedStatus: 404 });
     await administrator.client.request(`/api/model-connections/${superPersonal.id}`, {
       method: 'PATCH',
@@ -227,7 +302,10 @@ export default async function modelConnectionsApiScenario(context) {
     assert.equal(ownerConnections.some((connection) => connection.id === globalA.id), true);
     assertWriteOnly(ownerConnections, 'Model Connection list response');
     const { data: ownerOptions } = await owner.client.get('/api/model-connections/options');
-    assert.equal(ownerOptions.items.some((connection) => connection.id === ownerPersonal.id), true);
+    const ownerPersonalOption = ownerOptions.items.find((connection) => connection.id === ownerPersonal.id);
+    assert.ok(ownerPersonalOption);
+    assert.deepEqual(ownerPersonalOption.parameters, DETAILED_MODEL_PARAMETERS);
+    assert.deepEqual(ownerPersonalOption.request_parameters, RESPONSES_REQUEST_PARAMETERS);
     assert.equal(ownerOptions.items.some((connection) => connection.id === outsiderPersonal.id), false);
     assertWriteOnly(ownerOptions, 'Model Connection options response');
 
@@ -261,6 +339,16 @@ export default async function modelConnectionsApiScenario(context) {
       }
     );
     assert.equal(updatedPersonal.name, updatedPersonalName);
+    assert.deepEqual(
+      updatedPersonal.parameters,
+      DETAILED_MODEL_PARAMETERS,
+      'Omitting parameters during update must preserve the complete parameter object'
+    );
+    assert.deepEqual(
+      updatedPersonal.request_parameters,
+      RESPONSES_REQUEST_PARAMETERS,
+      'Omitting request parameters without changing protocol must preserve the complete object'
+    );
     assertWriteOnly(updatedPersonal, 'Model Connection update response');
     assert.equal(
       context.compose.psql(`
@@ -269,6 +357,107 @@ export default async function modelConnectionsApiScenario(context) {
       `),
       secretFingerprint,
       'Omitting api_key during update must preserve the encrypted secret'
+    );
+    const changedParameters = {
+      ...DETAILED_MODEL_PARAMETERS,
+      reasoning_summary: 'none',
+      auto_compact_token_limit: null,
+      service_tier: null,
+      request_max_retries: 0
+    };
+    const { data: parameterUpdatedPersonal } = await owner.client.request(
+      `/api/model-connections/${ownerPersonal.id}`,
+      {
+        method: 'PATCH',
+        body: {
+          name: updatedPersonalName,
+          base_url: PROVIDER_BASE_URL,
+          model_id: SUCCESS_MODEL_ID,
+          parameters: changedParameters
+        }
+      }
+    );
+    assert.deepEqual(parameterUpdatedPersonal.parameters, changedParameters);
+    assert.deepEqual(
+      (await owner.client.get(`/api/model-connections/${ownerPersonal.id}`)).data.parameters,
+      changedParameters
+    );
+    await owner.client.request(`/api/model-connections/${ownerPersonal.id}`, {
+      method: 'PATCH',
+      body: {
+        name: updatedPersonalName,
+        base_url: PROVIDER_BASE_URL,
+        model_id: SUCCESS_MODEL_ID,
+        parameters: { reasoning_summary: 'auto' }
+      },
+      expectedStatus: 422
+    });
+    assert.deepEqual(
+      (await owner.client.get(`/api/model-connections/${ownerPersonal.id}`)).data.parameters,
+      changedParameters,
+      'A rejected partial parameter object must not mutate stored settings'
+    );
+
+    const { data: chatDefaults } = await owner.client.request(
+      `/api/model-connections/${ownerPersonal.id}`,
+      {
+        method: 'PATCH',
+        body: {
+          name: updatedPersonalName,
+          base_url: PROVIDER_BASE_URL,
+          model_id: SUCCESS_MODEL_ID,
+          upstream_protocol: 'openai_chat_completions'
+        }
+      }
+    );
+    assert.deepEqual(
+      chatDefaults.request_parameters,
+      AUTOMATIC_CHAT_REQUEST_PARAMETERS,
+      'Changing protocol without request parameters must reset to that protocol defaults'
+    );
+    const { data: preservedChatDefaults } = await owner.client.request(
+      `/api/model-connections/${ownerPersonal.id}`,
+      {
+        method: 'PATCH',
+        body: {
+          name: updatedPersonalName,
+          base_url: PROVIDER_BASE_URL,
+          model_id: SUCCESS_MODEL_ID
+        }
+      }
+    );
+    assert.deepEqual(
+      preservedChatDefaults.request_parameters,
+      AUTOMATIC_CHAT_REQUEST_PARAMETERS,
+      'Omitting request parameters without changing protocol must preserve Chat values'
+    );
+    const { data: configuredChat } = await owner.client.request(
+      `/api/model-connections/${ownerPersonal.id}`,
+      {
+        method: 'PATCH',
+        body: {
+          name: updatedPersonalName,
+          base_url: PROVIDER_BASE_URL,
+          model_id: SUCCESS_MODEL_ID,
+          request_parameters: CHAT_REQUEST_PARAMETERS
+        }
+      }
+    );
+    assert.deepEqual(configuredChat.request_parameters, CHAT_REQUEST_PARAMETERS);
+    await owner.client.request(`/api/model-connections/${ownerPersonal.id}`, {
+      method: 'PATCH',
+      body: {
+        name: updatedPersonalName,
+        base_url: PROVIDER_BASE_URL,
+        model_id: SUCCESS_MODEL_ID,
+        request_parameters: ANTHROPIC_REQUEST_PARAMETERS
+      },
+      expectedStatus: 400
+    });
+    assert.deepEqual(
+      (await owner.client.get(`/api/model-connections/${ownerPersonal.id}`)).data.request_parameters,
+      CHAT_REQUEST_PARAMETERS,
+      'A rejected protocol mismatch must not mutate stored request parameters'
     );
 
     const ownerTest = (await owner.client.post(`/api/model-connections/${ownerPersonal.id}/test`)).data;
@@ -281,12 +470,27 @@ export default async function modelConnectionsApiScenario(context) {
     assert.equal(ownerTestUsage[0].subject.id, owner.user.id);
     assert.equal(ownerTestUsage[0].agent.id, null);
     assert.deepEqual(usageTotals(ownerTestUsage), {
-      input_tokens: 11,
-      output_tokens: 7,
-      total_tokens: 18,
-      cached_tokens: 3,
-      reasoning_tokens: 5
+      input_tokens: 14,
+      output_tokens: 9,
+      total_tokens: 23,
+      cached_tokens: 0,
+      reasoning_tokens: 0
     });
+    assert.equal(ownerTestUsage[0].model.upstream_protocol, 'openai_chat_completions');
+    assert.equal(
+      context.compose.psql(`
+        SELECT (request_parameters_snapshot->>'protocol') || '|' ||
+               (request_parameters_snapshot->>'temperature') || '|' ||
+               (request_parameters_snapshot->>'top_p') || '|' ||
+               (request_parameters_snapshot->>'max_completion_tokens')
+        FROM model_token_usage
+        WHERE model_connection_id = ${sqlLiteral(ownerPersonal.id)}
+        ORDER BY occurred_at DESC, id DESC
+        LIMIT 1
+      `),
+      'openai_chat_completions|0.3|0.8|321',
+      'Chat usage must retain the request parameter snapshot'
+    );
     const anthropicTest = (await administrator.client.post(
       `/api/model-connections/${anthropicGlobal.id}/test`
     )).data;
@@ -310,6 +514,20 @@ export default async function modelConnectionsApiScenario(context) {
       cached_tokens: 0,
       reasoning_tokens: 0
     });
+    assert.equal(
+      context.compose.psql(`
+        SELECT (request_parameters_snapshot->>'protocol') || '|' ||
+               (request_parameters_snapshot->>'temperature') || '|' ||
+               COALESCE(request_parameters_snapshot->>'top_p', '<null>') || '|' ||
+               (request_parameters_snapshot->>'max_tokens')
+        FROM model_token_usage
+        WHERE model_connection_id = ${sqlLiteral(anthropicGlobal.id)}
+        ORDER BY occurred_at DESC, id DESC
+        LIMIT 1
+      `),
+      'anthropic_messages|0.4|<null>|8192',
+      'Anthropic usage must retain the request parameter snapshot'
+    );
     const hiddenSuperUsage = (await administrator.client.get(ledgerPath('/api/model-usage', {
       model_connection_id: superPersonal.id,
       page_size: 100

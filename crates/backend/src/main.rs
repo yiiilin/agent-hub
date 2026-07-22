@@ -38,7 +38,7 @@ use chrono::{DateTime, Datelike, Duration as ChronoDuration, Timelike, Utc};
 use futures_util::{Stream, StreamExt};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Number, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Row, Transaction};
 use tower_http::{
@@ -1006,12 +1006,21 @@ fn openapi_schemas() -> Value {
         "RenewApiKeyRequest": { "type": "object", "additionalProperties": false, "required": ["validity"], "properties": { "validity": { "$ref": "#/components/schemas/ApiKeyValidity" } } },
         "ModelConnectionScope": { "type": "string", "enum": ["global", "personal"] },
         "ModelConnectionStatus": { "type": "string", "enum": ["enabled", "disabled"] },
-        "ModelUpstreamProtocol": { "type": "string", "enum": ["openai_responses", "anthropic_messages"], "default": "openai_responses" },
-        "ModelConnection": { "type": "object", "additionalProperties": false, "required": ["id", "owner_id", "scope", "name", "base_url", "model_id", "upstream_protocol", "status", "is_system_default", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": { "anyOf": [uuid(), { "type": "null" }] }, "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "name": { "type": "string" }, "base_url": { "type": "string", "format": "uri" }, "model_id": { "type": "string" }, "upstream_protocol": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "status": { "$ref": "#/components/schemas/ModelConnectionStatus" }, "is_system_default": { "type": "boolean" }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
-        "CreateModelConnectionRequest": { "type": "object", "additionalProperties": false, "required": ["scope", "name", "base_url", "model_id", "api_key"], "properties": { "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "name": { "type": "string", "minLength": 1, "maxLength": 128 }, "base_url": { "type": "string", "format": "uri" }, "model_id": { "type": "string", "minLength": 1, "maxLength": 256 }, "upstream_protocol": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "api_key": { "type": "string", "minLength": 1, "format": "password", "writeOnly": true } } },
-        "UpdateModelConnectionRequest": { "type": "object", "additionalProperties": false, "required": ["name", "base_url", "model_id"], "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 128 }, "base_url": { "type": "string", "format": "uri" }, "model_id": { "type": "string", "minLength": 1, "maxLength": 256 }, "upstream_protocol": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "api_key": { "type": "string", "minLength": 1, "format": "password", "writeOnly": true } } },
+        "ModelUpstreamProtocol": { "type": "string", "enum": ["openai_responses", "openai_chat_completions", "anthropic_messages"], "default": "openai_responses" },
+        "ModelReasoningSummary": { "type": "string", "enum": ["default", "auto", "concise", "detailed", "none"], "default": "default" },
+        "ModelVerbosity": { "type": "string", "enum": ["default", "low", "medium", "high"], "default": "default" },
+        "ModelReasoningSummarySupport": { "type": "string", "enum": ["auto", "supported", "unsupported"], "default": "auto" },
+        "ModelConnectionParameters": { "type": "object", "additionalProperties": false, "required": ["reasoning_effort", "reasoning_summary", "verbosity", "context_window_tokens", "auto_compact_token_limit", "reasoning_summary_support", "service_tier", "request_max_retries", "stream_max_retries", "stream_idle_timeout_ms"], "properties": { "reasoning_effort": { "$ref": "#/components/schemas/ReasoningEffort" }, "reasoning_summary": { "$ref": "#/components/schemas/ModelReasoningSummary" }, "verbosity": { "$ref": "#/components/schemas/ModelVerbosity" }, "context_window_tokens": { "type": ["integer", "null"], "format": "int64", "minimum": 1 }, "auto_compact_token_limit": { "type": ["integer", "null"], "format": "int64", "minimum": 1 }, "reasoning_summary_support": { "$ref": "#/components/schemas/ModelReasoningSummarySupport" }, "service_tier": { "type": ["string", "null"], "minLength": 1, "maxLength": 64 }, "request_max_retries": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 }, "stream_max_retries": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 }, "stream_idle_timeout_ms": { "type": ["integer", "null"], "format": "int64", "minimum": 1 } } },
+        "ModelConnectionRequestParameters": { "oneOf": [
+            { "type": "object", "additionalProperties": false, "required": ["protocol"], "properties": { "protocol": { "type": "string", "enum": ["openai_responses"] } } },
+            { "type": "object", "additionalProperties": false, "required": ["protocol"], "properties": { "protocol": { "type": "string", "enum": ["openai_chat_completions"] }, "temperature": { "type": ["number", "null"], "minimum": 0, "maximum": 2 }, "top_p": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }, "max_completion_tokens": { "type": ["integer", "null"], "minimum": 1, "maximum": 4294967295_u64 } } },
+            { "type": "object", "additionalProperties": false, "required": ["protocol"], "properties": { "protocol": { "type": "string", "enum": ["anthropic_messages"] }, "temperature": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }, "top_p": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }, "max_tokens": { "type": ["integer", "null"], "minimum": 1, "maximum": 4294967295_u64 } }, "not": { "required": ["temperature", "top_p"], "properties": { "temperature": { "type": "number" }, "top_p": { "type": "number" } } } }
+        ], "discriminator": { "propertyName": "protocol" } },
+        "ModelConnection": { "type": "object", "additionalProperties": false, "required": ["id", "owner_id", "scope", "name", "base_url", "model_id", "upstream_protocol", "parameters", "request_parameters", "status", "is_system_default", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": { "anyOf": [uuid(), { "type": "null" }] }, "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "name": { "type": "string" }, "base_url": { "type": "string", "format": "uri" }, "model_id": { "type": "string" }, "upstream_protocol": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "parameters": { "$ref": "#/components/schemas/ModelConnectionParameters" }, "request_parameters": { "$ref": "#/components/schemas/ModelConnectionRequestParameters" }, "status": { "$ref": "#/components/schemas/ModelConnectionStatus" }, "is_system_default": { "type": "boolean" }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
+        "CreateModelConnectionRequest": { "type": "object", "additionalProperties": false, "required": ["scope", "name", "base_url", "model_id", "api_key"], "properties": { "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "name": { "type": "string", "minLength": 1, "maxLength": 128 }, "base_url": { "type": "string", "format": "uri" }, "model_id": { "type": "string", "minLength": 1, "maxLength": 256 }, "upstream_protocol": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "parameters": { "$ref": "#/components/schemas/ModelConnectionParameters" }, "request_parameters": { "$ref": "#/components/schemas/ModelConnectionRequestParameters" }, "api_key": { "type": "string", "minLength": 1, "format": "password", "writeOnly": true } } },
+        "UpdateModelConnectionRequest": { "type": "object", "additionalProperties": false, "required": ["name", "base_url", "model_id"], "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 128 }, "base_url": { "type": "string", "format": "uri" }, "model_id": { "type": "string", "minLength": 1, "maxLength": 256 }, "upstream_protocol": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "parameters": { "$ref": "#/components/schemas/ModelConnectionParameters" }, "request_parameters": { "$ref": "#/components/schemas/ModelConnectionRequestParameters" }, "api_key": { "type": "string", "minLength": 1, "format": "password", "writeOnly": true } } },
         "UpdateModelConnectionStatusRequest": { "type": "object", "additionalProperties": false, "required": ["status"], "properties": { "status": { "$ref": "#/components/schemas/ModelConnectionStatus" } } },
-        "ModelConnectionOption": { "type": "object", "additionalProperties": false, "required": ["id", "name", "model_id", "upstream_protocol", "scope", "status"], "properties": { "id": uuid(), "name": { "type": "string" }, "model_id": { "type": "string" }, "upstream_protocol": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "status": { "$ref": "#/components/schemas/ModelConnectionStatus" } } },
+        "ModelConnectionOption": { "type": "object", "additionalProperties": false, "required": ["id", "name", "model_id", "upstream_protocol", "parameters", "request_parameters", "scope", "status"], "properties": { "id": uuid(), "name": { "type": "string" }, "model_id": { "type": "string" }, "upstream_protocol": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "parameters": { "$ref": "#/components/schemas/ModelConnectionParameters" }, "request_parameters": { "$ref": "#/components/schemas/ModelConnectionRequestParameters" }, "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "status": { "$ref": "#/components/schemas/ModelConnectionStatus" } } },
         "ModelConnectionOptions": { "type": "object", "additionalProperties": false, "required": ["items", "system_default_model_connection_id"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/ModelConnectionOption" } }, "system_default_model_connection_id": { "anyOf": [uuid(), { "type": "null" }] } } },
         "ModelConnectionTestResult": { "type": "object", "additionalProperties": false, "required": ["success", "status_code", "error_code", "message"], "properties": { "success": { "type": "boolean" }, "status_code": { "type": ["integer", "null"], "minimum": 100, "maximum": 599 }, "error_code": { "type": ["string", "null"] }, "message": { "type": ["string", "null"] } } },
         "SystemDefaultModelConnection": { "type": "object", "additionalProperties": false, "required": ["model_connection_id"], "properties": { "model_connection_id": { "anyOf": [uuid(), { "type": "null" }] } } },
@@ -2597,7 +2606,12 @@ async fn list_model_connections(
     let user = require_user(&state, &headers).await?;
     let rows = sqlx::query(
         "SELECT c.id, c.owner_id, c.scope, c.name, c.base_url, c.model_id,
-                c.upstream_protocol,
+                c.upstream_protocol, c.request_parameters,
+                c.reasoning_effort, c.reasoning_summary,
+                c.verbosity, c.context_window_tokens, c.auto_compact_token_limit,
+                c.reasoning_summary_support, c.service_tier,
+                c.request_max_retries, c.stream_max_retries,
+                c.stream_idle_timeout_ms,
                 c.enabled, c.created_at, c.updated_at,
                 EXISTS(
                     SELECT 1 FROM system_default_model_connection d
@@ -2631,6 +2645,8 @@ async fn get_model_connection_options(
             name: connection.name,
             model_id: connection.model_id,
             upstream_protocol: connection.upstream_protocol,
+            parameters: connection.parameters,
+            request_parameters: connection.request_parameters,
             scope: connection.scope,
             status: connection.status,
         })
@@ -2663,6 +2679,13 @@ async fn create_model_connection(
         &req.model_id,
         Some(&req.api_key),
     )?;
+    let parameters = validate_model_connection_parameters(req.parameters)?;
+    let request_parameters = validate_model_connection_request_parameters(
+        req.upstream_protocol,
+        req.request_parameters.unwrap_or_else(|| {
+            ModelConnectionRequestParameters::for_protocol(req.upstream_protocol)
+        }),
+    )?;
     let encrypted = state
         .model_secret_cipher
         .encrypt(&req.api_key)
@@ -2675,8 +2698,13 @@ async fn create_model_connection(
     sqlx::query(
         "INSERT INTO model_connections
              (id, scope, owner_id, name, base_url, model_id, upstream_protocol,
+              request_parameters, reasoning_effort, reasoning_summary, verbosity,
+              context_window_tokens, auto_compact_token_limit,
+              reasoning_summary_support, service_tier, request_max_retries,
+              stream_max_retries, stream_idle_timeout_ms,
               api_key_ciphertext, api_key_nonce, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                 $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)",
     )
     .bind(id)
     .bind(scope)
@@ -2685,6 +2713,26 @@ async fn create_model_connection(
     .bind(fields.base_url)
     .bind(fields.model_id)
     .bind(model_upstream_protocol_name(req.upstream_protocol))
+    .bind(
+        serde_json::to_value(&request_parameters)
+            .map_err(|_| ApiError::internal("model request parameters could not be encoded"))?,
+    )
+    .bind(reasoning_effort_name(parameters.reasoning_effort))
+    .bind(model_reasoning_summary_name(parameters.reasoning_summary))
+    .bind(model_verbosity_name(parameters.verbosity))
+    .bind(parameters.context_window_tokens.map(|value| value as i64))
+    .bind(
+        parameters
+            .auto_compact_token_limit
+            .map(|value| value as i64),
+    )
+    .bind(model_reasoning_summary_support_name(
+        parameters.reasoning_summary_support,
+    ))
+    .bind(parameters.service_tier.as_deref())
+    .bind(parameters.request_max_retries.map(|value| value as i32))
+    .bind(parameters.stream_max_retries.map(|value| value as i32))
+    .bind(parameters.stream_idle_timeout_ms.map(|value| value as i64))
     .bind(encrypted.ciphertext)
     .bind(encrypted.nonce)
     .bind(user.id)
@@ -2728,56 +2776,92 @@ async fn update_model_connection(
         .map_err(|_| ApiError::internal("model secret encryption failed"))?;
     let mut tx = state.pool.begin().await?;
     load_mutable_model_connection_tx(&mut tx, model_connection_id, &user).await?;
-    let previous: (String, String, String) = sqlx::query_as(
-        "SELECT name, model_id, upstream_protocol
+    let previous = sqlx::query(
+        "SELECT name, model_id, upstream_protocol, request_parameters, reasoning_effort,
+                reasoning_summary, verbosity, context_window_tokens,
+                auto_compact_token_limit, reasoning_summary_support,
+                service_tier, request_max_retries, stream_max_retries,
+                stream_idle_timeout_ms
          FROM model_connections WHERE id = $1 FOR UPDATE",
     )
     .bind(model_connection_id)
     .fetch_one(&mut *tx)
     .await?;
-    let upstream_protocol = req
-        .upstream_protocol
-        .unwrap_or_else(|| model_upstream_protocol_from_name(&previous.2));
+    let previous_upstream_protocol =
+        model_upstream_protocol_from_name(&previous.get::<String, _>("upstream_protocol"));
+    let upstream_protocol = req.upstream_protocol.unwrap_or(previous_upstream_protocol);
     let upstream_protocol_name = model_upstream_protocol_name(upstream_protocol);
-    let updated = if let Some(encrypted) = encrypted {
-        sqlx::query(
-            "UPDATE model_connections
-             SET name = $1, base_url = $2, model_id = $3, upstream_protocol = $4,
-                 api_key_ciphertext = $5, api_key_nonce = $6,
-                 updated_at = CURRENT_TIMESTAMP(3)
-             WHERE id = $7 AND deleted_at IS NULL",
-        )
-        .bind(&fields.name)
-        .bind(&fields.base_url)
-        .bind(&fields.model_id)
-        .bind(upstream_protocol_name)
-        .bind(encrypted.ciphertext)
-        .bind(encrypted.nonce)
-        .bind(model_connection_id)
-        .execute(&mut *tx)
-        .await
-    } else {
-        sqlx::query(
-            "UPDATE model_connections
-             SET name = $1, base_url = $2, model_id = $3, upstream_protocol = $4,
-                 updated_at = CURRENT_TIMESTAMP(3)
-             WHERE id = $5 AND deleted_at IS NULL",
-        )
-        .bind(&fields.name)
-        .bind(&fields.base_url)
-        .bind(&fields.model_id)
-        .bind(upstream_protocol_name)
-        .bind(model_connection_id)
-        .execute(&mut *tx)
-        .await
-    }
+    let previous_parameters = model_connection_parameters_from_row(&previous);
+    let previous_request_parameters = model_connection_request_parameters_from_row(&previous);
+    let parameters = req
+        .parameters
+        .map(validate_model_connection_parameters)
+        .transpose()?
+        .unwrap_or_else(|| previous_parameters.clone());
+    let request_parameters = match req.request_parameters {
+        Some(parameters) => {
+            validate_model_connection_request_parameters(upstream_protocol, parameters)?
+        }
+        None if upstream_protocol != previous_upstream_protocol => {
+            ModelConnectionRequestParameters::for_protocol(upstream_protocol)
+        }
+        None => previous_request_parameters.clone(),
+    };
+    let (api_key_ciphertext, api_key_nonce) = encrypted
+        .map(|encrypted| (Some(encrypted.ciphertext), Some(encrypted.nonce)))
+        .unwrap_or((None, None));
+    let updated = sqlx::query(
+        "UPDATE model_connections
+         SET name = $1, base_url = $2, model_id = $3, upstream_protocol = $4,
+             request_parameters = $5,
+             reasoning_effort = $6, reasoning_summary = $7, verbosity = $8,
+             context_window_tokens = $9, auto_compact_token_limit = $10,
+             reasoning_summary_support = $11, service_tier = $12,
+             request_max_retries = $13, stream_max_retries = $14,
+             stream_idle_timeout_ms = $15,
+             api_key_ciphertext = COALESCE($16, api_key_ciphertext),
+             api_key_nonce = COALESCE($17, api_key_nonce),
+             updated_at = CURRENT_TIMESTAMP(3)
+         WHERE id = $18 AND deleted_at IS NULL",
+    )
+    .bind(&fields.name)
+    .bind(&fields.base_url)
+    .bind(&fields.model_id)
+    .bind(upstream_protocol_name)
+    .bind(
+        serde_json::to_value(&request_parameters)
+            .map_err(|_| ApiError::internal("model request parameters could not be encoded"))?,
+    )
+    .bind(reasoning_effort_name(parameters.reasoning_effort))
+    .bind(model_reasoning_summary_name(parameters.reasoning_summary))
+    .bind(model_verbosity_name(parameters.verbosity))
+    .bind(parameters.context_window_tokens.map(|value| value as i64))
+    .bind(
+        parameters
+            .auto_compact_token_limit
+            .map(|value| value as i64),
+    )
+    .bind(model_reasoning_summary_support_name(
+        parameters.reasoning_summary_support,
+    ))
+    .bind(parameters.service_tier.as_deref())
+    .bind(parameters.request_max_retries.map(|value| value as i32))
+    .bind(parameters.stream_max_retries.map(|value| value as i32))
+    .bind(parameters.stream_idle_timeout_ms.map(|value| value as i64))
+    .bind(api_key_ciphertext)
+    .bind(api_key_nonce)
+    .bind(model_connection_id)
+    .execute(&mut *tx)
+    .await
     .map_err(map_model_connection_write_error)?;
     if updated.rows_affected() == 0 {
         return Err(ApiError::not_found("model connection not found"));
     }
-    if previous.0 != fields.name
-        || previous.1 != fields.model_id
-        || previous.2 != upstream_protocol_name
+    if previous.get::<String, _>("name") != fields.name
+        || previous.get::<String, _>("model_id") != fields.model_id
+        || previous.get::<String, _>("upstream_protocol") != upstream_protocol_name
+        || previous_parameters != parameters
+        || previous_request_parameters != request_parameters
     {
         bump_agents_for_model_connection_tx(&mut tx, model_connection_id).await?;
     }
@@ -3047,6 +3131,7 @@ async fn test_model_connection(
         ModelGatewayForwardRequest {
             request_id,
             upstream_protocol: connection.dto.upstream_protocol,
+            request_parameters: &connection.dto.request_parameters,
             upstream_url: &connection.dto.base_url,
             query: None,
             headers: &request_headers,
@@ -3247,6 +3332,125 @@ fn validate_model_connection_fields(
     })
 }
 
+fn validate_model_connection_parameters(
+    mut parameters: ModelConnectionParameters,
+) -> Result<ModelConnectionParameters, ApiError> {
+    let max_database_integer =
+        u64::try_from(i64::MAX).expect("i64 maximum is representable as u64");
+    for (name, value) in [
+        ("context window", parameters.context_window_tokens),
+        (
+            "automatic compact limit",
+            parameters.auto_compact_token_limit,
+        ),
+        ("stream idle timeout", parameters.stream_idle_timeout_ms),
+    ] {
+        if value.is_some_and(|value| value == 0 || value > max_database_integer) {
+            return Err(ApiError::bad_request(format!(
+                "Model Connection {name} must be a positive signed 64-bit integer"
+            )));
+        }
+    }
+    if parameters
+        .context_window_tokens
+        .zip(parameters.auto_compact_token_limit)
+        .is_some_and(|(context_window, compact_limit)| compact_limit > context_window)
+    {
+        return Err(ApiError::bad_request(
+            "Model Connection automatic compact limit cannot exceed the context window",
+        ));
+    }
+    if parameters
+        .request_max_retries
+        .is_some_and(|value| value > 100)
+        || parameters
+            .stream_max_retries
+            .is_some_and(|value| value > 100)
+    {
+        return Err(ApiError::bad_request(
+            "Model Connection retry counts must be between 0 and 100",
+        ));
+    }
+    parameters.service_tier = parameters.service_tier.and_then(|value| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    });
+    if parameters
+        .service_tier
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > 64 || value.chars().any(char::is_control))
+    {
+        return Err(ApiError::bad_request(
+            "Model Connection service tier must not exceed 64 characters or contain controls",
+        ));
+    }
+    Ok(parameters)
+}
+
+fn validate_model_connection_request_parameters(
+    protocol: ModelUpstreamProtocol,
+    parameters: ModelConnectionRequestParameters,
+) -> Result<ModelConnectionRequestParameters, ApiError> {
+    if parameters.protocol() != protocol {
+        return Err(ApiError::bad_request(
+            "Model Connection request parameter protocol must match the upstream protocol",
+        ));
+    }
+    match &parameters {
+        ModelConnectionRequestParameters::OpenaiResponses {} => {}
+        ModelConnectionRequestParameters::OpenaiChatCompletions {
+            temperature,
+            top_p,
+            max_completion_tokens,
+        } => {
+            validate_model_request_number("temperature", temperature.as_ref(), 2.0)?;
+            validate_model_request_number("top_p", top_p.as_ref(), 1.0)?;
+            validate_model_request_token_limit("max_completion_tokens", *max_completion_tokens)?;
+        }
+        ModelConnectionRequestParameters::AnthropicMessages {
+            temperature,
+            top_p,
+            max_tokens,
+        } => {
+            if temperature.is_some() && top_p.is_some() {
+                return Err(ApiError::bad_request(
+                    "Model Connection Anthropic request parameters cannot set both temperature and top_p",
+                ));
+            }
+            validate_model_request_number("temperature", temperature.as_ref(), 1.0)?;
+            validate_model_request_number("top_p", top_p.as_ref(), 1.0)?;
+            validate_model_request_token_limit("max_tokens", *max_tokens)?;
+        }
+    }
+    Ok(parameters)
+}
+
+fn validate_model_request_number(
+    name: &str,
+    value: Option<&Number>,
+    maximum: f64,
+) -> Result<(), ApiError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let value = value.as_f64().filter(|value| value.is_finite());
+    if !value.is_some_and(|value| (0.0..=maximum).contains(&value)) {
+        return Err(ApiError::bad_request(format!(
+            "Model Connection {name} must be a finite number between 0 and {maximum}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_model_request_token_limit(name: &str, value: Option<u32>) -> Result<(), ApiError> {
+    if value == Some(0) {
+        return Err(ApiError::bad_request(format!(
+            "Model Connection {name} must be a positive integer"
+        )));
+    }
+    Ok(())
+}
+
 fn model_connection_from_row(row: &sqlx::postgres::PgRow) -> ModelConnectionDto {
     ModelConnectionDto {
         id: row.get("id"),
@@ -3261,6 +3465,8 @@ fn model_connection_from_row(row: &sqlx::postgres::PgRow) -> ModelConnectionDto 
         upstream_protocol: model_upstream_protocol_from_name(
             &row.get::<String, _>("upstream_protocol"),
         ),
+        parameters: model_connection_parameters_from_row(row),
+        request_parameters: model_connection_request_parameters_from_row(row),
         status: if row.get("enabled") {
             ModelConnectionStatus::Enabled
         } else {
@@ -3272,6 +3478,51 @@ fn model_connection_from_row(row: &sqlx::postgres::PgRow) -> ModelConnectionDto 
     }
 }
 
+fn model_connection_request_parameters_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> ModelConnectionRequestParameters {
+    serde_json::from_value(row.get::<Value, _>("request_parameters"))
+        .expect("request parameters are constrained by the Model Connection contract")
+}
+
+fn model_connection_request_parameters_value(
+    parameters: &ModelConnectionRequestParameters,
+) -> Value {
+    serde_json::to_value(parameters)
+        .expect("validated Model Connection request parameters are serializable")
+}
+
+fn model_connection_parameters_from_row(row: &sqlx::postgres::PgRow) -> ModelConnectionParameters {
+    ModelConnectionParameters {
+        reasoning_effort: reasoning_effort_from_name(&row.get::<String, _>("reasoning_effort")),
+        reasoning_summary: model_reasoning_summary_from_name(
+            &row.get::<String, _>("reasoning_summary"),
+        ),
+        verbosity: model_verbosity_from_name(&row.get::<String, _>("verbosity")),
+        context_window_tokens: row
+            .get::<Option<i64>, _>("context_window_tokens")
+            .map(|value| u64::try_from(value).expect("context window is constrained positive")),
+        auto_compact_token_limit: row
+            .get::<Option<i64>, _>("auto_compact_token_limit")
+            .map(|value| u64::try_from(value).expect("compact limit is constrained positive")),
+        reasoning_summary_support: model_reasoning_summary_support_from_name(
+            &row.get::<String, _>("reasoning_summary_support"),
+        ),
+        service_tier: row.get("service_tier"),
+        request_max_retries: row
+            .get::<Option<i32>, _>("request_max_retries")
+            .map(|value| u32::try_from(value).expect("request retries are constrained")),
+        stream_max_retries: row
+            .get::<Option<i32>, _>("stream_max_retries")
+            .map(|value| u32::try_from(value).expect("stream retries are constrained")),
+        stream_idle_timeout_ms: row
+            .get::<Option<i64>, _>("stream_idle_timeout_ms")
+            .map(|value| {
+                u64::try_from(value).expect("stream idle timeout is constrained positive")
+            }),
+    }
+}
+
 async fn load_visible_model_connection(
     pool: &PgPool,
     model_connection_id: Uuid,
@@ -3279,7 +3530,12 @@ async fn load_visible_model_connection(
 ) -> Result<ModelConnectionDto, ApiError> {
     let row = sqlx::query(
         "SELECT c.id, c.owner_id, c.scope, c.name, c.base_url, c.model_id,
-                c.upstream_protocol,
+                c.upstream_protocol, c.request_parameters,
+                c.reasoning_effort, c.reasoning_summary,
+                c.verbosity, c.context_window_tokens, c.auto_compact_token_limit,
+                c.reasoning_summary_support, c.service_tier,
+                c.request_max_retries, c.stream_max_retries,
+                c.stream_idle_timeout_ms,
                 c.enabled, c.created_at, c.updated_at,
                 EXISTS(
                     SELECT 1 FROM system_default_model_connection d
@@ -3359,7 +3615,12 @@ async fn load_model_connection_secret_for_test(
     authorize_model_connection_mutation(pool, model_connection_id, user).await?;
     let row = sqlx::query(
         "SELECT c.id, c.owner_id, c.scope, c.name, c.base_url, c.model_id,
-                c.upstream_protocol,
+                c.upstream_protocol, c.request_parameters,
+                c.reasoning_effort, c.reasoning_summary,
+                c.verbosity, c.context_window_tokens, c.auto_compact_token_limit,
+                c.reasoning_summary_support, c.service_tier,
+                c.request_max_retries, c.stream_max_retries,
+                c.stream_idle_timeout_ms,
                 c.enabled, c.created_at, c.updated_at,
                 c.api_key_ciphertext, c.api_key_nonce,
                 EXISTS(
@@ -3454,12 +3715,13 @@ async fn record_model_test_usage(
              (id, request_id, response_status, model_connection_id,
               model_connection_scope_snapshot, model_connection_name_snapshot,
               model_id_snapshot, upstream_protocol_snapshot,
+              request_parameters_snapshot,
               agent_id, agent_name_snapshot,
               subject_type, subject_user_id, subject_display_name_snapshot,
               input_tokens, output_tokens, total_tokens, cached_tokens,
               reasoning_tokens)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NULL,
-                 'user', $9, $10, $11, $12, $13, $14, $15)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NULL,
+                 'user', $10, $11, $12, $13, $14, $15, $16)",
     )
     .bind(Uuid::new_v4())
     .bind(request_id)
@@ -3469,6 +3731,9 @@ async fn record_model_test_usage(
     .bind(&connection.name)
     .bind(&connection.model_id)
     .bind(model_upstream_protocol_name(connection.upstream_protocol))
+    .bind(model_connection_request_parameters_value(
+        &connection.request_parameters,
+    ))
     .bind(user.id)
     .bind(&user.display_name)
     .bind(usage.input_tokens)
@@ -3499,10 +3764,11 @@ async fn record_model_test_error(
               error_kind, error_code, message, model_connection_id,
               model_connection_scope_snapshot, model_connection_name_snapshot,
               model_id_snapshot, upstream_protocol_snapshot,
+              request_parameters_snapshot,
               agent_id, agent_name_snapshot,
               subject_type, subject_user_id, subject_display_name_snapshot)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                 NULL, NULL, 'user', $13, $14)",
+                 $13, NULL, NULL, 'user', $14, $15)",
     )
     .bind(Uuid::new_v4())
     .bind(request_id)
@@ -3516,6 +3782,9 @@ async fn record_model_test_error(
     .bind(&connection.name)
     .bind(&connection.model_id)
     .bind(model_upstream_protocol_name(connection.upstream_protocol))
+    .bind(model_connection_request_parameters_value(
+        &connection.request_parameters,
+    ))
     .bind(user.id)
     .bind(&user.display_name)
     .execute(pool)
@@ -3533,6 +3802,7 @@ fn model_connection_scope_name(scope: ModelConnectionScope) -> &'static str {
 fn model_upstream_protocol_name(protocol: ModelUpstreamProtocol) -> &'static str {
     match protocol {
         ModelUpstreamProtocol::OpenaiResponses => "openai_responses",
+        ModelUpstreamProtocol::OpenaiChatCompletions => "openai_chat_completions",
         ModelUpstreamProtocol::AnthropicMessages => "anthropic_messages",
     }
 }
@@ -3540,6 +3810,7 @@ fn model_upstream_protocol_name(protocol: ModelUpstreamProtocol) -> &'static str
 fn model_upstream_protocol_from_name(value: &str) -> ModelUpstreamProtocol {
     match value {
         "openai_responses" => ModelUpstreamProtocol::OpenaiResponses,
+        "openai_chat_completions" => ModelUpstreamProtocol::OpenaiChatCompletions,
         "anthropic_messages" => ModelUpstreamProtocol::AnthropicMessages,
         _ => unreachable!("model upstream protocol is constrained"),
     }
@@ -4181,7 +4452,11 @@ async fn get_agent_model_connection_options(
     let user = require_user(&state, &headers).await?;
     let agent = load_agent_manageable_by_user(&state.pool, agent_id, &user).await?;
     let rows = sqlx::query(
-        "SELECT id, name, model_id, upstream_protocol, scope, enabled
+        "SELECT id, name, model_id, upstream_protocol, request_parameters, reasoning_effort,
+                reasoning_summary, verbosity, context_window_tokens,
+                auto_compact_token_limit, reasoning_summary_support,
+                service_tier, request_max_retries, stream_max_retries,
+                stream_idle_timeout_ms, scope, enabled
          FROM model_connections
          WHERE deleted_at IS NULL
            AND (scope = 'global' OR owner_id = $1)
@@ -4199,6 +4474,8 @@ async fn get_agent_model_connection_options(
             upstream_protocol: model_upstream_protocol_from_name(
                 &row.get::<String, _>("upstream_protocol"),
             ),
+            parameters: model_connection_parameters_from_row(&row),
+            request_parameters: model_connection_request_parameters_from_row(&row),
             scope: if row.get::<String, _>("scope") == "global" {
                 ModelConnectionScope::Global
             } else {
@@ -9927,18 +10204,30 @@ async fn runtime_claim_run(
         .iter()
         .map(|connection| model_upstream_protocol_name(connection.upstream_protocol))
         .collect::<Vec<_>>();
+    let selected_request_parameters = execution_configuration
+        .model_connections
+        .iter()
+        .map(|connection| {
+            serde_json::to_string(&connection.request_parameters)
+                .map_err(|_| ApiError::internal("model request parameters could not be encoded"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     sqlx::query(
         "INSERT INTO run_model_connection_snapshots
-             (run_id, model_connection_id, model_id, upstream_protocol)
-         SELECT $1, selected.model_connection_id, selected.model_id, selected.upstream_protocol
-         FROM unnest($2::uuid[], $3::text[], $4::text[])
-              AS selected(model_connection_id, model_id, upstream_protocol)
+             (run_id, model_connection_id, model_id, upstream_protocol, request_parameters)
+         SELECT $1, selected.model_connection_id, selected.model_id,
+                selected.upstream_protocol, selected.request_parameters::jsonb
+         FROM unnest($2::uuid[], $3::text[], $4::text[], $5::text[])
+              AS selected(
+                  model_connection_id, model_id, upstream_protocol, request_parameters
+              )
          ON CONFLICT (run_id, model_connection_id) DO NOTHING",
     )
     .bind(run_id)
     .bind(&selected_model_connection_ids)
     .bind(&selected_model_ids)
     .bind(&selected_upstream_protocols)
+    .bind(&selected_request_parameters)
     .execute(&mut *tx)
     .await?;
     let expected_configuration_fingerprint =
@@ -10827,11 +11116,13 @@ async fn runtime_model_proxy(
             "request model does not match the selected Model Connection",
         ));
     }
+    let request_parameters = resolved.accounting.request_parameters.clone();
     proxy_model_request_to_upstream_with_options(
         &state,
         ModelProxyForwardRequest {
             upstream_url: resolved.upstream_url,
             upstream_protocol: resolved.accounting.upstream_protocol,
+            request_parameters,
             path,
             query: uri.query().map(str::to_owned),
             headers,
@@ -10858,6 +11149,7 @@ struct ModelProxyAccountingContext {
     model_connection_name: String,
     model_id: String,
     upstream_protocol: ModelUpstreamProtocol,
+    request_parameters: ModelConnectionRequestParameters,
     agent_id: Uuid,
     agent_name: String,
     subject_type: String,
@@ -10878,6 +11170,7 @@ async fn resolve_model_proxy_request(
         "SELECT c.id AS model_connection_id, c.scope AS model_connection_scope,
                 c.name AS model_connection_name, c.base_url,
                 selected_model.model_id, selected_model.upstream_protocol,
+                selected_model.request_parameters,
                 c.api_key_ciphertext, c.api_key_nonce,
                 a.id AS agent_id, a.name AS agent_name,
                 r.model_subject_type,
@@ -10943,6 +11236,7 @@ async fn resolve_model_proxy_request(
     let model_id: String = row.get("model_id");
     let upstream_protocol_name: String = row.get("upstream_protocol");
     let upstream_protocol = model_upstream_protocol_from_name(&upstream_protocol_name);
+    let request_parameters = model_connection_request_parameters_from_row(&row);
     Ok(ResolvedModelProxyRequest {
         upstream_url: row.get("base_url"),
         model_id: model_id.clone(),
@@ -10954,6 +11248,7 @@ async fn resolve_model_proxy_request(
             model_connection_name: row.get("model_connection_name"),
             model_id,
             upstream_protocol,
+            request_parameters,
             agent_id: row.get("agent_id"),
             agent_name: row.get("agent_name"),
             subject_type: row.get("model_subject_type"),
@@ -10972,6 +11267,7 @@ fn model_proxy_path_supported(path: &str) -> bool {
 struct ModelProxyForwardRequest {
     upstream_url: String,
     upstream_protocol: ModelUpstreamProtocol,
+    request_parameters: ModelConnectionRequestParameters,
     path: String,
     query: Option<String>,
     headers: HeaderMap,
@@ -10984,6 +11280,7 @@ struct ModelProxyForwardRequest {
 struct ModelGatewayRequestEnvelope<'a> {
     request_id: String,
     protocol: ModelUpstreamProtocol,
+    request_parameters: &'a ModelConnectionRequestParameters,
     endpoint: &'a str,
     api_key: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10996,6 +11293,7 @@ struct ModelGatewayRequestEnvelope<'a> {
 struct ModelGatewayForwardRequest<'a> {
     request_id: Uuid,
     upstream_protocol: ModelUpstreamProtocol,
+    request_parameters: &'a ModelConnectionRequestParameters,
     upstream_url: &'a str,
     query: Option<&'a str>,
     headers: &'a HeaderMap,
@@ -11010,6 +11308,7 @@ async fn send_model_gateway_request(
     let ModelGatewayForwardRequest {
         request_id,
         upstream_protocol,
+        request_parameters,
         upstream_url,
         query,
         headers,
@@ -11028,6 +11327,7 @@ async fn send_model_gateway_request(
     let envelope = ModelGatewayRequestEnvelope {
         request_id: request_id.to_string(),
         protocol: upstream_protocol,
+        request_parameters,
         endpoint: upstream_url,
         api_key,
         query: query.filter(|query| !query.is_empty()),
@@ -11055,6 +11355,7 @@ async fn proxy_model_request_to_upstream(
         ModelProxyForwardRequest {
             upstream_url: upstream_url.to_owned(),
             upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
+            request_parameters: ModelConnectionRequestParameters::default(),
             path: path.to_owned(),
             query: None,
             headers: HeaderMap::new(),
@@ -11073,6 +11374,7 @@ async fn proxy_model_request_to_upstream_with_options(
     let ModelProxyForwardRequest {
         upstream_url,
         upstream_protocol,
+        request_parameters,
         path,
         query,
         headers,
@@ -11099,6 +11401,7 @@ async fn proxy_model_request_to_upstream_with_options(
         ModelGatewayForwardRequest {
             request_id,
             upstream_protocol,
+            request_parameters: &request_parameters,
             upstream_url: &upstream_url,
             query: query.as_deref(),
             headers: &upstream_headers,
@@ -11663,6 +11966,7 @@ async fn try_persist_model_proxy_observation(
                  (id, request_id, response_status, model_connection_id,
                   model_connection_scope_snapshot, model_connection_name_snapshot,
                   model_id_snapshot, upstream_protocol_snapshot,
+                  request_parameters_snapshot,
                   agent_id, agent_name_snapshot,
                   subject_type, subject_user_id, subject_display_name_snapshot,
                   source_integration_app_id, source_integration_app_name_snapshot,
@@ -11671,11 +11975,11 @@ async fn try_persist_model_proxy_observation(
              VALUES (
                  $1, $2, $3,
                  (SELECT id FROM model_connections WHERE id = $4),
-                 $5, $6, $7, $8,
-                 (SELECT id FROM agents WHERE id = $9), $10,
-                 $11, (SELECT id FROM users WHERE id = $12), $13,
-                 (SELECT id FROM oauth_apps WHERE id = $14), $15,
-                 $16, $17, $18, $19, $20
+                 $5, $6, $7, $8, $9,
+                 (SELECT id FROM agents WHERE id = $10), $11,
+                 $12, (SELECT id FROM users WHERE id = $13), $14,
+                 (SELECT id FROM oauth_apps WHERE id = $15), $16,
+                 $17, $18, $19, $20, $21
              )
              ON CONFLICT (request_id) DO NOTHING",
         )
@@ -11687,6 +11991,9 @@ async fn try_persist_model_proxy_observation(
         .bind(&context.model_connection_name)
         .bind(&context.model_id)
         .bind(model_upstream_protocol_name(context.upstream_protocol))
+        .bind(model_connection_request_parameters_value(
+            &context.request_parameters,
+        ))
         .bind(context.agent_id)
         .bind(&context.agent_name)
         .bind(&context.subject_type)
@@ -11709,16 +12016,17 @@ async fn try_persist_model_proxy_observation(
                   error_kind, error_code, message, model_connection_id,
                   model_connection_scope_snapshot, model_connection_name_snapshot,
                   model_id_snapshot, upstream_protocol_snapshot,
+                  request_parameters_snapshot,
                   agent_id, agent_name_snapshot,
                   subject_type, subject_user_id, subject_display_name_snapshot,
                   source_integration_app_id, source_integration_app_name_snapshot)
              VALUES (
                  $1, $2, $3, $4, $5, $6, $7,
                  (SELECT id FROM model_connections WHERE id = $8),
-                 $9, $10, $11, $12,
-                 (SELECT id FROM agents WHERE id = $13), $14,
-                 $15, (SELECT id FROM users WHERE id = $16), $17,
-                 (SELECT id FROM oauth_apps WHERE id = $18), $19
+                 $9, $10, $11, $12, $13,
+                 (SELECT id FROM agents WHERE id = $14), $15,
+                 $16, (SELECT id FROM users WHERE id = $17), $18,
+                 (SELECT id FROM oauth_apps WHERE id = $19), $20
              )
              ON CONFLICT (request_id) DO NOTHING",
         )
@@ -11734,6 +12042,9 @@ async fn try_persist_model_proxy_observation(
         .bind(&context.model_connection_name)
         .bind(&context.model_id)
         .bind(model_upstream_protocol_name(context.upstream_protocol))
+        .bind(model_connection_request_parameters_value(
+            &context.request_parameters,
+        ))
         .bind(context.agent_id)
         .bind(&context.agent_name)
         .bind(&context.subject_type)
@@ -14073,6 +14384,60 @@ fn reasoning_effort_from_name(value: &str) -> ReasoningEffort {
     }
 }
 
+fn model_reasoning_summary_name(summary: ModelReasoningSummary) -> &'static str {
+    match summary {
+        ModelReasoningSummary::Default => "default",
+        ModelReasoningSummary::Auto => "auto",
+        ModelReasoningSummary::Concise => "concise",
+        ModelReasoningSummary::Detailed => "detailed",
+        ModelReasoningSummary::None => "none",
+    }
+}
+
+fn model_reasoning_summary_from_name(value: &str) -> ModelReasoningSummary {
+    match value {
+        "auto" => ModelReasoningSummary::Auto,
+        "concise" => ModelReasoningSummary::Concise,
+        "detailed" => ModelReasoningSummary::Detailed,
+        "none" => ModelReasoningSummary::None,
+        _ => ModelReasoningSummary::Default,
+    }
+}
+
+fn model_verbosity_name(verbosity: ModelVerbosity) -> &'static str {
+    match verbosity {
+        ModelVerbosity::Default => "default",
+        ModelVerbosity::Low => "low",
+        ModelVerbosity::Medium => "medium",
+        ModelVerbosity::High => "high",
+    }
+}
+
+fn model_verbosity_from_name(value: &str) -> ModelVerbosity {
+    match value {
+        "low" => ModelVerbosity::Low,
+        "medium" => ModelVerbosity::Medium,
+        "high" => ModelVerbosity::High,
+        _ => ModelVerbosity::Default,
+    }
+}
+
+fn model_reasoning_summary_support_name(support: ModelReasoningSummarySupport) -> &'static str {
+    match support {
+        ModelReasoningSummarySupport::Auto => "auto",
+        ModelReasoningSummarySupport::Supported => "supported",
+        ModelReasoningSummarySupport::Unsupported => "unsupported",
+    }
+}
+
+fn model_reasoning_summary_support_from_name(value: &str) -> ModelReasoningSummarySupport {
+    match value {
+        "supported" => ModelReasoningSummarySupport::Supported,
+        "unsupported" => ModelReasoningSummarySupport::Unsupported,
+        _ => ModelReasoningSummarySupport::Auto,
+    }
+}
+
 fn codex_subagent_from_row(row: sqlx::postgres::PgRow) -> CodexSubagentDefinition {
     CodexSubagentDefinition {
         name: row.get("name"),
@@ -14377,6 +14742,8 @@ fn build_agent_execution_configuration(
             upstream_protocol: model_upstream_protocol_from_name(
                 &row.get::<String, _>("upstream_protocol"),
             ),
+            parameters: model_connection_parameters_from_row(&row),
+            request_parameters: model_connection_request_parameters_from_row(&row),
             scope: if row.get::<String, _>("scope") == "global" {
                 ModelConnectionScope::Global
             } else {
@@ -14454,7 +14821,11 @@ async fn load_execution_model_connections_tx(
     }
     let ids = ids.into_iter().collect::<Vec<_>>();
     let rows = sqlx::query(
-        "SELECT id, name, model_id, upstream_protocol, scope
+        "SELECT id, name, model_id, upstream_protocol, request_parameters, reasoning_effort,
+                reasoning_summary, verbosity, context_window_tokens,
+                auto_compact_token_limit, reasoning_summary_support,
+                service_tier, request_max_retries, stream_max_retries,
+                stream_idle_timeout_ms, scope
          FROM model_connections
          WHERE id = ANY($1) AND enabled = true AND deleted_at IS NULL
            AND (scope = 'global' OR owner_id = $2)
@@ -17191,6 +17562,7 @@ mod tests {
     struct TestModelGatewayEnvelope {
         request_id: String,
         protocol: ModelUpstreamProtocol,
+        request_parameters: ModelConnectionRequestParameters,
         endpoint: String,
         api_key: String,
         query: Option<String>,
@@ -17387,6 +17759,57 @@ mod tests {
         assert_eq!(foreign_user.status, StatusCode::FORBIDDEN);
     }
 
+    #[test]
+    fn model_request_parameters_validate_protocol_and_ranges() {
+        let chat = serde_json::from_value(json!({
+            "protocol": "openai_chat_completions",
+            "temperature": 1.5,
+            "top_p": 0.8,
+            "max_completion_tokens": 4096
+        }))
+        .unwrap();
+        assert!(validate_model_connection_request_parameters(
+            ModelUpstreamProtocol::OpenaiChatCompletions,
+            chat,
+        )
+        .is_ok());
+
+        let mismatched = validate_model_connection_request_parameters(
+            ModelUpstreamProtocol::AnthropicMessages,
+            ModelConnectionRequestParameters::default(),
+        )
+        .unwrap_err();
+        assert_eq!(mismatched.status, StatusCode::BAD_REQUEST);
+
+        let invalid_temperature = serde_json::from_value(json!({
+            "protocol": "anthropic_messages",
+            "temperature": 1.1,
+            "top_p": null,
+            "max_tokens": null
+        }))
+        .unwrap();
+        let invalid_temperature = validate_model_connection_request_parameters(
+            ModelUpstreamProtocol::AnthropicMessages,
+            invalid_temperature,
+        )
+        .unwrap_err();
+        assert_eq!(invalid_temperature.status, StatusCode::BAD_REQUEST);
+
+        let mutually_exclusive_sampling = serde_json::from_value(json!({
+            "protocol": "anthropic_messages",
+            "temperature": 0.4,
+            "top_p": 0.9,
+            "max_tokens": 4096
+        }))
+        .unwrap();
+        let mutually_exclusive_sampling = validate_model_connection_request_parameters(
+            ModelUpstreamProtocol::AnthropicMessages,
+            mutually_exclusive_sampling,
+        )
+        .unwrap_err();
+        assert_eq!(mutually_exclusive_sampling.status, StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn openapi_is_public_json_and_only_documents_registered_routes() {
         let document = openapi_document();
@@ -17498,7 +17921,38 @@ mod tests {
         );
         assert_eq!(
             document["components"]["schemas"]["ModelUpstreamProtocol"]["enum"],
-            json!(["openai_responses", "anthropic_messages"])
+            json!([
+                "openai_responses",
+                "openai_chat_completions",
+                "anthropic_messages"
+            ])
+        );
+        assert_eq!(
+            document["components"]["schemas"]["ModelReasoningSummary"]["enum"],
+            json!(["default", "auto", "concise", "detailed", "none"])
+        );
+        assert_eq!(
+            document["components"]["schemas"]["ModelVerbosity"]["enum"],
+            json!(["default", "low", "medium", "high"])
+        );
+        assert_eq!(
+            document["components"]["schemas"]["ModelReasoningSummarySupport"]["enum"],
+            json!(["auto", "supported", "unsupported"])
+        );
+        assert_eq!(
+            document["components"]["schemas"]["ModelConnectionRequestParameters"]["oneOf"][2]
+                ["not"]["required"],
+            json!(["temperature", "top_p"])
+        );
+        let parameters = &document["components"]["schemas"]["ModelConnectionParameters"];
+        assert_eq!(parameters["additionalProperties"], false);
+        assert_eq!(
+            parameters["properties"]["request_max_retries"]["maximum"],
+            100
+        );
+        assert_eq!(
+            parameters["properties"]["stream_idle_timeout_ms"]["minimum"],
+            1
         );
         for schema in [
             "ModelConnection",
@@ -17512,6 +17966,24 @@ mod tests {
                     ["$ref"],
                 "#/components/schemas/ModelUpstreamProtocol",
                 "missing upstream protocol from {schema}"
+            );
+        }
+        for schema in [
+            "ModelConnection",
+            "CreateModelConnectionRequest",
+            "UpdateModelConnectionRequest",
+            "ModelConnectionOption",
+        ] {
+            assert_eq!(
+                document["components"]["schemas"][schema]["properties"]["parameters"]["$ref"],
+                "#/components/schemas/ModelConnectionParameters",
+                "missing detailed parameters from {schema}"
+            );
+            assert_eq!(
+                document["components"]["schemas"][schema]["properties"]["request_parameters"]
+                    ["$ref"],
+                "#/components/schemas/ModelConnectionRequestParameters",
+                "missing protocol request parameters from {schema}"
             );
         }
         let update_agent = &document["components"]["schemas"]["UpdateAgentRequest"];
@@ -32000,6 +32472,10 @@ mod tests {
             ModelUpstreamProtocol::OpenaiResponses
         );
         assert_eq!(
+            captured.envelope.request_parameters,
+            ModelConnectionRequestParameters::default()
+        );
+        assert_eq!(
             captured.envelope.endpoint,
             format!("http://{address}/provider")
         );
@@ -32044,6 +32520,21 @@ mod tests {
                 fixture.agent_id
             )
         );
+        for table_and_column in [
+            ("run_model_connection_snapshots", "request_parameters"),
+            ("model_token_usage", "request_parameters_snapshot"),
+        ] {
+            let sql = format!(
+                "SELECT {} FROM {} WHERE model_connection_id = $1",
+                table_and_column.1, table_and_column.0
+            );
+            let snapshot: Value = sqlx::query_scalar(&sql)
+                .bind(fixture.model_connection_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+            assert_eq!(snapshot, json!({ "protocol": "openai_responses" }));
+        }
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM model_call_errors WHERE model_connection_id = $1",
@@ -32155,7 +32646,14 @@ mod tests {
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
         sqlx::query(
             "UPDATE model_connections
-             SET base_url = $1, upstream_protocol = 'anthropic_messages'
+             SET base_url = $1,
+                 upstream_protocol = 'anthropic_messages',
+                 request_parameters = '{
+                     \"protocol\": \"anthropic_messages\",
+                     \"temperature\": null,
+                     \"top_p\": null,
+                     \"max_tokens\": null
+                 }'::jsonb
              WHERE id = $2",
         )
         .bind(format!("http://{address}/provider"))
@@ -33092,6 +33590,10 @@ mod tests {
         assert_eq!(headers[header::AUTHORIZATION], "Bearer test-gateway-token");
         assert!(Uuid::parse_str(&envelope.request_id).is_ok());
         assert_eq!(envelope.protocol, ModelUpstreamProtocol::OpenaiResponses);
+        assert_eq!(
+            envelope.request_parameters,
+            ModelConnectionRequestParameters::default()
+        );
         assert_eq!(envelope.endpoint, "https://provider.example/custom");
         assert_eq!(envelope.api_key, "test-provider-secret");
         assert_eq!(envelope.query, None);
@@ -37627,6 +38129,8 @@ mod tests {
                 base_url: default_connection.base_url.clone(),
                 model_id: updated_model_id.clone(),
                 upstream_protocol: None,
+                parameters: None,
+                request_parameters: None,
                 api_key: None,
             }),
         )
@@ -37641,7 +38145,43 @@ mod tests {
             .any(|model| model.id == default_connection.id && model.model_id == updated_model_id));
         assert_ne!(after_model_fingerprint, after_fingerprint);
 
-        let revision_before_force = after_model.revision;
+        let _ = update_model_connection(
+            State(state.clone()),
+            session_headers(&owner_token),
+            Path(default_connection.id),
+            Json(UpdateModelConnectionRequest {
+                name: default_connection.name.clone(),
+                base_url: default_connection.base_url.clone(),
+                model_id: updated_model_id,
+                upstream_protocol: None,
+                parameters: Some(ModelConnectionParameters {
+                    reasoning_summary: ModelReasoningSummary::Concise,
+                    context_window_tokens: Some(128_000),
+                    auto_compact_token_limit: Some(96_000),
+                    ..ModelConnectionParameters::default()
+                }),
+                request_parameters: None,
+                api_key: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let (after_parameters, after_parameters_fingerprint) =
+            load_test_execution_configuration(&pool, agent.id).await;
+        assert_eq!(after_parameters.revision, after_model.revision + 1);
+        assert_eq!(
+            after_parameters
+                .model_connections
+                .iter()
+                .find(|connection| connection.id == default_connection.id)
+                .unwrap()
+                .parameters
+                .reasoning_summary,
+            ModelReasoningSummary::Concise
+        );
+        assert_ne!(after_parameters_fingerprint, after_model_fingerprint);
+
+        let revision_before_force = after_parameters.revision;
         force_delete_model_connection(
             State(state.clone()),
             session_headers(&owner_token),
@@ -37801,6 +38341,19 @@ mod tests {
                 base_url: "http://169.254.169.254/latest".into(),
                 model_id: "local-model".into(),
                 upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
+                parameters: ModelConnectionParameters {
+                    reasoning_effort: ReasoningEffort::High,
+                    reasoning_summary: ModelReasoningSummary::Detailed,
+                    verbosity: ModelVerbosity::Low,
+                    context_window_tokens: Some(200_000),
+                    auto_compact_token_limit: Some(160_000),
+                    reasoning_summary_support: ModelReasoningSummarySupport::Supported,
+                    service_tier: Some(" priority ".into()),
+                    request_max_retries: Some(7),
+                    stream_max_retries: Some(9),
+                    stream_idle_timeout_ms: Some(420_000),
+                },
+                request_parameters: None,
                 api_key: "personal-secret".into(),
             }),
         )
@@ -37812,6 +38365,11 @@ mod tests {
         assert_eq!(
             personal.upstream_protocol,
             ModelUpstreamProtocol::OpenaiResponses
+        );
+        assert_eq!(personal.parameters.reasoning_effort, ReasoningEffort::High);
+        assert_eq!(
+            personal.parameters.service_tier.as_deref(),
+            Some("priority")
         );
         assert!(!serde_json::to_string(&personal)
             .unwrap()
@@ -37837,6 +38395,23 @@ mod tests {
                 base_url: "https://models.internal.example/business".into(),
                 model_id: "local-model-2".into(),
                 upstream_protocol: Some(ModelUpstreamProtocol::AnthropicMessages),
+                parameters: Some(ModelConnectionParameters {
+                    reasoning_effort: ReasoningEffort::Low,
+                    reasoning_summary: ModelReasoningSummary::Concise,
+                    verbosity: ModelVerbosity::High,
+                    context_window_tokens: Some(128_000),
+                    auto_compact_token_limit: Some(96_000),
+                    reasoning_summary_support: ModelReasoningSummarySupport::Unsupported,
+                    service_tier: Some("flex".into()),
+                    request_max_retries: Some(2),
+                    stream_max_retries: Some(3),
+                    stream_idle_timeout_ms: Some(300_000),
+                }),
+                request_parameters: Some(ModelConnectionRequestParameters::AnthropicMessages {
+                    temperature: Number::from_f64(0.4),
+                    top_p: None,
+                    max_tokens: Some(8192),
+                }),
                 api_key: None,
             }),
         )
@@ -37848,6 +38423,16 @@ mod tests {
             updated.upstream_protocol,
             ModelUpstreamProtocol::AnthropicMessages
         );
+        assert_eq!(updated.parameters.reasoning_effort, ReasoningEffort::Low);
+        assert_eq!(updated.parameters.verbosity, ModelVerbosity::High);
+        assert_eq!(
+            updated.request_parameters,
+            ModelConnectionRequestParameters::AnthropicMessages {
+                temperature: Number::from_f64(0.4),
+                top_p: None,
+                max_tokens: Some(8192),
+            }
+        );
         let preserved = update_model_connection(
             State(state.clone()),
             member_headers.clone(),
@@ -37857,6 +38442,8 @@ mod tests {
                 base_url: updated.base_url.clone(),
                 model_id: updated.model_id.clone(),
                 upstream_protocol: None,
+                parameters: None,
+                request_parameters: None,
                 api_key: None,
             }),
         )
@@ -37867,6 +38454,29 @@ mod tests {
             preserved.upstream_protocol,
             ModelUpstreamProtocol::AnthropicMessages
         );
+        assert_eq!(preserved.parameters, updated.parameters);
+        assert_eq!(preserved.request_parameters, updated.request_parameters);
+        let mismatched = update_model_connection(
+            State(state.clone()),
+            member_headers.clone(),
+            Path(personal.id),
+            Json(UpdateModelConnectionRequest {
+                name: preserved.name.clone(),
+                base_url: preserved.base_url.clone(),
+                model_id: preserved.model_id.clone(),
+                upstream_protocol: None,
+                parameters: None,
+                request_parameters: Some(ModelConnectionRequestParameters::OpenaiChatCompletions {
+                    temperature: None,
+                    top_p: None,
+                    max_completion_tokens: None,
+                }),
+                api_key: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(mismatched.status, StatusCode::BAD_REQUEST);
         let stored_after: (Vec<u8>, Vec<u8>) = sqlx::query_as(
             "SELECT api_key_ciphertext, api_key_nonce
              FROM model_connections WHERE id = $1",
@@ -37886,6 +38496,8 @@ mod tests {
                 base_url: "https://example.com".into(),
                 model_id: "global-model".into(),
                 upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
+                parameters: ModelConnectionParameters::default(),
+                request_parameters: None,
                 api_key: "global-secret".into(),
             }),
         )
@@ -37902,6 +38514,8 @@ mod tests {
                 base_url: "https://example.com/provider".into(),
                 model_id: "global-model".into(),
                 upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
+                parameters: ModelConnectionParameters::default(),
+                request_parameters: None,
                 api_key: "global-secret".into(),
             }),
         )
@@ -37980,6 +38594,38 @@ mod tests {
                     base_url: invalid_url.into(),
                     model_id: "local-model".into(),
                     upstream_protocol: None,
+                    parameters: None,
+                    request_parameters: None,
+                    api_key: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        }
+
+        for parameters in [
+            ModelConnectionParameters {
+                context_window_tokens: Some(100_000),
+                auto_compact_token_limit: Some(100_001),
+                ..ModelConnectionParameters::default()
+            },
+            ModelConnectionParameters {
+                request_max_retries: Some(101),
+                ..ModelConnectionParameters::default()
+            },
+        ] {
+            let error = update_model_connection(
+                State(state.clone()),
+                member_headers.clone(),
+                Path(personal.id),
+                Json(UpdateModelConnectionRequest {
+                    name: personal.name.clone(),
+                    base_url: personal.base_url.clone(),
+                    model_id: personal.model_id.clone(),
+                    upstream_protocol: None,
+                    parameters: Some(parameters),
+                    request_parameters: None,
                     api_key: None,
                 }),
             )
@@ -38006,6 +38652,8 @@ mod tests {
                 base_url: "http://127.0.0.1:1".into(),
                 model_id: "referenced-model".into(),
                 upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
+                parameters: ModelConnectionParameters::default(),
+                request_parameters: None,
                 api_key: "referenced-secret".into(),
             }),
         )
@@ -38208,6 +38856,8 @@ mod tests {
                 base_url: format!("http://{address}/ok"),
                 model_id: "test-model".into(),
                 upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
+                parameters: ModelConnectionParameters::default(),
+                request_parameters: None,
                 api_key: "provider-secret".into(),
             }),
         )
@@ -38244,6 +38894,8 @@ mod tests {
                 base_url: format!("http://{address}/fail"),
                 model_id: "test-model".into(),
                 upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
+                parameters: ModelConnectionParameters::default(),
+                request_parameters: None,
                 api_key: "provider-secret".into(),
             }),
         )
@@ -38314,6 +38966,8 @@ mod tests {
                 base_url: format!("http://{address}/broken"),
                 model_id: "test-model".into(),
                 upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
+                parameters: ModelConnectionParameters::default(),
+                request_parameters: None,
                 api_key: "provider-secret".into(),
             }),
         )
@@ -38992,6 +39646,8 @@ mod tests {
                 base_url: format!("http://127.0.0.1:1/{}", Uuid::new_v4()),
                 model_id: format!("model-{}", Uuid::new_v4().simple()),
                 upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
+                parameters: ModelConnectionParameters::default(),
+                request_parameters: None,
                 api_key: "test-provider-secret".into(),
             }),
         )

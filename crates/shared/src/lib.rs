@@ -1,6 +1,9 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde::{
+    de::{self, Deserializer},
+    Deserialize, Serialize,
+};
+use serde_json::{json, Number, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt;
@@ -211,7 +214,165 @@ pub enum ModelConnectionStatus {
 pub enum ModelUpstreamProtocol {
     #[default]
     OpenaiResponses,
+    OpenaiChatCompletions,
     AnthropicMessages,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "protocol", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModelConnectionRequestParameters {
+    OpenaiResponses {},
+    OpenaiChatCompletions {
+        #[serde(default)]
+        temperature: Option<Number>,
+        #[serde(default)]
+        top_p: Option<Number>,
+        #[serde(default)]
+        max_completion_tokens: Option<u32>,
+    },
+    AnthropicMessages {
+        #[serde(default)]
+        temperature: Option<Number>,
+        #[serde(default)]
+        top_p: Option<Number>,
+        #[serde(default)]
+        max_tokens: Option<u32>,
+    },
+}
+
+impl ModelConnectionRequestParameters {
+    pub fn for_protocol(protocol: ModelUpstreamProtocol) -> Self {
+        match protocol {
+            ModelUpstreamProtocol::OpenaiResponses => Self::OpenaiResponses {},
+            ModelUpstreamProtocol::OpenaiChatCompletions => Self::OpenaiChatCompletions {
+                temperature: None,
+                top_p: None,
+                max_completion_tokens: None,
+            },
+            ModelUpstreamProtocol::AnthropicMessages => Self::AnthropicMessages {
+                temperature: None,
+                top_p: None,
+                max_tokens: None,
+            },
+        }
+    }
+
+    pub fn protocol(&self) -> ModelUpstreamProtocol {
+        match self {
+            Self::OpenaiResponses { .. } => ModelUpstreamProtocol::OpenaiResponses,
+            Self::OpenaiChatCompletions { .. } => ModelUpstreamProtocol::OpenaiChatCompletions,
+            Self::AnthropicMessages { .. } => ModelUpstreamProtocol::AnthropicMessages,
+        }
+    }
+}
+
+impl Default for ModelConnectionRequestParameters {
+    fn default() -> Self {
+        Self::for_protocol(ModelUpstreamProtocol::OpenaiResponses)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelReasoningSummary {
+    #[default]
+    Default,
+    Auto,
+    Concise,
+    Detailed,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelVerbosity {
+    #[default]
+    Default,
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelReasoningSummarySupport {
+    #[default]
+    Auto,
+    Supported,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct ModelConnectionParameters {
+    pub reasoning_effort: ReasoningEffort,
+    pub reasoning_summary: ModelReasoningSummary,
+    pub verbosity: ModelVerbosity,
+    pub context_window_tokens: Option<u64>,
+    pub auto_compact_token_limit: Option<u64>,
+    pub reasoning_summary_support: ModelReasoningSummarySupport,
+    pub service_tier: Option<String>,
+    pub request_max_retries: Option<u32>,
+    pub stream_max_retries: Option<u32>,
+    pub stream_idle_timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelConnectionParametersWire {
+    reasoning_effort: ReasoningEffort,
+    reasoning_summary: ModelReasoningSummary,
+    verbosity: ModelVerbosity,
+    context_window_tokens: Option<u64>,
+    auto_compact_token_limit: Option<u64>,
+    reasoning_summary_support: ModelReasoningSummarySupport,
+    service_tier: Option<String>,
+    request_max_retries: Option<u32>,
+    stream_max_retries: Option<u32>,
+    stream_idle_timeout_ms: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for ModelConnectionParameters {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        const REQUIRED_FIELDS: [&str; 10] = [
+            "reasoning_effort",
+            "reasoning_summary",
+            "verbosity",
+            "context_window_tokens",
+            "auto_compact_token_limit",
+            "reasoning_summary_support",
+            "service_tier",
+            "request_max_retries",
+            "stream_max_retries",
+            "stream_idle_timeout_ms",
+        ];
+
+        let value = Value::deserialize(deserializer)?;
+        let object = value.as_object().ok_or_else(|| {
+            <D::Error as de::Error>::custom("Model Connection parameters must be an object")
+        })?;
+        for field in REQUIRED_FIELDS {
+            if !object.contains_key(field) {
+                return Err(<D::Error as de::Error>::missing_field(field));
+            }
+        }
+        let wire: ModelConnectionParametersWire =
+            serde_json::from_value(value).map_err(<D::Error as de::Error>::custom)?;
+        Ok(Self {
+            reasoning_effort: wire.reasoning_effort,
+            reasoning_summary: wire.reasoning_summary,
+            verbosity: wire.verbosity,
+            context_window_tokens: wire.context_window_tokens,
+            auto_compact_token_limit: wire.auto_compact_token_limit,
+            reasoning_summary_support: wire.reasoning_summary_support,
+            service_tier: wire.service_tier,
+            request_max_retries: wire.request_max_retries,
+            stream_max_retries: wire.stream_max_retries,
+            stream_idle_timeout_ms: wire.stream_idle_timeout_ms,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -225,6 +386,10 @@ pub struct ModelConnectionDto {
     pub model_id: String,
     #[serde(default)]
     pub upstream_protocol: ModelUpstreamProtocol,
+    #[serde(default)]
+    pub parameters: ModelConnectionParameters,
+    #[serde(default)]
+    pub request_parameters: ModelConnectionRequestParameters,
     pub status: ModelConnectionStatus,
     pub is_system_default: bool,
     pub created_at: DateTime<Utc>,
@@ -240,6 +405,10 @@ pub struct CreateModelConnectionRequest {
     pub model_id: String,
     #[serde(default)]
     pub upstream_protocol: ModelUpstreamProtocol,
+    #[serde(default)]
+    pub parameters: ModelConnectionParameters,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_parameters: Option<ModelConnectionRequestParameters>,
     pub api_key: String,
 }
 
@@ -251,6 +420,10 @@ pub struct UpdateModelConnectionRequest {
     pub model_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_protocol: Option<ModelUpstreamProtocol>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<ModelConnectionParameters>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_parameters: Option<ModelConnectionRequestParameters>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
 }
@@ -269,6 +442,10 @@ pub struct ModelConnectionOptionDto {
     pub model_id: String,
     #[serde(default)]
     pub upstream_protocol: ModelUpstreamProtocol,
+    #[serde(default)]
+    pub parameters: ModelConnectionParameters,
+    #[serde(default)]
+    pub request_parameters: ModelConnectionRequestParameters,
     pub scope: ModelConnectionScope,
     pub status: ModelConnectionStatus,
 }
@@ -618,6 +795,7 @@ pub fn execution_configuration_fingerprint(
                 "id": connection.id,
                 "name": connection.name,
                 "model_id": connection.model_id,
+                "parameters": connection.parameters,
                 "scope": connection.scope,
                 "status": connection.status,
             })
@@ -1679,6 +1857,136 @@ mod tests {
     }
 
     #[test]
+    fn model_connection_parameters_are_backward_compatible_and_typed() {
+        let create: CreateModelConnectionRequest = serde_json::from_value(json!({
+            "scope": "personal",
+            "name": "Default Parameters",
+            "base_url": "https://models.example.test",
+            "model_id": "gpt-test",
+            "api_key": "secret"
+        }))
+        .unwrap();
+        assert_eq!(create.parameters, ModelConnectionParameters::default());
+        assert!(create.request_parameters.is_none());
+
+        let update: UpdateModelConnectionRequest = serde_json::from_value(json!({
+            "name": "Keep Parameters",
+            "base_url": "https://models.example.test",
+            "model_id": "gpt-test"
+        }))
+        .unwrap();
+        assert!(update.parameters.is_none());
+        assert!(update.request_parameters.is_none());
+
+        let partial_update = serde_json::from_value::<UpdateModelConnectionRequest>(json!({
+            "name": "Reject Partial Parameters",
+            "base_url": "https://models.example.test",
+            "model_id": "gpt-test",
+            "parameters": {
+                "reasoning_summary": "none"
+            }
+        }));
+        assert!(partial_update.is_err());
+
+        let parameters: ModelConnectionParameters = serde_json::from_value(json!({
+            "reasoning_effort": "high",
+            "reasoning_summary": "detailed",
+            "verbosity": "low",
+            "context_window_tokens": 200000,
+            "auto_compact_token_limit": 160000,
+            "reasoning_summary_support": "supported",
+            "service_tier": "priority",
+            "request_max_retries": 7,
+            "stream_max_retries": 9,
+            "stream_idle_timeout_ms": 420000
+        }))
+        .unwrap();
+        assert_eq!(parameters.reasoning_effort, ReasoningEffort::High);
+        assert_eq!(
+            parameters.reasoning_summary,
+            ModelReasoningSummary::Detailed
+        );
+        assert_eq!(parameters.verbosity, ModelVerbosity::Low);
+        assert_eq!(parameters.context_window_tokens, Some(200_000));
+        assert_eq!(parameters.auto_compact_token_limit, Some(160_000));
+        assert_eq!(
+            parameters.reasoning_summary_support,
+            ModelReasoningSummarySupport::Supported
+        );
+        assert_eq!(parameters.service_tier.as_deref(), Some("priority"));
+        assert_eq!(parameters.request_max_retries, Some(7));
+        assert_eq!(parameters.stream_max_retries, Some(9));
+        assert_eq!(parameters.stream_idle_timeout_ms, Some(420_000));
+        assert_eq!(
+            serde_json::to_value(ModelConnectionParameters::default()).unwrap(),
+            json!({
+                "reasoning_effort": "default",
+                "reasoning_summary": "default",
+                "verbosity": "default",
+                "context_window_tokens": null,
+                "auto_compact_token_limit": null,
+                "reasoning_summary_support": "auto",
+                "service_tier": null,
+                "request_max_retries": null,
+                "stream_max_retries": null,
+                "stream_idle_timeout_ms": null
+            })
+        );
+    }
+
+    #[test]
+    fn model_connection_request_parameters_are_protocol_tagged() {
+        let responses: ModelConnectionRequestParameters = serde_json::from_value(json!({
+            "protocol": "openai_responses"
+        }))
+        .unwrap();
+        assert_eq!(
+            responses,
+            ModelConnectionRequestParameters::for_protocol(ModelUpstreamProtocol::OpenaiResponses)
+        );
+
+        let chat: ModelConnectionRequestParameters = serde_json::from_value(json!({
+            "protocol": "openai_chat_completions",
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "max_completion_tokens": 4096
+        }))
+        .unwrap();
+        assert_eq!(
+            chat.protocol(),
+            ModelUpstreamProtocol::OpenaiChatCompletions
+        );
+        assert_eq!(
+            serde_json::to_value(&chat).unwrap(),
+            json!({
+                "protocol": "openai_chat_completions",
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "max_completion_tokens": 4096
+            })
+        );
+
+        let anthropic: ModelConnectionRequestParameters = serde_json::from_value(json!({
+            "protocol": "anthropic_messages",
+            "temperature": null,
+            "top_p": 0.8,
+            "max_tokens": 8192
+        }))
+        .unwrap();
+        assert_eq!(
+            anthropic.protocol(),
+            ModelUpstreamProtocol::AnthropicMessages
+        );
+        assert!(
+            serde_json::from_value::<ModelConnectionRequestParameters>(json!({
+                "protocol": "openai_chat_completions",
+                "max_tokens": 1024
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn model_connection_contracts_keep_api_keys_write_only() {
         let connection_id = Uuid::from_u128(101);
         let owner_id = Uuid::from_u128(102);
@@ -1734,6 +2042,8 @@ mod tests {
             base_url: "http://127.0.0.1:8080/provider".into(),
             model_id: "gpt-test".into(),
             upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
+            parameters: ModelConnectionParameters::default(),
+            request_parameters: ModelConnectionRequestParameters::default(),
             status: ModelConnectionStatus::Enabled,
             is_system_default: false,
             created_at: now,
@@ -1743,6 +2053,11 @@ mod tests {
         assert_eq!(read_value["scope"], "personal");
         assert_eq!(read_value["status"], "enabled");
         assert_eq!(read_value["upstream_protocol"], "openai_responses");
+        assert_eq!(read_value["parameters"]["reasoning_effort"], "default");
+        assert_eq!(
+            read_value["request_parameters"]["protocol"],
+            "openai_responses"
+        );
         assert!(read_value.get("api_key").is_none());
         assert!(serde_json::from_value::<ModelConnectionDto>(json!({
             "id": connection_id,
@@ -1766,6 +2081,8 @@ mod tests {
                     name: "Local Responses".into(),
                     model_id: "gpt-test".into(),
                     upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
+                    parameters: ModelConnectionParameters::default(),
+                    request_parameters: ModelConnectionRequestParameters::default(),
                     scope: ModelConnectionScope::Personal,
                     status: ModelConnectionStatus::Enabled,
                 }],
@@ -2833,6 +3150,8 @@ mod tests {
                     name: "Agent Default".into(),
                     model_id: "gpt-test".into(),
                     upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
+                    parameters: ModelConnectionParameters::default(),
+                    request_parameters: ModelConnectionRequestParameters::default(),
                     scope: ModelConnectionScope::Personal,
                     status: ModelConnectionStatus::Enabled,
                 },
@@ -2841,6 +3160,14 @@ mod tests {
                     name: "Reviewer Override".into(),
                     model_id: "gpt-review".into(),
                     upstream_protocol: ModelUpstreamProtocol::AnthropicMessages,
+                    parameters: ModelConnectionParameters {
+                        verbosity: ModelVerbosity::High,
+                        context_window_tokens: Some(200_000),
+                        ..ModelConnectionParameters::default()
+                    },
+                    request_parameters: ModelConnectionRequestParameters::for_protocol(
+                        ModelUpstreamProtocol::AnthropicMessages,
+                    ),
                     scope: ModelConnectionScope::Global,
                     status: ModelConnectionStatus::Enabled,
                 },
@@ -2876,6 +3203,15 @@ mod tests {
         model_id_edit.model_connections[0].model_id = "gpt-test-v2".into();
         assert_ne!(
             execution_configuration_fingerprint(&model_id_edit).unwrap(),
+            fingerprint
+        );
+
+        let mut model_parameter_edit = configuration.clone();
+        model_parameter_edit.model_connections[0]
+            .parameters
+            .reasoning_summary = ModelReasoningSummary::Concise;
+        assert_ne!(
+            execution_configuration_fingerprint(&model_parameter_edit).unwrap(),
             fingerprint
         );
 
@@ -2929,6 +3265,8 @@ mod tests {
                 name: "Agent Default".into(),
                 model_id: "gpt-test".into(),
                 upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
+                parameters: ModelConnectionParameters::default(),
+                request_parameters: ModelConnectionRequestParameters::default(),
                 scope: ModelConnectionScope::Personal,
                 status: ModelConnectionStatus::Enabled,
             }],

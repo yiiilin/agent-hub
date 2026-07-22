@@ -87,6 +87,10 @@ func (c *requestConn) Close() error {
 }
 
 func (s *server) proxyAnthropic(w http.ResponseWriter, r *http.Request, envelope proxyEnvelope, body []byte, endpoint *url.URL) {
+	if err := validateResponsesRepresentability(body, protocolAnthropicMessages); err != nil {
+		writeError(w, http.StatusBadRequest, "unsupported_protocol_feature", err.Error(), envelope.APIKey)
+		return
+	}
 	var wireRequest openai.OpenAIResponsesRequest
 	if err := json.Unmarshal(body, &wireRequest); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_responses_request", "invalid Responses request", envelope.APIKey)
@@ -117,6 +121,7 @@ func (s *server) proxyAnthropic(w http.ResponseWriter, r *http.Request, envelope
 	}
 	request.Provider = schemas.Anthropic
 	request.Fallbacks = nil
+	mergeAnthropicRequestParameters(request, envelope.RequestParameters)
 	requestURL := upstreamRequestURL(endpoint, "/v1/messages", envelope.Query)
 	stream := wireRequest.Stream != nil && *wireRequest.Stream
 	if stream {
@@ -124,6 +129,24 @@ func (s *server) proxyAnthropic(w http.ResponseWriter, r *http.Request, envelope
 		return
 	}
 	s.proxyAnthropicJSON(w, r, envelope, bifrostCtx, requestURL, request, safeHeaders)
+}
+
+func mergeAnthropicRequestParameters(request *schemas.BifrostResponsesRequest, parameters modelRequestParameters) {
+	if request.Params == nil {
+		request.Params = &schemas.ResponsesParameters{}
+	}
+	if parameters.Temperature != nil {
+		request.Params.Temperature = parameters.Temperature
+		request.Params.TopP = nil
+	}
+	if parameters.TopP != nil {
+		request.Params.TopP = parameters.TopP
+		request.Params.Temperature = nil
+	}
+	if parameters.MaxTokens != nil {
+		value := int(*parameters.MaxTokens)
+		request.Params.MaxOutputTokens = &value
+	}
 }
 
 func (s *server) proxyAnthropicJSON(

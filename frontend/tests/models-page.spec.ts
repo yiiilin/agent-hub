@@ -8,6 +8,19 @@ const currentUser = {
   role: 'admin'
 };
 
+const automaticModelParameters = {
+  reasoning_effort: 'default',
+  reasoning_summary: 'default',
+  verbosity: 'default',
+  context_window_tokens: null,
+  auto_compact_token_limit: null,
+  reasoning_summary_support: 'auto',
+  service_tier: null,
+  request_max_retries: null,
+  stream_max_retries: null,
+  stream_idle_timeout_ms: null
+};
+
 const personalConnection = {
   id: '20000000-0000-0000-0000-000000000001',
   owner_id: currentUser.id,
@@ -16,6 +29,19 @@ const personalConnection = {
   base_url: 'https://personal.example.test/provider',
   model_id: 'personal-model',
   upstream_protocol: 'openai_responses',
+  request_parameters: { protocol: 'openai_responses' },
+  parameters: {
+    reasoning_effort: 'medium',
+    reasoning_summary: 'concise',
+    verbosity: 'high',
+    context_window_tokens: 128_000,
+    auto_compact_token_limit: 96_000,
+    reasoning_summary_support: 'supported',
+    service_tier: 'flex',
+    request_max_retries: 3,
+    stream_max_retries: 5,
+    stream_idle_timeout_ms: 300_000
+  },
   status: 'enabled',
   is_system_default: false,
   created_at: '2026-07-18T01:00:00.000Z',
@@ -30,6 +56,8 @@ const globalConnection = {
   base_url: 'https://global.example.test',
   model_id: 'global-model',
   upstream_protocol: 'anthropic_messages',
+  request_parameters: { protocol: 'anthropic_messages', temperature: 0.4, top_p: null, max_tokens: 8192 },
+  parameters: automaticModelParameters,
   status: 'enabled',
   is_system_default: true,
   created_at: '2026-07-18T01:00:00.000Z',
@@ -131,6 +159,8 @@ async function installModelsApi(page: Page, role = 'admin') {
         base_url: body.base_url,
         model_id: body.model_id,
         upstream_protocol: body.upstream_protocol,
+        request_parameters: body.request_parameters,
+        parameters: body.parameters,
         status: 'enabled',
         is_system_default: false,
         created_at: '2026-07-18T06:00:00.000Z',
@@ -228,7 +258,7 @@ for (const [role, expectedTabs] of [['member', 3], ['admin', 4], ['super_admin',
     const available = page.getByRole('table', { name: 'Available model list' });
     await expect(available).toContainText('Personal GPT');
     await expect(available).toContainText('Global Responses');
-    await expect(available).toContainText('Anthropic Messages');
+    await expect(available).toContainText('anthropic_messages');
     await expect(available).not.toContainText('Disabled Global');
   });
 }
@@ -242,15 +272,65 @@ test('connection action dialogs serialize CRUD, test, status, default, and force
   await dialog.getByLabel('Connection name').fill('Created Personal');
   await dialog.getByLabel('Base URL').fill('https://created.example.test/base');
   await dialog.getByLabel('Model ID').fill('created-model');
+  await expect(dialog.getByLabel('Upstream protocol').locator('..')).toHaveClass(/model-wide-field/);
+  await expect(dialog.getByLabel('API key').locator('..')).toHaveClass(/model-wide-field/);
   await expect(dialog.getByLabel('Upstream protocol')).toHaveValue('openai_responses');
+  await expect(dialog.getByLabel('temperature')).toHaveCount(0);
+  await dialog.getByLabel('Upstream protocol').selectOption('openai_chat_completions');
+  await dialog.getByLabel('temperature').fill('0.7');
+  await dialog.getByLabel('top_p').fill('0.8');
+  await dialog.getByLabel('max_completion_tokens').fill('4096');
   await dialog.getByLabel('Upstream protocol').selectOption('anthropic_messages');
+  await expect(dialog.getByLabel('temperature')).toHaveValue('');
+  await expect(dialog.getByLabel('top_p')).toHaveValue('');
+  await expect(dialog.getByLabel('max_tokens')).toHaveValue('');
+  await dialog.getByLabel('top_p').fill('0.6');
+  await dialog.getByLabel('max_tokens').fill('8192');
+  await dialog.getByLabel('temperature').fill('0.4');
+  await expect(dialog.getByLabel('top_p')).toHaveValue('');
+  await dialog.getByLabel('top_p').fill('0.6');
+  await dialog.getByLabel('Reasoning effort').selectOption('high');
+  await dialog.getByLabel('Reasoning summary', { exact: true }).selectOption('detailed');
+  await dialog.getByLabel('Verbosity').selectOption('low');
+  await dialog.getByLabel('Reasoning summary support').selectOption('supported');
+  await dialog.getByLabel('Service tier').fill('priority');
+  await dialog.getByLabel('Context window tokens').fill('200000');
+  await dialog.getByLabel('Auto-compact token limit').fill('160000');
+  await dialog.getByLabel('Request max retries').fill('7');
+  await dialog.getByLabel('Stream max retries').fill('9');
+  await dialog.getByLabel('Stream idle timeout (ms)').fill('420000');
   await dialog.getByLabel('API key').fill('one-time-provider-secret');
   await dialog.getByRole('button', { name: 'Create model connection' }).click();
   await expect(page.getByRole('table', { name: 'Personal model connection list' })).toContainText('Created Personal');
   expect(stats.requests.at(-1)).toMatchObject({
     method: 'POST',
     path: '/api/model-connections',
-    body: { scope: 'personal', name: 'Created Personal', base_url: 'https://created.example.test/base', model_id: 'created-model', upstream_protocol: 'anthropic_messages', api_key: 'one-time-provider-secret' }
+    body: {
+      scope: 'personal',
+      name: 'Created Personal',
+      base_url: 'https://created.example.test/base',
+      model_id: 'created-model',
+      upstream_protocol: 'anthropic_messages',
+      parameters: {
+        reasoning_effort: 'high',
+        reasoning_summary: 'detailed',
+        verbosity: 'low',
+        context_window_tokens: 200_000,
+        auto_compact_token_limit: 160_000,
+        reasoning_summary_support: 'supported',
+        service_tier: 'priority',
+        request_max_retries: 7,
+        stream_max_retries: 9,
+        stream_idle_timeout_ms: 420_000
+      },
+      api_key: 'one-time-provider-secret',
+      request_parameters: {
+        protocol: 'anthropic_messages',
+        temperature: null,
+        top_p: 0.6,
+        max_tokens: 8192
+      }
+    }
   });
   await expect(page.getByText('one-time-provider-secret')).toHaveCount(0);
 
@@ -258,12 +338,40 @@ test('connection action dialogs serialize CRUD, test, status, default, and force
   dialog = page.getByRole('dialog', { name: 'Edit model connection' });
   await expect(dialog.getByLabel('API key')).toHaveValue('');
   await expect(dialog.getByLabel('Upstream protocol')).toHaveValue('openai_responses');
+  await expect(dialog.getByLabel('temperature')).toHaveCount(0);
+  await expect(dialog.getByLabel('Reasoning effort')).toHaveValue('medium');
+  await expect(dialog.getByLabel('Reasoning summary', { exact: true })).toHaveValue('concise');
+  await expect(dialog.getByLabel('Verbosity')).toHaveValue('high');
+  await expect(dialog.getByLabel('Reasoning summary support')).toHaveValue('supported');
+  await expect(dialog.getByLabel('Service tier')).toHaveValue('flex');
+  await expect(dialog.getByLabel('Context window tokens')).toHaveValue('128000');
+  await expect(dialog.getByLabel('Auto-compact token limit')).toHaveValue('96000');
+  await expect(dialog.getByLabel('Request max retries')).toHaveValue('3');
+  await expect(dialog.getByLabel('Stream max retries')).toHaveValue('5');
+  await expect(dialog.getByLabel('Stream idle timeout (ms)')).toHaveValue('300000');
   await dialog.getByLabel('Connection name').fill('Personal GPT Updated');
-  await dialog.getByLabel('Upstream protocol').selectOption('anthropic_messages');
+  await dialog.getByLabel('Upstream protocol').selectOption('openai_chat_completions');
+  await expect(dialog.getByLabel('temperature')).toHaveValue('');
+  await dialog.getByLabel('temperature').fill('0.5');
+  await dialog.getByLabel('top_p').fill('0.9');
+  await dialog.getByLabel('max_completion_tokens').fill('2048');
+  await dialog.getByLabel('Reasoning summary', { exact: true }).selectOption('none');
+  await dialog.getByLabel('Auto-compact token limit').fill('');
   await dialog.getByRole('button', { name: 'Save changes' }).click();
   const update = stats.requests.at(-1)!;
   expect(update).toMatchObject({ method: 'PATCH', path: `/api/model-connections/${personalConnection.id}` });
-  expect(update.body).toMatchObject({ upstream_protocol: 'anthropic_messages' });
+  expect(update.body).toMatchObject({ upstream_protocol: 'openai_chat_completions' });
+  expect(update.body?.request_parameters).toEqual({
+    protocol: 'openai_chat_completions',
+    temperature: 0.5,
+    top_p: 0.9,
+    max_completion_tokens: 2048
+  });
+  expect(update.body?.parameters).toEqual({
+    ...personalConnection.parameters,
+    reasoning_summary: 'none',
+    auto_compact_token_limit: null
+  });
   expect(update.body).not.toHaveProperty('api_key');
 
   await page.getByRole('button', { name: 'Test Personal GPT Updated' }).click();
@@ -378,6 +486,11 @@ test('Models tabs, ledgers, and dialogs stay inside a 390px viewport', async ({ 
   const dialog = page.getByRole('dialog', { name: 'Create model connection' });
   await expect(dialog).toBeVisible();
   await expect(dialog.getByLabel('Upstream protocol')).toBeVisible();
-  await expect(dialog.getByLabel('Upstream protocol').locator('option')).toHaveCount(2);
+  await expect(dialog.getByLabel('Upstream protocol').locator('option')).toHaveCount(3);
+  await expect(dialog.getByRole('heading', { name: 'Codex parameters' })).toBeVisible();
+  await expect(dialog.getByRole('group', { name: 'Generation and reasoning' })).toBeVisible();
+  await expect(dialog.getByRole('group', { name: 'Context' })).toBeVisible();
+  await expect(dialog.getByRole('group', { name: 'Connection reliability' })).toBeVisible();
+  await expect(dialog.getByLabel('Stream idle timeout (ms)')).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
 });
