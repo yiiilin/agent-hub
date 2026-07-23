@@ -2,6 +2,25 @@ import assert from 'node:assert/strict';
 import { poll } from '../../support/api.mjs';
 import { withBrowser } from '../../support/browser.mjs';
 
+async function createComposeModelFixture(request, scenarioContext) {
+  const response = await request.post('/api/model-connections', {
+    data: {
+      scope: 'personal',
+      name: scenarioContext.unique('QA Pi browser model'),
+      base_url: 'http://fake-model-provider:8080',
+      api_type: 'openai_responses',
+      allowed_model_ids: ['hub-proxy-smoke'],
+      api_key: 'dev-model-provider-api-key'
+    }
+  });
+  assert.equal(response.ok(), true, await response.text());
+  const connection = await response.json();
+  return {
+    connectionId: connection.id,
+    selection: { connection_id: connection.id, model_id: 'hub-proxy-smoke' }
+  };
+}
+
 export default async function sessionBrowserScenario(scenarioContext) {
   await withBrowser(scenarioContext, {
     allowedHttpErrors: [
@@ -9,6 +28,7 @@ export default async function sessionBrowserScenario(scenarioContext) {
     ]
   }, async ({ page, request }) => {
     let agent = null;
+    let modelConnectionId = null;
     try {
       await page.goto('/login', { waitUntil: 'domcontentloaded' });
       await page.waitForLoadState('networkidle');
@@ -18,12 +38,15 @@ export default async function sessionBrowserScenario(scenarioContext) {
       await page.getByText('admin@example.com', { exact: true }).waitFor();
 
       const agentName = scenarioContext.unique('QA Browser Agent');
+      const modelFixture = await createComposeModelFixture(request, scenarioContext);
+      modelConnectionId = modelFixture.connectionId;
       const agentResponse = await request.post('/api/agents', {
         data: {
           name: agentName,
-          instructions: 'Complete deterministic browser QA through fake Codex.',
+          instructions: 'Complete deterministic browser QA through Pi.',
           visibility: 'private',
-          public_to: []
+          public_to: [],
+          model_selection: modelFixture.selection
         }
       });
       assert.equal(agentResponse.ok(), true, await agentResponse.text());
@@ -48,16 +71,15 @@ export default async function sessionBrowserScenario(scenarioContext) {
       assert.equal(completed.status, 'completed');
 
       await page.goto('/sessions', { waitUntil: 'domcontentloaded' });
+      await page.getByRole('complementary', { name: 'Session list' })
+        .getByRole('combobox', { name: 'Agent' })
+        .selectOption(agent.id);
       await page.getByRole('heading', { name: agentName, level: 2, exact: true }).waitFor();
       await page.locator('.session-message-text').filter({ hasText: message }).waitFor();
-      await page.locator('.session-message-text').filter({ hasText: 'Fake Codex completed run' }).waitFor();
-
-      const activitySummary = page.locator('.session-activity-events > summary').first();
-      await activitySummary.waitFor();
-      assert.match(await activitySummary.innerText(), /^Worked for .+$/);
-      await activitySummary.click();
-      assert.ok(await page.locator('.session-activity-row').count() > 0);
-      await page.getByText('Thought', { exact: true }).waitFor();
+      const assistantMessages = page.locator('.session-bubble.role-assistant .session-message-text');
+      await assistantMessages.first().waitFor();
+      assert.equal(await assistantMessages.count(), 1);
+      assert.ok((await assistantMessages.first().innerText()).trim().length > 0);
 
       const desktopOverflow = await page.evaluate(() => (
         document.documentElement.scrollWidth - document.documentElement.clientWidth
@@ -72,6 +94,10 @@ export default async function sessionBrowserScenario(scenarioContext) {
     } finally {
       if (agent) {
         const deleteResponse = await request.delete(`/api/agents/${agent.id}`);
+        assert.equal(deleteResponse.status(), 204, await deleteResponse.text());
+      }
+      if (modelConnectionId) {
+        const deleteResponse = await request.delete(`/api/model-connections/${modelConnectionId}`);
         assert.equal(deleteResponse.status(), 204, await deleteResponse.text());
       }
     }

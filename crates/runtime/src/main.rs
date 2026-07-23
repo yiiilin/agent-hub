@@ -41,8 +41,10 @@ use tracing::{info, warn};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+mod pi_driver;
 mod session_bundle;
 
+#[cfg(test)]
 const REDACTED_SECRET: &str = "********";
 const DEFAULT_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_MODEL_PROXY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -807,6 +809,12 @@ async fn apply_runtime_codex_rollout(
     manager: Option<&SessionSupervisorManager>,
     command: &RuntimeCodexRolloutCommandDto,
 ) {
+    if config.codex_driver == "app-server" {
+        // The compatibility-named app-server driver now runs Pi RPC. Keep
+        // accepting the Hub DTO, but Pi images are pinned at build time.
+        rollout.clear_candidate();
+        return;
+    }
     let active_catch_up = command.target_artifact.as_ref().is_some_and(|artifact| {
         command.active_version.as_deref() == Some(artifact.version.as_str())
             && artifact.version != rollout.current_version
@@ -1074,7 +1082,7 @@ fn runtime_register_request(config: &Config) -> RuntimeRegisterRequest {
                 "architecture": std::env::consts::ARCH
             },
             "model_proxy": true,
-            "mcp_allowlist": true,
+            "mcp_allowlist": false,
             "thread_resume": true,
             "local_skills": config.local_skills_dir.is_some(),
             "sandbox_downgraded": sandbox_downgraded,
@@ -2305,10 +2313,11 @@ async fn execute_managed_run_inner(
     let metadata =
         session_supervisor_metadata_for_claim(manager.runtime_id, &claim, &config.codex_version)?;
     manager
-        .ensure_app_server(
+        .ensure_pi(
             metadata,
             config.codex_bin.clone(),
             run_env.clone(),
+            pi_driver::pi_tool_allowlist(&claim.agent),
             config.app_server_timeout,
             Some(model_proxy),
         )
@@ -3325,6 +3334,7 @@ impl PersistentAppServerProcess {
         self.child.as_ref().map_or(0, std::process::Child::id)
     }
 
+    #[cfg(test)]
     fn ensure_running(&mut self) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.cancellation.is_cancelled(),
@@ -3364,6 +3374,7 @@ impl PersistentAppServerProcess {
         result
     }
 
+    #[cfg(test)]
     fn execute_controlled(
         &mut self,
         claim: &ClaimRunResponse,
@@ -3739,7 +3750,98 @@ struct SessionSupervisor {
     stopped: AtomicBool,
 }
 
+enum PersistentSessionProcess {
+    #[cfg(test)]
+    Codex(PersistentAppServerProcess),
+    Pi(pi_driver::PersistentPiRpcProcess),
+}
+
+impl PersistentSessionProcess {
+    fn execute_controlled(
+        &mut self,
+        claim: &ClaimRunResponse,
+        event_tx: Option<tokio_mpsc::Sender<AppendRunEventRequest>>,
+        command_rx: &mpsc::Receiver<SessionSupervisorCommand>,
+        deferred_commands: &mut VecDeque<SessionSupervisorCommand>,
+    ) -> anyhow::Result<AppServerRunResult> {
+        match self {
+            #[cfg(test)]
+            Self::Codex(process) => {
+                process.execute_controlled(claim, event_tx, command_rx, deferred_commands)
+            }
+            Self::Pi(process) => {
+                process.execute_controlled(claim, event_tx, command_rx, deferred_commands)
+            }
+        }
+    }
+
+    fn ensure_running(&mut self) -> anyhow::Result<()> {
+        match self {
+            #[cfg(test)]
+            Self::Codex(process) => process.ensure_running(),
+            Self::Pi(process) => process.ensure_running(),
+        }
+    }
+}
+
+enum SessionProcessLaunch {
+    #[cfg(test)]
+    Codex {
+        binary: String,
+        run_env: RunEnv,
+        timeout: Duration,
+    },
+    Pi {
+        binary: String,
+        run_env: RunEnv,
+        saved_session: Option<PathBuf>,
+        tools: Vec<String>,
+        timeout: Duration,
+    },
+}
+
+impl SessionProcessLaunch {
+    fn timeout(&self) -> Duration {
+        match self {
+            #[cfg(test)]
+            Self::Codex { timeout, .. } => *timeout,
+            Self::Pi { timeout, .. } => *timeout,
+        }
+    }
+
+    fn start(
+        self,
+        cancellation: Arc<AppServerCancellation>,
+    ) -> anyhow::Result<PersistentSessionProcess> {
+        match self {
+            #[cfg(test)]
+            Self::Codex {
+                binary,
+                run_env,
+                timeout,
+            } => PersistentAppServerProcess::start(&binary, &run_env, timeout, cancellation)
+                .map(PersistentSessionProcess::Codex),
+            Self::Pi {
+                binary,
+                run_env,
+                saved_session,
+                tools,
+                timeout,
+            } => pi_driver::PersistentPiRpcProcess::start(
+                &binary,
+                &run_env,
+                saved_session.as_deref(),
+                &tools,
+                timeout,
+                cancellation,
+            )
+            .map(PersistentSessionProcess::Pi),
+        }
+    }
+}
+
 impl SessionSupervisor {
+    #[cfg(test)]
     async fn start_app_server(
         session_id: Uuid,
         ownership_generation: i64,
@@ -3763,6 +3865,7 @@ impl SessionSupervisor {
         .await?
     }
 
+    #[cfg(test)]
     fn start_app_server_blocking(
         session_id: Uuid,
         ownership_generation: i64,
@@ -3770,6 +3873,52 @@ impl SessionSupervisor {
         run_env: RunEnv,
         timeout: Duration,
     ) -> anyhow::Result<Arc<Self>> {
+        Self::start_process_blocking(
+            session_id,
+            ownership_generation,
+            SessionProcessLaunch::Codex {
+                binary: codex_bin,
+                run_env,
+                timeout,
+            },
+        )
+    }
+
+    async fn start_pi(
+        session_id: Uuid,
+        ownership_generation: i64,
+        pi_bin: String,
+        run_env: RunEnv,
+        saved_session: Option<PathBuf>,
+        tools: Vec<String>,
+        timeout: Duration,
+    ) -> anyhow::Result<Arc<Self>> {
+        anyhow::ensure!(
+            ownership_generation > 0,
+            "ownership generation must be positive"
+        );
+        tokio::task::spawn_blocking(move || {
+            Self::start_process_blocking(
+                session_id,
+                ownership_generation,
+                SessionProcessLaunch::Pi {
+                    binary: pi_bin,
+                    run_env,
+                    saved_session,
+                    tools,
+                    timeout,
+                },
+            )
+        })
+        .await?
+    }
+
+    fn start_process_blocking(
+        session_id: Uuid,
+        ownership_generation: i64,
+        launch: SessionProcessLaunch,
+    ) -> anyhow::Result<Arc<Self>> {
+        let startup_timeout = launch.timeout();
         let (command_tx, command_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let cancellation = Arc::new(AppServerCancellation::default());
@@ -3777,12 +3926,7 @@ impl SessionSupervisor {
         let terminal_error = Arc::new(std::sync::Mutex::new(None));
         let actor_terminal_error = Arc::clone(&terminal_error);
         let actor = std::thread::spawn(move || {
-            let mut process = match PersistentAppServerProcess::start(
-                &codex_bin,
-                &run_env,
-                timeout,
-                actor_cancellation,
-            ) {
+            let mut process = match launch.start(actor_cancellation) {
                 Ok(process) => {
                     let _ = ready_tx.send(Ok(()));
                     process
@@ -3838,7 +3982,7 @@ impl SessionSupervisor {
                 }
             }
         });
-        match ready_rx.recv_timeout(timeout + Duration::from_secs(1)) {
+        match ready_rx.recv_timeout(startup_timeout + Duration::from_secs(1)) {
             Ok(Ok(())) => Ok(Arc::new(Self {
                 session_id,
                 ownership_generation,
@@ -5303,6 +5447,7 @@ impl SessionSupervisorManager {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn ensure_app_server(
         &self,
         metadata: SessionSupervisorMetadata,
@@ -5311,6 +5456,61 @@ impl SessionSupervisorManager {
         timeout: Duration,
         model_proxy: Option<Arc<LocalModelProxy>>,
     ) -> anyhow::Result<Arc<SessionSupervisor>> {
+        let session_id = metadata.session_id;
+        let ownership_generation = metadata.ownership_generation;
+        self.ensure_session_supervisor(metadata, model_proxy, move || {
+            SessionSupervisor::start_app_server(
+                session_id,
+                ownership_generation,
+                codex_bin,
+                run_env,
+                timeout,
+            )
+        })
+        .await
+    }
+
+    async fn ensure_pi(
+        &self,
+        metadata: SessionSupervisorMetadata,
+        pi_bin: String,
+        run_env: RunEnv,
+        tools: Vec<String>,
+        timeout: Duration,
+        model_proxy: Option<Arc<LocalModelProxy>>,
+    ) -> anyhow::Result<Arc<SessionSupervisor>> {
+        let session_id = metadata.session_id;
+        let ownership_generation = metadata.ownership_generation;
+        let native_session_id = metadata.native_thread_id.clone();
+        self.ensure_session_supervisor(metadata, model_proxy, move || async move {
+            let saved_session = native_session_id
+                .as_deref()
+                .map(|session_id| pi_driver::discover_session_file(&run_env.codex_home, session_id))
+                .transpose()?;
+            SessionSupervisor::start_pi(
+                session_id,
+                ownership_generation,
+                pi_bin,
+                run_env,
+                saved_session,
+                tools,
+                timeout,
+            )
+            .await
+        })
+        .await
+    }
+
+    async fn ensure_session_supervisor<F, Fut>(
+        &self,
+        metadata: SessionSupervisorMetadata,
+        model_proxy: Option<Arc<LocalModelProxy>>,
+        start: F,
+    ) -> anyhow::Result<Arc<SessionSupervisor>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<Arc<SessionSupervisor>>>,
+    {
         anyhow::ensure!(
             !self.stopped.load(Ordering::Acquire),
             "Session manager is stopped"
@@ -5382,15 +5582,7 @@ impl SessionSupervisorManager {
             self.mark_blocked(metadata.session_id, error.to_string());
             return Err(error);
         }
-        let supervisor = match SessionSupervisor::start_app_server(
-            metadata.session_id,
-            metadata.ownership_generation,
-            codex_bin,
-            run_env,
-            timeout,
-        )
-        .await
-        {
+        let supervisor = match start().await {
             Ok(supervisor) => supervisor,
             Err(error) => {
                 self.mark_blocked(metadata.session_id, error.to_string());
@@ -5891,11 +6083,23 @@ impl SessionSupervisorManager {
             }
         }
         let paths = SessionPaths::for_session(&self.work_root, session_id);
+        // Codex app-server remains test-only compatibility coverage. Release
+        // Pi runtimes never materialize its config because it may contain MCP
+        // credentials that Pi must not receive.
+        #[cfg(test)]
         synchronize_execution_configuration(
             &paths,
             configuration,
             configuration_fingerprint,
             ModelConfigurationMaterialization::PreserveExisting,
+            local_skills_dir,
+        )
+        .await?;
+        synchronize_pi_execution_configuration(
+            &paths,
+            configuration,
+            configuration_fingerprint,
+            PiModelConfigurationMaterialization::PreserveExisting,
             local_skills_dir,
         )
         .await
@@ -7568,11 +7772,22 @@ async fn prepare_run_env_with_local_skills(
         runtime_fingerprint == claim.expected_configuration_fingerprint,
         "Hub and Runtime execution configuration fingerprints differ"
     );
+    // Keep the legacy materializer available only for the converted Codex
+    // fixtures. The production Pi process uses the isolated Pi materializer.
+    #[cfg(test)]
     synchronize_execution_configuration(
         &paths,
         &claim.execution_configuration,
         &runtime_fingerprint,
         ModelConfigurationMaterialization::RunBindings { model_base_url },
+        local_skills_dir,
+    )
+    .await?;
+    synchronize_pi_execution_configuration(
+        &paths,
+        &claim.execution_configuration,
+        &runtime_fingerprint,
+        PiModelConfigurationMaterialization::RunBindings { model_base_url },
         local_skills_dir,
     )
     .await?;
@@ -7584,7 +7799,10 @@ async fn prepare_run_env_with_local_skills(
 }
 
 const MATERIALIZATION_MARKER_FILE: &str = ".agent-hub-materialization.json";
+const PI_MATERIALIZATION_MARKER_FILE: &str = ".agent-hub-materialization.json";
+const PI_AGENT_DIRECTORY: &str = ".pi/agent";
 
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ExecutionMaterializationMarker {
     format_version: u32,
@@ -7595,12 +7813,32 @@ struct ExecutionMaterializationMarker {
     owned_agent_files: Vec<String>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 enum ModelConfigurationMaterialization<'a> {
     RunBindings { model_base_url: Option<&'a str> },
     PreserveExisting,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PiExecutionMaterializationMarker {
+    format_version: u32,
+    configuration_fingerprint: String,
+    materialization_sha256: String,
+    owned_skill_directories: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+enum PiModelConfigurationMaterialization<'a> {
+    RunBindings { model_base_url: Option<&'a str> },
+    PreserveExisting,
+}
+
+fn pi_agent_directory(pi_home: &Path) -> PathBuf {
+    pi_home.join(PI_AGENT_DIRECTORY)
+}
+
+#[cfg(test)]
 async fn synchronize_execution_configuration(
     paths: &SessionPaths,
     configuration: &AgentExecutionConfigurationDto,
@@ -7702,6 +7940,378 @@ async fn synchronize_execution_configuration(
     result
 }
 
+async fn synchronize_pi_execution_configuration(
+    paths: &SessionPaths,
+    configuration: &AgentExecutionConfigurationDto,
+    configuration_fingerprint: &str,
+    model_configuration: PiModelConfigurationMaterialization<'_>,
+    local_skills_dir: Option<&Path>,
+) -> anyhow::Result<()> {
+    #[cfg(not(test))]
+    remove_legacy_codex_execution_materialization(&paths.codex).await?;
+    let agent_dir = pi_agent_directory(&paths.codex);
+    let stage = paths
+        .staging
+        .join(format!("pi-execution-config-{}", Uuid::new_v4()));
+    let stage_agent_dir = stage.join("agent");
+    let result: anyhow::Result<()> = async {
+        fs::create_dir_all(stage_agent_dir.join("skills")).await?;
+        let instructions = format!("{}\n", configuration.instructions.trim_end());
+        write_private_file(&stage_agent_dir.join("AGENTS.md"), instructions.as_bytes())
+            .context("stage Pi Agent guidance")?;
+
+        match model_configuration {
+            PiModelConfigurationMaterialization::RunBindings { model_base_url } => {
+                let models_json = render_pi_models_json(configuration, model_base_url)?;
+                write_private_file(&stage_agent_dir.join("models.json"), models_json.as_bytes())
+                    .context("stage per-Session Pi models config")?;
+            }
+            PiModelConfigurationMaterialization::PreserveExisting => {
+                let _ = validated_pi_execution_materialization(&agent_dir)?;
+                let models_json = stdfs::read_to_string(agent_dir.join("models.json"))
+                    .context("read current per-Session Pi models config")?;
+                let parsed = serde_json::from_str::<Value>(&models_json)
+                    .context("parse current per-Session Pi models config")?;
+                anyhow::ensure!(
+                    parsed.get("providers").and_then(Value::as_object).is_some(),
+                    "current per-Session Pi models config has no providers object"
+                );
+                write_private_file(&stage_agent_dir.join("models.json"), models_json.as_bytes())
+                    .context("preserve per-Session Pi models config")?;
+            }
+        }
+
+        write_private_file(
+            &stage_agent_dir.join("skills-manifest.json"),
+            &serde_json::to_vec_pretty(&configuration.skills)?,
+        )
+        .context("stage Pi Skills manifest")?;
+        if let Some(local_skills_dir) = local_skills_dir {
+            materialize_local_skills(&stage_agent_dir, local_skills_dir).await?;
+        }
+        let skills = serde_json::to_value(&configuration.skills)?;
+        // Hub Skills are applied last so an inline/managed Skill overrides runtime-local content.
+        materialize_skills(&stage_agent_dir, &skills).await?;
+        let owned_skill_directories =
+            skill_directory_entries(&stage_agent_dir.join("skills")).await?;
+        let materialization_sha256 =
+            pi_execution_materialization_sha256(&stage_agent_dir, &owned_skill_directories)?;
+        let marker = PiExecutionMaterializationMarker {
+            format_version: 1,
+            configuration_fingerprint: configuration_fingerprint.to_owned(),
+            materialization_sha256,
+            owned_skill_directories,
+        };
+        write_private_file(
+            &stage_agent_dir.join(PI_MATERIALIZATION_MARKER_FILE),
+            &serde_json::to_vec_pretty(&marker)?,
+        )
+        .context("stage Pi execution configuration marker")?;
+
+        if pi_materialization_is_current(&agent_dir, &marker) {
+            return Ok(());
+        }
+        commit_pi_execution_materialization(&agent_dir, &stage_agent_dir, &marker).await
+    }
+    .await;
+    if let Err(cleanup_error) = fs::remove_dir_all(&stage).await {
+        if cleanup_error.kind() != std::io::ErrorKind::NotFound {
+            if result.is_ok() {
+                return Err(cleanup_error)
+                    .context("remove Pi execution configuration staging directory");
+            }
+            warn!(
+                path = %stage.display(),
+                error = %cleanup_error,
+                "failed to clean Pi execution configuration staging directory"
+            );
+        }
+    }
+    result
+}
+
+#[cfg(not(test))]
+async fn remove_legacy_codex_execution_materialization(codex_home: &Path) -> anyhow::Result<()> {
+    for filename in [
+        "AGENTS.md",
+        "config.toml",
+        "skills-manifest.json",
+        "mcp-allowlist.json",
+        MATERIALIZATION_MARKER_FILE,
+        "skills",
+        "agents",
+    ] {
+        remove_materialized_path(&codex_home.join(filename))
+            .await
+            .with_context(|| format!("remove legacy Codex materialization {filename}"))?;
+    }
+    Ok(())
+}
+
+fn render_pi_models_json(
+    configuration: &AgentExecutionConfigurationDto,
+    model_base_url: Option<&str>,
+) -> anyhow::Result<String> {
+    let binding = model_binding(configuration, "main")?;
+    let provider_name = pi_model_provider_name(binding.id);
+    let base_url = model_base_url.unwrap_or("http://127.0.0.1:0/v1");
+    let mut model = serde_json::Map::new();
+    model.insert("id".into(), json!(binding.model_id));
+    model.insert("name".into(), json!(binding.model_id));
+    model.insert("input".into(), json!(["text"]));
+    model.insert(
+        "contextWindow".into(),
+        json!(binding
+            .model_settings
+            .context_window_tokens
+            .unwrap_or(128_000)),
+    );
+    model.insert(
+        "maxTokens".into(),
+        json!(pi_model_max_output_tokens(&binding.model_settings)),
+    );
+    if let Some(thinking_level) = pi_thinking_level(binding.model_settings.reasoning_effort) {
+        model.insert("reasoning".into(), Value::Bool(true));
+        model.insert(
+            "thinkingLevelMap".into(),
+            pi_thinking_level_map(binding.model_settings.reasoning_effort, thinking_level),
+        );
+    } else {
+        model.insert("reasoning".into(), Value::Bool(false));
+    }
+
+    serde_json::to_string_pretty(&json!({
+        "providers": {
+            provider_name: {
+                "baseUrl": base_url,
+                "api": "openai-responses",
+                // Pi needs an auth presence to expose a custom model. This is a
+                // non-secret placeholder; the loopback proxy strips it.
+                "apiKey": "agent-hub-local-proxy",
+                "headers": {
+                    "x-agent-hub-model-binding-id": binding.id.to_string()
+                },
+                "models": [Value::Object(model)]
+            }
+        }
+    }))
+    .context("serialize Pi models config")
+}
+
+fn pi_model_provider_name(binding_id: Uuid) -> String {
+    format!("agent-hub-{}", binding_id.simple())
+}
+
+fn pi_model_max_output_tokens(settings: &AgentModelSettings) -> u32 {
+    match &settings.request_settings {
+        ModelRequestSettings::OpenaiResponses { .. } => None,
+        ModelRequestSettings::OpenaiChatCompletions {
+            max_completion_tokens,
+            ..
+        } => *max_completion_tokens,
+        ModelRequestSettings::AnthropicMessages { max_tokens, .. } => *max_tokens,
+    }
+    .unwrap_or(16_384)
+}
+
+fn pi_thinking_level(effort: ReasoningEffort) -> Option<&'static str> {
+    match effort {
+        ReasoningEffort::Default => None,
+        ReasoningEffort::None => Some("off"),
+        ReasoningEffort::Minimal => Some("minimal"),
+        ReasoningEffort::Low => Some("low"),
+        ReasoningEffort::Medium => Some("medium"),
+        ReasoningEffort::High => Some("high"),
+        ReasoningEffort::Xhigh => Some("xhigh"),
+        ReasoningEffort::Max | ReasoningEffort::Ultra => Some("max"),
+    }
+}
+
+fn pi_thinking_level_map(effort: ReasoningEffort, _thinking_level: &str) -> Value {
+    match effort {
+        ReasoningEffort::None => json!({
+            "off": "none",
+            "minimal": null,
+            "low": null,
+            "medium": null,
+            "high": null,
+            "xhigh": null,
+            "max": null
+        }),
+        ReasoningEffort::Ultra => json!({
+            "off": null,
+            "minimal": "minimal",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "ultra"
+        }),
+        ReasoningEffort::Minimal
+        | ReasoningEffort::Low
+        | ReasoningEffort::Medium
+        | ReasoningEffort::High
+        | ReasoningEffort::Xhigh
+        | ReasoningEffort::Max => json!({
+            "off": null,
+            "minimal": "minimal",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
+        }),
+        ReasoningEffort::Default => Value::Object(serde_json::Map::new()),
+    }
+}
+
+fn pi_execution_materialization_sha256(
+    agent_dir: &Path,
+    skill_dirs: &[String],
+) -> anyhow::Result<String> {
+    let mut paths = ["AGENTS.md", "models.json", "skills-manifest.json"]
+        .into_iter()
+        .map(|path| agent_dir.join(path))
+        .collect::<Vec<_>>();
+    for directory in skill_dirs {
+        paths.extend(
+            WalkDir::new(agent_dir.join("skills").join(directory))
+                .follow_links(false)
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|entry| entry.into_path()),
+        );
+    }
+    paths.sort();
+    let mut digest = Sha256::new();
+    for path in paths {
+        let relative = path.strip_prefix(agent_dir)?;
+        let metadata = stdfs::symlink_metadata(&path)?;
+        digest.update(relative.to_string_lossy().as_bytes());
+        digest.update([0]);
+        if metadata.is_dir() {
+            digest.update(b"directory");
+        } else if metadata.is_file() {
+            digest.update(stdfs::read(&path)?);
+        } else {
+            anyhow::bail!("materialized Pi configuration contains an unsupported file type");
+        }
+        digest.update([0]);
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn pi_materialization_is_current(
+    agent_dir: &Path,
+    desired: &PiExecutionMaterializationMarker,
+) -> bool {
+    let marker_path = agent_dir.join(PI_MATERIALIZATION_MARKER_FILE);
+    let Ok(marker) = stdfs::read(&marker_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<PiExecutionMaterializationMarker>(&bytes).ok())
+        .ok_or(())
+    else {
+        return false;
+    };
+    if marker != *desired
+        || !private_file_permissions_are_valid(&marker_path)
+        || !private_file_permissions_are_valid(&agent_dir.join("AGENTS.md"))
+        || !private_file_permissions_are_valid(&agent_dir.join("models.json"))
+        || !private_file_permissions_are_valid(&agent_dir.join("skills-manifest.json"))
+        || desired
+            .owned_skill_directories
+            .iter()
+            .any(|directory| !is_single_normal_path_component(directory))
+    {
+        return false;
+    }
+    pi_execution_materialization_sha256(agent_dir, &desired.owned_skill_directories)
+        .is_ok_and(|digest| digest == desired.materialization_sha256)
+}
+
+fn validated_pi_execution_materialization(
+    agent_dir: &Path,
+) -> anyhow::Result<PiExecutionMaterializationMarker> {
+    let marker: PiExecutionMaterializationMarker = serde_json::from_slice(
+        &stdfs::read(agent_dir.join(PI_MATERIALIZATION_MARKER_FILE))
+            .context("read current Pi execution configuration marker")?,
+    )
+    .context("parse current Pi execution configuration marker")?;
+    anyhow::ensure!(
+        marker.format_version == 1 && pi_materialization_is_current(agent_dir, &marker),
+        "current per-Session Pi configuration materialization is invalid"
+    );
+    Ok(marker)
+}
+
+async fn commit_pi_execution_materialization(
+    agent_dir: &Path,
+    stage_agent_dir: &Path,
+    marker: &PiExecutionMaterializationMarker,
+) -> anyhow::Result<()> {
+    fs::create_dir_all(agent_dir.join("skills")).await?;
+    let previous_owned = previous_pi_owned_skill_directories(agent_dir);
+    for directory in &marker.owned_skill_directories {
+        let target = agent_dir.join("skills").join(directory);
+        remove_materialized_path(&target).await?;
+        fs::rename(stage_agent_dir.join("skills").join(directory), &target)
+            .await
+            .with_context(|| format!("install managed Pi Skill directory {directory}"))?;
+    }
+    for directory in previous_owned {
+        if !marker.owned_skill_directories.contains(&directory) {
+            remove_materialized_path(&agent_dir.join("skills").join(directory)).await?;
+        }
+    }
+    for filename in ["AGENTS.md", "models.json", "skills-manifest.json"] {
+        fs::rename(stage_agent_dir.join(filename), agent_dir.join(filename))
+            .await
+            .with_context(|| format!("install Pi {filename}"))?;
+    }
+    fs::rename(
+        stage_agent_dir.join(PI_MATERIALIZATION_MARKER_FILE),
+        agent_dir.join(PI_MATERIALIZATION_MARKER_FILE),
+    )
+    .await
+    .context("commit Pi execution configuration marker")?;
+    Ok(())
+}
+
+fn previous_pi_owned_skill_directories(agent_dir: &Path) -> Vec<String> {
+    if let Ok(marker) = stdfs::read(agent_dir.join(PI_MATERIALIZATION_MARKER_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<PiExecutionMaterializationMarker>(&bytes).ok())
+        .ok_or(())
+    {
+        if marker
+            .owned_skill_directories
+            .iter()
+            .all(|directory| is_single_normal_path_component(directory))
+        {
+            return marker.owned_skill_directories;
+        }
+    }
+    stdfs::read(agent_dir.join("skills-manifest.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|skill| {
+            skill
+                .get("name")
+                .and_then(Value::as_str)
+                .map(skill_directory_name)
+        })
+        .filter(|directory| is_single_normal_path_component(directory))
+        .collect()
+}
+
 async fn skill_directory_entries(root: &Path) -> anyhow::Result<Vec<String>> {
     let mut entries = fs::read_dir(root).await?;
     let mut names = Vec::new();
@@ -7714,6 +8324,7 @@ async fn skill_directory_entries(root: &Path) -> anyhow::Result<Vec<String>> {
     Ok(names)
 }
 
+#[cfg(test)]
 fn execution_materialization_sha256(
     root: &Path,
     skill_dirs: &[String],
@@ -7766,6 +8377,7 @@ fn execution_materialization_sha256(
         .collect())
 }
 
+#[cfg(test)]
 fn materialization_is_current(codex_home: &Path, desired: &ExecutionMaterializationMarker) -> bool {
     let marker_path = codex_home.join(MATERIALIZATION_MARKER_FILE);
     let Ok(marker) = stdfs::read(&marker_path)
@@ -7795,6 +8407,7 @@ fn materialization_is_current(codex_home: &Path, desired: &ExecutionMaterializat
     .is_ok_and(|digest| digest == desired.materialization_sha256)
 }
 
+#[cfg(test)]
 fn validated_execution_materialization(
     codex_home: &Path,
 ) -> anyhow::Result<ExecutionMaterializationMarker> {
@@ -7822,6 +8435,7 @@ fn private_file_permissions_are_valid(_path: &Path) -> bool {
     false
 }
 
+#[cfg(test)]
 async fn commit_execution_materialization(
     codex_home: &Path,
     stage: &Path,
@@ -7874,6 +8488,7 @@ async fn commit_execution_materialization(
     Ok(())
 }
 
+#[cfg(test)]
 fn previous_owned_skill_directories(codex_home: &Path) -> Vec<String> {
     if let Ok(marker) = stdfs::read(codex_home.join(MATERIALIZATION_MARKER_FILE))
         .ok()
@@ -7904,6 +8519,7 @@ fn previous_owned_skill_directories(codex_home: &Path) -> Vec<String> {
         .collect()
 }
 
+#[cfg(test)]
 fn previous_owned_agent_files(codex_home: &Path) -> Vec<String> {
     stdfs::read(codex_home.join(MATERIALIZATION_MARKER_FILE))
         .ok()
@@ -7915,6 +8531,7 @@ fn previous_owned_agent_files(codex_home: &Path) -> Vec<String> {
         .collect()
 }
 
+#[cfg(test)]
 fn is_owned_agent_filename(filename: &str) -> bool {
     is_single_normal_path_component(filename)
         && filename
@@ -7922,6 +8539,7 @@ fn is_owned_agent_filename(filename: &str) -> bool {
             .is_some_and(is_valid_codex_agent_name)
 }
 
+#[cfg(test)]
 fn is_valid_codex_agent_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
@@ -7971,6 +8589,7 @@ fn copy_directory_snapshot(source: &Path, destination: &Path) -> anyhow::Result<
     Ok(())
 }
 
+#[cfg(test)]
 async fn materialize_codex_agents(
     stage: &Path,
     configuration: &AgentExecutionConfigurationDto,
@@ -8000,6 +8619,7 @@ async fn materialize_codex_agents(
     Ok(owned_files)
 }
 
+#[cfg(test)]
 fn preserve_codex_agent_model_configuration(
     codex_home: &Path,
     stage: &Path,
@@ -8051,6 +8671,7 @@ fn preserve_codex_agent_model_configuration(
     Ok(())
 }
 
+#[cfg(test)]
 fn render_codex_agent(
     configuration: &AgentExecutionConfigurationDto,
     subagent: &CodexSubagentDefinition,
@@ -8103,6 +8724,7 @@ fn write_private_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     }
 }
 
+#[cfg(test)]
 fn render_codex_config(
     configuration: &AgentExecutionConfigurationDto,
     model_base_url: Option<&str>,
@@ -8180,6 +8802,7 @@ fn render_codex_config(
     toml::to_string(&toml::Value::Table(root)).context("serialize Codex config")
 }
 
+#[cfg(test)]
 fn render_codex_config_preserving_model_configuration(
     existing_path: &Path,
     mcp_allowlist: &serde_json::Value,
@@ -8225,6 +8848,7 @@ fn model_provider_name(binding_id: Uuid) -> String {
     format!("agent_hub_{}", binding_id.simple())
 }
 
+#[cfg(test)]
 fn apply_model_settings(
     root: &mut toml::map::Map<String, toml::Value>,
     settings: &AgentModelSettings,
@@ -8287,6 +8911,7 @@ fn apply_model_settings(
     Ok(())
 }
 
+#[cfg(test)]
 fn codex_reasoning_summary(summary: ModelReasoningSummary) -> Option<&'static str> {
     match summary {
         ModelReasoningSummary::Default => None,
@@ -8297,6 +8922,7 @@ fn codex_reasoning_summary(summary: ModelReasoningSummary) -> Option<&'static st
     }
 }
 
+#[cfg(test)]
 fn codex_model_verbosity(verbosity: ModelVerbosity) -> Option<&'static str> {
     match verbosity {
         ModelVerbosity::Default => None,
@@ -8320,6 +8946,7 @@ fn codex_reasoning_effort(effort: ReasoningEffort) -> Option<&'static str> {
     }
 }
 
+#[cfg(test)]
 fn render_mcp_servers(mcp_allowlist: &serde_json::Value) -> toml::map::Map<String, toml::Value> {
     let Some(servers) = mcp_allowlist.as_array() else {
         return toml::map::Map::new();
@@ -8356,6 +8983,7 @@ fn render_mcp_servers(mcp_allowlist: &serde_json::Value) -> toml::map::Map<Strin
     output
 }
 
+#[cfg(test)]
 fn mcp_env_values(server: &serde_json::Value) -> Vec<(String, String)> {
     let mut values = Vec::new();
     if let Some(entries) = server.get("secrets").and_then(|value| value.as_object()) {
@@ -8368,6 +8996,7 @@ fn mcp_env_values(server: &serde_json::Value) -> Vec<(String, String)> {
     values
 }
 
+#[cfg(test)]
 fn redact_mcp_secrets(value: &serde_json::Value) -> serde_json::Value {
     let Some(servers) = value.as_array() else {
         return json!([]);
@@ -9600,13 +10229,40 @@ mod tests {
             .await
             .unwrap();
         fs::write(
-            paths
-                .codex
-                .join(format!("sessions/rollout-{thread_id}.jsonl")),
-            "{}\n",
+            paths.codex.join("sessions/pi-session.jsonl"),
+            format!("{{\"type\":\"session\",\"id\":\"{thread_id}\"}}\n"),
         )
         .await
         .unwrap();
+        fs::write(
+            paths
+                .codex
+                .join(format!("sessions/decoy-{thread_id}.jsonl")),
+            "{\"type\":\"session\",\"id\":\"another-session\"}\n",
+        )
+        .await
+        .unwrap();
+        fs::create_dir_all(paths.codex.join(".pi/agent/skills/private"))
+            .await
+            .unwrap();
+        fs::create_dir_all(paths.codex.join(".pi/agent/extensions"))
+            .await
+            .unwrap();
+        fs::create_dir_all(paths.codex.join(".pi/agent/cache"))
+            .await
+            .unwrap();
+        for (relative, contents) in [
+            (".pi/agent/models.json", "model proxy token"),
+            (".pi/agent/auth.json", "provider secret"),
+            (".pi/agent/settings.json", "settings"),
+            (".pi/agent/skills/private/SKILL.md", "generated skill"),
+            (".pi/agent/extensions/provider.ts", "generated extension"),
+            (".pi/agent/cache/data", "cache"),
+        ] {
+            fs::write(paths.codex.join(relative), contents)
+                .await
+                .unwrap();
+        }
         manager
             .request_checkpoint(session_id, 1, RuntimeCheckpointReason::Idle)
             .unwrap();
@@ -9686,11 +10342,21 @@ mod tests {
             std::fs::read_to_string(restored.join("workspace/result.txt")).unwrap(),
             "saved workspace\n"
         );
+        let recovered =
+            pi_driver::discover_session_file(&restored.join("codex"), thread_id).unwrap();
+        assert_eq!(
+            recovered.file_name().unwrap().to_string_lossy(),
+            "pi-session.jsonl"
+        );
+        assert!(!restored.join("codex/.pi").exists());
+        assert!(!restored
+            .join(format!("codex/sessions/decoy-{thread_id}.jsonl"))
+            .exists());
         hub.abort();
     }
 
     #[tokio::test]
-    async fn restoring_claim_downloads_verifies_and_atomically_installs_the_current_bundle() {
+    async fn restoring_claim_installs_the_current_bundle_and_resumes_its_pi_session() {
         let temp = tempfile::tempdir().unwrap();
         let source_workspace = temp.path().join("source/workspace");
         let source_codex = temp.path().join("source/codex");
@@ -9701,14 +10367,41 @@ mod tests {
         fs::write(source_workspace.join("restored.txt"), "from bundle\n")
             .await
             .unwrap();
-        let thread_id = "019bf9b2-7a4d-7000-8000-000000000005";
+        let thread_id = "fake-pi-restored";
         fs::write(
-            source_codex.join(format!("sessions/rollout-{thread_id}.jsonl")),
-            "{}\n",
+            source_codex.join("sessions/restored.jsonl"),
+            format!("{{\"type\":\"session\",\"id\":\"{thread_id}\"}}\n"),
         )
         .await
         .unwrap();
-        fs::write(source_codex.join("auth.json"), "must not restore")
+        fs::write(
+            source_codex.join("sessions/other.jsonl"),
+            "{\"type\":\"session\",\"id\":\"another-session\"}\n",
+        )
+        .await
+        .unwrap();
+        fs::create_dir_all(source_codex.join(".pi/agent/skills/private"))
+            .await
+            .unwrap();
+        fs::create_dir_all(source_codex.join(".pi/agent/extensions"))
+            .await
+            .unwrap();
+        fs::create_dir_all(source_codex.join(".pi/agent/cache"))
+            .await
+            .unwrap();
+        for (relative, contents) in [
+            (".pi/agent/models.json", "must not restore"),
+            (".pi/agent/auth.json", "must not restore"),
+            (".pi/agent/settings.json", "must not restore"),
+            (".pi/agent/skills/private/SKILL.md", "must not restore"),
+            (".pi/agent/extensions/provider.ts", "must not restore"),
+            (".pi/agent/cache/data", "must not restore"),
+        ] {
+            fs::write(source_codex.join(relative), contents)
+                .await
+                .unwrap();
+        }
+        fs::write(source_codex.join("session_index.jsonl"), "must not restore")
             .await
             .unwrap();
         let session_id = Uuid::new_v4();
@@ -9821,11 +10514,14 @@ mod tests {
             "from bundle\n"
         );
         assert!(!paths.workspace.join("stale.txt").exists());
-        assert!(paths
-            .codex
-            .join(format!("sessions/rollout-{thread_id}.jsonl"))
-            .is_file());
-        assert!(!paths.codex.join("auth.json").exists());
+        let restored_session = pi_driver::discover_session_file(&paths.codex, thread_id).unwrap();
+        assert_eq!(
+            restored_session.file_name().unwrap().to_string_lossy(),
+            "restored.jsonl"
+        );
+        assert!(!paths.codex.join("sessions/other.jsonl").exists());
+        assert!(!paths.codex.join(".pi").exists());
+        assert!(!paths.codex.join("session_index.jsonl").exists());
         let metadata: SessionSupervisorMetadata = serde_json::from_slice(
             &fs::read(paths.supervisor.join(SESSION_SUPERVISOR_METADATA_FILE))
                 .await
@@ -9835,6 +10531,28 @@ mod tests {
         assert_eq!(metadata.runtime_id, runtime_id);
         assert_eq!(metadata.ownership_generation, 4);
         assert_eq!(metadata.native_thread_id.as_deref(), Some(thread_id));
+
+        let run_env = prepare_run_env(&config.work_root, &claim, None)
+            .await
+            .unwrap();
+        let pid_file = temp.path().join("pi-restored.pid");
+        let pi_bin = write_fake_pi_wrapper(&temp, &pid_file, &["FAKE_PI_DISABLE_MODEL=1"]);
+        let mut process = pi_driver::PersistentPiRpcProcess::start(
+            pi_bin.to_str().unwrap(),
+            &run_env,
+            Some(&restored_session),
+            &pi_driver::pi_tool_allowlist(&claim.agent),
+            Duration::from_secs(2),
+            Arc::new(AppServerCancellation::default()),
+        )
+        .unwrap();
+        assert_eq!(process.session_id(), thread_id);
+        assert_eq!(
+            process.execute(&claim, None).unwrap().final_status,
+            "completed"
+        );
+        drop(process);
+        assert_process_group_reaped_or_clean_up(&pid_file);
         hub.abort();
     }
 
@@ -12062,6 +12780,926 @@ done
         );
         assert!(parse_session_idle_timeout(Some("0")).is_err());
         assert!(parse_session_idle_timeout(Some("invalid")).is_err());
+    }
+
+    #[test]
+    fn pi_models_json_uses_the_local_gateway_and_preserves_ultra_intent() {
+        let mut claim = test_claim();
+        let binding = claim
+            .execution_configuration
+            .model_bindings
+            .first_mut()
+            .unwrap();
+        binding.api_type = ModelUpstreamProtocol::OpenaiChatCompletions;
+        binding.model_settings = AgentModelSettings {
+            reasoning_effort: ReasoningEffort::Ultra,
+            context_window_tokens: Some(200_000),
+            request_settings: ModelRequestSettings::OpenaiChatCompletions {
+                temperature: None,
+                top_p: None,
+                max_completion_tokens: Some(12_345),
+            },
+            ..AgentModelSettings::default()
+        };
+
+        let rendered = render_pi_models_json(
+            &claim.execution_configuration,
+            Some("http://127.0.0.1:4567/v1"),
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&rendered).unwrap();
+        let binding = &claim.execution_configuration.model_bindings[0];
+        let provider_name = pi_model_provider_name(binding.id);
+        let provider = &parsed["providers"][&provider_name];
+        let model = &provider["models"][0];
+
+        assert_eq!(provider["baseUrl"], "http://127.0.0.1:4567/v1");
+        assert_eq!(provider["api"], "openai-responses");
+        assert_eq!(
+            provider["headers"]["x-agent-hub-model-binding-id"],
+            binding.id.to_string()
+        );
+        assert_eq!(provider["apiKey"], "agent-hub-local-proxy");
+        assert!(provider.get("x-agent-hub-model-connection-id").is_none());
+        assert_eq!(model["id"], "gpt-main");
+        assert_eq!(model["reasoning"], true);
+        assert_eq!(model["contextWindow"], 200_000);
+        assert_eq!(model["maxTokens"], 12_345);
+        assert_eq!(model["thinkingLevelMap"]["max"], "ultra");
+        assert_eq!(pi_thinking_level(ReasoningEffort::Ultra), Some("max"));
+        assert_eq!(pi_thinking_level(ReasoningEffort::Default), None);
+        assert_eq!(pi_thinking_level(ReasoningEffort::None), Some("off"));
+    }
+
+    #[tokio::test]
+    async fn pi_materialization_is_private_skill_aware_and_excludes_mcp_and_subagents() {
+        const PROVIDER_URL: &str = "https://provider-secret.example";
+        const PROVIDER_API_KEY: &str = "provider-api-key-must-not-leak";
+        const MCP_SECRET: &str = "mcp-secret-must-not-leak";
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut claim = test_claim();
+        claim.execution_configuration.model_policy = json!({
+            "base_url": PROVIDER_URL,
+            "api_key": PROVIDER_API_KEY,
+        });
+        claim.execution_configuration.mcp_allowlist = json!([{
+            "name": "private-mcp",
+            "command": "private-mcp",
+            "secrets": { "TOKEN": MCP_SECRET }
+        }]);
+        claim.execution_configuration.codex_subagents = vec![CodexSubagentDefinition {
+            name: "excluded".into(),
+            description: "must not be materialized for Pi".into(),
+            developer_instructions: "do not run".into(),
+            model_selection: None,
+            model_settings_override: AgentModelSettingsOverride::default(),
+            enabled: true,
+            disabled_reason: None,
+        }];
+        claim.expected_configuration_fingerprint =
+            execution_configuration_fingerprint(&claim.execution_configuration).unwrap();
+        let paths = SessionPaths::for_claim(temp.path(), &claim).unwrap();
+        fs::create_dir_all(&paths.workspace).await.unwrap();
+        fs::create_dir_all(&paths.codex).await.unwrap();
+        fs::create_dir_all(&paths.staging).await.unwrap();
+
+        synchronize_pi_execution_configuration(
+            &paths,
+            &claim.execution_configuration,
+            &claim.expected_configuration_fingerprint,
+            PiModelConfigurationMaterialization::RunBindings {
+                model_base_url: Some("http://127.0.0.1:4567/v1"),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let agent_dir = paths.codex.join(".pi/agent");
+        assert_eq!(
+            fs::read_to_string(agent_dir.join("AGENTS.md"))
+                .await
+                .unwrap(),
+            "Be concise\n"
+        );
+        let skill_directory = skill_directory_name("repo-review");
+        assert!(agent_dir
+            .join("skills")
+            .join(&skill_directory)
+            .join("SKILL.md")
+            .is_file());
+        assert!(!agent_dir.join("mcp-allowlist.json").exists());
+        assert!(!agent_dir.join("agents").exists());
+        assert!(private_file_permissions_are_valid(
+            &agent_dir.join("AGENTS.md")
+        ));
+        assert!(private_file_permissions_are_valid(
+            &agent_dir.join("models.json")
+        ));
+        assert!(private_file_permissions_are_valid(
+            &agent_dir.join(PI_MATERIALIZATION_MARKER_FILE)
+        ));
+
+        for entry in WalkDir::new(&agent_dir) {
+            let entry = entry.unwrap();
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let bytes = stdfs::read(entry.path()).unwrap();
+            let contents = String::from_utf8_lossy(&bytes);
+            assert!(!contents.contains(PROVIDER_URL));
+            assert!(!contents.contains(PROVIDER_API_KEY));
+            assert!(!contents.contains(MCP_SECRET));
+        }
+
+        let mut refreshed = claim.execution_configuration.clone();
+        refreshed.skills.clear();
+        let refreshed_fingerprint = execution_configuration_fingerprint(&refreshed).unwrap();
+        synchronize_pi_execution_configuration(
+            &paths,
+            &refreshed,
+            &refreshed_fingerprint,
+            PiModelConfigurationMaterialization::PreserveExisting,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!agent_dir.join("skills").join(skill_directory).exists());
+    }
+
+    #[tokio::test]
+    async fn persistent_pi_rpc_process_translates_fixture_events_and_suppresses_duplicates() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("pi.pid");
+        let pi_bin = write_fake_pi_wrapper(
+            &temp,
+            &pid_file,
+            &["FAKE_PI_DISABLE_MODEL=1", "FAKE_PI_DUPLICATE_EVENTS=1"],
+        );
+        let mut claim = test_claim();
+        claim.run.initial_message = "fixture:retry".into();
+        let run_env = prepare_run_env(temp.path(), &claim, Some("http://127.0.0.1:1/v1"))
+            .await
+            .unwrap();
+        let cancellation = Arc::new(AppServerCancellation::default());
+        let mut process = pi_driver::PersistentPiRpcProcess::start(
+            pi_bin.to_str().unwrap(),
+            &run_env,
+            None,
+            &pi_driver::pi_tool_allowlist(&claim.agent),
+            Duration::from_secs(2),
+            cancellation,
+        )
+        .unwrap();
+
+        assert!(!process.session_id().is_empty());
+        assert!(process.session_file().is_file());
+        let result = process.execute(&claim, None).unwrap();
+        assert_eq!(result.final_status, "completed");
+        assert_eq!(result.session_id.as_deref(), Some(process.session_id()));
+        assert_eq!(
+            result.native_turn_id.as_deref(),
+            Some(claim.run.id.to_string().as_str())
+        );
+        assert_eq!(
+            result
+                .events
+                .iter()
+                .filter(|event| event.event_type == "turn_started")
+                .count(),
+            1
+        );
+        assert_eq!(
+            result
+                .events
+                .iter()
+                .filter(|event| {
+                    event.event_type == "item"
+                        && event.payload["item_id"] == "fake-pi-bash-1"
+                        && event.payload["phase"] == "started"
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            result
+                .events
+                .iter()
+                .filter(|event| {
+                    event.event_type == "item"
+                        && event.payload["item_id"] == "fake-pi-bash-1"
+                        && event.payload["phase"] == "completed"
+                })
+                .count(),
+            1
+        );
+        assert!(result.events.iter().any(|event| {
+            event.event_type == "item"
+                && event.payload["item_type"] == "reasoning"
+                && event.payload["phase"] == "summary_delta"
+        }));
+        assert!(result.events.iter().any(|event| {
+            event.event_type == "message"
+                && event.content.as_deref() == Some("Fake Pi response for: fixture:retry")
+        }));
+        assert!(result.events.iter().any(|event| {
+            event.event_type == "item"
+                && event.payload["item_type"] == "contextCompaction"
+                && event.payload["phase"] == "started"
+        }));
+        assert!(result.events.iter().any(|event| {
+            event.event_type == "item"
+                && event.payload["item_type"] == "retry"
+                && event.payload["phase"] == "completed"
+        }));
+        let serialized = serde_json::to_string(&result.events).unwrap();
+        assert!(!serialized.contains("fixture-sensitive"));
+
+        drop(process);
+        assert_process_group_reaped_or_clean_up(&pid_file);
+    }
+
+    #[tokio::test]
+    async fn persistent_pi_rpc_process_reports_failed_terminal_state_without_error_details() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("pi-failure.pid");
+        let pi_bin = write_fake_pi_wrapper(&temp, &pid_file, &["FAKE_PI_DISABLE_MODEL=1"]);
+        let mut claim = test_claim();
+        claim.run.initial_message = "fixture:fail".into();
+        let run_env = prepare_run_env(temp.path(), &claim, Some("http://127.0.0.1:1/v1"))
+            .await
+            .unwrap();
+        let cancellation = Arc::new(AppServerCancellation::default());
+        let mut process = pi_driver::PersistentPiRpcProcess::start(
+            pi_bin.to_str().unwrap(),
+            &run_env,
+            None,
+            &pi_driver::pi_tool_allowlist(&claim.agent),
+            Duration::from_secs(2),
+            cancellation,
+        )
+        .unwrap();
+
+        let result = process.execute(&claim, None).unwrap();
+        assert_eq!(result.final_status, "failed");
+        let serialized = serde_json::to_string(&result.events).unwrap();
+        assert!(!serialized.contains("errorMessage"));
+        assert!(result.events.iter().any(|event| {
+            event.event_type == "status" && event.content.as_deref() == Some("failed")
+        }));
+        drop(process);
+        assert_process_group_reaped_or_clean_up(&pid_file);
+    }
+
+    #[tokio::test]
+    async fn persistent_pi_rpc_process_rejects_malformed_json_and_reaps_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("pi-malformed.pid");
+        let pi_bin = write_fake_pi_wrapper(
+            &temp,
+            &pid_file,
+            &[
+                "FAKE_PI_DISABLE_MODEL=1",
+                "FAKE_PI_MALFORMED_AFTER_PROMPT=1",
+            ],
+        );
+        let claim = test_claim();
+        let run_env = prepare_run_env(temp.path(), &claim, Some("http://127.0.0.1:1/v1"))
+            .await
+            .unwrap();
+        let cancellation = Arc::new(AppServerCancellation::default());
+        let mut process = pi_driver::PersistentPiRpcProcess::start(
+            pi_bin.to_str().unwrap(),
+            &run_env,
+            None,
+            &pi_driver::pi_tool_allowlist(&claim.agent),
+            Duration::from_secs(2),
+            cancellation,
+        )
+        .unwrap();
+
+        let error = format!("{:#}", process.execute(&claim, None).unwrap_err());
+        assert!(error.contains("parse Pi RPC JSON line"));
+        drop(process);
+        assert_process_group_reaped_or_clean_up(&pid_file);
+    }
+
+    #[tokio::test]
+    async fn persistent_pi_rpc_process_times_out_and_reaps_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("pi-timeout.pid");
+        let pi_bin = write_fake_pi_wrapper(&temp, &pid_file, &["FAKE_PI_DISABLE_MODEL=1"]);
+        let mut claim = test_claim();
+        claim.run.initial_message = "fixture:hold".into();
+        let run_env = prepare_run_env(temp.path(), &claim, Some("http://127.0.0.1:1/v1"))
+            .await
+            .unwrap();
+        let cancellation = Arc::new(AppServerCancellation::default());
+        let mut process = pi_driver::PersistentPiRpcProcess::start(
+            pi_bin.to_str().unwrap(),
+            &run_env,
+            None,
+            &pi_driver::pi_tool_allowlist(&claim.agent),
+            Duration::from_millis(250),
+            cancellation,
+        )
+        .unwrap();
+
+        let error = format!("{:#}", process.execute(&claim, None).unwrap_err());
+        assert!(error.contains("Pi RPC process timed out"));
+        drop(process);
+        assert_process_group_reaped_or_clean_up(&pid_file);
+    }
+
+    #[tokio::test]
+    async fn persistent_pi_rpc_process_abort_finishes_as_interrupted() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("pi-abort.pid");
+        let pi_bin = write_fake_pi_wrapper(&temp, &pid_file, &["FAKE_PI_DISABLE_MODEL=1"]);
+        let mut claim = test_claim();
+        claim.run.initial_message = "fixture:hold".into();
+        let run_env = prepare_run_env(temp.path(), &claim, Some("http://127.0.0.1:1/v1"))
+            .await
+            .unwrap();
+        let cancellation = Arc::new(AppServerCancellation::default());
+        let process = pi_driver::PersistentPiRpcProcess::start(
+            pi_bin.to_str().unwrap(),
+            &run_env,
+            None,
+            &pi_driver::pi_tool_allowlist(&claim.agent),
+            Duration::from_secs(2),
+            cancellation,
+        )
+        .unwrap();
+        let (command_tx, command_rx) = mpsc::channel();
+        let (event_tx, mut event_rx) = app_server_event_channel();
+        let driver = std::thread::spawn(move || {
+            let mut process = process;
+            let mut deferred = VecDeque::new();
+            process.execute_controlled(&claim, Some(event_tx), &command_rx, &mut deferred)
+        });
+
+        let native_turn_id = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = event_rx.recv().await.unwrap();
+                if event.event_type == "turn_started" {
+                    break event.payload["native_turn_id"].as_str().unwrap().to_owned();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let (response, outcome) = oneshot::channel();
+        command_tx
+            .send(SessionSupervisorCommand::Interrupt {
+                expected_turn_id: native_turn_id,
+                response,
+            })
+            .unwrap();
+        assert_eq!(
+            outcome.await.unwrap().unwrap(),
+            SessionInterruptOutcome::Interrupted
+        );
+        let result = tokio::task::spawn_blocking(move || driver.join().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.final_status, "interrupted");
+        assert_process_group_reaped_or_clean_up(&pid_file);
+    }
+
+    #[tokio::test]
+    async fn pi_session_supervisor_steers_once_and_reuses_its_process_for_next_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("pi-supervisor-steer.pid");
+        let request_log = temp.path().join("pi-supervisor-steer.jsonl");
+        let request_log_env = format!("FAKE_PI_REQUEST_LOG={}", request_log.display());
+        let pi_bin = write_fake_pi_wrapper(
+            &temp,
+            &pid_file,
+            &["FAKE_PI_DISABLE_MODEL=1", &request_log_env],
+        );
+        let mut first = test_claim();
+        let session_id = Uuid::new_v4();
+        first.run.hub_session_id = Some(session_id);
+        first.run.initial_message = "fixture:hold".into();
+        let run_env = prepare_run_env(temp.path(), &first, None).await.unwrap();
+        let supervisor = SessionSupervisor::start_pi(
+            session_id,
+            1,
+            pi_bin.display().to_string(),
+            run_env,
+            None,
+            pi_driver::pi_tool_allowlist(&first.agent),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let (event_tx, mut event_rx) = app_server_event_channel();
+        let first_turn_id = first.run.id.to_string();
+        let execution = tokio::spawn({
+            let supervisor = Arc::clone(&supervisor);
+            async move { supervisor.execute(first, Some(event_tx)).await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = event_rx.recv().await.unwrap();
+                if event.event_type == "turn_started" {
+                    assert_eq!(event.payload["native_turn_id"], first_turn_id);
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            supervisor
+                .steer(
+                    1,
+                    first_turn_id.clone(),
+                    Uuid::new_v4(),
+                    vec!["fixture:release".into()],
+                )
+                .await
+                .unwrap(),
+            SessionSteerOutcome::Applied
+        );
+        assert_eq!(execution.await.unwrap().unwrap().final_status, "completed");
+
+        let mut second = test_claim();
+        second.run.id = Uuid::new_v4();
+        second.run.hub_session_id = Some(session_id);
+        second.execution_configuration.model_bindings[0].id = Uuid::new_v4();
+        second.execution_configuration.model_bindings[0].run_id = second.run.id;
+        second.expected_configuration_fingerprint =
+            execution_configuration_fingerprint(&second.execution_configuration).unwrap();
+        prepare_run_env(temp.path(), &second, None).await.unwrap();
+        assert_eq!(
+            supervisor.execute(second, None).await.unwrap().final_status,
+            "completed"
+        );
+
+        let requests = std::fs::read_to_string(&request_log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["type"] == "steer")
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["type"] == "prompt")
+                .count(),
+            2
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pid_file).unwrap().lines().count(),
+            1
+        );
+
+        supervisor.shutdown();
+        assert_process_group_reaped_or_clean_up(&pid_file);
+    }
+
+    #[tokio::test]
+    async fn pi_session_supervisor_interrupts_without_erasing_session_and_continues() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("pi-supervisor-interrupt.pid");
+        let request_log = temp.path().join("pi-supervisor-interrupt.jsonl");
+        let request_log_env = format!("FAKE_PI_REQUEST_LOG={}", request_log.display());
+        let pi_bin = write_fake_pi_wrapper(
+            &temp,
+            &pid_file,
+            &["FAKE_PI_DISABLE_MODEL=1", &request_log_env],
+        );
+        let mut first = test_claim();
+        let session_id = Uuid::new_v4();
+        first.run.hub_session_id = Some(session_id);
+        first.run.initial_message = "fixture:hold".into();
+        let run_env = prepare_run_env(temp.path(), &first, None).await.unwrap();
+        let supervisor = SessionSupervisor::start_pi(
+            session_id,
+            1,
+            pi_bin.display().to_string(),
+            run_env,
+            None,
+            pi_driver::pi_tool_allowlist(&first.agent),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let (event_tx, mut event_rx) = app_server_event_channel();
+        let first_turn_id = first.run.id.to_string();
+        let execution = tokio::spawn({
+            let supervisor = Arc::clone(&supervisor);
+            async move { supervisor.execute(first, Some(event_tx)).await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = event_rx.recv().await.unwrap();
+                if event.event_type == "turn_started" {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            supervisor.interrupt(1, first_turn_id).await.unwrap(),
+            SessionInterruptOutcome::Interrupted
+        );
+        assert_eq!(
+            execution.await.unwrap().unwrap().final_status,
+            "interrupted"
+        );
+
+        let mut second = test_claim();
+        second.run.id = Uuid::new_v4();
+        second.run.hub_session_id = Some(session_id);
+        second.execution_configuration.model_bindings[0].id = Uuid::new_v4();
+        second.execution_configuration.model_bindings[0].run_id = second.run.id;
+        second.expected_configuration_fingerprint =
+            execution_configuration_fingerprint(&second.execution_configuration).unwrap();
+        prepare_run_env(temp.path(), &second, None).await.unwrap();
+        assert_eq!(
+            supervisor.execute(second, None).await.unwrap().final_status,
+            "completed"
+        );
+
+        let session_file = SessionPaths::for_session(temp.path(), session_id)
+            .codex
+            .join("sessions/fake-pi-session.jsonl");
+        let session_events = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let events = std::fs::read_to_string(&session_file)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                    .collect::<Vec<_>>();
+                if events.iter().any(|event| event["type"] == "aborted")
+                    && events.iter().any(|event| event["type"] == "assistant")
+                {
+                    break events;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(session_events
+            .iter()
+            .any(|event| event["type"] == "aborted"));
+        assert!(session_events
+            .iter()
+            .any(|event| event["type"] == "assistant"));
+        let requests = std::fs::read_to_string(&request_log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["type"] == "abort")
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["type"] == "prompt")
+                .count(),
+            2
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pid_file).unwrap().lines().count(),
+            1
+        );
+
+        supervisor.shutdown();
+        assert_process_group_reaped_or_clean_up(&pid_file);
+    }
+
+    #[tokio::test]
+    async fn pi_cold_restart_reopens_the_discovered_session_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_pid_file = temp.path().join("pi-cold-first.pid");
+        let first_bin = write_fake_pi_wrapper(&temp, &first_pid_file, &["FAKE_PI_DISABLE_MODEL=1"]);
+        let first = test_claim();
+        let run_env = prepare_run_env(temp.path(), &first, None).await.unwrap();
+        let mut first_process = pi_driver::PersistentPiRpcProcess::start(
+            first_bin.to_str().unwrap(),
+            &run_env,
+            None,
+            &pi_driver::pi_tool_allowlist(&first.agent),
+            Duration::from_secs(2),
+            Arc::new(AppServerCancellation::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            first_process.execute(&first, None).unwrap().final_status,
+            "completed"
+        );
+        let native_session_id = first_process.session_id().to_owned();
+        let first_session_file = first_process.session_file().to_path_buf();
+        drop(first_process);
+        assert_process_group_reaped_or_clean_up(&first_pid_file);
+
+        let recovered_session_file =
+            pi_driver::discover_session_file(&run_env.codex_home, &native_session_id).unwrap();
+        assert_eq!(recovered_session_file, first_session_file);
+
+        let second_pid_file = temp.path().join("pi-cold-second.pid");
+        let second_bin =
+            write_fake_pi_wrapper(&temp, &second_pid_file, &["FAKE_PI_DISABLE_MODEL=1"]);
+        let mut second = first.clone();
+        second.run.id = Uuid::new_v4();
+        second.execution_configuration.model_bindings[0].id = Uuid::new_v4();
+        second.execution_configuration.model_bindings[0].run_id = second.run.id;
+        second.expected_configuration_fingerprint =
+            execution_configuration_fingerprint(&second.execution_configuration).unwrap();
+        let second_run_env = prepare_run_env(temp.path(), &second, None).await.unwrap();
+        let mut recovered_process = pi_driver::PersistentPiRpcProcess::start(
+            second_bin.to_str().unwrap(),
+            &second_run_env,
+            Some(&recovered_session_file),
+            &pi_driver::pi_tool_allowlist(&second.agent),
+            Duration::from_secs(2),
+            Arc::new(AppServerCancellation::default()),
+        )
+        .unwrap();
+        assert_eq!(recovered_process.session_id(), native_session_id);
+        assert_eq!(recovered_process.session_file(), recovered_session_file);
+        assert_eq!(
+            recovered_process
+                .execute(&second, None)
+                .unwrap()
+                .final_status,
+            "completed"
+        );
+        drop(recovered_process);
+        assert_process_group_reaped_or_clean_up(&second_pid_file);
+    }
+
+    #[tokio::test]
+    async fn persistent_pi_rpc_process_reloads_next_run_model_without_restarting() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("pi-reload.pid");
+        let request_log = temp.path().join("pi-reload-requests.jsonl");
+        let request_log_env = format!("FAKE_PI_REQUEST_LOG={}", request_log.display());
+        let pi_bin = write_fake_pi_wrapper(
+            &temp,
+            &pid_file,
+            &["FAKE_PI_DISABLE_MODEL=1", &request_log_env],
+        );
+        let first = test_claim();
+        let run_env = prepare_run_env(temp.path(), &first, Some("http://127.0.0.1:1/v1"))
+            .await
+            .unwrap();
+        let cancellation = Arc::new(AppServerCancellation::default());
+        let mut process = pi_driver::PersistentPiRpcProcess::start(
+            pi_bin.to_str().unwrap(),
+            &run_env,
+            None,
+            &pi_driver::pi_tool_allowlist(&first.agent),
+            Duration::from_secs(2),
+            cancellation,
+        )
+        .unwrap();
+
+        process.execute(&first, None).unwrap();
+        let first_pid = std::fs::read_to_string(&pid_file).unwrap();
+
+        let mut second = first.clone();
+        second.run.id = Uuid::new_v4();
+        let binding = second
+            .execution_configuration
+            .model_bindings
+            .first_mut()
+            .unwrap();
+        binding.id = Uuid::new_v4();
+        binding.run_id = second.run.id;
+        binding.model_id = "gpt-second".into();
+        second
+            .execution_configuration
+            .model_selection
+            .as_mut()
+            .unwrap()
+            .model_id = "gpt-second".into();
+        second.agent.model_selection.as_mut().unwrap().model_id = "gpt-second".into();
+        second.expected_configuration_fingerprint =
+            execution_configuration_fingerprint(&second.execution_configuration).unwrap();
+        prepare_run_env(temp.path(), &second, Some("http://127.0.0.1:1/v1"))
+            .await
+            .unwrap();
+
+        let result = process.execute(&second, None).unwrap();
+        assert_eq!(result.final_status, "completed");
+        assert_eq!(std::fs::read_to_string(&pid_file).unwrap(), first_pid);
+        let requests = std::fs::read_to_string(&request_log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["type"] == "reload_models")
+                .count(),
+            2
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["type"] == "set_model")
+                .map(|request| request["modelId"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["gpt-main", "gpt-second"]
+        );
+
+        drop(process);
+        assert_process_group_reaped_or_clean_up(&pid_file);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_pi_standalone_reloads_two_run_bindings_on_one_session() {
+        let Ok(pi_bin) = env::var("PI_STANDALONE_BIN") else {
+            return;
+        };
+        let pi_bin = PathBuf::from(pi_bin).canonicalize().unwrap();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = Router::new().route(
+            "/v1/responses",
+            post({
+                let observed = Arc::clone(&observed);
+                move |headers: HeaderMap, body: Bytes| {
+                    let observed = Arc::clone(&observed);
+                    async move {
+                        let request = serde_json::from_slice::<Value>(&body).unwrap();
+                        observed.lock().unwrap().push((
+                            headers
+                                .get("x-agent-hub-model-binding-id")
+                                .unwrap()
+                                .to_str()
+                                .unwrap()
+                                .to_owned(),
+                            request["model"].as_str().unwrap().to_owned(),
+                        ));
+                        let response = json!({
+                            "id": "resp_agent_hub_pi",
+                            "object": "response",
+                            "status": "completed",
+                            "output": [],
+                            "usage": {
+                                "input_tokens": 5,
+                                "output_tokens": 3,
+                                "total_tokens": 8,
+                                "input_tokens_details": { "cached_tokens": 0 }
+                            }
+                        });
+                        let output_item = json!({
+                            "type": "message",
+                            "id": "msg_agent_hub_pi",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [{ "type": "output_text", "text": "Hello from real Pi" }]
+                        });
+                        let sse = [
+                            json!({
+                                "type": "response.output_item.added",
+                                "output_index": 0,
+                                "item": {
+                                    "type": "message",
+                                    "id": "msg_agent_hub_pi",
+                                    "role": "assistant",
+                                    "status": "in_progress",
+                                    "content": []
+                                }
+                            }),
+                            json!({
+                                "type": "response.content_part.added",
+                                "output_index": 0,
+                                "content_index": 0,
+                                "part": { "type": "output_text", "text": "" }
+                            }),
+                            json!({
+                                "type": "response.output_text.delta",
+                                "output_index": 0,
+                                "content_index": 0,
+                                "delta": "Hello from real Pi"
+                            }),
+                            json!({
+                                "type": "response.output_item.done",
+                                "output_index": 0,
+                                "item": output_item
+                            }),
+                            json!({ "type": "response.completed", "response": response }),
+                        ]
+                        .into_iter()
+                        .map(|event| format!("data: {event}\n\n"))
+                        .collect::<String>();
+                        ([(header::CONTENT_TYPE, "text/event-stream")], sse)
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let model_addr = listener.local_addr().unwrap();
+        let model_server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut first = test_claim();
+        first.run.initial_message = "first real Pi turn".into();
+        let first_binding_id = first.execution_configuration.model_bindings[0].id;
+        let model_base_url = format!("http://{model_addr}/v1");
+        let run_env = prepare_run_env(temp.path(), &first, Some(&model_base_url))
+            .await
+            .unwrap();
+        let mut process = pi_driver::PersistentPiRpcProcess::start(
+            pi_bin.to_str().unwrap(),
+            &run_env,
+            None,
+            &pi_driver::pi_tool_allowlist(&first.agent),
+            Duration::from_secs(15),
+            Arc::new(AppServerCancellation::default()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            process.execute(&first, None).unwrap().final_status,
+            "completed"
+        );
+
+        let mut second = first.clone();
+        second.run.id = Uuid::new_v4();
+        second.run.initial_message = "second real Pi turn".into();
+        let second_binding_id = Uuid::new_v4();
+        let binding = second
+            .execution_configuration
+            .model_bindings
+            .first_mut()
+            .unwrap();
+        binding.id = second_binding_id;
+        binding.run_id = second.run.id;
+        binding.model_id = "gpt-second".into();
+        second
+            .execution_configuration
+            .model_selection
+            .as_mut()
+            .unwrap()
+            .model_id = "gpt-second".into();
+        second.agent.model_selection.as_mut().unwrap().model_id = "gpt-second".into();
+        second.expected_configuration_fingerprint =
+            execution_configuration_fingerprint(&second.execution_configuration).unwrap();
+        prepare_run_env(temp.path(), &second, Some(&model_base_url))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            process.execute(&second, None).unwrap().final_status,
+            "completed"
+        );
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![
+                (first_binding_id.to_string(), "gpt-main".into()),
+                (second_binding_id.to_string(), "gpt-second".into()),
+            ]
+        );
+
+        drop(process);
+        model_server.abort();
+    }
+
+    #[test]
+    fn pi_tool_allowlist_never_grants_bash_to_read_only_or_offline_agents() {
+        let mut agent = test_claim().agent;
+        agent.sandbox_policy = json!({ "mode": "read-only", "network_access": true });
+        assert_eq!(
+            pi_driver::pi_tool_allowlist(&agent),
+            ["read", "grep", "find", "ls"]
+        );
+
+        agent.sandbox_policy = json!({ "mode": "workspace-write", "network_access": false });
+        assert_eq!(
+            pi_driver::pi_tool_allowlist(&agent),
+            ["read", "grep", "find", "ls", "edit", "write"]
+        );
+
+        agent.sandbox_policy = json!({ "mode": "workspace-write", "network_access": true });
+        assert_eq!(
+            pi_driver::pi_tool_allowlist(&agent),
+            ["read", "grep", "find", "ls", "edit", "write", "bash"]
+        );
     }
 
     #[test]
@@ -14945,45 +16583,10 @@ done
     #[tokio::test]
     async fn managed_session_waits_for_turn_ack_and_reuses_proxy_while_switching_run_auth() {
         let temp = tempfile::tempdir().unwrap();
-        let pid_log = temp.path().join("managed-pids");
-        let base_url_log = temp.path().join("managed-base-urls");
-        let script = temp.path().join("managed-fake-codex");
-        std::fs::write(
-            &script,
-            format!(
-                r#"#!/bin/sh
-while IFS= read -r line; do
-  case "$line" in
-    *'"method":"initialize"'*) echo '{{"id":1,"result":{{}}}}' ;;
-    *'"method":"thread/start"'*) echo '{{"id":2,"result":{{"thread":{{"id":"managed-thread"}}}}}}' ;;
-    *'"method":"thread/unsubscribe"'*)
-      request_id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-      printf '{{"id":%s,"result":{{}}}}\n' "$request_id"
-      ;;
-    *'"method":"thread/resume"'*)
-      request_id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-      printf '{{"id":%s,"result":{{"thread":{{"id":"managed-thread"}}}}}}\n' "$request_id"
-      ;;
-    *'"method":"turn/start"'*)
-      echo $$ >> {}
-      base_url=$(sed -n 's/^base_url = "\(.*\)"$/\1/p' "$CODEX_HOME/config.toml" | head -n 1)
-      binding_id=$(sed -n 's/^x-agent-hub-model-binding-id = "\(.*\)"$/\1/p' "$CODEX_HOME/config.toml" | head -n 1)
-      echo "$base_url" >> {}
-      request_id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-      printf '{{"id":%s,"result":{{"turn":{{"id":"managed-turn-%s","status":"inProgress","items":[]}}}}}}\n' "$request_id" "$request_id"
-      printf '{{"method":"turn/started","params":{{"threadId":"managed-thread","turn":{{"id":"managed-turn-%s","status":"inProgress","items":[]}}}}}}\n' "$request_id"
-      curl --fail --silent --show-error -X POST "$base_url/responses" -H 'content-type: application/json' -H "x-agent-hub-model-binding-id: $binding_id" -d '{{}}' >/dev/null || exit 42
-      echo '{{"method":"turn/completed","params":{{"thread":{{"id":"managed-thread"}},"turn":{{"status":"completed","items":[{{"type":"agentMessage","text":"done"}}]}}}}}}'
-      ;;
-  esac
-done
-"#,
-                shell_single_quote(&pid_log),
-                shell_single_quote(&base_url_log),
-            ),
-        )
-        .unwrap();
-        make_executable(&script);
+        let pid_file = temp.path().join("managed-pi.pid");
+        let request_log = temp.path().join("managed-pi-requests.jsonl");
+        let request_log_env = format!("FAKE_PI_REQUEST_LOG={}", request_log.display());
+        let pi_bin = write_fake_pi_wrapper(&temp, &pid_file, &[&request_log_env]);
 
         let forwarded = Arc::new(std::sync::Mutex::new(Vec::new()));
         let acknowledged_turns = Arc::new(AtomicUsize::new(0));
@@ -15021,7 +16624,7 @@ done
                                     .unwrap()
                                     .to_owned(),
                             ));
-                            Json(json!({ "ok": true })).into_response()
+                            Json(json!({ "output_text": "done" })).into_response()
                         }
                     }
                 }),
@@ -15077,7 +16680,7 @@ done
         ));
         let mut config = test_config();
         config.work_root = temp.path().to_path_buf();
-        config.codex_bin = script.display().to_string();
+        config.codex_bin = pi_bin.display().to_string();
         config.hub_url = format!("http://{hub_addr}");
         let client = HubClient {
             http: reqwest::Client::new(),
@@ -15091,6 +16694,11 @@ done
         execute_managed_run(&config, &client, Arc::clone(&manager), first.clone())
             .await
             .unwrap();
+        let first_proxy_base_url = manager
+            .model_proxy(first.run.hub_session_id.unwrap())
+            .unwrap()
+            .base_url
+            .clone();
 
         let mut second = first.clone();
         second.run.id = Uuid::new_v4();
@@ -15101,22 +16709,37 @@ done
         execute_managed_run(&config, &client, Arc::clone(&manager), second.clone())
             .await
             .unwrap();
+        let second_proxy_base_url = manager
+            .model_proxy(second.run.hub_session_id.unwrap())
+            .unwrap()
+            .base_url
+            .clone();
 
-        let pids = std::fs::read_to_string(&pid_log)
+        assert_eq!(first_proxy_base_url, second_proxy_base_url);
+        let requests = std::fs::read_to_string(&request_log)
             .unwrap()
             .lines()
-            .map(str::to_owned)
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect::<Vec<_>>();
-        let base_urls = std::fs::read_to_string(&base_url_log)
-            .unwrap()
-            .lines()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        assert_eq!(pids.len(), 2);
-        assert_eq!(pids[0], pids[1]);
-        assert_eq!(base_urls.len(), 2);
-        assert_eq!(base_urls[0], base_urls[1]);
-        let proxy_addr: SocketAddr = base_urls[0]
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["type"] == "prompt")
+                .count(),
+            2
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["type"] == "reload_models")
+                .count(),
+            2
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pid_file).unwrap().lines().count(),
+            1
+        );
+        let proxy_addr: SocketAddr = first_proxy_base_url
             .trim_start_matches("http://")
             .trim_end_matches("/v1")
             .parse()
@@ -15146,8 +16769,13 @@ done
                 .join(SESSION_SUPERVISOR_METADATA_FILE);
         let metadata: SessionSupervisorMetadata =
             serde_json::from_slice(&std::fs::read(metadata_path).unwrap()).unwrap();
-        assert_eq!(metadata.native_thread_id.as_deref(), Some("managed-thread"));
+        let native_session_id = "fake-pi-fake-pi-session";
+        assert_eq!(
+            metadata.native_thread_id.as_deref(),
+            Some(native_session_id)
+        );
         manager.shutdown();
+        assert_process_group_reaped_or_clean_up(&pid_file);
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if tokio::net::TcpStream::connect(proxy_addr).await.is_err() {
@@ -15166,7 +16794,7 @@ done
                 session_id,
                 ownership_generation: 1,
                 lifecycle_status: "online".into(),
-                native_thread_id: Some("managed-thread".into()),
+                native_thread_id: Some(native_session_id.into()),
                 active_run_id: None,
             }],
             1,
@@ -15332,21 +16960,46 @@ done
     async fn idle_child_exit_is_reconciled_to_blocked_without_waiting_for_another_claim() {
         let temp = tempfile::tempdir().unwrap();
         let starts = temp.path().join("idle-crash-starts");
-        let script = temp.path().join("idle-crashing-codex");
+        let script = temp.path().join("idle-crashing-pi");
         std::fs::write(
             &script,
             format!(
                 r#"#!/bin/sh
 echo start >> {}
+session_dir=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --session-dir) session_dir="$2"; shift 2 ;;
+    --mode|--tools) shift 2 ;;
+    --no-extensions|--no-themes|--no-prompt-templates|--approve) shift ;;
+    *) exit 64 ;;
+  esac
+done
+mkdir -p "$session_dir"
+session_file="$session_dir/idle-pi.jsonl"
+printf '%s\n' '{{"type":"session","id":"idle-pi"}}' > "$session_file"
 while IFS= read -r line; do
-  case "$line" in
-    *'"method":"initialize"'*) echo '{{"id":1,"result":{{}}}}' ;;
-    *'"method":"thread/start"'*) echo '{{"id":2,"result":{{"thread":{{"id":"idle-thread"}}}}}}' ;;
-    *'"method":"turn/start"'*)
-      echo '{{"method":"turn/completed","params":{{"thread":{{"id":"idle-thread"}},"turn":{{"status":"completed","items":[{{"type":"agentMessage","text":"done"}}]}}}}}}'
+  command="$(printf '%s\n' "$line" | jq -r '.type')"
+  request_id="$(printf '%s\n' "$line" | jq -r '.id')"
+  case "$command" in
+    get_state)
+      jq -cn --arg id "$request_id" --arg file "$session_file" '{{type:"response",id:$id,command:"get_state",success:true,data:{{sessionFile:$file,sessionId:"idle-pi"}}}}'
+      ;;
+    reload_models|set_model|set_thinking_level)
+      jq -cn --arg id "$request_id" --arg command "$command" '{{type:"response",id:$id,command:$command,success:true,data:null}}'
+      ;;
+    prompt)
+      jq -cn --arg id "$request_id" '{{type:"response",id:$id,command:"prompt",success:true,data:null}}'
+      jq -cn '{{type:"agent_start"}}'
+      jq -cn '{{type:"turn_start"}}'
+      jq -cn '{{type:"message_end",message:{{role:"assistant",content:[{{type:"text",text:"done"}}],stopReason:"stop"}}}}'
+      jq -cn '{{type:"turn_end",message:{{role:"assistant",content:[{{type:"text",text:"done"}}],stopReason:"stop"}},toolResults:[]}}'
+      jq -cn '{{type:"agent_end",messages:[],willRetry:false}}'
+      jq -cn '{{type:"agent_settled"}}'
       sleep 0.1
       exit 72
       ;;
+    *) exit 64 ;;
   esac
 done
 "#,
@@ -15392,6 +17045,7 @@ done
         config.work_root = temp.path().to_path_buf();
         config.codex_bin = script.display().to_string();
         config.hub_url = format!("http://{hub_addr}");
+        config.app_server_timeout = Duration::from_secs(5);
         let client = HubClient {
             http: reqwest::Client::new(),
             hub_url: config.hub_url.clone(),
@@ -15483,22 +17137,48 @@ done
     async fn session_workers_run_different_sessions_concurrently_and_keep_each_session_serial() {
         let temp = tempfile::tempdir().unwrap();
         let release = temp.path().join("worker-release");
-        let script = temp.path().join("worker-fake-codex");
+        let script = temp.path().join("worker-fake-pi");
         std::fs::write(
             &script,
             format!(
                 r#"#!/bin/sh
+session_dir=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --session-dir) session_dir="$2"; shift 2 ;;
+    --mode|--tools) shift 2 ;;
+    --no-extensions|--no-themes|--no-prompt-templates|--approve) shift ;;
+    *) exit 64 ;;
+  esac
+done
+mkdir -p "$session_dir"
+session_id="worker-pi-$(basename "$(dirname "$(dirname "$session_dir")")")"
+session_file="$session_dir/session.jsonl"
+printf '{{"type":"session","id":"%s"}}\n' "$session_id" > "$session_file"
 while IFS= read -r line; do
-  case "$line" in
-    *'"method":"initialize"'*) echo '{{"id":1,"result":{{}}}}' ;;
-    *'"method":"thread/start"'*) echo '{{"id":2,"result":{{"thread":{{"id":"worker-thread"}}}}}}' ;;
-    *'"method":"turn/start"'*)
+  command="$(printf '%s\n' "$line" | jq -r '.type')"
+  request_id="$(printf '%s\n' "$line" | jq -r '.id')"
+  case "$command" in
+    get_state)
+      jq -cn --arg id "$request_id" --arg file "$session_file" --arg session "$session_id" '{{type:"response",id:$id,command:"get_state",success:true,data:{{sessionFile:$file,sessionId:$session}}}}'
+      ;;
+    reload_models|set_model|set_thinking_level)
+      jq -cn --arg id "$request_id" --arg command "$command" '{{type:"response",id:$id,command:$command,success:true,data:null}}'
+      ;;
+    prompt)
+      jq -cn --arg id "$request_id" '{{type:"response",id:$id,command:"prompt",success:true,data:null}}'
+      jq -cn '{{type:"agent_start"}}'
+      jq -cn '{{type:"turn_start"}}'
       echo start >> "$PWD/turns"
       touch "$PWD/entered"
       while [ ! -f {} ]; do sleep 0.01; done
       echo done >> "$PWD/turns"
-      echo '{{"method":"turn/completed","params":{{"thread":{{"id":"worker-thread"}},"turn":{{"status":"completed","items":[{{"type":"agentMessage","text":"done"}}]}}}}}}'
+      jq -cn '{{type:"message_end",message:{{role:"assistant",content:[{{type:"text",text:"done"}}],stopReason:"stop"}}}}'
+      jq -cn '{{type:"turn_end",message:{{role:"assistant",content:[{{type:"text",text:"done"}}],stopReason:"stop"}},toolResults:[]}}'
+      jq -cn '{{type:"agent_end",messages:[],willRetry:false}}'
+      jq -cn '{{type:"agent_settled"}}'
       ;;
+    *) exit 64 ;;
   esac
 done
 "#,
@@ -16445,6 +18125,96 @@ done
     }
 
     #[test]
+    fn fake_pi_fixture_uses_pi_jsonl_not_codex_app_server() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../deploy/fake-pi-rpc.sh");
+        let source = stdfs::read_to_string(&fixture).expect("read fake Pi fixture");
+        assert!(source.contains("--mode rpc"));
+        assert!(source.contains("prompt)"));
+        assert!(source.contains("agent_settled"));
+        assert!(!source.contains("thread/start"));
+        assert!(!source.contains("turn/start"));
+
+        let temp = tempfile::tempdir().unwrap();
+        let session_dir = temp.path().join("sessions");
+        let mut child = Command::new(&fixture)
+            .args(["--mode", "rpc", "--session-dir"])
+            .arg(&session_dir)
+            .env("FAKE_PI_DISABLE_MODEL", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("start fake Pi fixture");
+        let mut stdin = child.stdin.take().expect("open fake Pi stdin");
+        let stdout = child.stdout.take().expect("open fake Pi stdout");
+        let mut lines = BufReader::new(stdout).lines();
+
+        fn send(stdin: &mut std::process::ChildStdin, value: Value) {
+            serde_json::to_writer(&mut *stdin, &value).unwrap();
+            stdin.write_all(b"\n").unwrap();
+            stdin.flush().unwrap();
+        }
+
+        fn recv(lines: &mut std::io::Lines<BufReader<std::process::ChildStdout>>) -> Value {
+            serde_json::from_str(
+                &lines
+                    .next()
+                    .expect("fixture output")
+                    .expect("read fixture output"),
+            )
+            .expect("fixture JSON")
+        }
+
+        send(&mut stdin, json!({ "id": "state", "type": "get_state" }));
+        let state = recv(&mut lines);
+        assert_eq!(state["type"], "response");
+        assert_eq!(state["command"], "get_state");
+        assert!(state["data"]["sessionFile"].as_str().is_some());
+
+        send(
+            &mut stdin,
+            json!({ "id": "model", "type": "set_model", "provider": "hub", "modelId": "fixture" }),
+        );
+        assert_eq!(recv(&mut lines)["command"], "set_model");
+        send(
+            &mut stdin,
+            json!({ "id": "thinking", "type": "set_thinking_level", "level": "high" }),
+        );
+        assert_eq!(recv(&mut lines)["command"], "set_thinking_level");
+
+        send(
+            &mut stdin,
+            json!({ "id": "prompt", "type": "prompt", "message": "fixture:hold" }),
+        );
+        assert_eq!(recv(&mut lines)["command"], "prompt");
+        assert_eq!(recv(&mut lines)["type"], "agent_start");
+        assert_eq!(recv(&mut lines)["type"], "turn_start");
+        assert_eq!(
+            recv(&mut lines)["assistantMessageEvent"]["type"],
+            "thinking_delta"
+        );
+
+        send(
+            &mut stdin,
+            json!({ "id": "steer", "type": "steer", "message": "fixture:release" }),
+        );
+        assert_eq!(recv(&mut lines)["command"], "steer");
+        assert_eq!(recv(&mut lines)["type"], "queue_update");
+        assert_eq!(recv(&mut lines)["type"], "tool_execution_start");
+        assert_eq!(recv(&mut lines)["type"], "tool_execution_update");
+        assert_eq!(recv(&mut lines)["type"], "tool_execution_end");
+        assert_eq!(
+            recv(&mut lines)["assistantMessageEvent"]["type"],
+            "text_delta"
+        );
+        assert_eq!(recv(&mut lines)["type"], "turn_end");
+        assert_eq!(recv(&mut lines)["type"], "agent_end");
+        assert_eq!(recv(&mut lines)["type"], "agent_settled");
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
     fn app_server_steer_response_only_falls_back_for_an_ended_expected_turn() {
         assert_eq!(
             app_server_steer_response(
@@ -17161,6 +18931,73 @@ exit 0
         assert!(error.to_string().contains("Hub"));
     }
 
+    #[tokio::test]
+    async fn pi_runtime_ignores_legacy_codex_rollout_commands() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut config = test_config();
+        assert_eq!(config.codex_driver, "app-server");
+        let original_binary = config.codex_bin.clone();
+        let original_version = config.codex_version.clone();
+        let artifact_requests = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/api/runtime/codex/artifacts/{version}/{os}/{architecture}",
+            get({
+                let artifact_requests = Arc::clone(&artifact_requests);
+                move || {
+                    let artifact_requests = Arc::clone(&artifact_requests);
+                    async move {
+                        artifact_requests.fetch_add(1, Ordering::SeqCst);
+                        AxumStatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hub_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = HubClient {
+            http: reqwest::Client::new(),
+            hub_url: format!("http://{hub_addr}"),
+            runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
+            protocol_capabilities: HashSet::new(),
+        };
+        let mut rollout = RuntimeCodexState::new(&config);
+
+        apply_runtime_codex_rollout(
+            &mut config,
+            &client,
+            &mut rollout,
+            None,
+            &RuntimeCodexRolloutCommandDto {
+                active_version: Some("0.144.5".into()),
+                target_artifact: Some(CodexVersionArtifactDto {
+                    version: "0.144.5".into(),
+                    os: std::env::consts::OS.into(),
+                    architecture: std::env::consts::ARCH.into(),
+                    artifact_name: "codex.zst".into(),
+                    sha256: "0".repeat(64),
+                    size_bytes: 1,
+                }),
+            },
+        )
+        .await;
+
+        assert_eq!(artifact_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(config.codex_bin, original_binary);
+        assert_eq!(config.codex_version, original_version);
+        assert_eq!(
+            rollout.heartbeat_status(),
+            RuntimeCodexStatusDto {
+                current_version: original_version,
+                candidate_version: None,
+                candidate_status: None,
+                candidate_error: None,
+            }
+        );
+        server.abort();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn candidate_codex_must_pass_bounded_exact_version_and_app_server_checks() {
@@ -17327,6 +19164,7 @@ exit 0
         config.work_root = root.path().to_path_buf();
         config.codex_version = "0.143.0".into();
         config.codex_bin = "/old/codex".into();
+        config.codex_driver = "fake".into();
         let mut rollout = RuntimeCodexState::new(&config);
 
         apply_runtime_codex_rollout(
@@ -17511,6 +19349,7 @@ done
         config.work_root = root.path().to_path_buf();
         config.codex_version = "0.143.0".into();
         config.codex_bin = old_binary.display().to_string();
+        config.codex_driver = "fake".into();
         let mut rollout = RuntimeCodexState::new(&config);
         apply_runtime_codex_rollout(
             &mut config,
@@ -17598,6 +19437,36 @@ done
             permissions.set_mode(0o755);
             std::fs::set_permissions(path, permissions).unwrap();
         }
+    }
+
+    fn write_fake_pi_wrapper(
+        temp: &tempfile::TempDir,
+        pid_file: &Path,
+        environment: &[&str],
+    ) -> PathBuf {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/fake-pi-rpc.sh")
+            .canonicalize()
+            .unwrap();
+        let script = temp
+            .path()
+            .join(format!("fake-pi-{}", Uuid::new_v4().simple()));
+        let exports = environment
+            .iter()
+            .map(|assignment| format!("export {assignment}\n"))
+            .collect::<String>();
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho $$ > {}\n{}exec {} \"$@\"\n",
+                shell_single_quote(pid_file),
+                exports,
+                shell_single_quote(&fixture)
+            ),
+        )
+        .unwrap();
+        make_executable(&script);
+        script
     }
 
     fn write_long_running_streaming_codex(temp: &tempfile::TempDir, pid_file: &Path) -> PathBuf {

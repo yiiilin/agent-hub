@@ -1,0 +1,6 @@
+{
+  "name": "Pi Session idle Bundle cold recovery API smoke",
+  "type": "api",
+  "timeout_ms": 240000,
+  "covers": ["REC-002"]
+}

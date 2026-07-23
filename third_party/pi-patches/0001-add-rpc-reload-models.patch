@@ -1,0 +1,37 @@
+diff --git a/packages/coding-agent/src/modes/rpc/rpc-mode.ts b/packages/coding-agent/src/modes/rpc/rpc-mode.ts
+index 4c0edf2..79fc033 100644
+--- a/packages/coding-agent/src/modes/rpc/rpc-mode.ts
++++ b/packages/coding-agent/src/modes/rpc/rpc-mode.ts
+@@ -465,6 +465,11 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<never
+ 			// Model
+ 			// =================================================================
+ 
++			case "reload_models": {
++				await session.modelRuntime.reloadConfig();
++				return success(id, "reload_models");
++			}
++
+ 			case "set_model": {
+ 				const models = await session.modelRuntime.getAvailable();
+ 				const model = models.find((m) => m.provider === command.provider && m.id === command.modelId);
+diff --git a/packages/coding-agent/src/modes/rpc/rpc-types.ts b/packages/coding-agent/src/modes/rpc/rpc-types.ts
+index 34ead3e..eec4212 100644
+--- a/packages/coding-agent/src/modes/rpc/rpc-types.ts
++++ b/packages/coding-agent/src/modes/rpc/rpc-types.ts
+@@ -33,7 +33,8 @@ export type RpcCommand =
+ 	// State
+ 	| { id?: string; type: "get_state" }
+ 
+ 	// Model
++	| { id?: string; type: "reload_models" }
+ 	| { id?: string; type: "set_model"; provider: string; modelId: string }
+ 	| { id?: string; type: "cycle_model" }
+ 	| { id?: string; type: "get_available_models" }
+@@ -111,6 +112,7 @@ export type RpcResponse =
+ 	| { id?: string; type: "response"; command: "get_state"; success: true; data: RpcSessionState }
+ 
+ 	// Model
++	| { id?: string; type: "response"; command: "reload_models"; success: true }
+ 	| {
+ 			id?: string;
+ 			type: "response";

@@ -1,0 +1,3 @@
+[submodule "third_party/pi"]
+	path = third_party/pi
+	url = https://github.com/earendil-works/pi.git

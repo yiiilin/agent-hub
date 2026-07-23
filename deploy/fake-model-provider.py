@@ -119,21 +119,102 @@ class Handler(BaseHTTPRequestHandler):
                 },
             }
         else:
+            model = request.get("model", "hub-proxy-smoke")
+            text = "Fake Codex completed run through the Hub model proxy."
+            output = {
+                "id": "msg_proxy_fake_completed",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": text}],
+            }
+            usage = {
+                "input_tokens": 11,
+                "output_tokens": 7,
+                "total_tokens": 18,
+                "input_tokens_details": {"cached_tokens": 3},
+                "output_tokens_details": {"reasoning_tokens": 5},
+            }
+            if request.get("stream") is True:
+                self.send_responses_stream(model, text, output, usage)
+                return
             response = {
                 "id": "resp_proxy_fake_completed",
                 "object": "response",
-                "model": request.get("model", "hub-proxy-smoke"),
+                "model": model,
                 "status": "completed",
-                "output_text": "Fake Codex completed run through the Hub model proxy.",
-                "usage": {
-                    "input_tokens": 11,
-                    "output_tokens": 7,
-                    "total_tokens": 18,
-                    "input_tokens_details": {"cached_tokens": 3},
-                    "output_tokens_details": {"reasoning_tokens": 5},
-                },
+                "output_text": text,
+                "output": [output],
+                "usage": usage,
             }
         self.send_json(response)
+
+    def send_responses_stream(self, model, text, output, usage):
+        response = {
+            "id": "resp_proxy_fake_completed",
+            "object": "response",
+            "model": model,
+            "status": "completed",
+            "output": [output],
+            "usage": usage,
+        }
+        events = (
+            {
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {
+                    "id": response["id"],
+                    "object": "response",
+                    "model": model,
+                    "status": "in_progress",
+                },
+            },
+            {
+                "type": "response.output_item.added",
+                "sequence_number": 1,
+                "output_index": 0,
+                "item": {
+                    "id": output["id"],
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": [],
+                },
+            },
+            {
+                "type": "response.content_part.added",
+                "sequence_number": 2,
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": ""},
+            },
+            {
+                "type": "response.output_text.delta",
+                "sequence_number": 3,
+                "output_index": 0,
+                "content_index": 0,
+                "delta": text,
+            },
+            {
+                "type": "response.output_item.done",
+                "sequence_number": 4,
+                "output_index": 0,
+                "item": output,
+            },
+            {
+                "type": "response.completed",
+                "sequence_number": 5,
+                "response": response,
+            },
+        )
+        body = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+        encoded = body.encode()
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("cache-control", "no-cache")
+        self.send_header("content-length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
 
     def handle_chat_completions(self):
         if self.headers.get("authorization") != f"Bearer {API_KEY}":

@@ -1,6 +1,38 @@
 # Agent Hub Operations
 
-本文说明 Native Codex Session Runtime 的部署配置、持久化边界和故障处理。协议与状态机的权威定义仍在 `docs/session-runtime-spec.md` 和 ADR-0001 至 ADR-0027。
+本文说明 Native Pi Session Runtime 的部署配置、持久化边界和故障处理。协议与状态机的权威定义仍在 `docs/session-runtime-spec.md`、`docs/pi-driver-spec.md` 和 ADR-0001 至 ADR-0027。
+
+## Pi Runtime artifact
+
+Runtime 镜像内置 Pi `v0.81.1`，源码固定为 git submodule `third_party/pi` 的
+commit `20be4b18d4c57487f8993d2762bace129f0cf7c6`。构建期使用 Node/npm 和固定
+Bun `1.3.14`；最终 Runtime 镜像不安装 Node、npm 或 Bun。Linux x64 必须使用
+`bun-linux-x64-baseline`，不能使用依赖 AVX/AVX2 的通用 artifact。
+
+从已初始化 submodule 的干净 checkout 重建：
+
+```bash
+git submodule update --init --recursive third_party/pi
+./scripts/build-pi-standalone.sh
+target/pi-runtime/linux-x64/pi --version
+```
+
+输出必须是 `0.81.1`。脚本校验 submodule commit、Bun archive SHA-256、
+`third_party/pi-patches/0001-add-rpc-reload-models.patch` SHA-256、以及
+`third_party/pi-model-data/v0.81.1/` 的完整 tree SHA-256，然后在 `/tmp` 的
+一次性源码导出中应用补丁并构建 release directory。`--skip-install` 只用于本机
+已存在与 lockfile 匹配的 `third_party/pi/node_modules` 时复用依赖；不能作为干净
+构建证明。
+
+model-data snapshot 的 freshness 定义为：目录版本与 Pi pin 相同，tree hash 与
+构建脚本常量一致，并且该 pin 的 offline build 通过。升级 Pi、修改 provider
+适配或上游 model catalog 变化时，必须重新生成 snapshot、更新 tree hash、重建
+artifact 并执行真实 standalone RPC smoke；不能仅修改版本字符串。
+
+运行时只执行镜像内的 Pi binary，不能让 Runtime 下载 GitHub release，也不能
+把 provider key 写入 Pi 配置。模型请求始终经 Runtime loopback -> Hub model
+gateway；Bundle 只保存 Pi recovery JSONL 和 Workspace。旧 Codex rollout API
+仅为公开契约兼容而保留，不负责分发 Pi artifact。
 
 ## 生产 Compose
 
@@ -25,17 +57,20 @@ Hub 默认只发布到 `127.0.0.1:8080`，应由宿主机反向代理终止 TLS�
 
 Model Gateway 不发布宿主机端口，只连接 `model-network`；Runtime 只连接 `hub-network`，不是 `model-network` 成员，不能访问 Compose 中的 gateway/provider 服务地址。Backend 同时连接两个网络，并等待 gateway `/readyz` 健康后启动。Gateway 不接收数据库、S3、OAuth 或 provider 的持久凭据，provider key 只在单次 Hub 请求中传入。
 
-生产 Runtime 是可选 profile，因为 Runtime 可以部署在其他节点。若要在同一台机器运行，先把可执行的真实 Codex CLI 放到 `CODEX_BIN_PATH`，在管理台创建一次性 Enrollment Token，并设置 `RUNTIME_ENROLLMENT_TOKEN`、实际 `RUNTIME_CODEX_VERSION` 和稳定的 `RUNTIME_HOSTNAME`，然后启动：
+生产 Runtime 是可选 profile，因为 Runtime 可以部署在其他节点。若要在同一台机器运行，在管理台创建一次性 Enrollment Token，设置 `RUNTIME_ENROLLMENT_TOKEN` 和稳定的 `RUNTIME_HOSTNAME`，然后启动：
 
 ```bash
 docker compose --profile runtime up -d --build
 ```
 
-该 Codex CLI 是 Runtime 首次注册和兼容性检查所需的 bootstrap 版本；后续精确版本仍由 Hub 下载、校验并分发。`runtime-data` 已包含 Runtime credential、Workspace 和 Hub 分发的 Codex 版本，不得当作无状态缓存删除。
+Runtime 镜像固定执行 `/opt/agent-hub/pi/pi`，版本由镜像内
+`RUNTIME_CODEX_VERSION=0.81.1` 兼容字段上报，Compose 不接受宿主机同名变量
+覆盖它；不挂载 `CODEX_BIN_PATH`，也不从 Hub 下载执行 artifact。`runtime-data` 包含 Runtime credential、Workspace、在线
+Pi Session state 和暂存文件，不得当作无状态缓存删除。
 
 ## 开发 Compose
 
-`compose.dev.yml` 保留 Mock OIDC、开发种子、fake model provider 和 fake Codex，只用于本地开发及自动化测试。它同样由 backend 直接提供构建后的前端资源：
+`compose.dev.yml` 保留 Mock OIDC、开发种子和 fake model provider，只用于本地开发及自动化测试；Runtime 仍执行镜像内真实 Pi standalone。确定性的 `deploy/fake-pi-rpc.sh` 只用于协议级测试。开发环境同样由 backend 直接提供构建后的前端资源：
 
 ```bash
 docker compose -p agent-hub-dev -f compose.dev.yml up -d --build
@@ -53,8 +88,8 @@ E2E_COMPOSE_PROJECT=agent-hub-dev npm --prefix frontend run test:e2e
 | Volume | 容器路径 | 内容 |
 | --- | --- | --- |
 | `postgres-data` | `/var/lib/postgresql/data` | Hub 数据库 |
-| `hub-data` | `/var/lib/agent-hub` | Hub 已校验的 Codex CLI 版本文件 |
-| `runtime-data` | `/var/lib/agent-hub-runtime` | Runtime credential、在线 Session 目录、已下载的 Codex CLI 和暂存文件 |
+| `hub-data` | `/var/lib/agent-hub` | Hub 持久数据及兼容保留的旧 artifact 数据 |
+| `runtime-data` | `/var/lib/agent-hub-runtime` | Runtime credential、在线 Session 目录和暂存文件 |
 | `bundle-store-data` | `/data` | Compose 内置 MinIO 中的 Session Bundle 对象 |
 
 不要在 Runtime 尚有 Session 时删除 `runtime-data`。其中可能有尚未成功写入 Session Bundle 的最新 Workspace 状态。
@@ -80,17 +115,17 @@ Runtime 被普通或强制删除后，原 Runtime identity 和 credential 永久
 
 ## Runtime 本地数据和 Session Bundle
 
-每个在线 Session 位于 `RUNTIME_WORK_ROOT/sessions/<session-id>/`，包含独立的 `workspace/`、生成的 `codex/`、本地 `supervisor/` 元数据和 `staging/`。Runtime 还在同一持久根目录保存按精确版本安装的 Codex CLI。不同 Session 不共享 Workspace 或 `CODEX_HOME`。
+每个在线 Session 位于 `RUNTIME_WORK_ROOT/sessions/<session-id>/`，包含独立的 `workspace/`、作为隔离 Pi `HOME` 的兼容路径 `codex/`、本地 `supervisor/` 元数据和 `staging/`。`codex/.pi/agent/` 是 Hub 可重建配置，`codex/sessions/` 是 Pi native JSONL。不同 Session 不共享 Workspace、Pi HOME 或 JSONL。
 
-Session 空闲 15 分钟后，Runtime 默认停止其 app-server 并生成一个 `tar.zst` Session Bundle。Bundle 只包含：
+Session 空闲 15 分钟后，Runtime 默认停止其 Pi RPC 进程并生成一个 `tar.zst` Session Bundle。Bundle 只包含：
 
 | 路径 | 用途 |
 | --- | --- |
 | `workspace/` | Session 的完整工作区，包括隐藏文件和 `.git` |
-| `codex-thread/` | 恢复同一 native Codex Thread 所需的最小 transcript 和 index 文件 |
-| `manifest.json` | Session/Thread 标识、Bundle generation、Hub history checkpoint、生成时 Codex 版本，以及内容大小和校验声明 |
+| `codex-thread/sessions/<file>.jsonl` | 恢复同一 native Pi Session 的唯一 JSONL |
+| `manifest.json` | Hub/Pi Session 标识、Bundle generation、Hub history checkpoint、生成时 Pi 版本，以及内容大小和校验声明 |
 
-Bundle 不包含 Runtime credential、模型密钥、OAuth secret、Agent/Skill/MCP 配置、日志、缓存、Codex CLI 或其他 Session。Agent/Skill/MCP 文件由 Hub 在下一 Turn 前按当前配置重新生成。
+Runtime 按 JSONL 第一行的 `type=session` 和 `id=<native_thread_id>` 选择唯一恢复文件，不依赖文件名。恢复只接受兼容目录根、`sessions/` 和一个直接子级 `.jsonl`，并在提交恢复目录前再次验证 header 与 manifest 匹配。Bundle 不包含 `.pi/agent`、Runtime credential、模型密钥、OAuth secret、Agent/Skill/MCP 配置、settings、extensions、日志、缓存、Pi binary 或其他 Session。Agent/Skill/model binding 文件由 Hub 在下一 Turn 前按当前配置重新生成。
 
 物理删除 Hub Skill 会请求相关在线 Session 刷新派生配置。空闲 Session 立即处理，活动 Turn 结束或被停止后处理；这只修改 `codex/` 中 Hub-owned 文件，不修改 `workspace/`、Bundle 或 native transcript。
 
@@ -102,7 +137,7 @@ Runtime 创建压缩包并计算压缩文件的 SHA-256。Hub 只校验身份、
 
 Hub 启动必须提供 `HUB_MODEL_SECRET_KEY`，用于加密数据库中的 Model Connection API Key。该值是部署 secret，不得写入镜像、源码、日志、浏览器响应或 Runtime 配置；Compose 中的固定开发值只能用于本地测试。第一版没有 key rotation，修改或丢失该值会导致既有模型密钥无法解密。
 
-Runtime 和 per-Session `CODEX_HOME` 只包含指向 loopback/Hub proxy 的 provider 配置，不包含真实 provider URL credential。`HUB_MODEL_PROXY_UPSTREAM_URL`、`HUB_MODEL_PROXY_API_KEY` 和全部 `RUNTIME_DIRECT_MODEL_*` 已废弃且不迁移；管理员必须在管理台创建 Global/Personal Model Connection。连接的服务根地址不带 `/v1`。Hub 完成 Run 授权、密钥解密和账本归属后，把单次请求交给内部 Model Gateway；Gateway 根据连接协议调用 provider，并把规范化 Responses JSON/SSE 返回 Hub。
+Runtime 和 per-Session Pi HOME 只包含指向 loopback/Hub proxy 的 provider 配置，不包含真实 provider URL credential。`HUB_MODEL_PROXY_UPSTREAM_URL`、`HUB_MODEL_PROXY_API_KEY` 和全部 `RUNTIME_DIRECT_MODEL_*` 已废弃且不迁移；管理员必须在管理台创建 Global/Personal Model Connection。连接的服务根地址不带 `/v1`。Hub 完成 Run 授权、密钥解密和账本归属后，把单次请求交给内部 Model Gateway；Gateway 根据连接协议调用 provider，并把规范化 Responses JSON/SSE 返回 Hub。
 
 `HUB_MODEL_GATEWAY_URL` 和 `HUB_MODEL_GATEWAY_AUTH_TOKEN` 是 Hub 启动必需配置。Compose 固定 URL 为 `http://model-gateway:8090`，共享令牌由 `.env` 注入 Hub 和 Gateway。`MODEL_GATEWAY_UPSTREAM_TIMEOUT` 与 `MODEL_GATEWAY_STREAM_IDLE_TIMEOUT` 使用 Go duration 语法；默认分别为 `300s` 和 `120s`。Gateway 不保存 provider key、请求、响应、用量或错误历史，重启不需要持久卷。
 
@@ -130,19 +165,23 @@ Endpoint 只允许 HTTP/HTTPS，且不能包含 query 或 fragment。HTTPS 是�
 
 S3 credential、bucket 和对象 URL 只存在于 Hub。Runtime 的上传和下载都只连接 Hub，不获得 S3 credential、预签名 URL，也不直接访问对象存储。
 
-## 精确 Codex CLI 版本发布
+## Pi 镜像升级和回滚
 
-Hub 默认从 `https://api.github.com/repos/openai/codex` 获取官方 release，并把已验证 artifact 保存到 `HUB_CODEX_ARTIFACT_ROOT`（Compose 中为持久化的 `/var/lib/agent-hub/codex-artifacts`）。测试镜像源只有在显式设置 `HUB_CODEX_GITHUB_ALLOW_HTTP=true` 后才能使用 HTTP。
+Pi 版本随完整 Runtime 镜像发布，不由 Hub 的兼容 Codex rollout API 分发。该 API/DTO
+仍可读取和下发旧字段，但 Pi Runtime 不下载 candidate、不切换二进制，也不为它
+安排 version checkpoint。
 
-发布流程：
+升级前保存当前镜像的不可变 digest 作为上一已知良好版本。先 Drain 待升级 Runtime，
+等全部 Session 完成 Turn、提交 current Bundle 并释放 ownership，再用新 digest 重建
+Runtime。启动后必须验证 `/healthz`、`/opt/agent-hub/pi/pi --version`、一轮经 fake
+或受控 provider 的 Session 对话，以及同一 Session 的下一 Turn continuity。任一步失败
+即停止扩大部署，不 Force Delete 仍可能持有未 checkpoint 状态的旧节点。
 
-1. 在 Administration 页面输入明确版本号，例如 `0.104.0`；不接受 `latest`。
-2. Hub 按所有已注册 Runtime 的 OS/architecture 下载官方 release artifact 并验证发布的 SHA-256。
-3. Runtime 只从 Hub 下载候选文件，再次校验并运行有界的基础兼容性检查，然后报告 readiness。
-4. 所有要求的平台 ready 后，管理员 Promote 该 Target Codex Version 为全局 Active Codex Version。
-5. 正在运行的 Turn 继续使用旧进程直到结束。Session 随后用旧版本完成 checkpoint，下一 Turn 直接使用新 Active Codex Version；不做跨版本恢复冒烟测试，也不静默回退旧版本。
-
-恢复始终使用当前 Active Codex Version。若它无法继续原 native Thread，原 Bundle 保持不变，Session 进入 `recovery_failed`，不会创建替代 Thread。
+回滚同样是整张 Runtime 镜像切换：Drain 新节点并等 Session 排出，固定 Compose 的
+Runtime image 为之前记录的 digest，再启动并重复 health、Pi version 和 Session recovery
+smoke。回滚镜像会重新物化当前 Agent/Skill/model 配置，但必须 resume Bundle 中同一 Pi
+Session id；无法恢复时保留原 Bundle，Session 进入 `recovery_failed`，不得静默创建新
+native Session。没有 current Bundle 或仍有未完成 Turn 时，不得把镜像回滚当作数据恢复。
 
 ## Runtime drain 和删除
 
@@ -158,9 +197,9 @@ Force Delete 只用于确认节点永久丢失或无法完成 drain 的情况。
 
 ## `recovery_failed` 处理
 
-`recovery_failed` 表示 Hub 最新历史无法匹配一个完整可恢复的 Workspace 和 native Codex Thread，常见原因是永久丢失带有未 checkpoint 数据的 Runtime，或 Active Codex Version 无法恢复原 Thread。
+`recovery_failed` 表示 Hub 最新历史无法匹配一个完整可恢复的 Workspace 和 native Pi Session，常见原因是永久丢失带有未 checkpoint 数据的 Runtime，或当前 Pi 镜像无法恢复原 Session。
 
 - 保留 Session 历史和最后一个不可变 Bundle，禁止继续发送消息。
-- 不回滚到旧 Workspace，不从 Hub 消息重建新 Thread，也不自动切回旧 Codex 版本。
-- 先保留对象存储和数据库记录，再检查 Runtime、Hub 日志及 Active Codex Version。不要用 Force Delete 作为普通重试手段。
+- 不回滚到旧 Workspace，不从 Hub 消息重建新 Pi Session，也不自动切回旧 Pi 镜像。
+- 先保留对象存储和数据库记录，再检查 Runtime、Hub 日志及当前 Pi 镜像版本。不要用 Force Delete 作为普通重试手段。
 - 当前产品没有把 `recovery_failed` Session 原地改回可执行状态的管理操作；它只能作为只读历史保留，或随其 Hub User 被不可逆删除。

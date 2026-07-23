@@ -158,9 +158,7 @@ services:
       RUNTIME_HOSTNAME: ${RUNTIME_HOSTNAME:-compose-runtime-1}
       RUNTIME_CODEX_DRIVER: app-server
       RUNTIME_CODEX_SOURCE: path
-      RUNTIME_CODEX_VERSION: ${RUNTIME_CODEX_VERSION:-unmanaged}
       RUNTIME_HEALTH_BIND_ADDR: 0.0.0.0:8081
-      CODEX_BIN: /usr/local/bin/codex
       RUST_LOG: ${RUNTIME_RUST_LOG:-agent_hub_runtime=info}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/healthz"]
@@ -169,10 +167,6 @@ services:
       retries: 20
     volumes:
       - runtime-data:/var/lib/agent-hub-runtime
-      - type: bind
-        source: ${CODEX_BIN_PATH:-/opt/agent-hub/codex}
-        target: /usr/local/bin/codex
-        read_only: true
     depends_on:
       backend:
         condition: service_healthy

@@ -1,4 +1,14 @@
 .git/
+!.git/modules/
+!.git/modules/third_party/
+!.git/modules/third_party/pi/
+!.git/modules/third_party/pi/HEAD
+!.git/modules/third_party/pi/config
+!.git/modules/third_party/pi/objects/
+!.git/modules/third_party/pi/objects/**
+!.git/modules/third_party/pi/packed-refs
+!.git/modules/third_party/pi/refs/
+!.git/modules/third_party/pi/refs/**
 
 .env
 .env.*
@@ -31,3 +41,5 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+
+third_party/pi/node_modules/

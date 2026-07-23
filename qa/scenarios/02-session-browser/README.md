@@ -4,6 +4,6 @@ Type: `browser`
 
 This scenario reuses the Playwright installation under `frontend/`. It signs in
 through the real UI, creates an Agent and Run through authenticated browser API
-requests, waits for fake Codex completion, and verifies the Session transcript,
-collapsed readable activity, browser diagnostics, and horizontal overflow at
-desktop and 390px mobile widths.
+requests, waits for Pi completion, and verifies the Session transcript contains
+one non-empty assistant answer without coupling to model wording. It also checks
+browser diagnostics and horizontal overflow at desktop and 390px mobile widths.

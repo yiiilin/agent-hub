@@ -7,7 +7,7 @@ Agent Hub 是 Rust 控制面、独立 Rust runtime 与 React 管理台组成的�
 ## 目录边界
 
 - `crates/backend/`：HTTP API、认证、调度、PostgreSQL migrations 和后端测试。
-- `crates/runtime/`：runtime 注册、任务领取、Codex app-server 驱动和本地运行隔离。
+- `crates/runtime/`：runtime 注册、任务领取、Pi standalone RPC 驱动和本地运行隔离。
 - `crates/shared/`：后端与 runtime 共用的序列化 DTO 和协议类型。
 - `frontend/`：React 控制台、API client、样式和 Playwright 测试。
 - `compose.yml`：默认生产部署；`compose.dev.yml`：本地开发和测试环境。
