@@ -38,14 +38,14 @@ type Config struct {
 }
 
 type proxyEnvelope struct {
-	RequestID         string                 `json:"request_id"`
-	Protocol          string                 `json:"protocol"`
-	RequestParameters modelRequestParameters `json:"request_parameters"`
-	Endpoint          string                 `json:"endpoint"`
-	APIKey            string                 `json:"api_key"`
-	Query             string                 `json:"query,omitempty"`
-	Headers           map[string][]string    `json:"headers,omitempty"`
-	BodyBase64        string                 `json:"body_base64"`
+	RequestID       string               `json:"request_id"`
+	Protocol        string               `json:"protocol"`
+	RequestSettings modelRequestSettings `json:"request_settings"`
+	Endpoint        string               `json:"endpoint"`
+	APIKey          string               `json:"api_key"`
+	Query           string               `json:"query,omitempty"`
+	Headers         map[string][]string  `json:"headers,omitempty"`
+	BodyBase64      string               `json:"body_base64"`
 }
 
 type server struct {
@@ -186,7 +186,7 @@ func validateEnvelope(envelope proxyEnvelope) ([]byte, *url.URL, error) {
 		envelope.Protocol != protocolAnthropicMessages {
 		return nil, nil, errors.New("unsupported upstream protocol")
 	}
-	if err := envelope.RequestParameters.validate(envelope.Protocol); err != nil {
+	if err := envelope.RequestSettings.validate(envelope.Protocol); err != nil {
 		return nil, nil, err
 	}
 	if envelope.APIKey == "" {

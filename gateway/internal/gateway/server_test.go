@@ -71,12 +71,12 @@ func encodedBody(body string) string {
 
 func openAIEnvelope(endpoint, body string) proxyEnvelope {
 	return proxyEnvelope{
-		RequestID:         "req-openai",
-		Protocol:          protocolOpenAIResponses,
-		RequestParameters: modelRequestParameters{Protocol: protocolOpenAIResponses},
-		Endpoint:          endpoint,
-		APIKey:            "provider-secret",
-		Query:             "include=usage%2Edetails&trace=one",
+		RequestID:       "req-openai",
+		Protocol:        protocolOpenAIResponses,
+		RequestSettings: modelRequestSettings{Protocol: protocolOpenAIResponses},
+		Endpoint:        endpoint,
+		APIKey:          "provider-secret",
+		Query:           "include=usage%2Edetails&trace=one",
 		Headers: map[string][]string{
 			"Accept":                       {"text/event-stream"},
 			"Content-Type":                 {"application/json"},
@@ -93,11 +93,11 @@ func openAIEnvelope(endpoint, body string) proxyEnvelope {
 func anthropicEnvelope(endpoint string, stream bool) proxyEnvelope {
 	body := fmt.Sprintf(`{"model":"claude-test","input":[{"role":"user","content":[{"type":"input_text","text":"private prompt"}]}],"max_output_tokens":64,"stream":%t}`, stream)
 	return proxyEnvelope{
-		RequestID:         "req-anthropic",
-		Protocol:          protocolAnthropicMessages,
-		RequestParameters: modelRequestParameters{Protocol: protocolAnthropicMessages},
-		Endpoint:          endpoint,
-		APIKey:            "shared-anthropic-secret",
+		RequestID:       "req-anthropic",
+		Protocol:        protocolAnthropicMessages,
+		RequestSettings: modelRequestSettings{Protocol: protocolAnthropicMessages},
+		Endpoint:        endpoint,
+		APIKey:          "shared-anthropic-secret",
 		Headers: map[string][]string{
 			"Accept":       {"application/json"},
 			"Content-Type": {"application/json"},
@@ -114,7 +114,7 @@ func chatEnvelope(endpoint, body string) proxyEnvelope {
 	return proxyEnvelope{
 		RequestID: "req-chat",
 		Protocol:  protocolOpenAIChatCompletions,
-		RequestParameters: modelRequestParameters{
+		RequestSettings: modelRequestSettings{
 			Protocol:            protocolOpenAIChatCompletions,
 			Temperature:         &temperature,
 			TopP:                &topP,
@@ -693,7 +693,7 @@ func TestAnthropicErrorPreservesStatusDoesNotRetryOrLogSecrets(t *testing.T) {
 	}
 }
 
-func TestOpenAIChatCompletionsConvertsResponsesAndMergesConnectionParameters(t *testing.T) {
+func TestOpenAIChatCompletionsConvertsResponsesAndMergesRequestSettings(t *testing.T) {
 	var received map[string]any
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/tenant/v1/chat/completions" {
@@ -738,7 +738,7 @@ func TestOpenAIChatCompletionsConvertsResponsesAndMergesConnectionParameters(t *
 		t.Fatalf("model = %#v", received["model"])
 	}
 	if received["temperature"] != 0.3 || received["top_p"] != 0.8 || received["max_completion_tokens"] != float64(321) {
-		t.Fatalf("connection parameters were not merged: %#v", received)
+		t.Fatalf("request settings were not merged: %#v", received)
 	}
 	messages, _ := received["messages"].([]any)
 	if len(messages) != 2 {
@@ -755,8 +755,21 @@ func TestOpenAIChatCompletionsConvertsResponsesAndMergesConnectionParameters(t *
 	if converted["object"] != "response" || converted["status"] != "completed" {
 		t.Fatalf("converted response = %s", responseBody)
 	}
-	if _, ok := converted["output"].([]any); !ok {
+	output, ok := converted["output"].([]any)
+	if !ok || len(output) != 1 {
 		t.Fatalf("converted response has no output: %s", responseBody)
+	}
+	message, ok := output[0].(map[string]any)
+	if !ok {
+		t.Fatalf("converted response output is invalid: %s", responseBody)
+	}
+	content, ok := message["content"].([]any)
+	if !ok || len(content) != 1 {
+		t.Fatalf("converted response has no content: %s", responseBody)
+	}
+	text, ok := content[0].(map[string]any)
+	if !ok || text["type"] != "output_text" || text["text"] != "chat answer" {
+		t.Fatalf("converted response has no output text: %s", responseBody)
 	}
 	usage, _ := converted["usage"].(map[string]any)
 	if usage["input_tokens"] != float64(4) || usage["output_tokens"] != float64(6) || usage["total_tokens"] != float64(10) {
@@ -920,7 +933,7 @@ func TestGatewayRejectsLossyResponsesHistoryBeforeUpstream(t *testing.T) {
 	}
 }
 
-func TestGatewayValidatesProtocolSpecificRequestParameters(t *testing.T) {
+func TestGatewayValidatesProtocolSpecificRequestSettings(t *testing.T) {
 	var calls atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
@@ -931,16 +944,16 @@ func TestGatewayValidatesProtocolSpecificRequestParameters(t *testing.T) {
 
 	tests := map[string]proxyEnvelope{}
 	missing := chatEnvelope(upstream.URL, `{"model":"chat-model","input":"hello"}`)
-	missing.RequestParameters = modelRequestParameters{}
+	missing.RequestSettings = modelRequestSettings{}
 	tests["missing protocol"] = missing
 	mismatch := chatEnvelope(upstream.URL, `{"model":"chat-model","input":"hello"}`)
-	mismatch.RequestParameters.Protocol = protocolOpenAIResponses
+	mismatch.RequestSettings.Protocol = protocolOpenAIResponses
 	tests["mismatched protocol"] = mismatch
 	anthropicBoth := anthropicEnvelope(upstream.URL, false)
 	temperature := 0.2
 	topP := 0.8
-	anthropicBoth.RequestParameters.Temperature = &temperature
-	anthropicBoth.RequestParameters.TopP = &topP
+	anthropicBoth.RequestSettings.Temperature = &temperature
+	anthropicBoth.RequestSettings.TopP = &topP
 	tests["anthropic sampling conflict"] = anthropicBoth
 
 	for name, envelope := range tests {
@@ -962,7 +975,7 @@ func TestGatewayValidatesProtocolSpecificRequestParameters(t *testing.T) {
 	}
 }
 
-func TestAnthropicRequestParametersOverrideConvertedResponsesParameters(t *testing.T) {
+func TestAnthropicRequestSettingsOverrideConvertedResponsesSettings(t *testing.T) {
 	var received map[string]any
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
@@ -978,8 +991,8 @@ func TestAnthropicRequestParametersOverrideConvertedResponsesParameters(t *testi
 	envelope := anthropicEnvelope(upstream.URL, false)
 	temperature := 0.4
 	maxTokens := uint32(777)
-	envelope.RequestParameters.Temperature = &temperature
-	envelope.RequestParameters.MaxTokens = &maxTokens
+	envelope.RequestSettings.Temperature = &temperature
+	envelope.RequestSettings.MaxTokens = &maxTokens
 	envelope.BodyBase64 = encodedBody(`{"model":"claude-test","input":"hello","top_p":0.7,"max_output_tokens":99}`)
 	req := proxyRequest(t, context.Background(), gatewayServer.URL, envelope, testGatewayToken)
 	resp, err := http.DefaultClient.Do(req)
@@ -992,7 +1005,7 @@ func TestAnthropicRequestParametersOverrideConvertedResponsesParameters(t *testi
 		t.Fatalf("status = %d: %s", resp.StatusCode, body)
 	}
 	if received["temperature"] != 0.4 || received["max_tokens"] != float64(777) {
-		t.Fatalf("connection parameters missing: %#v", received)
+		t.Fatalf("request settings missing: %#v", received)
 	}
 	if _, present := received["top_p"]; present {
 		t.Fatalf("overridden top_p reached Anthropic: %#v", received)
@@ -1020,22 +1033,24 @@ func TestGatewayRejectsInvalidEnvelopesBeforeCallingUpstream(t *testing.T) {
 	invalidBody := valid
 	invalidBody.BodyBase64 = "%%%"
 	invalidBodyJSON, _ := json.Marshal(invalidBody)
-	var unknownRequestParameters map[string]any
-	if err := json.Unmarshal(validJSON, &unknownRequestParameters); err != nil {
+	var unknownRequestSettings map[string]any
+	if err := json.Unmarshal(validJSON, &unknownRequestSettings); err != nil {
 		t.Fatalf("decode valid envelope: %v", err)
 	}
-	unknownRequestParameters["request_parameters"] = map[string]any{
+	unknownRequestSettings["request_settings"] = map[string]any{
 		"protocol":    protocolOpenAIResponses,
 		"temperature": 0.4,
 	}
-	unknownRequestParametersJSON, _ := json.Marshal(unknownRequestParameters)
+	unknownRequestSettingsJSON, _ := json.Marshal(unknownRequestSettings)
+	legacyRequestParameters := append(validJSON[:len(validJSON)-1], []byte(`,"request_parameters":{"protocol":"openai_responses"}}`)...)
 	tests := []struct {
 		name string
 		body []byte
 	}{
 		{name: "malformed JSON", body: []byte(`{"request_id":`)},
 		{name: "unknown field", body: append(validJSON[:len(validJSON)-1], []byte(`,"unexpected":true}`)...)},
-		{name: "unknown protocol parameter", body: unknownRequestParametersJSON},
+		{name: "unknown protocol setting", body: unknownRequestSettingsJSON},
+		{name: "legacy request_parameters field", body: legacyRequestParameters},
 		{name: "unknown protocol", body: unknownProtocolJSON},
 		{name: "unsupported endpoint", body: invalidEndpointJSON},
 		{name: "invalid body encoding", body: invalidBodyJSON},

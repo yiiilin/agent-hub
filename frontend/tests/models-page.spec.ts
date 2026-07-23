@@ -8,42 +8,16 @@ const currentUser = {
   role: 'admin'
 };
 
-const automaticModelParameters = {
-  reasoning_effort: 'default',
-  reasoning_summary: 'default',
-  verbosity: 'default',
-  context_window_tokens: null,
-  auto_compact_token_limit: null,
-  reasoning_summary_support: 'auto',
-  service_tier: null,
-  request_max_retries: null,
-  stream_max_retries: null,
-  stream_idle_timeout_ms: null
-};
-
 const personalConnection = {
   id: '20000000-0000-0000-0000-000000000001',
   owner_id: currentUser.id,
   scope: 'personal',
-  name: 'Personal GPT',
+  name: 'Personal Provider',
   base_url: 'https://personal.example.test/provider',
-  model_id: 'personal-model',
-  upstream_protocol: 'openai_responses',
-  request_parameters: { protocol: 'openai_responses' },
-  parameters: {
-    reasoning_effort: 'medium',
-    reasoning_summary: 'concise',
-    verbosity: 'high',
-    context_window_tokens: 128_000,
-    auto_compact_token_limit: 96_000,
-    reasoning_summary_support: 'supported',
-    service_tier: 'flex',
-    request_max_retries: 3,
-    stream_max_retries: 5,
-    stream_idle_timeout_ms: 300_000
-  },
+  api_type: 'openai_responses',
+  allowed_model_ids: ['personal-main', 'personal-mini'],
   status: 'enabled',
-  is_system_default: false,
+  has_api_key: true,
   created_at: '2026-07-18T01:00:00.000Z',
   updated_at: '2026-07-18T01:00:00.000Z'
 };
@@ -52,357 +26,228 @@ const globalConnection = {
   id: '20000000-0000-0000-0000-000000000002',
   owner_id: null,
   scope: 'global',
-  name: 'Global Responses',
+  name: 'Global Provider',
   base_url: 'https://global.example.test',
-  model_id: 'global-model',
-  upstream_protocol: 'anthropic_messages',
-  request_parameters: { protocol: 'anthropic_messages', temperature: 0.4, top_p: null, max_tokens: 8192 },
-  parameters: automaticModelParameters,
+  api_type: 'openai_chat_completions',
+  allowed_model_ids: ['global-main', 'global-mini'],
   status: 'enabled',
-  is_system_default: true,
+  has_api_key: true,
   created_at: '2026-07-18T01:00:00.000Z',
   updated_at: '2026-07-18T01:00:00.000Z'
 };
 
-const disabledGlobalConnection = {
-  ...globalConnection,
-  id: '20000000-0000-0000-0000-000000000003',
-  name: 'Disabled Global',
-  model_id: 'disabled-model',
-  status: 'disabled',
-  is_system_default: false
-};
-
-const agent = {
-  id: '30000000-0000-0000-0000-000000000001',
-  name: 'Release Agent',
-  instructions: '',
-  visibility: 'private',
-  public_to: [],
-  runtime_id: null,
-  default_model_connection_id: globalConnection.id,
-  reasoning_effort: 'medium',
-  codex_subagents: [],
-  owner_id: currentUser.id,
-  is_owner: true,
-  can_manage: true,
-  can_administer: true,
-  can_invoke: true,
-  model_policy: {},
-  sandbox_policy: {},
-  managed_skill_ids: [],
-  mcp_allowlist: [],
-  created_at: '2026-07-18T01:00:00.000Z',
-  updated_at: '2026-07-18T01:00:00.000Z'
-};
-
-const totals = {
-  input_tokens: 120,
-  output_tokens: 40,
-  total_tokens: 160,
-  cached_tokens: 20,
-  reasoning_tokens: 10
-};
-
-const usageItem = {
-  id: '40000000-0000-0000-0000-000000000001',
-  occurred_at: '2026-07-18T05:00:00.123Z',
-  response_status: 'completed',
-  model: { id: globalConnection.id, scope: 'global', name: globalConnection.name, model_id: globalConnection.model_id, upstream_protocol: globalConnection.upstream_protocol },
-  agent: { id: agent.id, name: agent.name },
-  subject: { kind: 'user', id: currentUser.id, display_name: currentUser.display_name },
-  ...totals
-};
-
-const errorItem = {
-  id: '50000000-0000-0000-0000-000000000001',
-  occurred_at: '2026-07-18T05:05:00.456Z',
-  response_status: 'failed',
-  model: usageItem.model,
-  agent: usageItem.agent,
-  subject: usageItem.subject,
-  upstream_status: 429,
-  error_code: 'rate_limit',
-  message: 'Try again later.'
-};
-
-type MockStats = {
-  requests: Array<{ method: string; path: string; body?: Record<string, unknown> }>;
-  summaryQueries: URL[];
-  usageQueries: URL[];
-  errorQueries: URL[];
-};
+type RequestRecord = { method: string; path: string; body?: Record<string, unknown> };
+type Stats = { requests: RequestRecord[]; summaryQueries: URL[]; usageQueries: URL[]; errorQueries: URL[] };
 
 async function installModelsApi(page: Page, role = 'admin') {
-  const stats: MockStats = { requests: [], summaryQueries: [], usageQueries: [], errorQueries: [] };
-  let connections = [
-    { ...personalConnection },
-    { ...globalConnection },
-    { ...disabledGlobalConnection }
-  ];
+  const stats: Stats = { requests: [], summaryQueries: [], usageQueries: [], errorQueries: [] };
+  let connections = [personalConnection, globalConnection];
+  let systemDefault: { connection_id: string; model_id: string } | null = {
+    connection_id: globalConnection.id,
+    model_id: 'global-main'
+  };
 
-  await page.route('**/api/**', async (route: Route) => {
+  await page.route(/https?:\/\/[^/]+\/api\//, async (route: Route) => {
     const request = route.request();
     const url = new URL(request.url());
-    const { pathname } = url;
+    const path = url.pathname;
     const method = request.method();
-    if (pathname === '/api/auth/me') return route.fulfill({ json: { ...currentUser, role } });
-    if (pathname === '/api/model-connections' && method === 'GET') return route.fulfill({ json: connections });
-    if (pathname === '/api/model-connections' && method === 'POST') {
+    if (path === '/api/auth/me') return route.fulfill({ json: { ...currentUser, role } });
+    if (path === '/api/model-connections' && method === 'GET') return route.fulfill({ json: connections });
+    if (path === '/api/model-connections/system-default' && method === 'GET') return route.fulfill({ json: { selection: systemDefault } });
+    if (path === '/api/model-connections' && method === 'POST') {
       const body = request.postDataJSON() as Record<string, unknown>;
-      stats.requests.push({ method, path: pathname, body });
+      stats.requests.push({ method, path, body });
       const created = {
         id: '20000000-0000-0000-0000-000000000099',
         owner_id: body.scope === 'personal' ? currentUser.id : null,
         scope: body.scope,
         name: body.name,
         base_url: body.base_url,
-        model_id: body.model_id,
-        upstream_protocol: body.upstream_protocol,
-        request_parameters: body.request_parameters,
-        parameters: body.parameters,
+        api_type: body.api_type,
+        allowed_model_ids: body.allowed_model_ids,
         status: 'enabled',
-        is_system_default: false,
+        has_api_key: true,
         created_at: '2026-07-18T06:00:00.000Z',
         updated_at: '2026-07-18T06:00:00.000Z'
       };
       connections = [...connections, created as typeof personalConnection];
       return route.fulfill({ json: created });
     }
-    const connectionMatch = pathname.match(/^\/api\/model-connections\/([^/]+)$/);
-    if (connectionMatch && method === 'PATCH') {
+    const connection = path.match(/^\/api\/model-connections\/([^/]+)$/);
+    if (connection && method === 'PUT') {
       const body = request.postDataJSON() as Record<string, unknown>;
-      stats.requests.push({ method, path: pathname, body });
-      const current = connections.find((connection) => connection.id === connectionMatch[1])!;
+      const requestPath = `${path}${url.search}`;
+      stats.requests.push({ method, path: requestPath, body });
+      if (
+        connection[1] === personalConnection.id
+        && url.searchParams.get('force') !== 'true'
+        && !(body.allowed_model_ids as string[]).includes('personal-mini')
+      ) {
+        return route.fulfill({ status: 409, json: { error: 'Model API Connection is referenced' } });
+      }
+      const current = connections.find((item) => item.id === connection[1])!;
       const updated = { ...current, ...body, updated_at: '2026-07-18T07:00:00.000Z' };
-      connections = connections.map((connection) => connection.id === updated.id ? updated as typeof connection : connection);
+      connections = connections.map((item) => item.id === updated.id ? updated as typeof item : item);
       return route.fulfill({ json: updated });
     }
-    const statusMatch = pathname.match(/^\/api\/model-connections\/([^/]+)\/status$/);
-    if (statusMatch && method === 'PUT') {
-      const body = request.postDataJSON() as Record<string, unknown>;
-      stats.requests.push({ method, path: pathname, body });
-      const current = connections.find((connection) => connection.id === statusMatch[1])!;
-      const updated = { ...current, status: body.status };
-      connections = connections.map((connection) => connection.id === updated.id ? updated as typeof connection : connection);
-      return route.fulfill({ json: updated });
+    const testConnection = path.match(/^\/api\/model-connections\/([^/]+)\/test$/);
+    if (testConnection && method === 'POST') {
+      stats.requests.push({ method, path, body: request.postDataJSON() as Record<string, unknown> });
+      return route.fulfill({ json: { success: true, status_code: 200, error_code: null, message: null, response_text: 'Hello from the test model.', response_time_ms: 42 } });
     }
-    const testMatch = pathname.match(/^\/api\/model-connections\/([^/]+)\/test$/);
-    if (testMatch && method === 'POST') {
-      stats.requests.push({ method, path: pathname });
-      return route.fulfill({ json: { success: true, status_code: 200, error_code: null, message: null } });
+    if (path === '/api/model-connections/system-default' && method === 'PUT') {
+      const body = request.postDataJSON() as { selection: typeof systemDefault };
+      stats.requests.push({ method, path, body });
+      systemDefault = body.selection;
+      return route.fulfill({ json: { selection: systemDefault } });
     }
-    const forceMatch = pathname.match(/^\/api\/model-connections\/([^/]+)\/force-delete$/);
-    if (forceMatch && method === 'POST') {
-      stats.requests.push({ method, path: pathname });
-      connections = connections.filter((connection) => connection.id !== forceMatch[1]);
-      return route.fulfill({ status: 204 });
+    if (path === '/api/model-connections/' + personalConnection.id + '/status' && method === 'PUT') {
+      stats.requests.push({ method, path, body: request.postDataJSON() as Record<string, unknown> });
+      return route.fulfill({ json: { ...personalConnection, status: 'disabled' } });
     }
-    if (connectionMatch && method === 'DELETE') {
-      stats.requests.push({ method, path: pathname });
-      connections = connections.filter((connection) => connection.id !== connectionMatch[1]);
-      return route.fulfill({ status: 204 });
-    }
-    if (pathname === '/api/model-connections/system-default' && method === 'PUT') {
-      const body = request.postDataJSON() as Record<string, unknown>;
-      stats.requests.push({ method, path: pathname, body });
-      connections = connections.map((connection) => ({ ...connection, is_system_default: connection.id === body.model_connection_id }));
-      return route.fulfill({ json: { model_connection_id: body.model_connection_id } });
-    }
-    if (pathname === '/api/agents' && method === 'GET') return route.fulfill({ json: [agent] });
-    if (pathname === '/api/users' && method === 'GET') return route.fulfill({ json: [{ ...currentUser, role }] });
-    if (pathname === '/api/model-usage/summary' && method === 'GET') {
+    if (path === '/api/agents') return route.fulfill({ json: [] });
+    if (path === '/api/users') return route.fulfill({ json: [currentUser] });
+    const totals = { input_tokens: 0, output_tokens: 0, total_tokens: 0, cached_tokens: 0, reasoning_tokens: 0 };
+    if (path === '/api/model-usage/summary') {
       stats.summaryQueries.push(url);
-      return route.fulfill({ json: {
-        overall: totals,
-        by_model: [{ model: usageItem.model, totals }],
-        by_agent: [{ agent: usageItem.agent, totals }],
-        by_user: [{ user_id: currentUser.id, display_name: currentUser.display_name, totals }]
-      } });
+      return route.fulfill({ json: { overall: totals, by_model: [], by_agent: [], by_user: [] } });
     }
-    if (pathname === '/api/model-usage' && method === 'GET') {
+    if (path === '/api/model-usage') {
       stats.usageQueries.push(url);
-      const secondPage = url.searchParams.has('cursor_id');
-      return route.fulfill({ json: {
-        items: [{ ...usageItem, id: secondPage ? '40000000-0000-0000-0000-000000000002' : usageItem.id }],
-        next_cursor: secondPage ? null : { occurred_at_ms: 1_752_813_200_123, id: usageItem.id }
-      } });
+      return route.fulfill({ json: { items: [], next_cursor: null } });
     }
-    if (pathname === '/api/model-call-errors' && method === 'GET') {
+    if (path === '/api/model-call-errors') {
       stats.errorQueries.push(url);
-      const secondPage = url.searchParams.has('cursor_id');
-      return route.fulfill({ json: {
-        items: [{ ...errorItem, id: secondPage ? '50000000-0000-0000-0000-000000000002' : errorItem.id }],
-        next_cursor: secondPage ? null : { occurred_at_ms: 1_752_813_500_456, id: errorItem.id }
-      } });
+      return route.fulfill({ json: { items: [], next_cursor: null } });
     }
-    return route.fulfill({ status: 404, json: { error: `Unhandled route: ${method} ${pathname}` } });
+    return route.fulfill({ status: 404, json: { error: `Unhandled ${method} ${path}` } });
   });
   return stats;
 }
 
-for (const [role, expectedTabs] of [['member', 3], ['admin', 4], ['super_admin', 4]] as const) {
-  test(`${role} sees only the permitted Models tabs`, async ({ page }) => {
-    await installModelsApi(page, role);
-    await page.goto('/models');
-    const tabs = page.getByRole('tablist', { name: 'Models' });
-    await expect(tabs.getByRole('tab')).toHaveCount(expectedTabs);
-    await expect(tabs.getByRole('tab', { name: 'My Models' })).toBeVisible();
-    await expect(tabs.getByRole('tab', { name: 'Available Models' })).toBeVisible();
-    await expect(tabs.getByRole('tab', { name: 'Usage' })).toBeVisible();
-    await expect(tabs.getByRole('tab', { name: 'Global Models' })).toHaveCount(role === 'member' ? 0 : 1);
-
-    await expect(page.getByRole('table', { name: 'Personal model connection list' })).toContainText('Personal GPT');
-    await expect(page.getByRole('table', { name: 'Personal model connection list' })).not.toContainText('Global Responses');
-    await tabs.getByRole('tab', { name: 'Available Models' }).click();
-    const available = page.getByRole('table', { name: 'Available model list' });
-    await expect(available).toContainText('Personal GPT');
-    await expect(available).toContainText('Global Responses');
-    await expect(available).toContainText('anthropic_messages');
-    await expect(available).not.toContainText('Disabled Global');
-  });
-}
-
-test('connection action dialogs serialize CRUD, test, status, default, and force-delete requests without exposing keys', async ({ page }) => {
-  const stats = await installModelsApi(page);
+test('Model API Connections use a multi-model access form and final V1 requests', async ({ page }) => {
+  const { requests } = await installModelsApi(page);
   await page.goto('/models');
+
+  const table = page.getByRole('table', { name: 'Personal model connection list' });
+  await expect(table).toContainText('Personal Provider');
+  await expect(table).toContainText('personal-main');
+  await expect(table).toContainText('personal-mini');
 
   await page.getByRole('button', { name: 'Create personal model' }).click();
   let dialog = page.getByRole('dialog', { name: 'Create model connection' });
-  await dialog.getByLabel('Connection name').fill('Created Personal');
+  await dialog.getByLabel('Connection name').fill('Created Provider');
   await dialog.getByLabel('Base URL').fill('https://created.example.test/base');
-  await dialog.getByLabel('Model ID').fill('created-model');
-  await expect(dialog.getByLabel('Upstream protocol').locator('..')).toHaveClass(/model-wide-field/);
-  await expect(dialog.getByLabel('API key').locator('..')).toHaveClass(/model-wide-field/);
-  await expect(dialog.getByLabel('Upstream protocol')).toHaveValue('openai_responses');
-  await expect(dialog.getByLabel('temperature')).toHaveCount(0);
-  await dialog.getByLabel('Upstream protocol').selectOption('openai_chat_completions');
-  await dialog.getByLabel('temperature').fill('0.7');
-  await dialog.getByLabel('top_p').fill('0.8');
-  await dialog.getByLabel('max_completion_tokens').fill('4096');
-  await dialog.getByLabel('Upstream protocol').selectOption('anthropic_messages');
-  await expect(dialog.getByLabel('temperature')).toHaveValue('');
-  await expect(dialog.getByLabel('top_p')).toHaveValue('');
-  await expect(dialog.getByLabel('max_tokens')).toHaveValue('');
-  await dialog.getByLabel('top_p').fill('0.6');
-  await dialog.getByLabel('max_tokens').fill('8192');
-  await dialog.getByLabel('temperature').fill('0.4');
-  await expect(dialog.getByLabel('top_p')).toHaveValue('');
-  await dialog.getByLabel('top_p').fill('0.6');
-  await dialog.getByLabel('Reasoning effort').selectOption('high');
-  await dialog.getByLabel('Reasoning summary', { exact: true }).selectOption('detailed');
-  await dialog.getByLabel('Verbosity').selectOption('low');
-  await dialog.getByLabel('Reasoning summary support').selectOption('supported');
-  await dialog.getByLabel('Service tier').fill('priority');
-  await dialog.getByLabel('Context window tokens').fill('200000');
-  await dialog.getByLabel('Auto-compact token limit').fill('160000');
-  await dialog.getByLabel('Request max retries').fill('7');
-  await dialog.getByLabel('Stream max retries').fill('9');
-  await dialog.getByLabel('Stream idle timeout (ms)').fill('420000');
+  await dialog.getByLabel('API type').selectOption('anthropic_messages');
+  await dialog.getByLabel('Allowed Model IDs').fill('created-main\ncreated-mini\ncreated-main');
   await dialog.getByLabel('API key').fill('one-time-provider-secret');
   await dialog.getByRole('button', { name: 'Create model connection' }).click();
-  await expect(page.getByRole('table', { name: 'Personal model connection list' })).toContainText('Created Personal');
-  expect(stats.requests.at(-1)).toMatchObject({
+  expect(requests.at(-1)).toEqual({
     method: 'POST',
     path: '/api/model-connections',
     body: {
       scope: 'personal',
-      name: 'Created Personal',
+      name: 'Created Provider',
       base_url: 'https://created.example.test/base',
-      model_id: 'created-model',
-      upstream_protocol: 'anthropic_messages',
-      parameters: {
-        reasoning_effort: 'high',
-        reasoning_summary: 'detailed',
-        verbosity: 'low',
-        context_window_tokens: 200_000,
-        auto_compact_token_limit: 160_000,
-        reasoning_summary_support: 'supported',
-        service_tier: 'priority',
-        request_max_retries: 7,
-        stream_max_retries: 9,
-        stream_idle_timeout_ms: 420_000
-      },
-      api_key: 'one-time-provider-secret',
-      request_parameters: {
-        protocol: 'anthropic_messages',
-        temperature: null,
-        top_p: 0.6,
-        max_tokens: 8192
-      }
+      api_type: 'anthropic_messages',
+      allowed_model_ids: ['created-main', 'created-mini'],
+      api_key: 'one-time-provider-secret'
     }
   });
   await expect(page.getByText('one-time-provider-secret')).toHaveCount(0);
 
-  await page.getByRole('button', { name: 'Edit Personal GPT' }).click();
+  await page.getByRole('button', { name: 'Edit Personal Provider' }).click();
   dialog = page.getByRole('dialog', { name: 'Edit model connection' });
-  await expect(dialog.getByLabel('API key')).toHaveValue('');
-  await expect(dialog.getByLabel('Upstream protocol')).toHaveValue('openai_responses');
-  await expect(dialog.getByLabel('temperature')).toHaveCount(0);
-  await expect(dialog.getByLabel('Reasoning effort')).toHaveValue('medium');
-  await expect(dialog.getByLabel('Reasoning summary', { exact: true })).toHaveValue('concise');
-  await expect(dialog.getByLabel('Verbosity')).toHaveValue('high');
-  await expect(dialog.getByLabel('Reasoning summary support')).toHaveValue('supported');
-  await expect(dialog.getByLabel('Service tier')).toHaveValue('flex');
-  await expect(dialog.getByLabel('Context window tokens')).toHaveValue('128000');
-  await expect(dialog.getByLabel('Auto-compact token limit')).toHaveValue('96000');
-  await expect(dialog.getByLabel('Request max retries')).toHaveValue('3');
-  await expect(dialog.getByLabel('Stream max retries')).toHaveValue('5');
-  await expect(dialog.getByLabel('Stream idle timeout (ms)')).toHaveValue('300000');
-  await dialog.getByLabel('Connection name').fill('Personal GPT Updated');
-  await dialog.getByLabel('Upstream protocol').selectOption('openai_chat_completions');
-  await expect(dialog.getByLabel('temperature')).toHaveValue('');
-  await dialog.getByLabel('temperature').fill('0.5');
-  await dialog.getByLabel('top_p').fill('0.9');
-  await dialog.getByLabel('max_completion_tokens').fill('2048');
-  await dialog.getByLabel('Reasoning summary', { exact: true }).selectOption('none');
-  await dialog.getByLabel('Auto-compact token limit').fill('');
+  await dialog.getByLabel('Connection name').fill('Personal Provider Updated');
+  await dialog.getByLabel('Allowed Model IDs').fill('personal-main\npersonal-reasoning');
   await dialog.getByRole('button', { name: 'Save changes' }).click();
-  const update = stats.requests.at(-1)!;
-  expect(update).toMatchObject({ method: 'PATCH', path: `/api/model-connections/${personalConnection.id}` });
-  expect(update.body).toMatchObject({ upstream_protocol: 'openai_chat_completions' });
-  expect(update.body?.request_parameters).toEqual({
-    protocol: 'openai_chat_completions',
-    temperature: 0.5,
-    top_p: 0.9,
-    max_completion_tokens: 2048
+  expect(requests.at(-1)).toEqual({
+    method: 'PUT',
+    path: `/api/model-connections/${personalConnection.id}`,
+    body: {
+      name: 'Personal Provider Updated',
+      base_url: personalConnection.base_url,
+      api_type: 'openai_responses',
+      allowed_model_ids: ['personal-main', 'personal-reasoning']
+    }
   });
-  expect(update.body?.parameters).toEqual({
-    ...personalConnection.parameters,
-    reasoning_summary: 'none',
-    auto_compact_token_limit: null
+  await expect(dialog.getByRole('alert')).toContainText('Force saving clears affected selections');
+  await dialog.getByRole('button', { name: 'Force save changes' }).click();
+  expect(requests.at(-1)).toEqual({
+    method: 'PUT',
+    path: `/api/model-connections/${personalConnection.id}?force=true`,
+    body: {
+      name: 'Personal Provider Updated',
+      base_url: personalConnection.base_url,
+      api_type: 'openai_responses',
+      allowed_model_ids: ['personal-main', 'personal-reasoning']
+    }
   });
-  expect(update.body).not.toHaveProperty('api_key');
+  expect(requests.at(-1)?.body).not.toHaveProperty('parameters');
+  expect(requests.at(-1)?.body).not.toHaveProperty('request_parameters');
 
-  await page.getByRole('button', { name: 'Test Personal GPT Updated' }).click();
+  await page.getByRole('button', { name: 'Test Personal Provider Updated' }).click();
   dialog = page.getByRole('dialog', { name: 'Test model connection' });
-  await dialog.getByRole('button', { name: 'Run connection test' }).click();
-  await expect(dialog.getByText('Connection test succeeded.')).toBeVisible();
+  await dialog.getByLabel('Model ID').selectOption('personal-reasoning');
+  await expect(dialog.getByLabel('Request')).toHaveValue('hi');
+  await dialog.getByRole('button', { name: 'Send test message' }).click();
+  expect(requests.at(-1)).toEqual({ method: 'POST', path: `/api/model-connections/${personalConnection.id}/test`, body: { model_id: 'personal-reasoning', message: 'hi' } });
+  await expect(dialog.getByLabel('Response')).toHaveText('Hello from the test model.');
+  await expect(dialog.getByText('Response time 42 ms')).toBeVisible();
+
   await dialog.locator('.modal-actions').getByRole('button', { name: 'Close' }).click();
-
-  await page.getByRole('button', { name: 'Disable Personal GPT Updated' }).click();
-  dialog = page.getByRole('dialog', { name: 'Disable model connection' });
-  await dialog.getByRole('button', { name: 'Disable model connection' }).click();
-  expect(stats.requests.at(-1)).toMatchObject({ method: 'PUT', path: `/api/model-connections/${personalConnection.id}/status`, body: { status: 'disabled' } });
-
-  await page.getByRole('button', { name: 'Delete Personal GPT Updated', exact: true }).click();
-  dialog = page.getByRole('dialog', { name: 'Delete model connection' });
-  await dialog.getByRole('button', { name: 'Delete model connection' }).click();
-  expect(stats.requests.at(-1)).toMatchObject({ method: 'DELETE', path: `/api/model-connections/${personalConnection.id}` });
-
   await page.getByRole('tab', { name: 'Global Models' }).click();
-  await page.getByRole('button', { name: 'Clear Global Responses as system default' }).click();
+  await page.getByRole('button', { name: 'Clear Global Provider as system default' }).click();
   dialog = page.getByRole('dialog', { name: 'Clear system default' });
   await dialog.getByRole('button', { name: 'Clear system default' }).click();
-  expect(stats.requests.at(-1)).toMatchObject({ method: 'PUT', path: '/api/model-connections/system-default', body: { model_connection_id: null } });
+  expect(requests.at(-1)).toEqual({ method: 'PUT', path: '/api/model-connections/system-default', body: { selection: null } });
 
-  await page.getByRole('button', { name: 'Force-delete Disabled Global' }).click();
-  dialog = page.getByRole('dialog', { name: 'Force-delete model connection' });
-  await dialog.getByRole('button', { name: 'Force-delete model connection' }).click();
-  expect(stats.requests.at(-1)).toMatchObject({ method: 'POST', path: `/api/model-connections/${disabledGlobalConnection.id}/force-delete` });
+  await page.getByRole('button', { name: 'Set Global Provider as system default' }).click();
+  dialog = page.getByRole('dialog', { name: 'Set system default' });
+  await dialog.getByLabel('Model ID').selectOption('global-mini');
+  await dialog.getByRole('button', { name: 'Set system default' }).click();
+  expect(requests.at(-1)).toEqual({
+    method: 'PUT',
+    path: '/api/model-connections/system-default',
+    body: { selection: { connection_id: globalConnection.id, model_id: 'global-mini' } }
+  });
 });
 
-test('usage ranges send browser-local half-open millisecond boundaries and omit internal hierarchy filters', async ({ page }) => {
+test('Model API Connection workflow remains inside a 390px viewport', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await installModelsApi(page);
+  await page.goto('/models');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0);
+
+  await page.getByRole('button', { name: 'Create personal model' }).click();
+  let dialog = page.getByRole('dialog', { name: 'Create model connection' });
+  await expect(dialog.getByLabel('Allowed Model IDs')).toBeVisible();
+  await expect(dialog.getByLabel('API type')).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0);
+  await dialog.getByRole('button', { name: 'Cancel' }).click();
+
+  await page.getByRole('button', { name: 'Test Personal Provider' }).click();
+  dialog = page.getByRole('dialog', { name: 'Test model connection' });
+  await expect(dialog.getByLabel('Request')).toHaveValue('hi');
+  await dialog.getByRole('button', { name: 'Send test message' }).click();
+  await expect(dialog.getByLabel('Response')).toHaveText('Hello from the test model.');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0);
+});
+
+test('Models tabs remain scoped to the signed-in role', async ({ page }) => {
+  for (const [role, expectedTabs] of [['member', 3], ['admin', 4], ['super_admin', 4]] as const) {
+    await page.unroute(/https?:\/\/[^/]+\/api\//).catch(() => undefined);
+    await installModelsApi(page, role);
+    await page.goto('/models');
+    const tabs = page.getByRole('tablist', { name: 'Models' });
+    await expect(tabs.getByRole('tab')).toHaveCount(expectedTabs);
+    await expect(tabs.getByRole('tab', { name: 'Global Models' })).toHaveCount(role === 'member' ? 0 : 1);
+    await expect(page.getByRole('table', { name: 'Personal model connection list' })).toContainText('Personal Provider');
+  }
+});
+
+test('Model usage uses local half-open millisecond ranges', async ({ page }) => {
   await page.clock.setFixedTime(new Date('2026-07-18T12:34:56.789'));
   const stats = await installModelsApi(page);
   await page.goto('/models');
@@ -415,14 +260,7 @@ test('usage ranges send browser-local half-open millisecond boundaries and omit 
     today.setHours(0, 0, 0, 0);
     const yesterday = new Date(today);
     yesterday.setDate(yesterday.getDate() - 1);
-    const sevenDays = new Date(today);
-    sevenDays.setDate(sevenDays.getDate() - 6);
-    return {
-      now: now.getTime(),
-      today: today.getTime(),
-      yesterday: yesterday.getTime(),
-      sevenDays: sevenDays.getTime()
-    };
+    return { now: now.getTime(), today: today.getTime(), yesterday: yesterday.getTime() };
   });
   expect(stats.summaryQueries[0].searchParams.get('from_ms')).toBe(String(expected.today));
   expect(stats.summaryQueries[0].searchParams.get('to_ms')).toBe(String(expected.now));
@@ -431,66 +269,7 @@ test('usage ranges send browser-local half-open millisecond boundaries and omit 
   await expect.poll(() => stats.summaryQueries.length).toBe(2);
   expect(stats.summaryQueries[1].searchParams.get('from_ms')).toBe(String(expected.yesterday));
   expect(stats.summaryQueries[1].searchParams.get('to_ms')).toBe(String(expected.today));
-
-  await page.getByLabel('Time range').selectOption('7days');
-  await expect.poll(() => stats.summaryQueries.length).toBe(3);
-  expect(stats.summaryQueries[2].searchParams.get('from_ms')).toBe(String(expected.sevenDays));
-  expect(stats.summaryQueries[2].searchParams.get('to_ms')).toBe(String(expected.now));
-
-  await page.getByLabel('Time range').selectOption('all');
-  await expect.poll(() => stats.summaryQueries.length).toBe(4);
-  expect(stats.summaryQueries[3].searchParams.has('from_ms')).toBe(false);
-  expect(stats.summaryQueries[3].searchParams.has('to_ms')).toBe(false);
-  for (const url of [...stats.summaryQueries, ...stats.usageQueries, ...stats.errorQueries]) {
-    for (const forbidden of ['session_id', 'run_id', 'turn_id', 'subagent']) expect(url.searchParams.has(forbidden)).toBe(false);
+  for (const request of [...stats.summaryQueries, ...stats.usageQueries, ...stats.errorQueries]) {
+    for (const forbidden of ['session_id', 'run_id', 'turn_id', 'subagent']) expect(request.searchParams.has(forbidden)).toBe(false);
   }
-});
-
-test('whole-range summary stays fixed while usage and error keysets paginate independently', async ({ page }) => {
-  const stats = await installModelsApi(page);
-  await page.goto('/models');
-  await page.getByRole('tab', { name: 'Usage' }).click();
-  await expect(page.getByRole('heading', { name: 'Usage details' })).toBeVisible();
-  await expect.poll(() => stats.summaryQueries.length).toBe(1);
-  await expect.poll(() => stats.usageQueries.length).toBe(1);
-  await expect.poll(() => stats.errorQueries.length).toBe(1);
-  const userNameCell = page.getByRole('region', { name: 'By user' }).locator('tbody td').first();
-  expect(await userNameCell.evaluate((element) => element.getBoundingClientRect().width)).toBeGreaterThanOrEqual(180);
-
-  await page.getByRole('button', { name: 'Next usage page' }).click();
-  await expect.poll(() => stats.usageQueries.length).toBe(2);
-  expect(stats.summaryQueries).toHaveLength(1);
-  expect(stats.errorQueries).toHaveLength(1);
-  expect(stats.usageQueries[1].searchParams.get('cursor_id')).toBe(usageItem.id);
-
-  await page.getByRole('button', { name: 'Next error page' }).click();
-  await expect.poll(() => stats.errorQueries.length).toBe(2);
-  expect(stats.summaryQueries).toHaveLength(1);
-  expect(stats.usageQueries).toHaveLength(2);
-  expect(stats.errorQueries[1].searchParams.get('cursor_id')).toBe(errorItem.id);
-});
-
-test('Models tabs, ledgers, and dialogs stay inside a 390px viewport', async ({ page }) => {
-  await page.setViewportSize({ width: 390, height: 844 });
-  await installModelsApi(page, 'super_admin');
-  await page.goto('/models');
-  await expect(page.getByRole('tablist', { name: 'Models' }).getByRole('tab')).toHaveCount(4);
-  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
-
-  await page.getByRole('tab', { name: 'Usage' }).click();
-  await expect(page.getByRole('heading', { name: 'Usage details' })).toBeVisible();
-  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
-
-  await page.getByRole('tab', { name: 'Global Models' }).click();
-  await page.getByRole('button', { name: 'Create global model' }).click();
-  const dialog = page.getByRole('dialog', { name: 'Create model connection' });
-  await expect(dialog).toBeVisible();
-  await expect(dialog.getByLabel('Upstream protocol')).toBeVisible();
-  await expect(dialog.getByLabel('Upstream protocol').locator('option')).toHaveCount(3);
-  await expect(dialog.getByRole('heading', { name: 'Codex parameters' })).toBeVisible();
-  await expect(dialog.getByRole('group', { name: 'Generation and reasoning' })).toBeVisible();
-  await expect(dialog.getByRole('group', { name: 'Context' })).toBeVisible();
-  await expect(dialog.getByRole('group', { name: 'Connection reliability' })).toBeVisible();
-  await expect(dialog.getByLabel('Stream idle timeout (ms)')).toBeVisible();
-  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
 });

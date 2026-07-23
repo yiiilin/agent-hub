@@ -206,6 +206,7 @@ impl RuntimeSessionCommandDispatcher {
         client: &HubClient,
         manager: &Arc<SessionSupervisorManager>,
         commands: &[RuntimeSessionCommandDto],
+        local_skills_dir: Option<&Path>,
     ) {
         let incoming = commands
             .iter()
@@ -260,9 +261,10 @@ impl RuntimeSessionCommandDispatcher {
             let dispatcher = Arc::clone(self);
             let client = client.clone();
             let manager = Arc::clone(manager);
+            let local_skills_dir = local_skills_dir.map(Path::to_path_buf);
             tokio::spawn(async move {
                 dispatcher
-                    .run_session_queue(client, manager, session_id)
+                    .run_session_queue(client, manager, session_id, local_skills_dir)
                     .await;
             });
         }
@@ -273,6 +275,7 @@ impl RuntimeSessionCommandDispatcher {
         client: HubClient,
         manager: Arc<SessionSupervisorManager>,
         session_id: Uuid,
+        local_skills_dir: Option<PathBuf>,
     ) {
         loop {
             let command = {
@@ -291,7 +294,9 @@ impl RuntimeSessionCommandDispatcher {
                 return;
             };
             let key = RuntimeSessionCommandKey::from(&command);
-            match apply_runtime_session_command(&manager, &command).await {
+            match apply_runtime_session_command(&manager, &command, local_skills_dir.as_deref())
+                .await
+            {
                 Ok(applied) => {
                     loop {
                         match client
@@ -1211,7 +1216,12 @@ async fn run_registered_cycle(
                 &heartbeat.codex_rollout,
             )
             .await;
-            command_dispatcher.enqueue(client, &session_manager, &heartbeat.session_commands);
+            command_dispatcher.enqueue(
+                client,
+                &session_manager,
+                &heartbeat.session_commands,
+                config.local_skills_dir.as_deref(),
+            );
             fail_interrupted_restoring_runs(&session_manager, client).await;
             match dispatcher.claim_next(client, &session_manager).await {
                 Ok(Some(claim)) => {
@@ -1257,8 +1267,55 @@ async fn run_registered_cycle(
 async fn apply_runtime_session_command(
     manager: &SessionSupervisorManager,
     command: &RuntimeSessionCommandDto,
+    local_skills_dir: Option<&Path>,
 ) -> anyhow::Result<AppliedRuntimeSessionCommand> {
     match command.command.as_str() {
+        "refresh_configuration" => {
+            let configuration = command
+                .execution_configuration
+                .as_ref()
+                .context("configuration refresh is missing its execution configuration")?;
+            let revision = command
+                .configuration_revision
+                .context("configuration refresh is missing its revision")?;
+            let fingerprint = command
+                .fingerprint
+                .as_deref()
+                .context("configuration refresh is missing its fingerprint")?;
+            anyhow::ensure!(
+                configuration.revision == revision,
+                "configuration refresh revision does not match its execution configuration"
+            );
+            anyhow::ensure!(
+                configuration.model_bindings.is_empty(),
+                "configuration refresh must not contain Run Model Bindings"
+            );
+            let runtime_fingerprint = execution_configuration_fingerprint(configuration)
+                .context("validate refreshed Agent execution configuration")?;
+            anyhow::ensure!(
+                runtime_fingerprint == fingerprint,
+                "configuration refresh fingerprint does not match its execution configuration"
+            );
+            match manager
+                .refresh_execution_configuration(
+                    command.session_id,
+                    command.ownership_generation,
+                    configuration,
+                    fingerprint,
+                    local_skills_dir,
+                )
+                .await
+            {
+                Ok(()) => Ok(AppliedRuntimeSessionCommand {
+                    outcome: "applied",
+                    native_error: None,
+                }),
+                Err(error) => Ok(AppliedRuntimeSessionCommand {
+                    outcome: "failed",
+                    native_error: Some(error),
+                }),
+            }
+        }
         "steer" => {
             let message = command
                 .message
@@ -2721,6 +2778,27 @@ async fn local_model_proxy_request(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if headers.contains_key("x-agent-hub-model-connection-id") {
+        return (
+            AxumStatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Model Connection ID routing is not supported" })),
+        )
+            .into_response();
+    }
+    let binding_id = match headers
+        .get("x-agent-hub-model-binding-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok())
+    {
+        Some(binding_id) => binding_id,
+        None => {
+            return (
+                AxumStatusCode::BAD_REQUEST,
+                Json(json!({ "error": "valid Run Model Binding ID is required" })),
+            )
+                .into_response();
+        }
+    };
     let requested_run_id = state.active_run.read().unwrap().run_id;
     let active_run = loop {
         let acknowledged = state.turn_acknowledged.notified();
@@ -2748,6 +2826,7 @@ async fn local_model_proxy_request(
         .headers(forwarded_model_request_headers(&headers))
         .bearer_auth(&active_run.model_proxy_token)
         .header("x-agent-hub-run-id", active_run.run_id.to_string())
+        .header("x-agent-hub-model-binding-id", binding_id.to_string())
         .body(body)
         .send()
         .await;
@@ -2789,6 +2868,8 @@ fn forwarded_model_request_headers(upstream: &HeaderMap) -> HeaderMap {
                 &header::AUTHORIZATION | &header::COOKIE | &header::HOST | &header::CONTENT_LENGTH
             )
             || name == "x-agent-hub-run-id"
+            || name == "x-agent-hub-model-binding-id"
+            || name == "x-agent-hub-model-connection-id"
             || is_sensitive_model_header(name)
         {
             continue;
@@ -2959,16 +3040,8 @@ fn app_server_thread_refresh_request(
 }
 
 fn app_server_default_model_configuration(claim: &ClaimRunResponse) -> Option<(&str, String)> {
-    let connection_id = claim.execution_configuration.default_model_connection_id?;
-    let connection = claim
-        .execution_configuration
-        .model_connections
-        .iter()
-        .find(|connection| connection.id == connection_id)?;
-    Some((
-        connection.model_id.as_str(),
-        model_provider_name(connection.id),
-    ))
+    let binding = model_binding(&claim.execution_configuration, "main").ok()?;
+    Some((binding.model_id.as_str(), model_provider_name(binding.id)))
 }
 
 fn app_server_turn_start_request(claim: &ClaimRunResponse, thread_id: &str) -> serde_json::Value {
@@ -3013,7 +3086,10 @@ fn app_server_turn_start_request(claim: &ClaimRunResponse, thread_id: &str) -> s
     if let Some((model, _)) = app_server_default_model_configuration(claim) {
         params["model"] = json!(model);
     }
-    if let Some(effort) = codex_reasoning_effort(claim.execution_configuration.reasoning_effort) {
+    if let Some(effort) = model_binding(&claim.execution_configuration, "main")
+        .ok()
+        .and_then(|binding| codex_reasoning_effort(binding.model_settings.reasoning_effort))
+    {
         params["effort"] = json!(effort);
     }
     json!({
@@ -3312,6 +3388,7 @@ impl PersistentAppServerProcess {
     ) -> anyhow::Result<AppServerRunResult> {
         let started_at = Instant::now();
         let mut state = AppServerState::new(claim.run.id);
+        let driver_configuration_fingerprint = driver_configuration_fingerprint(claim);
         anyhow::ensure!(self.child.is_some(), "Codex app-server is not running");
         let reused_thread = self.thread_id.is_some();
         let thread_id = if let Some(thread_id) = self.thread_id.clone() {
@@ -3329,14 +3406,21 @@ impl PersistentAppServerProcess {
             }
             let thread_id = state.thread_id.clone().context("missing Codex thread id")?;
             self.thread_id = Some(thread_id.clone());
-            self.configuration_fingerprint = Some(claim.expected_configuration_fingerprint.clone());
+            self.configuration_fingerprint = Some(driver_configuration_fingerprint.clone());
             thread_id
         };
         if reused_thread
             && self.configuration_fingerprint.as_deref()
-                != Some(claim.expected_configuration_fingerprint.as_str())
+                != Some(driver_configuration_fingerprint.as_str())
         {
-            self.refresh_thread_configuration(claim, &thread_id, &mut state, started_at, event_tx)?;
+            self.refresh_thread_configuration(
+                claim,
+                &thread_id,
+                &driver_configuration_fingerprint,
+                &mut state,
+                started_at,
+                event_tx,
+            )?;
         }
         let request_id = self.send_request(app_server_turn_start_request(claim, &thread_id))?;
         state.expect_response(request_id, AppServerResponseKind::TurnStart);
@@ -3375,6 +3459,12 @@ impl PersistentAppServerProcess {
                             );
                         }
                         Ok(command @ SessionSupervisorCommand::Execute { .. }) => {
+                            deferred_commands
+                                .as_deref_mut()
+                                .expect("controlled execution has a deferred command queue")
+                                .push_back(command);
+                        }
+                        Ok(command @ SessionSupervisorCommand::RefreshConfiguration { .. }) => {
                             deferred_commands
                                 .as_deref_mut()
                                 .expect("controlled execution has a deferred command queue")
@@ -3470,6 +3560,7 @@ impl PersistentAppServerProcess {
         &mut self,
         claim: &ClaimRunResponse,
         thread_id: &str,
+        driver_configuration_fingerprint: &str,
         state: &mut AppServerState,
         started_at: Instant,
         event_tx: &Option<tokio_mpsc::Sender<AppendRunEventRequest>>,
@@ -3492,7 +3583,7 @@ impl PersistentAppServerProcess {
             started_at,
             event_tx,
         )?;
-        self.configuration_fingerprint = Some(claim.expected_configuration_fingerprint.clone());
+        self.configuration_fingerprint = Some(driver_configuration_fingerprint.to_owned());
         Ok(())
     }
 
@@ -3577,6 +3668,17 @@ impl PersistentAppServerProcess {
     }
 }
 
+fn driver_configuration_fingerprint(claim: &ClaimRunResponse) -> String {
+    let mut bindings = claim
+        .execution_configuration
+        .model_bindings
+        .iter()
+        .map(|binding| (binding.binding_key.trim().to_lowercase(), binding.id))
+        .collect::<Vec<_>>();
+    bindings.sort();
+    format!("{}:{bindings:?}", claim.expected_configuration_fingerprint)
+}
+
 impl Drop for PersistentAppServerProcess {
     fn drop(&mut self) {
         self.shutdown();
@@ -3620,6 +3722,9 @@ enum SessionSupervisorCommand {
     Interrupt {
         expected_turn_id: String,
         response: oneshot::Sender<anyhow::Result<SessionInterruptOutcome>>,
+    },
+    RefreshConfiguration {
+        response: oneshot::Sender<anyhow::Result<()>>,
     },
     Stop,
 }
@@ -3718,6 +3823,9 @@ impl SessionSupervisor {
                     }
                     Ok(SessionSupervisorCommand::Interrupt { response, .. }) => {
                         let _ = response.send(Ok(SessionInterruptOutcome::TurnEnded));
+                    }
+                    Ok(SessionSupervisorCommand::RefreshConfiguration { response }) => {
+                        let _ = response.send(Ok(()));
                     }
                     Ok(SessionSupervisorCommand::Stop)
                     | Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -3848,6 +3956,20 @@ impl SessionSupervisor {
         result
             .await
             .map_err(|_| anyhow::anyhow!("Session supervisor actor stopped during interrupt"))?
+    }
+
+    async fn wait_for_configuration_refresh(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.stopped.load(Ordering::Acquire),
+            "Session supervisor is stopped"
+        );
+        let (response, result) = oneshot::channel();
+        self.command_tx
+            .send(SessionSupervisorCommand::RefreshConfiguration { response })
+            .map_err(|_| anyhow::anyhow!("Session supervisor actor is not running"))?;
+        result.await.map_err(|_| {
+            anyhow::anyhow!("Session supervisor actor stopped before configuration refresh")
+        })?
     }
 
     fn shutdown(&self) {
@@ -5710,6 +5832,75 @@ impl SessionSupervisorManager {
             .await
     }
 
+    async fn refresh_execution_configuration(
+        &self,
+        session_id: Uuid,
+        ownership_generation: i64,
+        configuration: &AgentExecutionConfigurationDto,
+        configuration_fingerprint: &str,
+        local_skills_dir: Option<&Path>,
+    ) -> anyhow::Result<()> {
+        let supervisor = {
+            let records = self.records.lock().unwrap();
+            let record = records
+                .get(&session_id)
+                .context("configuration refresh Session is not managed by this Runtime")?;
+            anyhow::ensure!(
+                record.snapshot.ownership_generation == ownership_generation,
+                "configuration refresh ownership generation is stale"
+            );
+            anyhow::ensure!(
+                record.reserved_run_id.is_none(),
+                "configuration refresh cannot overlap a reserved Run"
+            );
+            match &record.status {
+                ManagedSessionStatus::Ready { supervisor, .. } => Some(Arc::clone(supervisor)),
+                ManagedSessionStatus::Cold { .. } => None,
+                ManagedSessionStatus::Starting => {
+                    anyhow::bail!("Session supervisor is still starting")
+                }
+                ManagedSessionStatus::Blocked { reason, .. } => {
+                    anyhow::bail!("Session supervisor is blocked: {reason}")
+                }
+            }
+        };
+        if let Some(supervisor) = supervisor {
+            supervisor.wait_for_configuration_refresh().await?;
+        }
+        {
+            let records = self.records.lock().unwrap();
+            let record = records
+                .get(&session_id)
+                .context("configuration refresh Session disappeared")?;
+            anyhow::ensure!(
+                record.snapshot.ownership_generation == ownership_generation,
+                "configuration refresh ownership changed before materialization"
+            );
+            anyhow::ensure!(
+                record.reserved_run_id.is_none(),
+                "configuration refresh overlapped a newly reserved Run"
+            );
+            match &record.status {
+                ManagedSessionStatus::Ready { .. } | ManagedSessionStatus::Cold { .. } => {}
+                ManagedSessionStatus::Starting => {
+                    anyhow::bail!("Session supervisor started during configuration refresh")
+                }
+                ManagedSessionStatus::Blocked { reason, .. } => {
+                    anyhow::bail!("Session supervisor is blocked: {reason}")
+                }
+            }
+        }
+        let paths = SessionPaths::for_session(&self.work_root, session_id);
+        synchronize_execution_configuration(
+            &paths,
+            configuration,
+            configuration_fingerprint,
+            ModelConfigurationMaterialization::PreserveExisting,
+            local_skills_dir,
+        )
+        .await
+    }
+
     async fn interrupt(
         &self,
         session_id: Uuid,
@@ -7381,7 +7572,7 @@ async fn prepare_run_env_with_local_skills(
         &paths,
         &claim.execution_configuration,
         &runtime_fingerprint,
-        model_base_url,
+        ModelConfigurationMaterialization::RunBindings { model_base_url },
         local_skills_dir,
     )
     .await?;
@@ -7404,11 +7595,17 @@ struct ExecutionMaterializationMarker {
     owned_agent_files: Vec<String>,
 }
 
+#[derive(Clone, Copy)]
+enum ModelConfigurationMaterialization<'a> {
+    RunBindings { model_base_url: Option<&'a str> },
+    PreserveExisting,
+}
+
 async fn synchronize_execution_configuration(
     paths: &SessionPaths,
     configuration: &AgentExecutionConfigurationDto,
     configuration_fingerprint: &str,
-    model_base_url: Option<&str>,
+    model_configuration: ModelConfigurationMaterialization<'_>,
     local_skills_dir: Option<&Path>,
 ) -> anyhow::Result<()> {
     let stage = paths
@@ -7421,9 +7618,24 @@ async fn synchronize_execution_configuration(
         fs::write(stage.join("AGENTS.md"), instructions.as_bytes())
             .await
             .context("stage Agent guidance")?;
-        let config_toml = render_codex_config(configuration, model_base_url)?;
-        write_private_file(&stage.join("config.toml"), config_toml.as_bytes())
-            .context("stage per-Session Codex config")?;
+        let existing_marker = match model_configuration {
+            ModelConfigurationMaterialization::RunBindings { model_base_url } => {
+                let config_toml = render_codex_config(configuration, model_base_url)?;
+                write_private_file(&stage.join("config.toml"), config_toml.as_bytes())
+                    .context("stage per-Session Codex config")?;
+                None
+            }
+            ModelConfigurationMaterialization::PreserveExisting => {
+                let marker = validated_execution_materialization(&paths.codex)?;
+                let config_toml = render_codex_config_preserving_model_configuration(
+                    &paths.codex.join("config.toml"),
+                    &configuration.mcp_allowlist,
+                )?;
+                write_private_file(&stage.join("config.toml"), config_toml.as_bytes())
+                    .context("preserve per-Session Codex model configuration")?;
+                Some(marker)
+            }
+        };
         fs::write(
             stage.join("skills-manifest.json"),
             serde_json::to_vec_pretty(&configuration.skills)?,
@@ -7443,6 +7655,14 @@ async fn synchronize_execution_configuration(
         // Hub Skills are applied last so an inline/managed Skill overrides runtime-local content.
         materialize_skills(&stage, &skills).await?;
         let owned_agent_files = materialize_codex_agents(&stage, configuration).await?;
+        if let Some(existing_marker) = &existing_marker {
+            preserve_codex_agent_model_configuration(
+                &paths.codex,
+                &stage,
+                &existing_marker.owned_agent_files,
+                &owned_agent_files,
+            )?;
+        }
         let owned_skill_directories = skill_directory_entries(&stage.join("skills")).await?;
         let materialization_sha256 =
             execution_materialization_sha256(&stage, &owned_skill_directories, &owned_agent_files)?;
@@ -7573,6 +7793,21 @@ fn materialization_is_current(codex_home: &Path, desired: &ExecutionMaterializat
         &desired.owned_agent_files,
     )
     .is_ok_and(|digest| digest == desired.materialization_sha256)
+}
+
+fn validated_execution_materialization(
+    codex_home: &Path,
+) -> anyhow::Result<ExecutionMaterializationMarker> {
+    let marker: ExecutionMaterializationMarker = serde_json::from_slice(
+        &stdfs::read(codex_home.join(MATERIALIZATION_MARKER_FILE))
+            .context("read current execution configuration marker")?,
+    )
+    .context("parse current execution configuration marker")?;
+    anyhow::ensure!(
+        marker.format_version == 2 && materialization_is_current(codex_home, &marker),
+        "current execution configuration materialization is invalid"
+    );
+    Ok(marker)
 }
 
 #[cfg(unix)]
@@ -7765,6 +8000,57 @@ async fn materialize_codex_agents(
     Ok(owned_files)
 }
 
+fn preserve_codex_agent_model_configuration(
+    codex_home: &Path,
+    stage: &Path,
+    existing_owned_files: &[String],
+    refreshed_owned_files: &[String],
+) -> anyhow::Result<()> {
+    const MODEL_CONFIGURATION_KEYS: &[&str] = &[
+        "model",
+        "model_provider",
+        "model_reasoning_effort",
+        "model_reasoning_summary",
+        "model_verbosity",
+        "model_context_window",
+        "model_auto_compact_token_limit",
+        "model_supports_reasoning_summaries",
+        "service_tier",
+    ];
+
+    for filename in refreshed_owned_files
+        .iter()
+        .filter(|filename| existing_owned_files.contains(filename))
+    {
+        let existing_path = codex_home.join("agents").join(filename);
+        let refreshed_path = stage.join("agents").join(filename);
+        let existing = stdfs::read_to_string(&existing_path)
+            .with_context(|| format!("read current Codex agent file {filename}"))?
+            .parse::<toml::Value>()
+            .with_context(|| format!("parse current Codex agent file {filename}"))?;
+        let mut refreshed = stdfs::read_to_string(&refreshed_path)
+            .with_context(|| format!("read refreshed Codex agent file {filename}"))?
+            .parse::<toml::Value>()
+            .with_context(|| format!("parse refreshed Codex agent file {filename}"))?;
+        let existing = existing
+            .as_table()
+            .context("current Codex agent configuration is not a TOML table")?;
+        let refreshed = refreshed
+            .as_table_mut()
+            .context("refreshed Codex agent configuration is not a TOML table")?;
+        for key in MODEL_CONFIGURATION_KEYS {
+            if let Some(value) = existing.get(*key) {
+                refreshed.insert((*key).to_owned(), value.clone());
+            }
+        }
+        let contents = toml::to_string(&toml::Value::Table(refreshed.clone()))
+            .context("serialize refreshed Codex agent config")?;
+        write_private_file(&refreshed_path, contents.as_bytes())
+            .with_context(|| format!("preserve Codex agent model configuration {filename}"))?;
+    }
+    Ok(())
+}
+
 fn render_codex_agent(
     configuration: &AgentExecutionConfigurationDto,
     subagent: &CodexSubagentDefinition,
@@ -7779,31 +8065,16 @@ fn render_codex_agent(
         "developer_instructions".into(),
         toml::Value::String(subagent.developer_instructions.clone()),
     );
-    if let Some(connection_id) = subagent.model_connection_id {
-        let connection = model_connection(configuration, connection_id)?;
+    if let Ok(binding) = model_binding(configuration, &subagent.name) {
         root.insert(
             "model".into(),
-            toml::Value::String(connection.model_id.clone()),
+            toml::Value::String(binding.model_id.clone()),
         );
         root.insert(
             "model_provider".into(),
-            toml::Value::String(model_provider_name(connection.id)),
+            toml::Value::String(model_provider_name(binding.id)),
         );
-        let reasoning_effort = effective_reasoning_effort(
-            connection.parameters.reasoning_effort,
-            configuration.reasoning_effort,
-            subagent.reasoning_effort,
-        );
-        apply_model_parameters(&mut root, &connection.parameters, reasoning_effort)?;
-    } else if let Some(effort) = subagent
-        .reasoning_effort
-        .filter(|effort| *effort != ReasoningEffort::Default)
-        .and_then(codex_reasoning_effort)
-    {
-        root.insert(
-            "model_reasoning_effort".into(),
-            toml::Value::String(effort.into()),
-        );
+        apply_model_settings(&mut root, &binding.model_settings)?;
     }
     toml::to_string(&toml::Value::Table(root)).context("serialize Codex agent config")
 }
@@ -7837,52 +8108,47 @@ fn render_codex_config(
     model_base_url: Option<&str>,
 ) -> anyhow::Result<String> {
     let base_url = model_base_url.unwrap_or("http://127.0.0.1:0/v1");
-    let default_connection_id = configuration
-        .default_model_connection_id
-        .context("Agent default Model Connection is required")?;
-    let default_connection = model_connection(configuration, default_connection_id)?;
+    let main_binding = model_binding(configuration, "main")?;
     let mut root = toml::map::Map::new();
     root.insert(
         "model".into(),
-        toml::Value::String(default_connection.model_id.clone()),
+        toml::Value::String(main_binding.model_id.clone()),
     );
     root.insert(
         "model_provider".into(),
-        toml::Value::String(model_provider_name(default_connection.id)),
+        toml::Value::String(model_provider_name(main_binding.id)),
     );
-    let reasoning_effort = effective_reasoning_effort(
-        default_connection.parameters.reasoning_effort,
-        configuration.reasoning_effort,
-        None,
-    );
-    apply_model_parameters(&mut root, &default_connection.parameters, reasoning_effort)?;
+    apply_model_settings(&mut root, &main_binding.model_settings)?;
 
     let mut model_providers = toml::map::Map::new();
-    for connection in &configuration.model_connections {
+    for binding in &configuration.model_bindings {
         let mut provider_config = toml::map::Map::new();
-        provider_config.insert("name".into(), toml::Value::String(connection.name.clone()));
+        provider_config.insert(
+            "name".into(),
+            toml::Value::String(binding.connection_name_snapshot.clone()),
+        );
         provider_config.insert("base_url".into(), toml::Value::String(base_url.to_owned()));
         provider_config.insert("wire_api".into(), toml::Value::String("responses".into()));
         provider_config.insert(
             "http_headers".into(),
             toml::Value::Table(toml::map::Map::from_iter([(
-                "x-agent-hub-model-connection-id".into(),
-                toml::Value::String(connection.id.to_string()),
+                "x-agent-hub-model-binding-id".into(),
+                toml::Value::String(binding.id.to_string()),
             )])),
         );
-        if let Some(retries) = connection.parameters.request_max_retries {
+        if let Some(retries) = binding.model_settings.request_max_retries {
             provider_config.insert(
                 "request_max_retries".into(),
                 toml::Value::Integer(i64::from(retries)),
             );
         }
-        if let Some(retries) = connection.parameters.stream_max_retries {
+        if let Some(retries) = binding.model_settings.stream_max_retries {
             provider_config.insert(
                 "stream_max_retries".into(),
                 toml::Value::Integer(i64::from(retries)),
             );
         }
-        if let Some(timeout_ms) = connection.parameters.stream_idle_timeout_ms {
+        if let Some(timeout_ms) = binding.model_settings.stream_idle_timeout_ms {
             provider_config.insert(
                 "stream_idle_timeout_ms".into(),
                 toml::Value::Integer(
@@ -7892,7 +8158,7 @@ fn render_codex_config(
             );
         }
         model_providers.insert(
-            model_provider_name(connection.id),
+            model_provider_name(binding.id),
             toml::Value::Table(provider_config),
         );
     }
@@ -7914,61 +8180,74 @@ fn render_codex_config(
     toml::to_string(&toml::Value::Table(root)).context("serialize Codex config")
 }
 
-fn model_connection(
-    configuration: &AgentExecutionConfigurationDto,
-    connection_id: Uuid,
-) -> anyhow::Result<&ModelConnectionOptionDto> {
-    let connection = configuration
-        .model_connections
-        .iter()
-        .find(|connection| connection.id == connection_id)
-        .context("selected Model Connection is missing from execution configuration")?;
+fn render_codex_config_preserving_model_configuration(
+    existing_path: &Path,
+    mcp_allowlist: &serde_json::Value,
+) -> anyhow::Result<String> {
+    let mut existing = stdfs::read_to_string(existing_path)
+        .context("read current per-Session Codex config")?
+        .parse::<toml::Value>()
+        .context("parse current per-Session Codex config")?;
+    let root = existing
+        .as_table_mut()
+        .context("current per-Session Codex config is not a TOML table")?;
+    let provider_name = root
+        .get("model_provider")
+        .and_then(toml::Value::as_str)
+        .context("current per-Session Codex config has no model provider")?;
     anyhow::ensure!(
-        connection.status == ModelConnectionStatus::Enabled,
-        "selected Model Connection is disabled"
+        root.get("model_providers")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|providers| providers.contains_key(provider_name)),
+        "current per-Session Codex provider route is missing"
     );
-    Ok(connection)
+    let mcp_servers = render_mcp_servers(mcp_allowlist);
+    if mcp_servers.is_empty() {
+        root.remove("mcp_servers");
+    } else {
+        root.insert("mcp_servers".into(), toml::Value::Table(mcp_servers));
+    }
+    toml::to_string(&existing).context("serialize preserved per-Session Codex config")
 }
 
-fn model_provider_name(connection_id: Uuid) -> String {
-    format!("agent_hub_{}", connection_id.simple())
+fn model_binding<'a>(
+    configuration: &'a AgentExecutionConfigurationDto,
+    binding_key: &str,
+) -> anyhow::Result<&'a RunModelBindingDto> {
+    configuration
+        .model_bindings
+        .iter()
+        .find(|binding| binding.binding_key.eq_ignore_ascii_case(binding_key))
+        .context("required Run Model Binding is missing from execution configuration")
 }
 
-fn effective_reasoning_effort(
-    connection_default: ReasoningEffort,
-    agent_override: ReasoningEffort,
-    subagent_override: Option<ReasoningEffort>,
-) -> ReasoningEffort {
-    subagent_override
-        .filter(|effort| *effort != ReasoningEffort::Default)
-        .or((agent_override != ReasoningEffort::Default).then_some(agent_override))
-        .unwrap_or(connection_default)
+fn model_provider_name(binding_id: Uuid) -> String {
+    format!("agent_hub_{}", binding_id.simple())
 }
 
-fn apply_model_parameters(
+fn apply_model_settings(
     root: &mut toml::map::Map<String, toml::Value>,
-    parameters: &ModelConnectionParameters,
-    reasoning_effort: ReasoningEffort,
+    settings: &AgentModelSettings,
 ) -> anyhow::Result<()> {
-    if let Some(effort) = codex_reasoning_effort(reasoning_effort) {
+    if let Some(effort) = codex_reasoning_effort(settings.reasoning_effort) {
         root.insert(
             "model_reasoning_effort".into(),
             toml::Value::String(effort.into()),
         );
     }
-    if let Some(summary) = codex_reasoning_summary(parameters.reasoning_summary) {
+    if let Some(summary) = codex_reasoning_summary(settings.reasoning_summary) {
         root.insert(
             "model_reasoning_summary".into(),
             toml::Value::String(summary.into()),
         );
     }
-    if let Some(verbosity) = codex_model_verbosity(parameters.verbosity) {
+    if let Some(verbosity) = codex_model_verbosity(settings.verbosity) {
         root.insert(
             "model_verbosity".into(),
             toml::Value::String(verbosity.into()),
         );
     }
-    if let Some(tokens) = parameters.context_window_tokens {
+    if let Some(tokens) = settings.context_window_tokens {
         root.insert(
             "model_context_window".into(),
             toml::Value::Integer(
@@ -7976,7 +8255,7 @@ fn apply_model_parameters(
             ),
         );
     }
-    if let Some(tokens) = parameters.auto_compact_token_limit {
+    if let Some(tokens) = settings.auto_compact_token_limit {
         root.insert(
             "model_auto_compact_token_limit".into(),
             toml::Value::Integer(
@@ -7984,7 +8263,7 @@ fn apply_model_parameters(
             ),
         );
     }
-    match parameters.reasoning_summary_support {
+    match settings.reasoning_summary_support {
         ModelReasoningSummarySupport::Auto => {}
         ModelReasoningSummarySupport::Supported => {
             root.insert(
@@ -7999,7 +8278,7 @@ fn apply_model_parameters(
             );
         }
     }
-    if let Some(service_tier) = &parameters.service_tier {
+    if let Some(service_tier) = &settings.service_tier {
         root.insert(
             "service_tier".into(),
             toml::Value::String(service_tier.clone()),
@@ -8797,6 +9076,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn online_refresh_without_bindings_preserves_provider_routes_until_the_next_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_id = Uuid::new_v4();
+        let mut first = test_claim();
+        first.run.runtime_id = Some(runtime_id);
+        first.execution_configuration.instructions = "old guidance".into();
+        let reviewer_connection_id = Uuid::from_u128(0x301);
+        let reviewer_binding_id = Uuid::from_u128(0x302);
+        first.execution_configuration.codex_subagents = vec![CodexSubagentDefinition {
+            name: "reviewer".into(),
+            description: "Review the current change".into(),
+            developer_instructions: "Use the old review guidance.".into(),
+            model_selection: Some(ModelSelectionDto {
+                connection_id: reviewer_connection_id,
+                model_id: "gpt-review-old".into(),
+            }),
+            model_settings_override: AgentModelSettingsOverride {
+                reasoning_effort: ModelSettingOverride::Value(ReasoningEffort::Ultra),
+                ..AgentModelSettingsOverride::default()
+            },
+            enabled: true,
+            disabled_reason: None,
+        }];
+        first
+            .execution_configuration
+            .model_bindings
+            .push(RunModelBindingDto {
+                id: reviewer_binding_id,
+                run_id: first.run.id,
+                binding_key: "reviewer".into(),
+                model_connection_id: reviewer_connection_id,
+                connection_name_snapshot: "Old reviewer".into(),
+                connection_scope_snapshot: ModelConnectionScope::Global,
+                model_id: "gpt-review-old".into(),
+                api_type: ModelUpstreamProtocol::OpenaiResponses,
+                model_settings: AgentModelSettings {
+                    reasoning_effort: ReasoningEffort::Ultra,
+                    ..AgentModelSettings::default()
+                },
+            });
+        first.expected_configuration_fingerprint =
+            execution_configuration_fingerprint(&first.execution_configuration).unwrap();
+        let run_env = prepare_run_env(temp.path(), &first, Some("http://127.0.0.1:4567/v1"))
+            .await
+            .unwrap();
+        let original_config = fs::read_to_string(run_env.codex_home.join("config.toml"))
+            .await
+            .unwrap()
+            .parse::<toml::Value>()
+            .unwrap();
+
+        let manager = SessionSupervisorManager::new(temp.path().to_path_buf(), runtime_id, 1);
+        manager.reserve_claim(&first).unwrap();
+        manager.complete_fake_claim(&first).await.unwrap();
+
+        let mut refreshed = first.execution_configuration.clone();
+        refreshed.revision += 1;
+        refreshed.instructions = "refreshed non-model guidance".into();
+        refreshed.model_selection = None;
+        refreshed.model_settings = AgentModelSettings::default();
+        refreshed.model_bindings.clear();
+        refreshed.mcp_allowlist = json!([{
+            "name": "refresh-mcp",
+            "command": "refresh-command",
+            "args": ["--new"]
+        }]);
+        refreshed.codex_subagents[0].developer_instructions =
+            "Use refreshed review guidance.".into();
+        refreshed.codex_subagents[0].model_selection = None;
+        refreshed.codex_subagents[0].model_settings_override =
+            AgentModelSettingsOverride::default();
+        let refreshed_fingerprint = execution_configuration_fingerprint(&refreshed).unwrap();
+        let command = RuntimeSessionCommandDto {
+            command_id: Uuid::new_v4(),
+            session_id: first.run.hub_session_id.unwrap(),
+            ownership_generation: 1,
+            command: "refresh_configuration".into(),
+            run_id: None,
+            turn_id: None,
+            native_thread_id: None,
+            native_turn_id: None,
+            message: None,
+            configuration_revision: Some(refreshed.revision),
+            fingerprint: Some(refreshed_fingerprint.clone()),
+            execution_configuration: Some(refreshed),
+        };
+
+        let applied = apply_runtime_session_command(&manager, &command, None)
+            .await
+            .unwrap();
+
+        assert_eq!(applied.outcome, "applied");
+        assert!(applied.native_error.is_none());
+        let refreshed_config = fs::read_to_string(run_env.codex_home.join("config.toml"))
+            .await
+            .unwrap()
+            .parse::<toml::Value>()
+            .unwrap();
+        assert_eq!(refreshed_config["model"], original_config["model"]);
+        assert_eq!(
+            refreshed_config["model_provider"],
+            original_config["model_provider"]
+        );
+        assert_eq!(
+            refreshed_config["model_providers"],
+            original_config["model_providers"]
+        );
+        assert_eq!(
+            refreshed_config["mcp_servers"]["refresh-mcp"]["command"].as_str(),
+            Some("refresh-command")
+        );
+        assert_eq!(
+            fs::read_to_string(run_env.codex_home.join("AGENTS.md"))
+                .await
+                .unwrap(),
+            "refreshed non-model guidance\n"
+        );
+        let reviewer = fs::read_to_string(run_env.codex_home.join("agents/reviewer.toml"))
+            .await
+            .unwrap();
+        assert!(reviewer.contains("Use refreshed review guidance."));
+        assert!(reviewer.contains("model = \"gpt-review-old\""));
+        assert!(reviewer.contains(&format!(
+            "model_provider = \"{}\"",
+            model_provider_name(reviewer_binding_id)
+        )));
+        assert!(reviewer.contains("model_reasoning_effort = \"ultra\""));
+        let marker: ExecutionMaterializationMarker = serde_json::from_slice(
+            &fs::read(run_env.codex_home.join(MATERIALIZATION_MARKER_FILE))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(marker.configuration_fingerprint, refreshed_fingerprint);
+
+        let mut next = first.clone();
+        next.run.id = Uuid::new_v4();
+        next.execution_configuration.revision += 1;
+        next.execution_configuration.instructions = "refreshed non-model guidance".into();
+        next.execution_configuration.mcp_allowlist = json!([{
+            "name": "refresh-mcp",
+            "command": "refresh-command",
+            "args": ["--new"]
+        }]);
+        let next_binding_id = Uuid::from_u128(0x401);
+        next.execution_configuration.model_selection = Some(ModelSelectionDto {
+            connection_id: next.execution_configuration.model_bindings[0].model_connection_id,
+            model_id: "gpt-main-next".into(),
+        });
+        next.execution_configuration.model_settings = AgentModelSettings {
+            reasoning_effort: ReasoningEffort::High,
+            ..AgentModelSettings::default()
+        };
+        next.execution_configuration.model_bindings[0].id = next_binding_id;
+        next.execution_configuration.model_bindings[0].run_id = next.run.id;
+        next.execution_configuration.model_bindings[0].model_id = "gpt-main-next".into();
+        next.execution_configuration.model_bindings[0].model_settings =
+            next.execution_configuration.model_settings.clone();
+        next.execution_configuration.model_bindings[1].id = Uuid::from_u128(0x402);
+        next.execution_configuration.model_bindings[1].run_id = next.run.id;
+        next.expected_configuration_fingerprint =
+            execution_configuration_fingerprint(&next.execution_configuration).unwrap();
+
+        let next_env = prepare_run_env(temp.path(), &next, Some("http://127.0.0.1:4567/v1"))
+            .await
+            .unwrap();
+        let next_config = fs::read_to_string(next_env.codex_home.join("config.toml"))
+            .await
+            .unwrap();
+        assert!(next_config.contains("model = \"gpt-main-next\""));
+        assert!(next_config.contains(&format!(
+            "model_provider = \"{}\"",
+            model_provider_name(next_binding_id)
+        )));
+        assert!(next_config.contains(&format!(
+            "x-agent-hub-model-binding-id = \"{next_binding_id}\""
+        )));
+        assert_ne!(
+            driver_configuration_fingerprint(&first),
+            driver_configuration_fingerprint(&next)
+        );
+        manager.shutdown();
+    }
+
+    #[tokio::test]
     async fn execution_materialization_removes_owned_skills_preserves_unknown_and_isolates_sessions(
     ) {
         let temp = tempfile::tempdir().unwrap();
@@ -8863,35 +9327,41 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut claim = test_claim();
         let override_connection_id = Uuid::from_u128(0x303);
+        let override_binding_id = Uuid::from_u128(0x304);
+        let override_selection = ModelSelectionDto {
+            connection_id: override_connection_id,
+            model_id: "gpt-review".into(),
+        };
         claim
             .execution_configuration
-            .model_connections
-            .push(ModelConnectionOptionDto {
-                id: override_connection_id,
-                name: "Review model".into(),
+            .model_bindings
+            .push(RunModelBindingDto {
+                id: override_binding_id,
+                run_id: claim.run.id,
+                binding_key: "reviewer".into(),
+                model_connection_id: override_connection_id,
+                connection_name_snapshot: "Review model".into(),
+                connection_scope_snapshot: ModelConnectionScope::Personal,
                 model_id: "gpt-review".into(),
-                upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
-                parameters: ModelConnectionParameters {
-                    reasoning_effort: ReasoningEffort::Medium,
+                api_type: ModelUpstreamProtocol::OpenaiResponses,
+                model_settings: AgentModelSettings {
+                    reasoning_effort: ReasoningEffort::Ultra,
                     reasoning_summary: ModelReasoningSummary::Concise,
                     verbosity: ModelVerbosity::High,
                     context_window_tokens: Some(128_000),
                     auto_compact_token_limit: Some(96_000),
                     reasoning_summary_support: ModelReasoningSummarySupport::Unsupported,
                     service_tier: Some("flex".into()),
-                    ..ModelConnectionParameters::default()
+                    ..AgentModelSettings::default()
                 },
-                request_parameters: ModelConnectionRequestParameters::default(),
-                scope: ModelConnectionScope::Personal,
-                status: ModelConnectionStatus::Enabled,
             });
         claim.execution_configuration.codex_subagents = vec![
             CodexSubagentDefinition {
                 name: "researcher".into(),
                 description: "Research the requested topic".into(),
                 developer_instructions: "Use primary sources.".into(),
-                model_connection_id: None,
-                reasoning_effort: None,
+                model_selection: None,
+                model_settings_override: AgentModelSettingsOverride::default(),
                 enabled: true,
                 disabled_reason: None,
             },
@@ -8899,8 +9369,11 @@ mod tests {
                 name: "reviewer".into(),
                 description: "Review the current change".into(),
                 developer_instructions: "Inspect correctness and security.".into(),
-                model_connection_id: Some(override_connection_id),
-                reasoning_effort: Some(ReasoningEffort::Ultra),
+                model_selection: Some(override_selection),
+                model_settings_override: AgentModelSettingsOverride {
+                    reasoning_effort: ModelSettingOverride::Value(ReasoningEffort::Ultra),
+                    ..AgentModelSettingsOverride::default()
+                },
                 enabled: true,
                 disabled_reason: None,
             },
@@ -8908,10 +9381,10 @@ mod tests {
                 name: "disabled".into(),
                 description: "Disabled role".into(),
                 developer_instructions: "Must not be materialized.".into(),
-                model_connection_id: None,
-                reasoning_effort: None,
+                model_selection: None,
+                model_settings_override: AgentModelSettingsOverride::default(),
                 enabled: false,
-                disabled_reason: Some("model_connection_deleted".into()),
+                disabled_reason: Some("model_selection_removed".into()),
             },
         ];
         claim.expected_configuration_fingerprint =
@@ -8949,31 +9422,9 @@ mod tests {
             Some(false)
         );
         assert_eq!(reviewer["service_tier"].as_str(), Some("flex"));
-        let mut inherited_reasoning = claim.execution_configuration.clone();
-        inherited_reasoning.reasoning_effort = ReasoningEffort::Low;
-        inherited_reasoning.codex_subagents[1].reasoning_effort = None;
-        let reviewer_with_agent_default = render_codex_agent(
-            &inherited_reasoning,
-            &inherited_reasoning.codex_subagents[1],
-        )
-        .unwrap()
-        .parse::<toml::Value>()
-        .unwrap();
         assert_eq!(
-            reviewer_with_agent_default["model_reasoning_effort"].as_str(),
-            Some("low")
-        );
-        inherited_reasoning.reasoning_effort = ReasoningEffort::Default;
-        let reviewer_with_connection_default = render_codex_agent(
-            &inherited_reasoning,
-            &inherited_reasoning.codex_subagents[1],
-        )
-        .unwrap()
-        .parse::<toml::Value>()
-        .unwrap();
-        assert_eq!(
-            reviewer_with_connection_default["model_reasoning_effort"].as_str(),
-            Some("medium")
+            reviewer["model_provider"].as_str(),
+            Some(model_provider_name(override_binding_id).as_str())
         );
         assert!(!agents_dir.join("disabled.toml").exists());
         assert_eq!(
@@ -8998,11 +9449,22 @@ mod tests {
             name: "researcher".into(),
             description: "Research with updated guidance".into(),
             developer_instructions: "Use primary sources and cite them.".into(),
-            model_connection_id: None,
-            reasoning_effort: Some(ReasoningEffort::Max),
+            model_selection: None,
+            model_settings_override: AgentModelSettingsOverride {
+                reasoning_effort: ModelSettingOverride::Value(ReasoningEffort::Max),
+                ..AgentModelSettingsOverride::default()
+            },
             enabled: true,
             disabled_reason: None,
         }];
+        let mut researcher_binding = refreshed.execution_configuration.model_bindings[0].clone();
+        researcher_binding.id = Uuid::from_u128(0x305);
+        researcher_binding.binding_key = "researcher".into();
+        researcher_binding.model_settings.reasoning_effort = ReasoningEffort::Max;
+        refreshed.execution_configuration.model_bindings = vec![
+            refreshed.execution_configuration.model_bindings[0].clone(),
+            researcher_binding,
+        ];
         refreshed.expected_configuration_fingerprint =
             execution_configuration_fingerprint(&refreshed.execution_configuration).unwrap();
 
@@ -9843,6 +10305,7 @@ mod tests {
                 fingerprint: None,
                 execution_configuration: None,
             }],
+            None,
         );
 
         assert_eq!(
@@ -11619,17 +12082,8 @@ done
     #[test]
     fn codex_config_materializes_native_multi_provider_models_and_reasoning() {
         let mut claim = test_claim();
-        let default_connection_id = claim
-            .execution_configuration
-            .default_model_connection_id
-            .unwrap();
-        claim
-            .execution_configuration
-            .model_connections
-            .iter_mut()
-            .find(|connection| connection.id == default_connection_id)
-            .unwrap()
-            .parameters = ModelConnectionParameters {
+        let default_binding_id = claim.execution_configuration.model_bindings[0].id;
+        claim.execution_configuration.model_bindings[0].model_settings = AgentModelSettings {
             reasoning_effort: ReasoningEffort::High,
             reasoning_summary: ModelReasoningSummary::Detailed,
             verbosity: ModelVerbosity::Low,
@@ -11640,18 +12094,25 @@ done
             request_max_retries: Some(7),
             stream_max_retries: Some(9),
             stream_idle_timeout_ms: Some(420_000),
+            request_settings: ModelRequestSettings::OpenaiResponses {},
         };
-        let override_connection_id = Uuid::from_u128(0x202);
+        let override_binding_id = Uuid::from_u128(0x202);
+        let shared_connection_id =
+            claim.execution_configuration.model_bindings[0].model_connection_id;
         claim
             .execution_configuration
-            .model_connections
-            .push(ModelConnectionOptionDto {
-                id: override_connection_id,
-                name: "Review model".into(),
-                model_id: "gpt-review".into(),
-                upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
-                parameters: ModelConnectionParameters {
-                    reasoning_effort: ReasoningEffort::Medium,
+            .model_bindings
+            .push(RunModelBindingDto {
+                id: override_binding_id,
+                run_id: claim.run.id,
+                binding_key: "reviewer".into(),
+                model_connection_id: shared_connection_id,
+                connection_name_snapshot: "Main model".into(),
+                connection_scope_snapshot: ModelConnectionScope::Global,
+                model_id: "gpt-main".into(),
+                api_type: ModelUpstreamProtocol::OpenaiResponses,
+                model_settings: AgentModelSettings {
+                    reasoning_effort: ReasoningEffort::Ultra,
                     reasoning_summary: ModelReasoningSummary::Concise,
                     verbosity: ModelVerbosity::High,
                     context_window_tokens: Some(128_000),
@@ -11661,22 +12122,23 @@ done
                     request_max_retries: Some(2),
                     stream_max_retries: Some(3),
                     stream_idle_timeout_ms: Some(300_000),
+                    request_settings: ModelRequestSettings::OpenaiResponses {},
                 },
-                request_parameters: ModelConnectionRequestParameters::default(),
-                scope: ModelConnectionScope::Personal,
-                status: ModelConnectionStatus::Enabled,
             });
         claim.execution_configuration.codex_subagents = vec![CodexSubagentDefinition {
             name: "reviewer".into(),
             description: "Review the current change".into(),
             developer_instructions: "Inspect correctness and security.".into(),
-            model_connection_id: Some(override_connection_id),
-            reasoning_effort: Some(ReasoningEffort::Ultra),
+            model_selection: None,
+            model_settings_override: AgentModelSettingsOverride {
+                reasoning_effort: ModelSettingOverride::Value(ReasoningEffort::Ultra),
+                ..AgentModelSettingsOverride::default()
+            },
             enabled: true,
             disabled_reason: None,
         }];
-        let default_provider = format!("agent_hub_{}", default_connection_id.simple());
-        let override_provider = format!("agent_hub_{}", override_connection_id.simple());
+        let default_provider = model_provider_name(default_binding_id);
+        let override_provider = model_provider_name(override_binding_id);
 
         let rendered = render_codex_config(
             &claim.execution_configuration,
@@ -11705,9 +12167,9 @@ done
         assert_eq!(parsed["service_tier"].as_str(), Some("priority"));
         assert_eq!(parsed["agents"]["max_threads"].as_integer(), Some(6));
         assert_eq!(parsed["agents"]["max_depth"].as_integer(), Some(1));
-        for (connection_id, provider) in [
-            (default_connection_id, default_provider),
-            (override_connection_id, override_provider),
+        for (binding_id, provider) in [
+            (default_binding_id, default_provider),
+            (override_binding_id, override_provider),
         ] {
             let provider = &parsed["model_providers"][&provider];
             assert_eq!(
@@ -11716,11 +12178,14 @@ done
             );
             assert_eq!(provider["wire_api"].as_str(), Some("responses"));
             assert_eq!(
-                provider["http_headers"]["x-agent-hub-model-connection-id"].as_str(),
-                Some(connection_id.to_string().as_str())
+                provider["http_headers"]["x-agent-hub-model-binding-id"].as_str(),
+                Some(binding_id.to_string().as_str())
             );
+            assert!(provider["http_headers"]
+                .get("x-agent-hub-model-connection-id")
+                .is_none());
             assert!(provider.get("env_key").is_none());
-            let expected_transport = if connection_id == default_connection_id {
+            let expected_transport = if binding_id == default_binding_id {
                 (7, 9, 420_000)
             } else {
                 (2, 3, 300_000)
@@ -11740,7 +12205,7 @@ done
         }
 
         let efforts = [
-            (ReasoningEffort::Default, Some("high")),
+            (ReasoningEffort::Default, None),
             (ReasoningEffort::None, Some("none")),
             (ReasoningEffort::Minimal, Some("minimal")),
             (ReasoningEffort::Low, Some("low")),
@@ -11751,7 +12216,9 @@ done
             (ReasoningEffort::Ultra, Some("ultra")),
         ];
         for (effort, expected) in efforts {
-            claim.execution_configuration.reasoning_effort = effort;
+            claim.execution_configuration.model_bindings[0]
+                .model_settings
+                .reasoning_effort = effort;
             let parsed = render_codex_config(
                 &claim.execution_configuration,
                 Some("http://127.0.0.1:4567/v1"),
@@ -11773,7 +12240,7 @@ done
     fn installed_codex_strictly_accepts_detailed_model_configuration() {
         let temp = tempfile::tempdir().unwrap();
         let mut claim = test_claim();
-        claim.execution_configuration.model_connections[0].parameters = ModelConnectionParameters {
+        claim.execution_configuration.model_bindings[0].model_settings = AgentModelSettings {
             reasoning_effort: ReasoningEffort::High,
             reasoning_summary: ModelReasoningSummary::Detailed,
             verbosity: ModelVerbosity::Low,
@@ -11784,6 +12251,7 @@ done
             request_max_retries: Some(7),
             stream_max_retries: Some(9),
             stream_idle_timeout_ms: Some(420_000),
+            request_settings: ModelRequestSettings::OpenaiResponses {},
         };
         let config = render_codex_config(
             &claim.execution_configuration,
@@ -12014,7 +12482,7 @@ done
     }
 
     #[tokio::test]
-    async fn local_model_proxy_preserves_connection_query_safe_headers_and_body() {
+    async fn local_model_proxy_requires_binding_and_preserves_query_safe_headers_and_body() {
         #[derive(Debug)]
         struct ForwardedRequest {
             query: Option<String>,
@@ -12052,7 +12520,7 @@ done
             protocol_capabilities: HashSet::new(),
         };
         let run_id = Uuid::new_v4();
-        let connection_id = Uuid::new_v4();
+        let binding_id = Uuid::new_v4();
         let proxy = start_model_proxy(
             &client,
             run_id,
@@ -12063,13 +12531,25 @@ done
         .unwrap();
         proxy.acknowledge_turn(run_id).unwrap();
         let request_body = br#"{"model":"gpt-main","input":"keep bytes"}"#;
+        let legacy_response = reqwest::Client::new()
+            .post(format!("{}/responses", proxy.base_url))
+            .header(
+                "x-agent-hub-model-connection-id",
+                Uuid::new_v4().to_string(),
+            )
+            .body(request_body.as_slice())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(legacy_response.status(), StatusCode::BAD_REQUEST);
+        assert!(forwarded.lock().unwrap().is_none());
 
         let response = reqwest::Client::new()
             .post(format!(
                 "{}/responses?include=usage&trace=a%2Fb",
                 proxy.base_url
             ))
-            .header("x-agent-hub-model-connection-id", connection_id.to_string())
+            .header("x-agent-hub-model-binding-id", binding_id.to_string())
             .header("x-request-id", "request-123")
             .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
             .header(header::AUTHORIZATION, "Bearer must-not-escape")
@@ -12082,12 +12562,13 @@ done
         let request = forwarded.lock().unwrap().take().unwrap();
         assert_eq!(request.query.as_deref(), Some("include=usage&trace=a%2Fb"));
         assert_eq!(
-            request
-                .headers
-                .get("x-agent-hub-model-connection-id")
-                .unwrap(),
-            connection_id.to_string().as_str()
+            request.headers.get("x-agent-hub-model-binding-id").unwrap(),
+            binding_id.to_string().as_str()
         );
+        assert!(request
+            .headers
+            .get("x-agent-hub-model-connection-id")
+            .is_none());
         assert_eq!(request.headers.get("x-request-id").unwrap(), "request-123");
         assert_eq!(
             request.headers.get(header::CONTENT_TYPE).unwrap(),
@@ -12161,6 +12642,7 @@ Transfer-Encoding: chunked\r\n\
             protocol_capabilities: HashSet::new(),
         };
         let run_id = Uuid::new_v4();
+        let binding_id = Uuid::new_v4();
         let proxy = start_model_proxy(
             &client,
             run_id,
@@ -12175,6 +12657,7 @@ Transfer-Encoding: chunked\r\n\
         let response = tokio::time::timeout(
             Duration::from_millis(150),
             http.post(format!("{}/responses", proxy.base_url))
+                .header("x-agent-hub-model-binding-id", binding_id.to_string())
                 .header(header::CONTENT_TYPE, "application/json")
                 .body("{}")
                 .send(),
@@ -12233,6 +12716,7 @@ Transfer-Encoding: chunked\r\n\
             protocol_capabilities: HashSet::new(),
         };
         let run_id = Uuid::new_v4();
+        let binding_id = Uuid::new_v4();
         let proxy = start_model_proxy(
             &client,
             run_id,
@@ -12244,6 +12728,7 @@ Transfer-Encoding: chunked\r\n\
         proxy.acknowledge_turn(run_id).unwrap();
         let mut response = reqwest::Client::new()
             .post(format!("{}/responses", proxy.base_url))
+            .header("x-agent-hub-model-binding-id", binding_id.to_string())
             .body("{}")
             .send()
             .await
@@ -12286,6 +12771,12 @@ Transfer-Encoding: chunked\r\n\
                                 .to_str()
                                 .unwrap()
                                 .to_owned(),
+                            headers
+                                .get("x-agent-hub-model-binding-id")
+                                .unwrap()
+                                .to_str()
+                                .unwrap()
+                                .to_owned(),
                         ));
                         AxumStatusCode::OK
                     }
@@ -12303,6 +12794,8 @@ Transfer-Encoding: chunked\r\n\
         };
         let first_run_id = Uuid::new_v4();
         let second_run_id = Uuid::new_v4();
+        let first_binding_id = Uuid::new_v4();
+        let second_binding_id = Uuid::new_v4();
         let proxy = start_model_proxy(
             &client,
             first_run_id,
@@ -12317,6 +12810,7 @@ Transfer-Encoding: chunked\r\n\
 
         assert_eq!(
             http.post(format!("{stable_base_url}/responses"))
+                .header("x-agent-hub-model-binding-id", first_binding_id.to_string())
                 .body("{}")
                 .send()
                 .await
@@ -12329,6 +12823,10 @@ Transfer-Encoding: chunked\r\n\
         assert_eq!(proxy.base_url, stable_base_url);
         assert_eq!(
             http.post(format!("{stable_base_url}/responses"))
+                .header(
+                    "x-agent-hub-model-binding-id",
+                    second_binding_id.to_string()
+                )
                 .body("{}")
                 .send()
                 .await
@@ -12340,10 +12838,15 @@ Transfer-Encoding: chunked\r\n\
         assert_eq!(
             *forwarded.lock().unwrap(),
             vec![
-                ("Bearer first-model-token".into(), first_run_id.to_string()),
+                (
+                    "Bearer first-model-token".into(),
+                    first_run_id.to_string(),
+                    first_binding_id.to_string(),
+                ),
                 (
                     "Bearer second-model-token".into(),
-                    second_run_id.to_string()
+                    second_run_id.to_string(),
+                    second_binding_id.to_string(),
                 ),
             ]
         );
@@ -13487,6 +13990,7 @@ done
         first.expected_configuration_fingerprint =
             execution_configuration_fingerprint(&first.execution_configuration).unwrap();
         first.agent.instructions = first.execution_configuration.instructions.clone();
+        let first_binding_id = first.execution_configuration.model_bindings[0].id;
         let run_env = prepare_run_env(temp.path(), &first, None).await.unwrap();
         let codex_home = run_env.codex_home.clone();
         let supervisor = SessionSupervisor::start_app_server(
@@ -13504,23 +14008,33 @@ done
         updated.execution_configuration.revision += 1;
         updated.execution_configuration.instructions = "updated guidance".into();
         let updated_connection_id = Uuid::from_u128(0x202);
-        updated.execution_configuration.default_model_connection_id = Some(updated_connection_id);
-        updated.execution_configuration.reasoning_effort = ReasoningEffort::Ultra;
-        updated.execution_configuration.model_connections = vec![ModelConnectionOptionDto {
-            id: updated_connection_id,
-            name: "Updated model".into(),
+        let updated_binding_id = Uuid::from_u128(0x203);
+        let updated_selection = ModelSelectionDto {
+            connection_id: updated_connection_id,
             model_id: "gpt-updated".into(),
-            upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
-            parameters: ModelConnectionParameters::default(),
-            request_parameters: ModelConnectionRequestParameters::default(),
-            scope: ModelConnectionScope::Global,
-            status: ModelConnectionStatus::Enabled,
+        };
+        let updated_settings = AgentModelSettings {
+            reasoning_effort: ReasoningEffort::Ultra,
+            ..AgentModelSettings::default()
+        };
+        updated.execution_configuration.model_selection = Some(updated_selection.clone());
+        updated.execution_configuration.model_settings = updated_settings.clone();
+        updated.execution_configuration.model_bindings = vec![RunModelBindingDto {
+            id: updated_binding_id,
+            run_id: updated.run.id,
+            binding_key: "main".into(),
+            model_connection_id: updated_connection_id,
+            connection_name_snapshot: "Updated model".into(),
+            connection_scope_snapshot: ModelConnectionScope::Global,
+            model_id: "gpt-updated".into(),
+            api_type: ModelUpstreamProtocol::OpenaiResponses,
+            model_settings: updated_settings.clone(),
         }];
         updated.expected_configuration_fingerprint =
             execution_configuration_fingerprint(&updated.execution_configuration).unwrap();
         updated.agent.instructions = updated.execution_configuration.instructions.clone();
-        updated.agent.default_model_connection_id = Some(updated_connection_id);
-        updated.agent.reasoning_effort = ReasoningEffort::Ultra;
+        updated.agent.model_selection = Some(updated_selection);
+        updated.agent.model_settings = updated_settings;
 
         let first_execution = tokio::spawn({
             let supervisor = Arc::clone(&supervisor);
@@ -13540,6 +14054,13 @@ done
             "old guidance\n"
         );
 
+        let refresh_boundary = tokio::spawn({
+            let supervisor = Arc::clone(&supervisor);
+            async move { supervisor.wait_for_configuration_refresh().await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!refresh_boundary.is_finished());
+
         assert_eq!(
             supervisor
                 .steer(
@@ -13556,6 +14077,28 @@ done
             first_execution.await.unwrap().unwrap().final_status,
             "completed"
         );
+        refresh_boundary.await.unwrap().unwrap();
+
+        let mut online_refresh = updated.execution_configuration.clone();
+        online_refresh.model_selection = None;
+        online_refresh.model_settings = AgentModelSettings::default();
+        online_refresh.model_bindings.clear();
+        let online_refresh_fingerprint =
+            execution_configuration_fingerprint(&online_refresh).unwrap();
+        synchronize_execution_configuration(
+            &SessionPaths::for_session(temp.path(), session_id),
+            &online_refresh,
+            &online_refresh_fingerprint,
+            ModelConfigurationMaterialization::PreserveExisting,
+            None,
+        )
+        .await
+        .unwrap();
+        let preserved_config = fs::read_to_string(codex_home.join("config.toml"))
+            .await
+            .unwrap();
+        assert!(preserved_config.contains(&model_provider_name(first_binding_id)));
+        assert!(!preserved_config.contains(&model_provider_name(updated_binding_id)));
 
         let _ = prepare_run_env(temp.path(), &updated, None).await.unwrap();
         assert_eq!(
@@ -13618,7 +14161,7 @@ done
         assert_eq!(resumes[0]["params"]["model"], "gpt-updated");
         assert_eq!(
             resumes[0]["params"]["modelProvider"],
-            model_provider_name(updated_connection_id)
+            model_provider_name(updated_binding_id)
         );
         assert_eq!(resumes[0]["params"]["excludeTurns"], true);
         assert_eq!(resumes[0]["params"]["config"], json!({}));
@@ -13940,8 +14483,8 @@ done
         let dispatcher = Arc::new(RuntimeSessionCommandDispatcher::with_retry_delay(
             Duration::from_millis(10),
         ));
-        dispatcher.enqueue(&client, &manager, std::slice::from_ref(&command));
-        dispatcher.enqueue(&client, &manager, &[command]);
+        dispatcher.enqueue(&client, &manager, std::slice::from_ref(&command), None);
+        dispatcher.enqueue(&client, &manager, &[command], None);
         tokio::time::timeout(Duration::from_secs(1), async {
             while ack_attempts.load(Ordering::SeqCst) < 2 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -14189,7 +14732,12 @@ done
         let dispatcher = Arc::new(RuntimeSessionCommandDispatcher::with_retry_delay(
             Duration::from_millis(10),
         ));
-        dispatcher.enqueue(&client, &manager, std::slice::from_ref(&interrupt_command));
+        dispatcher.enqueue(
+            &client,
+            &manager,
+            std::slice::from_ref(&interrupt_command),
+            None,
+        );
         tokio::time::timeout(Duration::from_secs(1), async {
             while !interrupt_log.exists() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -14203,6 +14751,7 @@ done
             &client,
             &manager,
             &[interrupt_command.clone(), steer_command],
+            None,
         );
         assert!(enqueued_at.elapsed() < Duration::from_millis(50));
         tokio::time::timeout(Duration::from_millis(300), async {
@@ -14212,7 +14761,12 @@ done
         })
         .await
         .expect("another Session steer was blocked behind an interrupt");
-        dispatcher.enqueue(&client, &manager, std::slice::from_ref(&interrupt_command));
+        dispatcher.enqueue(
+            &client,
+            &manager,
+            std::slice::from_ref(&interrupt_command),
+            None,
+        );
         assert_eq!(
             std::fs::read_to_string(&interrupt_log)
                 .unwrap()
@@ -14402,14 +14956,23 @@ while IFS= read -r line; do
   case "$line" in
     *'"method":"initialize"'*) echo '{{"id":1,"result":{{}}}}' ;;
     *'"method":"thread/start"'*) echo '{{"id":2,"result":{{"thread":{{"id":"managed-thread"}}}}}}' ;;
+    *'"method":"thread/unsubscribe"'*)
+      request_id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      printf '{{"id":%s,"result":{{}}}}\n' "$request_id"
+      ;;
+    *'"method":"thread/resume"'*)
+      request_id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      printf '{{"id":%s,"result":{{"thread":{{"id":"managed-thread"}}}}}}\n' "$request_id"
+      ;;
     *'"method":"turn/start"'*)
       echo $$ >> {}
       base_url=$(sed -n 's/^base_url = "\(.*\)"$/\1/p' "$CODEX_HOME/config.toml" | head -n 1)
+      binding_id=$(sed -n 's/^x-agent-hub-model-binding-id = "\(.*\)"$/\1/p' "$CODEX_HOME/config.toml" | head -n 1)
       echo "$base_url" >> {}
       request_id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
       printf '{{"id":%s,"result":{{"turn":{{"id":"managed-turn-%s","status":"inProgress","items":[]}}}}}}\n' "$request_id" "$request_id"
       printf '{{"method":"turn/started","params":{{"threadId":"managed-thread","turn":{{"id":"managed-turn-%s","status":"inProgress","items":[]}}}}}}\n' "$request_id"
-      curl --fail --silent --show-error -X POST "$base_url/responses" -H 'content-type: application/json' -d '{{}}' >/dev/null || exit 42
+      curl --fail --silent --show-error -X POST "$base_url/responses" -H 'content-type: application/json' -H "x-agent-hub-model-binding-id: $binding_id" -d '{{}}' >/dev/null || exit 42
       echo '{{"method":"turn/completed","params":{{"thread":{{"id":"managed-thread"}},"turn":{{"status":"completed","items":[{{"type":"agentMessage","text":"done"}}]}}}}}}'
       ;;
   esac
@@ -14447,6 +15010,12 @@ done
                                     .to_owned(),
                                 headers
                                     .get("x-agent-hub-run-id")
+                                    .unwrap()
+                                    .to_str()
+                                    .unwrap()
+                                    .to_owned(),
+                                headers
+                                    .get("x-agent-hub-model-binding-id")
                                     .unwrap()
                                     .to_str()
                                     .unwrap()
@@ -14525,6 +15094,8 @@ done
 
         let mut second = first.clone();
         second.run.id = Uuid::new_v4();
+        second.execution_configuration.model_bindings[0].id = Uuid::new_v4();
+        second.execution_configuration.model_bindings[0].run_id = second.run.id;
         second.model_proxy_token = "second-run-token".into();
         manager.reserve_claim(&second).unwrap();
         execute_managed_run(&config, &client, Arc::clone(&manager), second.clone())
@@ -14553,8 +15124,20 @@ done
         assert_eq!(
             *forwarded.lock().unwrap(),
             vec![
-                ("Bearer first-run-token".into(), first.run.id.to_string()),
-                ("Bearer second-run-token".into(), second.run.id.to_string()),
+                (
+                    "Bearer first-run-token".into(),
+                    first.run.id.to_string(),
+                    first.execution_configuration.model_bindings[0]
+                        .id
+                        .to_string(),
+                ),
+                (
+                    "Bearer second-run-token".into(),
+                    second.run.id.to_string(),
+                    second.execution_configuration.model_bindings[0]
+                        .id
+                        .to_string(),
+                ),
             ]
         );
         let metadata_path =
@@ -15671,7 +16254,9 @@ done
     fn app_server_request_lines_use_real_lifecycle_shape() {
         let temp = tempfile::tempdir().unwrap();
         let mut claim = test_claim();
-        claim.execution_configuration.reasoning_effort = ReasoningEffort::Ultra;
+        claim.execution_configuration.model_bindings[0]
+            .model_settings
+            .reasoning_effort = ReasoningEffort::Ultra;
         let run_env = RunEnv {
             workdir: temp.path().join("workdir"),
             codex_home: temp.path().join("codex-home"),
@@ -15908,7 +16493,7 @@ done
     }
 
     #[tokio::test]
-    async fn app_server_fixture_retains_v1_completion_behavior() {
+    async fn app_server_process_uses_run_model_binding_provider_header() {
         let model_server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let model_addr = model_server.local_addr().unwrap();
         let model_thread = std::thread::spawn(move || {
@@ -15928,9 +16513,9 @@ done
             let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
             assert!(request.starts_with("post /v1/responses "));
             assert!(request.contains(
-                "x-agent-hub-model-connection-id: 00000000-0000-0000-0000-000000000101\r\n"
+                "x-agent-hub-model-binding-id: 00000000-0000-0000-0000-000000000101\r\n"
             ));
-            let body = r#"{"output_text":"v1 fixture response"}"#;
+            let body = r#"{"output_text":"binding fixture response"}"#;
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -15942,8 +16527,29 @@ done
         });
 
         let temp = tempfile::tempdir().unwrap();
-        let fixture =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../deploy/fake-codex-app-server.sh");
+        let script = temp.path().join("binding-fake-codex");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  request_id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) echo "{\"id\":$request_id,\"result\":{}}" ;;
+    *'"method":"thread/start"'*) echo "{\"id\":$request_id,\"result\":{\"thread\":{\"id\":\"binding-thread\"}}}" ;;
+    *'"method":"turn/start"'*)
+      provider=$(sed -n 's/^model_provider = "\(.*\)"$/\1/p' "$CODEX_HOME/config.toml" | head -n 1)
+      base_url=$(awk -v provider="model_providers.$provider" '/^\[/ { section = substr($0, 2, length($0) - 2); in_provider = section == provider || index(section, provider ".") == 1; next } in_provider && index($0, "base_url = \"") == 1 { value = $0; sub("^[^=]*= \"", "", value); sub("\"$", "", value); print value; exit }' "$CODEX_HOME/config.toml")
+      binding_id=$(awk -v provider="model_providers.$provider" '/^\[/ { section = substr($0, 2, length($0) - 2); in_provider = section == provider || index(section, provider ".") == 1; next } in_provider && index($0, "x-agent-hub-model-binding-id = \"") == 1 { value = $0; sub("^[^=]*= \"", "", value); sub("\"$", "", value); print value; exit }' "$CODEX_HOME/config.toml")
+      curl -fsS -H 'Content-Type: application/json' -H "x-agent-hub-model-binding-id: $binding_id" --data '{"model":"gpt-main","input":"binding"}' "$base_url/responses" >/dev/null
+      echo "{\"id\":$request_id,\"result\":{\"turn\":{\"id\":\"binding-turn\"}}}"
+      echo '{"method":"turn/completed","params":{"threadId":"binding-thread","turn":{"id":"binding-turn","status":"completed","items":[{"type":"agentMessage","text":"binding fixture response"}]}}}'
+      ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        make_executable(&script);
         let claim = test_claim();
         let run_env = prepare_run_env(
             temp.path(),
@@ -15952,10 +16558,8 @@ done
         )
         .await
         .unwrap();
-        let session_id = claim.run.hub_session_id.unwrap();
-        let expected_turn_id = format!("fake-app-server-turn-{}", claim.run.id);
         let result = run_app_server_process(
-            fixture.to_str().unwrap(),
+            script.to_str().unwrap(),
             &run_env.workdir,
             &run_env.codex_home,
             &claim,
@@ -15965,52 +16569,11 @@ done
         .unwrap();
 
         assert_eq!(result.final_status, "completed");
+        assert_eq!(result.session_id.as_deref(), Some("binding-thread"));
         assert!(result.events.iter().any(|event| {
-            event.event_type == "turn_started"
-                && event.payload["native_turn_id"] == expected_turn_id
+            event.event_type == "message"
+                && event.content.as_deref() == Some("binding fixture response")
         }));
-        let expected_thread_id = format!("fake-app-server-thread-{session_id}");
-        assert_eq!(
-            result.session_id.as_deref(),
-            Some(expected_thread_id.as_str())
-        );
-        let transcript = run_env
-            .codex_home
-            .join("sessions")
-            .join(format!("rollout-{expected_thread_id}.jsonl"));
-        assert!(transcript.is_file());
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(
-                std::fs::read_to_string(&transcript).unwrap().trim()
-            )
-            .unwrap(),
-            json!({
-                "type": "fake_app_server_fixture",
-                "thread_id": expected_thread_id
-            })
-        );
-        let artifact =
-            session_bundle::create_session_bundle(&session_bundle::SessionBundleCreateSpec {
-                session_id,
-                native_thread_id: expected_thread_id.clone(),
-                history_checkpoint: 0,
-                bundle_generation: 1,
-                ownership_generation: 1,
-                producing_codex_version: "fake-codex-0.1.0".into(),
-                created_at: chrono::Utc::now(),
-                workspace: run_env.workdir.clone(),
-                codex_home: run_env.codex_home.clone(),
-                archive_path: temp.path().join("fixture-session-bundle.tar.zst"),
-            })
-            .unwrap();
-        assert_eq!(artifact.manifest.native_thread_id, expected_thread_id);
-        assert!(result.events.iter().any(|event| {
-            event.event_type == "message" && event.content.as_deref() == Some("v1 fixture response")
-        }));
-        assert!(result
-            .events
-            .iter()
-            .any(|event| event.event_type == "usage"));
         model_thread.join().unwrap();
     }
 
@@ -16550,6 +17113,26 @@ exit 0
         assert_eq!(
             request["params"]["modelProvider"],
             model_provider_name(Uuid::from_u128(0x101))
+        );
+    }
+
+    #[test]
+    fn driver_configuration_fingerprint_changes_with_run_binding_identity() {
+        let first = test_claim();
+        let mut second = first.clone();
+        second.run.id = Uuid::new_v4();
+        second.execution_configuration.model_bindings[0].id = Uuid::new_v4();
+        second.execution_configuration.model_bindings[0].run_id = second.run.id;
+        second.expected_configuration_fingerprint =
+            execution_configuration_fingerprint(&second.execution_configuration).unwrap();
+
+        assert_eq!(
+            first.expected_configuration_fingerprint,
+            second.expected_configuration_fingerprint
+        );
+        assert_ne!(
+            driver_configuration_fingerprint(&first),
+            driver_configuration_fingerprint(&second)
         );
     }
 
@@ -17343,22 +17926,30 @@ done
     }
 
     fn test_claim() -> ClaimRunResponse {
-        let default_model_connection_id = Uuid::from_u128(0x101);
+        let run_id = Uuid::new_v4();
+        let model_connection_id = Uuid::from_u128(0x201);
+        let model_binding_id = Uuid::from_u128(0x101);
+        let model_selection = ModelSelectionDto {
+            connection_id: model_connection_id,
+            model_id: "gpt-main".into(),
+        };
+        let model_settings = AgentModelSettings::default();
         let execution_configuration = AgentExecutionConfigurationDto {
             revision: 1,
             instructions: "Be concise".into(),
-            default_model_connection_id: Some(default_model_connection_id),
-            reasoning_effort: ReasoningEffort::Default,
+            model_selection: Some(model_selection.clone()),
+            model_settings: model_settings.clone(),
             codex_subagents: Vec::new(),
-            model_connections: vec![ModelConnectionOptionDto {
-                id: default_model_connection_id,
-                name: "Main model".into(),
+            model_bindings: vec![RunModelBindingDto {
+                id: model_binding_id,
+                run_id,
+                binding_key: "main".into(),
+                model_connection_id,
+                connection_name_snapshot: "Main model".into(),
+                connection_scope_snapshot: ModelConnectionScope::Global,
                 model_id: "gpt-main".into(),
-                upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
-                parameters: ModelConnectionParameters::default(),
-                request_parameters: ModelConnectionRequestParameters::default(),
-                scope: ModelConnectionScope::Global,
-                status: ModelConnectionStatus::Enabled,
+                api_type: ModelUpstreamProtocol::OpenaiResponses,
+                model_settings: model_settings.clone(),
             }],
             model_policy: json!({ "provider": "hub-proxy" }),
             sandbox_policy: json!({ "mode": "workspace-write", "network_access": true }),
@@ -17373,7 +17964,7 @@ done
             execution_configuration_fingerprint(&execution_configuration).unwrap();
         ClaimRunResponse {
             run: RunDto {
-                id: Uuid::new_v4(),
+                id: run_id,
                 agent_id: Uuid::new_v4(),
                 automation_id: None,
                 integration_session_id: None,
@@ -17399,8 +17990,8 @@ done
                 visibility: "private".into(),
                 public_to: Vec::new(),
                 runtime_id: None,
-                default_model_connection_id: Some(default_model_connection_id),
-                reasoning_effort: ReasoningEffort::Default,
+                model_selection: Some(model_selection),
+                model_settings,
                 codex_subagents: Vec::new(),
                 model_policy: json!({ "provider": "hub-proxy" }),
                 sandbox_policy: json!({ "mode": "workspace-write", "network_access": true }),

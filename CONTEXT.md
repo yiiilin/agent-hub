@@ -76,40 +76,52 @@ _Avoid_: Display name, email, external username, user ID
 The current versioned instructions, associated Skills, model and reasoning choices, sandbox and approval policies, and MCP or tool access that an Agent supplies to a new Turn. It excludes user credentials and Session-owned state.
 _Avoid_: Agent profile, user credentials, active Turn snapshot
 
-**Model Connection**:
-A reusable connection to one Responses API-compatible model endpoint, including the model identity and the credential needed to invoke it. A Model Connection is either Global or Personal and may be assigned only to Agents within that scope.
-_Avoid_: Model policy, provider environment variables, Agent credential
+**Model API Connection**:
+A reusable provider access configuration containing one endpoint, credential, API type, and set of allowed model identifiers. It is either Global or Personal and does not define an Agent's model invocation settings.
+_Avoid_: Model Connection, Model, provider environment variables
+
+**Allowed Model ID**:
+An exact provider model identifier permitted through one Model API Connection. It is a restriction on that connection rather than a separately owned Model resource.
+_Avoid_: Model Connection, model record
 
 **Model Gateway**:
-The stateless internal data-plane process that receives one Hub-authorized Responses request with its request-scoped endpoint, protocol, and credential, then transparently forwards OpenAI Responses or converts Anthropic Messages back to Responses JSON/SSE. It owns no Model Connections, provider keys, authorization policy, usage ledger, retry, or persistent state.
-_Avoid_: Model Connection manager, business control plane, provider key store, Runtime proxy
+The stateless internal data-plane process that receives one Hub-authorized Responses request with its request-scoped endpoint, protocol, and credential, then transparently forwards OpenAI Responses or converts Anthropic Messages back to Responses JSON/SSE. It owns no Model API Connections, provider keys, authorization policy, usage ledger, retry, or persistent state.
+_Avoid_: Model API Connection manager, business control plane, provider key store, Runtime proxy
 
-**Global Model Connection**:
-A system-wide Model Connection managed by an Administrator and available for assignment to every Agent in Agent Hub.
+**Global Model API Connection**:
+A system-wide Model API Connection managed by an Administrator and available for model selection by every Agent in Agent Hub.
 _Avoid_: Shared personal model, default model
 
-**Personal Model Connection**:
-A Model Connection owned by one Hub User and available for assignment only to Agents owned by that same Hub User.
+**Personal Model API Connection**:
+A Model API Connection owned by one Hub User and available for model selection only by Agents owned by that same Hub User.
 _Avoid_: Private global model, per-Agent credential
 
-**System Default Model Connection**:
-The one Global Model Connection copied into a newly created Agent as its Agent Default Model Connection. Changing the system default does not change existing Agents.
-_Avoid_: Dynamic global override, fallback model
+**System Default Model Selection**:
+The pair of one Global Model API Connection and one of its Allowed Model IDs copied into a newly created Agent. Changing the system default does not change existing Agents.
+_Avoid_: System Default Model Connection, dynamic global override, fallback model
 
-**Agent Default Model Connection**:
-The Model Connection selected for an Agent's primary Codex work and inherited by its Codex Subagent Definitions unless they explicitly select another permitted connection.
-_Avoid_: System default, fallback chain, provider environment variable
+**Agent Model Selection**:
+The pair of one permitted Model API Connection and one of its Allowed Model IDs selected for an Agent's primary Codex work. Codex Subagent Definitions inherit that pair unless they explicitly select another permitted pair.
+_Avoid_: Agent Default Model Connection, System default, fallback chain
+
+**Agent Model Settings**:
+The model invocation choices owned by an Agent and inherited by its Codex Subagent Definitions unless they explicitly override them. They exclude provider endpoints and credentials.
+_Avoid_: Model API Connection settings, provider credential
+
+**Run Model Binding**:
+An immutable, non-secret routing snapshot created for one Run and one effective main-Agent or Subagent model configuration. Runtime sends its UUID to Hub so two callers using the same Model API Connection and Allowed Model ID can still use different Agent Model Settings without exposing provider access details.
+_Avoid_: Model API Connection ID, Model record, provider credential
 
 **Model-Unconfigured Agent**:
-An Agent whose required Agent Default Model Connection is absent, including after that connection is force-deleted. Its configuration and history remain viewable, but it cannot start a new Turn until an available Model Connection is selected.
+An Agent whose required Agent Model Selection is absent or no longer permitted, including after its Model API Connection is force-deleted or its Allowed Model ID is removed. Its configuration and history remain viewable, but it cannot start a new Turn until a valid selection is made.
 _Avoid_: Deleted Agent, Historical Session, automatic fallback
 
 **Codex Subagent Definition**:
-A uniquely named child role within one Agent, with its own description, Markdown instructions, and optional model and reasoning overrides. It shares the parent Agent's Workspace, Skills, MCP, and sandbox authority, does not create another Hub Session, and becomes model-unconfigured rather than silently inheriting when an explicit override is force-deleted.
+A uniquely named child role within one Agent, with its own description, Markdown instructions, and optional Model Selection and Model Settings overrides. It shares the parent Agent's Workspace, Skills, MCP, and sandbox authority, does not create another Hub Session, and becomes model-unconfigured rather than silently inheriting when an explicit override is removed.
 _Avoid_: Agent Hub Agent, separate Hub Session, independently owned Agent
 
 **Model Token Usage**:
-Token consumption reported by a model service and attributed both to the Agent whose work caused it and to its initiating subject: the calling Hub User, an Automation's owning Hub User, a user-level Application Token's Hub User, or an app-only Integration App. Once recorded, it remains in historical model totals after related Users, Agents, Sessions, Runs, or Model Connections are deleted, with erased user attribution anonymized.
+Token consumption reported by a model service and attributed both to the Agent whose work caused it and to its initiating subject: the calling Hub User, an Automation's owning Hub User, a user-level Application Token's Hub User, or an app-only Integration App. Once recorded, it remains in historical model totals after related Users, Agents, Sessions, Runs, or Model API Connections are deleted, with erased user attribution anonymized.
 _Avoid_: Agent owner usage, estimated billing, Session ownership
 
 **Model Call Error**:

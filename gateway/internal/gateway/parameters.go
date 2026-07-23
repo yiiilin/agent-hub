@@ -6,10 +6,10 @@ import (
 	"fmt"
 )
 
-// modelRequestParameters is the small, protocol-specific portion of a Hub
+// modelRequestSettings is the small, protocol-specific portion of a Hub
 // envelope. It is deliberately decoded strictly so a newly added field cannot
 // be silently dropped while converting the request.
-type modelRequestParameters struct {
+type modelRequestSettings struct {
 	Protocol            string   `json:"protocol"`
 	Temperature         *float64 `json:"temperature,omitempty"`
 	TopP                *float64 `json:"top_p,omitempty"`
@@ -17,45 +17,45 @@ type modelRequestParameters struct {
 	MaxTokens           *uint32  `json:"max_tokens,omitempty"`
 }
 
-func (p modelRequestParameters) validate(protocol string) error {
-	if p.Protocol == "" {
-		return fmt.Errorf("request parameters are required")
+func (s modelRequestSettings) validate(protocol string) error {
+	if s.Protocol == "" {
+		return fmt.Errorf("request settings are required")
 	}
-	if p.Protocol != protocol {
-		return fmt.Errorf("request parameter protocol must match upstream protocol")
+	if s.Protocol != protocol {
+		return fmt.Errorf("request settings protocol must match upstream protocol")
 	}
 	switch protocol {
 	case protocolOpenAIResponses:
-		if p.Temperature != nil || p.TopP != nil || p.MaxCompletionTokens != nil || p.MaxTokens != nil {
-			return fmt.Errorf("Responses request parameters cannot contain protocol-specific overrides")
+		if s.Temperature != nil || s.TopP != nil || s.MaxCompletionTokens != nil || s.MaxTokens != nil {
+			return fmt.Errorf("Responses request settings cannot contain protocol-specific overrides")
 		}
 	case protocolOpenAIChatCompletions:
-		if p.MaxTokens != nil {
-			return fmt.Errorf("Chat Completions request parameters do not support max_tokens; use max_completion_tokens")
+		if s.MaxTokens != nil {
+			return fmt.Errorf("Chat Completions request settings do not support max_tokens; use max_completion_tokens")
 		}
-		if err := validateParameterNumber("temperature", p.Temperature, 2); err != nil {
+		if err := validateSettingNumber("temperature", s.Temperature, 2); err != nil {
 			return err
 		}
-		if err := validateParameterNumber("top_p", p.TopP, 1); err != nil {
+		if err := validateSettingNumber("top_p", s.TopP, 1); err != nil {
 			return err
 		}
-		if p.MaxCompletionTokens != nil && *p.MaxCompletionTokens == 0 {
+		if s.MaxCompletionTokens != nil && *s.MaxCompletionTokens == 0 {
 			return fmt.Errorf("max_completion_tokens must be positive")
 		}
 	case protocolAnthropicMessages:
-		if p.MaxCompletionTokens != nil {
-			return fmt.Errorf("Anthropic Messages request parameters do not support max_completion_tokens; use max_tokens")
+		if s.MaxCompletionTokens != nil {
+			return fmt.Errorf("Anthropic Messages request settings do not support max_completion_tokens; use max_tokens")
 		}
-		if p.Temperature != nil && p.TopP != nil {
-			return fmt.Errorf("Anthropic Messages request parameters cannot set both temperature and top_p")
+		if s.Temperature != nil && s.TopP != nil {
+			return fmt.Errorf("Anthropic Messages request settings cannot set both temperature and top_p")
 		}
-		if err := validateParameterNumber("temperature", p.Temperature, 1); err != nil {
+		if err := validateSettingNumber("temperature", s.Temperature, 1); err != nil {
 			return err
 		}
-		if err := validateParameterNumber("top_p", p.TopP, 1); err != nil {
+		if err := validateSettingNumber("top_p", s.TopP, 1); err != nil {
 			return err
 		}
-		if p.MaxTokens != nil && *p.MaxTokens == 0 {
+		if s.MaxTokens != nil && *s.MaxTokens == 0 {
 			return fmt.Errorf("max_tokens must be positive")
 		}
 	default:
@@ -64,7 +64,7 @@ func (p modelRequestParameters) validate(protocol string) error {
 	return nil
 }
 
-func validateParameterNumber(name string, value *float64, maximum float64) error {
+func validateSettingNumber(name string, value *float64, maximum float64) error {
 	if value == nil {
 		return nil
 	}
@@ -74,9 +74,9 @@ func validateParameterNumber(name string, value *float64, maximum float64) error
 	return nil
 }
 
-func (p *modelRequestParameters) UnmarshalJSON(data []byte) error {
+func (s *modelRequestSettings) UnmarshalJSON(data []byte) error {
 	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
-		return fmt.Errorf("request parameters cannot be null")
+		return fmt.Errorf("request settings cannot be null")
 	}
 
 	var tag struct {
@@ -86,10 +86,10 @@ func (p *modelRequestParameters) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	if tag.Protocol == "" {
-		return fmt.Errorf("request parameter protocol is required")
+		return fmt.Errorf("request settings protocol is required")
 	}
 
-	*p = modelRequestParameters{Protocol: tag.Protocol}
+	*s = modelRequestSettings{Protocol: tag.Protocol}
 	switch tag.Protocol {
 	case protocolOpenAIResponses:
 		var value struct {
@@ -108,9 +108,9 @@ func (p *modelRequestParameters) UnmarshalJSON(data []byte) error {
 		if err := decodeStrictJSON(data, &value); err != nil {
 			return err
 		}
-		p.Temperature = value.Temperature
-		p.TopP = value.TopP
-		p.MaxCompletionTokens = value.MaxCompletionTokens
+		s.Temperature = value.Temperature
+		s.TopP = value.TopP
+		s.MaxCompletionTokens = value.MaxCompletionTokens
 	case protocolAnthropicMessages:
 		var value struct {
 			Protocol    string   `json:"protocol"`
@@ -121,9 +121,9 @@ func (p *modelRequestParameters) UnmarshalJSON(data []byte) error {
 		if err := decodeStrictJSON(data, &value); err != nil {
 			return err
 		}
-		p.Temperature = value.Temperature
-		p.TopP = value.TopP
-		p.MaxTokens = value.MaxTokens
+		s.Temperature = value.Temperature
+		s.TopP = value.TopP
+		s.MaxTokens = value.MaxTokens
 	default:
 		return fmt.Errorf("unsupported upstream protocol")
 	}

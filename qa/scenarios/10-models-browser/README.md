@@ -1,20 +1,35 @@
-# Model Connections and usage browser workflows
+# Model API Connections, Agent settings, references, and retained usage
 
-Uses the real console, backend, Model Gateway, PostgreSQL, and fake OpenAI
-Responses/Chat Completions/Anthropic Messages provider. A member creates and
-tests a Chat Completions Personal connection, exercises Personal, Available,
-and Usage tabs, including Agent and subagent model bindings and independent
-usage/error pagination. An Administrator changes a Global connection from
-Responses to Anthropic, tests the converted request, and exercises System Default copy semantics,
-ordinary-delete conflict handling, and Force Delete.
+Type: `browser`
 
-Create and edit dialogs verify raw protocol values, automatic protocol-specific
-request defaults after switching, Chat/Anthropic parameter submission, grouped
-Codex reasoning/context/reliability controls, persisted edit values, and
-write-only API keys.
+This scenario uses the real console, Hub backend, Runtime, stateless Model
+Gateway, PostgreSQL, and fake provider. Shared browser support captures console,
+page, request, same-origin HTTP, trace, screenshot, and artifact-safety failures.
 
-The scenario checks 1280x800 and 390x844 layouts and relies on the shared
-browser support for console, page error, request failure, and HTTP diagnostics.
-Tracing is paused while API keys are entered and resumes only after the secret
-fields have been removed from the DOM. The prior System Default is restored in
-`finally`.
+A member creates and edits one Personal Model API Connection with three allowed
+model IDs, sends the default `hi` test message to an explicit successful and
+failing model, checks the returned text and response time, and verifies that the
+API key is write-only. Through the Agent console, the member selects a complete
+connection/model pair, enters detailed Agent model settings, and creates both an
+inheriting subagent and a subagent with an explicit pair and settings override.
+Enum values, API Type, and setting values are checked as their raw tokens.
+
+The member starts a real Run through Runtime and Gateway. After the Agent and
+Personal connection are deleted, the Usage page still renders the snapshotted
+connection name and original model IDs. The same browser session checks the real
+ledger response for the retained API Type and typed request settings because the
+current Usage table does not render those two fields.
+
+An Administrator creates a multi-model Global connection and sets System
+Default to an explicit connection/model pair. A newly created Agent copies that
+pair. Removing its referenced model through an ordinary allowlist update returns
+`409`; an explicit `force=true` update clears the root selection and System
+Default while preserving an unaffected subagent pair. After the Agent is rebound
+to the remaining model, ordinary delete conflicts and Force Delete leaves the
+Agent visibly model-unconfigured and disables the affected subagent definition.
+
+The scenario checks document overflow at 1280x800 and 390x844 across Models,
+Usage, Agent settings, and destructive dialogs. API key entry occurs while trace
+capture is paused. Scenario-owned Agents and connections are removed, the
+temporary Administrator role is reverted, and the original System Default pair
+is restored and read back even after a scenario failure.

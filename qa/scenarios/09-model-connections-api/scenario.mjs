@@ -4,9 +4,12 @@ import { ApiClient, loginAsAdmin, poll, waitForRunStatus } from '../../support/a
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const PROVIDER_BASE_URL = 'http://fake-model-provider:8080';
 const PROVIDER_API_KEY = 'dev-model-provider-api-key';
+const WRONG_PROVIDER_API_KEY = 'rotated-provider-key-for-negative-control';
 const SUCCESS_MODEL_ID = 'hub-proxy-smoke';
 const ERROR_MODEL_ID = 'hub-proxy-error';
-const AUTOMATIC_MODEL_PARAMETERS = {
+const TEST_MESSAGE = 'hi';
+
+const AUTOMATIC_MODEL_SETTINGS = {
   reasoning_effort: 'default',
   reasoning_summary: 'default',
   verbosity: 'default',
@@ -16,39 +19,37 @@ const AUTOMATIC_MODEL_PARAMETERS = {
   service_tier: null,
   request_max_retries: null,
   stream_max_retries: null,
-  stream_idle_timeout_ms: null
+  stream_idle_timeout_ms: null,
+  request_settings: { protocol: 'openai_responses' }
 };
-const DETAILED_MODEL_PARAMETERS = {
-  reasoning_effort: 'medium',
-  reasoning_summary: 'concise',
-  verbosity: 'high',
-  context_window_tokens: 128_000,
-  auto_compact_token_limit: 96_000,
-  reasoning_summary_support: 'supported',
-  service_tier: 'flex',
-  request_max_retries: 3,
-  stream_max_retries: 5,
-  stream_idle_timeout_ms: 300_000
-};
-const RESPONSES_REQUEST_PARAMETERS = { protocol: 'openai_responses' };
-const AUTOMATIC_CHAT_REQUEST_PARAMETERS = {
-  protocol: 'openai_chat_completions',
-  temperature: null,
-  top_p: null,
-  max_completion_tokens: null
-};
-const CHAT_REQUEST_PARAMETERS = {
-  protocol: 'openai_chat_completions',
-  temperature: 0.3,
-  top_p: 0.8,
-  max_completion_tokens: 321
-};
-const ANTHROPIC_REQUEST_PARAMETERS = {
-  protocol: 'anthropic_messages',
-  temperature: 0.4,
-  top_p: null,
-  max_tokens: 8_192
-};
+
+function modelSettings(apiType, overrides = {}) {
+  const requestSettings = apiType === 'openai_chat_completions'
+    ? { protocol: apiType, temperature: null, top_p: null, max_completion_tokens: null }
+    : apiType === 'anthropic_messages'
+      ? { protocol: apiType, temperature: null, top_p: null, max_tokens: null }
+      : { protocol: apiType };
+  return {
+    ...AUTOMATIC_MODEL_SETTINGS,
+    ...overrides,
+    request_settings: overrides.request_settings ?? requestSettings
+  };
+}
+
+function connectionRequest(scope, name, apiType, allowedModelIds, apiKey = PROVIDER_API_KEY) {
+  return {
+    scope,
+    name,
+    base_url: PROVIDER_BASE_URL,
+    api_type: apiType,
+    allowed_model_ids: allowedModelIds,
+    api_key: apiKey
+  };
+}
+
+function selection(connection, modelId = SUCCESS_MODEL_ID) {
+  return { connection_id: connection.id, model_id: modelId };
+}
 
 function uniqueSlug(context, prefix) {
   return context.unique(prefix)
@@ -62,49 +63,27 @@ function sqlLiteral(value) {
 }
 
 function ledgerPath(path, query = {}) {
-  const params = new URLSearchParams();
+  const parameters = new URLSearchParams();
   for (const [key, value] of Object.entries(query)) {
-    if (value !== undefined && value !== null) params.set(key, String(value));
+    if (value !== undefined && value !== null) parameters.set(key, String(value));
   }
-  const encoded = params.toString();
+  const encoded = parameters.toString();
   return encoded ? `${path}?${encoded}` : path;
 }
 
-function assertWriteOnly(value, label) {
+function assertSecretAbsent(value, label) {
   const serialized = JSON.stringify(value);
-  assert.equal(serialized.includes(PROVIDER_API_KEY), false, `${label} must not expose the provider key`);
+  for (const secret of [PROVIDER_API_KEY, WRONG_PROVIDER_API_KEY]) {
+    assert.equal(serialized.includes(secret), false, `${label} must not expose provider credentials`);
+  }
   assert.equal(serialized.includes('"api_key"'), false, `${label} must not expose an api_key field`);
-}
-
-function connectionRequest(
-  scope,
-  name,
-  modelId = SUCCESS_MODEL_ID,
-  upstreamProtocol = 'openai_responses',
-  parameters,
-  requestParameters
-) {
-  const request = {
-    scope,
-    name,
-    base_url: PROVIDER_BASE_URL,
-    model_id: modelId,
-    upstream_protocol: upstreamProtocol,
-    api_key: PROVIDER_API_KEY
-  };
-  if (parameters !== undefined) request.parameters = parameters;
-  if (requestParameters !== undefined) request.request_parameters = requestParameters;
-  return request;
 }
 
 async function manualRedirect(client, path) {
   const headers = { accept: 'application/json' };
   const cookie = client.cookieHeader();
   if (cookie) headers.cookie = cookie;
-  const response = await fetch(new URL(path, client.baseURL), {
-    headers,
-    redirect: 'manual'
-  });
+  const response = await fetch(new URL(path, client.baseURL), { headers, redirect: 'manual' });
   client.absorbCookies(response.headers);
   assert.equal(response.status, 303, 'Mock OIDC step must redirect');
   const location = response.headers.get('location');
@@ -124,23 +103,25 @@ async function oidcLogin(context, prefix) {
   return { client, user };
 }
 
-async function readTwoKeysetPages(client, path, filters) {
-  const first = (await client.get(ledgerPath(path, { ...filters, page_size: 1 }))).data;
-  assert.equal(first.items.length, 1, `${path} first page must contain one item`);
-  assert.ok(first.next_cursor, `${path} first page must expose a next cursor`);
-  assert.equal(first.next_cursor.occurred_at_ms, Date.parse(first.items[0].occurred_at));
-  assert.match(first.next_cursor.id, UUID_PATTERN);
+async function waitForLedgerItems(client, path, filters, count) {
+  return poll(async () => {
+    const { data } = await client.get(ledgerPath(path, { ...filters, page_size: 100 }));
+    return data.items;
+  }, (items) => items.length === count, {
+    timeoutMs: 20_000,
+    description: `${path} to contain ${count} isolated rows`
+  });
+}
 
-  const second = (await client.get(ledgerPath(path, {
-    ...filters,
-    page_size: 1,
-    cursor_occurred_at_ms: first.next_cursor.occurred_at_ms,
-    cursor_id: first.next_cursor.id
-  }))).data;
-  assert.equal(second.items.length, 1, `${path} second page must contain one item`);
-  assert.notEqual(second.items[0].id, first.items[0].id, `${path} pages must not overlap`);
-  assert.equal(second.next_cursor, null, `${path} second page must be terminal for this fixture`);
-  return [...first.items, ...second.items];
+async function createRun(client, agentId, message, expectedStatus = 'completed') {
+  const { data: run } = await client.post(`/api/agents/${agentId}/runs`, {
+    message,
+    hub_session_id: null,
+    parent_run_id: null
+  });
+  assert.match(run.id, UUID_PATTERN);
+  await waitForRunStatus(client, agentId, run.id, expectedStatus, 90_000);
+  return run;
 }
 
 function usageTotals(items) {
@@ -159,36 +140,27 @@ function usageTotals(items) {
   });
 }
 
-async function waitForLedgerItems(client, path, filters, count) {
-  return poll(async () => {
-    const { data } = await client.get(ledgerPath(path, { ...filters, page_size: 100 }));
-    return data.items;
-  }, (items) => items.length === count, {
-    timeoutMs: 15_000,
-    description: `${path} to contain ${count} isolated rows`
-  });
-}
-
 export default async function modelConnectionsApiScenario(context) {
   const superClient = new ApiClient(context.baseURL);
   const { data: superAdmin } = await loginAsAdmin(superClient);
   const { data: originalDefault } = await superClient.get('/api/model-connections/system-default');
-  let defaultSnapshotTaken = true;
-  let promotedAdminId = null;
-  const createdAgents = [];
   const createdConnections = [];
-  let scenarioFailure = null;
+  const createdAgents = [];
+  let promotedAdminId = null;
+  let scenarioError = null;
 
-  const trackAgent = (client, agent) => {
-    createdAgents.push({ client, id: agent.id });
-    return agent;
-  };
   const createConnection = async (client, request) => {
-    const { data } = await client.post('/api/model-connections', request);
-    createdConnections.push({ client, id: data.id });
-    assert.match(data.id, UUID_PATTERN);
-    assertWriteOnly(data, 'Model Connection create response');
-    return data;
+    const { data: connection } = await client.post('/api/model-connections', request);
+    createdConnections.push({ client, id: connection.id });
+    assert.match(connection.id, UUID_PATTERN);
+    assertSecretAbsent(connection, 'Model Connection create response');
+    return connection;
+  };
+  const createAgent = async (client, request) => {
+    const { data: agent } = await client.post('/api/agents', request);
+    createdAgents.push({ client, id: agent.id });
+    assert.match(agent.id, UUID_PATTERN);
+    return agent;
   };
 
   try {
@@ -203,111 +175,96 @@ export default async function modelConnectionsApiScenario(context) {
     assert.equal(promoted.user.role, 'admin');
 
     const { data: openapi } = await superClient.get('/openapi.json');
-    assert.equal(openapi.components.schemas.CreateModelConnectionRequest.properties.api_key.writeOnly, true);
-    assert.equal(Object.hasOwn(openapi.components.schemas.ModelConnection.properties, 'api_key'), false);
-    assert.deepEqual(
-      openapi.components.schemas.ModelReasoningSummary.enum,
-      ['default', 'auto', 'concise', 'detailed', 'none']
-    );
-    assert.equal(
-      openapi.components.schemas.ModelConnectionParameters.properties.request_max_retries.maximum,
-      100
-    );
-    assert.deepEqual(openapi.components.schemas.ModelUpstreamProtocol.enum, [
-      'openai_responses',
-      'openai_chat_completions',
-      'anthropic_messages'
+    const createSchema = openapi.components.schemas.CreateModelConnectionRequest;
+    const connectionSchema = openapi.components.schemas.ModelConnection;
+    assert.deepEqual(createSchema.required, [
+      'scope', 'name', 'base_url', 'api_type', 'allowed_model_ids', 'api_key'
     ]);
-    assert.equal(openapi.components.schemas.ModelConnectionRequestParameters.oneOf.length, 3);
-    assert.deepEqual(Object.keys(openapi.paths['/api/model-usage']), ['get']);
-    assert.deepEqual(Object.keys(openapi.paths['/api/model-call-errors']), ['get']);
+    assert.equal(createSchema.properties.api_key.writeOnly, true);
+    for (const legacyField of ['model_id', 'upstream_protocol', 'parameters', 'request_parameters']) {
+      assert.equal(Object.hasOwn(createSchema.properties, legacyField), false);
+      assert.equal(Object.hasOwn(connectionSchema.properties, legacyField), false);
+    }
+    assert.equal(Object.hasOwn(connectionSchema.properties, 'api_key'), false);
+    assert.ok(openapi.components.schemas.SystemDefaultModelSelection);
+    assert.equal(Object.hasOwn(openapi.components.schemas, 'SystemDefaultModelConnection'), false);
+    assert.deepEqual(openapi.components.schemas.ModelUpstreamProtocol.enum, [
+      'openai_responses', 'openai_chat_completions', 'anthropic_messages'
+    ]);
 
     await owner.client.post('/api/model-connections', connectionRequest(
       'global',
-      context.unique('QA forbidden member Global')
+      context.unique('QA forbidden Global'),
+      'openai_responses',
+      [SUCCESS_MODEL_ID]
     ), { expectedStatus: 403 });
+    await owner.client.post('/api/model-connections', {
+      ...connectionRequest(
+        'personal',
+        context.unique('QA rejected legacy Connection'),
+        'openai_responses',
+        [SUCCESS_MODEL_ID]
+      ),
+      model_id: SUCCESS_MODEL_ID
+    }, { expectedStatus: 422 });
 
-    const superPersonal = await createConnection(superClient, connectionRequest(
-      'personal',
-      context.unique('QA super Personal')
+    const responseConnection = await createConnection(administrator.client, connectionRequest(
+      'global',
+      context.unique('QA multi-model Responses'),
+      'openai_responses',
+      [` ${SUCCESS_MODEL_ID} `, ERROR_MODEL_ID, SUCCESS_MODEL_ID]
+    ));
+    assert.deepEqual(responseConnection.allowed_model_ids, [SUCCESS_MODEL_ID, ERROR_MODEL_ID]);
+    const chatConnection = await createConnection(administrator.client, connectionRequest(
+      'global',
+      context.unique('QA Chat'),
+      'openai_chat_completions',
+      [SUCCESS_MODEL_ID]
+    ));
+    const anthropicConnection = await createConnection(administrator.client, connectionRequest(
+      'global',
+      context.unique('QA Anthropic'),
+      'anthropic_messages',
+      [SUCCESS_MODEL_ID]
     ));
     const ownerPersonal = await createConnection(owner.client, connectionRequest(
       'personal',
       context.unique('QA owner Personal'),
-      SUCCESS_MODEL_ID,
       'openai_responses',
-      DETAILED_MODEL_PARAMETERS
+      [SUCCESS_MODEL_ID, 'owner-secondary']
     ));
     const outsiderPersonal = await createConnection(outsider.client, connectionRequest(
       'personal',
-      context.unique('QA outsider Personal')
+      context.unique('QA outsider Personal'),
+      'openai_responses',
+      [SUCCESS_MODEL_ID]
     ));
-    const globalA = await createConnection(administrator.client, connectionRequest(
-      'global',
-      context.unique('QA Global A')
+    const superPersonal = await createConnection(superClient, connectionRequest(
+      'personal',
+      context.unique('QA super Personal'),
+      'openai_responses',
+      [SUCCESS_MODEL_ID]
     ));
-    const globalB = await createConnection(administrator.client, connectionRequest(
-      'global',
-      context.unique('QA Global B')
-    ));
-    const errorGlobal = await createConnection(administrator.client, connectionRequest(
-      'global',
-      context.unique('QA Global Error'),
-      ERROR_MODEL_ID
-    ));
-    const anthropicGlobal = await createConnection(administrator.client, connectionRequest(
-      'global',
-      context.unique('QA Global Anthropic'),
-      SUCCESS_MODEL_ID,
-      'anthropic_messages',
-      undefined,
-      ANTHROPIC_REQUEST_PARAMETERS
-    ));
-
     assert.equal(superPersonal.owner_id, superAdmin.id);
-    assert.equal(ownerPersonal.owner_id, owner.user.id);
-    assert.deepEqual(ownerPersonal.parameters, DETAILED_MODEL_PARAMETERS);
-    assert.equal(globalA.owner_id, null);
-    assert.equal(globalA.scope, 'global');
-    assert.deepEqual(globalA.parameters, AUTOMATIC_MODEL_PARAMETERS);
-    assert.deepEqual(globalA.request_parameters, RESPONSES_REQUEST_PARAMETERS);
-    assert.deepEqual(anthropicGlobal.request_parameters, ANTHROPIC_REQUEST_PARAMETERS);
-    assert.deepEqual(
-      (await owner.client.get(`/api/model-connections/${ownerPersonal.id}`)).data.parameters,
-      DETAILED_MODEL_PARAMETERS
-    );
-    await administrator.client.get(`/api/model-connections/${superPersonal.id}`, { expectedStatus: 404 });
-    await administrator.client.request(`/api/model-connections/${superPersonal.id}`, {
-      method: 'PATCH',
-      body: {
-        name: superPersonal.name,
-        base_url: superPersonal.base_url,
-        model_id: superPersonal.model_id
-      },
-      expectedStatus: 404
-    });
-    await administrator.client.get(`/api/model-connections/${ownerPersonal.id}`, { expectedStatus: 404 });
-    await outsider.client.get(`/api/model-connections/${ownerPersonal.id}`, { expectedStatus: 404 });
-    await superClient.get(`/api/model-connections/${ownerPersonal.id}`, { expectedStatus: 404 });
-    await owner.client.request(`/api/model-connections/${globalA.id}`, {
-      method: 'PATCH',
-      body: { name: globalA.name, base_url: globalA.base_url, model_id: globalA.model_id },
-      expectedStatus: 403
-    });
 
     const { data: ownerConnections } = await owner.client.get('/api/model-connections');
-    assert.equal(ownerConnections.some((connection) => connection.id === ownerPersonal.id), true);
-    assert.equal(ownerConnections.some((connection) => connection.id === outsiderPersonal.id), false);
-    assert.equal(ownerConnections.some((connection) => connection.id === superPersonal.id), false);
-    assert.equal(ownerConnections.some((connection) => connection.id === globalA.id), true);
-    assertWriteOnly(ownerConnections, 'Model Connection list response');
-    const { data: ownerOptions } = await owner.client.get('/api/model-connections/options');
-    const ownerPersonalOption = ownerOptions.items.find((connection) => connection.id === ownerPersonal.id);
-    assert.ok(ownerPersonalOption);
-    assert.deepEqual(ownerPersonalOption.parameters, DETAILED_MODEL_PARAMETERS);
-    assert.deepEqual(ownerPersonalOption.request_parameters, RESPONSES_REQUEST_PARAMETERS);
-    assert.equal(ownerOptions.items.some((connection) => connection.id === outsiderPersonal.id), false);
-    assertWriteOnly(ownerOptions, 'Model Connection options response');
+    assert.equal(ownerConnections.some((item) => item.id === ownerPersonal.id), true);
+    assert.equal(ownerConnections.some((item) => item.id === outsiderPersonal.id), false);
+    assert.equal(ownerConnections.some((item) => item.id === responseConnection.id), true);
+    assertSecretAbsent(ownerConnections, 'Model Connection list');
+    await administrator.client.get(`/api/model-connections/${superPersonal.id}`, { expectedStatus: 404 });
+    await owner.client.get(`/api/model-connections/${outsiderPersonal.id}`, { expectedStatus: 404 });
+
+    const { data: options } = await owner.client.get('/api/model-connections/options');
+    assert.deepEqual(
+      options.items
+        .filter((item) => item.connection_id === responseConnection.id)
+        .map((item) => item.model_id),
+      [SUCCESS_MODEL_ID, ERROR_MODEL_ID]
+    );
+    assert.equal(options.items.some((item) => item.connection_id === ownerPersonal.id), true);
+    assert.equal(options.items.some((item) => item.connection_id === outsiderPersonal.id), false);
+    assertSecretAbsent(options, 'Model Connection options');
 
     assert.equal(
       context.compose.psql(`
@@ -322,548 +279,383 @@ export default async function modelConnectionsApiScenario(context) {
       'true|true|true|true',
       'Equal plaintext keys must use independently randomized encrypted records'
     );
-    const secretFingerprint = context.compose.psql(`
+
+    const successfulTest = (await administrator.client.post(
+      `/api/model-connections/${responseConnection.id}/test`,
+      { model_id: SUCCESS_MODEL_ID, message: TEST_MESSAGE }
+    )).data;
+    assert.equal(successfulTest.success, true);
+    assert.equal(successfulTest.status_code, 200);
+    assert.equal(successfulTest.error_code, null);
+    assert.equal(successfulTest.message, null);
+    assert.equal(successfulTest.response_text, 'Fake Codex completed run through the Hub model proxy.');
+    assert.equal(Number.isInteger(successfulTest.response_time_ms), true);
+    assert.ok(successfulTest.response_time_ms >= 0);
+    const failedModelTest = (await administrator.client.post(
+      `/api/model-connections/${responseConnection.id}/test`,
+      { model_id: ERROR_MODEL_ID, message: TEST_MESSAGE }
+    )).data;
+    assert.equal(failedModelTest.success, false);
+    assert.equal(failedModelTest.status_code, 200);
+    assert.equal(failedModelTest.error_code, 'fake_model_error');
+    await administrator.client.post(
+      `/api/model-connections/${responseConnection.id}/test`,
+      { model_id: 'not-allowed', message: TEST_MESSAGE },
+      { expectedStatus: 400 }
+    );
+
+    const secretBeforeRotation = context.compose.psql(`
       SELECT md5(api_key_ciphertext) || '|' || encode(api_key_nonce, 'hex')
-      FROM model_connections WHERE id = ${sqlLiteral(ownerPersonal.id)}
+      FROM model_connections WHERE id = ${sqlLiteral(responseConnection.id)}
     `);
-    const updatedPersonalName = context.unique('QA owner Personal Updated');
-    const { data: updatedPersonal } = await owner.client.request(
-      `/api/model-connections/${ownerPersonal.id}`,
+    const { data: rotatedWrong } = await administrator.client.request(
+      `/api/model-connections/${responseConnection.id}`,
       {
-        method: 'PATCH',
+        method: 'PUT',
         body: {
-          name: updatedPersonalName,
-          base_url: PROVIDER_BASE_URL,
-          model_id: SUCCESS_MODEL_ID
+          name: responseConnection.name,
+          base_url: responseConnection.base_url,
+          api_type: responseConnection.api_type,
+          allowed_model_ids: responseConnection.allowed_model_ids,
+          api_key: WRONG_PROVIDER_API_KEY
         }
       }
     );
-    assert.equal(updatedPersonal.name, updatedPersonalName);
-    assert.deepEqual(
-      updatedPersonal.parameters,
-      DETAILED_MODEL_PARAMETERS,
-      'Omitting parameters during update must preserve the complete parameter object'
-    );
-    assert.deepEqual(
-      updatedPersonal.request_parameters,
-      RESPONSES_REQUEST_PARAMETERS,
-      'Omitting request parameters without changing protocol must preserve the complete object'
-    );
-    assertWriteOnly(updatedPersonal, 'Model Connection update response');
-    assert.equal(
+    assertSecretAbsent(rotatedWrong, 'Rotated Model Connection response');
+    assert.notEqual(
       context.compose.psql(`
         SELECT md5(api_key_ciphertext) || '|' || encode(api_key_nonce, 'hex')
-        FROM model_connections WHERE id = ${sqlLiteral(ownerPersonal.id)}
+        FROM model_connections WHERE id = ${sqlLiteral(responseConnection.id)}
       `),
-      secretFingerprint,
-      'Omitting api_key during update must preserve the encrypted secret'
+      secretBeforeRotation,
+      'Rotating a provider key must replace its encrypted record'
     );
-    const changedParameters = {
-      ...DETAILED_MODEL_PARAMETERS,
-      reasoning_summary: 'none',
-      auto_compact_token_limit: null,
-      service_tier: null,
-      request_max_retries: 0
-    };
-    const { data: parameterUpdatedPersonal } = await owner.client.request(
-      `/api/model-connections/${ownerPersonal.id}`,
-      {
-        method: 'PATCH',
-        body: {
-          name: updatedPersonalName,
-          base_url: PROVIDER_BASE_URL,
-          model_id: SUCCESS_MODEL_ID,
-          parameters: changedParameters
-        }
-      }
-    );
-    assert.deepEqual(parameterUpdatedPersonal.parameters, changedParameters);
-    assert.deepEqual(
-      (await owner.client.get(`/api/model-connections/${ownerPersonal.id}`)).data.parameters,
-      changedParameters
-    );
-    await owner.client.request(`/api/model-connections/${ownerPersonal.id}`, {
-      method: 'PATCH',
-      body: {
-        name: updatedPersonalName,
-        base_url: PROVIDER_BASE_URL,
-        model_id: SUCCESS_MODEL_ID,
-        parameters: { reasoning_summary: 'auto' }
-      },
-      expectedStatus: 422
-    });
-    assert.deepEqual(
-      (await owner.client.get(`/api/model-connections/${ownerPersonal.id}`)).data.parameters,
-      changedParameters,
-      'A rejected partial parameter object must not mutate stored settings'
-    );
-
-    const { data: chatDefaults } = await owner.client.request(
-      `/api/model-connections/${ownerPersonal.id}`,
-      {
-        method: 'PATCH',
-        body: {
-          name: updatedPersonalName,
-          base_url: PROVIDER_BASE_URL,
-          model_id: SUCCESS_MODEL_ID,
-          upstream_protocol: 'openai_chat_completions'
-        }
-      }
-    );
-    assert.deepEqual(
-      chatDefaults.request_parameters,
-      AUTOMATIC_CHAT_REQUEST_PARAMETERS,
-      'Changing protocol without request parameters must reset to that protocol defaults'
-    );
-    const { data: preservedChatDefaults } = await owner.client.request(
-      `/api/model-connections/${ownerPersonal.id}`,
-      {
-        method: 'PATCH',
-        body: {
-          name: updatedPersonalName,
-          base_url: PROVIDER_BASE_URL,
-          model_id: SUCCESS_MODEL_ID
-        }
-      }
-    );
-    assert.deepEqual(
-      preservedChatDefaults.request_parameters,
-      AUTOMATIC_CHAT_REQUEST_PARAMETERS,
-      'Omitting request parameters without changing protocol must preserve Chat values'
-    );
-    const { data: configuredChat } = await owner.client.request(
-      `/api/model-connections/${ownerPersonal.id}`,
-      {
-        method: 'PATCH',
-        body: {
-          name: updatedPersonalName,
-          base_url: PROVIDER_BASE_URL,
-          model_id: SUCCESS_MODEL_ID,
-          request_parameters: CHAT_REQUEST_PARAMETERS
-        }
-      }
-    );
-    assert.deepEqual(configuredChat.request_parameters, CHAT_REQUEST_PARAMETERS);
-    await owner.client.request(`/api/model-connections/${ownerPersonal.id}`, {
-      method: 'PATCH',
-      body: {
-        name: updatedPersonalName,
-        base_url: PROVIDER_BASE_URL,
-        model_id: SUCCESS_MODEL_ID,
-        request_parameters: ANTHROPIC_REQUEST_PARAMETERS
-      },
-      expectedStatus: 400
-    });
-    assert.deepEqual(
-      (await owner.client.get(`/api/model-connections/${ownerPersonal.id}`)).data.request_parameters,
-      CHAT_REQUEST_PARAMETERS,
-      'A rejected protocol mismatch must not mutate stored request parameters'
-    );
-
-    const ownerTest = (await owner.client.post(`/api/model-connections/${ownerPersonal.id}/test`)).data;
-    assert.deepEqual(ownerTest, { success: true, status_code: 200, error_code: null, message: null });
-    const superTest = (await superClient.post(`/api/model-connections/${superPersonal.id}/test`)).data;
-    assert.equal(superTest.success, true);
-    const ownerTestUsage = await waitForLedgerItems(owner.client, '/api/model-usage', {
-      model_connection_id: ownerPersonal.id
-    }, 1);
-    assert.equal(ownerTestUsage[0].subject.id, owner.user.id);
-    assert.equal(ownerTestUsage[0].agent.id, null);
-    assert.deepEqual(usageTotals(ownerTestUsage), {
-      input_tokens: 14,
-      output_tokens: 9,
-      total_tokens: 23,
-      cached_tokens: 0,
-      reasoning_tokens: 0
-    });
-    assert.equal(ownerTestUsage[0].model.upstream_protocol, 'openai_chat_completions');
-    assert.equal(
-      context.compose.psql(`
-        SELECT (request_parameters_snapshot->>'protocol') || '|' ||
-               (request_parameters_snapshot->>'temperature') || '|' ||
-               (request_parameters_snapshot->>'top_p') || '|' ||
-               (request_parameters_snapshot->>'max_completion_tokens')
-        FROM model_token_usage
-        WHERE model_connection_id = ${sqlLiteral(ownerPersonal.id)}
-        ORDER BY occurred_at DESC, id DESC
-        LIMIT 1
-      `),
-      'openai_chat_completions|0.3|0.8|321',
-      'Chat usage must retain the request parameter snapshot'
-    );
-    const anthropicTest = (await administrator.client.post(
-      `/api/model-connections/${anthropicGlobal.id}/test`
+    const wrongKeyTest = (await administrator.client.post(
+      `/api/model-connections/${responseConnection.id}/test`,
+      { model_id: SUCCESS_MODEL_ID, message: TEST_MESSAGE }
     )).data;
-    assert.deepEqual(anthropicTest, {
-      success: true,
-      status_code: 200,
-      error_code: null,
-      message: null
+    assert.equal(wrongKeyTest.success, false);
+    assert.equal(wrongKeyTest.status_code, 401, 'The live rotated key must be used immediately');
+    await administrator.client.request(`/api/model-connections/${responseConnection.id}`, {
+      method: 'PUT',
+      body: {
+        name: responseConnection.name,
+        base_url: responseConnection.base_url,
+        api_type: responseConnection.api_type,
+        allowed_model_ids: responseConnection.allowed_model_ids,
+        api_key: PROVIDER_API_KEY
+      }
     });
-    const anthropicUsage = await waitForLedgerItems(
-      administrator.client,
-      '/api/model-usage',
-      { model_connection_id: anthropicGlobal.id },
-      1
-    );
-    assert.equal(anthropicUsage[0].model.upstream_protocol, 'anthropic_messages');
-    assert.deepEqual(usageTotals(anthropicUsage), {
-      input_tokens: 13,
-      output_tokens: 8,
-      total_tokens: 21,
-      cached_tokens: 0,
-      reasoning_tokens: 0
-    });
-    assert.equal(
-      context.compose.psql(`
-        SELECT (request_parameters_snapshot->>'protocol') || '|' ||
-               (request_parameters_snapshot->>'temperature') || '|' ||
-               COALESCE(request_parameters_snapshot->>'top_p', '<null>') || '|' ||
-               (request_parameters_snapshot->>'max_tokens')
-        FROM model_token_usage
-        WHERE model_connection_id = ${sqlLiteral(anthropicGlobal.id)}
-        ORDER BY occurred_at DESC, id DESC
-        LIMIT 1
-      `),
-      'anthropic_messages|0.4|<null>|8192',
-      'Anthropic usage must retain the request parameter snapshot'
-    );
-    const hiddenSuperUsage = (await administrator.client.get(ledgerPath('/api/model-usage', {
-      model_connection_id: superPersonal.id,
-      page_size: 100
-    }))).data;
-    assert.deepEqual(hiddenSuperUsage.items, [], 'Administrator must not see super-admin Personal usage');
+    assert.equal((await administrator.client.post(
+      `/api/model-connections/${responseConnection.id}/test`,
+      { model_id: SUCCESS_MODEL_ID, message: TEST_MESSAGE }
+    )).data.success, true);
+
+    assert.equal((await administrator.client.post(
+      `/api/model-connections/${chatConnection.id}/test`,
+      { model_id: SUCCESS_MODEL_ID, message: TEST_MESSAGE }
+    )).data.success, true);
+    assert.equal((await administrator.client.post(
+      `/api/model-connections/${anthropicConnection.id}/test`,
+      { model_id: SUCCESS_MODEL_ID, message: TEST_MESSAGE }
+    )).data.success, true);
 
     await superClient.request('/api/model-connections/system-default', {
       method: 'PUT',
-      body: { model_connection_id: globalA.id }
+      body: { selection: selection(responseConnection) }
     });
-    assert.equal((await superClient.get(`/api/model-connections/${globalA.id}`)).data.is_system_default, true);
+    const copiedDefaultAgent = await createAgent(owner.client, {
+      name: context.unique('QA copied System Default'),
+      instructions: 'Use the copied System Default model selection.',
+      visibility: 'private',
+      public_to: [],
+      model_selection: null,
+      model_settings: modelSettings('openai_responses'),
+      codex_subagents: []
+    });
+    assert.deepEqual(copiedDefaultAgent.model_selection, selection(responseConnection));
 
-    const agentA = trackAgent(owner.client, (await owner.client.post('/api/agents', {
-      name: context.unique('QA copied Global A Agent'),
-      instructions: 'Exercise Agent default and subagent model overrides.',
+    const responseSettings = modelSettings('openai_responses', {
+      reasoning_effort: 'medium',
+      reasoning_summary: 'concise',
+      verbosity: 'high',
+      context_window_tokens: 128_000,
+      auto_compact_token_limit: 96_000,
+      reasoning_summary_support: 'supported',
+      service_tier: 'flex',
+      request_max_retries: 1,
+      stream_max_retries: 3,
+      stream_idle_timeout_ms: 300_000
+    });
+    const responseAgent = await createAgent(owner.client, {
+      name: context.unique('QA Responses Agent'),
+      instructions: 'Exercise immutable main and subagent model bindings.',
       visibility: 'private',
       public_to: [],
+      model_selection: selection(responseConnection),
+      model_settings: responseSettings,
+      codex_subagents: [{
+        name: 'inherit_agent',
+        description: 'Inherits the Agent model and settings.',
+        developer_instructions: 'Use the Agent model configuration.',
+        model_selection: null,
+        model_settings_override: {}
+      }, {
+        name: 'reviewer',
+        description: 'Uses the same model with stronger reasoning.',
+        developer_instructions: 'Review the response carefully.',
+        model_selection: selection(responseConnection),
+        model_settings_override: {
+          reasoning_effort: 'high',
+          request_max_retries: 2
+        }
+      }]
+    });
+    assert.deepEqual(responseAgent.model_selection, selection(responseConnection));
+    assert.deepEqual(responseAgent.model_settings, responseSettings);
+    assert.deepEqual(responseAgent.codex_subagents[0].model_selection, null);
+    assert.deepEqual(responseAgent.codex_subagents[0].model_settings_override, {});
+    assert.deepEqual(responseAgent.codex_subagents[1].model_settings_override, {
       reasoning_effort: 'high',
-      codex_subagents: [{
-        name: 'inherit_default',
-        description: 'Inherits the Agent default connection.',
-        developer_instructions: 'Use the Agent default model configuration.'
-      }, {
-        name: 'personal_override',
-        description: 'Uses the Agent owner Personal connection.',
-        developer_instructions: 'Use the explicit Personal model override.',
-        model_connection_id: ownerPersonal.id,
-        reasoning_effort: 'max'
-      }, {
-        name: 'global_override',
-        description: 'Uses the explicit Global connection.',
-        developer_instructions: 'Use the explicit Global model override.',
-        model_connection_id: globalA.id,
-        reasoning_effort: 'low'
-      }]
-    })).data);
-    assert.equal(agentA.default_model_connection_id, globalA.id);
-    assert.equal(agentA.codex_subagents.find((item) => item.name === 'inherit_default')?.model_connection_id, null);
-    assert.equal(agentA.codex_subagents.find((item) => item.name === 'personal_override')?.model_connection_id, ownerPersonal.id);
-    assert.equal(agentA.codex_subagents.find((item) => item.name === 'global_override')?.model_connection_id, globalA.id);
-    const { data: agentOptions } = await owner.client.get(`/api/agents/${agentA.id}/model-options`);
-    assert.equal(agentOptions.items.some((item) => item.id === ownerPersonal.id), true);
-    assert.equal(agentOptions.items.some((item) => item.id === outsiderPersonal.id), false);
+      request_max_retries: 2
+    });
+
     await owner.client.post('/api/agents', {
-      name: context.unique('QA rejected foreign Personal Agent'),
-      instructions: 'This payload must be rejected.',
+      name: context.unique('QA rejected foreign Personal model'),
+      instructions: 'This model selection belongs to another user.',
       visibility: 'private',
       public_to: [],
-      default_model_connection_id: globalA.id,
-      codex_subagents: [{
-        name: 'foreign_override',
-        description: 'Attempts a foreign Personal connection.',
-        developer_instructions: 'This configuration must not be accepted.',
-        model_connection_id: outsiderPersonal.id
-      }]
+      model_selection: selection(outsiderPersonal),
+      model_settings: modelSettings('openai_responses'),
+      codex_subagents: []
     }, { expectedStatus: 400 });
 
-    await superClient.request('/api/model-connections/system-default', {
-      method: 'PUT',
-      body: { model_connection_id: globalB.id }
+    const responseRun = await createRun(
+      owner.client,
+      responseAgent.id,
+      'Verify the Responses binding and usage snapshots.'
+    );
+    const bindingRows = context.compose.psql(`
+      SELECT binding_key || '|' || model_connection_id::text || '|' || model_id || '|' ||
+             (model_settings->>'reasoning_effort') || '|' ||
+             COALESCE(model_settings->>'request_max_retries', '<null>')
+      FROM run_model_bindings
+      WHERE run_id = ${sqlLiteral(responseRun.id)}
+      ORDER BY binding_key
+    `).split('\n');
+    assert.deepEqual(bindingRows, [
+      `main|${responseConnection.id}|${SUCCESS_MODEL_ID}|medium|1`,
+      `reviewer|${responseConnection.id}|${SUCCESS_MODEL_ID}|high|2`
+    ]);
+
+    const chatSettings = modelSettings('openai_chat_completions', {
+      reasoning_effort: 'max',
+      request_settings: {
+        protocol: 'openai_chat_completions',
+        temperature: 0.3,
+        top_p: 0.8,
+        max_completion_tokens: 321
+      }
     });
-    assert.equal((await owner.client.get(`/api/agents/${agentA.id}`)).data.default_model_connection_id, globalA.id);
-    const agentB = trackAgent(owner.client, (await owner.client.post('/api/agents', {
-      name: context.unique('QA copied Global B Agent'),
-      instructions: 'Copy the replacement System Default.',
+    const chatAgent = await createAgent(owner.client, {
+      name: context.unique('QA Chat Agent'),
+      instructions: 'Exercise Responses to Chat conversion.',
       visibility: 'private',
-      public_to: []
-    })).data);
-    assert.equal(agentB.default_model_connection_id, globalB.id);
-    await administrator.client.delete(`/api/model-connections/${globalB.id}`, { expectedStatus: 409 });
-
-    await superClient.request('/api/model-connections/system-default', {
-      method: 'PUT',
-      body: { model_connection_id: null }
-    });
-    const unconfiguredAgent = trackAgent(owner.client, (await owner.client.post('/api/agents', {
-      name: context.unique('QA model unconfigured Agent'),
-      instructions: 'Remain model-unconfigured.',
-      visibility: 'private',
-      public_to: []
-    })).data);
-    assert.equal(unconfiguredAgent.default_model_connection_id, null);
-    await owner.client.post(`/api/agents/${unconfiguredAgent.id}/runs`, {
-      message: 'A model-unconfigured Agent must not start.',
-      hub_session_id: null,
-      parent_run_id: null
-    }, { expectedStatus: 409 });
-
-    const disabledA = (await administrator.client.request(`/api/model-connections/${globalA.id}/status`, {
-      method: 'PUT',
-      body: { status: 'disabled' }
-    })).data;
-    assert.equal(disabledA.status, 'disabled');
-    await owner.client.post(`/api/agents/${agentA.id}/runs`, {
-      message: 'A disabled model must reject the next request.',
-      hub_session_id: null,
-      parent_run_id: null
-    }, { expectedStatus: 409 });
-    const enabledA = (await administrator.client.request(`/api/model-connections/${globalA.id}/status`, {
-      method: 'PUT',
-      body: { status: 'enabled' }
-    })).data;
-    assert.equal(enabledA.status, 'enabled');
-    assert.equal((await administrator.client.post(`/api/model-connections/${globalA.id}/test`)).data.success, true);
-
-    const errorFilters = { model_connection_id: errorGlobal.id };
-    for (let index = 0; index < 2; index += 1) {
-      const result = (await administrator.client.post(`/api/model-connections/${errorGlobal.id}/test`)).data;
-      assert.equal(result.success, false);
-      assert.equal(result.status_code, 200);
-      assert.equal(result.error_code, 'fake_model_error');
-      assert.equal(result.message, 'Deterministic fake provider failure.');
-    }
-    await waitForLedgerItems(administrator.client, '/api/model-usage', errorFilters, 2);
-    await waitForLedgerItems(administrator.client, '/api/model-call-errors', errorFilters, 2);
-    const pagedTestUsage = await readTwoKeysetPages(administrator.client, '/api/model-usage', errorFilters);
-    const pagedTestErrors = await readTwoKeysetPages(administrator.client, '/api/model-call-errors', errorFilters);
-    assert.equal(pagedTestUsage.every((item) => item.response_status === 'failed'), true);
-    assert.equal(pagedTestErrors.every((item) => item.error_code === 'fake_model_error'), true);
-    assert.equal(pagedTestErrors.every((item) => item.agent.id === null), true);
-    assert.equal(pagedTestErrors.every((item) => item.subject.id === administrator.user.id), true);
-    assert.equal(JSON.stringify(pagedTestErrors).includes(PROVIDER_API_KEY), false);
-    await administrator.client.delete(`/api/model-connections/${errorGlobal.id}`, { expectedStatus: 204 });
-    await administrator.client.get(`/api/model-connections/${errorGlobal.id}`, { expectedStatus: 404 });
-    const errorsAfterOrdinaryDelete = (await administrator.client.get(ledgerPath(
-      '/api/model-call-errors',
-      { ...errorFilters, page_size: 100 }
-    ))).data.items;
-    assert.equal(errorsAfterOrdinaryDelete.length, 2);
-    assert.equal(errorsAfterOrdinaryDelete.every((item) => item.model.id === errorGlobal.id), true);
-    assert.equal(errorsAfterOrdinaryDelete.every((item) => item.model.name === errorGlobal.name), true);
-
-    const rangeStart = Date.now() - 1_000;
-    const { data: successfulRun } = await owner.client.post(`/api/agents/${agentA.id}/runs`, {
-      message: 'Verify successful Responses usage accounting.',
-      hub_session_id: null,
-      parent_run_id: null
-    });
-    await waitForRunStatus(owner.client, agentA.id, successfulRun.id, 'completed', 60_000);
-    const { data: failedRun } = await owner.client.post(`/api/agents/${agentA.id}/runs`, {
-      message: 'fixture:model-error verify failed Responses usage and error accounting',
-      hub_session_id: null,
-      parent_run_id: null
-    });
-    await waitForRunStatus(owner.client, agentA.id, failedRun.id, 'failed', 60_000);
-    const rangeEnd = Date.now() + 1_000;
-    const agentFilters = {
-      from_ms: rangeStart,
-      to_ms: rangeEnd,
-      model_connection_id: globalA.id,
-      agent_id: agentA.id,
-      user_id: owner.user.id
-    };
-    const agentUsage = await waitForLedgerItems(owner.client, '/api/model-usage', agentFilters, 2);
-    const agentErrors = await waitForLedgerItems(owner.client, '/api/model-call-errors', agentFilters, 1);
-    const completedUsage = agentUsage.find((item) => item.response_status === 'completed');
-    const failedUsage = agentUsage.find((item) => item.response_status === 'failed');
-    assert.deepEqual(usageTotals([completedUsage]), {
-      input_tokens: 11,
-      output_tokens: 7,
-      total_tokens: 18,
-      cached_tokens: 3,
-      reasoning_tokens: 5
-    });
-    assert.deepEqual(usageTotals([failedUsage]), {
-      input_tokens: 5,
-      output_tokens: 2,
-      total_tokens: 7,
-      cached_tokens: 1,
-      reasoning_tokens: 1
-    });
-    assert.equal(agentUsage.every((item) => item.agent.id === agentA.id), true);
-    assert.equal(agentUsage.every((item) => item.agent.name === agentA.name), true);
-    assert.equal(agentUsage.every((item) => item.subject.id === owner.user.id), true);
-    assert.equal(agentErrors[0].error_code, 'fake_model_error');
-    assert.equal(agentErrors[0].message, 'Deterministic fake provider failure.');
-
-    const { data: summary } = await owner.client.get(ledgerPath('/api/model-usage/summary', agentFilters));
-    const expectedTotals = usageTotals(agentUsage);
-    assert.deepEqual(summary.overall, expectedTotals);
-    assert.deepEqual(summary.by_model.find((item) => item.model.id === globalA.id)?.totals, expectedTotals);
-    assert.deepEqual(summary.by_agent.find((item) => item.agent.id === agentA.id)?.totals, expectedTotals);
-    assert.deepEqual(summary.by_user.find((item) => item.user_id === owner.user.id)?.totals, expectedTotals);
-    const { data: beforeRange } = await owner.client.get(ledgerPath('/api/model-usage/summary', {
-      ...agentFilters,
-      from_ms: rangeStart - 100_000,
-      to_ms: rangeStart
-    }));
-    assert.equal(beforeRange.overall.total_tokens, 0, 'The millisecond to_ms bound must be exclusive');
-    await owner.client.get(ledgerPath('/api/model-usage', {
-      ...agentFilters,
-      from_ms: rangeEnd,
-      to_ms: rangeEnd
-    }), { expectedStatus: 400 });
-    const pagedAgentUsage = await readTwoKeysetPages(owner.client, '/api/model-usage', agentFilters);
-    assert.deepEqual(new Set(pagedAgentUsage.map((item) => item.id)), new Set(agentUsage.map((item) => item.id)));
-
-    const sharedAgent = trackAgent(administrator.client, (await administrator.client.post('/api/agents', {
-      name: context.unique('QA shared attribution Agent'),
-      instructions: 'Attribute shared-Agent usage to the caller.',
-      visibility: 'public',
       public_to: [],
-      default_model_connection_id: globalB.id,
-      reasoning_effort: 'medium',
+      model_selection: selection(chatConnection),
+      model_settings: chatSettings,
       codex_subagents: []
-    })).data);
-    const { data: sharedRun } = await outsider.client.post(`/api/agents/${sharedAgent.id}/runs`, {
-      message: 'Verify shared Agent caller attribution.',
+    });
+    await createRun(owner.client, chatAgent.id, 'Verify the Chat conversion path.');
+
+    const anthropicSettings = modelSettings('anthropic_messages', {
+      reasoning_effort: 'high',
+      request_settings: {
+        protocol: 'anthropic_messages',
+        temperature: 0.4,
+        top_p: null,
+        max_tokens: 8_192
+      }
+    });
+    const anthropicAgent = await createAgent(owner.client, {
+      name: context.unique('QA Anthropic Agent'),
+      instructions: 'Exercise Responses to Anthropic conversion.',
+      visibility: 'private',
+      public_to: [],
+      model_selection: selection(anthropicConnection),
+      model_settings: anthropicSettings,
+      codex_subagents: []
+    });
+    await createRun(owner.client, anthropicAgent.id, 'Verify the Anthropic conversion path.');
+
+    const responseAgentUsage = await waitForLedgerItems(owner.client, '/api/model-usage', {
+      model_connection_id: responseConnection.id,
+      agent_id: responseAgent.id,
+      user_id: owner.user.id
+    }, 1);
+    assert.deepEqual(responseAgentUsage[0].model.request_settings, { protocol: 'openai_responses' });
+    assert.equal(responseAgentUsage[0].model.api_type, 'openai_responses');
+    const chatUsage = await waitForLedgerItems(owner.client, '/api/model-usage', {
+      model_connection_id: chatConnection.id,
+      agent_id: chatAgent.id,
+      user_id: owner.user.id
+    }, 1);
+    assert.deepEqual(chatUsage[0].model.request_settings, chatSettings.request_settings);
+    assert.equal(chatUsage[0].model.api_type, 'openai_chat_completions');
+    const anthropicUsage = await waitForLedgerItems(owner.client, '/api/model-usage', {
+      model_connection_id: anthropicConnection.id,
+      agent_id: anthropicAgent.id,
+      user_id: owner.user.id
+    }, 1);
+    assert.deepEqual(anthropicUsage[0].model.request_settings, anthropicSettings.request_settings);
+    assert.equal(anthropicUsage[0].model.api_type, 'anthropic_messages');
+
+    const connectionUsageBeforeDelete = await waitForLedgerItems(
+      administrator.client,
+      '/api/model-usage',
+      { model_connection_id: responseConnection.id },
+      4
+    );
+    const connectionErrorsBeforeDelete = await waitForLedgerItems(
+      administrator.client,
+      '/api/model-call-errors',
+      { model_connection_id: responseConnection.id },
+      2
+    );
+    assert.equal(connectionUsageBeforeDelete.some((item) => item.model.model_id === ERROR_MODEL_ID), true);
+    assert.equal(connectionErrorsBeforeDelete.some((item) => item.error_code === 'fake_model_error'), true);
+    assert.equal(JSON.stringify(connectionErrorsBeforeDelete).includes(PROVIDER_API_KEY), false);
+
+    const updateBody = {
+      name: responseConnection.name,
+      base_url: responseConnection.base_url,
+      api_type: responseConnection.api_type,
+      allowed_model_ids: [ERROR_MODEL_ID]
+    };
+    await administrator.client.request(`/api/model-connections/${responseConnection.id}`, {
+      method: 'PUT',
+      body: updateBody,
+      expectedStatus: 409
+    });
+    assert.deepEqual(
+      (await owner.client.get(`/api/agents/${responseAgent.id}`)).data.model_selection,
+      selection(responseConnection),
+      'A rejected allowlist update must not mutate Agent selection'
+    );
+    const { data: forceUpdated } = await administrator.client.request(
+      `/api/model-connections/${responseConnection.id}?force=true`,
+      { method: 'PUT', body: updateBody }
+    );
+    assert.deepEqual(forceUpdated.allowed_model_ids, [ERROR_MODEL_ID]);
+    const { data: unconfiguredAgent } = await owner.client.get(`/api/agents/${responseAgent.id}`);
+    assert.equal(unconfiguredAgent.model_selection, null);
+    const disabledReviewer = unconfiguredAgent.codex_subagents.find((item) => item.name === 'reviewer');
+    assert.equal(disabledReviewer.enabled, false);
+    assert.equal(disabledReviewer.disabled_reason, 'model_selection_removed');
+    assert.equal(disabledReviewer.model_selection, null);
+    assert.equal(
+      (await superClient.get('/api/model-connections/system-default')).data.selection,
+      null
+    );
+    await owner.client.post(`/api/agents/${responseAgent.id}/runs`, {
+      message: 'A model-unconfigured Agent must not start a new Run.',
       hub_session_id: null,
       parent_run_id: null
-    });
-    await waitForRunStatus(outsider.client, sharedAgent.id, sharedRun.id, 'completed', 60_000);
-    const sharedUsage = await waitForLedgerItems(outsider.client, '/api/model-usage', {
-      model_connection_id: globalB.id,
-      agent_id: sharedAgent.id,
-      user_id: outsider.user.id
-    }, 1);
-    assert.equal(sharedUsage[0].subject.id, outsider.user.id);
-    assert.equal(sharedUsage[0].agent.id, sharedAgent.id);
-    const adminSharedUsage = (await administrator.client.get(ledgerPath('/api/model-usage', {
-      model_connection_id: globalB.id,
-      agent_id: sharedAgent.id,
-      user_id: outsider.user.id,
-      page_size: 100
-    }))).data.items;
-    assert.equal(adminSharedUsage.length, 1);
-    assert.equal(adminSharedUsage[0].subject.id, outsider.user.id);
+    }, { expectedStatus: 409 });
 
-    await administrator.client.delete(`/api/model-connections/${globalA.id}`, { expectedStatus: 409 });
-    await administrator.client.post(`/api/model-connections/${globalA.id}/force-delete`, undefined, {
+    await administrator.client.delete(`/api/model-connections/${responseConnection.id}`, {
       expectedStatus: 204
     });
-    await administrator.client.get(`/api/model-connections/${globalA.id}`, { expectedStatus: 404 });
-    const { data: detachedAgent } = await owner.client.get(`/api/agents/${agentA.id}`);
-    assert.equal(detachedAgent.default_model_connection_id, null);
-    const deletedOverride = detachedAgent.codex_subagents.find((item) => item.name === 'global_override');
-    assert.equal(deletedOverride.enabled, false);
-    assert.equal(deletedOverride.model_connection_id, null);
-    assert.equal(deletedOverride.disabled_reason, 'model_connection_deleted');
-    const retainedOverride = detachedAgent.codex_subagents.find((item) => item.name === 'personal_override');
-    assert.equal(retainedOverride.enabled ?? true, true);
-    assert.equal(retainedOverride.model_connection_id, ownerPersonal.id);
-    await owner.client.post(`/api/agents/${agentA.id}/runs`, {
-      message: 'Force-deleted default must leave the Agent model-unconfigured.',
-      hub_session_id: null,
-      parent_run_id: null
-    }, { expectedStatus: 409 });
+    await administrator.client.get(`/api/model-connections/${responseConnection.id}`, {
+      expectedStatus: 404
+    });
     assert.equal(
       context.compose.psql(`
-        SELECT (deleted_at IS NOT NULL)::text || '|' ||
-               (base_url IS NULL)::text || '|' ||
+        SELECT (base_url IS NULL)::text || '|' ||
                (api_key_ciphertext IS NULL)::text || '|' ||
-               (api_key_nonce IS NULL)::text
-        FROM model_connections WHERE id = ${sqlLiteral(globalA.id)}
+               (api_key_nonce IS NULL)::text || '|' ||
+               (deleted_at IS NOT NULL)::text
+        FROM model_connections WHERE id = ${sqlLiteral(responseConnection.id)}
       `),
       'true|true|true|true',
-      'Force Delete must remove executable configuration and encrypted secret material'
+      'Deleting a Connection must scrub its live endpoint and credential'
     );
-    const usageAfterModelDelete = (await owner.client.get(ledgerPath(
-      '/api/model-usage',
-      { ...agentFilters, page_size: 100 }
-    ))).data.items;
-    const errorsAfterModelDelete = (await owner.client.get(ledgerPath(
-      '/api/model-call-errors',
-      { ...agentFilters, page_size: 100 }
-    ))).data.items;
-    assert.equal(usageAfterModelDelete.length, 2);
-    assert.equal(errorsAfterModelDelete.length, 1);
-    assert.equal(usageAfterModelDelete.every((item) => item.model.id === globalA.id), true);
-    assert.equal(usageAfterModelDelete.every((item) => item.model.name === globalA.name), true);
-    assert.equal(usageAfterModelDelete.every((item) => item.model.model_id === SUCCESS_MODEL_ID), true);
 
-    await owner.client.delete(`/api/agents/${agentA.id}`, { expectedStatus: 204 });
-    const usageAfterAgentDelete = (await owner.client.get(ledgerPath(
+    const { data: retainedUsagePage } = await administrator.client.get(ledgerPath(
       '/api/model-usage',
-      { ...agentFilters, page_size: 100 }
-    ))).data.items;
-    const errorsAfterAgentDelete = (await owner.client.get(ledgerPath(
+      { model_connection_id: responseConnection.id, page_size: 100 }
+    ));
+    const { data: retainedErrorPage } = await administrator.client.get(ledgerPath(
       '/api/model-call-errors',
-      { ...agentFilters, page_size: 100 }
-    ))).data.items;
-    assert.equal(usageAfterAgentDelete.length, 2);
-    assert.equal(errorsAfterAgentDelete.length, 1);
-    assert.equal(usageAfterAgentDelete.every((item) => item.agent.name === agentA.name), true);
-    assert.equal(errorsAfterAgentDelete[0].agent.name, agentA.name);
+      { model_connection_id: responseConnection.id, page_size: 100 }
+    ));
+    assert.equal(retainedUsagePage.items.length, connectionUsageBeforeDelete.length);
+    assert.equal(retainedErrorPage.items.length, connectionErrorsBeforeDelete.length);
+    for (const item of [...retainedUsagePage.items, ...retainedErrorPage.items]) {
+      assert.equal(item.model.id, responseConnection.id);
+      assert.equal(item.model.name, responseConnection.name);
+      assert.equal(item.model.api_type, 'openai_responses');
+      assert.deepEqual(item.model.request_settings, { protocol: 'openai_responses' });
+    }
+    const { data: retainedSummary } = await administrator.client.get(ledgerPath(
+      '/api/model-usage/summary',
+      { model_connection_id: responseConnection.id }
+    ));
+    assert.deepEqual(retainedSummary.overall, usageTotals(retainedUsagePage.items));
+    assert.equal(
+      retainedSummary.by_model.some((row) => (
+        row.model.name === responseConnection.name
+        && row.model.api_type === 'openai_responses'
+        && row.model.model_id === SUCCESS_MODEL_ID
+      )),
+      true
+    );
+    assertSecretAbsent(retainedSummary, 'Retained model usage summary');
   } catch (error) {
-    scenarioFailure = error;
-  } finally {
-    const cleanupErrors = [];
-    if (defaultSnapshotTaken) {
-      try {
-        const { data: restored } = await superClient.request('/api/model-connections/system-default', {
-          method: 'PUT',
-          body: { model_connection_id: originalDefault.model_connection_id }
-        });
-        assert.deepEqual(restored, originalDefault);
-        const { data: persisted } = await superClient.get('/api/model-connections/system-default');
-        assert.deepEqual(persisted, originalDefault);
-      } catch (error) {
-        cleanupErrors.push(error);
-      }
+    scenarioError = error;
+  }
+
+  const cleanupErrors = [];
+  const cleanup = async (label, action) => {
+    try {
+      await action();
+    } catch (error) {
+      cleanupErrors.push(`${label}: ${error.message}`);
     }
-    for (const resource of createdAgents.toReversed()) {
-      try {
-        await resource.client.delete(`/api/agents/${resource.id}`, { expectedStatus: [204, 404] });
-      } catch (error) {
-        cleanupErrors.push(error);
-      }
+  };
+  await cleanup('restore System Default', async () => {
+    const { data } = await superClient.request('/api/model-connections/system-default', {
+      method: 'PUT',
+      body: { selection: originalDefault.selection }
+    });
+    assert.deepEqual(data, originalDefault);
+  });
+  for (const agent of [...createdAgents].reverse()) {
+    await cleanup(`delete Agent ${agent.id}`, () => agent.client.delete(
+      `/api/agents/${agent.id}`,
+      { expectedStatus: [204, 404] }
+    ));
+  }
+  for (const connection of [...createdConnections].reverse()) {
+    await cleanup(`force-delete Model Connection ${connection.id}`, () => connection.client.request(
+      `/api/model-connections/${connection.id}/force-delete`,
+      { method: 'POST', expectedStatus: [204, 404] }
+    ));
+  }
+  if (promotedAdminId) {
+    await cleanup('restore Administrator role', () => superClient.request(
+      `/api/admin/users/${promotedAdminId}/role`,
+      { method: 'PUT', body: { role: 'member' } }
+    ));
+  }
+
+  if (scenarioError) {
+    if (cleanupErrors.length > 0) {
+      scenarioError.message += `\nCleanup failures:\n${cleanupErrors.join('\n')}`;
     }
-    for (const resource of createdConnections.toReversed()) {
-      try {
-        await resource.client.post(`/api/model-connections/${resource.id}/force-delete`, undefined, {
-          expectedStatus: [204, 404]
-        });
-      } catch (error) {
-        cleanupErrors.push(error);
-      }
-    }
-    if (promotedAdminId) {
-      try {
-        const { data: demoted } = await superClient.request(`/api/admin/users/${promotedAdminId}/role`, {
-          method: 'PUT',
-          body: { role: 'member' }
-        });
-        assert.equal(demoted.user.role, 'member');
-      } catch (error) {
-        cleanupErrors.push(error);
-      }
-    }
-    if (scenarioFailure && cleanupErrors.length === 0) throw scenarioFailure;
-    if (!scenarioFailure && cleanupErrors.length === 1) throw cleanupErrors[0];
-    if (scenarioFailure || cleanupErrors.length > 0) {
-      throw new AggregateError(
-        [scenarioFailure, ...cleanupErrors].filter(Boolean),
-        'Model Connections API scenario or mandatory cleanup failed'
-      );
-    }
+    throw scenarioError;
+  }
+  if (cleanupErrors.length > 0) {
+    throw new Error(`Model scenario cleanup failed:\n${cleanupErrors.join('\n')}`);
   }
 }

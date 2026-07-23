@@ -53,7 +53,7 @@ services:
       HUB_MODEL_SECRET_KEY: ${HUB_MODEL_SECRET_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}
       SEED_DEV_MODEL_CONNECTION: ${SEED_DEV_MODEL_CONNECTION:-true}
       DEV_MODEL_PROVIDER_BASE_URL: ${DEV_MODEL_PROVIDER_BASE_URL:-http://fake-model-provider:8080}
-      DEV_MODEL_PROVIDER_MODEL_ID: ${DEV_MODEL_PROVIDER_MODEL_ID:-hub-proxy-smoke}
+      DEV_MODEL_PROVIDER_MODEL_IDS: ${DEV_MODEL_PROVIDER_MODEL_IDS:-hub-proxy-smoke,hub-proxy-smoke-fast}
       DEV_MODEL_PROVIDER_API_KEY: ${DEV_MODEL_PROVIDER_API_KEY:-dev-model-provider-api-key}
       DEV_RUNTIME_ENROLLMENT_TOKEN: ${DEV_RUNTIME_ENROLLMENT_TOKEN:-dev-runtime-enrollment-token}
       HUB_MODEL_PROXY_TIMEOUT_SECS: ${HUB_MODEL_PROXY_TIMEOUT_SECS:-300}
@@ -184,7 +184,13 @@ services:
 
 networks:
   hub-network:
+    ipam:
+      config:
+        - subnet: ${HUB_NETWORK_SUBNET:-10.127.254.0/24}
   model-network:
+    ipam:
+      config:
+        - subnet: ${MODEL_NETWORK_SUBNET:-10.127.255.0/24}
 
 volumes:
   postgres-data:

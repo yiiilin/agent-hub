@@ -10,7 +10,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use agent_hub_backend::ModelSecretCipher;
@@ -63,7 +63,7 @@ type HmacSha256 = Hmac<Sha256>;
 const REDACTED_SECRET: &str = "********";
 const DEFAULT_MODEL_PROXY_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_MODEL_PROXY_TIMEOUT: Duration = Duration::from_secs(900);
-const MODEL_PROXY_CONNECTION_ID_HEADER: &str = "x-agent-hub-model-connection-id";
+const MODEL_PROXY_BINDING_ID_HEADER: &str = "x-agent-hub-model-binding-id";
 const MODEL_PROXY_OBSERVER_MAX_BYTES: usize = 2 * 1024 * 1024;
 const MODEL_PROXY_SSE_LINE_MAX_BYTES: usize = 64 * 1024;
 const DATABASE_READINESS_TIMEOUT: Duration = Duration::from_millis(500);
@@ -236,9 +236,13 @@ async fn main() -> anyhow::Result<()> {
             &env::var("DEV_MODEL_PROVIDER_BASE_URL").context(
                 "DEV_MODEL_PROVIDER_BASE_URL is required when development model seeding is enabled",
             )?,
-            &env::var("DEV_MODEL_PROVIDER_MODEL_ID").context(
-                "DEV_MODEL_PROVIDER_MODEL_ID is required when development model seeding is enabled",
-            )?,
+            env::var("DEV_MODEL_PROVIDER_MODEL_IDS")
+                .context(
+                    "DEV_MODEL_PROVIDER_MODEL_IDS is required when development model seeding is enabled",
+                )?
+                .split(',')
+                .map(str::to_owned)
+                .collect(),
             &env::var("DEV_MODEL_PROVIDER_API_KEY").context(
                 "DEV_MODEL_PROVIDER_API_KEY is required when development model seeding is enabled",
             )?,
@@ -408,7 +412,7 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/model-connections/{model_connection_id}",
             get(get_model_connection)
-                .patch(update_model_connection)
+                .put(update_model_connection)
                 .delete(delete_model_connection),
         )
         .route(
@@ -425,7 +429,7 @@ fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/model-connections/system-default",
-            get(get_system_default_model_connection).put(set_system_default_model_connection),
+            get(get_system_default_model_selection).put(set_system_default_model_selection),
         )
         .route("/api/model-usage/summary", get(get_model_usage_summary))
         .route("/api/model-usage", get(list_model_token_usage))
@@ -765,21 +769,21 @@ fn openapi_document() -> Value {
             },
             "/api/model-connections/{model_connection_id}": {
                 "get": { "summary": "Get a visible Model Connection", "parameters": [id("model_connection_id")], "responses": { "200": response("ModelConnection"), "404": { "$ref": "#/components/responses/NotFound" } } },
-                "patch": { "summary": "Update a Model Connection", "parameters": [id("model_connection_id")], "requestBody": body("UpdateModelConnectionRequest"), "responses": { "200": response("ModelConnection"), "400": { "$ref": "#/components/responses/BadRequest" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } },
+                "put": { "summary": "Update a Model Connection", "parameters": [id("model_connection_id")], "requestBody": body("UpdateModelConnectionRequest"), "responses": { "200": response("ModelConnection"), "400": { "$ref": "#/components/responses/BadRequest" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } },
                 "delete": { "summary": "Delete an unreferenced Model Connection", "parameters": [id("model_connection_id")], "responses": { "204": no_content(), "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } }
             },
             "/api/model-connections/{model_connection_id}/status": {
                 "put": { "summary": "Enable or disable a Model Connection", "parameters": [id("model_connection_id")], "requestBody": body("UpdateModelConnectionStatusRequest"), "responses": { "200": response("ModelConnection"), "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" } } }
             },
             "/api/model-connections/{model_connection_id}/test": {
-                "post": { "summary": "Test a Model Connection with a minimal Responses request", "parameters": [id("model_connection_id")], "responses": { "200": response("ModelConnectionTestResult"), "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" } } }
+                "post": { "summary": "Send a test message through a Model Connection", "parameters": [id("model_connection_id")], "requestBody": body("TestModelConnectionRequest"), "responses": { "200": response("ModelConnectionTestResult"), "400": { "$ref": "#/components/responses/BadRequest" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" } } }
             },
             "/api/model-connections/{model_connection_id}/force-delete": {
                 "post": { "summary": "Force delete a Model Connection and clear live references", "parameters": [id("model_connection_id")], "responses": { "204": no_content(), "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" } } }
             },
             "/api/model-connections/system-default": {
-                "get": { "summary": "Get the System Default Model Connection", "responses": { "200": response("SystemDefaultModelConnection") } },
-                "put": { "summary": "Set the enabled Global System Default Model Connection", "requestBody": body("SetSystemDefaultModelConnectionRequest"), "responses": { "200": response("SystemDefaultModelConnection"), "400": { "$ref": "#/components/responses/BadRequest" }, "403": { "$ref": "#/components/responses/Forbidden" } } }
+                "get": { "summary": "Get the System Default Model Selection", "responses": { "200": response("SystemDefaultModelSelection") } },
+                "put": { "summary": "Set the enabled Global System Default Model Selection", "requestBody": body("SetSystemDefaultModelSelectionRequest"), "responses": { "200": response("SystemDefaultModelSelection"), "400": { "$ref": "#/components/responses/BadRequest" }, "403": { "$ref": "#/components/responses/Forbidden" } } }
             },
             "/api/model-usage/summary": {
                 "get": { "summary": "Summarize visible model token usage over the full requested range", "parameters": model_ledger_parameters(), "responses": { "200": response("ModelUsageSummary"), "400": { "$ref": "#/components/responses/BadRequest" }, "403": { "$ref": "#/components/responses/Forbidden" } } }
@@ -869,7 +873,7 @@ fn openapi_document() -> Value {
             "/api/runtime/heartbeat": { "post": { "summary": "Heartbeat and complete staged Runtime credential rotation", "security": [{ "runtimeBearer": [] }], "requestBody": body("RuntimeHeartbeatRequest"), "responses": { "200": response("RuntimeHeartbeatResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/runtime/codex/artifacts/{version}/{os}/{architecture}": { "get": { "summary": "Download the authenticated Runtime's verified Codex artifact", "security": [{ "runtimeBearer": [] }], "parameters": [{ "name": "version", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "os", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "architecture", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "Verified zstd-compressed Codex binary", "content": { "application/zstd": { "schema": { "type": "string", "format": "binary" } } } }, "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/runtime/runs/claim": { "post": { "summary": "Claim one capacity-fenced Run and its exclusive Session ownership generation", "security": [{ "runtimeBearer": [] }], "requestBody": body("RuntimeClaimRunRequest"), "responses": { "200": response("ClaimRunResponse"), "204": no_content(), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" } } } },
-            "/api/runtime/model-proxy/v1/responses": { "post": { "summary": "Proxy one run-scoped Responses API request through its selected Model Connection", "security": [{ "modelProxyBearer": [] }], "parameters": [required_header("x-agent-hub-run-id", json!({ "type": "string", "format": "uuid" })), required_header("x-agent-hub-model-connection-id", json!({ "type": "string", "format": "uuid" }))], "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } }, "responses": { "200": { "description": "Responses JSON or SSE from the selected upstream protocol" }, "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" }, "502": { "description": "Model upstream transport failed" }, "504": { "description": "Model upstream timed out" } } } },
+            "/api/runtime/model-proxy/v1/responses": { "post": { "summary": "Proxy one run-scoped Responses API request through its selected Model Connection", "security": [{ "modelProxyBearer": [] }], "parameters": [required_header("x-agent-hub-run-id", json!({ "type": "string", "format": "uuid" })), required_header("x-agent-hub-model-binding-id", json!({ "type": "string", "format": "uuid" }))], "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } }, "responses": { "200": { "description": "Responses JSON or SSE from the selected upstream protocol" }, "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" }, "502": { "description": "Model upstream transport failed" }, "504": { "description": "Model upstream timed out" } } } },
             "/api/runtime/runs/{run_id}/turn/begin": { "post": { "summary": "Bind synchronized configuration and begin generation-fenced Turn delivery", "security": [{ "runtimeBearer": [] }], "parameters": [id("run_id")], "requestBody": body("RuntimeBeginTurnRequest"), "responses": { "200": response("BeginRuntimeTurnResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/runtime/sessions/{session_id}/commands/{command_id}/complete": { "post": { "summary": "Acknowledge one generation-fenced Session command outcome", "security": [{ "runtimeBearer": [] }], "parameters": [id("session_id"), id("command_id")], "requestBody": body("RuntimeCompleteSessionCommandRequest"), "responses": { "200": response("CompleteRuntimeSessionCommandResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/runtime/sessions/{session_id}/release": { "post": { "summary": "Release Session ownership after a current Hub-committed Bundle", "security": [{ "runtimeBearer": [] }], "parameters": [id("session_id")], "requestBody": body("ReleaseRuntimeSessionRequest"), "responses": { "200": response("HubSession"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
@@ -1010,22 +1014,26 @@ fn openapi_schemas() -> Value {
         "ModelReasoningSummary": { "type": "string", "enum": ["default", "auto", "concise", "detailed", "none"], "default": "default" },
         "ModelVerbosity": { "type": "string", "enum": ["default", "low", "medium", "high"], "default": "default" },
         "ModelReasoningSummarySupport": { "type": "string", "enum": ["auto", "supported", "unsupported"], "default": "auto" },
-        "ModelConnectionParameters": { "type": "object", "additionalProperties": false, "required": ["reasoning_effort", "reasoning_summary", "verbosity", "context_window_tokens", "auto_compact_token_limit", "reasoning_summary_support", "service_tier", "request_max_retries", "stream_max_retries", "stream_idle_timeout_ms"], "properties": { "reasoning_effort": { "$ref": "#/components/schemas/ReasoningEffort" }, "reasoning_summary": { "$ref": "#/components/schemas/ModelReasoningSummary" }, "verbosity": { "$ref": "#/components/schemas/ModelVerbosity" }, "context_window_tokens": { "type": ["integer", "null"], "format": "int64", "minimum": 1 }, "auto_compact_token_limit": { "type": ["integer", "null"], "format": "int64", "minimum": 1 }, "reasoning_summary_support": { "$ref": "#/components/schemas/ModelReasoningSummarySupport" }, "service_tier": { "type": ["string", "null"], "minLength": 1, "maxLength": 64 }, "request_max_retries": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 }, "stream_max_retries": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 }, "stream_idle_timeout_ms": { "type": ["integer", "null"], "format": "int64", "minimum": 1 } } },
-        "ModelConnectionRequestParameters": { "oneOf": [
+        "ModelRequestSettings": { "oneOf": [
             { "type": "object", "additionalProperties": false, "required": ["protocol"], "properties": { "protocol": { "type": "string", "enum": ["openai_responses"] } } },
             { "type": "object", "additionalProperties": false, "required": ["protocol"], "properties": { "protocol": { "type": "string", "enum": ["openai_chat_completions"] }, "temperature": { "type": ["number", "null"], "minimum": 0, "maximum": 2 }, "top_p": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }, "max_completion_tokens": { "type": ["integer", "null"], "minimum": 1, "maximum": 4294967295_u64 } } },
             { "type": "object", "additionalProperties": false, "required": ["protocol"], "properties": { "protocol": { "type": "string", "enum": ["anthropic_messages"] }, "temperature": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }, "top_p": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }, "max_tokens": { "type": ["integer", "null"], "minimum": 1, "maximum": 4294967295_u64 } }, "not": { "required": ["temperature", "top_p"], "properties": { "temperature": { "type": "number" }, "top_p": { "type": "number" } } } }
         ], "discriminator": { "propertyName": "protocol" } },
-        "ModelConnection": { "type": "object", "additionalProperties": false, "required": ["id", "owner_id", "scope", "name", "base_url", "model_id", "upstream_protocol", "parameters", "request_parameters", "status", "is_system_default", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": { "anyOf": [uuid(), { "type": "null" }] }, "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "name": { "type": "string" }, "base_url": { "type": "string", "format": "uri" }, "model_id": { "type": "string" }, "upstream_protocol": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "parameters": { "$ref": "#/components/schemas/ModelConnectionParameters" }, "request_parameters": { "$ref": "#/components/schemas/ModelConnectionRequestParameters" }, "status": { "$ref": "#/components/schemas/ModelConnectionStatus" }, "is_system_default": { "type": "boolean" }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
-        "CreateModelConnectionRequest": { "type": "object", "additionalProperties": false, "required": ["scope", "name", "base_url", "model_id", "api_key"], "properties": { "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "name": { "type": "string", "minLength": 1, "maxLength": 128 }, "base_url": { "type": "string", "format": "uri" }, "model_id": { "type": "string", "minLength": 1, "maxLength": 256 }, "upstream_protocol": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "parameters": { "$ref": "#/components/schemas/ModelConnectionParameters" }, "request_parameters": { "$ref": "#/components/schemas/ModelConnectionRequestParameters" }, "api_key": { "type": "string", "minLength": 1, "format": "password", "writeOnly": true } } },
-        "UpdateModelConnectionRequest": { "type": "object", "additionalProperties": false, "required": ["name", "base_url", "model_id"], "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 128 }, "base_url": { "type": "string", "format": "uri" }, "model_id": { "type": "string", "minLength": 1, "maxLength": 256 }, "upstream_protocol": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "parameters": { "$ref": "#/components/schemas/ModelConnectionParameters" }, "request_parameters": { "$ref": "#/components/schemas/ModelConnectionRequestParameters" }, "api_key": { "type": "string", "minLength": 1, "format": "password", "writeOnly": true } } },
+        "AgentModelSettings": { "type": "object", "additionalProperties": false, "required": ["reasoning_effort", "reasoning_summary", "verbosity", "context_window_tokens", "auto_compact_token_limit", "reasoning_summary_support", "service_tier", "request_max_retries", "stream_max_retries", "stream_idle_timeout_ms", "request_settings"], "properties": { "reasoning_effort": { "$ref": "#/components/schemas/ReasoningEffort" }, "reasoning_summary": { "$ref": "#/components/schemas/ModelReasoningSummary" }, "verbosity": { "$ref": "#/components/schemas/ModelVerbosity" }, "context_window_tokens": { "type": ["integer", "null"], "format": "int64", "minimum": 1 }, "auto_compact_token_limit": { "type": ["integer", "null"], "format": "int64", "minimum": 1 }, "reasoning_summary_support": { "$ref": "#/components/schemas/ModelReasoningSummarySupport" }, "service_tier": { "type": ["string", "null"], "minLength": 1, "maxLength": 64 }, "request_max_retries": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 }, "stream_max_retries": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 }, "stream_idle_timeout_ms": { "type": ["integer", "null"], "format": "int64", "minimum": 1 }, "request_settings": { "$ref": "#/components/schemas/ModelRequestSettings" } } },
+        "AgentModelSettingsOverride": { "type": "object", "additionalProperties": false, "properties": { "reasoning_effort": { "anyOf": [{ "$ref": "#/components/schemas/ReasoningEffort" }, { "type": "null" }] }, "reasoning_summary": { "anyOf": [{ "$ref": "#/components/schemas/ModelReasoningSummary" }, { "type": "null" }] }, "verbosity": { "anyOf": [{ "$ref": "#/components/schemas/ModelVerbosity" }, { "type": "null" }] }, "context_window_tokens": { "type": ["integer", "null"], "minimum": 1 }, "auto_compact_token_limit": { "type": ["integer", "null"], "minimum": 1 }, "reasoning_summary_support": { "anyOf": [{ "$ref": "#/components/schemas/ModelReasoningSummarySupport" }, { "type": "null" }] }, "service_tier": { "type": ["string", "null"], "minLength": 1, "maxLength": 64 }, "request_max_retries": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 }, "stream_max_retries": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 }, "stream_idle_timeout_ms": { "type": ["integer", "null"], "minimum": 1 }, "request_settings": { "anyOf": [{ "$ref": "#/components/schemas/ModelRequestSettings" }, { "type": "null" }] } } },
+        "ModelSelection": { "type": "object", "additionalProperties": false, "required": ["connection_id", "model_id"], "properties": { "connection_id": uuid(), "model_id": { "type": "string", "minLength": 1, "maxLength": 255 } } },
+        "RunModelBinding": { "type": "object", "additionalProperties": false, "required": ["id", "run_id", "binding_key", "model_connection_id", "connection_name_snapshot", "connection_scope_snapshot", "model_id", "api_type", "model_settings"], "properties": { "id": uuid(), "run_id": uuid(), "binding_key": { "type": "string" }, "model_connection_id": uuid(), "connection_name_snapshot": { "type": "string" }, "connection_scope_snapshot": { "$ref": "#/components/schemas/ModelConnectionScope" }, "model_id": { "type": "string" }, "api_type": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" } } },
+        "ModelConnection": { "type": "object", "additionalProperties": false, "required": ["id", "owner_id", "scope", "name", "base_url", "api_type", "allowed_model_ids", "status", "has_api_key", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": { "anyOf": [uuid(), { "type": "null" }] }, "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "name": { "type": "string" }, "base_url": { "type": "string", "format": "uri" }, "api_type": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "allowed_model_ids": { "type": "array", "minItems": 1, "maxItems": 256, "items": { "type": "string", "minLength": 1, "maxLength": 255 } }, "status": { "$ref": "#/components/schemas/ModelConnectionStatus" }, "has_api_key": { "type": "boolean" }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
+        "CreateModelConnectionRequest": { "type": "object", "additionalProperties": false, "required": ["scope", "name", "base_url", "api_type", "allowed_model_ids", "api_key"], "properties": { "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "name": { "type": "string", "minLength": 1, "maxLength": 128 }, "base_url": { "type": "string", "format": "uri" }, "api_type": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "allowed_model_ids": { "type": "array", "minItems": 1, "maxItems": 256, "items": { "type": "string", "minLength": 1, "maxLength": 255 } }, "api_key": { "type": "string", "minLength": 1, "format": "password", "writeOnly": true } } },
+        "UpdateModelConnectionRequest": { "type": "object", "additionalProperties": false, "required": ["name", "base_url", "api_type", "allowed_model_ids"], "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 128 }, "base_url": { "type": "string", "format": "uri" }, "api_type": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "allowed_model_ids": { "type": "array", "minItems": 1, "maxItems": 256, "items": { "type": "string", "minLength": 1, "maxLength": 255 } }, "api_key": { "type": ["string", "null"], "minLength": 1, "format": "password", "writeOnly": true } } },
         "UpdateModelConnectionStatusRequest": { "type": "object", "additionalProperties": false, "required": ["status"], "properties": { "status": { "$ref": "#/components/schemas/ModelConnectionStatus" } } },
-        "ModelConnectionOption": { "type": "object", "additionalProperties": false, "required": ["id", "name", "model_id", "upstream_protocol", "parameters", "request_parameters", "scope", "status"], "properties": { "id": uuid(), "name": { "type": "string" }, "model_id": { "type": "string" }, "upstream_protocol": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "parameters": { "$ref": "#/components/schemas/ModelConnectionParameters" }, "request_parameters": { "$ref": "#/components/schemas/ModelConnectionRequestParameters" }, "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "status": { "$ref": "#/components/schemas/ModelConnectionStatus" } } },
-        "ModelConnectionOptions": { "type": "object", "additionalProperties": false, "required": ["items", "system_default_model_connection_id"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/ModelConnectionOption" } }, "system_default_model_connection_id": { "anyOf": [uuid(), { "type": "null" }] } } },
-        "ModelConnectionTestResult": { "type": "object", "additionalProperties": false, "required": ["success", "status_code", "error_code", "message"], "properties": { "success": { "type": "boolean" }, "status_code": { "type": ["integer", "null"], "minimum": 100, "maximum": 599 }, "error_code": { "type": ["string", "null"] }, "message": { "type": ["string", "null"] } } },
-        "SystemDefaultModelConnection": { "type": "object", "additionalProperties": false, "required": ["model_connection_id"], "properties": { "model_connection_id": { "anyOf": [uuid(), { "type": "null" }] } } },
-        "SetSystemDefaultModelConnectionRequest": { "type": "object", "additionalProperties": false, "required": ["model_connection_id"], "properties": { "model_connection_id": { "anyOf": [uuid(), { "type": "null" }] } } },
-        "ModelConnectionSnapshot": { "type": "object", "additionalProperties": false, "required": ["id", "scope", "name", "model_id", "upstream_protocol"], "properties": { "id": { "anyOf": [uuid(), { "type": "null" }] }, "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "name": { "type": "string" }, "model_id": { "type": "string" }, "upstream_protocol": { "$ref": "#/components/schemas/ModelUpstreamProtocol" } } },
+        "ModelConnectionOption": { "type": "object", "additionalProperties": false, "required": ["connection_id", "connection_name", "model_id", "api_type", "scope", "status"], "properties": { "connection_id": uuid(), "connection_name": { "type": "string" }, "model_id": { "type": "string" }, "api_type": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "status": { "$ref": "#/components/schemas/ModelConnectionStatus" } } },
+        "ModelConnectionOptions": { "type": "object", "additionalProperties": false, "required": ["items", "system_default"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/ModelConnectionOption" } }, "system_default": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] } } },
+        "TestModelConnectionRequest": { "type": "object", "additionalProperties": false, "required": ["model_id", "message"], "properties": { "model_id": { "type": "string", "minLength": 1, "maxLength": 255 }, "message": { "type": "string", "minLength": 1, "maxLength": 4000 } } },
+        "ModelConnectionTestResult": { "type": "object", "additionalProperties": false, "required": ["success", "status_code", "error_code", "message", "response_text", "response_time_ms"], "properties": { "success": { "type": "boolean" }, "status_code": { "type": ["integer", "null"], "minimum": 100, "maximum": 599 }, "error_code": { "type": ["string", "null"] }, "message": { "type": ["string", "null"] }, "response_text": { "type": ["string", "null"] }, "response_time_ms": { "type": "integer", "format": "int64", "minimum": 0 } } },
+        "SystemDefaultModelSelection": { "type": "object", "additionalProperties": false, "required": ["selection"], "properties": { "selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] } } },
+        "SetSystemDefaultModelSelectionRequest": { "type": "object", "additionalProperties": false, "required": ["selection"], "properties": { "selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] } } },
+        "ModelConnectionSnapshot": { "type": "object", "additionalProperties": false, "required": ["id", "scope", "name", "model_id", "api_type", "request_settings"], "properties": { "id": { "anyOf": [uuid(), { "type": "null" }] }, "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "name": { "type": "string" }, "model_id": { "type": "string" }, "api_type": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "request_settings": { "$ref": "#/components/schemas/ModelRequestSettings" } } },
         "ModelAgentSnapshot": { "type": "object", "additionalProperties": false, "required": ["id", "name"], "properties": { "id": { "anyOf": [uuid(), { "type": "null" }] }, "name": { "type": "string" } } },
         "ModelUsageSubject": { "type": "object", "additionalProperties": false, "required": ["kind", "id", "display_name"], "properties": { "kind": { "type": "string", "enum": ["user", "integration_app", "system"] }, "id": { "anyOf": [uuid(), { "type": "null" }] }, "display_name": { "type": ["string", "null"] } } },
         "ModelTokenUsageTotals": { "type": "object", "additionalProperties": false, "required": ["input_tokens", "output_tokens", "total_tokens", "cached_tokens", "reasoning_tokens"], "properties": { "input_tokens": { "type": "integer", "minimum": 0 }, "output_tokens": { "type": "integer", "minimum": 0 }, "total_tokens": { "type": "integer", "minimum": 0 }, "cached_tokens": { "type": "integer", "minimum": 0 }, "reasoning_tokens": { "type": "integer", "minimum": 0 } } },
@@ -1039,10 +1047,10 @@ fn openapi_schemas() -> Value {
         "ModelTokenUsagePage": { "type": "object", "additionalProperties": false, "required": ["items", "next_cursor"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/ModelTokenUsage" } }, "next_cursor": { "anyOf": [{ "$ref": "#/components/schemas/ModelLedgerCursor" }, { "type": "null" }] } } },
         "ModelCallErrorPage": { "type": "object", "additionalProperties": false, "required": ["items", "next_cursor"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/ModelCallError" } }, "next_cursor": { "anyOf": [{ "$ref": "#/components/schemas/ModelLedgerCursor" }, { "type": "null" }] } } },
         "ReasoningEffort": { "type": "string", "enum": ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] },
-        "CodexSubagentDefinition": { "type": "object", "additionalProperties": false, "required": ["name", "description", "developer_instructions"], "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 64 }, "description": { "type": "string", "minLength": 1, "maxLength": 512 }, "developer_instructions": { "type": "string", "minLength": 1, "maxLength": 100000 }, "model_connection_id": { "anyOf": [uuid(), { "type": "null" }] }, "reasoning_effort": { "anyOf": [{ "$ref": "#/components/schemas/ReasoningEffort" }, { "type": "null" }] }, "enabled": { "type": "boolean", "default": true }, "disabled_reason": { "type": ["string", "null"] } } },
-        "Agent": { "type": "object", "required": ["id", "owner_id", "name", "instructions", "visibility", "default_model_connection_id", "reasoning_effort", "codex_subagents"], "properties": { "id": uuid(), "owner_id": uuid(), "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string", "enum": ["private", "public", "public_to"] }, "public_to": { "type": "array", "items": uuid() }, "runtime_id": { "anyOf": [uuid(), { "type": "null" }] }, "default_model_connection_id": { "anyOf": [uuid(), { "type": "null" }] }, "reasoning_effort": { "$ref": "#/components/schemas/ReasoningEffort" }, "codex_subagents": { "type": "array", "items": { "$ref": "#/components/schemas/CodexSubagentDefinition" } }, "can_view": { "type": "boolean" }, "can_manage": { "type": "boolean" }, "can_invoke": { "type": "boolean" } } },
-        "CreateAgentRequest": { "type": "object", "required": ["name", "instructions", "visibility"], "properties": { "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string" }, "public_to": { "type": "array", "items": uuid() }, "default_model_connection_id": { "anyOf": [uuid(), { "type": "null" }] }, "reasoning_effort": { "$ref": "#/components/schemas/ReasoningEffort" }, "codex_subagents": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/CodexSubagentDefinition" } } } },
-        "UpdateAgentRequest": { "type": "object", "additionalProperties": false, "required": ["name", "instructions", "visibility", "public_to", "runtime_id", "default_model_connection_id", "reasoning_effort", "codex_subagents", "sandbox_policy", "managed_skill_ids", "mcp_allowlist"], "properties": { "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string" }, "public_to": { "type": "array", "items": uuid() }, "runtime_id": { "anyOf": [uuid(), { "type": "null" }] }, "default_model_connection_id": { "anyOf": [uuid(), { "type": "null" }] }, "reasoning_effort": { "$ref": "#/components/schemas/ReasoningEffort" }, "codex_subagents": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/CodexSubagentDefinition" } }, "sandbox_policy": { "type": "object" }, "managed_skill_ids": { "type": "array", "items": uuid() }, "mcp_allowlist": {} } },
+        "CodexSubagentDefinition": { "type": "object", "additionalProperties": false, "required": ["name", "description", "developer_instructions"], "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 64 }, "description": { "type": "string", "minLength": 1, "maxLength": 512 }, "developer_instructions": { "type": "string", "minLength": 1, "maxLength": 100000 }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings_override": { "$ref": "#/components/schemas/AgentModelSettingsOverride" }, "enabled": { "type": "boolean", "default": true }, "disabled_reason": { "type": ["string", "null"] } } },
+        "Agent": { "type": "object", "required": ["id", "owner_id", "name", "instructions", "visibility", "public_to", "runtime_id", "model_selection", "model_settings", "codex_subagents", "model_policy", "sandbox_policy", "managed_skill_ids", "mcp_allowlist", "is_owner", "can_manage", "can_administer", "can_invoke", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": uuid(), "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string", "enum": ["private", "public", "public_to"] }, "public_to": { "type": "array", "items": uuid() }, "runtime_id": { "anyOf": [uuid(), { "type": "null" }] }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "codex_subagents": { "type": "array", "items": { "$ref": "#/components/schemas/CodexSubagentDefinition" } }, "model_policy": {}, "sandbox_policy": {}, "managed_skill_ids": { "type": "array", "items": uuid() }, "mcp_allowlist": {}, "is_owner": { "type": "boolean" }, "can_manage": { "type": "boolean" }, "can_administer": { "type": "boolean" }, "can_invoke": { "type": "boolean" }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
+        "CreateAgentRequest": { "type": "object", "additionalProperties": false, "required": ["name", "instructions", "visibility"], "properties": { "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string" }, "public_to": { "type": "array", "items": uuid() }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "codex_subagents": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/CodexSubagentDefinition" } } } },
+        "UpdateAgentRequest": { "type": "object", "additionalProperties": false, "required": ["name", "instructions", "visibility", "public_to", "runtime_id", "model_selection", "model_settings", "codex_subagents", "sandbox_policy", "managed_skill_ids", "mcp_allowlist"], "properties": { "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string" }, "public_to": { "type": "array", "items": uuid() }, "runtime_id": { "anyOf": [uuid(), { "type": "null" }] }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "codex_subagents": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/CodexSubagentDefinition" } }, "sandbox_policy": { "type": "object" }, "managed_skill_ids": { "type": "array", "items": uuid() }, "mcp_allowlist": {} } },
         "Run": { "type": "object", "required": ["id", "agent_id", "automation_id", "integration_session_id", "parent_run_id", "runtime_id", "hub_session_id", "hub_message_id", "hub_turn_id", "session_ownership_generation", "status", "initial_message", "session_id", "work_dir_ref", "source", "created_at", "updated_at"], "properties": { "id": uuid(), "agent_id": uuid(), "automation_id": { "anyOf": [uuid(), { "type": "null" }] }, "integration_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "parent_run_id": { "anyOf": [uuid(), { "type": "null" }] }, "runtime_id": { "anyOf": [uuid(), { "type": "null" }] }, "hub_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "hub_message_id": { "anyOf": [uuid(), { "type": "null" }] }, "hub_turn_id": { "anyOf": [uuid(), { "type": "null" }] }, "session_ownership_generation": { "type": ["integer", "null"] }, "status": { "type": "string" }, "initial_message": { "type": "string" }, "session_id": { "type": ["string", "null"] }, "work_dir_ref": { "type": ["string", "null"] }, "source": { "type": "string" }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
         "RunListResponse": { "type": "object", "required": ["items", "total", "page", "page_size"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/Run" } }, "total": { "type": "integer", "minimum": 0 }, "page": { "type": "integer", "minimum": 1 }, "page_size": { "type": "integer", "minimum": 1, "maximum": 100 } } },
         "CreateRunRequest": { "type": "object", "required": ["message"], "properties": { "message": { "type": "string" }, "hub_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "parent_run_id": { "anyOf": [uuid(), { "type": "null" }] }, "client_message_key": { "type": ["string", "null"] } } },
@@ -1096,7 +1104,7 @@ fn openapi_schemas() -> Value {
         "RuntimeBeginTurnRequest": { "type": "object", "additionalProperties": false, "required": ["ownership_generation", "payload"], "properties": { "ownership_generation": { "type": "integer", "minimum": 1 }, "payload": { "$ref": "#/components/schemas/BeginRuntimeTurnRequest" } } },
         "BeginRuntimeTurnResponse": { "type": "object", "additionalProperties": false, "required": ["session_id", "turn_id", "ownership_generation", "configuration_fingerprint", "messages"], "properties": { "session_id": uuid(), "turn_id": uuid(), "ownership_generation": { "type": "integer", "minimum": 1 }, "configuration_fingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }, "messages": { "type": "array", "items": { "$ref": "#/components/schemas/HubSessionMessage" } } } },
         "ClaimRunResponse": { "type": "object", "required": ["run", "agent", "execution_configuration", "expected_configuration_fingerprint", "integration_context", "resume", "model_proxy_token", "session_context"], "properties": { "run": { "$ref": "#/components/schemas/Run" }, "agent": { "$ref": "#/components/schemas/Agent" }, "execution_configuration": { "$ref": "#/components/schemas/AgentExecutionConfiguration" }, "expected_configuration_fingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }, "integration_context": {}, "resume": {}, "model_proxy_token": { "type": "string" }, "session_context": {} } },
-        "AgentExecutionConfiguration": { "type": "object", "additionalProperties": false, "required": ["revision", "instructions", "default_model_connection_id", "reasoning_effort", "codex_subagents", "model_connections", "model_policy", "sandbox_policy", "skills", "mcp_allowlist"], "properties": { "revision": { "type": "integer", "minimum": 1 }, "instructions": { "type": "string" }, "default_model_connection_id": { "anyOf": [uuid(), { "type": "null" }] }, "reasoning_effort": { "$ref": "#/components/schemas/ReasoningEffort" }, "codex_subagents": { "type": "array", "items": { "$ref": "#/components/schemas/CodexSubagentDefinition" } }, "model_connections": { "type": "array", "items": { "$ref": "#/components/schemas/ModelConnectionOption" } }, "model_policy": {}, "sandbox_policy": {}, "skills": { "type": "array", "items": { "$ref": "#/components/schemas/AgentExecutionSkill" } }, "mcp_allowlist": {} } },
+        "AgentExecutionConfiguration": { "type": "object", "additionalProperties": false, "required": ["revision", "instructions", "model_selection", "model_settings", "codex_subagents", "model_bindings", "model_policy", "sandbox_policy", "skills", "mcp_allowlist"], "properties": { "revision": { "type": "integer", "minimum": 1 }, "instructions": { "type": "string" }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "codex_subagents": { "type": "array", "items": { "$ref": "#/components/schemas/CodexSubagentDefinition" } }, "model_bindings": { "type": "array", "items": { "$ref": "#/components/schemas/RunModelBinding" } }, "model_policy": {}, "sandbox_policy": {}, "skills": { "type": "array", "items": { "$ref": "#/components/schemas/AgentExecutionSkill" } }, "mcp_allowlist": {} } },
         "AgentExecutionSkill": { "type": "object", "additionalProperties": false, "required": ["source", "source_id", "name", "description", "content", "revision", "content_checksum_sha256"], "properties": { "source": { "type": "string", "enum": ["managed"] }, "source_id": { "anyOf": [uuid(), { "type": "null" }] }, "name": { "type": "string" }, "description": { "type": "string" }, "content": { "type": "string" }, "revision": { "type": "integer", "minimum": 1 }, "content_checksum_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" } } },
         "AppendRunEventRequest": { "type": "object", "required": ["event_type", "role", "content", "payload", "waiting_tool"], "properties": { "event_type": { "type": "string" }, "role": { "type": ["string", "null"] }, "content": { "type": ["string", "null"] }, "payload": {}, "waiting_tool": {} } },
         "FinalizeToolRequestsRequest": { "type": "object", "required": ["integration_session_id", "session_id", "work_dir_ref", "tool_requests"], "properties": { "integration_session_id": uuid(), "session_id": { "type": "string" }, "work_dir_ref": { "type": "string" }, "tool_requests": { "type": "array", "items": { "type": "object" } } } },
@@ -2605,18 +2613,10 @@ async fn list_model_connections(
 ) -> Result<Json<Vec<ModelConnectionDto>>, ApiError> {
     let user = require_user(&state, &headers).await?;
     let rows = sqlx::query(
-        "SELECT c.id, c.owner_id, c.scope, c.name, c.base_url, c.model_id,
-                c.upstream_protocol, c.request_parameters,
-                c.reasoning_effort, c.reasoning_summary,
-                c.verbosity, c.context_window_tokens, c.auto_compact_token_limit,
-                c.reasoning_summary_support, c.service_tier,
-                c.request_max_retries, c.stream_max_retries,
-                c.stream_idle_timeout_ms,
-                c.enabled, c.created_at, c.updated_at,
-                EXISTS(
-                    SELECT 1 FROM system_default_model_connection d
-                    WHERE d.model_connection_id = c.id
-                ) AS is_system_default
+        "SELECT c.id, c.owner_id, c.scope, c.name, c.base_url, c.api_type,
+                c.allowed_model_ids, c.enabled,
+                (c.api_key_ciphertext IS NOT NULL) AS has_api_key,
+                c.created_at, c.updated_at
          FROM model_connections c
          WHERE c.deleted_at IS NULL
            AND (c.scope = 'global' OR c.owner_id = $1)
@@ -2640,25 +2640,34 @@ async fn get_model_connection_options(
         .await?
         .0
         .into_iter()
-        .map(|connection| ModelConnectionOptionDto {
-            id: connection.id,
-            name: connection.name,
-            model_id: connection.model_id,
-            upstream_protocol: connection.upstream_protocol,
-            parameters: connection.parameters,
-            request_parameters: connection.request_parameters,
-            scope: connection.scope,
-            status: connection.status,
+        .flat_map(|connection| {
+            connection
+                .allowed_model_ids
+                .into_iter()
+                .map(move |model_id| ModelConnectionOptionDto {
+                    connection_id: connection.id,
+                    connection_name: connection.name.clone(),
+                    model_id,
+                    api_type: connection.api_type,
+                    scope: connection.scope,
+                    status: connection.status,
+                })
         })
         .collect();
-    let system_default_model_connection_id = sqlx::query_scalar(
-        "SELECT model_connection_id FROM system_default_model_connection WHERE singleton = true",
+    let system_default = sqlx::query(
+        "SELECT model_connection_id, model_id
+         FROM system_default_model_selection
+         WHERE singleton = true",
     )
     .fetch_optional(&state.pool)
-    .await?;
+    .await?
+    .map(|row| ModelSelectionDto {
+        connection_id: row.get("model_connection_id"),
+        model_id: row.get("model_id"),
+    });
     Ok(Json(ModelConnectionOptionsDto {
         items,
-        system_default_model_connection_id,
+        system_default,
     }))
 }
 
@@ -2670,21 +2679,16 @@ async fn create_model_connection(
     let user = require_user(&state, &headers).await?;
     if req.scope == ModelConnectionScope::Global && !is_admin_role(&user.role) {
         return Err(ApiError::forbidden(
-            "administrator permission is required for Global Model Connections",
+            "administrator permission is required for Global Model API Connections",
         ));
     }
+    let allowed_model_ids = normalize_allowed_model_ids(req.allowed_model_ids)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let fields = validate_model_connection_fields(
         &req.name,
         &req.base_url,
-        &req.model_id,
+        allowed_model_ids,
         Some(&req.api_key),
-    )?;
-    let parameters = validate_model_connection_parameters(req.parameters)?;
-    let request_parameters = validate_model_connection_request_parameters(
-        req.upstream_protocol,
-        req.request_parameters.unwrap_or_else(|| {
-            ModelConnectionRequestParameters::for_protocol(req.upstream_protocol)
-        }),
     )?;
     let encrypted = state
         .model_secret_cipher
@@ -2697,42 +2701,17 @@ async fn create_model_connection(
     };
     sqlx::query(
         "INSERT INTO model_connections
-             (id, scope, owner_id, name, base_url, model_id, upstream_protocol,
-              request_parameters, reasoning_effort, reasoning_summary, verbosity,
-              context_window_tokens, auto_compact_token_limit,
-              reasoning_summary_support, service_tier, request_max_retries,
-              stream_max_retries, stream_idle_timeout_ms,
-              api_key_ciphertext, api_key_nonce, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                 $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)",
+             (id, scope, owner_id, name, base_url, api_type,
+              allowed_model_ids, api_key_ciphertext, api_key_nonce, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(id)
     .bind(scope)
     .bind(owner_id)
     .bind(fields.name)
     .bind(fields.base_url)
-    .bind(fields.model_id)
-    .bind(model_upstream_protocol_name(req.upstream_protocol))
-    .bind(
-        serde_json::to_value(&request_parameters)
-            .map_err(|_| ApiError::internal("model request parameters could not be encoded"))?,
-    )
-    .bind(reasoning_effort_name(parameters.reasoning_effort))
-    .bind(model_reasoning_summary_name(parameters.reasoning_summary))
-    .bind(model_verbosity_name(parameters.verbosity))
-    .bind(parameters.context_window_tokens.map(|value| value as i64))
-    .bind(
-        parameters
-            .auto_compact_token_limit
-            .map(|value| value as i64),
-    )
-    .bind(model_reasoning_summary_support_name(
-        parameters.reasoning_summary_support,
-    ))
-    .bind(parameters.service_tier.as_deref())
-    .bind(parameters.request_max_retries.map(|value| value as i32))
-    .bind(parameters.stream_max_retries.map(|value| value as i32))
-    .bind(parameters.stream_idle_timeout_ms.map(|value| value as i64))
+    .bind(model_upstream_protocol_name(req.api_type))
+    .bind(fields.allowed_model_ids)
     .bind(encrypted.ciphertext)
     .bind(encrypted.nonce)
     .bind(user.id)
@@ -2755,17 +2734,26 @@ async fn get_model_connection(
     ))
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct UpdateModelConnectionQuery {
+    #[serde(default)]
+    force: bool,
+}
+
 async fn update_model_connection(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(model_connection_id): Path<Uuid>,
+    Query(query): Query<UpdateModelConnectionQuery>,
     Json(req): Json<UpdateModelConnectionRequest>,
 ) -> Result<Json<ModelConnectionDto>, ApiError> {
     let user = require_user(&state, &headers).await?;
+    let allowed_model_ids = normalize_allowed_model_ids(req.allowed_model_ids)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let fields = validate_model_connection_fields(
         &req.name,
         &req.base_url,
-        &req.model_id,
+        allowed_model_ids,
         req.api_key.as_deref(),
     )?;
     let encrypted = req
@@ -2775,79 +2763,59 @@ async fn update_model_connection(
         .transpose()
         .map_err(|_| ApiError::internal("model secret encryption failed"))?;
     let mut tx = state.pool.begin().await?;
+    sqlx::query(
+        "LOCK TABLE system_default_model_selection, agents, codex_subagent_definitions
+         IN SHARE ROW EXCLUSIVE MODE",
+    )
+    .execute(&mut *tx)
+    .await?;
     load_mutable_model_connection_tx(&mut tx, model_connection_id, &user).await?;
     let previous = sqlx::query(
-        "SELECT name, model_id, upstream_protocol, request_parameters, reasoning_effort,
-                reasoning_summary, verbosity, context_window_tokens,
-                auto_compact_token_limit, reasoning_summary_support,
-                service_tier, request_max_retries, stream_max_retries,
-                stream_idle_timeout_ms
-         FROM model_connections WHERE id = $1 FOR UPDATE",
+        "SELECT name, api_type, allowed_model_ids
+         FROM model_connections WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
     )
     .bind(model_connection_id)
     .fetch_one(&mut *tx)
     .await?;
-    let previous_upstream_protocol =
-        model_upstream_protocol_from_name(&previous.get::<String, _>("upstream_protocol"));
-    let upstream_protocol = req.upstream_protocol.unwrap_or(previous_upstream_protocol);
-    let upstream_protocol_name = model_upstream_protocol_name(upstream_protocol);
-    let previous_parameters = model_connection_parameters_from_row(&previous);
-    let previous_request_parameters = model_connection_request_parameters_from_row(&previous);
-    let parameters = req
-        .parameters
-        .map(validate_model_connection_parameters)
-        .transpose()?
-        .unwrap_or_else(|| previous_parameters.clone());
-    let request_parameters = match req.request_parameters {
-        Some(parameters) => {
-            validate_model_connection_request_parameters(upstream_protocol, parameters)?
-        }
-        None if upstream_protocol != previous_upstream_protocol => {
-            ModelConnectionRequestParameters::for_protocol(upstream_protocol)
-        }
-        None => previous_request_parameters.clone(),
-    };
+    let previous_name: String = previous.get("name");
+    let previous_api_type: String = previous.get("api_type");
+    let previous_allowed_model_ids: Vec<String> = previous.get("allowed_model_ids");
+    let api_type_name = model_upstream_protocol_name(req.api_type);
+    let api_type_changed = previous_api_type != api_type_name;
+    let allowed = fields
+        .allowed_model_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let removed_model_ids = previous_allowed_model_ids
+        .into_iter()
+        .filter(|model_id| !allowed.contains(model_id))
+        .collect::<Vec<_>>();
+    if query.force && (api_type_changed || !removed_model_ids.is_empty()) {
+        clear_model_selection_references_tx(
+            &mut tx,
+            model_connection_id,
+            &removed_model_ids,
+            api_type_changed,
+            "model_selection_removed",
+        )
+        .await?;
+    }
     let (api_key_ciphertext, api_key_nonce) = encrypted
         .map(|encrypted| (Some(encrypted.ciphertext), Some(encrypted.nonce)))
         .unwrap_or((None, None));
     let updated = sqlx::query(
         "UPDATE model_connections
-         SET name = $1, base_url = $2, model_id = $3, upstream_protocol = $4,
-             request_parameters = $5,
-             reasoning_effort = $6, reasoning_summary = $7, verbosity = $8,
-             context_window_tokens = $9, auto_compact_token_limit = $10,
-             reasoning_summary_support = $11, service_tier = $12,
-             request_max_retries = $13, stream_max_retries = $14,
-             stream_idle_timeout_ms = $15,
-             api_key_ciphertext = COALESCE($16, api_key_ciphertext),
-             api_key_nonce = COALESCE($17, api_key_nonce),
+         SET name = $1, base_url = $2, api_type = $3, allowed_model_ids = $4,
+             api_key_ciphertext = COALESCE($5, api_key_ciphertext),
+             api_key_nonce = COALESCE($6, api_key_nonce),
              updated_at = CURRENT_TIMESTAMP(3)
-         WHERE id = $18 AND deleted_at IS NULL",
+         WHERE id = $7 AND deleted_at IS NULL",
     )
     .bind(&fields.name)
     .bind(&fields.base_url)
-    .bind(&fields.model_id)
-    .bind(upstream_protocol_name)
-    .bind(
-        serde_json::to_value(&request_parameters)
-            .map_err(|_| ApiError::internal("model request parameters could not be encoded"))?,
-    )
-    .bind(reasoning_effort_name(parameters.reasoning_effort))
-    .bind(model_reasoning_summary_name(parameters.reasoning_summary))
-    .bind(model_verbosity_name(parameters.verbosity))
-    .bind(parameters.context_window_tokens.map(|value| value as i64))
-    .bind(
-        parameters
-            .auto_compact_token_limit
-            .map(|value| value as i64),
-    )
-    .bind(model_reasoning_summary_support_name(
-        parameters.reasoning_summary_support,
-    ))
-    .bind(parameters.service_tier.as_deref())
-    .bind(parameters.request_max_retries.map(|value| value as i32))
-    .bind(parameters.stream_max_retries.map(|value| value as i32))
-    .bind(parameters.stream_idle_timeout_ms.map(|value| value as i64))
+    .bind(api_type_name)
+    .bind(&fields.allowed_model_ids)
     .bind(api_key_ciphertext)
     .bind(api_key_nonce)
     .bind(model_connection_id)
@@ -2857,12 +2825,7 @@ async fn update_model_connection(
     if updated.rows_affected() == 0 {
         return Err(ApiError::not_found("model connection not found"));
     }
-    if previous.get::<String, _>("name") != fields.name
-        || previous.get::<String, _>("model_id") != fields.model_id
-        || previous.get::<String, _>("upstream_protocol") != upstream_protocol_name
-        || previous_parameters != parameters
-        || previous_request_parameters != request_parameters
-    {
+    if previous_name != fields.name || api_type_changed {
         bump_agents_for_model_connection_tx(&mut tx, model_connection_id).await?;
     }
     tx.commit().await?;
@@ -2892,7 +2855,7 @@ async fn update_model_connection_status(
     .await?;
     bump_agents_for_model_connection_tx(&mut tx, model_connection_id).await?;
     if !enabled {
-        sqlx::query("DELETE FROM system_default_model_connection WHERE model_connection_id = $1")
+        sqlx::query("DELETE FROM system_default_model_selection WHERE model_connection_id = $1")
             .bind(model_connection_id)
             .execute(&mut *tx)
             .await?;
@@ -2929,7 +2892,7 @@ async fn bump_agents_for_model_connection_tx(
              updated_at = CURRENT_TIMESTAMP(3)
          WHERE agent.deleted_at IS NULL
            AND (
-               agent.default_model_connection_id = $1
+               agent.model_connection_id = $1
                OR EXISTS (
                    SELECT 1 FROM codex_subagent_definitions AS subagent
                    WHERE subagent.agent_id = agent.id
@@ -2938,6 +2901,73 @@ async fn bump_agents_for_model_connection_tx(
            )",
     )
     .bind(model_connection_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn clear_model_selection_references_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    model_connection_id: Uuid,
+    removed_model_ids: &[String],
+    all_models: bool,
+    disabled_reason: &str,
+) -> Result<(), ApiError> {
+    if !all_models && removed_model_ids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "DELETE FROM system_default_model_selection
+         WHERE model_connection_id = $1
+           AND ($3 OR model_id = ANY($2))",
+    )
+    .bind(model_connection_id)
+    .bind(removed_model_ids)
+    .bind(all_models)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE agents AS agent
+         SET model_connection_id = NULL, model_id = NULL,
+             execution_config_revision = execution_config_revision + 1,
+             updated_at = CURRENT_TIMESTAMP(3)
+         WHERE agent.deleted_at IS NULL
+           AND agent.model_connection_id = $1
+           AND ($3 OR agent.model_id = ANY($2))",
+    )
+    .bind(model_connection_id)
+    .bind(removed_model_ids)
+    .bind(all_models)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE agents AS agent
+         SET execution_config_revision = execution_config_revision + 1,
+             updated_at = CURRENT_TIMESTAMP(3)
+         WHERE agent.deleted_at IS NULL
+           AND EXISTS (
+               SELECT 1 FROM codex_subagent_definitions AS subagent
+               WHERE subagent.agent_id = agent.id
+                 AND subagent.model_connection_id = $1
+                 AND ($3 OR subagent.model_id = ANY($2))
+           )",
+    )
+    .bind(model_connection_id)
+    .bind(removed_model_ids)
+    .bind(all_models)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE codex_subagent_definitions
+         SET model_connection_id = NULL, model_id = NULL, enabled = false,
+             disabled_reason = $4, updated_at = CURRENT_TIMESTAMP(3)
+         WHERE model_connection_id = $1
+           AND ($3 OR model_id = ANY($2))",
+    )
+    .bind(model_connection_id)
+    .bind(removed_model_ids)
+    .bind(all_models)
+    .bind(disabled_reason)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -2952,7 +2982,7 @@ async fn delete_model_connection_impl(
     let user = require_user(state, headers).await?;
     let mut tx = state.pool.begin().await?;
     sqlx::query(
-        "LOCK TABLE system_default_model_connection, agents, codex_subagent_definitions
+        "LOCK TABLE system_default_model_selection, agents, codex_subagent_definitions
          IN SHARE ROW EXCLUSIVE MODE",
     )
     .execute(&mut *tx)
@@ -2960,7 +2990,7 @@ async fn delete_model_connection_impl(
     load_mutable_model_connection_tx(&mut tx, model_connection_id, &user).await?;
     let is_system_default: bool = sqlx::query_scalar(
         "SELECT EXISTS(
-             SELECT 1 FROM system_default_model_connection
+             SELECT 1 FROM system_default_model_selection
              WHERE model_connection_id = $1
          )",
     )
@@ -2969,7 +2999,7 @@ async fn delete_model_connection_impl(
     .await?;
     let agent_references: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM agents
-         WHERE default_model_connection_id = $1 AND deleted_at IS NULL",
+         WHERE model_connection_id = $1 AND deleted_at IS NULL",
     )
     .bind(model_connection_id)
     .fetch_one(&mut *tx)
@@ -2983,47 +3013,20 @@ async fn delete_model_connection_impl(
     .await?;
     if !force && (is_system_default || agent_references > 0 || subagent_references > 0) {
         return Err(ApiError::conflict(format!(
-            "Model Connection is referenced by System Default ({}), Agents ({}), subagents ({})",
+            "Model API Connection is referenced by System Default ({}), Agents ({}), subagents ({})",
             i64::from(is_system_default),
             agent_references,
             subagent_references
         )));
     }
     if force {
-        sqlx::query("DELETE FROM system_default_model_connection WHERE model_connection_id = $1")
-            .bind(model_connection_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query(
-            "UPDATE agents AS agent
-             SET default_model_connection_id = CASE
-                     WHEN default_model_connection_id = $1 THEN NULL
-                     ELSE default_model_connection_id
-                 END,
-                 execution_config_revision = execution_config_revision + 1,
-                 updated_at = CURRENT_TIMESTAMP(3)
-             WHERE deleted_at IS NULL
-               AND (
-                   default_model_connection_id = $1
-                   OR EXISTS (
-                       SELECT 1 FROM codex_subagent_definitions AS subagent
-                       WHERE subagent.agent_id = agent.id
-                         AND subagent.model_connection_id = $1
-                   )
-               )",
+        clear_model_selection_references_tx(
+            &mut tx,
+            model_connection_id,
+            &[],
+            true,
+            "model_connection_deleted",
         )
-        .bind(model_connection_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE codex_subagent_definitions
-             SET model_connection_id = NULL, enabled = false,
-                 disabled_reason = 'model_connection_deleted',
-                 updated_at = CURRENT_TIMESTAMP(3)
-             WHERE model_connection_id = $1",
-        )
-        .bind(model_connection_id)
-        .execute(&mut *tx)
         .await?;
     }
     sqlx::query(
@@ -3040,67 +3043,76 @@ async fn delete_model_connection_impl(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn get_system_default_model_connection(
+async fn get_system_default_model_selection(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-) -> Result<Json<SystemDefaultModelConnectionDto>, ApiError> {
+) -> Result<Json<SystemDefaultModelSelectionDto>, ApiError> {
     require_user(&state, &headers).await?;
-    let model_connection_id = sqlx::query_scalar(
-        "SELECT model_connection_id FROM system_default_model_connection WHERE singleton = true",
+    let selection = sqlx::query(
+        "SELECT model_connection_id, model_id
+         FROM system_default_model_selection
+         WHERE singleton = true",
     )
     .fetch_optional(&state.pool)
-    .await?;
-    Ok(Json(SystemDefaultModelConnectionDto {
-        model_connection_id,
-    }))
+    .await?
+    .map(|row| ModelSelectionDto {
+        connection_id: row.get("model_connection_id"),
+        model_id: row.get("model_id"),
+    });
+    Ok(Json(SystemDefaultModelSelectionDto { selection }))
 }
 
-async fn set_system_default_model_connection(
+async fn set_system_default_model_selection(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(req): Json<SetSystemDefaultModelConnectionRequest>,
-) -> Result<Json<SystemDefaultModelConnectionDto>, ApiError> {
+    Json(req): Json<SetSystemDefaultModelSelectionRequest>,
+) -> Result<Json<SystemDefaultModelSelectionDto>, ApiError> {
     let administrator = require_administrator(&state, &headers).await?;
     let mut tx = state.pool.begin().await?;
-    match req.model_connection_id {
-        Some(model_connection_id) => {
+    match req.selection.as_ref() {
+        Some(selection) => {
             let valid = sqlx::query_scalar::<_, Uuid>(
                 "SELECT id FROM model_connections
                  WHERE id = $1 AND scope = 'global' AND enabled = true
-                   AND deleted_at IS NULL
+                   AND deleted_at IS NULL AND $2 = ANY(allowed_model_ids)
                  FOR UPDATE",
             )
-            .bind(model_connection_id)
+            .bind(selection.connection_id)
+            .bind(&selection.model_id)
             .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| {
-                ApiError::bad_request("System Default must be an enabled Global Model Connection")
+                ApiError::bad_request(
+                    "System Default must be an allowed model on an enabled Global Model API Connection",
+                )
             })?;
-            debug_assert_eq!(valid, model_connection_id);
+            debug_assert_eq!(valid, selection.connection_id);
             sqlx::query(
-                "INSERT INTO system_default_model_connection
-                     (singleton, model_connection_id, updated_by)
-                 VALUES (true, $1, $2)
+                "INSERT INTO system_default_model_selection
+                     (singleton, model_connection_id, model_id, updated_by)
+                 VALUES (true, $1, $2, $3)
                  ON CONFLICT (singleton) DO UPDATE
                  SET model_connection_id = EXCLUDED.model_connection_id,
+                     model_id = EXCLUDED.model_id,
                      updated_by = EXCLUDED.updated_by,
                      updated_at = CURRENT_TIMESTAMP(3)",
             )
-            .bind(model_connection_id)
+            .bind(selection.connection_id)
+            .bind(&selection.model_id)
             .bind(administrator.id)
             .execute(&mut *tx)
             .await
             .map_err(map_model_connection_write_error)?;
         }
         None => {
-            sqlx::query("DELETE FROM system_default_model_connection WHERE singleton = true")
+            sqlx::query("DELETE FROM system_default_model_selection WHERE singleton = true")
                 .execute(&mut *tx)
                 .await?;
         }
     }
     tx.commit().await?;
-    Ok(Json(SystemDefaultModelConnectionDto {
-        model_connection_id: req.model_connection_id,
+    Ok(Json(SystemDefaultModelSelectionDto {
+        selection: req.selection,
     }))
 }
 
@@ -3108,10 +3120,29 @@ async fn test_model_connection(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(model_connection_id): Path<Uuid>,
+    Json(req): Json<TestModelConnectionRequest>,
 ) -> Result<Json<ModelConnectionTestResultDto>, ApiError> {
     let user = require_user(&state, &headers).await?;
     let connection =
         load_model_connection_secret_for_test(&state.pool, model_connection_id, &user).await?;
+    let model_id = req.model_id.trim();
+    if !connection
+        .dto
+        .allowed_model_ids
+        .iter()
+        .any(|allowed| allowed == model_id)
+    {
+        return Err(ApiError::bad_request(
+            "Model ID is not allowed by this Model API Connection",
+        ));
+    }
+    let message = req.message.trim();
+    if message.is_empty() || message.chars().count() > 4_000 {
+        return Err(ApiError::bad_request(
+            "Model Connection test message must be 1 to 4000 characters",
+        ));
+    }
+    let request_settings = ModelRequestSettings::for_protocol(connection.dto.api_type);
     let api_key = Zeroizing::new(
         state
             .model_secret_cipher
@@ -3119,19 +3150,28 @@ async fn test_model_connection(
             .map_err(|_| ApiError::internal("model secret decryption failed"))?,
     );
     let request_id = Uuid::new_v4();
+    let ledger_context = ModelTestLedgerContext {
+        pool: &state.pool,
+        request_id,
+        connection: &connection.dto,
+        model_id,
+        request_settings: &request_settings,
+        user: &user,
+    };
     let request_body = serde_json::to_vec(&json!({
-    "model": connection.dto.model_id,
-    "input": "Respond with one token.",
-    "max_output_tokens": 1
+        "model": model_id,
+        "input": message,
+        "max_output_tokens": 256
     }))
     .map_err(|_| ApiError::internal("failed to encode Model Connection test request"))?;
     let request_headers = HeaderMap::new();
+    let started_at = Instant::now();
     let response = send_model_gateway_request(
         &state,
         ModelGatewayForwardRequest {
             request_id,
-            upstream_protocol: connection.dto.upstream_protocol,
-            request_parameters: &connection.dto.request_parameters,
+            upstream_protocol: connection.dto.api_type,
+            request_settings: &request_settings,
             upstream_url: &connection.dto.base_url,
             query: None,
             headers: &request_headers,
@@ -3144,10 +3184,7 @@ async fn test_model_connection(
         Ok(response) => response,
         Err(_) => {
             record_model_test_error(
-                &state.pool,
-                request_id,
-                &connection.dto,
-                &user,
+                &ledger_context,
                 "transport_error",
                 None,
                 "transport_error",
@@ -3160,6 +3197,8 @@ async fn test_model_connection(
                 status_code: None,
                 error_code: Some("transport_error".into()),
                 message: Some("connection request failed".into()),
+                response_text: None,
+                response_time_ms: model_test_response_time_ms(started_at),
             }));
         }
     };
@@ -3170,10 +3209,7 @@ async fn test_model_connection(
             let error_code = "response_body_error";
             let message = "failed to read Model Connection test response";
             record_model_test_error(
-                &state.pool,
-                request_id,
-                &connection.dto,
-                &user,
+                &ledger_context,
                 "transport_error",
                 Some(status.as_u16()),
                 "response_body",
@@ -3186,22 +3222,17 @@ async fn test_model_connection(
                 status_code: Some(status.as_u16()),
                 error_code: Some(error_code.into()),
                 message: Some(message.into()),
+                response_text: None,
+                response_time_ms: model_test_response_time_ms(started_at),
             }));
         }
     };
+    let response_time_ms = model_test_response_time_ms(started_at);
     let value = serde_json::from_slice::<Value>(&body).ok();
     let response_status = model_response_status(value.as_ref(), status.is_success());
     let usage = value.as_ref().and_then(extract_model_usage);
     if let Some(usage) = usage.as_ref() {
-        record_model_test_usage(
-            &state.pool,
-            request_id,
-            &connection.dto,
-            &user,
-            response_status,
-            usage,
-        )
-        .await?;
+        record_model_test_usage(&ledger_context, response_status, usage).await?;
     }
     let completed = status.is_success() && response_status == "completed" && usage.is_some();
     if completed {
@@ -3210,6 +3241,8 @@ async fn test_model_connection(
             status_code: Some(status.as_u16()),
             error_code: None,
             message: None,
+            response_text: value.as_ref().and_then(model_test_response_text),
+            response_time_ms,
         }));
     }
     let error_code = value
@@ -3246,10 +3279,7 @@ async fn test_model_connection(
         "failed"
     };
     record_model_test_error(
-        &state.pool,
-        request_id,
-        &connection.dto,
-        &user,
+        &ledger_context,
         ledger_status,
         Some(status.as_u16()),
         if status.is_success() {
@@ -3266,35 +3296,60 @@ async fn test_model_connection(
         status_code: Some(status.as_u16()),
         error_code,
         message: Some(message),
+        response_text: None,
+        response_time_ms,
     }))
+}
+
+fn model_test_response_time_ms(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn model_test_response_text(value: &Value) -> Option<String> {
+    if let Some(text) = value
+        .get("output_text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+    {
+        return Some(text.to_owned());
+    }
+
+    let mut chunks = Vec::new();
+    for item in value.get("output").and_then(Value::as_array)? {
+        let Some(content) = item.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for part in content {
+            let text = match part.get("type").and_then(Value::as_str) {
+                Some("output_text" | "text") => part.get("text").and_then(Value::as_str),
+                Some("refusal") => part.get("refusal").and_then(Value::as_str),
+                _ => None,
+            };
+            if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
+                chunks.push(text);
+            }
+        }
+    }
+    (!chunks.is_empty()).then(|| chunks.join("\n"))
 }
 
 #[derive(Debug)]
 struct ValidatedModelConnectionFields {
     name: String,
     base_url: String,
-    model_id: String,
+    allowed_model_ids: Vec<String>,
 }
 
 fn validate_model_connection_fields(
     name: &str,
     base_url: &str,
-    model_id: &str,
+    allowed_model_ids: Vec<String>,
     api_key: Option<&str>,
 ) -> Result<ValidatedModelConnectionFields, ApiError> {
     let name = name.trim();
     if name.is_empty() || name.chars().count() > 128 || name.chars().any(char::is_control) {
         return Err(ApiError::bad_request(
             "Model Connection name must be 1 to 128 characters",
-        ));
-    }
-    let model_id = model_id.trim();
-    if model_id.is_empty()
-        || model_id.chars().count() > 256
-        || model_id.chars().any(char::is_control)
-    {
-        return Err(ApiError::bad_request(
-            "Model ID must be 1 to 256 characters",
         ));
     }
     if api_key.is_some_and(|value| value.trim().is_empty()) {
@@ -3328,77 +3383,75 @@ fn validate_model_connection_fields(
     Ok(ValidatedModelConnectionFields {
         name: name.into(),
         base_url: parsed.to_string().trim_end_matches('/').to_owned(),
-        model_id: model_id.into(),
+        allowed_model_ids,
     })
 }
 
-fn validate_model_connection_parameters(
-    mut parameters: ModelConnectionParameters,
-) -> Result<ModelConnectionParameters, ApiError> {
+fn validate_agent_model_settings(
+    mut settings: AgentModelSettings,
+    protocol: ModelUpstreamProtocol,
+) -> Result<AgentModelSettings, ApiError> {
     let max_database_integer =
         u64::try_from(i64::MAX).expect("i64 maximum is representable as u64");
     for (name, value) in [
-        ("context window", parameters.context_window_tokens),
-        (
-            "automatic compact limit",
-            parameters.auto_compact_token_limit,
-        ),
-        ("stream idle timeout", parameters.stream_idle_timeout_ms),
+        ("context window", settings.context_window_tokens),
+        ("automatic compact limit", settings.auto_compact_token_limit),
+        ("stream idle timeout", settings.stream_idle_timeout_ms),
     ] {
         if value.is_some_and(|value| value == 0 || value > max_database_integer) {
             return Err(ApiError::bad_request(format!(
-                "Model Connection {name} must be a positive signed 64-bit integer"
+                "Agent Model Settings {name} must be a positive signed 64-bit integer"
             )));
         }
     }
-    if parameters
+    if settings
         .context_window_tokens
-        .zip(parameters.auto_compact_token_limit)
+        .zip(settings.auto_compact_token_limit)
         .is_some_and(|(context_window, compact_limit)| compact_limit > context_window)
     {
         return Err(ApiError::bad_request(
-            "Model Connection automatic compact limit cannot exceed the context window",
+            "Agent Model Settings automatic compact limit cannot exceed the context window",
         ));
     }
-    if parameters
+    if settings
         .request_max_retries
         .is_some_and(|value| value > 100)
-        || parameters
-            .stream_max_retries
-            .is_some_and(|value| value > 100)
+        || settings.stream_max_retries.is_some_and(|value| value > 100)
     {
         return Err(ApiError::bad_request(
-            "Model Connection retry counts must be between 0 and 100",
+            "Agent Model Settings retry counts must be between 0 and 100",
         ));
     }
-    parameters.service_tier = parameters.service_tier.and_then(|value| {
+    settings.service_tier = settings.service_tier.and_then(|value| {
         let trimmed = value.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_owned())
     });
-    if parameters
+    if settings
         .service_tier
         .as_ref()
         .is_some_and(|value| value.chars().count() > 64 || value.chars().any(char::is_control))
     {
         return Err(ApiError::bad_request(
-            "Model Connection service tier must not exceed 64 characters or contain controls",
+            "Agent Model Settings service tier must not exceed 64 characters or contain controls",
         ));
     }
-    Ok(parameters)
+    settings.request_settings =
+        validate_model_request_settings(protocol, settings.request_settings)?;
+    Ok(settings)
 }
 
-fn validate_model_connection_request_parameters(
+fn validate_model_request_settings(
     protocol: ModelUpstreamProtocol,
-    parameters: ModelConnectionRequestParameters,
-) -> Result<ModelConnectionRequestParameters, ApiError> {
-    if parameters.protocol() != protocol {
+    settings: ModelRequestSettings,
+) -> Result<ModelRequestSettings, ApiError> {
+    if settings.protocol() != protocol {
         return Err(ApiError::bad_request(
-            "Model Connection request parameter protocol must match the upstream protocol",
+            "Agent request settings protocol must match the selected API Type",
         ));
     }
-    match &parameters {
-        ModelConnectionRequestParameters::OpenaiResponses {} => {}
-        ModelConnectionRequestParameters::OpenaiChatCompletions {
+    match &settings {
+        ModelRequestSettings::OpenaiResponses {} => {}
+        ModelRequestSettings::OpenaiChatCompletions {
             temperature,
             top_p,
             max_completion_tokens,
@@ -3407,14 +3460,14 @@ fn validate_model_connection_request_parameters(
             validate_model_request_number("top_p", top_p.as_ref(), 1.0)?;
             validate_model_request_token_limit("max_completion_tokens", *max_completion_tokens)?;
         }
-        ModelConnectionRequestParameters::AnthropicMessages {
+        ModelRequestSettings::AnthropicMessages {
             temperature,
             top_p,
             max_tokens,
         } => {
             if temperature.is_some() && top_p.is_some() {
                 return Err(ApiError::bad_request(
-                    "Model Connection Anthropic request parameters cannot set both temperature and top_p",
+                    "Anthropic request settings cannot set both temperature and top_p",
                 ));
             }
             validate_model_request_number("temperature", temperature.as_ref(), 1.0)?;
@@ -3422,7 +3475,7 @@ fn validate_model_connection_request_parameters(
             validate_model_request_token_limit("max_tokens", *max_tokens)?;
         }
     }
-    Ok(parameters)
+    Ok(settings)
 }
 
 fn validate_model_request_number(
@@ -3436,7 +3489,7 @@ fn validate_model_request_number(
     let value = value.as_f64().filter(|value| value.is_finite());
     if !value.is_some_and(|value| (0.0..=maximum).contains(&value)) {
         return Err(ApiError::bad_request(format!(
-            "Model Connection {name} must be a finite number between 0 and {maximum}"
+            "Agent request setting {name} must be a finite number between 0 and {maximum}"
         )));
     }
     Ok(())
@@ -3445,7 +3498,7 @@ fn validate_model_request_number(
 fn validate_model_request_token_limit(name: &str, value: Option<u32>) -> Result<(), ApiError> {
     if value == Some(0) {
         return Err(ApiError::bad_request(format!(
-            "Model Connection {name} must be a positive integer"
+            "Agent request setting {name} must be a positive integer"
         )));
     }
     Ok(())
@@ -3461,66 +3514,21 @@ fn model_connection_from_row(row: &sqlx::postgres::PgRow) -> ModelConnectionDto 
         },
         name: row.get("name"),
         base_url: row.get("base_url"),
-        model_id: row.get("model_id"),
-        upstream_protocol: model_upstream_protocol_from_name(
-            &row.get::<String, _>("upstream_protocol"),
-        ),
-        parameters: model_connection_parameters_from_row(row),
-        request_parameters: model_connection_request_parameters_from_row(row),
+        api_type: model_upstream_protocol_from_name(&row.get::<String, _>("api_type")),
+        allowed_model_ids: row.get("allowed_model_ids"),
         status: if row.get("enabled") {
             ModelConnectionStatus::Enabled
         } else {
             ModelConnectionStatus::Disabled
         },
-        is_system_default: row.get("is_system_default"),
+        has_api_key: row.get("has_api_key"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
 }
 
-fn model_connection_request_parameters_from_row(
-    row: &sqlx::postgres::PgRow,
-) -> ModelConnectionRequestParameters {
-    serde_json::from_value(row.get::<Value, _>("request_parameters"))
-        .expect("request parameters are constrained by the Model Connection contract")
-}
-
-fn model_connection_request_parameters_value(
-    parameters: &ModelConnectionRequestParameters,
-) -> Value {
-    serde_json::to_value(parameters)
-        .expect("validated Model Connection request parameters are serializable")
-}
-
-fn model_connection_parameters_from_row(row: &sqlx::postgres::PgRow) -> ModelConnectionParameters {
-    ModelConnectionParameters {
-        reasoning_effort: reasoning_effort_from_name(&row.get::<String, _>("reasoning_effort")),
-        reasoning_summary: model_reasoning_summary_from_name(
-            &row.get::<String, _>("reasoning_summary"),
-        ),
-        verbosity: model_verbosity_from_name(&row.get::<String, _>("verbosity")),
-        context_window_tokens: row
-            .get::<Option<i64>, _>("context_window_tokens")
-            .map(|value| u64::try_from(value).expect("context window is constrained positive")),
-        auto_compact_token_limit: row
-            .get::<Option<i64>, _>("auto_compact_token_limit")
-            .map(|value| u64::try_from(value).expect("compact limit is constrained positive")),
-        reasoning_summary_support: model_reasoning_summary_support_from_name(
-            &row.get::<String, _>("reasoning_summary_support"),
-        ),
-        service_tier: row.get("service_tier"),
-        request_max_retries: row
-            .get::<Option<i32>, _>("request_max_retries")
-            .map(|value| u32::try_from(value).expect("request retries are constrained")),
-        stream_max_retries: row
-            .get::<Option<i32>, _>("stream_max_retries")
-            .map(|value| u32::try_from(value).expect("stream retries are constrained")),
-        stream_idle_timeout_ms: row
-            .get::<Option<i64>, _>("stream_idle_timeout_ms")
-            .map(|value| {
-                u64::try_from(value).expect("stream idle timeout is constrained positive")
-            }),
-    }
+fn model_request_settings_value(settings: &ModelRequestSettings) -> Value {
+    serde_json::to_value(settings).expect("validated Model request settings are serializable")
 }
 
 async fn load_visible_model_connection(
@@ -3529,18 +3537,10 @@ async fn load_visible_model_connection(
     user_id: Uuid,
 ) -> Result<ModelConnectionDto, ApiError> {
     let row = sqlx::query(
-        "SELECT c.id, c.owner_id, c.scope, c.name, c.base_url, c.model_id,
-                c.upstream_protocol, c.request_parameters,
-                c.reasoning_effort, c.reasoning_summary,
-                c.verbosity, c.context_window_tokens, c.auto_compact_token_limit,
-                c.reasoning_summary_support, c.service_tier,
-                c.request_max_retries, c.stream_max_retries,
-                c.stream_idle_timeout_ms,
-                c.enabled, c.created_at, c.updated_at,
-                EXISTS(
-                    SELECT 1 FROM system_default_model_connection d
-                    WHERE d.model_connection_id = c.id
-                ) AS is_system_default
+        "SELECT c.id, c.owner_id, c.scope, c.name, c.base_url, c.api_type,
+                c.allowed_model_ids, c.enabled,
+                (c.api_key_ciphertext IS NOT NULL) AS has_api_key,
+                c.created_at, c.updated_at
          FROM model_connections c
          WHERE c.id = $1 AND c.deleted_at IS NULL
            AND (c.scope = 'global' OR c.owner_id = $2)",
@@ -3614,19 +3614,11 @@ async fn load_model_connection_secret_for_test(
 ) -> Result<ModelConnectionSecretRecord, ApiError> {
     authorize_model_connection_mutation(pool, model_connection_id, user).await?;
     let row = sqlx::query(
-        "SELECT c.id, c.owner_id, c.scope, c.name, c.base_url, c.model_id,
-                c.upstream_protocol, c.request_parameters,
-                c.reasoning_effort, c.reasoning_summary,
-                c.verbosity, c.context_window_tokens, c.auto_compact_token_limit,
-                c.reasoning_summary_support, c.service_tier,
-                c.request_max_retries, c.stream_max_retries,
-                c.stream_idle_timeout_ms,
-                c.enabled, c.created_at, c.updated_at,
-                c.api_key_ciphertext, c.api_key_nonce,
-                EXISTS(
-                    SELECT 1 FROM system_default_model_connection d
-                    WHERE d.model_connection_id = c.id
-                ) AS is_system_default
+        "SELECT c.id, c.owner_id, c.scope, c.name, c.base_url, c.api_type,
+                c.allowed_model_ids, c.enabled,
+                (c.api_key_ciphertext IS NOT NULL) AS has_api_key,
+                c.created_at, c.updated_at,
+                c.api_key_ciphertext, c.api_key_nonce
          FROM model_connections c
          WHERE c.id = $1 AND c.deleted_at IS NULL",
     )
@@ -3645,6 +3637,7 @@ fn map_model_connection_write_error(error: sqlx::Error) -> ApiError {
     if let sqlx::Error::Database(database) = &error {
         return match database.code().as_deref() {
             Some("23505") => ApiError::conflict("Model Connection name already exists"),
+            Some("23503") => ApiError::conflict("Model API Connection is still referenced"),
             Some("23514") => ApiError::bad_request("invalid Model Connection reference"),
             _ => {
                 tracing::error!(error = %error, "database error");
@@ -3663,6 +3656,15 @@ struct ObservedModelUsage {
     total_tokens: i64,
     cached_tokens: i64,
     reasoning_tokens: i64,
+}
+
+struct ModelTestLedgerContext<'a> {
+    pool: &'a PgPool,
+    request_id: Uuid,
+    connection: &'a ModelConnectionDto,
+    model_id: &'a str,
+    request_settings: &'a ModelRequestSettings,
+    user: &'a UserDto,
 }
 
 fn extract_model_usage(response: &Value) -> Option<ObservedModelUsage> {
@@ -3703,10 +3705,7 @@ fn model_response_status(response: Option<&Value>, http_success: bool) -> &'stat
 }
 
 async fn record_model_test_usage(
-    pool: &PgPool,
-    request_id: Uuid,
-    connection: &ModelConnectionDto,
-    user: &UserDto,
+    context: &ModelTestLedgerContext<'_>,
     response_status: &str,
     usage: &ObservedModelUsage,
 ) -> Result<(), ApiError> {
@@ -3714,8 +3713,8 @@ async fn record_model_test_usage(
         "INSERT INTO model_token_usage
              (id, request_id, response_status, model_connection_id,
               model_connection_scope_snapshot, model_connection_name_snapshot,
-              model_id_snapshot, upstream_protocol_snapshot,
-              request_parameters_snapshot,
+              model_id_snapshot, api_type_snapshot,
+              request_settings_snapshot,
               agent_id, agent_name_snapshot,
               subject_type, subject_user_id, subject_display_name_snapshot,
               input_tokens, output_tokens, total_tokens, cached_tokens,
@@ -3724,34 +3723,28 @@ async fn record_model_test_usage(
                  'user', $10, $11, $12, $13, $14, $15, $16)",
     )
     .bind(Uuid::new_v4())
-    .bind(request_id)
+    .bind(context.request_id)
     .bind(response_status)
-    .bind(connection.id)
-    .bind(model_connection_scope_name(connection.scope))
-    .bind(&connection.name)
-    .bind(&connection.model_id)
-    .bind(model_upstream_protocol_name(connection.upstream_protocol))
-    .bind(model_connection_request_parameters_value(
-        &connection.request_parameters,
-    ))
-    .bind(user.id)
-    .bind(&user.display_name)
+    .bind(context.connection.id)
+    .bind(model_connection_scope_name(context.connection.scope))
+    .bind(&context.connection.name)
+    .bind(context.model_id)
+    .bind(model_upstream_protocol_name(context.connection.api_type))
+    .bind(model_request_settings_value(context.request_settings))
+    .bind(context.user.id)
+    .bind(&context.user.display_name)
     .bind(usage.input_tokens)
     .bind(usage.output_tokens)
     .bind(usage.total_tokens)
     .bind(usage.cached_tokens)
     .bind(usage.reasoning_tokens)
-    .execute(pool)
+    .execute(context.pool)
     .await?;
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn record_model_test_error(
-    pool: &PgPool,
-    request_id: Uuid,
-    connection: &ModelConnectionDto,
-    user: &UserDto,
+    context: &ModelTestLedgerContext<'_>,
     response_status: &str,
     upstream_http_status: Option<u16>,
     error_kind: &str,
@@ -3763,31 +3756,29 @@ async fn record_model_test_error(
              (id, request_id, response_status, upstream_http_status,
               error_kind, error_code, message, model_connection_id,
               model_connection_scope_snapshot, model_connection_name_snapshot,
-              model_id_snapshot, upstream_protocol_snapshot,
-              request_parameters_snapshot,
+              model_id_snapshot, api_type_snapshot,
+              request_settings_snapshot,
               agent_id, agent_name_snapshot,
               subject_type, subject_user_id, subject_display_name_snapshot)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
                  $13, NULL, NULL, 'user', $14, $15)",
     )
     .bind(Uuid::new_v4())
-    .bind(request_id)
+    .bind(context.request_id)
     .bind(response_status)
     .bind(upstream_http_status.map(i32::from))
     .bind(error_kind)
     .bind(error_code.map(|value| value.chars().take(256).collect::<String>()))
     .bind(message.chars().take(2048).collect::<String>())
-    .bind(connection.id)
-    .bind(model_connection_scope_name(connection.scope))
-    .bind(&connection.name)
-    .bind(&connection.model_id)
-    .bind(model_upstream_protocol_name(connection.upstream_protocol))
-    .bind(model_connection_request_parameters_value(
-        &connection.request_parameters,
-    ))
-    .bind(user.id)
-    .bind(&user.display_name)
-    .execute(pool)
+    .bind(context.connection.id)
+    .bind(model_connection_scope_name(context.connection.scope))
+    .bind(&context.connection.name)
+    .bind(context.model_id)
+    .bind(model_upstream_protocol_name(context.connection.api_type))
+    .bind(model_request_settings_value(context.request_settings))
+    .bind(context.user.id)
+    .bind(&context.user.display_name)
+    .execute(context.pool)
     .await?;
     Ok(())
 }
@@ -4020,7 +4011,8 @@ async fn get_model_usage_summary(
                 ledger.model_connection_scope_snapshot,
                 ledger.model_connection_name_snapshot,
                 ledger.model_id_snapshot,
-                ledger.upstream_protocol_snapshot,
+                ledger.api_type_snapshot,
+                ledger.request_settings_snapshot,
                 sum(ledger.input_tokens)::bigint AS input_tokens,
                 sum(ledger.output_tokens)::bigint AS output_tokens,
                 sum(ledger.total_tokens)::bigint AS total_tokens,
@@ -4031,7 +4023,8 @@ async fn get_model_usage_summary(
                   ledger.model_connection_scope_snapshot,
                   ledger.model_connection_name_snapshot,
                   ledger.model_id_snapshot,
-                  ledger.upstream_protocol_snapshot
+                  ledger.api_type_snapshot,
+                  ledger.request_settings_snapshot
          ORDER BY total_tokens DESC, ledger.model_connection_name_snapshot,
                   ledger.model_id_snapshot, ledger.model_connection_id NULLS LAST"
     );
@@ -4150,7 +4143,7 @@ async fn list_model_token_usage(
                 ledger.model_connection_id,
                 ledger.model_connection_scope_snapshot,
                 ledger.model_connection_name_snapshot, ledger.model_id_snapshot,
-                ledger.upstream_protocol_snapshot,
+                ledger.api_type_snapshot, ledger.request_settings_snapshot,
                 ledger.agent_id, ledger.agent_name_snapshot,
                 ledger.subject_type, ledger.subject_user_id,
                 ledger.subject_display_name_snapshot,
@@ -4209,7 +4202,7 @@ async fn list_model_call_errors(
                 ledger.model_connection_id,
                 ledger.model_connection_scope_snapshot,
                 ledger.model_connection_name_snapshot, ledger.model_id_snapshot,
-                ledger.upstream_protocol_snapshot,
+                ledger.api_type_snapshot, ledger.request_settings_snapshot,
                 ledger.agent_id, ledger.agent_name_snapshot,
                 ledger.subject_type, ledger.subject_user_id,
                 ledger.subject_display_name_snapshot,
@@ -4275,9 +4268,9 @@ fn model_connection_snapshot_from_row(row: &sqlx::postgres::PgRow) -> ModelConne
         },
         name: row.get("model_connection_name_snapshot"),
         model_id: row.get("model_id_snapshot"),
-        upstream_protocol: model_upstream_protocol_from_name(
-            &row.get::<String, _>("upstream_protocol_snapshot"),
-        ),
+        api_type: model_upstream_protocol_from_name(&row.get::<String, _>("api_type_snapshot")),
+        request_settings: serde_json::from_value(row.get("request_settings_snapshot"))
+            .expect("model ledger request settings are constrained"),
     }
 }
 
@@ -4350,7 +4343,7 @@ async fn list_agents(
     let user = require_user(&state, &headers).await?;
     let rows = sqlx::query(
         "SELECT a.id, a.owner_id, a.name, a.instructions, a.visibility, a.public_to,
-                a.runtime_id, a.default_model_connection_id, a.reasoning_effort,
+                a.runtime_id, a.model_connection_id, a.model_id, a.model_settings,
                 a.model_policy, a.sandbox_policy, a.mcp_allowlist,
                 a.created_at, a.updated_at
          FROM agents AS a
@@ -4380,7 +4373,7 @@ async fn list_agents(
 async fn create_agent(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(req): Json<CreateAgentRequest>,
+    Json(mut req): Json<CreateAgentRequest>,
 ) -> Result<Json<AgentDto>, ApiError> {
     let user = require_user(&state, &headers).await?;
     if req.name.trim().is_empty() {
@@ -4393,29 +4386,52 @@ async fn create_agent(
     let model_policy = json!({ "provider": "hub-proxy" });
     let id = Uuid::new_v4();
     let mut tx = state.pool.begin().await?;
-    let default_model_connection_id = match req.default_model_connection_id {
-        Some(model_connection_id) => Some(model_connection_id),
+    let model_selection = match req.model_selection {
+        Some(selection) => Some(selection),
+        None => sqlx::query(
+            "SELECT model_connection_id, model_id
+             FROM system_default_model_selection WHERE singleton = true",
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|row| ModelSelectionDto {
+            connection_id: row.get("model_connection_id"),
+            model_id: row.get("model_id"),
+        }),
+    };
+    let mut model_settings = match req.model_settings {
+        Some(settings) => settings,
         None => {
-            sqlx::query_scalar(
-                "SELECT model_connection_id
-             FROM system_default_model_connection WHERE singleton = true",
-            )
-            .fetch_optional(&mut *tx)
-            .await?
+            let mut settings = AgentModelSettings::default();
+            if let Some(selection) = model_selection.as_ref() {
+                let api_type =
+                    load_permitted_model_selection_api_type_tx(&mut tx, user.id, selection).await?;
+                settings.request_settings = ModelRequestSettings::for_protocol(api_type);
+            }
+            settings
         }
     };
-    ensure_agent_model_connections_tx(
+    model_settings = validate_agent_model_configuration_tx(
         &mut tx,
         user.id,
-        default_model_connection_id,
-        &req.codex_subagents,
+        model_selection.as_ref(),
+        model_settings,
+        &mut req.codex_subagents,
     )
     .await?;
+    let model_connection_id = model_selection
+        .as_ref()
+        .map(|selection| selection.connection_id);
+    let model_id = model_selection
+        .as_ref()
+        .map(|selection| selection.model_id.as_str());
+    let model_settings_value = serde_json::to_value(&model_settings)
+        .map_err(|_| ApiError::internal("Agent Model Settings could not be encoded"))?;
     sqlx::query(
         "INSERT INTO agents
              (id, owner_id, name, instructions, visibility, public_to, model_policy,
-              default_model_connection_id, reasoning_effort)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+              model_connection_id, model_id, model_settings)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(id)
     .bind(user.id)
@@ -4424,8 +4440,9 @@ async fn create_agent(
     .bind(visibility)
     .bind(req.public_to)
     .bind(model_policy)
-    .bind(default_model_connection_id)
-    .bind(reasoning_effort_name(req.reasoning_effort))
+    .bind(model_connection_id)
+    .bind(model_id)
+    .bind(model_settings_value)
     .execute(&mut *tx)
     .await?;
     replace_codex_subagents_tx(&mut tx, id, &req.codex_subagents).await?;
@@ -4452,11 +4469,7 @@ async fn get_agent_model_connection_options(
     let user = require_user(&state, &headers).await?;
     let agent = load_agent_manageable_by_user(&state.pool, agent_id, &user).await?;
     let rows = sqlx::query(
-        "SELECT id, name, model_id, upstream_protocol, request_parameters, reasoning_effort,
-                reasoning_summary, verbosity, context_window_tokens,
-                auto_compact_token_limit, reasoning_summary_support,
-                service_tier, request_max_retries, stream_max_retries,
-                stream_idle_timeout_ms, scope, enabled
+        "SELECT id, name, api_type, allowed_model_ids, scope, enabled
          FROM model_connections
          WHERE deleted_at IS NULL
            AND (scope = 'global' OR owner_id = $1)
@@ -4467,35 +4480,45 @@ async fn get_agent_model_connection_options(
     .await?;
     let items = rows
         .into_iter()
-        .map(|row| ModelConnectionOptionDto {
-            id: row.get("id"),
-            name: row.get("name"),
-            model_id: row.get("model_id"),
-            upstream_protocol: model_upstream_protocol_from_name(
-                &row.get::<String, _>("upstream_protocol"),
-            ),
-            parameters: model_connection_parameters_from_row(&row),
-            request_parameters: model_connection_request_parameters_from_row(&row),
-            scope: if row.get::<String, _>("scope") == "global" {
+        .flat_map(|row| {
+            let connection_id = row.get("id");
+            let connection_name: String = row.get("name");
+            let api_type = model_upstream_protocol_from_name(&row.get::<String, _>("api_type"));
+            let scope = if row.get::<String, _>("scope") == "global" {
                 ModelConnectionScope::Global
             } else {
                 ModelConnectionScope::Personal
-            },
-            status: if row.get("enabled") {
+            };
+            let status = if row.get("enabled") {
                 ModelConnectionStatus::Enabled
             } else {
                 ModelConnectionStatus::Disabled
-            },
+            };
+            row.get::<Vec<String>, _>("allowed_model_ids")
+                .into_iter()
+                .map(move |model_id| ModelConnectionOptionDto {
+                    connection_id,
+                    connection_name: connection_name.clone(),
+                    model_id,
+                    api_type,
+                    scope,
+                    status,
+                })
         })
         .collect();
-    let system_default_model_connection_id = sqlx::query_scalar(
-        "SELECT model_connection_id FROM system_default_model_connection WHERE singleton = true",
+    let system_default = sqlx::query(
+        "SELECT model_connection_id, model_id
+         FROM system_default_model_selection WHERE singleton = true",
     )
     .fetch_optional(&state.pool)
-    .await?;
+    .await?
+    .map(|row| ModelSelectionDto {
+        connection_id: row.get("model_connection_id"),
+        model_id: row.get("model_id"),
+    });
     Ok(Json(ModelConnectionOptionsDto {
         items,
-        system_default_model_connection_id,
+        system_default,
     }))
 }
 
@@ -4528,22 +4551,33 @@ async fn update_agent(
     )
     .await?;
     let mut tx = state.pool.begin().await?;
-    ensure_agent_model_connections_tx(
+    req.model_settings = validate_agent_model_configuration_tx(
         &mut tx,
         existing_agent.owner_id,
-        req.default_model_connection_id,
-        &req.codex_subagents,
+        req.model_selection.as_ref(),
+        req.model_settings,
+        &mut req.codex_subagents,
     )
     .await?;
+    let model_connection_id = req
+        .model_selection
+        .as_ref()
+        .map(|selection| selection.connection_id);
+    let model_id = req
+        .model_selection
+        .as_ref()
+        .map(|selection| selection.model_id.as_str());
+    let model_settings_value = serde_json::to_value(&req.model_settings)
+        .map_err(|_| ApiError::internal("Agent Model Settings could not be encoded"))?;
     let updated = sqlx::query(
         "UPDATE agents
          SET name = $1, instructions = $2, visibility = $3, public_to = $4, runtime_id = $5,
-             default_model_connection_id = $6, reasoning_effort = $7,
-             model_policy = $8, sandbox_policy = $9, mcp_allowlist = $10,
+             model_connection_id = $6, model_id = $7, model_settings = $8,
+             model_policy = $9, sandbox_policy = $10, mcp_allowlist = $11,
              execution_config_revision = execution_config_revision
-                 + CASE WHEN $11 THEN 1 ELSE 0 END,
+                 + CASE WHEN $12 THEN 1 ELSE 0 END,
              updated_at = now()
-         WHERE id = $12 AND deleted_at IS NULL
+         WHERE id = $13 AND deleted_at IS NULL
          ",
     )
     .bind(req.name.trim())
@@ -4551,8 +4585,9 @@ async fn update_agent(
     .bind(visibility)
     .bind(req.public_to)
     .bind(req.runtime_id)
-    .bind(req.default_model_connection_id)
-    .bind(reasoning_effort_name(req.reasoning_effort))
+    .bind(model_connection_id)
+    .bind(model_id)
+    .bind(model_settings_value)
     .bind(req.model_policy)
     .bind(req.sandbox_policy)
     .bind(req.mcp_allowlist)
@@ -4770,7 +4805,8 @@ async fn delete_agent(
             "UPDATE agents
              SET instructions = '', visibility = 'private', public_to = '{}',
                  runtime_id = NULL, model_policy = '{}'::jsonb,
-                 default_model_connection_id = NULL, reasoning_effort = 'default',
+                 model_connection_id = NULL, model_id = NULL,
+                 model_settings = '{\"reasoning_effort\":\"default\",\"reasoning_summary\":\"default\",\"verbosity\":\"default\",\"context_window_tokens\":null,\"auto_compact_token_limit\":null,\"reasoning_summary_support\":\"auto\",\"service_tier\":null,\"request_max_retries\":null,\"stream_max_retries\":null,\"stream_idle_timeout_ms\":null,\"request_settings\":{\"protocol\":\"openai_responses\"}}'::jsonb,
                  sandbox_policy = '{}'::jsonb, mcp_allowlist = '[]'::jsonb,
                  execution_config_revision = execution_config_revision + 1,
                  deleted_at = now(), updated_at = now()
@@ -9905,8 +9941,10 @@ fn runtime_claim_candidate_sql() -> String {
            AND a.deleted_at IS NULL
            AND EXISTS (
              SELECT 1 FROM model_connections model
-             WHERE model.id = a.default_model_connection_id
+             WHERE model.id = a.model_connection_id
                AND model.enabled = true AND model.deleted_at IS NULL
+               AND a.model_id = ANY(model.allowed_model_ids)
+               AND (a.model_settings->'request_settings')->>'protocol' = model.api_type
                AND (model.scope = 'global' OR model.owner_id = a.owner_id)
            )
            AND (a.runtime_id IS NULL OR a.runtime_id = $1)
@@ -9921,8 +9959,8 @@ fn runtime_claim_agent_sql() -> String {
     format!(
         "SELECT a.id AS a_id, a.owner_id, a.name, a.instructions, a.visibility, a.public_to,
                 a.runtime_id AS a_runtime_id, a.model_policy AS a_model_policy,
-                a.default_model_connection_id AS a_default_model_connection_id,
-                a.reasoning_effort AS a_reasoning_effort,
+                a.model_connection_id AS a_model_connection_id,
+                a.model_id AS a_model_id, a.model_settings AS a_model_settings,
                 a.sandbox_policy AS a_sandbox_policy, a.mcp_allowlist AS a_mcp_allowlist,
                 a.execution_config_revision AS a_execution_config_revision,
                 a.created_at AS a_created_at, a.updated_at AS a_updated_at
@@ -9932,8 +9970,10 @@ fn runtime_claim_agent_sql() -> String {
            AND a.deleted_at IS NULL
            AND EXISTS (
              SELECT 1 FROM model_connections model
-             WHERE model.id = a.default_model_connection_id
+             WHERE model.id = a.model_connection_id
                AND model.enabled = true AND model.deleted_at IS NULL
+               AND a.model_id = ANY(model.allowed_model_ids)
+               AND (a.model_settings->'request_settings')->>'protocol' = model.api_type
                AND (model.scope = 'global' OR model.owner_id = a.owner_id)
            )
            AND (a.runtime_id IS NULL OR a.runtime_id = $1)
@@ -10152,10 +10192,12 @@ async fn runtime_claim_run(
         visibility: agent_row.get("visibility"),
         public_to: agent_row.get("public_to"),
         runtime_id: agent_row.get("a_runtime_id"),
-        default_model_connection_id: agent_row.get("a_default_model_connection_id"),
-        reasoning_effort: reasoning_effort_from_name(
-            &agent_row.get::<String, _>("a_reasoning_effort"),
-        ),
+        model_selection: Some(ModelSelectionDto {
+            connection_id: agent_row.get("a_model_connection_id"),
+            model_id: agent_row.get("a_model_id"),
+        }),
+        model_settings: serde_json::from_value(agent_row.get("a_model_settings"))
+            .expect("Agent Model Settings are constrained"),
         codex_subagents: Vec::new(),
         model_policy: agent_row.get("a_model_policy"),
         sandbox_policy: agent_row.get("a_sandbox_policy"),
@@ -10182,54 +10224,10 @@ async fn runtime_claim_run(
     .bind(agent.owner_id)
     .fetch_all(&mut *tx)
     .await?;
-    let model_rows = load_execution_model_connections_tx(&mut tx, &agent).await?;
-    let execution_configuration = build_agent_execution_configuration(
-        &agent,
-        execution_config_revision,
-        skill_rows,
-        model_rows,
-    )?;
-    let selected_model_connection_ids = execution_configuration
-        .model_connections
-        .iter()
-        .map(|connection| connection.id)
-        .collect::<Vec<_>>();
-    let selected_model_ids = execution_configuration
-        .model_connections
-        .iter()
-        .map(|connection| connection.model_id.clone())
-        .collect::<Vec<_>>();
-    let selected_upstream_protocols = execution_configuration
-        .model_connections
-        .iter()
-        .map(|connection| model_upstream_protocol_name(connection.upstream_protocol))
-        .collect::<Vec<_>>();
-    let selected_request_parameters = execution_configuration
-        .model_connections
-        .iter()
-        .map(|connection| {
-            serde_json::to_string(&connection.request_parameters)
-                .map_err(|_| ApiError::internal("model request parameters could not be encoded"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    sqlx::query(
-        "INSERT INTO run_model_connection_snapshots
-             (run_id, model_connection_id, model_id, upstream_protocol, request_parameters)
-         SELECT $1, selected.model_connection_id, selected.model_id,
-                selected.upstream_protocol, selected.request_parameters::jsonb
-         FROM unnest($2::uuid[], $3::text[], $4::text[], $5::text[])
-              AS selected(
-                  model_connection_id, model_id, upstream_protocol, request_parameters
-              )
-         ON CONFLICT (run_id, model_connection_id) DO NOTHING",
-    )
-    .bind(run_id)
-    .bind(&selected_model_connection_ids)
-    .bind(&selected_model_ids)
-    .bind(&selected_upstream_protocols)
-    .bind(&selected_request_parameters)
-    .execute(&mut *tx)
-    .await?;
+    let mut execution_configuration =
+        build_agent_execution_configuration(&agent, execution_config_revision, skill_rows)?;
+    execution_configuration.model_bindings =
+        create_run_model_bindings_tx(&mut tx, run_id, &agent).await?;
     let expected_configuration_fingerprint =
         execution_configuration_fingerprint(&execution_configuration)
             .map_err(|error| ApiError::internal(error.to_string()))?;
@@ -11095,11 +11093,11 @@ async fn runtime_model_proxy(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| Uuid::parse_str(value).ok())
         .ok_or(ApiError::bad_request("missing run id"))?;
-    let model_connection_id = headers
-        .get(MODEL_PROXY_CONNECTION_ID_HEADER)
+    let model_binding_id = headers
+        .get(MODEL_PROXY_BINDING_ID_HEADER)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| Uuid::parse_str(value).ok())
-        .ok_or(ApiError::bad_request("missing model connection id"))?;
+        .ok_or(ApiError::bad_request("missing model binding id"))?;
     let request_json: Value = serde_json::from_slice(&body)
         .map_err(|_| ApiError::bad_request("model request must be JSON"))?;
     let request_model_id = request_json
@@ -11109,20 +11107,19 @@ async fn runtime_model_proxy(
         .ok_or(ApiError::bad_request(
             "model request must include a model id",
         ))?;
-    let resolved =
-        resolve_model_proxy_request(&state, &headers, run_id, model_connection_id).await?;
+    let resolved = resolve_model_proxy_request(&state, &headers, run_id, model_binding_id).await?;
     if request_model_id != resolved.model_id {
         return Err(ApiError::bad_request(
             "request model does not match the selected Model Connection",
         ));
     }
-    let request_parameters = resolved.accounting.request_parameters.clone();
+    let request_settings = resolved.accounting.request_settings.clone();
     proxy_model_request_to_upstream_with_options(
         &state,
         ModelProxyForwardRequest {
             upstream_url: resolved.upstream_url,
-            upstream_protocol: resolved.accounting.upstream_protocol,
-            request_parameters,
+            upstream_protocol: resolved.accounting.api_type,
+            request_settings,
             path,
             query: uri.query().map(str::to_owned),
             headers,
@@ -11148,8 +11145,8 @@ struct ModelProxyAccountingContext {
     model_connection_scope: String,
     model_connection_name: String,
     model_id: String,
-    upstream_protocol: ModelUpstreamProtocol,
-    request_parameters: ModelConnectionRequestParameters,
+    api_type: ModelUpstreamProtocol,
+    request_settings: ModelRequestSettings,
     agent_id: Uuid,
     agent_name: String,
     subject_type: String,
@@ -11163,14 +11160,16 @@ async fn resolve_model_proxy_request(
     state: &AppState,
     headers: &HeaderMap,
     run_id: Uuid,
-    model_connection_id: Uuid,
+    model_binding_id: Uuid,
 ) -> Result<ResolvedModelProxyRequest, ApiError> {
     let token = bearer_token(headers).ok_or(ApiError::unauthorized("missing model proxy token"))?;
     let row = sqlx::query(
-        "SELECT c.id AS model_connection_id, c.scope AS model_connection_scope,
-                c.name AS model_connection_name, c.base_url,
-                selected_model.model_id, selected_model.upstream_protocol,
-                selected_model.request_parameters,
+        "SELECT c.id AS model_connection_id,
+                binding.connection_scope_snapshot AS model_connection_scope,
+                binding.connection_name_snapshot AS model_connection_name,
+                c.base_url,
+                binding.model_id, binding.api_type,
+                binding.model_settings->'request_settings' AS request_settings,
                 c.api_key_ciphertext, c.api_key_nonce,
                 a.id AS agent_id, a.name AS agent_name,
                 r.model_subject_type,
@@ -11194,10 +11193,10 @@ async fn resolve_model_proxy_request(
                   r.model_subject_user_id,
                   CASE WHEN r.model_subject_type = 'user' THEN r.owner_id END
               )
-         JOIN run_model_connection_snapshots selected_model
-           ON selected_model.run_id = r.id
-          AND selected_model.model_connection_id = $3
-         JOIN model_connections c ON c.id = selected_model.model_connection_id
+         JOIN run_model_bindings binding
+           ON binding.run_id = r.id
+          AND binding.id = $3
+         JOIN model_connections c ON c.id = binding.model_connection_id
          LEFT JOIN embed_sessions widget ON widget.id = r.widget_session_id
          LEFT JOIN integration_sessions integration
            ON integration.id = r.integration_session_id
@@ -11221,7 +11220,7 @@ async fn resolve_model_proxy_request(
     )
     .bind(run_id)
     .bind(sha256_hex(&token))
-    .bind(model_connection_id)
+    .bind(model_binding_id)
     .fetch_optional(&state.pool)
     .await?;
     let row = row.ok_or(ApiError::unauthorized("invalid model proxy request"))?;
@@ -11234,9 +11233,10 @@ async fn resolve_model_proxy_request(
             .map_err(|_| ApiError::internal("Model Connection credential is unavailable"))?,
     );
     let model_id: String = row.get("model_id");
-    let upstream_protocol_name: String = row.get("upstream_protocol");
-    let upstream_protocol = model_upstream_protocol_from_name(&upstream_protocol_name);
-    let request_parameters = model_connection_request_parameters_from_row(&row);
+    let api_type = model_upstream_protocol_from_name(&row.get::<String, _>("api_type"));
+    let request_settings: ModelRequestSettings =
+        serde_json::from_value(row.get("request_settings"))
+            .expect("Run Model Binding request settings are constrained");
     Ok(ResolvedModelProxyRequest {
         upstream_url: row.get("base_url"),
         model_id: model_id.clone(),
@@ -11247,8 +11247,8 @@ async fn resolve_model_proxy_request(
             model_connection_scope: row.get("model_connection_scope"),
             model_connection_name: row.get("model_connection_name"),
             model_id,
-            upstream_protocol,
-            request_parameters,
+            api_type,
+            request_settings,
             agent_id: row.get("agent_id"),
             agent_name: row.get("agent_name"),
             subject_type: row.get("model_subject_type"),
@@ -11267,7 +11267,7 @@ fn model_proxy_path_supported(path: &str) -> bool {
 struct ModelProxyForwardRequest {
     upstream_url: String,
     upstream_protocol: ModelUpstreamProtocol,
-    request_parameters: ModelConnectionRequestParameters,
+    request_settings: ModelRequestSettings,
     path: String,
     query: Option<String>,
     headers: HeaderMap,
@@ -11280,7 +11280,7 @@ struct ModelProxyForwardRequest {
 struct ModelGatewayRequestEnvelope<'a> {
     request_id: String,
     protocol: ModelUpstreamProtocol,
-    request_parameters: &'a ModelConnectionRequestParameters,
+    request_settings: &'a ModelRequestSettings,
     endpoint: &'a str,
     api_key: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -11293,7 +11293,7 @@ struct ModelGatewayRequestEnvelope<'a> {
 struct ModelGatewayForwardRequest<'a> {
     request_id: Uuid,
     upstream_protocol: ModelUpstreamProtocol,
-    request_parameters: &'a ModelConnectionRequestParameters,
+    request_settings: &'a ModelRequestSettings,
     upstream_url: &'a str,
     query: Option<&'a str>,
     headers: &'a HeaderMap,
@@ -11308,7 +11308,7 @@ async fn send_model_gateway_request(
     let ModelGatewayForwardRequest {
         request_id,
         upstream_protocol,
-        request_parameters,
+        request_settings,
         upstream_url,
         query,
         headers,
@@ -11327,7 +11327,7 @@ async fn send_model_gateway_request(
     let envelope = ModelGatewayRequestEnvelope {
         request_id: request_id.to_string(),
         protocol: upstream_protocol,
-        request_parameters,
+        request_settings,
         endpoint: upstream_url,
         api_key,
         query: query.filter(|query| !query.is_empty()),
@@ -11355,7 +11355,7 @@ async fn proxy_model_request_to_upstream(
         ModelProxyForwardRequest {
             upstream_url: upstream_url.to_owned(),
             upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
-            request_parameters: ModelConnectionRequestParameters::default(),
+            request_settings: ModelRequestSettings::default(),
             path: path.to_owned(),
             query: None,
             headers: HeaderMap::new(),
@@ -11374,7 +11374,7 @@ async fn proxy_model_request_to_upstream_with_options(
     let ModelProxyForwardRequest {
         upstream_url,
         upstream_protocol,
-        request_parameters,
+        request_settings,
         path,
         query,
         headers,
@@ -11401,7 +11401,7 @@ async fn proxy_model_request_to_upstream_with_options(
         ModelGatewayForwardRequest {
             request_id,
             upstream_protocol,
-            request_parameters: &request_parameters,
+            request_settings: &request_settings,
             upstream_url: &upstream_url,
             query: query.as_deref(),
             headers: &upstream_headers,
@@ -11965,8 +11965,8 @@ async fn try_persist_model_proxy_observation(
             "INSERT INTO model_token_usage
                  (id, request_id, response_status, model_connection_id,
                   model_connection_scope_snapshot, model_connection_name_snapshot,
-                  model_id_snapshot, upstream_protocol_snapshot,
-                  request_parameters_snapshot,
+                  model_id_snapshot, api_type_snapshot,
+                  request_settings_snapshot,
                   agent_id, agent_name_snapshot,
                   subject_type, subject_user_id, subject_display_name_snapshot,
                   source_integration_app_id, source_integration_app_name_snapshot,
@@ -11990,10 +11990,8 @@ async fn try_persist_model_proxy_observation(
         .bind(&context.model_connection_scope)
         .bind(&context.model_connection_name)
         .bind(&context.model_id)
-        .bind(model_upstream_protocol_name(context.upstream_protocol))
-        .bind(model_connection_request_parameters_value(
-            &context.request_parameters,
-        ))
+        .bind(model_upstream_protocol_name(context.api_type))
+        .bind(model_request_settings_value(&context.request_settings))
         .bind(context.agent_id)
         .bind(&context.agent_name)
         .bind(&context.subject_type)
@@ -12015,8 +12013,8 @@ async fn try_persist_model_proxy_observation(
                  (id, request_id, response_status, upstream_http_status,
                   error_kind, error_code, message, model_connection_id,
                   model_connection_scope_snapshot, model_connection_name_snapshot,
-                  model_id_snapshot, upstream_protocol_snapshot,
-                  request_parameters_snapshot,
+                  model_id_snapshot, api_type_snapshot,
+                  request_settings_snapshot,
                   agent_id, agent_name_snapshot,
                   subject_type, subject_user_id, subject_display_name_snapshot,
                   source_integration_app_id, source_integration_app_name_snapshot)
@@ -12041,10 +12039,8 @@ async fn try_persist_model_proxy_observation(
         .bind(&context.model_connection_scope)
         .bind(&context.model_connection_name)
         .bind(&context.model_id)
-        .bind(model_upstream_protocol_name(context.upstream_protocol))
-        .bind(model_connection_request_parameters_value(
-            &context.request_parameters,
-        ))
+        .bind(model_upstream_protocol_name(context.api_type))
+        .bind(model_request_settings_value(&context.request_settings))
         .bind(context.agent_id)
         .bind(&context.agent_name)
         .bind(&context.subject_type)
@@ -12826,9 +12822,11 @@ async fn ensure_agent_has_configured_model_tx(
              SELECT 1
              FROM agents AS agent
              JOIN model_connections AS model
-               ON model.id = agent.default_model_connection_id
+               ON model.id = agent.model_connection_id
              WHERE agent.id = $1 AND agent.deleted_at IS NULL
                AND model.enabled = true AND model.deleted_at IS NULL
+               AND agent.model_id = ANY(model.allowed_model_ids)
+               AND (agent.model_settings->'request_settings')->>'protocol' = model.api_type
                AND (model.scope = 'global' OR model.owner_id = agent.owner_id)
          )",
     )
@@ -14117,7 +14115,7 @@ async fn load_agent_for_user(
 ) -> Result<AgentDto, ApiError> {
     let row = sqlx::query(
         "SELECT a.id, a.owner_id, a.name, a.instructions, a.visibility, a.public_to,
-                a.runtime_id, a.default_model_connection_id, a.reasoning_effort,
+                a.runtime_id, a.model_connection_id, a.model_id, a.model_settings,
                 a.model_policy, a.sandbox_policy, a.mcp_allowlist,
                 a.created_at, a.updated_at
          FROM agents AS a
@@ -14148,7 +14146,7 @@ async fn load_agent_owned_by_user(
 ) -> Result<AgentDto, ApiError> {
     let row = sqlx::query(
         "SELECT id, owner_id, name, instructions, visibility, public_to, runtime_id,
-                default_model_connection_id, reasoning_effort,
+                model_connection_id, model_id, model_settings,
                 model_policy, sandbox_policy, mcp_allowlist, created_at, updated_at
          FROM agents
          WHERE id = $1 AND owner_id = $2 AND deleted_at IS NULL",
@@ -14170,7 +14168,7 @@ async fn load_agent_manageable_by_user(
 ) -> Result<AgentDto, ApiError> {
     let row = sqlx::query(
         "SELECT a.id, a.owner_id, a.name, a.instructions, a.visibility, a.public_to,
-                a.runtime_id, a.default_model_connection_id, a.reasoning_effort,
+                a.runtime_id, a.model_connection_id, a.model_id, a.model_settings,
                 a.model_policy, a.sandbox_policy, a.mcp_allowlist,
                 a.created_at, a.updated_at
          FROM agents AS a
@@ -14235,6 +14233,11 @@ fn validate_codex_subagent_definitions(
         if !names.insert(name.to_ascii_lowercase()) {
             return Err(ApiError::bad_request("Codex subagent names must be unique"));
         }
+        if name.eq_ignore_ascii_case("main") {
+            return Err(ApiError::bad_request(
+                "Codex subagent name 'main' is reserved",
+            ));
+        }
         let description = definition.description.trim();
         if description.is_empty()
             || description.chars().count() > 512
@@ -14257,8 +14260,11 @@ fn validate_codex_subagent_definitions(
                     "enabled Codex subagents cannot have a disabled reason",
                 ));
             }
-        } else if definition.model_connection_id.is_some()
-            || definition.disabled_reason.as_deref() != Some("model_connection_deleted")
+        } else if definition.model_selection.is_some()
+            || !matches!(
+                definition.disabled_reason.as_deref(),
+                Some("model_connection_deleted" | "model_selection_removed")
+            )
         {
             return Err(ApiError::bad_request(
                 "disabled Codex subagents must retain the deleted-model reason without an override",
@@ -14268,41 +14274,140 @@ fn validate_codex_subagent_definitions(
     Ok(())
 }
 
-async fn ensure_agent_model_connections_tx(
+async fn load_permitted_model_selection_api_type_tx(
     tx: &mut Transaction<'_, Postgres>,
     owner_id: Uuid,
-    default_model_connection_id: Option<Uuid>,
-    subagents: &[CodexSubagentDefinition],
-) -> Result<(), ApiError> {
-    let mut ids = BTreeSet::new();
-    if let Some(model_connection_id) = default_model_connection_id {
-        ids.insert(model_connection_id);
-    }
-    for definition in subagents.iter().filter(|definition| definition.enabled) {
-        if let Some(model_connection_id) = definition.model_connection_id {
-            ids.insert(model_connection_id);
-        }
-    }
-    if ids.is_empty() {
-        return Ok(());
-    }
-    let ids = ids.into_iter().collect::<Vec<_>>();
-    let rows = sqlx::query(
-        "SELECT id FROM model_connections
-         WHERE id = ANY($1) AND enabled = true AND deleted_at IS NULL
-           AND (scope = 'global' OR owner_id = $2)
-         ORDER BY id FOR SHARE",
+    selection: &ModelSelectionDto,
+) -> Result<ModelUpstreamProtocol, ApiError> {
+    let api_type: String = sqlx::query_scalar(
+        "SELECT api_type FROM model_connections
+         WHERE id = $1 AND enabled = true AND deleted_at IS NULL
+           AND $2 = ANY(allowed_model_ids)
+           AND (scope = 'global' OR owner_id = $3)
+         FOR SHARE",
     )
-    .bind(&ids)
+    .bind(selection.connection_id)
+    .bind(&selection.model_id)
     .bind(owner_id)
-    .fetch_all(&mut **tx)
-    .await?;
-    if rows.len() != ids.len() {
-        return Err(ApiError::bad_request(
-            "Agent models must be enabled Global or Agent-owner Personal Model Connections",
-        ));
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| {
+        ApiError::bad_request(
+            "Agent model selection must be an allowed model on an enabled Global or Agent-owner Personal Model API Connection",
+        )
+    })?;
+    Ok(model_upstream_protocol_from_name(&api_type))
+}
+
+fn apply_enum_model_setting_override<T: Clone + Default>(
+    value: &mut T,
+    setting_override: &ModelSettingOverride<T>,
+) {
+    match setting_override {
+        ModelSettingOverride::Inherit => {}
+        ModelSettingOverride::Automatic => *value = T::default(),
+        ModelSettingOverride::Value(overridden) => *value = overridden.clone(),
     }
-    Ok(())
+}
+
+fn apply_optional_model_setting_override<T: Clone>(
+    value: &mut Option<T>,
+    setting_override: &ModelSettingOverride<T>,
+) {
+    match setting_override {
+        ModelSettingOverride::Inherit => {}
+        ModelSettingOverride::Automatic => *value = None,
+        ModelSettingOverride::Value(overridden) => *value = Some(overridden.clone()),
+    }
+}
+
+fn effective_subagent_model_settings(
+    parent: &AgentModelSettings,
+    overrides: &AgentModelSettingsOverride,
+    protocol: ModelUpstreamProtocol,
+    selection_protocol_changed: bool,
+) -> Result<AgentModelSettings, ApiError> {
+    let mut effective = parent.clone();
+    apply_enum_model_setting_override(&mut effective.reasoning_effort, &overrides.reasoning_effort);
+    apply_enum_model_setting_override(
+        &mut effective.reasoning_summary,
+        &overrides.reasoning_summary,
+    );
+    apply_enum_model_setting_override(&mut effective.verbosity, &overrides.verbosity);
+    apply_optional_model_setting_override(
+        &mut effective.context_window_tokens,
+        &overrides.context_window_tokens,
+    );
+    apply_optional_model_setting_override(
+        &mut effective.auto_compact_token_limit,
+        &overrides.auto_compact_token_limit,
+    );
+    apply_enum_model_setting_override(
+        &mut effective.reasoning_summary_support,
+        &overrides.reasoning_summary_support,
+    );
+    apply_optional_model_setting_override(&mut effective.service_tier, &overrides.service_tier);
+    apply_optional_model_setting_override(
+        &mut effective.request_max_retries,
+        &overrides.request_max_retries,
+    );
+    apply_optional_model_setting_override(
+        &mut effective.stream_max_retries,
+        &overrides.stream_max_retries,
+    );
+    apply_optional_model_setting_override(
+        &mut effective.stream_idle_timeout_ms,
+        &overrides.stream_idle_timeout_ms,
+    );
+    match &overrides.request_settings {
+        ModelSettingOverride::Inherit if selection_protocol_changed => {
+            effective.request_settings = ModelRequestSettings::for_protocol(protocol);
+        }
+        ModelSettingOverride::Inherit => {}
+        ModelSettingOverride::Automatic => {
+            effective.request_settings = ModelRequestSettings::for_protocol(protocol);
+        }
+        ModelSettingOverride::Value(settings) => effective.request_settings = settings.clone(),
+    }
+    validate_agent_model_settings(effective, protocol)
+}
+
+async fn validate_agent_model_configuration_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    owner_id: Uuid,
+    model_selection: Option<&ModelSelectionDto>,
+    model_settings: AgentModelSettings,
+    subagents: &mut [CodexSubagentDefinition],
+) -> Result<AgentModelSettings, ApiError> {
+    let parent_protocol = match model_selection {
+        Some(selection) => {
+            load_permitted_model_selection_api_type_tx(tx, owner_id, selection).await?
+        }
+        None => model_settings.request_settings.protocol(),
+    };
+    let model_settings = validate_agent_model_settings(model_settings, parent_protocol)?;
+    for subagent in subagents.iter_mut().filter(|subagent| subagent.enabled) {
+        let protocol = match subagent.model_selection.as_ref() {
+            Some(selection) => {
+                load_permitted_model_selection_api_type_tx(tx, owner_id, selection).await?
+            }
+            None => parent_protocol,
+        };
+        let selection_protocol_changed =
+            subagent.model_selection.is_some() && protocol != parent_protocol;
+        if let ModelSettingOverride::Value(service_tier) =
+            &mut subagent.model_settings_override.service_tier
+        {
+            *service_tier = service_tier.trim().to_owned();
+        }
+        effective_subagent_model_settings(
+            &model_settings,
+            &subagent.model_settings_override,
+            protocol,
+            selection_protocol_changed,
+        )?;
+    }
+    Ok(model_settings)
 }
 
 async fn replace_codex_subagents_tx(
@@ -14338,16 +14443,31 @@ async fn replace_codex_subagents_tx(
         sqlx::query(
             "INSERT INTO codex_subagent_definitions
                  (id, agent_id, name, description, developer_instructions,
-                  model_connection_id, reasoning_effort, enabled, disabled_reason)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                  model_connection_id, model_id, model_settings_override,
+                  enabled, disabled_reason)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(id)
         .bind(agent_id)
         .bind(definition.name.trim())
         .bind(definition.description.trim())
         .bind(definition.developer_instructions.trim())
-        .bind(definition.model_connection_id)
-        .bind(definition.reasoning_effort.map(reasoning_effort_name))
+        .bind(
+            definition
+                .model_selection
+                .as_ref()
+                .map(|selection| selection.connection_id),
+        )
+        .bind(
+            definition
+                .model_selection
+                .as_ref()
+                .map(|selection| selection.model_id.as_str()),
+        )
+        .bind(
+            serde_json::to_value(&definition.model_settings_override)
+                .map_err(|_| ApiError::internal("subagent Model Settings could not be encoded"))?,
+        )
         .bind(definition.enabled)
         .bind(definition.disabled_reason.as_deref())
         .execute(&mut **tx)
@@ -14356,98 +14476,21 @@ async fn replace_codex_subagents_tx(
     Ok(())
 }
 
-fn reasoning_effort_name(reasoning_effort: ReasoningEffort) -> &'static str {
-    match reasoning_effort {
-        ReasoningEffort::Default => "default",
-        ReasoningEffort::None => "none",
-        ReasoningEffort::Minimal => "minimal",
-        ReasoningEffort::Low => "low",
-        ReasoningEffort::Medium => "medium",
-        ReasoningEffort::High => "high",
-        ReasoningEffort::Xhigh => "xhigh",
-        ReasoningEffort::Max => "max",
-        ReasoningEffort::Ultra => "ultra",
-    }
-}
-
-fn reasoning_effort_from_name(value: &str) -> ReasoningEffort {
-    match value {
-        "none" => ReasoningEffort::None,
-        "minimal" => ReasoningEffort::Minimal,
-        "low" => ReasoningEffort::Low,
-        "medium" => ReasoningEffort::Medium,
-        "high" => ReasoningEffort::High,
-        "xhigh" => ReasoningEffort::Xhigh,
-        "max" => ReasoningEffort::Max,
-        "ultra" => ReasoningEffort::Ultra,
-        _ => ReasoningEffort::Default,
-    }
-}
-
-fn model_reasoning_summary_name(summary: ModelReasoningSummary) -> &'static str {
-    match summary {
-        ModelReasoningSummary::Default => "default",
-        ModelReasoningSummary::Auto => "auto",
-        ModelReasoningSummary::Concise => "concise",
-        ModelReasoningSummary::Detailed => "detailed",
-        ModelReasoningSummary::None => "none",
-    }
-}
-
-fn model_reasoning_summary_from_name(value: &str) -> ModelReasoningSummary {
-    match value {
-        "auto" => ModelReasoningSummary::Auto,
-        "concise" => ModelReasoningSummary::Concise,
-        "detailed" => ModelReasoningSummary::Detailed,
-        "none" => ModelReasoningSummary::None,
-        _ => ModelReasoningSummary::Default,
-    }
-}
-
-fn model_verbosity_name(verbosity: ModelVerbosity) -> &'static str {
-    match verbosity {
-        ModelVerbosity::Default => "default",
-        ModelVerbosity::Low => "low",
-        ModelVerbosity::Medium => "medium",
-        ModelVerbosity::High => "high",
-    }
-}
-
-fn model_verbosity_from_name(value: &str) -> ModelVerbosity {
-    match value {
-        "low" => ModelVerbosity::Low,
-        "medium" => ModelVerbosity::Medium,
-        "high" => ModelVerbosity::High,
-        _ => ModelVerbosity::Default,
-    }
-}
-
-fn model_reasoning_summary_support_name(support: ModelReasoningSummarySupport) -> &'static str {
-    match support {
-        ModelReasoningSummarySupport::Auto => "auto",
-        ModelReasoningSummarySupport::Supported => "supported",
-        ModelReasoningSummarySupport::Unsupported => "unsupported",
-    }
-}
-
-fn model_reasoning_summary_support_from_name(value: &str) -> ModelReasoningSummarySupport {
-    match value {
-        "supported" => ModelReasoningSummarySupport::Supported,
-        "unsupported" => ModelReasoningSummarySupport::Unsupported,
-        _ => ModelReasoningSummarySupport::Auto,
-    }
-}
-
 fn codex_subagent_from_row(row: sqlx::postgres::PgRow) -> CodexSubagentDefinition {
+    let connection_id: Option<Uuid> = row.get("model_connection_id");
+    let model_id: Option<String> = row.get("model_id");
     CodexSubagentDefinition {
         name: row.get("name"),
         description: row.get("description"),
         developer_instructions: row.get("developer_instructions"),
-        model_connection_id: row.get("model_connection_id"),
-        reasoning_effort: row
-            .get::<Option<String>, _>("reasoning_effort")
-            .as_deref()
-            .map(reasoning_effort_from_name),
+        model_selection: connection_id
+            .zip(model_id)
+            .map(|(connection_id, model_id)| ModelSelectionDto {
+                connection_id,
+                model_id,
+            }),
+        model_settings_override: serde_json::from_value(row.get("model_settings_override"))
+            .expect("subagent Model Settings are constrained"),
         enabled: row.get("enabled"),
         disabled_reason: row.get("disabled_reason"),
     }
@@ -14459,7 +14502,7 @@ async fn load_codex_subagents(
 ) -> Result<Vec<CodexSubagentDefinition>, ApiError> {
     let rows = sqlx::query(
         "SELECT name, description, developer_instructions, model_connection_id,
-                reasoning_effort, enabled, disabled_reason
+                model_id, model_settings_override, enabled, disabled_reason
          FROM codex_subagent_definitions
          WHERE agent_id = $1
          ORDER BY lower(name), id",
@@ -14476,7 +14519,7 @@ async fn load_codex_subagents_tx(
 ) -> Result<Vec<CodexSubagentDefinition>, ApiError> {
     let rows = sqlx::query(
         "SELECT name, description, developer_instructions, model_connection_id,
-                reasoning_effort, enabled, disabled_reason
+                model_id, model_settings_override, enabled, disabled_reason
          FROM codex_subagent_definitions
          WHERE agent_id = $1
          ORDER BY lower(name), id",
@@ -14521,8 +14564,8 @@ fn agent_execution_configuration_changed(
         .copied()
         .collect::<BTreeSet<_>>();
     existing.instructions != request.instructions.trim()
-        || existing.default_model_connection_id != request.default_model_connection_id
-        || existing.reasoning_effort != request.reasoning_effort
+        || existing.model_selection != request.model_selection
+        || existing.model_settings != request.model_settings
         || normalized_codex_subagents(&existing.codex_subagents)
             != normalized_codex_subagents(&request.codex_subagents)
         || existing.model_policy != request.model_policy
@@ -14628,8 +14671,8 @@ fn apply_agent_access(mut agent: AgentDto, user: &UserDto) -> AgentDto {
     if !agent.is_owner && !is_admin_role(&user.role) {
         agent.public_to.clear();
         agent.runtime_id = None;
-        agent.default_model_connection_id = None;
-        agent.reasoning_effort = ReasoningEffort::Default;
+        agent.model_selection = None;
+        agent.model_settings = AgentModelSettings::default();
         agent.codex_subagents.clear();
         agent.model_policy = json!({});
         agent.sandbox_policy = json!({});
@@ -14710,7 +14753,6 @@ fn build_agent_execution_configuration(
     agent: &AgentDto,
     revision: i64,
     managed_rows: Vec<sqlx::postgres::PgRow>,
-    model_rows: Vec<sqlx::postgres::PgRow>,
 ) -> Result<AgentExecutionConfigurationDto, ApiError> {
     let mut skills = std::collections::BTreeMap::new();
     for row in managed_rows {
@@ -14733,32 +14775,13 @@ fn build_agent_execution_configuration(
             },
         );
     }
-    let model_connections = model_rows
-        .into_iter()
-        .map(|row| ModelConnectionOptionDto {
-            id: row.get("id"),
-            name: row.get("name"),
-            model_id: row.get("model_id"),
-            upstream_protocol: model_upstream_protocol_from_name(
-                &row.get::<String, _>("upstream_protocol"),
-            ),
-            parameters: model_connection_parameters_from_row(&row),
-            request_parameters: model_connection_request_parameters_from_row(&row),
-            scope: if row.get::<String, _>("scope") == "global" {
-                ModelConnectionScope::Global
-            } else {
-                ModelConnectionScope::Personal
-            },
-            status: ModelConnectionStatus::Enabled,
-        })
-        .collect();
     Ok(AgentExecutionConfigurationDto {
         revision,
         instructions: agent.instructions.clone(),
-        default_model_connection_id: agent.default_model_connection_id,
-        reasoning_effort: agent.reasoning_effort,
+        model_selection: agent.model_selection.clone(),
+        model_settings: agent.model_settings.clone(),
         codex_subagents: agent.codex_subagents.clone(),
-        model_connections,
+        model_bindings: Vec::new(),
         model_policy: agent.model_policy.clone(),
         sandbox_policy: agent.sandbox_policy.clone(),
         skills: skills.into_values().collect(),
@@ -14772,7 +14795,7 @@ async fn load_agent_execution_configuration_tx(
 ) -> Result<AgentExecutionConfigurationDto, ApiError> {
     let row = sqlx::query(
         "SELECT id, owner_id, name, instructions, visibility, public_to, runtime_id,
-                default_model_connection_id, reasoning_effort,
+                model_connection_id, model_id, model_settings,
                 model_policy, sandbox_policy, mcp_allowlist, execution_config_revision,
                 created_at, updated_at
          FROM agents
@@ -14797,50 +14820,134 @@ async fn load_agent_execution_configuration_tx(
     .bind(agent.owner_id)
     .fetch_all(&mut **tx)
     .await?;
-    let model_rows = load_execution_model_connections_tx(tx, &agent).await?;
-    build_agent_execution_configuration(&agent, revision, skill_rows, model_rows)
+    let mut configuration = build_agent_execution_configuration(&agent, revision, skill_rows)?;
+    // A configuration refresh occurs between Runs. It must not manufacture a
+    // new binding or replace the immutable provider route already materialized
+    // for the online Session; the next claimed Run supplies fresh bindings.
+    configuration.model_selection = None;
+    configuration.model_settings = AgentModelSettings::default();
+    for subagent in &mut configuration.codex_subagents {
+        subagent.model_selection = None;
+        subagent.model_settings_override = AgentModelSettingsOverride::default();
+    }
+    Ok(configuration)
 }
 
-async fn load_execution_model_connections_tx(
+async fn create_run_model_binding_tx(
     tx: &mut Transaction<'_, Postgres>,
-    agent: &AgentDto,
-) -> Result<Vec<sqlx::postgres::PgRow>, ApiError> {
-    ensure_agent_has_configured_model_tx(tx, agent.id).await?;
-    let mut ids = BTreeSet::new();
-    if let Some(model_connection_id) = agent.default_model_connection_id {
-        ids.insert(model_connection_id);
-    }
-    for definition in agent
-        .codex_subagents
-        .iter()
-        .filter(|definition| definition.enabled)
-    {
-        if let Some(model_connection_id) = definition.model_connection_id {
-            ids.insert(model_connection_id);
-        }
-    }
-    let ids = ids.into_iter().collect::<Vec<_>>();
-    let rows = sqlx::query(
-        "SELECT id, name, model_id, upstream_protocol, request_parameters, reasoning_effort,
-                reasoning_summary, verbosity, context_window_tokens,
-                auto_compact_token_limit, reasoning_summary_support,
-                service_tier, request_max_retries, stream_max_retries,
-                stream_idle_timeout_ms, scope
+    run_id: Uuid,
+    binding_key: &str,
+    owner_id: Uuid,
+    selection: &ModelSelectionDto,
+    settings: &AgentModelSettings,
+) -> Result<RunModelBindingDto, ApiError> {
+    let row = sqlx::query(
+        "SELECT id, name, scope, api_type
          FROM model_connections
-         WHERE id = ANY($1) AND enabled = true AND deleted_at IS NULL
-           AND (scope = 'global' OR owner_id = $2)
-         ORDER BY id",
+         WHERE id = $1 AND enabled = true AND deleted_at IS NULL
+           AND $2 = ANY(allowed_model_ids)
+           AND (scope = 'global' OR owner_id = $3)
+         FOR SHARE",
     )
-    .bind(&ids)
-    .bind(agent.owner_id)
-    .fetch_all(&mut **tx)
+    .bind(selection.connection_id)
+    .bind(&selection.model_id)
+    .bind(owner_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ApiError::conflict(
+        "Agent model configuration is unavailable",
+    ))?;
+    let api_type = model_upstream_protocol_from_name(&row.get::<String, _>("api_type"));
+    let settings = validate_agent_model_settings(settings.clone(), api_type)?;
+    let binding = RunModelBindingDto {
+        id: Uuid::new_v4(),
+        run_id,
+        binding_key: binding_key.to_owned(),
+        model_connection_id: selection.connection_id,
+        connection_name_snapshot: row.get("name"),
+        connection_scope_snapshot: if row.get::<String, _>("scope") == "global" {
+            ModelConnectionScope::Global
+        } else {
+            ModelConnectionScope::Personal
+        },
+        model_id: selection.model_id.clone(),
+        api_type,
+        model_settings: settings,
+    };
+    sqlx::query(
+        "INSERT INTO run_model_bindings
+             (id, run_id, binding_key, model_connection_id,
+              connection_name_snapshot, connection_scope_snapshot,
+              model_id, api_type, model_settings)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+    )
+    .bind(binding.id)
+    .bind(run_id)
+    .bind(&binding.binding_key)
+    .bind(binding.model_connection_id)
+    .bind(&binding.connection_name_snapshot)
+    .bind(model_connection_scope_name(
+        binding.connection_scope_snapshot,
+    ))
+    .bind(&binding.model_id)
+    .bind(model_upstream_protocol_name(binding.api_type))
+    .bind(
+        serde_json::to_value(&binding.model_settings)
+            .map_err(|_| ApiError::internal("Run Model Binding could not be encoded"))?,
+    )
+    .execute(&mut **tx)
     .await?;
-    if rows.len() != ids.len() {
-        return Err(ApiError::conflict(
-            "Agent subagent model configuration is unavailable",
-        ));
+    Ok(binding)
+}
+
+async fn create_run_model_bindings_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    run_id: Uuid,
+    agent: &AgentDto,
+) -> Result<Vec<RunModelBindingDto>, ApiError> {
+    let main_selection = agent
+        .model_selection
+        .as_ref()
+        .ok_or(ApiError::conflict("Agent has no configured model"))?;
+    let mut bindings = vec![
+        create_run_model_binding_tx(
+            tx,
+            run_id,
+            "main",
+            agent.owner_id,
+            main_selection,
+            &agent.model_settings,
+        )
+        .await?,
+    ];
+    for subagent in agent.codex_subagents.iter().filter(|subagent| {
+        subagent.enabled
+            && (subagent.model_selection.is_some()
+                || subagent.model_settings_override != AgentModelSettingsOverride::default())
+    }) {
+        let selection = subagent.model_selection.as_ref().unwrap_or(main_selection);
+        let protocol =
+            load_permitted_model_selection_api_type_tx(tx, agent.owner_id, selection).await?;
+        let settings = effective_subagent_model_settings(
+            &agent.model_settings,
+            &subagent.model_settings_override,
+            protocol,
+            subagent.model_selection.is_some()
+                && protocol != agent.model_settings.request_settings.protocol(),
+        )?;
+        bindings.push(
+            create_run_model_binding_tx(
+                tx,
+                run_id,
+                subagent.name.trim(),
+                agent.owner_id,
+                selection,
+                &settings,
+            )
+            .await?,
+        );
     }
-    Ok(rows)
+    Ok(bindings)
 }
 
 fn validate_integration_app_payload(
@@ -16990,12 +17097,15 @@ async fn seed_dev_model_connection(
     pool: &PgPool,
     cipher: &ModelSecretCipher,
     base_url: &str,
-    model_id: &str,
+    allowed_model_ids: Vec<String>,
     api_key: &str,
 ) -> anyhow::Result<Uuid> {
     const NAME: &str = "Compose Responses";
     let seeded_id = Uuid::parse_str("de000000-0000-4000-8000-000000000001")?;
-    let fields = validate_model_connection_fields(NAME, base_url, model_id, Some(api_key))
+    let allowed_model_ids = normalize_allowed_model_ids(allowed_model_ids)
+        .context("invalid development Model Connection model ids")?;
+    let default_model_id = allowed_model_ids[0].clone();
+    let fields = validate_model_connection_fields(NAME, base_url, allowed_model_ids, Some(api_key))
         .map_err(|error| {
             anyhow::anyhow!("invalid development Model Connection: {}", error.message)
         })?;
@@ -17018,12 +17128,13 @@ async fn seed_dev_model_connection(
 
     sqlx::query(
         "INSERT INTO model_connections
-             (id, scope, owner_id, name, base_url, model_id,
+             (id, scope, owner_id, name, base_url, api_type, allowed_model_ids,
               api_key_ciphertext, api_key_nonce, enabled, deleted_at)
-         VALUES ($1, 'global', NULL, $2, $3, $4, $5, $6, true, NULL)
+         VALUES ($1, 'global', NULL, $2, $3, 'openai_responses', $4, $5, $6, true, NULL)
          ON CONFLICT (id) DO UPDATE
          SET scope = 'global', owner_id = NULL, name = EXCLUDED.name,
-             base_url = EXCLUDED.base_url, model_id = EXCLUDED.model_id,
+             base_url = EXCLUDED.base_url, api_type = EXCLUDED.api_type,
+             allowed_model_ids = EXCLUDED.allowed_model_ids,
              api_key_ciphertext = EXCLUDED.api_key_ciphertext,
              api_key_nonce = EXCLUDED.api_key_nonce, enabled = true,
              deleted_at = NULL, updated_at = CURRENT_TIMESTAMP(3)",
@@ -17031,21 +17142,23 @@ async fn seed_dev_model_connection(
     .bind(id)
     .bind(fields.name)
     .bind(fields.base_url)
-    .bind(fields.model_id)
+    .bind(fields.allowed_model_ids)
     .bind(encrypted.ciphertext)
     .bind(encrypted.nonce)
     .execute(&mut *tx)
     .await?;
     sqlx::query(
-        "INSERT INTO system_default_model_connection
-             (singleton, model_connection_id, updated_by)
-         VALUES (true, $1, NULL)
+        "INSERT INTO system_default_model_selection
+             (singleton, model_connection_id, model_id, updated_by)
+         VALUES (true, $1, $2, NULL)
          ON CONFLICT (singleton) DO UPDATE
          SET model_connection_id = EXCLUDED.model_connection_id,
+             model_id = EXCLUDED.model_id,
              updated_by = NULL,
              updated_at = CURRENT_TIMESTAMP(3)",
     )
     .bind(id)
+    .bind(default_model_id)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -17122,6 +17235,8 @@ fn authentication_channel_from_row(row: sqlx::postgres::PgRow) -> Authentication
 }
 
 fn agent_from_row(row: sqlx::postgres::PgRow) -> AgentDto {
+    let connection_id: Option<Uuid> = row.try_get("model_connection_id").unwrap_or_default();
+    let model_id: Option<String> = row.try_get("model_id").unwrap_or_default();
     AgentDto {
         id: row.get("id"),
         owner_id: row.get("owner_id"),
@@ -17130,13 +17245,16 @@ fn agent_from_row(row: sqlx::postgres::PgRow) -> AgentDto {
         visibility: row.get("visibility"),
         public_to: row.get("public_to"),
         runtime_id: row.get("runtime_id"),
-        default_model_connection_id: row
-            .try_get("default_model_connection_id")
-            .unwrap_or_default(),
-        reasoning_effort: row
-            .try_get::<String, _>("reasoning_effort")
+        model_selection: connection_id
+            .zip(model_id)
+            .map(|(connection_id, model_id)| ModelSelectionDto {
+                connection_id,
+                model_id,
+            }),
+        model_settings: row
+            .try_get::<Value, _>("model_settings")
             .ok()
-            .map(|value| reasoning_effort_from_name(&value))
+            .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default(),
         codex_subagents: Vec::new(),
         model_policy: row.get("model_policy"),
@@ -17562,7 +17680,7 @@ mod tests {
     struct TestModelGatewayEnvelope {
         request_id: String,
         protocol: ModelUpstreamProtocol,
-        request_parameters: ModelConnectionRequestParameters,
+        request_settings: ModelRequestSettings,
         endpoint: String,
         api_key: String,
         query: Option<String>,
@@ -17760,49 +17878,49 @@ mod tests {
     }
 
     #[test]
-    fn model_request_parameters_validate_protocol_and_ranges() {
-        let chat = serde_json::from_value(json!({
+    fn model_request_settings_validate_protocol_and_ranges() {
+        let chat: ModelRequestSettings = serde_json::from_value(json!({
             "protocol": "openai_chat_completions",
             "temperature": 1.5,
             "top_p": 0.8,
             "max_completion_tokens": 4096
         }))
         .unwrap();
-        assert!(validate_model_connection_request_parameters(
+        assert!(validate_model_request_settings(
             ModelUpstreamProtocol::OpenaiChatCompletions,
             chat,
         )
         .is_ok());
 
-        let mismatched = validate_model_connection_request_parameters(
+        let mismatched = validate_model_request_settings(
             ModelUpstreamProtocol::AnthropicMessages,
-            ModelConnectionRequestParameters::default(),
+            ModelRequestSettings::default(),
         )
         .unwrap_err();
         assert_eq!(mismatched.status, StatusCode::BAD_REQUEST);
 
-        let invalid_temperature = serde_json::from_value(json!({
+        let invalid_temperature: ModelRequestSettings = serde_json::from_value(json!({
             "protocol": "anthropic_messages",
             "temperature": 1.1,
             "top_p": null,
             "max_tokens": null
         }))
         .unwrap();
-        let invalid_temperature = validate_model_connection_request_parameters(
+        let invalid_temperature = validate_model_request_settings(
             ModelUpstreamProtocol::AnthropicMessages,
             invalid_temperature,
         )
         .unwrap_err();
         assert_eq!(invalid_temperature.status, StatusCode::BAD_REQUEST);
 
-        let mutually_exclusive_sampling = serde_json::from_value(json!({
+        let mutually_exclusive_sampling: ModelRequestSettings = serde_json::from_value(json!({
             "protocol": "anthropic_messages",
             "temperature": 0.4,
             "top_p": 0.9,
             "max_tokens": 4096
         }))
         .unwrap();
-        let mutually_exclusive_sampling = validate_model_connection_request_parameters(
+        let mutually_exclusive_sampling = validate_model_request_settings(
             ModelUpstreamProtocol::AnthropicMessages,
             mutually_exclusive_sampling,
         )
@@ -17904,6 +18022,10 @@ mod tests {
             document["paths"]["/api/agents"]["get"]["security"],
             json!([{ "sessionCookie": [] }, { "userBearer": [] }])
         );
+        let model_connection_item =
+            &document["paths"]["/api/model-connections/{model_connection_id}"];
+        assert!(model_connection_item.get("put").is_some());
+        assert!(model_connection_item.get("patch").is_none());
         assert!(
             document["components"]["schemas"]["ModelConnection"]["properties"]
                 .get("api_key")
@@ -17940,11 +18062,11 @@ mod tests {
             json!(["auto", "supported", "unsupported"])
         );
         assert_eq!(
-            document["components"]["schemas"]["ModelConnectionRequestParameters"]["oneOf"][2]
-                ["not"]["required"],
+            document["components"]["schemas"]["ModelRequestSettings"]["oneOf"][2]["not"]
+                ["required"],
             json!(["temperature", "top_p"])
         );
-        let parameters = &document["components"]["schemas"]["ModelConnectionParameters"];
+        let parameters = &document["components"]["schemas"]["AgentModelSettings"];
         assert_eq!(parameters["additionalProperties"], false);
         assert_eq!(
             parameters["properties"]["request_max_retries"]["maximum"],
@@ -17962,30 +18084,45 @@ mod tests {
             "ModelConnectionSnapshot",
         ] {
             assert_eq!(
-                document["components"]["schemas"][schema]["properties"]["upstream_protocol"]
-                    ["$ref"],
+                document["components"]["schemas"][schema]["properties"]["api_type"]["$ref"],
                 "#/components/schemas/ModelUpstreamProtocol",
-                "missing upstream protocol from {schema}"
+                "missing API type from {schema}"
             );
         }
         for schema in [
             "ModelConnection",
             "CreateModelConnectionRequest",
             "UpdateModelConnectionRequest",
-            "ModelConnectionOption",
         ] {
-            assert_eq!(
-                document["components"]["schemas"][schema]["properties"]["parameters"]["$ref"],
-                "#/components/schemas/ModelConnectionParameters",
-                "missing detailed parameters from {schema}"
-            );
-            assert_eq!(
-                document["components"]["schemas"][schema]["properties"]["request_parameters"]
-                    ["$ref"],
-                "#/components/schemas/ModelConnectionRequestParameters",
-                "missing protocol request parameters from {schema}"
-            );
+            assert!(document["components"]["schemas"][schema]["properties"]
+                .get("allowed_model_ids")
+                .is_some());
+            assert!(document["components"]["schemas"][schema]["properties"]
+                .get("parameters")
+                .is_none());
+            assert!(document["components"]["schemas"][schema]["properties"]
+                .get("request_parameters")
+                .is_none());
         }
+        let execution_configuration =
+            &document["components"]["schemas"]["AgentExecutionConfiguration"];
+        assert_eq!(
+            execution_configuration["properties"]["model_bindings"]["items"]["$ref"],
+            "#/components/schemas/RunModelBinding"
+        );
+        assert!(execution_configuration["properties"]
+            .get("default_model_connection_id")
+            .is_none());
+        let proxy_parameters = document["paths"]["/api/runtime/model-proxy/v1/responses"]["post"]
+            ["parameters"]
+            .as_array()
+            .unwrap();
+        assert!(proxy_parameters
+            .iter()
+            .any(|parameter| parameter["name"] == "x-agent-hub-model-binding-id"));
+        assert!(!proxy_parameters
+            .iter()
+            .any(|parameter| parameter["name"] == "x-agent-hub-model-connection-id"));
         let update_agent = &document["components"]["schemas"]["UpdateAgentRequest"];
         assert_eq!(update_agent["additionalProperties"], false);
         assert!(update_agent["required"]
@@ -18370,16 +18507,28 @@ mod tests {
         let execution_configuration =
             &openapi_document()["components"]["schemas"]["AgentExecutionConfiguration"];
         for property in [
-            "default_model_connection_id",
-            "reasoning_effort",
+            "model_selection",
+            "model_settings",
             "codex_subagents",
-            "model_connections",
+            "model_bindings",
         ] {
             assert!(
                 execution_configuration["properties"]
                     .get(property)
                     .is_some(),
                 "missing AgentExecutionConfiguration property {property}"
+            );
+        }
+        for legacy_property in [
+            "default_model_connection_id",
+            "reasoning_effort",
+            "model_connections",
+        ] {
+            assert!(
+                execution_configuration["properties"]
+                    .get(legacy_property)
+                    .is_none(),
+                "legacy AgentExecutionConfiguration property {legacy_property} remains"
             );
         }
     }
@@ -19233,8 +19382,8 @@ mod tests {
                 instructions: "Initial instructions".into(),
                 visibility: "private".into(),
                 public_to: Vec::new(),
-                default_model_connection_id: None,
-                reasoning_effort: ReasoningEffort::Default,
+                model_selection: None,
+                model_settings: Some(AgentModelSettings::default()),
                 codex_subagents: Vec::new(),
             }),
         )
@@ -19247,8 +19396,8 @@ mod tests {
             visibility: agent.visibility.clone(),
             public_to: Vec::new(),
             runtime_id: None,
-            default_model_connection_id: agent.default_model_connection_id,
-            reasoning_effort: agent.reasoning_effort,
+            model_selection: agent.model_selection.clone(),
+            model_settings: agent.model_settings.clone(),
             codex_subagents: agent.codex_subagents.clone(),
             model_policy: agent.model_policy.clone(),
             sandbox_policy: agent.sandbox_policy.clone(),
@@ -31021,7 +31170,7 @@ mod tests {
             &pool,
             &cipher,
             "http://fake-model-provider:8080",
-            "hub-proxy-smoke",
+            vec!["hub-proxy-smoke".into(), "hub-proxy-smoke-fast".into()],
             "development-provider-key",
         )
         .await
@@ -31030,7 +31179,7 @@ mod tests {
             &pool,
             &cipher,
             "http://fake-model-provider:8080",
-            "hub-proxy-smoke",
+            vec!["hub-proxy-smoke".into(), "hub-proxy-smoke-fast".into()],
             "development-provider-key",
         )
         .await
@@ -31047,8 +31196,8 @@ mod tests {
             1
         );
         let row = sqlx::query(
-            "SELECT scope, owner_id, base_url, model_id, enabled, deleted_at,
-                    api_key_ciphertext, api_key_nonce
+            "SELECT scope, owner_id, base_url, api_type, allowed_model_ids,
+                    enabled, deleted_at, api_key_ciphertext, api_key_nonce
              FROM model_connections WHERE id = $1",
         )
         .bind(first)
@@ -31061,7 +31210,11 @@ mod tests {
             row.get::<String, _>("base_url"),
             "http://fake-model-provider:8080"
         );
-        assert_eq!(row.get::<String, _>("model_id"), "hub-proxy-smoke");
+        assert_eq!(row.get::<String, _>("api_type"), "openai_responses");
+        assert_eq!(
+            row.get::<Vec<String>, _>("allowed_model_ids"),
+            vec!["hub-proxy-smoke", "hub-proxy-smoke-fast"]
+        );
         assert!(row.get::<bool, _>("enabled"));
         assert_eq!(row.get::<Option<DateTime<Utc>>, _>("deleted_at"), None);
         assert_eq!(
@@ -31074,13 +31227,14 @@ mod tests {
             "development-provider-key"
         );
         assert_eq!(
-            sqlx::query_scalar::<_, Uuid>(
-                "SELECT model_connection_id FROM system_default_model_connection WHERE singleton = true",
+            sqlx::query_as::<_, (Uuid, String)>(
+                "SELECT model_connection_id, model_id
+                 FROM system_default_model_selection WHERE singleton = true",
             )
             .fetch_one(&pool)
             .await
             .unwrap(),
-            first
+            (first, "hub-proxy-smoke".into())
         );
     }
 
@@ -32219,6 +32373,23 @@ mod tests {
     }
 
     #[test]
+    fn codex_subagent_main_binding_key_is_reserved_case_insensitively() {
+        for name in ["main", "MAIN", " Main "] {
+            let error = validate_codex_subagent_definitions(&[CodexSubagentDefinition {
+                name: name.into(),
+                description: "Reviews output".into(),
+                developer_instructions: "Review carefully.".into(),
+                model_selection: None,
+                model_settings_override: AgentModelSettingsOverride::default(),
+                enabled: true,
+                disabled_reason: None,
+            }])
+            .unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
     fn console_runtime_capabilities_only_keep_known_non_sensitive_fields() {
         let capabilities = console_runtime_capabilities(&json!({
             "driver": "app-server",
@@ -32299,6 +32470,62 @@ mod tests {
             .0;
         assert!(background.contains("Duration::from_secs(5)"));
         assert!(background.contains("reap_stale_runtimes(&pool).await"));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn run_model_bindings_distinguish_same_connection_model_with_different_settings(
+        pool: PgPool,
+    ) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        sqlx::query(
+            "INSERT INTO codex_subagent_definitions
+                 (id, agent_id, name, description, developer_instructions,
+                  model_settings_override)
+             VALUES ($1, $2, 'reviewer', 'Reviews output', 'Review carefully.',
+                     '{\"reasoning_effort\":\"high\",\"request_max_retries\":2}'::jsonb)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(fixture.agent_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        let main = claim
+            .execution_configuration
+            .model_bindings
+            .iter()
+            .find(|binding| binding.binding_key == "main")
+            .unwrap();
+        let reviewer = claim
+            .execution_configuration
+            .model_bindings
+            .iter()
+            .find(|binding| binding.binding_key == "reviewer")
+            .unwrap();
+        assert_ne!(main.id, reviewer.id);
+        assert_eq!(main.model_connection_id, reviewer.model_connection_id);
+        assert_eq!(main.model_id, reviewer.model_id);
+        assert_eq!(
+            main.model_settings.reasoning_effort,
+            ReasoningEffort::Default
+        );
+        assert_eq!(
+            reviewer.model_settings.reasoning_effort,
+            ReasoningEffort::High
+        );
+        assert_eq!(main.model_settings.request_max_retries, None);
+        assert_eq!(reviewer.model_settings.request_max_retries, Some(2));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM run_model_bindings WHERE run_id = $1",
+            )
+            .bind(fixture.run_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            2
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -32390,6 +32617,7 @@ mod tests {
             .await
             .unwrap();
         let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        let main_binding_id = model_binding_id(&claim, "main");
         sqlx::query(
             "UPDATE hub_sessions
              SET lifecycle_status = 'online', active_turn_id = $1
@@ -32416,10 +32644,7 @@ mod tests {
                         format!("Bearer {}", claim.model_proxy_token),
                     )
                     .header("x-agent-hub-run-id", fixture.run_id.to_string())
-                    .header(
-                        "x-agent-hub-model-connection-id",
-                        fixture.model_connection_id.to_string(),
-                    )
+                    .header(MODEL_PROXY_BINDING_ID_HEADER, main_binding_id.to_string())
                     .header(header::CONTENT_TYPE, "application/json")
                     .header("x-client-feature", "preserve-me")
                     .header(header::COOKIE, "runtime_cookie=drop-me")
@@ -32472,8 +32697,8 @@ mod tests {
             ModelUpstreamProtocol::OpenaiResponses
         );
         assert_eq!(
-            captured.envelope.request_parameters,
-            ModelConnectionRequestParameters::default()
+            captured.envelope.request_settings,
+            ModelRequestSettings::default()
         );
         assert_eq!(
             captured.envelope.endpoint,
@@ -32492,7 +32717,7 @@ mod tests {
         for filtered in [
             "cookie",
             "x-agent-hub-run-id",
-            "x-agent-hub-model-connection-id",
+            MODEL_PROXY_BINDING_ID_HEADER,
             "x-client-hop",
         ] {
             assert!(!captured.envelope.headers.contains_key(filtered));
@@ -32521,8 +32746,8 @@ mod tests {
             )
         );
         for table_and_column in [
-            ("run_model_connection_snapshots", "request_parameters"),
-            ("model_token_usage", "request_parameters_snapshot"),
+            ("run_model_bindings", "model_settings->'request_settings'"),
+            ("model_token_usage", "request_settings_snapshot"),
         ] {
             let sql = format!(
                 "SELECT {} FROM {} WHERE model_connection_id = $1",
@@ -32556,7 +32781,7 @@ mod tests {
             let app = Router::new().route(
                 "/internal/v1/responses",
                 post(|Json(envelope): Json<TestModelGatewayEnvelope>| async move {
-                    if envelope.protocol != ModelUpstreamProtocol::AnthropicMessages {
+                    if envelope.protocol != ModelUpstreamProtocol::OpenaiResponses {
                         return StatusCode::BAD_REQUEST.into_response();
                     }
                     let case = envelope
@@ -32644,24 +32869,14 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        sqlx::query(
-            "UPDATE model_connections
-             SET base_url = $1,
-                 upstream_protocol = 'anthropic_messages',
-                 request_parameters = '{
-                     \"protocol\": \"anthropic_messages\",
-                     \"temperature\": null,
-                     \"top_p\": null,
-                     \"max_tokens\": null
-                 }'::jsonb
-             WHERE id = $2",
-        )
-        .bind(format!("http://{address}/provider"))
-        .bind(fixture.model_connection_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
+        sqlx::query("UPDATE model_connections SET base_url = $1 WHERE id = $2")
+            .bind(format!("http://{address}/provider"))
+            .bind(fixture.model_connection_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
         let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        let main_binding_id = model_binding_id(&claim, "main");
         sqlx::query(
             "UPDATE hub_sessions
              SET lifecycle_status = 'online', active_turn_id = $1
@@ -32690,7 +32905,7 @@ mod tests {
                 &app,
                 &fixture,
                 &claim.model_proxy_token,
-                fixture.model_connection_id,
+                main_binding_id,
                 &format!("case={case}"),
                 "runtime-claim-model",
             )
@@ -32765,13 +32980,13 @@ mod tests {
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM (
-                     SELECT upstream_protocol_snapshot FROM model_token_usage
+                     SELECT api_type_snapshot FROM model_token_usage
                      WHERE model_connection_id = $1
                      UNION ALL
-                     SELECT upstream_protocol_snapshot FROM model_call_errors
+                     SELECT api_type_snapshot FROM model_call_errors
                      WHERE model_connection_id = $1
                  ) AS snapshots
-                 WHERE upstream_protocol_snapshot <> 'anthropic_messages'",
+                 WHERE api_type_snapshot <> 'openai_responses'",
             )
             .bind(fixture.model_connection_id)
             .fetch_one(&fixture.state.pool)
@@ -32786,6 +33001,7 @@ mod tests {
     async fn model_proxy_fails_closed_before_upstream_for_invalid_execution_scope(pool: PgPool) {
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
         let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        let main_binding_id = model_binding_id(&claim, "main");
         sqlx::query(
             "UPDATE hub_sessions
              SET lifecycle_status = 'online', active_turn_id = $1
@@ -32796,27 +33012,14 @@ mod tests {
         .execute(&fixture.state.pool)
         .await
         .unwrap();
-        let unassigned_connection_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO model_connections
-                 (id, scope, owner_id, name, base_url, model_id,
-                  api_key_ciphertext, api_key_nonce, created_by)
-             SELECT $1, 'global', NULL, 'Unassigned Proxy Model', base_url, model_id,
-                    api_key_ciphertext, api_key_nonce, created_by
-             FROM model_connections WHERE id = $2",
-        )
-        .bind(unassigned_connection_id)
-        .bind(fixture.model_connection_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
+        let unassigned_binding_id = Uuid::new_v4();
         let app = build_router((*fixture.state).clone());
 
         let mismatch = model_proxy_test_http_request(
             &app,
             &fixture,
             &claim.model_proxy_token,
-            fixture.model_connection_id,
+            main_binding_id,
             "case=mismatch",
             "another-model",
         )
@@ -32827,7 +33030,7 @@ mod tests {
             &app,
             &fixture,
             "invalid-token",
-            fixture.model_connection_id,
+            main_binding_id,
             "case=bad-token",
             "runtime-claim-model",
         )
@@ -32838,7 +33041,7 @@ mod tests {
             &app,
             &fixture,
             &claim.model_proxy_token,
-            unassigned_connection_id,
+            unassigned_binding_id,
             "case=unassigned",
             "runtime-claim-model",
         )
@@ -32854,7 +33057,7 @@ mod tests {
             &app,
             &fixture,
             &claim.model_proxy_token,
-            fixture.model_connection_id,
+            main_binding_id,
             "case=disabled",
             "runtime-claim-model",
         )
@@ -32875,7 +33078,7 @@ mod tests {
             &app,
             &fixture,
             &claim.model_proxy_token,
-            fixture.model_connection_id,
+            main_binding_id,
             "case=inactive-run",
             "runtime-claim-model",
         )
@@ -32896,7 +33099,7 @@ mod tests {
             &app,
             &fixture,
             &claim.model_proxy_token,
-            fixture.model_connection_id,
+            main_binding_id,
             "case=offline-runtime",
             "runtime-claim-model",
         )
@@ -32915,12 +33118,35 @@ mod tests {
             &app,
             &fixture,
             &claim.model_proxy_token,
-            fixture.model_connection_id,
+            main_binding_id,
             "case=stale-runtime",
             "runtime-claim-model",
         )
         .await;
         assert_eq!(stale_runtime.status(), StatusCode::UNAUTHORIZED);
+
+        let legacy_connection_header = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/runtime/model-proxy/v1/responses")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", claim.model_proxy_token),
+                    )
+                    .header("x-agent-hub-run-id", fixture.run_id.to_string())
+                    .header(
+                        "x-agent-hub-model-connection-id",
+                        fixture.model_connection_id.to_string(),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(br#"{"model":"runtime-claim-model"}"#.as_slice()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy_connection_header.status(), StatusCode::BAD_REQUEST);
 
         let unsupported = app
             .clone()
@@ -32933,10 +33159,7 @@ mod tests {
                         format!("Bearer {}", claim.model_proxy_token),
                     )
                     .header("x-agent-hub-run-id", fixture.run_id.to_string())
-                    .header(
-                        MODEL_PROXY_CONNECTION_ID_HEADER,
-                        fixture.model_connection_id.to_string(),
-                    )
+                    .header(MODEL_PROXY_BINDING_ID_HEADER, main_binding_id.to_string())
                     .body(Body::from(br#"{"model":"runtime-claim-model"}"#.as_slice()))
                     .unwrap(),
             )
@@ -32998,6 +33221,7 @@ mod tests {
             });
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
         let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        let main_binding_id = model_binding_id(&claim, "main");
         sqlx::query(
             "UPDATE hub_sessions
              SET lifecycle_status = 'online', active_turn_id = $1
@@ -33015,8 +33239,7 @@ mod tests {
             .unwrap();
         sqlx::query(
             "UPDATE model_connections
-             SET base_url = $1, model_id = 'rotated-model',
-                 api_key_ciphertext = $2, api_key_nonce = $3
+             SET base_url = $1, api_key_ciphertext = $2, api_key_nonce = $3
              WHERE id = $4",
         )
         .bind(format!("http://{address}/rotated"))
@@ -33028,7 +33251,7 @@ mod tests {
         .unwrap();
         sqlx::query(
             "UPDATE agents
-             SET default_model_connection_id = NULL,
+             SET model_connection_id = NULL, model_id = NULL,
                  execution_config_revision = execution_config_revision + 1
              WHERE id = $1",
         )
@@ -33044,7 +33267,7 @@ mod tests {
             &app,
             &fixture,
             &claim.model_proxy_token,
-            fixture.model_connection_id,
+            main_binding_id,
             "case=current-turn",
             "runtime-claim-model",
         )
@@ -33075,7 +33298,7 @@ mod tests {
             &app,
             &fixture,
             &claim.model_proxy_token,
-            fixture.model_connection_id,
+            main_binding_id,
             "case=future-turn",
             "rotated-model",
         )
@@ -33108,10 +33331,11 @@ mod tests {
         let subagent_connection_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO model_connections
-                 (id, scope, owner_id, name, base_url, model_id,
+                 (id, scope, owner_id, name, base_url, api_type, allowed_model_ids,
                   api_key_ciphertext, api_key_nonce, created_by)
              SELECT $1, scope, owner_id, 'Subagent Override Model', $2,
-                    'subagent-model', api_key_ciphertext, api_key_nonce, created_by
+                    api_type, ARRAY['subagent-model'], api_key_ciphertext,
+                    api_key_nonce, created_by
              FROM model_connections WHERE id = $3",
         )
         .bind(subagent_connection_id)
@@ -33123,9 +33347,9 @@ mod tests {
         sqlx::query(
             "INSERT INTO codex_subagent_definitions
                  (id, agent_id, name, description, developer_instructions,
-                  model_connection_id, reasoning_effort)
+                  model_connection_id, model_id, model_settings_override)
              VALUES ($1, $2, 'reviewer', 'Reviews changes', 'Review carefully.',
-                     $3, 'high')",
+                     $3, 'subagent-model', '{\"reasoning_effort\":\"high\"}'::jsonb)",
         )
         .bind(Uuid::new_v4())
         .bind(fixture.agent_id)
@@ -33134,6 +33358,7 @@ mod tests {
         .await
         .unwrap();
         let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        let reviewer_binding_id = model_binding_id(&claim, "reviewer");
         sqlx::query(
             "UPDATE hub_sessions
              SET lifecycle_status = 'online', active_turn_id = $1
@@ -33152,7 +33377,7 @@ mod tests {
             &app,
             &fixture,
             &claim.model_proxy_token,
-            subagent_connection_id,
+            reviewer_binding_id,
             "case=subagent",
             "subagent-model",
         )
@@ -33182,7 +33407,7 @@ mod tests {
             &app,
             &fixture,
             &claim.model_proxy_token,
-            subagent_connection_id,
+            reviewer_binding_id,
             "case=disabled-subagent",
             "subagent-model",
         )
@@ -33230,6 +33455,7 @@ mod tests {
             .unwrap();
         let header_claim =
             claim_runtime_run(&header_fixture.state, &header_fixture.runtime_token).await;
+        let header_binding_id = model_binding_id(&header_claim, "main");
         sqlx::query(
             "UPDATE hub_sessions
              SET lifecycle_status = 'online', active_turn_id = $1
@@ -33253,7 +33479,7 @@ mod tests {
             &header_app,
             &header_fixture,
             &header_claim.model_proxy_token,
-            header_fixture.model_connection_id,
+            header_binding_id,
             "case=header-timeout",
             "runtime-claim-model",
         )
@@ -33282,6 +33508,7 @@ mod tests {
             .await
             .unwrap();
         let body_claim = claim_runtime_run(&body_fixture.state, &body_fixture.runtime_token).await;
+        let body_binding_id = model_binding_id(&body_claim, "main");
         sqlx::query(
             "UPDATE hub_sessions
              SET lifecycle_status = 'online', active_turn_id = $1
@@ -33305,7 +33532,7 @@ mod tests {
             &body_app,
             &body_fixture,
             &body_claim.model_proxy_token,
-            body_fixture.model_connection_id,
+            body_binding_id,
             "case=body-timeout",
             "runtime-claim-model",
         )
@@ -33590,10 +33817,7 @@ mod tests {
         assert_eq!(headers[header::AUTHORIZATION], "Bearer test-gateway-token");
         assert!(Uuid::parse_str(&envelope.request_id).is_ok());
         assert_eq!(envelope.protocol, ModelUpstreamProtocol::OpenaiResponses);
-        assert_eq!(
-            envelope.request_parameters,
-            ModelConnectionRequestParameters::default()
-        );
+        assert_eq!(envelope.request_settings, ModelRequestSettings::default());
         assert_eq!(envelope.endpoint, "https://provider.example/custom");
         assert_eq!(envelope.api_key, "test-provider-secret");
         assert_eq!(envelope.query, None);
@@ -37162,8 +37386,8 @@ mod tests {
             visibility: "private".into(),
             public_to: Vec::new(),
             runtime_id: None,
-            default_model_connection_id: None,
-            reasoning_effort: ReasoningEffort::Default,
+            model_selection: None,
+            model_settings: AgentModelSettings::default(),
             codex_subagents: Vec::new(),
             model_policy: json!({}),
             sandbox_policy: json!({}),
@@ -37195,8 +37419,8 @@ mod tests {
             visibility: "private".into(),
             public_to: Vec::new(),
             runtime_id: None,
-            default_model_connection_id: None,
-            reasoning_effort: ReasoningEffort::Default,
+            model_selection: None,
+            model_settings: AgentModelSettings::default(),
             codex_subagents: Vec::new(),
             model_policy: json!({ "provider": "hub-proxy" }),
             sandbox_policy: json!({ "mode": "workspace-write", "network_access": true }),
@@ -37367,10 +37591,11 @@ mod tests {
         let encrypted = cipher.encrypt("runtime-claim-secret").unwrap();
         sqlx::query(
             "INSERT INTO model_connections
-                 (id, scope, owner_id, name, base_url, model_id,
+                 (id, scope, owner_id, name, base_url, api_type, allowed_model_ids,
                   api_key_ciphertext, api_key_nonce, created_by)
              VALUES ($1, 'personal', $2, 'Runtime Claim Model',
-                     'http://127.0.0.1:1', 'runtime-claim-model', $3, $4, $2)",
+                     'http://127.0.0.1:1', 'openai_responses',
+                     ARRAY['runtime-claim-model'], $3, $4, $2)",
         )
         .bind(model_connection_id)
         .bind(owner_id)
@@ -37395,10 +37620,10 @@ mod tests {
         sqlx::query(
             "INSERT INTO agents
              (id, owner_id, name, instructions, visibility, model_policy, sandbox_policy,
-              runtime_id, default_model_connection_id)
+              runtime_id, model_connection_id, model_id)
              VALUES ($1, $2, 'Runtime Claim Test Agent', 'test', 'private',
                      '{\"provider\":\"hub-proxy\"}'::jsonb,
-                     $3, $4, $5)",
+                     $3, $4, $5, 'runtime-claim-model')",
         )
         .bind(agent_id)
         .bind(owner_id)
@@ -37943,11 +38168,11 @@ mod tests {
             "Admin Personal",
         )
         .await;
-        let _ = set_system_default_model_connection(
+        let _ = set_system_default_model_selection(
             State(state.clone()),
             session_headers(&admin_token),
-            Json(SetSystemDefaultModelConnectionRequest {
-                model_connection_id: Some(global.id),
+            Json(SetSystemDefaultModelSelectionRequest {
+                selection: Some(test_model_selection(&global)),
             }),
         )
         .await
@@ -37961,14 +38186,20 @@ mod tests {
                 instructions: "# Use the configured model".into(),
                 visibility: "private".into(),
                 public_to: Vec::new(),
-                default_model_connection_id: None,
-                reasoning_effort: ReasoningEffort::High,
+                model_selection: None,
+                model_settings: Some(AgentModelSettings {
+                    reasoning_effort: ReasoningEffort::High,
+                    ..AgentModelSettings::default()
+                }),
                 codex_subagents: vec![CodexSubagentDefinition {
                     name: "researcher".into(),
                     description: "Researches primary sources".into(),
                     developer_instructions: "# Research\n\nCite sources.".into(),
-                    model_connection_id: None,
-                    reasoning_effort: Some(ReasoningEffort::Medium),
+                    model_selection: None,
+                    model_settings_override: AgentModelSettingsOverride {
+                        reasoning_effort: ModelSettingOverride::Value(ReasoningEffort::Medium),
+                        ..AgentModelSettingsOverride::default()
+                    },
                     enabled: true,
                     disabled_reason: None,
                 }],
@@ -37977,8 +38208,11 @@ mod tests {
         .await
         .unwrap()
         .0;
-        assert_eq!(created.default_model_connection_id, Some(global.id));
-        assert_eq!(created.reasoning_effort, ReasoningEffort::High);
+        assert_eq!(created.model_selection, Some(test_model_selection(&global)));
+        assert_eq!(
+            created.model_settings.reasoning_effort,
+            ReasoningEffort::High
+        );
         assert_eq!(created.codex_subagents.len(), 1);
 
         let options = get_agent_model_connection_options(
@@ -37989,20 +38223,24 @@ mod tests {
         .await
         .unwrap()
         .0;
-        assert!(options.items.iter().any(|item| item.id == global.id));
         assert!(options
             .items
             .iter()
-            .any(|item| item.id == owner_personal.id));
+            .any(|item| item.connection_id == global.id));
+        assert!(options
+            .items
+            .iter()
+            .any(|item| item.connection_id == owner_personal.id));
         assert!(!options
             .items
             .iter()
-            .any(|item| item.id == admin_personal.id));
+            .any(|item| item.connection_id == admin_personal.id));
 
         let mut owner_scoped = update_request_from_agent(&created);
-        owner_scoped.default_model_connection_id = Some(owner_personal.id);
-        owner_scoped.reasoning_effort = ReasoningEffort::Ultra;
-        owner_scoped.codex_subagents[0].model_connection_id = Some(owner_personal.id);
+        owner_scoped.model_selection = Some(test_model_selection(&owner_personal));
+        owner_scoped.model_settings.reasoning_effort = ReasoningEffort::Ultra;
+        owner_scoped.codex_subagents[0].model_selection =
+            Some(test_model_selection(&owner_personal));
         let updated = update_agent(
             State(state.clone()),
             session_headers(&admin_token),
@@ -38012,15 +38250,21 @@ mod tests {
         .await
         .unwrap()
         .0;
-        assert_eq!(updated.default_model_connection_id, Some(owner_personal.id));
-        assert_eq!(updated.reasoning_effort, ReasoningEffort::Ultra);
         assert_eq!(
-            updated.codex_subagents[0].model_connection_id,
-            Some(owner_personal.id)
+            updated.model_selection,
+            Some(test_model_selection(&owner_personal))
+        );
+        assert_eq!(
+            updated.model_settings.reasoning_effort,
+            ReasoningEffort::Ultra
+        );
+        assert_eq!(
+            updated.codex_subagents[0].model_selection,
+            Some(test_model_selection(&owner_personal))
         );
 
         let mut wrong_owner = update_request_from_agent(&updated);
-        wrong_owner.default_model_connection_id = Some(admin_personal.id);
+        wrong_owner.model_selection = Some(test_model_selection(&admin_personal));
         let error = update_agent(
             State(state),
             session_headers(&admin_token),
@@ -38030,6 +38274,50 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn agent_creation_defaults_omitted_settings_to_the_selected_api_type(pool: PgPool) {
+        let member_token = create_user_session_with_role(&pool, "member").await;
+        let state = Arc::new(test_state_with_browser_session_auth(pool));
+
+        for api_type in [
+            ModelUpstreamProtocol::OpenaiChatCompletions,
+            ModelUpstreamProtocol::AnthropicMessages,
+        ] {
+            let connection = create_model_connection(
+                State(state.clone()),
+                session_headers(&member_token),
+                Json(CreateModelConnectionRequest {
+                    scope: ModelConnectionScope::Personal,
+                    name: format!("{api_type:?} Agent Connection"),
+                    base_url: format!("http://127.0.0.1:1/{}", Uuid::new_v4()),
+                    api_type,
+                    allowed_model_ids: vec![format!("model-{}", Uuid::new_v4().simple())],
+                    api_key: "test-provider-secret".into(),
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+            let request = serde_json::from_value::<CreateAgentRequest>(json!({
+                "name": format!("{api_type:?} Agent"),
+                "instructions": "Use the selected protocol.",
+                "visibility": "private",
+                "model_selection": test_model_selection(&connection)
+            }))
+            .unwrap();
+
+            let created = create_agent(
+                State(state.clone()),
+                session_headers(&member_token),
+                Json(request),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(created.model_settings.request_settings.protocol(), api_type);
+        }
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -38067,14 +38355,20 @@ mod tests {
                 instructions: "# Shared".into(),
                 visibility: "public_to".into(),
                 public_to: vec![caller.id],
-                default_model_connection_id: Some(default_connection.id),
-                reasoning_effort: ReasoningEffort::Low,
+                model_selection: Some(test_model_selection(&default_connection)),
+                model_settings: Some(AgentModelSettings {
+                    reasoning_effort: ReasoningEffort::Low,
+                    ..AgentModelSettings::default()
+                }),
                 codex_subagents: vec![CodexSubagentDefinition {
                     name: "reviewer".into(),
                     description: "Reviews the result".into(),
                     developer_instructions: "# Review\n\nCheck correctness.".into(),
-                    model_connection_id: Some(override_connection.id),
-                    reasoning_effort: Some(ReasoningEffort::Xhigh),
+                    model_selection: Some(test_model_selection(&override_connection)),
+                    model_settings_override: AgentModelSettingsOverride {
+                        reasoning_effort: ModelSettingOverride::Value(ReasoningEffort::Xhigh),
+                        ..AgentModelSettingsOverride::default()
+                    },
                     enabled: true,
                     disabled_reason: None,
                 }],
@@ -38097,14 +38391,12 @@ mod tests {
         .await
         .unwrap();
         let (before, before_fingerprint) = load_test_execution_configuration(&pool, agent.id).await;
-        assert_eq!(
-            before.default_model_connection_id,
-            Some(default_connection.id)
-        );
-        assert_eq!(before.model_connections.len(), 2);
+        assert_eq!(before.model_selection, None);
+        assert_eq!(before.model_settings, AgentModelSettings::default());
+        assert!(before.model_bindings.is_empty());
 
         let mut changed = update_request_from_agent(&agent);
-        changed.reasoning_effort = ReasoningEffort::Max;
+        changed.model_settings.reasoning_effort = ReasoningEffort::Max;
         let changed = update_agent(
             State(state.clone()),
             session_headers(&owner_token),
@@ -38116,72 +38408,32 @@ mod tests {
         .0;
         let (after, after_fingerprint) = load_test_execution_configuration(&pool, agent.id).await;
         assert_eq!(after.revision, before.revision + 1);
-        assert_eq!(after.reasoning_effort, ReasoningEffort::Max);
+        assert_eq!(after.model_settings, AgentModelSettings::default());
         assert_ne!(after_fingerprint, before_fingerprint);
 
-        let updated_model_id = format!("{}-v2", default_connection.model_id);
-        let _ = update_model_connection(
+        let renamed = update_model_connection(
             State(state.clone()),
             session_headers(&owner_token),
             Path(default_connection.id),
+            Query(UpdateModelConnectionQuery::default()),
             Json(UpdateModelConnectionRequest {
-                name: default_connection.name.clone(),
+                name: "Agent Default Renamed".into(),
                 base_url: default_connection.base_url.clone(),
-                model_id: updated_model_id.clone(),
-                upstream_protocol: None,
-                parameters: None,
-                request_parameters: None,
+                api_type: default_connection.api_type,
+                allowed_model_ids: default_connection.allowed_model_ids.clone(),
                 api_key: None,
             }),
         )
         .await
-        .unwrap();
-        let (after_model, after_model_fingerprint) =
+        .unwrap()
+        .0;
+        assert_eq!(renamed.name, "Agent Default Renamed");
+        let (after_connection, after_connection_fingerprint) =
             load_test_execution_configuration(&pool, agent.id).await;
-        assert_eq!(after_model.revision, after.revision + 1);
-        assert!(after_model
-            .model_connections
-            .iter()
-            .any(|model| model.id == default_connection.id && model.model_id == updated_model_id));
-        assert_ne!(after_model_fingerprint, after_fingerprint);
+        assert_eq!(after_connection.revision, after.revision + 1);
+        assert_ne!(after_connection_fingerprint, after_fingerprint);
 
-        let _ = update_model_connection(
-            State(state.clone()),
-            session_headers(&owner_token),
-            Path(default_connection.id),
-            Json(UpdateModelConnectionRequest {
-                name: default_connection.name.clone(),
-                base_url: default_connection.base_url.clone(),
-                model_id: updated_model_id,
-                upstream_protocol: None,
-                parameters: Some(ModelConnectionParameters {
-                    reasoning_summary: ModelReasoningSummary::Concise,
-                    context_window_tokens: Some(128_000),
-                    auto_compact_token_limit: Some(96_000),
-                    ..ModelConnectionParameters::default()
-                }),
-                request_parameters: None,
-                api_key: None,
-            }),
-        )
-        .await
-        .unwrap();
-        let (after_parameters, after_parameters_fingerprint) =
-            load_test_execution_configuration(&pool, agent.id).await;
-        assert_eq!(after_parameters.revision, after_model.revision + 1);
-        assert_eq!(
-            after_parameters
-                .model_connections
-                .iter()
-                .find(|connection| connection.id == default_connection.id)
-                .unwrap()
-                .parameters
-                .reasoning_summary,
-            ModelReasoningSummary::Concise
-        );
-        assert_ne!(after_parameters_fingerprint, after_model_fingerprint);
-
-        let revision_before_force = after_parameters.revision;
+        let revision_before_force = after_connection.revision;
         force_delete_model_connection(
             State(state.clone()),
             session_headers(&owner_token),
@@ -38198,15 +38450,15 @@ mod tests {
         .unwrap()
         .0;
         assert_eq!(
-            refreshed.default_model_connection_id,
-            Some(default_connection.id)
+            refreshed.model_selection,
+            Some(test_model_selection(&default_connection))
         );
         assert!(!refreshed.codex_subagents[0].enabled);
         assert_eq!(
             refreshed.codex_subagents[0].disabled_reason.as_deref(),
             Some("model_connection_deleted")
         );
-        assert_eq!(refreshed.codex_subagents[0].model_connection_id, None);
+        assert_eq!(refreshed.codex_subagents[0].model_selection, None);
         assert_eq!(
             agent_execution_revision(&pool, agent.id).await,
             revision_before_force + 1
@@ -38298,8 +38550,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let deleted: (String, String, Option<Uuid>, String, bool) = sqlx::query_as(
-            "SELECT name, instructions, default_model_connection_id, reasoning_effort,
+        let deleted: (String, String, Option<Uuid>, Option<String>, Value, bool) = sqlx::query_as(
+            "SELECT name, instructions, model_connection_id, model_id, model_settings,
                     deleted_at IS NOT NULL
              FROM agents WHERE id = $1",
         )
@@ -38310,8 +38562,12 @@ mod tests {
         assert_eq!(deleted.0, "Shared Typed Agent");
         assert_eq!(deleted.1, "");
         assert_eq!(deleted.2, None);
-        assert_eq!(deleted.3, "default");
-        assert!(deleted.4);
+        assert_eq!(deleted.3, None);
+        assert_eq!(
+            serde_json::from_value::<AgentModelSettings>(deleted.4).unwrap(),
+            AgentModelSettings::default()
+        );
+        assert!(deleted.5);
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM codex_subagent_definitions WHERE agent_id = $1",
@@ -38339,21 +38595,12 @@ mod tests {
                 scope: ModelConnectionScope::Personal,
                 name: "Local Responses".into(),
                 base_url: "http://169.254.169.254/latest".into(),
-                model_id: "local-model".into(),
-                upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
-                parameters: ModelConnectionParameters {
-                    reasoning_effort: ReasoningEffort::High,
-                    reasoning_summary: ModelReasoningSummary::Detailed,
-                    verbosity: ModelVerbosity::Low,
-                    context_window_tokens: Some(200_000),
-                    auto_compact_token_limit: Some(160_000),
-                    reasoning_summary_support: ModelReasoningSummarySupport::Supported,
-                    service_tier: Some(" priority ".into()),
-                    request_max_retries: Some(7),
-                    stream_max_retries: Some(9),
-                    stream_idle_timeout_ms: Some(420_000),
-                },
-                request_parameters: None,
+                api_type: ModelUpstreamProtocol::OpenaiResponses,
+                allowed_model_ids: vec![
+                    " local-model ".into(),
+                    "local-model-2".into(),
+                    "local-model".into(),
+                ],
                 api_key: "personal-secret".into(),
             }),
         )
@@ -38362,15 +38609,12 @@ mod tests {
         .0;
         assert_eq!(personal.scope, ModelConnectionScope::Personal);
         assert_eq!(personal.status, ModelConnectionStatus::Enabled);
+        assert_eq!(personal.api_type, ModelUpstreamProtocol::OpenaiResponses);
         assert_eq!(
-            personal.upstream_protocol,
-            ModelUpstreamProtocol::OpenaiResponses
+            personal.allowed_model_ids,
+            vec!["local-model".to_owned(), "local-model-2".to_owned()]
         );
-        assert_eq!(personal.parameters.reasoning_effort, ReasoningEffort::High);
-        assert_eq!(
-            personal.parameters.service_tier.as_deref(),
-            Some("priority")
-        );
+        assert!(personal.has_api_key);
         assert!(!serde_json::to_string(&personal)
             .unwrap()
             .contains("personal-secret"));
@@ -38390,28 +38634,12 @@ mod tests {
             State(state.clone()),
             member_headers.clone(),
             Path(personal.id),
+            Query(UpdateModelConnectionQuery::default()),
             Json(UpdateModelConnectionRequest {
                 name: "Local Responses Updated".into(),
                 base_url: "https://models.internal.example/business".into(),
-                model_id: "local-model-2".into(),
-                upstream_protocol: Some(ModelUpstreamProtocol::AnthropicMessages),
-                parameters: Some(ModelConnectionParameters {
-                    reasoning_effort: ReasoningEffort::Low,
-                    reasoning_summary: ModelReasoningSummary::Concise,
-                    verbosity: ModelVerbosity::High,
-                    context_window_tokens: Some(128_000),
-                    auto_compact_token_limit: Some(96_000),
-                    reasoning_summary_support: ModelReasoningSummarySupport::Unsupported,
-                    service_tier: Some("flex".into()),
-                    request_max_retries: Some(2),
-                    stream_max_retries: Some(3),
-                    stream_idle_timeout_ms: Some(300_000),
-                }),
-                request_parameters: Some(ModelConnectionRequestParameters::AnthropicMessages {
-                    temperature: Number::from_f64(0.4),
-                    top_p: None,
-                    max_tokens: Some(8192),
-                }),
+                api_type: ModelUpstreamProtocol::AnthropicMessages,
+                allowed_model_ids: vec!["local-model-2".into(), "claude-test".into()],
                 api_key: None,
             }),
         )
@@ -38419,64 +38647,29 @@ mod tests {
         .unwrap()
         .0;
         assert_eq!(updated.name, "Local Responses Updated");
+        assert_eq!(updated.api_type, ModelUpstreamProtocol::AnthropicMessages);
         assert_eq!(
-            updated.upstream_protocol,
-            ModelUpstreamProtocol::AnthropicMessages
-        );
-        assert_eq!(updated.parameters.reasoning_effort, ReasoningEffort::Low);
-        assert_eq!(updated.parameters.verbosity, ModelVerbosity::High);
-        assert_eq!(
-            updated.request_parameters,
-            ModelConnectionRequestParameters::AnthropicMessages {
-                temperature: Number::from_f64(0.4),
-                top_p: None,
-                max_tokens: Some(8192),
-            }
+            updated.allowed_model_ids,
+            vec!["local-model-2".to_owned(), "claude-test".to_owned()]
         );
         let preserved = update_model_connection(
             State(state.clone()),
             member_headers.clone(),
             Path(personal.id),
+            Query(UpdateModelConnectionQuery::default()),
             Json(UpdateModelConnectionRequest {
                 name: "Local Anthropic Updated".into(),
                 base_url: updated.base_url.clone(),
-                model_id: updated.model_id.clone(),
-                upstream_protocol: None,
-                parameters: None,
-                request_parameters: None,
+                api_type: updated.api_type,
+                allowed_model_ids: updated.allowed_model_ids.clone(),
                 api_key: None,
             }),
         )
         .await
         .unwrap()
         .0;
-        assert_eq!(
-            preserved.upstream_protocol,
-            ModelUpstreamProtocol::AnthropicMessages
-        );
-        assert_eq!(preserved.parameters, updated.parameters);
-        assert_eq!(preserved.request_parameters, updated.request_parameters);
-        let mismatched = update_model_connection(
-            State(state.clone()),
-            member_headers.clone(),
-            Path(personal.id),
-            Json(UpdateModelConnectionRequest {
-                name: preserved.name.clone(),
-                base_url: preserved.base_url.clone(),
-                model_id: preserved.model_id.clone(),
-                upstream_protocol: None,
-                parameters: None,
-                request_parameters: Some(ModelConnectionRequestParameters::OpenaiChatCompletions {
-                    temperature: None,
-                    top_p: None,
-                    max_completion_tokens: None,
-                }),
-                api_key: None,
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(mismatched.status, StatusCode::BAD_REQUEST);
+        assert_eq!(preserved.api_type, ModelUpstreamProtocol::AnthropicMessages);
+        assert_eq!(preserved.allowed_model_ids, updated.allowed_model_ids);
         let stored_after: (Vec<u8>, Vec<u8>) = sqlx::query_as(
             "SELECT api_key_ciphertext, api_key_nonce
              FROM model_connections WHERE id = $1",
@@ -38486,6 +38679,37 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(stored_before, stored_after);
+        let _ = update_model_connection(
+            State(state.clone()),
+            member_headers.clone(),
+            Path(personal.id),
+            Query(UpdateModelConnectionQuery::default()),
+            Json(UpdateModelConnectionRequest {
+                name: preserved.name.clone(),
+                base_url: preserved.base_url.clone(),
+                api_type: preserved.api_type,
+                allowed_model_ids: preserved.allowed_model_ids.clone(),
+                api_key: Some("rotated-personal-secret".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        let stored_rotated: (Vec<u8>, Vec<u8>) = sqlx::query_as(
+            "SELECT api_key_ciphertext, api_key_nonce
+             FROM model_connections WHERE id = $1",
+        )
+        .bind(personal.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_ne!(stored_rotated, stored_before);
+        assert_eq!(
+            state
+                .model_secret_cipher
+                .decrypt(&stored_rotated.0, &stored_rotated.1)
+                .unwrap(),
+            "rotated-personal-secret"
+        );
 
         let forbidden = create_model_connection(
             State(state.clone()),
@@ -38494,10 +38718,8 @@ mod tests {
                 scope: ModelConnectionScope::Global,
                 name: "Forbidden Global".into(),
                 base_url: "https://example.com".into(),
-                model_id: "global-model".into(),
-                upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
-                parameters: ModelConnectionParameters::default(),
-                request_parameters: None,
+                api_type: ModelUpstreamProtocol::OpenaiResponses,
+                allowed_model_ids: vec!["global-model".into()],
                 api_key: "global-secret".into(),
             }),
         )
@@ -38512,10 +38734,8 @@ mod tests {
                 scope: ModelConnectionScope::Global,
                 name: "Global Responses".into(),
                 base_url: "https://example.com/provider".into(),
-                model_id: "global-model".into(),
-                upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
-                parameters: ModelConnectionParameters::default(),
-                request_parameters: None,
+                api_type: ModelUpstreamProtocol::OpenaiResponses,
+                allowed_model_ids: vec!["global-model".into(), "global-mini".into()],
                 api_key: "global-secret".into(),
             }),
         )
@@ -38523,11 +38743,11 @@ mod tests {
         .unwrap()
         .0;
 
-        let _ = set_system_default_model_connection(
+        let _ = set_system_default_model_selection(
             State(state.clone()),
             admin_headers.clone(),
-            Json(SetSystemDefaultModelConnectionRequest {
-                model_connection_id: Some(global.id),
+            Json(SetSystemDefaultModelSelectionRequest {
+                selection: Some(test_model_selection(&global)),
             }),
         )
         .await
@@ -38544,13 +38764,12 @@ mod tests {
         .unwrap()
         .0;
         assert_eq!(disabled.status, ModelConnectionStatus::Disabled);
-        assert!(!disabled.is_system_default);
         assert_eq!(
-            get_system_default_model_connection(State(state.clone()), admin_headers.clone())
+            get_system_default_model_selection(State(state.clone()), admin_headers.clone())
                 .await
                 .unwrap()
                 .0
-                .model_connection_id,
+                .selection,
             None
         );
         let enabled = update_model_connection_status(
@@ -38589,13 +38808,12 @@ mod tests {
                 State(state.clone()),
                 member_headers.clone(),
                 Path(personal.id),
+                Query(UpdateModelConnectionQuery::default()),
                 Json(UpdateModelConnectionRequest {
                     name: "Invalid URL".into(),
                     base_url: invalid_url.into(),
-                    model_id: "local-model".into(),
-                    upstream_protocol: None,
-                    parameters: None,
-                    request_parameters: None,
+                    api_type: preserved.api_type,
+                    allowed_model_ids: preserved.allowed_model_ids.clone(),
                     api_key: None,
                 }),
             )
@@ -38604,28 +38822,17 @@ mod tests {
             assert_eq!(error.status, StatusCode::BAD_REQUEST);
         }
 
-        for parameters in [
-            ModelConnectionParameters {
-                context_window_tokens: Some(100_000),
-                auto_compact_token_limit: Some(100_001),
-                ..ModelConnectionParameters::default()
-            },
-            ModelConnectionParameters {
-                request_max_retries: Some(101),
-                ..ModelConnectionParameters::default()
-            },
-        ] {
+        for allowed_model_ids in [Vec::new(), vec!["bad\nmodel".into()]] {
             let error = update_model_connection(
                 State(state.clone()),
                 member_headers.clone(),
                 Path(personal.id),
+                Query(UpdateModelConnectionQuery::default()),
                 Json(UpdateModelConnectionRequest {
                     name: personal.name.clone(),
                     base_url: personal.base_url.clone(),
-                    model_id: personal.model_id.clone(),
-                    upstream_protocol: None,
-                    parameters: Some(parameters),
-                    request_parameters: None,
+                    api_type: personal.api_type,
+                    allowed_model_ids,
                     api_key: None,
                 }),
             )
@@ -38633,6 +38840,172 @@ mod tests {
             .unwrap_err();
             assert_eq!(error.status, StatusCode::BAD_REQUEST);
         }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn model_connection_update_requires_force_for_referenced_models_and_api_type(
+        pool: PgPool,
+    ) {
+        let admin_token = create_user_session_with_role(&pool, "admin").await;
+        let headers = session_headers(&admin_token);
+        let state = Arc::new(test_state_with_browser_session_auth(pool));
+        let connection = create_model_connection(
+            State(state.clone()),
+            headers.clone(),
+            Json(CreateModelConnectionRequest {
+                scope: ModelConnectionScope::Global,
+                name: "Force Update Global".into(),
+                base_url: "https://models.example.test".into(),
+                api_type: ModelUpstreamProtocol::OpenaiResponses,
+                allowed_model_ids: vec!["model-a".into(), "model-b".into()],
+                api_key: "force-update-secret".into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let selection_a = ModelSelectionDto {
+            connection_id: connection.id,
+            model_id: "model-a".into(),
+        };
+        let selection_b = ModelSelectionDto {
+            connection_id: connection.id,
+            model_id: "model-b".into(),
+        };
+        let _ = set_system_default_model_selection(
+            State(state.clone()),
+            headers.clone(),
+            Json(SetSystemDefaultModelSelectionRequest {
+                selection: Some(selection_a.clone()),
+            }),
+        )
+        .await
+        .unwrap();
+        let agent = create_agent(
+            State(state.clone()),
+            headers.clone(),
+            Json(CreateAgentRequest {
+                name: "Force Update Agent".into(),
+                instructions: "Use the selected model.".into(),
+                visibility: "private".into(),
+                public_to: Vec::new(),
+                model_selection: Some(selection_a),
+                model_settings: Some(AgentModelSettings::default()),
+                codex_subagents: vec![CodexSubagentDefinition {
+                    name: "reviewer".into(),
+                    description: "Reviews output".into(),
+                    developer_instructions: "Review carefully.".into(),
+                    model_selection: Some(selection_b),
+                    model_settings_override: AgentModelSettingsOverride::default(),
+                    enabled: true,
+                    disabled_reason: None,
+                }],
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        let remove_referenced = update_model_connection(
+            State(state.clone()),
+            headers.clone(),
+            Path(connection.id),
+            Query(UpdateModelConnectionQuery::default()),
+            Json(UpdateModelConnectionRequest {
+                name: connection.name.clone(),
+                base_url: connection.base_url.clone(),
+                api_type: connection.api_type,
+                allowed_model_ids: vec!["model-b".into()],
+                api_key: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(remove_referenced.status, StatusCode::CONFLICT);
+
+        let _ = update_model_connection(
+            State(state.clone()),
+            headers.clone(),
+            Path(connection.id),
+            Query(UpdateModelConnectionQuery { force: true }),
+            Json(UpdateModelConnectionRequest {
+                name: connection.name.clone(),
+                base_url: connection.base_url.clone(),
+                api_type: connection.api_type,
+                allowed_model_ids: vec!["model-b".into()],
+                api_key: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let after_model_removal = get_agent(State(state.clone()), headers.clone(), Path(agent.id))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(after_model_removal.model_selection, None);
+        assert!(after_model_removal.codex_subagents[0].enabled);
+        assert_eq!(
+            after_model_removal.codex_subagents[0]
+                .model_selection
+                .as_ref()
+                .map(|selection| selection.model_id.as_str()),
+            Some("model-b")
+        );
+        assert_eq!(
+            get_system_default_model_selection(State(state.clone()), headers.clone())
+                .await
+                .unwrap()
+                .0
+                .selection,
+            None
+        );
+
+        let change_referenced_type = update_model_connection(
+            State(state.clone()),
+            headers.clone(),
+            Path(connection.id),
+            Query(UpdateModelConnectionQuery::default()),
+            Json(UpdateModelConnectionRequest {
+                name: connection.name.clone(),
+                base_url: connection.base_url.clone(),
+                api_type: ModelUpstreamProtocol::AnthropicMessages,
+                allowed_model_ids: vec!["model-b".into()],
+                api_key: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(change_referenced_type.status, StatusCode::CONFLICT);
+
+        let changed = update_model_connection(
+            State(state.clone()),
+            headers.clone(),
+            Path(connection.id),
+            Query(UpdateModelConnectionQuery { force: true }),
+            Json(UpdateModelConnectionRequest {
+                name: connection.name,
+                base_url: connection.base_url,
+                api_type: ModelUpstreamProtocol::AnthropicMessages,
+                allowed_model_ids: vec!["model-b".into()],
+                api_key: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(changed.api_type, ModelUpstreamProtocol::AnthropicMessages);
+        let after_type_change = get_agent(State(state), headers, Path(agent.id))
+            .await
+            .unwrap()
+            .0;
+        assert!(!after_type_change.codex_subagents[0].enabled);
+        assert_eq!(after_type_change.codex_subagents[0].model_selection, None);
+        assert_eq!(
+            after_type_change.codex_subagents[0]
+                .disabled_reason
+                .as_deref(),
+            Some("model_selection_removed")
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -38650,21 +39023,19 @@ mod tests {
                 scope: ModelConnectionScope::Global,
                 name: "Referenced Global".into(),
                 base_url: "http://127.0.0.1:1".into(),
-                model_id: "referenced-model".into(),
-                upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
-                parameters: ModelConnectionParameters::default(),
-                request_parameters: None,
+                api_type: ModelUpstreamProtocol::OpenaiResponses,
+                allowed_model_ids: vec!["referenced-model".into(), "other-model".into()],
                 api_key: "referenced-secret".into(),
             }),
         )
         .await
         .unwrap()
         .0;
-        let _ = set_system_default_model_connection(
+        let _ = set_system_default_model_selection(
             State(state.clone()),
             admin_headers.clone(),
-            Json(SetSystemDefaultModelConnectionRequest {
-                model_connection_id: Some(connection.id),
+            Json(SetSystemDefaultModelSelectionRequest {
+                selection: Some(test_model_selection(&connection)),
             }),
         )
         .await
@@ -38674,12 +39045,13 @@ mod tests {
         sqlx::query(
             "INSERT INTO agents
                  (id, owner_id, name, instructions, visibility,
-                  default_model_connection_id)
-             VALUES ($1, $2, 'Model Agent', '# Instructions', 'private', $3)",
+                  model_connection_id, model_id)
+             VALUES ($1, $2, 'Model Agent', '# Instructions', 'private', $3, $4)",
         )
         .bind(agent_id)
         .bind(administrator.id)
         .bind(connection.id)
+        .bind(&connection.allowed_model_ids[0])
         .execute(&pool)
         .await
         .unwrap();
@@ -38687,12 +39059,13 @@ mod tests {
         sqlx::query(
             "INSERT INTO codex_subagent_definitions
                  (id, agent_id, name, description, developer_instructions,
-                  model_connection_id)
-             VALUES ($1, $2, 'researcher', 'Researches', '# Research', $3)",
+                  model_connection_id, model_id)
+             VALUES ($1, $2, 'researcher', 'Researches', '# Research', $3, $4)",
         )
         .bind(subagent_id)
         .bind(agent_id)
         .bind(connection.id)
+        .bind(&connection.allowed_model_ids[0])
         .execute(&pool)
         .await
         .unwrap();
@@ -38738,7 +39111,7 @@ mod tests {
         assert!(scrubbed.get::<bool, _>("deleted"));
         assert_eq!(
             sqlx::query_scalar::<_, Option<Uuid>>(
-                "SELECT default_model_connection_id FROM agents WHERE id = $1",
+                "SELECT model_connection_id FROM agents WHERE id = $1",
             )
             .bind(agent_id)
             .fetch_one(&pool)
@@ -38758,11 +39131,11 @@ mod tests {
         assert_eq!(subagent.1.as_deref(), Some("model_connection_deleted"));
         assert_eq!(subagent.2, None);
         assert_eq!(
-            get_system_default_model_connection(State(state), admin_headers)
+            get_system_default_model_selection(State(state), admin_headers)
                 .await
                 .unwrap()
                 .0
-                .model_connection_id,
+                .selection,
             None
         );
     }
@@ -38787,6 +39160,8 @@ mod tests {
                             serde_json::from_slice(&decode_gateway_body(&envelope)).unwrap();
                         if envelope.api_key != "provider-secret"
                             || body.get("model").and_then(Value::as_str) != Some("test-model")
+                            || body.get("input").and_then(Value::as_str) != Some("hi")
+                            || body.get("max_output_tokens").and_then(Value::as_u64) != Some(256)
                         {
                             return (
                                 StatusCode::BAD_REQUEST,
@@ -38800,6 +39175,14 @@ mod tests {
                                 "id": "resp_test",
                                 "object": "response",
                                 "status": "completed",
+                                "output": [{
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "content": [{
+                                        "type": "output_text",
+                                        "text": "Hello from the model"
+                                    }]
+                                }],
                                 "usage": {
                                     "input_tokens": 11,
                                     "output_tokens": 7,
@@ -38854,10 +39237,8 @@ mod tests {
                 scope: ModelConnectionScope::Personal,
                 name: "Test Success".into(),
                 base_url: format!("http://{address}/ok"),
-                model_id: "test-model".into(),
-                upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
-                parameters: ModelConnectionParameters::default(),
-                request_parameters: None,
+                api_type: ModelUpstreamProtocol::OpenaiResponses,
+                allowed_model_ids: vec!["test-model".into(), "test-model-2".into()],
                 api_key: "provider-secret".into(),
             }),
         )
@@ -38868,12 +39249,20 @@ mod tests {
             State(state.clone()),
             member_headers.clone(),
             Path(successful.id),
+            Json(TestModelConnectionRequest {
+                model_id: "test-model".into(),
+                message: "hi".into(),
+            }),
         )
         .await
         .unwrap()
         .0;
         assert!(result.success);
         assert_eq!(result.status_code, Some(200));
+        assert_eq!(
+            result.response_text.as_deref(),
+            Some("Hello from the model")
+        );
         let usage: (Option<Uuid>, Option<Uuid>, i64, i64, i64, i64, i64) = sqlx::query_as(
             "SELECT subject_user_id, agent_id, input_tokens, output_tokens,
                     total_tokens, cached_tokens, reasoning_tokens
@@ -38892,10 +39281,8 @@ mod tests {
                 scope: ModelConnectionScope::Personal,
                 name: "Test Failure".into(),
                 base_url: format!("http://{address}/fail"),
-                model_id: "test-model".into(),
-                upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
-                parameters: ModelConnectionParameters::default(),
-                request_parameters: None,
+                api_type: ModelUpstreamProtocol::OpenaiResponses,
+                allowed_model_ids: vec!["test-model".into()],
                 api_key: "provider-secret".into(),
             }),
         )
@@ -38906,6 +39293,10 @@ mod tests {
             State(state.clone()),
             member_headers.clone(),
             Path(failed.id),
+            Json(TestModelConnectionRequest {
+                model_id: "test-model".into(),
+                message: "hi".into(),
+            }),
         )
         .await
         .unwrap()
@@ -38964,20 +39355,26 @@ mod tests {
                 scope: ModelConnectionScope::Personal,
                 name: "Test Broken Body".into(),
                 base_url: format!("http://{address}/broken"),
-                model_id: "test-model".into(),
-                upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
-                parameters: ModelConnectionParameters::default(),
-                request_parameters: None,
+                api_type: ModelUpstreamProtocol::OpenaiResponses,
+                allowed_model_ids: vec!["test-model".into()],
                 api_key: "provider-secret".into(),
             }),
         )
         .await
         .unwrap()
         .0;
-        let body_failure = test_model_connection(State(state), member_headers, Path(broken.id))
-            .await
-            .unwrap()
-            .0;
+        let body_failure = test_model_connection(
+            State(state),
+            member_headers,
+            Path(broken.id),
+            Json(TestModelConnectionRequest {
+                model_id: "test-model".into(),
+                message: "hi".into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
         assert!(!body_failure.success);
         assert_eq!(body_failure.status_code, Some(200));
         assert_eq!(
@@ -39083,11 +39480,13 @@ mod tests {
                      (id, request_id, response_status, model_connection_id,
                       model_connection_scope_snapshot,
                       model_connection_name_snapshot, model_id_snapshot,
+                      api_type_snapshot, request_settings_snapshot,
                       agent_id, agent_name_snapshot, subject_type,
                       subject_user_id, subject_display_name_snapshot,
                       input_tokens, output_tokens, total_tokens,
                       cached_tokens, reasoning_tokens)
                  VALUES ($1, $2, 'completed', $3, 'global', $4, $5,
+                         'openai_responses', '{\"protocol\":\"openai_responses\"}'::jsonb,
                          $6, CASE WHEN $6::uuid IS NULL THEN NULL
                                   ELSE 'Protected Deleted Agent' END,
                          'user', $7, $8, $9, 0, $9, 0, 0)",
@@ -39096,7 +39495,7 @@ mod tests {
             .bind(Uuid::new_v4())
             .bind(connection.id)
             .bind(&connection.name)
-            .bind(&connection.model_id)
+            .bind(&connection.allowed_model_ids[0])
             .bind(agent_id)
             .bind(subject.id)
             .bind(&subject.display_name)
@@ -39112,17 +39511,20 @@ mod tests {
                   error_kind, error_code, message, model_connection_id,
                   model_connection_scope_snapshot,
                   model_connection_name_snapshot, model_id_snapshot,
+                  api_type_snapshot, request_settings_snapshot,
                   subject_type, subject_user_id, subject_display_name_snapshot,
                   source_integration_app_id,
                   source_integration_app_name_snapshot)
              VALUES ($1, $2, 'failed', 429, 'provider_failed', 'rate_limit',
-                     'try later', $3, 'global', $4, $5, 'user', $6, $7, $8, $9)",
+                     'try later', $3, 'global', $4, $5,
+                     'openai_responses', '{\"protocol\":\"openai_responses\"}'::jsonb,
+                     'user', $6, $7, $8, $9)",
         )
         .bind(app_error_id)
         .bind(Uuid::new_v4())
         .bind(connection.id)
         .bind(&connection.name)
-        .bind(&connection.model_id)
+        .bind(&connection.allowed_model_ids[0])
         .bind(member.id)
         .bind(&member.display_name)
         .bind(app.id)
@@ -39297,11 +39699,13 @@ mod tests {
                      (id, request_id, occurred_at, response_status,
                       model_connection_id, model_connection_scope_snapshot,
                       model_connection_name_snapshot, model_id_snapshot,
+                      api_type_snapshot, request_settings_snapshot,
                       agent_id, agent_name_snapshot, subject_type,
                       subject_user_id, subject_display_name_snapshot,
                       input_tokens, output_tokens, total_tokens,
                       cached_tokens, reasoning_tokens)
                  VALUES ($1, $2, $3, 'completed', $4, 'global', $5, $6,
+                         'openai_responses', '{\"protocol\":\"openai_responses\"}'::jsonb,
                          $7, $8, 'user', $9, $10, $11, 0, $11, 0, 0)",
             )
             .bind(id)
@@ -39309,7 +39713,7 @@ mod tests {
             .bind(occurred_at)
             .bind(connection.id)
             .bind(&connection.name)
-            .bind(&connection.model_id)
+            .bind(&connection.allowed_model_ids[0])
             .bind(agent_id)
             .bind(agent_name)
             .bind(subject.id)
@@ -39325,10 +39729,12 @@ mod tests {
                   upstream_http_status, error_kind, error_code, message,
                   model_connection_id, model_connection_scope_snapshot,
                   model_connection_name_snapshot, model_id_snapshot,
+                  api_type_snapshot, request_settings_snapshot,
                   agent_id, agent_name_snapshot, subject_type,
                   subject_user_id, subject_display_name_snapshot)
              VALUES ($1, $2, $3, 'failed', 429, 'provider_failed',
                      'rate_limit', 'try later', $4, 'global', $5, $6,
+                     'openai_responses', '{\"protocol\":\"openai_responses\"}'::jsonb,
                      $7, 'Owner Agent', 'user', $8, $9)",
         )
         .bind(Uuid::from_u128(0x50))
@@ -39336,7 +39742,7 @@ mod tests {
         .bind(at)
         .bind(connection.id)
         .bind(&connection.name)
-        .bind(&connection.model_id)
+        .bind(&connection.allowed_model_ids[0])
         .bind(owner_agent_id)
         .bind(caller.id)
         .bind(&caller.display_name)
@@ -39463,14 +39869,15 @@ mod tests {
         sqlx::query(
             "INSERT INTO agents
                  (id, owner_id, name, instructions, visibility, public_to,
-                  model_policy, default_model_connection_id)
+                  model_policy, model_connection_id, model_id)
              VALUES ($1, $2, 'Attribution Agent', '', 'public_to', $3,
-                     '{\"provider\":\"hub-proxy\"}'::jsonb, $4)",
+                     '{\"provider\":\"hub-proxy\"}'::jsonb, $4, $5)",
         )
         .bind(agent_id)
         .bind(owner.id)
         .bind(vec![caller.id])
         .bind(connection.id)
+        .bind(&connection.allowed_model_ids[0])
         .execute(&pool)
         .await
         .unwrap();
@@ -39644,16 +40051,24 @@ mod tests {
                 scope,
                 name: name.into(),
                 base_url: format!("http://127.0.0.1:1/{}", Uuid::new_v4()),
-                model_id: format!("model-{}", Uuid::new_v4().simple()),
-                upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
-                parameters: ModelConnectionParameters::default(),
-                request_parameters: None,
+                api_type: ModelUpstreamProtocol::OpenaiResponses,
+                allowed_model_ids: vec![
+                    format!("model-{}", Uuid::new_v4().simple()),
+                    format!("model-{}", Uuid::new_v4().simple()),
+                ],
                 api_key: "test-provider-secret".into(),
             }),
         )
         .await
         .unwrap()
         .0
+    }
+
+    fn test_model_selection(connection: &ModelConnectionDto) -> ModelSelectionDto {
+        ModelSelectionDto {
+            connection_id: connection.id,
+            model_id: connection.allowed_model_ids[0].clone(),
+        }
     }
 
     fn update_request_from_agent(agent: &AgentDto) -> UpdateAgentRequest {
@@ -39663,8 +40078,8 @@ mod tests {
             visibility: agent.visibility.clone(),
             public_to: agent.public_to.clone(),
             runtime_id: agent.runtime_id,
-            default_model_connection_id: agent.default_model_connection_id,
-            reasoning_effort: agent.reasoning_effort,
+            model_selection: agent.model_selection.clone(),
+            model_settings: agent.model_settings.clone(),
             codex_subagents: agent.codex_subagents.clone(),
             model_policy: agent.model_policy.clone(),
             sandbox_policy: agent.sandbox_policy.clone(),
@@ -39741,7 +40156,7 @@ mod tests {
         app: &Router,
         fixture: &RuntimeClaimFixture,
         model_proxy_token: &str,
-        model_connection_id: Uuid,
+        model_binding_id: Uuid,
         query: &str,
         model_id: &str,
     ) -> Response {
@@ -39752,10 +40167,7 @@ mod tests {
                     .uri(format!("/api/runtime/model-proxy/v1/responses?{query}"))
                     .header(header::AUTHORIZATION, format!("Bearer {model_proxy_token}"))
                     .header("x-agent-hub-run-id", fixture.run_id.to_string())
-                    .header(
-                        MODEL_PROXY_CONNECTION_ID_HEADER,
-                        model_connection_id.to_string(),
-                    )
+                    .header(MODEL_PROXY_BINDING_ID_HEADER, model_binding_id.to_string())
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&json!({
@@ -39769,6 +40181,16 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    fn model_binding_id(claim: &ClaimRunResponse, binding_key: &str) -> Uuid {
+        claim
+            .execution_configuration
+            .model_bindings
+            .iter()
+            .find(|binding| binding.binding_key.eq_ignore_ascii_case(binding_key))
+            .unwrap_or_else(|| panic!("missing {binding_key} Run Model Binding"))
+            .id
     }
 
     fn runtime_bundle_upload_headers(

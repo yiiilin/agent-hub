@@ -50,7 +50,7 @@ func (s *server) proxyOpenAIChat(w http.ResponseWriter, r *http.Request, envelop
 	chatRequest := responsesRequest.ToChatRequest()
 	chatRequest.Provider = schemas.OpenAI
 	prependChatInstructions(chatRequest, wireRequest.Instructions)
-	mergeChatRequestParameters(chatRequest, envelope.RequestParameters)
+	mergeChatRequestSettings(chatRequest, envelope.RequestSettings)
 
 	requestURL := upstreamRequestURL(endpoint, "/v1/chat/completions", envelope.Query)
 	if wireRequest.Stream != nil && *wireRequest.Stream {
@@ -73,18 +73,18 @@ func prependChatInstructions(request *schemas.BifrostChatRequest, instructions *
 	request.Input = append([]schemas.ChatMessage{message}, request.Input...)
 }
 
-func mergeChatRequestParameters(request *schemas.BifrostChatRequest, parameters modelRequestParameters) {
+func mergeChatRequestSettings(request *schemas.BifrostChatRequest, settings modelRequestSettings) {
 	if request.Params == nil {
 		request.Params = &schemas.ChatParameters{}
 	}
-	if parameters.Temperature != nil {
-		request.Params.Temperature = parameters.Temperature
+	if settings.Temperature != nil {
+		request.Params.Temperature = settings.Temperature
 	}
-	if parameters.TopP != nil {
-		request.Params.TopP = parameters.TopP
+	if settings.TopP != nil {
+		request.Params.TopP = settings.TopP
 	}
-	if parameters.MaxCompletionTokens != nil {
-		value := int(*parameters.MaxCompletionTokens)
+	if settings.MaxCompletionTokens != nil {
+		value := int(*settings.MaxCompletionTokens)
 		request.Params.MaxCompletionTokens = &value
 	}
 }

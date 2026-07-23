@@ -1,24 +1,30 @@
-# Model Connections API
+# Model API Connections, bindings, and accounting
 
 Type: `api`
 
-This scenario exercises Global and Personal Model Connections through the real
-Hub, Model Gateway, PostgreSQL, Runtime, fake Codex app-server, and fake
-OpenAI Responses/Chat Completions/Anthropic Messages provider. It
-checks role and owner boundaries, write-only encrypted API keys, System Default
-copy semantics, connection CRUD/test/status/delete behavior, Agent defaults and
-subagent overrides, model-unconfigured rejection, caller attribution, successful
-and failed usage/error accounting, protocol conversion and immutable protocol
-snapshots, millisecond ranges, independent keyset pages, and deletion-safe ledger
-snapshots. Connection CRUD also verifies automatic detailed-parameter defaults,
-typed create/read/options values, protocol-specific request parameters, protocol
-switch reset versus same-protocol preservation, immutable Chat/Anthropic usage
-snapshots, explicit updates, and rejection without mutation for mismatched
-request parameters.
+This scenario runs against an isolated Compose environment with the real Hub,
+PostgreSQL, Runtime, stateless Model Gateway, fake Codex app-server, and fake
+Responses/Chat Completions/Anthropic provider.
 
-The original System Default is restored and read back during cleanup. All Agents
-and Model Connections use unique names and are deleted or force-deleted after the
-scenario. PostgreSQL is used only where no public read API exists: ciphertext and
-nonce properties, secret preservation across a keyless update, and secret removal
-after deletion. Those queries return only booleans or one-way fingerprints and
-never return the provider key.
+It proves that a Connection owns only its URL, encrypted key, API Type, scope,
+status, and exact multi-model allowlist. It exercises Global/Personal ownership,
+write-only randomized credentials, immediate key rotation, flattened model
+options, per-model `hi` request/response text and response-time tests, and all
+three API types. Legacy
+one-connection/one-model fields are rejected.
+
+Agent coverage includes System Default pair copying, explicit connection/model
+selection, detailed Agent settings, inherited and overridden subagent settings,
+and two immutable Run bindings that share a connection/model but have different
+effective settings. Real Runs cross Runtime and Gateway for Responses, Chat,
+and Anthropic.
+
+The destructive tail verifies allowlist conflict, explicit force cleanup,
+model-unconfigured Run rejection, live credential scrubbing, and retained usage
+and error snapshots after Connection deletion. PostgreSQL is queried only for
+facts without a public read API: randomized encrypted records, immutable Run
+binding rows, and deletion-time credential scrubbing. Queries never return a
+plaintext provider key.
+
+The original System Default selection is restored and read back. Scenario-owned
+Agents and Connections are removed in reverse order.

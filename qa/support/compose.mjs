@@ -1,10 +1,22 @@
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { resolve } from 'node:path';
 
 const PROJECT_PATTERN = /^agent-hub-qa-[a-z0-9-]+$/;
 
 function commandText(args) {
   return ['docker', ...args].join(' ');
+}
+
+function subnetForIndex(index) {
+  const secondOctet = 128 + Math.floor(index / 256);
+  const thirdOctet = index % 256;
+  return `10.${secondOctet}.${thirdOctet}.0/24`;
+}
+
+function qaNetworkSubnets(project) {
+  const slot = createHash('sha256').update(project).digest().readUInt16BE(0) % 16_384;
+  return [subnetForIndex(slot * 2), subnetForIndex(slot * 2 + 1)];
 }
 
 export class ComposeHarness {
@@ -15,11 +27,14 @@ export class ComposeHarness {
     this.repoRoot = repoRoot;
     this.project = project;
     this.composeFile = resolve(repoRoot, 'compose.dev.yml');
+    const [hubNetworkSubnet, modelNetworkSubnet] = qaNetworkSubnets(project);
     this.environment = {
       ...process.env,
       FRONTEND_PORT: '0',
       HUB_CODEX_GITHUB_API_BASE: 'http://fake-model-provider:8080/codex',
-      HUB_CODEX_GITHUB_ALLOW_HTTP: 'true'
+      HUB_CODEX_GITHUB_ALLOW_HTTP: 'true',
+      HUB_NETWORK_SUBNET: hubNetworkSubnet,
+      MODEL_NETWORK_SUBNET: modelNetworkSubnet
     };
   }
 

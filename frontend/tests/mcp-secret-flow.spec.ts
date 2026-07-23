@@ -65,7 +65,6 @@ test('MCP secrets are redacted in the console and injected into the per-run runt
     const createAgentDialog = page.getByRole('dialog', { name: 'Create Agent' });
     await createAgentDialog.getByLabel('Name', { exact: true }).fill(agentName);
     await createAgentDialog.getByLabel('Instructions').fill('Validate MCP secret redaction and runtime injection.');
-    await expect(createAgentDialog.getByLabel('Default model connection')).not.toHaveValue('');
     const createAgentResponsePromise = page.waitForResponse((response) => response.request().method() === 'POST'
       && new URL(response.url()).pathname === '/api/agents');
     await createAgentDialog.getByRole('button', { name: 'Create agent' }).click();
@@ -117,22 +116,27 @@ test('MCP secrets are redacted in the console and injected into the per-run runt
     await expect(mcpTable).toContainText('--root /workspace --readonly');
     await expect(mcpTable).toContainText('API_TOKEN=********');
 
+    const createdAgentId = agentId;
+    if (!createdAgentId) throw new Error('created Agent id is missing');
+    const runResponse = await page.request.post(`/api/agents/${createdAgentId}/runs`, {
+      data: { message: 'Run with preserved MCP secret from Playwright', hub_session_id: null, parent_run_id: null }
+    });
+    expect(runResponse.ok()).toBeTruthy();
+    const createdRun = await runResponse.json() as { id: string };
+
     await page.getByRole('tab', { name: 'Activity' }).click();
-    await page.getByLabel('Message').fill('Run with preserved MCP secret from Playwright');
-    await page.getByRole('button', { name: 'Start run' }).click();
+    await expect(page.locator(`[data-run-id="${createdRun.id}"]`)).toBeVisible({ timeout: 30_000 });
     await expect(page.getByText('Fake Codex completed run')).toBeVisible({ timeout: 30_000 });
     await expect(page.locator('.status.completed')).toBeVisible({ timeout: 30_000 });
+    const completedRunResponse = await page.request.get(`/api/runs/${createdRun.id}`);
+    expect(completedRunResponse.ok()).toBeTruthy();
+    const run = await completedRunResponse.json() as { id: string; work_dir_ref: string | null };
+    const runWorkDirRef = run.work_dir_ref;
+    expect(runWorkDirRef).toBeTruthy();
+    if (!runWorkDirRef) throw new Error('run work directory is missing');
+    workDirRef = runWorkDirRef;
 
-    const run = await page.evaluate(async () => {
-      const firstRunId = document.querySelector('[data-run-id]')?.getAttribute('data-run-id');
-      if (!firstRunId) return null;
-      const response = await fetch(`/api/runs/${firstRunId}`);
-      return response.ok ? response.json() : null;
-    });
-    expect(run?.work_dir_ref).toBeTruthy();
-    workDirRef = run.work_dir_ref;
-
-    const probe = runtimeFileProbe(run.work_dir_ref, secret);
+    const probe = runtimeFileProbe(runWorkDirRef, secret);
     expect(probe).toEqual({
       mode: '600',
       configHasSecret: 'yes',

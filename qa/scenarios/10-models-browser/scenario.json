@@ -1,15 +1,17 @@
 {
-  "name": "Model Connections and usage browser workflows",
+  "name": "Model API Connections, Agent settings, references, and retained usage",
   "type": "browser",
-  "timeout_ms": 240000,
+  "timeout_ms": 300000,
   "covers": [
+    "AGT-004",
     "MDL-001",
     "MDL-002",
     "MDL-003",
     "MDL-004",
-    "MDL-006"
+    "MDL-006",
+    "MDL-007"
   ],
   "restores": [
-    "system_default_model_connection"
+    "system_default_model_selection"
   ]
 }

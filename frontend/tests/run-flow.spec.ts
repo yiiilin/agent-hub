@@ -823,26 +823,31 @@ test(consoleRunTestTitle, async ({ page, context, baseURL }) => {
   await expect(mcpPanel.getByRole('table', { name: 'MCP allowlist' })).toContainText('filesystem');
   await expect(page.getByRole('heading', { name: managedAgentName, level: 1 })).toBeVisible();
 
-  await page.getByRole('tab', { name: 'Activity' }).click();
-  await page.getByLabel('Message').fill('Run from Playwright');
+  await page.goto('/sessions');
+  const sessionList = page.getByRole('complementary', { name: 'Session list' });
+  await sessionList.getByRole('combobox', { name: 'Agent' }).selectOption(createdManagedAgentId);
+  await page.getByRole('button', { name: 'New conversation' }).click();
+  const sessionDetail = page.getByRole('region', { name: 'Session details' });
+  await sessionDetail.getByRole('textbox', { name: 'Message' }).fill('Run from Playwright');
   const targetRunResponsePromise = page.waitForResponse((response) => response.request().method() === 'POST'
     && new URL(response.url()).pathname === `/api/agents/${createdManagedAgentId}/runs`);
-  await page.getByRole('button', { name: 'Start run' }).click();
+  await sessionDetail.getByRole('button', { name: 'Send' }).click();
   const targetRunResponse = await targetRunResponsePromise;
   expect(targetRunResponse.ok()).toBeTruthy();
-  const targetRun = await targetRunResponse.json() as { id: string };
+  const targetRun = await targetRunResponse.json() as { id: string; hub_session_id: string | null };
+  expect(targetRun.hub_session_id).toBeTruthy();
   prioritizePendingRunForRuntimeClaim(targetRun.id);
-  await expect(page.getByText('Fake Codex completed run')).toBeVisible({ timeout: 30_000 });
-  await expect(page.getByText('Hub model proxy')).toBeVisible({ timeout: 30_000 });
-  await expect(page.locator('.status.completed')).toBeVisible({ timeout: 30_000 });
-  await expect(page.locator('[data-run-id].selected')).toContainText('Run from Playwright');
-  const firstRun = await page.evaluate(async () => {
-    const firstRunId = document.querySelector('[data-run-id].selected')?.getAttribute('data-run-id');
-    if (!firstRunId) return null;
-    const response = await fetch(`/api/runs/${firstRunId}`);
-    return response.ok ? response.json() : null;
-  });
+  await expect(sessionDetail.getByText('Fake Codex completed run')).toBeVisible({ timeout: 30_000 });
+  await expect.poll(async () => {
+    const response = await page.request.get(`/api/runs/${targetRun.id}`);
+    if (!response.ok()) return null;
+    return (await response.json() as { status: string }).status;
+  }, { timeout: 30_000 }).toBe('completed');
+  const firstRunResponse = await page.request.get(`/api/runs/${targetRun.id}`);
+  expect(firstRunResponse.ok()).toBeTruthy();
+  const firstRun = await firstRunResponse.json() as { id: string; work_dir_ref: string | null };
   expect(firstRun?.work_dir_ref).toBeTruthy();
+  if (!firstRun.work_dir_ref) throw new Error('first Run work directory is missing');
   expect(modelProxyConfigProbe(firstRun.work_dir_ref)).toEqual({
     providerSection: 'yes',
     responsesWire: 'yes',
@@ -850,24 +855,34 @@ test(consoleRunTestTitle, async ({ page, context, baseURL }) => {
     zeroPort: 'no'
   });
 
-  await page.getByRole('checkbox', { name: 'Continue selected thread' }).check();
-  await page.getByLabel('Message').fill('Resume the selected Codex thread from Playwright');
+  const sessionId = targetRun.hub_session_id;
+  if (!sessionId) throw new Error('first Run Session id is missing');
+  const firstSessionResponse = await page.request.get(`/api/sessions/${sessionId}`);
+  expect(firstSessionResponse.ok()).toBeTruthy();
+  const firstSession = await firstSessionResponse.json() as { native_thread_id: string | null };
+  expect(firstSession.native_thread_id).toBeTruthy();
+  await sessionDetail.getByRole('textbox', { name: 'Message' }).fill('Resume the selected Codex thread from Playwright');
   const resumeRunResponsePromise = page.waitForResponse((response) => response.request().method() === 'POST'
-    && new URL(response.url()).pathname === `/api/agents/${createdManagedAgentId}/runs`);
-  await page.getByRole('button', { name: 'Start run' }).click();
+    && new URL(response.url()).pathname === `/api/sessions/${sessionId}/messages`);
+  await sessionDetail.getByRole('button', { name: 'Send' }).click();
   const resumeRunResponse = await resumeRunResponsePromise;
   expect(resumeRunResponse.ok()).toBeTruthy();
-  prioritizePendingRunForRuntimeClaim((await resumeRunResponse.json() as { id: string }).id);
-  await expect(page.locator('[data-run-id].selected')).toContainText('Resume the selected Codex thread from Playwright');
-  await expect(page.locator('.status.completed')).toBeVisible({ timeout: 30_000 });
-  const resumedRun = await page.evaluate(async () => {
-    const runId = document.querySelector('[data-run-id].selected')?.getAttribute('data-run-id');
-    if (!runId) return null;
-    const response = await fetch(`/api/runs/${runId}`);
-    return response.ok ? response.json() : null;
-  });
-  expect(resumedRun?.parent_run_id).toBe(firstRun.id);
-  await page.getByRole('checkbox', { name: 'Continue selected thread' }).uncheck();
+  const acceptedMessage = await resumeRunResponse.json() as { run: { id: string } };
+  prioritizePendingRunForRuntimeClaim(acceptedMessage.run.id);
+  await expect(sessionDetail.getByText('Resume the selected Codex thread from Playwright', { exact: true })).toBeVisible();
+  await expect.poll(async () => {
+    const response = await page.request.get(`/api/runs/${acceptedMessage.run.id}`);
+    if (!response.ok()) return null;
+    return (await response.json() as { status: string }).status;
+  }, { timeout: 30_000 }).toBe('completed');
+  const resumedRunResponse = await page.request.get(`/api/runs/${acceptedMessage.run.id}`);
+  expect(resumedRunResponse.ok()).toBeTruthy();
+  const resumedRun = await resumedRunResponse.json() as { hub_session_id: string | null };
+  expect(resumedRun.hub_session_id).toBe(sessionId);
+  const continuedSessionResponse = await page.request.get(`/api/sessions/${sessionId}`);
+  expect(continuedSessionResponse.ok()).toBeTruthy();
+  const continuedSession = await continuedSessionResponse.json() as { native_thread_id: string | null };
+  expect(continuedSession.native_thread_id).toBe(firstSession.native_thread_id);
 
   const widgetSessionResponse = await page.request.post('/api/embed/sessions', {
     data: { agent_id: createdManagedAgentId }

@@ -36,8 +36,8 @@ function updateAgentPayload(agent, runtimeId) {
     visibility: agent.visibility,
     public_to: agent.public_to,
     runtime_id: runtimeId,
-    default_model_connection_id: agent.default_model_connection_id,
-    reasoning_effort: agent.reasoning_effort,
+    model_selection: agent.model_selection,
+    model_settings: agent.model_settings,
     codex_subagents: agent.codex_subagents,
     sandbox_policy: agent.sandbox_policy,
     managed_skill_ids: agent.managed_skill_ids,
@@ -697,6 +697,10 @@ export default async function runtimesBrowserScenario(scenarioContext) {
       await page.goto('/sessions', { waitUntil: 'domcontentloaded' });
       await page.locator('.session-workspace').waitFor();
       const sessionList = page.getByRole('complementary', { name: 'Session list' });
+      allowedNoContentAborts.add(
+        `requestfailed: GET ${new URL(`/api/sessions/${owned.session.id}/messages`, scenarioContext.baseURL).href}: net::ERR_ABORTED`
+      );
+      await sessionList.getByRole('combobox', { name: 'Agent' }).selectOption(primaryAgent.id);
       await sessionList.getByRole('textbox', { name: 'Search sessions' }).fill(owned.session.id);
       const sessionRow = sessionList.locator('.session-row').filter({ hasText: primaryAgent.name });
       await sessionRow.waitFor();

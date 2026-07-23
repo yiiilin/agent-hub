@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { expect, request, test, type APIRequestContext, type Page } from '@playwright/test';
+import type { Agent } from '../src/api/client';
 import { composeArgs } from './e2e-compose';
 
 function assertUuid(value: string, label: string) {
@@ -185,19 +186,19 @@ RETURNING id;
   expectReturnedId(output, runtimeId, 'Deleting non-executing runtime fixture');
 }
 
-type AgentConfiguration = {
-  name: string;
-  instructions: string;
-  visibility: string;
-  public_to: string[];
-  runtime_id: string | null;
-  default_model_connection_id: string | null;
-  reasoning_effort: string;
-  codex_subagents: unknown[];
-  sandbox_policy: Record<string, unknown>;
-  managed_skill_ids: string[];
-  mcp_allowlist: unknown[];
-};
+type AgentConfiguration = Pick<Agent,
+  | 'name'
+  | 'instructions'
+  | 'visibility'
+  | 'public_to'
+  | 'runtime_id'
+  | 'model_selection'
+  | 'model_settings'
+  | 'codex_subagents'
+  | 'sandbox_policy'
+  | 'managed_skill_ids'
+  | 'mcp_allowlist'
+>;
 
 async function setAgentRuntime(api: APIRequestContext, agentId: string, runtimeId: string | null) {
   const currentResponse = await api.get(`/api/agents/${agentId}`);
@@ -210,8 +211,8 @@ async function setAgentRuntime(api: APIRequestContext, agentId: string, runtimeI
       visibility: current.visibility,
       public_to: current.public_to,
       runtime_id: runtimeId,
-      default_model_connection_id: current.default_model_connection_id,
-      reasoning_effort: current.reasoning_effort,
+      model_selection: current.model_selection,
+      model_settings: current.model_settings,
       codex_subagents: current.codex_subagents,
       sandbox_policy: current.sandbox_policy,
       managed_skill_ids: current.managed_skill_ids,

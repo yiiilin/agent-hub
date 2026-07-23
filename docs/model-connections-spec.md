@@ -1,102 +1,157 @@
-# Model Connections and Token Usage Spec
+# Model API Connections and Token Usage Spec
 
-## 范围
+架构决策见 `docs/adr/0029-separate-model-api-connections-from-agent-model-settings.md`；协议转换边界见 `docs/model-proxy-spec.md`。
 
-1. Model Connection 是独立的模型连接配置，包含显示名称、服务根地址、Model ID、Upstream Protocol、详细 Codex 参数、协议专属请求参数、加密 API Key、启停状态和 Global/Personal 作用域。
-2. Upstream Protocol 只允许 `openai_responses`、`openai_chat_completions` 和 `anthropic_messages`。省略该字段的旧请求和升级前已有记录默认为 `openai_responses`；未知值必须由 API 和数据库拒绝。
-3. 服务根地址不包含 `/v1`，但可以带业务路径。Runtime 始终使用 Responses 契约：`openai_responses` 使用字节透明路径；`openai_chat_completions` 和 `anthropic_messages` 由内部协议网关转换后仍返回 Responses JSON/SSE。Hub 不提供外部 Chat Completions 入口。
-4. Personal Model Connection 仅能分配给同一 owner 的 Agent；Global Model Connection 可分配给所有 Agent。共享或公开 Agent 始终使用 Agent owner 配置的连接，调用者不能替换。
-5. Administrator 管理 Global Model Connection；普通用户管理自己的 Personal Model Connection。`admin` 不得查看或修改 `super_admin` 的个人连接，但可管理不属于个人的 Global Model Connection。
-6. 管理员可选择一个 System Default Model Connection。创建 Agent 时复制该 Global 连接；之后修改系统默认不影响已有 Agent。没有系统默认时仍可创建 model-unconfigured Agent，但不能开始新 Turn。
-7. 每个 Agent 选择一个默认连接和 reasoning effort。每个 Codex Subagent Definition 包含唯一名称、用途描述、Markdown developer instructions，以及可选的连接和 reasoning override；省略时继承 Agent 默认值。
-8. reasoning effort 支持模型默认、`none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max` 和 `ultra`。Hub 不静默降级供应商拒绝的取值。
-9. 子 Agent 共用主 Agent 的 Workspace、Skills、MCP 和 sandbox authority，不创建独立 Hub Session，也不能扩大权限。第一版使用 Codex 默认的最多 6 个并发线程和一层子 Agent 深度，不提供调节项。
+## 范围与术语
 
-## Codex 原生参数
+1. Model API Connection 是可复用的 provider 访问配置，只保存显示名称、Global/Personal 作用域、服务根地址、加密 API Key、单一 API Type、Allowed Model ID 列表、启停状态和时间戳。
+2. Allowed Model ID 是连接内精确匹配的 provider `model` 字符串，不是独立 Model 实体。一个连接可以开放多个 Model ID，不为每个 Model ID 复制地址和密钥。
+3. Agent Model Selection 是一个 `connection_id + model_id`；Agent Model Settings 保存 Codex 行为和协议专属请求设置。连接不保存调用参数。
+4. API Type 只允许 `openai_responses`、`openai_chat_completions` 和 `anthropic_messages`。Runtime 始终使用 Responses；Hub 经内部 Model Gateway 透明转发或转换。
+5. V1 直接使用本文件定义的最终 schema 和 API。开发、测试环境重建数据库，不回填旧连接字段，不保留旧 Run，不接受 connection-ID proxy header，也不提供旧 DTO alias。
 
-Model Connection 的 `parameters` 是完整、强类型的对象。创建请求省略它时按下表生成全自动值；编辑请求省略整个 `parameters` 时保留数据库中已有的整组参数。管理台创建和编辑始终提交完整对象，空数值或空服务等级提交为 `null`。
+## Model API Connection
 
-| 字段 | 自动值 | Codex 原生配置 | 约束和说明 |
+规范化发生在创建和更新 API 边界：
+
+- 输入必须是数组；每项先执行 Unicode 首尾空白裁剪。
+- 裁剪后的 ID 长度为 1 到 255 个 Unicode scalar value，且不得包含 control character。
+- ID 区分大小写。按规范化后的完整字符串去重，保留第一次出现顺序。
+- 去重后必须保留 1 到 256 项。数据库同时保证连接不能提交空 allowlist。
+- 请求体中的 `model` 必须与 Run binding 的 Model ID 字节级一致；Hub 不做 alias、模糊匹配或大小写折叠。
+
+Canonical read DTO：
+
+```json
+{
+  "id": "uuid",
+  "name": "Provider A",
+  "scope": "global",
+  "owner_id": null,
+  "base_url": "https://provider.example/api",
+  "api_type": "openai_responses",
+  "allowed_model_ids": ["gpt-5.6", "gpt-5.6-mini"],
+  "status": "enabled",
+  "has_api_key": true,
+  "created_at": "timestamp",
+  "updated_at": "timestamp"
+}
+```
+
+- `POST /api/model-connections` 创建连接；API Key 和非空 allowlist 必填。
+- `PUT /api/model-connections/{id}` 更新名称、地址、API Type、allowlist 和可选的新 Key。未提交 Key 时保留现有 ciphertext。作用域和 owner 不可变。
+- `PUT ...?force=true` 允许移除仍被选择的 Model ID，或修改仍被选择连接的 API Type，并执行下文的原子清理。未使用 `force=true` 时返回 `409 Conflict` 和不含 secret 的引用摘要。
+- `POST /api/model-connections/{id}/test` 接收 `{ "model_id": "...", "message": "hi" }`，只测试该连接当前 allowlist 中的精确 Model ID。Hub 发送一次非流式请求并返回模型文本、HTTP 状态与读取完整响应正文所用的毫秒数；测试输入和输出不写入 usage/error ledger，响应中的合法 usage 仍按既有规则记账。
+- status、普通删除和 force-delete 沿用独立 action。读取、列表、OpenAPI、错误和日志永不返回明文 Key。
+- `GET /api/model-connections/options` 返回扁平选择项：一个允许 Model ID 对应一项，包含 connection ID/name/scope/API Type/model ID/status。Agent 表单不自行组合连接与模型。
+
+Personal 连接只能分配给同一 owner 的 Agent；Global 连接可分配给所有 Agent。共享 Agent 始终使用 Agent owner 保存的选择，调用者不能替换。Administrator 管理 Global 连接；普通用户管理自己的 Personal 连接；`admin` 不得查看或修改 `super_admin` 的 Personal 连接。
+
+Base URL 不包含 `/v1`，可以包含业务路径。Global 和 Personal URL 都不限制公网、内网、loopback、link-local、metadata、DNS、redirect 或明文 HTTP；HTTPS 仍执行标准证书和 hostname 校验，不提供跳过校验。
+
+## Agent Model Selection
+
+```json
+{
+  "connection_id": "uuid",
+  "model_id": "gpt-5.6"
+}
+```
+
+- pair 必须同时存在或整体为 `null`。数据库和 API 都拒绝半个 selection。
+- 连接必须符合 Agent owner 的 Global/Personal scope，Model ID 必须在当前 allowlist 中。
+- System Default Model Selection 只能引用 enabled Global 连接及其一个 Allowed Model ID。创建 Agent 时复制 pair；以后修改默认值不改变已有 Agent。
+- 没有 selection 的 Agent 仍可保存和查看，但属于 model-unconfigured，不能启动新 Turn。
+- Codex Subagent Definition 不提交 selection 时继承 Agent pair；显式提交时必须是另一个完整、可授权 pair。
+
+## Agent Model Settings
+
+根 Agent 保存一个完整 `model_settings` 对象。枚举的 `default` 和数值/字符串的 `null` 表示保持 Codex/provider 自动行为：
+
+| 字段 | 自动值 | Codex 原生配置 | 约束 |
 | --- | --- | --- | --- |
 | `reasoning_effort` | `default` | `model_reasoning_effort` | `default`、`none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`ultra` |
 | `reasoning_summary` | `default` | `model_reasoning_summary` | `default`、`auto`、`concise`、`detailed`、`none` |
 | `verbosity` | `default` | `model_verbosity` | `default`、`low`、`medium`、`high` |
-| `context_window_tokens` | `null` | `model_context_window` | 正整数；`null` 由 Codex 自动判断 |
-| `auto_compact_token_limit` | `null` | `model_auto_compact_token_limit` | 正整数，不能大于上下文窗口 |
-| `reasoning_summary_support` | `auto` | `model_supports_reasoning_summaries` | `supported` 写入 `true`，`unsupported` 写入 `false`，`auto` 省略 |
-| `service_tier` | `null` | `service_tier` | 可选自定义字符串，去除首尾空白后最长 64 个字符 |
-| `request_max_retries` | `null` | 选定 provider 的 `request_max_retries` | `0..100`；由 Codex provider 配置使用 |
-| `stream_max_retries` | `null` | 选定 provider 的 `stream_max_retries` | `0..100`；由 Codex provider 配置使用 |
-| `stream_idle_timeout_ms` | `null` | 选定 provider 的 `stream_idle_timeout_ms` | 正整数毫秒；由 Codex provider 配置使用 |
+| `context_window_tokens` | `null` | `model_context_window` | 正整数 |
+| `auto_compact_token_limit` | `null` | `model_auto_compact_token_limit` | 正整数，不大于 context window |
+| `reasoning_summary_support` | `auto` | `model_supports_reasoning_summaries` | `auto`、`supported`、`unsupported` |
+| `service_tier` | `null` | `service_tier` | trim 后 1 到 64 字符 |
+| `request_max_retries` | `null` | provider `request_max_retries` | `0..100` |
+| `stream_max_retries` | `null` | provider `stream_max_retries` | `0..100` |
+| `stream_idle_timeout_ms` | `null` | provider `stream_idle_timeout_ms` | 正整数毫秒 |
 
-推理强度的有效值按以下顺序覆盖：Codex 子 Agent 明确值 > Agent 明确值 > 所选 Model Connection 的默认值 > Codex 模型元数据。其余字段来自当前主 Agent 或子 Agent 所选的 Model Connection；没有明确值时保持 Codex 自动行为。参数写入主 Agent 或子 Agent 的原生 TOML，变化在下一次 Turn 配置刷新时生效，在途 Run 保持开始时的配置。
+`request_settings` 是与有效 API Type 一致的 tagged object：
 
-这些字段是 Codex 的连接级原生配置，不是对每个请求的通用采样覆盖。Hub 和 Model Gateway 不根据 `parameters` 注入或改写 `temperature`、`top_p`、输出限制、`tool_choice` 或 `parallel_tool_calls`，也不把连接级重试设置转化为 Gateway 重试。Runtime 仍只发送原生 Responses 请求；Gateway 只做认证替换和已约定的协议转换。
-
-## 协议专属请求参数
-
-`request_parameters` 与 `parameters` 分开保存、读取、复制到 Run/usage/error 的非 secret 快照并发送到 Gateway。创建时省略它会按 `upstream_protocol` 生成全自动对象；同协议编辑时省略整组保留原值，切换协议且省略整组时重置为新协议的全自动对象。显式对象的 `protocol` 必须与连接协议一致，未知字段、错误字段或不合法范围均拒绝。
-
-| `upstream_protocol` | `request_parameters` | Gateway 行为 |
+| API Type | Request Settings | Gateway 行为 |
 | --- | --- | --- |
-| `openai_responses` | 只允许 `{ "protocol": "openai_responses" }` | 不注入采样或输出限制；Responses 到 Responses 保持请求与响应字节透明。 |
-| `openai_chat_completions` | `temperature` (`0..2`)、`top_p` (`0..1`)、`max_completion_tokens`（正整数）均可为 `null` | 将可无损表达的 Responses 请求转换为 Chat Completions，并以非 `null` 值覆盖转换后的同名请求参数。 |
-| `anthropic_messages` | `temperature` (`0..1`) 或 `top_p` (`0..1`) 至多一个，以及 `max_tokens`（正整数） | 将可无损表达的 Responses 请求转换为 Messages，并以非 `null` 值覆盖转换后的同名请求参数。 |
+| `openai_responses` | 只允许 `{ "protocol": "openai_responses" }` | 不注入参数，request/response body 保持字节透明 |
+| `openai_chat_completions` | nullable `temperature` (`0..2`)、`top_p` (`0..1`)、`max_completion_tokens`（正整数） | 转换后仅覆盖非 `null` 字段 |
+| `anthropic_messages` | nullable `temperature` (`0..1`) 或 `top_p` (`0..1`) 至多一个；nullable `max_tokens`（正整数） | 转换后仅覆盖非 `null` 字段 |
 
-这些是唯一由连接配置产生的 Gateway 请求级覆盖。它们不写入 Codex TOML，不改变 Runtime 的 Responses wire API，也不使 Gateway 重试、fallback 或保存请求状态。
+Subagent 使用 `model_settings_override`：
 
-## 连接和密钥生命周期
+- 字段缺失表示继承 Agent；枚举可以显式提交 `default`，nullable 数值/字符串可以显式提交 `null`，从而覆盖 Agent 并恢复自动行为。
+- 有具体值时覆盖 Agent。有效优先级逐字段为：Subagent override、Agent value、Codex/provider 自动行为。
+- 未显式选择另一 pair 时，请求设置按字段继承且协议相同。显式选择不同 API Type 时，缺失的 `request_settings` 使用新 API Type 的全自动对象，不能继承不兼容协议字段。
+- Runtime 只把 Codex 原生字段写入受控 TOML；协议专属 request settings 只进入 Hub 到 Gateway 的 envelope。
 
-- API Key 在创建 Model Connection 时必填。更新请求不提交新明文 Key 时保留旧值；查询、列表、错误、日志和 Runtime 协议永不返回明文。
-- Hub 从 `HUB_MODEL_SECRET_KEY` 读取一把部署级对称主密钥，使用带完整性校验的对称加密和每条 secret 独立随机 nonce 保存模型 API Key。第一版不支持主密钥轮换；缺失或格式错误时 Hub 拒绝启动。
-- Model Connection 可停用。已经建立的流继续完成；下一次模型请求拒绝使用。重新启用保留所有引用并恢复可用性。
-- 普通删除在仍被 System Default、Agent 默认或子 Agent override 引用时返回冲突。Force Delete 删除密钥和可执行配置并保留非 secret 历史快照：Agent 默认连接被删除后 Agent model-unconfigured；子 Agent override 被删除后只禁用该定义，不静默恢复继承。
-- 删除或停用 System Default 时清除默认选择。后续新 Agent 保持 model-unconfigured，已有 Agent 不自动改绑。
-- Base URL 或 API Key 修改从下一次模型请求生效，已建立的流继续使用请求开始时取得的值。Model ID、Upstream Protocol、全部详细 Codex 参数、协议专属请求参数和子 Agent 文件从下一 Turn 生效。
-- 新建和编辑不强制访问上游。显式“测试连接”发送最小 Responses 请求；返回的 usage 归入执行测试的 Hub User，不归入 Agent，错误进入 Model Call Error ledger。
+## 引用、删除和生效边界
 
-## Hub 与 Model Gateway 调用链
+- 普通 allowlist 更新在待移除 ID 仍被 System Default、Agent 或显式 Subagent selection 引用时返回 `409`。被引用连接的 API Type 变更以及普通删除同样返回 `409`，避免留下协议不匹配的 Agent settings。
+- Force 更新原子清除受移除 Model ID 或 API Type 变化影响的 System Default 和 Agent selection。受影响的显式 Subagent Definition 保留但设置为 disabled，原因是 `model_selection_removed`；不得静默改为继承。
+- Force Delete 执行相同清理并删除 live secret/config。Agent、Subagent、Run、usage 和 error 的非 secret 历史仍可查看。
+- 连接名称、allowlist、API Type、Agent selection 或 settings 的变化在下一 Run binding 生效；Run binding 不被修改。
+- Base URL 或 API Key 轮换从下一次 provider request 生效。disabled/deleted 连接阻止下一次 request；已交给 Gateway 的流可以完成。
+- 修改 allowlist 不使既有 Run binding 失效。该 binding 的 Model ID 已在 Run 开始时授权；Hub 仍要求 live 连接存在且 enabled。
 
-1. Runtime 系统流量仍只访问 Hub，不保留或接收真实 provider API Key，也不存在 `RUNTIME_DIRECT_MODEL_*` fallback。
-2. Runtime 为 Agent 默认连接和子 Agent override 生成受控 `CODEX_HOME` provider/agent 配置，通过本地 loopback proxy 携带 run-scoped token、Run ID 和所选 Model Connection ID 请求 Hub。
-3. Hub 每次模型请求只查询一次数据库，验证 Run、Runtime、Agent、Model Connection scope、启停状态和请求 `model` 与连接 Model ID 一致，再解密该次请求使用的 API Key。
-4. Hub 删除 Runtime/Hub authentication、Cookie、Host、Content-Length 和 hop-by-hop headers，把协议、协议专属请求参数、服务根地址、解密后的请求级 API Key、query、安全 headers 和原始 Responses body 发送给只在内部网络开放的 Model Gateway。
-5. Gateway 对 `openai_responses` 使用字节透明 fast path；对 `openai_chat_completions` 和 `anthropic_messages` 使用固定 Bifrost Core 转换为 Responses JSON/SSE。转换历史使用严格的可移植项/内容字段白名单：仅保留转换器明确支持的 message、function call/result、reasoning 和 refusal 形式；不能在目标协议中表达的 item `id`、`status`、`phase`、额外 item 字段以及 `output_text.annotations`、`logprobs` 等内容字段必须以 `unsupported_protocol_feature` 拒绝，不能发送到 provider。Hub 流式返回 Gateway status、允许的 response headers 和 body，并旁路解析 terminal response 记录 usage/error，不得把整个响应缓冲后再发送。
-6. 成功完成却没有 `usage` 属于 provider protocol error。任何状态只要返回了有效 `usage` 都写入 Model Token Usage；failed、incomplete、cancelled 或 transport failure 同时写入 Model Call Error，只有没有 usage 的失败才不增加 Token 总量。
-7. Personal 和 Global Base URL 都不做公网、内网、loopback、link-local、metadata、DNS、redirect 或明文 HTTP 限制，风险由 ADR-0024 明确接受。HTTP client 仍只实现 HTTP/HTTPS 协议，并对 HTTPS 执行标准证书和 hostname 校验，不提供跳过校验选项。连接所有者必须信任所选 provider 接收 API Key 并生成 response body；OpenAI 字节透明路径不扫描 provider body。
-8. Gateway 不保存 Model Connection、API Key、prompt、output、usage 或 error，不做 retry/fallback；Hub 仍是唯一业务 control plane 和历史账本权威。协议和传输细节见 `docs/model-proxy-spec.md` 与 ADR-0028。
+## Run Model Binding 与调用链
 
-## 用量和错误账本
+每个 Run 为主 Agent和每个不同的显式 Subagent 配置建立不可变、无 secret 的 binding：
 
-- 每个真实上游 Responses 请求最多写入一条 Model Token Usage。一个 Turn 中的多次调用、tool continuation、子 Agent 调用和 provider retry 按实际请求分别记录并汇总。
-- usage 保存 `input_tokens`、`output_tokens`、`total_tokens`、`cached_tokens` 和 `reasoning_tokens`；缓存 Token 是输入子集，推理 Token 是输出子集，不重复累加到 total。
-- usage 归属于 Hub Agent、发起 subject、Model Connection 和调用时的非 secret 快照，包括调用时固定的 Upstream Protocol 与协议专属请求参数，但不区分主 Agent 与具体子 Agent。调用者使用共享 Agent 时计入调用者而不是 Agent owner；Automation 计入 owner；user-level Application Token 计入 represented Hub User；app-only token 计入 Integration App。
-- Model Token Usage 和 Model Call Error 均使用 PostgreSQL `TIMESTAMPTZ(3)` 保存毫秒精度发生时间。Error 还保存上游/transport 状态、脱敏错误码与有限长度消息，以及同一权限范围需要的 User、Agent 和 Model 快照；不得保存 prompt、output、raw body、headers 或 credentials。
-- 两个 ledger 都不可删减。删除 User 后去除身份关联并显示“已删除用户”；删除 Agent 或 Model Connection 后保留非 secret 历史快照；删除 Session 或 Run 不改变历史总量。错误与用量使用相同生命周期。
-- 普通用户可查看自己的 usage/error 和自有 Agent 汇总，但不能看到调用自有共享 Agent 的其他用户身份。`admin` 可查看非 `super_admin` 范围；`super_admin` 可查看全平台。
+```json
+{
+  "id": "binding-uuid",
+  "run_id": "run-uuid",
+  "binding_key": "main",
+  "model_connection_id": "connection-uuid",
+  "connection_name_snapshot": "Provider A",
+  "connection_scope_snapshot": "global",
+  "model_id": "gpt-5.6",
+  "api_type": "openai_responses",
+  "model_settings": {}
+}
+```
 
-## API 和管理台
+1. Runtime claim 只包含 binding snapshots，不含 provider endpoint、Key 或 connection-level secret。
+2. Runtime 为每个 binding 渲染受控 Codex provider，并通过 loopback proxy 发送 Run ID、binding ID 和 run-scoped token。
+3. Hub 只接受 binding ID。它必须属于认证的 active Run，且 request `model` 等于 binding Model ID。
+4. Hub 验证 Runtime、Run、Agent scope、binding snapshot 和 live connection enabled state；每次请求读取一次 live endpoint/ciphertext 并解密 Key。
+5. Hub 使用 binding 的 API Type 和 effective request settings 调用 Gateway。两个 Agent 即使共享 connection/model，也由不同 binding ID 保留各自设置。
+6. Gateway 不保存连接、Key、prompt、output、usage 或 error，不做 retry/fallback；Hub 是唯一 control plane 和历史账本权威。
 
-- 新增一级“模型”菜单，包含“我的模型”“可用模型”“用量统计”；Administrator 额外看到“全局模型”。连接表格显示原始 Upstream Protocol 值；新建和编辑 FormDialog 将 Codex `parameters` 按“生成与推理”“上下文”“连接可靠性”分组，并单独展示随协议变化的 `request_parameters`。测试、启停、普通删除和 Force Delete 同样从表格操作打开 FormDialog，不在主页常驻表单。
-- Agent 新建/编辑表单选择默认 Model Connection 和 reasoning effort，并用列表加子表单维护 Codex Subagent Definitions。连接 CRUD 不嵌入 Agent 表单。
-- 用量页默认查询“当天”，可选“昨天”“7 天”“30 天”“90 天”“总共”。前端按浏览器本地日历计算毫秒级半开区间 `[from_ms, to_ms)`：当天从本地零点到当前时刻，昨天为完整前一日，7/30/90 天从对应本地零点到当前时刻，总共不传边界；后端只按传入时间戳查询。
-- 汇总查询计算整个时间范围的 overall totals，并按 Model、Agent 和 Hub User 三个维度分组，不提供 Session、Run 或 Turn 下钻。汇总不受明细分页影响；usage 和 error 明细分别按发生时间及 ID 倒序分页。
-- usage 列表每行是一条带 usage 的 Responses 调用，显示时间、subject、Agent、Model、input/output/cached/reasoning/total。Model Call Error 使用独立分页列表，不混入 usage。
-- 第一版不计算费用，不做图表、Token quota、rate limiting 或 CSV export。
+## 密钥、用量和错误账本
 
-## 兼容和非目标
+- Hub 从 `HUB_MODEL_SECRET_KEY` 读取部署级对称主密钥，使用带完整性校验的对称加密和每条 secret 独立随机 nonce。缺失或格式错误时拒绝启动。
+- 每个真实上游请求最多写一条 Model Token Usage。任意 terminal status 只要有合法 `usage` 就记录；失败、incomplete、cancelled、transport 或 protocol failure 同时写 Model Call Error；无 usage 的失败不增加 Token 总量。
+- usage 保存 input/output/total/cached/reasoning tokens。cached 是 input 子集，reasoning 是 output 子集，不重复累加。
+- usage/error 快照保存 connection name/scope、API Type、Model ID、有效 request settings、Agent 和发起 subject；不区分主/子 Agent，不保存 prompt、output、raw body、headers 或 credential。
+- 两类 ledger 使用 `TIMESTAMPTZ(3)`，不可删减。删除 User 后匿名化身份关联；删除 Agent、Session、Run 或 Model API Connection 不改变历史总量。
+- 普通用户可查看自己的 usage/error 和自有 Agent 汇总；共享 Agent 的 owner 看不到其他调用者身份。`admin` 可看非 `super_admin` 范围；`super_admin` 可看全平台。
 
-- 不自动迁移 `HUB_MODEL_PROXY_UPSTREAM_URL`、`HUB_MODEL_PROXY_API_KEY`、Agent JSON model policy 或 Runtime direct-model 配置。升级后由 Administrator 创建 Global Model Connection 并明确分配；现有 Agent 在此之前 model-unconfigured。
-- `parameters` 不转换成请求体字段；只有 `request_parameters` 按协议表覆盖转换后的 Chat Completions 或 Messages 请求。省略对象的默认和编辑保留行为严格区分；Gateway 不因任一参数保存状态、重试或 fallback。
-- Compose 测试环境直接创建开发用 Global Model Connection 和 API Key，并设置开发专用 `HUB_MODEL_SECRET_KEY`；fake provider 同时提供确定性的 OpenAI Responses、Chat Completions 与 Anthropic Messages JSON/SSE。
-- 不支持 arbitrary connection headers、Runtime/Hub Chat Completions 入口、provider price catalog、成本换算、secret 查询、主密钥轮换或 Runtime 直连 provider。
+## API、OpenAPI 和管理台
+
+- OpenAPI 的 create/update/read/test/options/System Default/Agent execution schemas 使用本文件的 final V1 字段；单值 `model_id`、`parameters`、`request_parameters` 不再属于 connection DTO。
+- “模型”页以 Global/Personal Model API Connection 列表和 usage/error 为主体。连接 FormDialog 只展示名称、作用域、Base URL、API Key、API Type、Allowed Model IDs 和状态操作。
+- Agent 新建/编辑表单选择扁平 connection/model option，并编辑完整 Model Settings；Subagent 子表单显示 inheritance source 和 effective value。
+- 用量页默认当天，可选昨天、7/30/90 天、总共。前端计算毫秒级半开区间 `[from_ms,to_ms)`；汇总覆盖完整范围且不受明细分页影响。
+- 第一版不做独立 Model catalog、`/v1/models` 自动发现、alias、wildcard、价格、图表、quota、rate limit、fallback、CSV 或 secret 查询。
 
 ## 验收标准
 
-- Global/Personal scope、Administrator/Super Administrator 边界、System Default copy、共享 Agent owner-connection 规则和 model-unconfigured 阻断均有数据库与 API 测试。
-- API Key ciphertext 使用随机 nonce，同一明文不会产生相同 ciphertext；任何 read DTO、OpenAPI、日志和 Runtime claim 都不含明文。
-- 省略 Upstream Protocol 的旧创建请求和已有数据库记录保持 `openai_responses`；创建、读取、编辑、Agent execution snapshot 和历史 ledger 均保留明确协议及其请求参数，未知协议、参数不匹配和无效范围 fail closed。
-- 网关测试证明 OpenAI Responses 原始 JSON bytes、query、允许 headers、status 和 SSE chunks 被流式保留；Chat Completions 与 Anthropic JSON/SSE 被规范化为 Responses，参数只在转换路径覆盖，认证按协议替换，每次请求只解析一次连接配置，Runtime 不持有 provider key。
-- usage/error 测试覆盖 completed/failed/incomplete/cancelled、带或不带 usage、缓存/推理子集、retry、多请求 Turn、连接测试、共享 Agent attribution、权限过滤和所有删除匿名化路径。
-- Runtime 测试覆盖多 provider config、子 Agent 文件、全部详细参数的原生 TOML 映射、自动值、省略值、推理优先级、下一 Turn refresh、连接禁用/删除、provider 重试/空闲超时配置和彻底移除 direct fallback。
-- 管理台在桌面与 390px 下验证四个 Model Tabs、三协议 CRUD dialogs、Codex 三组参数、协议专属请求参数、创建默认值、协议切换重置、编辑回填与完整更新、Agent model/subagent 配置、固定时间范围 totals、分页 usage/error 和角色可见性，并检查 console/network 与横向溢出。
+- 序列化和 PostgreSQL 测试覆盖 allowlist 规范化、pair 完整性、scope、System Default、API-Type settings、Subagent 逐字段继承和 binding 不可变性。
+- API 测试覆盖一个连接多个模型、扁平 options、精确测试、Key 不披露/轮换、引用冲突、force 清理、model-unconfigured、admin/super-admin 和 Personal owner 边界。
+- Runtime/Hub 测试证明只使用 binding ID，并能区分共享 connection/model 但 settings 不同的两个 binding；任何 connection-ID-only 请求 fail closed。
+- Gateway 测试保持 Responses 字节透明，并验证 Chat/Messages 转换只合并 binding 的有效 request settings。
+- usage/error 在 live connection 删除后仍按快照汇总，且所有日志、OpenAPI、Runtime 文件和 QA artifact 不包含 API Key。
+- 管理台在 desktop 和 390px 验证最小连接表单、allowlist、Agent/Subagent selection/settings、System Default、冲突/force 和历史用量，无 console/network 异常或横向溢出。

@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { expect, request, test, type Page } from '@playwright/test';
+import type { Agent, AgentModelSettings } from '../src/api/client';
 import { composeArgs, e2eComposeProject } from './e2e-compose';
 
 const ownerId = '10000000-0000-4000-8000-000000000001';
@@ -7,6 +8,20 @@ const alphaId = '20000000-0000-4000-8000-000000000001';
 const betaId = '20000000-0000-4000-8000-000000000002';
 const agentId = '30000000-0000-4000-8000-000000000001';
 const now = '2026-07-11T08:00:00.000Z';
+
+const automaticModelSettings: AgentModelSettings = {
+  reasoning_effort: 'default',
+  reasoning_summary: 'default',
+  verbosity: 'default',
+  context_window_tokens: null,
+  auto_compact_token_limit: null,
+  reasoning_summary_support: 'auto',
+  service_tier: null,
+  request_max_retries: null,
+  stream_max_retries: null,
+  stream_idle_timeout_ms: null,
+  request_settings: { protocol: 'openai_responses' }
+};
 
 const skills = [
   { id: alphaId, owner_id: ownerId, name: 'Alpha review', description: 'Used review skill', content: 'Alpha content', revision: 2, content_checksum_sha256: 'a'.repeat(64), created_at: '2026-07-01T08:00:00.000Z', updated_at: '2026-07-10T08:00:00.000Z' },
@@ -16,7 +31,7 @@ const skills = [
 const agents = [{
   id: agentId, name: 'Attached agent', instructions: 'Fixture', visibility: 'private', public_to: [], runtime_id: null,
   owner_id: ownerId, is_owner: true, can_manage: true, can_administer: true, can_invoke: true,
-  default_model_connection_id: null, reasoning_effort: 'default', codex_subagents: [],
+  model_selection: null, model_settings: automaticModelSettings, codex_subagents: [],
   model_policy: {}, sandbox_policy: {}, managed_skill_ids: [alphaId], mcp_allowlist: [],
   created_at: now, updated_at: now
 }];
@@ -369,18 +384,12 @@ test('skills and managed assignments enforce the real owner boundary', async ({ 
       instructions: 'Owner boundary fixture',
       visibility: 'private',
       public_to: [],
-      default_model_connection_id: null,
-      reasoning_effort: 'default',
+      model_selection: null,
+      model_settings: automaticModelSettings,
       codex_subagents: []
     } });
     expect(agentResponse.ok()).toBeTruthy();
-    const agent = await agentResponse.json() as Record<string, unknown> & {
-      id: string;
-      default_model_connection_id: string | null;
-      reasoning_effort: string;
-      codex_subagents: unknown[];
-      managed_skill_ids: string[];
-    };
+    const agent = await agentResponse.json() as Agent;
 
     const outsiderSkills = await (await outsider.get('/api/skills')).json() as Array<{ id: string }>;
     expect(outsiderSkills.map((item) => item.id)).not.toContain(skill.id);
@@ -394,8 +403,8 @@ test('skills and managed assignments enforce the real owner boundary', async ({ 
       visibility: agent.visibility,
       public_to: agent.public_to,
       runtime_id: agent.runtime_id,
-      default_model_connection_id: agent.default_model_connection_id,
-      reasoning_effort: agent.reasoning_effort,
+      model_selection: agent.model_selection,
+      model_settings: agent.model_settings,
       codex_subagents: agent.codex_subagents,
       sandbox_policy: agent.sandbox_policy,
       managed_skill_ids: [skill.id],

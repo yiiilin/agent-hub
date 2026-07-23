@@ -1,8 +1,5 @@
 use chrono::{DateTime, Utc};
-use serde::{
-    de::{self, Deserializer},
-    Deserialize, Serialize,
-};
+use serde::{de::Deserializer, Deserialize, Serialize, Serializer};
 use serde_json::{json, Number, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -209,6 +206,49 @@ pub enum ModelConnectionStatus {
     Disabled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllowedModelIdsError(&'static str);
+
+impl fmt::Display for AllowedModelIdsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for AllowedModelIdsError {}
+
+pub fn normalize_allowed_model_ids(
+    model_ids: Vec<String>,
+) -> Result<Vec<String>, AllowedModelIdsError> {
+    let mut seen = BTreeSet::new();
+    let mut normalized = Vec::new();
+
+    for model_id in model_ids {
+        let model_id = model_id.trim();
+        let length = model_id.chars().count();
+        if length == 0 || length > 255 || model_id.chars().any(char::is_control) {
+            return Err(AllowedModelIdsError(
+                "model ids must contain 1 to 255 non-control characters",
+            ));
+        }
+        if seen.insert(model_id.to_owned()) {
+            normalized.push(model_id.to_owned());
+            if normalized.len() > 256 {
+                return Err(AllowedModelIdsError(
+                    "a Model API Connection supports at most 256 model ids",
+                ));
+            }
+        }
+    }
+
+    if normalized.is_empty() {
+        return Err(AllowedModelIdsError(
+            "a Model API Connection requires at least one model id",
+        ));
+    }
+    Ok(normalized)
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelUpstreamProtocol {
@@ -216,60 +256,6 @@ pub enum ModelUpstreamProtocol {
     OpenaiResponses,
     OpenaiChatCompletions,
     AnthropicMessages,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "protocol", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ModelConnectionRequestParameters {
-    OpenaiResponses {},
-    OpenaiChatCompletions {
-        #[serde(default)]
-        temperature: Option<Number>,
-        #[serde(default)]
-        top_p: Option<Number>,
-        #[serde(default)]
-        max_completion_tokens: Option<u32>,
-    },
-    AnthropicMessages {
-        #[serde(default)]
-        temperature: Option<Number>,
-        #[serde(default)]
-        top_p: Option<Number>,
-        #[serde(default)]
-        max_tokens: Option<u32>,
-    },
-}
-
-impl ModelConnectionRequestParameters {
-    pub fn for_protocol(protocol: ModelUpstreamProtocol) -> Self {
-        match protocol {
-            ModelUpstreamProtocol::OpenaiResponses => Self::OpenaiResponses {},
-            ModelUpstreamProtocol::OpenaiChatCompletions => Self::OpenaiChatCompletions {
-                temperature: None,
-                top_p: None,
-                max_completion_tokens: None,
-            },
-            ModelUpstreamProtocol::AnthropicMessages => Self::AnthropicMessages {
-                temperature: None,
-                top_p: None,
-                max_tokens: None,
-            },
-        }
-    }
-
-    pub fn protocol(&self) -> ModelUpstreamProtocol {
-        match self {
-            Self::OpenaiResponses { .. } => ModelUpstreamProtocol::OpenaiResponses,
-            Self::OpenaiChatCompletions { .. } => ModelUpstreamProtocol::OpenaiChatCompletions,
-            Self::AnthropicMessages { .. } => ModelUpstreamProtocol::AnthropicMessages,
-        }
-    }
-}
-
-impl Default for ModelConnectionRequestParameters {
-    fn default() -> Self {
-        Self::for_protocol(ModelUpstreamProtocol::OpenaiResponses)
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -302,79 +288,6 @@ pub enum ModelReasoningSummarySupport {
     Unsupported,
 }
 
-#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
-pub struct ModelConnectionParameters {
-    pub reasoning_effort: ReasoningEffort,
-    pub reasoning_summary: ModelReasoningSummary,
-    pub verbosity: ModelVerbosity,
-    pub context_window_tokens: Option<u64>,
-    pub auto_compact_token_limit: Option<u64>,
-    pub reasoning_summary_support: ModelReasoningSummarySupport,
-    pub service_tier: Option<String>,
-    pub request_max_retries: Option<u32>,
-    pub stream_max_retries: Option<u32>,
-    pub stream_idle_timeout_ms: Option<u64>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ModelConnectionParametersWire {
-    reasoning_effort: ReasoningEffort,
-    reasoning_summary: ModelReasoningSummary,
-    verbosity: ModelVerbosity,
-    context_window_tokens: Option<u64>,
-    auto_compact_token_limit: Option<u64>,
-    reasoning_summary_support: ModelReasoningSummarySupport,
-    service_tier: Option<String>,
-    request_max_retries: Option<u32>,
-    stream_max_retries: Option<u32>,
-    stream_idle_timeout_ms: Option<u64>,
-}
-
-impl<'de> Deserialize<'de> for ModelConnectionParameters {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        const REQUIRED_FIELDS: [&str; 10] = [
-            "reasoning_effort",
-            "reasoning_summary",
-            "verbosity",
-            "context_window_tokens",
-            "auto_compact_token_limit",
-            "reasoning_summary_support",
-            "service_tier",
-            "request_max_retries",
-            "stream_max_retries",
-            "stream_idle_timeout_ms",
-        ];
-
-        let value = Value::deserialize(deserializer)?;
-        let object = value.as_object().ok_or_else(|| {
-            <D::Error as de::Error>::custom("Model Connection parameters must be an object")
-        })?;
-        for field in REQUIRED_FIELDS {
-            if !object.contains_key(field) {
-                return Err(<D::Error as de::Error>::missing_field(field));
-            }
-        }
-        let wire: ModelConnectionParametersWire =
-            serde_json::from_value(value).map_err(<D::Error as de::Error>::custom)?;
-        Ok(Self {
-            reasoning_effort: wire.reasoning_effort,
-            reasoning_summary: wire.reasoning_summary,
-            verbosity: wire.verbosity,
-            context_window_tokens: wire.context_window_tokens,
-            auto_compact_token_limit: wire.auto_compact_token_limit,
-            reasoning_summary_support: wire.reasoning_summary_support,
-            service_tier: wire.service_tier,
-            request_max_retries: wire.request_max_retries,
-            stream_max_retries: wire.stream_max_retries,
-            stream_idle_timeout_ms: wire.stream_idle_timeout_ms,
-        })
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConnectionDto {
@@ -383,15 +296,10 @@ pub struct ModelConnectionDto {
     pub scope: ModelConnectionScope,
     pub name: String,
     pub base_url: String,
-    pub model_id: String,
-    #[serde(default)]
-    pub upstream_protocol: ModelUpstreamProtocol,
-    #[serde(default)]
-    pub parameters: ModelConnectionParameters,
-    #[serde(default)]
-    pub request_parameters: ModelConnectionRequestParameters,
+    pub api_type: ModelUpstreamProtocol,
+    pub allowed_model_ids: Vec<String>,
     pub status: ModelConnectionStatus,
-    pub is_system_default: bool,
+    pub has_api_key: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -402,13 +310,8 @@ pub struct CreateModelConnectionRequest {
     pub scope: ModelConnectionScope,
     pub name: String,
     pub base_url: String,
-    pub model_id: String,
-    #[serde(default)]
-    pub upstream_protocol: ModelUpstreamProtocol,
-    #[serde(default)]
-    pub parameters: ModelConnectionParameters,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_parameters: Option<ModelConnectionRequestParameters>,
+    pub api_type: ModelUpstreamProtocol,
+    pub allowed_model_ids: Vec<String>,
     pub api_key: String,
 }
 
@@ -417,15 +320,54 @@ pub struct CreateModelConnectionRequest {
 pub struct UpdateModelConnectionRequest {
     pub name: String,
     pub base_url: String,
-    pub model_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upstream_protocol: Option<ModelUpstreamProtocol>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parameters: Option<ModelConnectionParameters>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_parameters: Option<ModelConnectionRequestParameters>,
+    pub api_type: ModelUpstreamProtocol,
+    pub allowed_model_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestModelConnectionRequest {
+    pub model_id: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelSelectionDto {
+    pub connection_id: Uuid,
+    pub model_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelConnectionOptionDto {
+    pub connection_id: Uuid,
+    pub connection_name: String,
+    pub model_id: String,
+    pub api_type: ModelUpstreamProtocol,
+    pub scope: ModelConnectionScope,
+    pub status: ModelConnectionStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelConnectionOptionsDto {
+    pub items: Vec<ModelConnectionOptionDto>,
+    pub system_default: Option<ModelSelectionDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SystemDefaultModelSelectionDto {
+    pub selection: Option<ModelSelectionDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SetSystemDefaultModelSelectionRequest {
+    pub selection: Option<ModelSelectionDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -436,46 +378,186 @@ pub struct UpdateModelConnectionStatusRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ModelConnectionOptionDto {
-    pub id: Uuid,
-    pub name: String,
-    pub model_id: String,
-    #[serde(default)]
-    pub upstream_protocol: ModelUpstreamProtocol,
-    #[serde(default)]
-    pub parameters: ModelConnectionParameters,
-    #[serde(default)]
-    pub request_parameters: ModelConnectionRequestParameters,
-    pub scope: ModelConnectionScope,
-    pub status: ModelConnectionStatus,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ModelConnectionOptionsDto {
-    pub items: Vec<ModelConnectionOptionDto>,
-    pub system_default_model_connection_id: Option<Uuid>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct ModelConnectionTestResultDto {
     pub success: bool,
     pub status_code: Option<u16>,
     pub error_code: Option<String>,
     pub message: Option<String>,
+    pub response_text: Option<String>,
+    pub response_time_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "protocol", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModelRequestSettings {
+    OpenaiResponses {},
+    OpenaiChatCompletions {
+        #[serde(default)]
+        temperature: Option<Number>,
+        #[serde(default)]
+        top_p: Option<Number>,
+        #[serde(default)]
+        max_completion_tokens: Option<u32>,
+    },
+    AnthropicMessages {
+        #[serde(default)]
+        temperature: Option<Number>,
+        #[serde(default)]
+        top_p: Option<Number>,
+        #[serde(default)]
+        max_tokens: Option<u32>,
+    },
+}
+
+impl ModelRequestSettings {
+    pub fn for_protocol(protocol: ModelUpstreamProtocol) -> Self {
+        match protocol {
+            ModelUpstreamProtocol::OpenaiResponses => Self::OpenaiResponses {},
+            ModelUpstreamProtocol::OpenaiChatCompletions => Self::OpenaiChatCompletions {
+                temperature: None,
+                top_p: None,
+                max_completion_tokens: None,
+            },
+            ModelUpstreamProtocol::AnthropicMessages => Self::AnthropicMessages {
+                temperature: None,
+                top_p: None,
+                max_tokens: None,
+            },
+        }
+    }
+
+    pub fn protocol(&self) -> ModelUpstreamProtocol {
+        match self {
+            Self::OpenaiResponses { .. } => ModelUpstreamProtocol::OpenaiResponses,
+            Self::OpenaiChatCompletions { .. } => ModelUpstreamProtocol::OpenaiChatCompletions,
+            Self::AnthropicMessages { .. } => ModelUpstreamProtocol::AnthropicMessages,
+        }
+    }
+}
+
+impl Default for ModelRequestSettings {
+    fn default() -> Self {
+        Self::for_protocol(ModelUpstreamProtocol::OpenaiResponses)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentModelSettings {
+    pub reasoning_effort: ReasoningEffort,
+    pub reasoning_summary: ModelReasoningSummary,
+    pub verbosity: ModelVerbosity,
+    pub context_window_tokens: Option<u64>,
+    pub auto_compact_token_limit: Option<u64>,
+    pub reasoning_summary_support: ModelReasoningSummarySupport,
+    pub service_tier: Option<String>,
+    pub request_max_retries: Option<u32>,
+    pub stream_max_retries: Option<u32>,
+    pub stream_idle_timeout_ms: Option<u64>,
+    pub request_settings: ModelRequestSettings,
+}
+
+impl Default for AgentModelSettings {
+    fn default() -> Self {
+        Self {
+            reasoning_effort: ReasoningEffort::Default,
+            reasoning_summary: ModelReasoningSummary::Default,
+            verbosity: ModelVerbosity::Default,
+            context_window_tokens: None,
+            auto_compact_token_limit: None,
+            reasoning_summary_support: ModelReasoningSummarySupport::Auto,
+            service_tier: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            request_settings: ModelRequestSettings::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ModelSettingOverride<T> {
+    #[default]
+    Inherit,
+    Automatic,
+    Value(T),
+}
+
+impl<T> ModelSettingOverride<T> {
+    fn is_inherit(&self) -> bool {
+        matches!(self, Self::Inherit)
+    }
+}
+
+impl<T> Serialize for ModelSettingOverride<T>
+where
+    T: Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Inherit | Self::Automatic => serializer.serialize_none(),
+            Self::Value(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de, T> Deserialize<'de> for ModelSettingOverride<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match Option::<T>::deserialize(deserializer)? {
+            Some(value) => Self::Value(value),
+            None => Self::Automatic,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentModelSettingsOverride {
+    #[serde(skip_serializing_if = "ModelSettingOverride::is_inherit")]
+    pub reasoning_effort: ModelSettingOverride<ReasoningEffort>,
+    #[serde(skip_serializing_if = "ModelSettingOverride::is_inherit")]
+    pub reasoning_summary: ModelSettingOverride<ModelReasoningSummary>,
+    #[serde(skip_serializing_if = "ModelSettingOverride::is_inherit")]
+    pub verbosity: ModelSettingOverride<ModelVerbosity>,
+    #[serde(skip_serializing_if = "ModelSettingOverride::is_inherit")]
+    pub context_window_tokens: ModelSettingOverride<u64>,
+    #[serde(skip_serializing_if = "ModelSettingOverride::is_inherit")]
+    pub auto_compact_token_limit: ModelSettingOverride<u64>,
+    #[serde(skip_serializing_if = "ModelSettingOverride::is_inherit")]
+    pub reasoning_summary_support: ModelSettingOverride<ModelReasoningSummarySupport>,
+    #[serde(skip_serializing_if = "ModelSettingOverride::is_inherit")]
+    pub service_tier: ModelSettingOverride<String>,
+    #[serde(skip_serializing_if = "ModelSettingOverride::is_inherit")]
+    pub request_max_retries: ModelSettingOverride<u32>,
+    #[serde(skip_serializing_if = "ModelSettingOverride::is_inherit")]
+    pub stream_max_retries: ModelSettingOverride<u32>,
+    #[serde(skip_serializing_if = "ModelSettingOverride::is_inherit")]
+    pub stream_idle_timeout_ms: ModelSettingOverride<u64>,
+    #[serde(skip_serializing_if = "ModelSettingOverride::is_inherit")]
+    pub request_settings: ModelSettingOverride<ModelRequestSettings>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct SystemDefaultModelConnectionDto {
-    pub model_connection_id: Option<Uuid>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct SetSystemDefaultModelConnectionRequest {
-    pub model_connection_id: Option<Uuid>,
+pub struct RunModelBindingDto {
+    pub id: Uuid,
+    pub run_id: Uuid,
+    pub binding_key: String,
+    pub model_connection_id: Uuid,
+    pub connection_name_snapshot: String,
+    pub connection_scope_snapshot: ModelConnectionScope,
+    pub model_id: String,
+    pub api_type: ModelUpstreamProtocol,
+    pub model_settings: AgentModelSettings,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -534,8 +616,8 @@ pub struct ModelConnectionSnapshotDto {
     pub scope: ModelConnectionScope,
     pub name: String,
     pub model_id: String,
-    #[serde(default)]
-    pub upstream_protocol: ModelUpstreamProtocol,
+    pub api_type: ModelUpstreamProtocol,
+    pub request_settings: ModelRequestSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -652,9 +734,9 @@ pub struct CodexSubagentDefinition {
     pub description: String,
     pub developer_instructions: String,
     #[serde(default)]
-    pub model_connection_id: Option<Uuid>,
+    pub model_selection: Option<ModelSelectionDto>,
     #[serde(default)]
-    pub reasoning_effort: Option<ReasoningEffort>,
+    pub model_settings_override: AgentModelSettingsOverride,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -678,9 +760,9 @@ pub struct AgentDto {
     pub public_to: Vec<Uuid>,
     pub runtime_id: Option<Uuid>,
     #[serde(default)]
-    pub default_model_connection_id: Option<Uuid>,
+    pub model_selection: Option<ModelSelectionDto>,
     #[serde(default)]
-    pub reasoning_effort: ReasoningEffort,
+    pub model_settings: AgentModelSettings,
     #[serde(default)]
     pub codex_subagents: Vec<CodexSubagentDefinition>,
     pub model_policy: Value,
@@ -721,13 +803,13 @@ pub struct AgentExecutionConfigurationDto {
     pub revision: i64,
     pub instructions: String,
     #[serde(default)]
-    pub default_model_connection_id: Option<Uuid>,
+    pub model_selection: Option<ModelSelectionDto>,
     #[serde(default)]
-    pub reasoning_effort: ReasoningEffort,
+    pub model_settings: AgentModelSettings,
     #[serde(default)]
     pub codex_subagents: Vec<CodexSubagentDefinition>,
     #[serde(default)]
-    pub model_connections: Vec<ModelConnectionOptionDto>,
+    pub model_bindings: Vec<RunModelBindingDto>,
     pub model_policy: Value,
     pub sandbox_policy: Value,
     pub skills: Vec<AgentExecutionSkillDto>,
@@ -765,39 +847,59 @@ pub fn execution_configuration_fingerprint(
         ));
     }
 
-    let mut model_connection_ids = BTreeSet::new();
-    let mut model_connections = configuration.model_connections.clone();
-    for connection in &model_connections {
-        if !model_connection_ids.insert(connection.id) {
+    let mut binding_ids = BTreeSet::new();
+    let mut binding_keys = BTreeSet::new();
+    let mut model_bindings = configuration.model_bindings.clone();
+    for binding in &model_bindings {
+        let normalized_key = binding.binding_key.trim().to_lowercase();
+        if !binding_ids.insert(binding.id) || !binding_keys.insert(normalized_key) {
             return Err(ExecutionConfigurationError(
-                "Model Connection ids must be unique",
+                "Run Model Binding ids and keys must be unique",
             ));
         }
-        if connection.name.trim().is_empty() || connection.model_id.trim().is_empty() {
+        if binding.binding_key.trim().is_empty()
+            || binding.connection_name_snapshot.trim().is_empty()
+            || binding.model_id.trim().is_empty()
+            || binding.model_settings.request_settings.protocol() != binding.api_type
+        {
             return Err(ExecutionConfigurationError(
-                "Model Connection name and model id are required",
+                "Run Model Binding metadata and request settings are invalid",
             ));
         }
     }
-    if configuration
-        .default_model_connection_id
-        .is_some_and(|id| !model_connection_ids.contains(&id))
-    {
-        return Err(ExecutionConfigurationError(
-            "default Model Connection must be included in the execution configuration",
-        ));
-    }
-    model_connections.sort_by_key(|connection| connection.id);
-    let model_connection_metadata = model_connections
+    let main_binding = model_bindings
         .iter()
-        .map(|connection| {
+        .find(|binding| binding.binding_key.eq_ignore_ascii_case("main"));
+    match (&configuration.model_selection, main_binding) {
+        (None, None) => {}
+        (Some(selection), Some(binding))
+            if selection.connection_id == binding.model_connection_id
+                && selection.model_id == binding.model_id
+                && configuration.model_settings == binding.model_settings => {}
+        _ => {
+            return Err(ExecutionConfigurationError(
+                "main Run Model Binding must match the Agent model selection and settings",
+            ));
+        }
+    }
+    model_bindings.sort_by(|left, right| {
+        left.binding_key
+            .trim()
+            .to_lowercase()
+            .cmp(&right.binding_key.trim().to_lowercase())
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let model_binding_metadata = model_bindings
+        .iter()
+        .map(|binding| {
             json!({
-                "id": connection.id,
-                "name": connection.name,
-                "model_id": connection.model_id,
-                "parameters": connection.parameters,
-                "scope": connection.scope,
-                "status": connection.status,
+                "binding_key": binding.binding_key,
+                "model_connection_id": binding.model_connection_id,
+                "connection_name_snapshot": binding.connection_name_snapshot,
+                "connection_scope_snapshot": binding.connection_scope_snapshot,
+                "model_id": binding.model_id,
+                "api_type": binding.api_type,
+                "model_settings": binding.model_settings,
             })
         })
         .collect::<Vec<_>>();
@@ -814,7 +916,7 @@ pub fn execution_configuration_fingerprint(
                 "Codex Subagent name, description, and developer instructions are required",
             ));
         }
-        if !subagent_names.insert(normalized_name) {
+        if !subagent_names.insert(normalized_name.clone()) {
             return Err(ExecutionConfigurationError(
                 "Codex Subagent names must be unique ignoring case",
             ));
@@ -828,12 +930,13 @@ pub fn execution_configuration_fingerprint(
                 ));
             }
         }
-        if subagent
-            .model_connection_id
-            .is_some_and(|id| !model_connection_ids.contains(&id))
+        if subagent.enabled
+            && (subagent.model_selection.is_some()
+                || subagent.model_settings_override != AgentModelSettingsOverride::default())
+            && !binding_keys.contains(&normalized_name)
         {
             return Err(ExecutionConfigurationError(
-                "Codex Subagent Model Connection must be included in the execution configuration",
+                "Codex Subagent override must have a matching Run Model Binding",
             ));
         }
     }
@@ -891,10 +994,10 @@ pub fn execution_configuration_fingerprint(
     let value = json!({
         "revision": configuration.revision,
         "instructions": configuration.instructions,
-        "default_model_connection_id": configuration.default_model_connection_id,
-        "reasoning_effort": configuration.reasoning_effort,
+        "model_selection": configuration.model_selection,
+        "model_settings": configuration.model_settings,
         "codex_subagents": codex_subagents,
-        "model_connections": model_connection_metadata,
+        "model_bindings": model_binding_metadata,
         "model_policy": configuration.model_policy,
         "sandbox_policy": configuration.sandbox_policy,
         "skills": skill_metadata,
@@ -1324,9 +1427,9 @@ pub struct CreateAgentRequest {
     #[serde(default)]
     pub public_to: Vec<Uuid>,
     #[serde(default)]
-    pub default_model_connection_id: Option<Uuid>,
+    pub model_selection: Option<ModelSelectionDto>,
     #[serde(default)]
-    pub reasoning_effort: ReasoningEffort,
+    pub model_settings: Option<AgentModelSettings>,
     #[serde(default)]
     pub codex_subagents: Vec<CodexSubagentDefinition>,
 }
@@ -1345,9 +1448,9 @@ pub struct UpdateAgentRequest {
     pub public_to: Vec<Uuid>,
     pub runtime_id: Option<Uuid>,
     #[serde(default)]
-    pub default_model_connection_id: Option<Uuid>,
+    pub model_selection: Option<ModelSelectionDto>,
     #[serde(default)]
-    pub reasoning_effort: ReasoningEffort,
+    pub model_settings: AgentModelSettings,
     #[serde(default)]
     pub codex_subagents: Vec<CodexSubagentDefinition>,
     #[doc(hidden)]
@@ -1857,38 +1960,83 @@ mod tests {
     }
 
     #[test]
-    fn model_connection_parameters_are_backward_compatible_and_typed() {
+    fn allowed_model_ids_are_normalized_once_and_remain_case_sensitive() {
+        let normalized = normalize_allowed_model_ids(vec![
+            "  gpt-5.6  ".into(),
+            "GPT-5.6".into(),
+            "gpt-5.6".into(),
+            "\u{3000}model-two\u{3000}".into(),
+        ])
+        .unwrap();
+
+        assert_eq!(normalized, vec!["gpt-5.6", "GPT-5.6", "model-two"]);
+        assert!(normalize_allowed_model_ids(Vec::new()).is_err());
+        assert!(normalize_allowed_model_ids(vec![" \t ".into()]).is_err());
+        assert!(normalize_allowed_model_ids(vec!["bad\nmodel".into()]).is_err());
+        assert!(normalize_allowed_model_ids(vec!["x".repeat(256)]).is_err());
+        assert!(normalize_allowed_model_ids(
+            (0..257).map(|index| format!("model-{index}")).collect()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn model_api_connection_contract_owns_access_and_multiple_model_ids_only() {
         let create: CreateModelConnectionRequest = serde_json::from_value(json!({
             "scope": "personal",
-            "name": "Default Parameters",
+            "name": "Provider access",
             "base_url": "https://models.example.test",
-            "model_id": "gpt-test",
-            "api_key": "secret"
+            "api_type": "openai_chat_completions",
+            "allowed_model_ids": ["model-a", "model-b"],
+            "api_key": "write-only-secret"
         }))
         .unwrap();
-        assert_eq!(create.parameters, ModelConnectionParameters::default());
-        assert!(create.request_parameters.is_none());
+        assert_eq!(create.allowed_model_ids, vec!["model-a", "model-b"]);
+        assert_eq!(
+            create.api_type,
+            ModelUpstreamProtocol::OpenaiChatCompletions
+        );
 
-        let update: UpdateModelConnectionRequest = serde_json::from_value(json!({
-            "name": "Keep Parameters",
-            "base_url": "https://models.example.test",
-            "model_id": "gpt-test"
-        }))
-        .unwrap();
-        assert!(update.parameters.is_none());
-        assert!(update.request_parameters.is_none());
+        assert!(
+            serde_json::from_value::<CreateModelConnectionRequest>(json!({
+                "scope": "personal",
+                "name": "Legacy shape",
+                "base_url": "https://models.example.test",
+                "model_id": "model-a",
+                "parameters": {},
+                "api_key": "secret"
+            }))
+            .is_err()
+        );
 
-        let partial_update = serde_json::from_value::<UpdateModelConnectionRequest>(json!({
-            "name": "Reject Partial Parameters",
-            "base_url": "https://models.example.test",
-            "model_id": "gpt-test",
-            "parameters": {
-                "reasoning_summary": "none"
-            }
-        }));
-        assert!(partial_update.is_err());
+        let now = DateTime::parse_from_rfc3339("2026-07-22T08:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let dto = ModelConnectionDto {
+            id: Uuid::from_u128(101),
+            owner_id: Some(Uuid::from_u128(102)),
+            scope: ModelConnectionScope::Personal,
+            name: "Provider access".into(),
+            base_url: "https://models.example.test".into(),
+            api_type: ModelUpstreamProtocol::OpenaiChatCompletions,
+            allowed_model_ids: vec!["model-a".into(), "model-b".into()],
+            status: ModelConnectionStatus::Enabled,
+            has_api_key: true,
+            created_at: now,
+            updated_at: now,
+        };
+        let value = serde_json::to_value(dto).unwrap();
+        assert_eq!(value["allowed_model_ids"], json!(["model-a", "model-b"]));
+        assert_eq!(value["api_type"], "openai_chat_completions");
+        assert!(value.get("api_key").is_none());
+        assert!(value.get("model_id").is_none());
+        assert!(value.get("parameters").is_none());
+        assert!(value.get("request_parameters").is_none());
+    }
 
-        let parameters: ModelConnectionParameters = serde_json::from_value(json!({
+    #[test]
+    fn agent_model_settings_and_subagent_overrides_preserve_intent() {
+        let settings: AgentModelSettings = serde_json::from_value(json!({
             "reasoning_effort": "high",
             "reasoning_summary": "detailed",
             "verbosity": "low",
@@ -1898,320 +2046,87 @@ mod tests {
             "service_tier": "priority",
             "request_max_retries": 7,
             "stream_max_retries": 9,
-            "stream_idle_timeout_ms": 420000
-        }))
-        .unwrap();
-        assert_eq!(parameters.reasoning_effort, ReasoningEffort::High);
-        assert_eq!(
-            parameters.reasoning_summary,
-            ModelReasoningSummary::Detailed
-        );
-        assert_eq!(parameters.verbosity, ModelVerbosity::Low);
-        assert_eq!(parameters.context_window_tokens, Some(200_000));
-        assert_eq!(parameters.auto_compact_token_limit, Some(160_000));
-        assert_eq!(
-            parameters.reasoning_summary_support,
-            ModelReasoningSummarySupport::Supported
-        );
-        assert_eq!(parameters.service_tier.as_deref(), Some("priority"));
-        assert_eq!(parameters.request_max_retries, Some(7));
-        assert_eq!(parameters.stream_max_retries, Some(9));
-        assert_eq!(parameters.stream_idle_timeout_ms, Some(420_000));
-        assert_eq!(
-            serde_json::to_value(ModelConnectionParameters::default()).unwrap(),
-            json!({
-                "reasoning_effort": "default",
-                "reasoning_summary": "default",
-                "verbosity": "default",
-                "context_window_tokens": null,
-                "auto_compact_token_limit": null,
-                "reasoning_summary_support": "auto",
-                "service_tier": null,
-                "request_max_retries": null,
-                "stream_max_retries": null,
-                "stream_idle_timeout_ms": null
-            })
-        );
-    }
-
-    #[test]
-    fn model_connection_request_parameters_are_protocol_tagged() {
-        let responses: ModelConnectionRequestParameters = serde_json::from_value(json!({
-            "protocol": "openai_responses"
-        }))
-        .unwrap();
-        assert_eq!(
-            responses,
-            ModelConnectionRequestParameters::for_protocol(ModelUpstreamProtocol::OpenaiResponses)
-        );
-
-        let chat: ModelConnectionRequestParameters = serde_json::from_value(json!({
-            "protocol": "openai_chat_completions",
-            "temperature": 0.7,
-            "top_p": 0.9,
-            "max_completion_tokens": 4096
-        }))
-        .unwrap();
-        assert_eq!(
-            chat.protocol(),
-            ModelUpstreamProtocol::OpenaiChatCompletions
-        );
-        assert_eq!(
-            serde_json::to_value(&chat).unwrap(),
-            json!({
+            "stream_idle_timeout_ms": 420000,
+            "request_settings": {
                 "protocol": "openai_chat_completions",
                 "temperature": 0.7,
                 "top_p": 0.9,
                 "max_completion_tokens": 4096
-            })
+            }
+        }))
+        .unwrap();
+        assert_eq!(settings.reasoning_effort, ReasoningEffort::High);
+        assert_eq!(
+            settings.request_settings.protocol(),
+            ModelUpstreamProtocol::OpenaiChatCompletions
         );
 
-        let anthropic: ModelConnectionRequestParameters = serde_json::from_value(json!({
-            "protocol": "anthropic_messages",
-            "temperature": null,
-            "top_p": 0.8,
-            "max_tokens": 8192
+        let overrides: AgentModelSettingsOverride = serde_json::from_value(json!({
+            "reasoning_effort": "default",
+            "context_window_tokens": null,
+            "stream_max_retries": 4
         }))
         .unwrap();
         assert_eq!(
-            anthropic.protocol(),
-            ModelUpstreamProtocol::AnthropicMessages
+            overrides.reasoning_effort,
+            ModelSettingOverride::Value(ReasoningEffort::Default)
         );
-        assert!(
-            serde_json::from_value::<ModelConnectionRequestParameters>(json!({
-                "protocol": "openai_chat_completions",
-                "max_tokens": 1024
-            }))
-            .is_err()
+        assert_eq!(
+            overrides.context_window_tokens,
+            ModelSettingOverride::Automatic
+        );
+        assert_eq!(overrides.stream_max_retries, ModelSettingOverride::Value(4));
+        assert_eq!(overrides.verbosity, ModelSettingOverride::Inherit);
+        assert_eq!(
+            serde_json::to_value(overrides).unwrap(),
+            json!({
+                "reasoning_effort": "default",
+                "context_window_tokens": null,
+                "stream_max_retries": 4
+            })
         );
     }
 
     #[test]
-    fn model_connection_contracts_keep_api_keys_write_only() {
-        let connection_id = Uuid::from_u128(101);
-        let owner_id = Uuid::from_u128(102);
-        let now = DateTime::parse_from_rfc3339("2026-07-18T08:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-
-        let create: CreateModelConnectionRequest = serde_json::from_value(json!({
-            "scope": "personal",
-            "name": "Local Responses",
-            "base_url": "http://127.0.0.1:8080/provider",
-            "model_id": "gpt-test",
-            "api_key": "create-secret"
+    fn model_selection_system_default_and_run_binding_use_complete_pairs() {
+        let connection_id = Uuid::from_u128(201);
+        let run_id = Uuid::from_u128(202);
+        let selection: ModelSelectionDto = serde_json::from_value(json!({
+            "connection_id": connection_id,
+            "model_id": "model-a"
         }))
         .unwrap();
-        assert_eq!(create.scope, ModelConnectionScope::Personal);
-        assert_eq!(create.api_key, "create-secret");
-        assert_eq!(
-            create.upstream_protocol,
-            ModelUpstreamProtocol::OpenaiResponses
-        );
-
-        let update: UpdateModelConnectionRequest = serde_json::from_value(json!({
-            "name": "Updated Responses",
-            "base_url": "https://models.example.test",
-            "model_id": "gpt-updated"
-        }))
-        .unwrap();
-        assert!(update.api_key.is_none());
-        assert!(update.upstream_protocol.is_none());
-        assert!(serde_json::to_value(update)
-            .unwrap()
-            .get("api_key")
-            .is_none());
-
-        let anthropic_update: UpdateModelConnectionRequest = serde_json::from_value(json!({
-            "name": "Updated Anthropic",
-            "base_url": "https://models.example.test",
-            "model_id": "claude-test",
-            "upstream_protocol": "anthropic_messages"
-        }))
-        .unwrap();
-        assert_eq!(
-            anthropic_update.upstream_protocol,
-            Some(ModelUpstreamProtocol::AnthropicMessages)
-        );
-
-        let connection = ModelConnectionDto {
-            id: connection_id,
-            owner_id: Some(owner_id),
-            scope: ModelConnectionScope::Personal,
-            name: "Local Responses".into(),
-            base_url: "http://127.0.0.1:8080/provider".into(),
-            model_id: "gpt-test".into(),
-            upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
-            parameters: ModelConnectionParameters::default(),
-            request_parameters: ModelConnectionRequestParameters::default(),
-            status: ModelConnectionStatus::Enabled,
-            is_system_default: false,
-            created_at: now,
-            updated_at: now,
-        };
-        let read_value = serde_json::to_value(&connection).unwrap();
-        assert_eq!(read_value["scope"], "personal");
-        assert_eq!(read_value["status"], "enabled");
-        assert_eq!(read_value["upstream_protocol"], "openai_responses");
-        assert_eq!(read_value["parameters"]["reasoning_effort"], "default");
-        assert_eq!(
-            read_value["request_parameters"]["protocol"],
-            "openai_responses"
-        );
-        assert!(read_value.get("api_key").is_none());
-        assert!(serde_json::from_value::<ModelConnectionDto>(json!({
-            "id": connection_id,
-            "owner_id": owner_id,
-            "scope": "personal",
-            "name": "Local Responses",
-            "base_url": "http://127.0.0.1:8080/provider",
-            "model_id": "gpt-test",
-            "status": "enabled",
-            "is_system_default": false,
-            "created_at": now,
-            "updated_at": now,
-            "api_key": "leaked-secret"
+        assert_eq!(selection.model_id, "model-a");
+        assert!(serde_json::from_value::<ModelSelectionDto>(json!({
+            "connection_id": connection_id
         }))
         .is_err());
 
-        let public_responses = [
-            serde_json::to_value(ModelConnectionOptionsDto {
-                items: vec![ModelConnectionOptionDto {
-                    id: connection_id,
-                    name: "Local Responses".into(),
-                    model_id: "gpt-test".into(),
-                    upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
-                    parameters: ModelConnectionParameters::default(),
-                    request_parameters: ModelConnectionRequestParameters::default(),
-                    scope: ModelConnectionScope::Personal,
-                    status: ModelConnectionStatus::Enabled,
-                }],
-                system_default_model_connection_id: None,
-            })
-            .unwrap(),
-            serde_json::to_value(ModelConnectionTestResultDto {
-                success: true,
-                status_code: Some(200),
-                error_code: None,
-                message: None,
-            })
-            .unwrap(),
-            serde_json::to_value(SystemDefaultModelConnectionDto {
-                model_connection_id: Some(connection_id),
-            })
-            .unwrap(),
-        ];
-        for value in public_responses {
-            assert!(!value.to_string().contains("api_key"));
-            assert!(!value.to_string().contains("secret"));
-        }
-
+        let system_default = SystemDefaultModelSelectionDto {
+            selection: Some(selection.clone()),
+        };
         assert_eq!(
-            serde_json::to_value(UpdateModelConnectionStatusRequest {
-                status: ModelConnectionStatus::Disabled,
-            })
-            .unwrap(),
-            json!({ "status": "disabled" })
+            serde_json::to_value(system_default).unwrap(),
+            json!({ "selection": selection })
         );
-        assert_eq!(
-            serde_json::to_value(SetSystemDefaultModelConnectionRequest {
-                model_connection_id: None,
-            })
-            .unwrap(),
-            json!({ "model_connection_id": null })
-        );
-    }
 
-    #[test]
-    fn model_agent_mutations_use_typed_defaults_and_subagents() {
-        let connection_id = Uuid::from_u128(201);
-        let create: CreateAgentRequest = serde_json::from_value(json!({
-            "name": "Typed Agent",
-            "instructions": "Use the configured model",
-            "visibility": "private"
-        }))
-        .unwrap();
-        assert_eq!(create.default_model_connection_id, None);
-        assert_eq!(create.reasoning_effort, ReasoningEffort::Default);
-        assert!(create.codex_subagents.is_empty());
-
-        let update_value = json!({
-            "name": "Typed Agent",
-            "instructions": "Use the configured model",
-            "visibility": "private",
-            "public_to": [],
-            "runtime_id": null,
-            "default_model_connection_id": connection_id,
-            "reasoning_effort": "high",
-            "codex_subagents": [{
-                "name": "reviewer",
-                "description": "Reviews implementation changes",
-                "developer_instructions": "# Review\nCheck correctness first.",
-                "model_connection_id": null,
-                "reasoning_effort": "max"
-            }],
-            "sandbox_policy": {},
-            "managed_skill_ids": [],
-            "mcp_allowlist": []
-        });
-        let update: UpdateAgentRequest = serde_json::from_value(update_value.clone()).unwrap();
-        assert_eq!(update.default_model_connection_id, Some(connection_id));
-        assert_eq!(update.reasoning_effort, ReasoningEffort::High);
-        assert_eq!(update.codex_subagents[0].name, "reviewer");
-        assert_eq!(
-            update.codex_subagents[0].reasoning_effort,
-            Some(ReasoningEffort::Max)
-        );
-        assert!(update.codex_subagents[0].enabled);
-        assert_eq!(update.codex_subagents[0].disabled_reason, None);
-        assert_eq!(update.model_policy, json!({ "provider": "hub-proxy" }));
-        let serialized_update = serde_json::to_value(update).unwrap();
-        assert!(serialized_update.get("model_policy").is_none());
-        assert!(serialized_update["codex_subagents"][0]
-            .get("enabled")
-            .is_none());
-        assert!(serialized_update["codex_subagents"][0]
-            .get("disabled_reason")
-            .is_none());
-        assert!(serialized_update["codex_subagents"][0].get("id").is_none());
-
-        let disabled: CodexSubagentDefinition = serde_json::from_value(json!({
-            "name": "reviewer",
-            "description": "Reviews implementation changes",
-            "developer_instructions": "# Review\nCheck correctness first.",
-            "enabled": false,
-            "disabled_reason": "model_connection_deleted"
-        }))
-        .unwrap();
-        let serialized_disabled = serde_json::to_value(disabled).unwrap();
-        assert_eq!(serialized_disabled["enabled"], false);
-        assert_eq!(
-            serialized_disabled["disabled_reason"],
-            "model_connection_deleted"
-        );
-        assert!(serialized_disabled.get("id").is_none());
-
-        let mut legacy = update_value;
-        legacy["model_policy"] = json!({ "provider": "hub-proxy" });
-        assert!(serde_json::from_value::<UpdateAgentRequest>(legacy).is_err());
-    }
-
-    #[test]
-    fn model_execution_configuration_defaults_new_fields_for_legacy_json() {
-        let configuration: AgentExecutionConfigurationDto = serde_json::from_value(json!({
-            "revision": 1,
-            "instructions": "Legacy configuration",
-            "model_policy": {},
-            "sandbox_policy": {},
-            "skills": [],
-            "mcp_allowlist": []
-        }))
-        .unwrap();
-
-        assert_eq!(configuration.default_model_connection_id, None);
-        assert_eq!(configuration.reasoning_effort, ReasoningEffort::Default);
-        assert!(configuration.codex_subagents.is_empty());
-        assert!(configuration.model_connections.is_empty());
+        let binding = RunModelBindingDto {
+            id: Uuid::from_u128(203),
+            run_id,
+            binding_key: "main".into(),
+            model_connection_id: connection_id,
+            connection_name_snapshot: "Provider access".into(),
+            connection_scope_snapshot: ModelConnectionScope::Global,
+            model_id: "model-a".into(),
+            api_type: ModelUpstreamProtocol::OpenaiResponses,
+            model_settings: AgentModelSettings::default(),
+        };
+        let value = serde_json::to_value(binding).unwrap();
+        assert_eq!(value["id"], Uuid::from_u128(203).to_string());
+        assert_eq!(value["binding_key"], "main");
+        assert_eq!(value["model_id"], "model-a");
+        assert!(value.get("base_url").is_none());
+        assert!(value.get("api_key").is_none());
     }
 
     #[test]
@@ -2242,7 +2157,8 @@ mod tests {
             scope: ModelConnectionScope::Global,
             name: "Global Responses".into(),
             model_id: "gpt-test".into(),
-            upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
+            api_type: ModelUpstreamProtocol::OpenaiResponses,
+            request_settings: ModelRequestSettings::default(),
         };
         let agent = ModelAgentSnapshotDto {
             id: Some(agent_id),
@@ -2558,10 +2474,10 @@ mod tests {
         let configuration = AgentExecutionConfigurationDto {
             revision: 8,
             instructions: "Use the current managed Skills".into(),
-            default_model_connection_id: None,
-            reasoning_effort: ReasoningEffort::Default,
+            model_selection: None,
+            model_settings: AgentModelSettings::default(),
             codex_subagents: Vec::new(),
-            model_connections: Vec::new(),
+            model_bindings: Vec::new(),
             model_policy: json!({ "model": "gpt-test" }),
             sandbox_policy: json!({ "mode": "workspace-write" }),
             skills: vec![AgentExecutionSkillDto {
@@ -3098,244 +3014,86 @@ mod tests {
     }
 
     #[test]
-    fn execution_configuration_fingerprint_is_deterministic_complete_and_secret_safe() {
-        let managed = AgentExecutionSkillDto {
-            source: "managed".into(),
-            source_id: Some(Uuid::from_u128(11)),
-            name: "managed-review".into(),
-            description: "Review managed changes".into(),
-            content: "managed content".into(),
-            revision: 4,
-            content_checksum_sha256:
-                "0a10dad816a1435e3bd058fc127f7ad79cf8f73a589e9e9f534e7d17c2df4018".into(),
+    fn execution_configuration_fingerprint_uses_effective_run_bindings() {
+        let connection_id = Uuid::from_u128(20);
+        let run_id = Uuid::from_u128(21);
+        let selection = ModelSelectionDto {
+            connection_id,
+            model_id: "model-a".into(),
         };
-        let managed_docs = AgentExecutionSkillDto {
-            source: "managed".into(),
-            source_id: Some(Uuid::from_u128(12)),
-            name: "managed-docs".into(),
-            description: "Review documentation".into(),
-            content: "managed docs content".into(),
-            revision: 7,
-            content_checksum_sha256:
-                "22c40e1525f701e38d3cf62ae490a603c1af79dab5ebffa4d73a2d220e25cbdc".into(),
+        let main_settings = AgentModelSettings {
+            reasoning_effort: ReasoningEffort::High,
+            ..AgentModelSettings::default()
+        };
+        let mut reviewer_settings = main_settings.clone();
+        reviewer_settings.reasoning_effort = ReasoningEffort::Max;
+        let main_binding = RunModelBindingDto {
+            id: Uuid::from_u128(22),
+            run_id,
+            binding_key: "main".into(),
+            model_connection_id: connection_id,
+            connection_name_snapshot: "Provider".into(),
+            connection_scope_snapshot: ModelConnectionScope::Global,
+            model_id: "model-a".into(),
+            api_type: ModelUpstreamProtocol::OpenaiResponses,
+            model_settings: main_settings.clone(),
+        };
+        let reviewer_binding = RunModelBindingDto {
+            id: Uuid::from_u128(23),
+            run_id,
+            binding_key: "reviewer".into(),
+            model_settings: reviewer_settings,
+            ..main_binding.clone()
         };
         let configuration = AgentExecutionConfigurationDto {
-            revision: 7,
-            instructions: "Follow repository guidance".into(),
-            default_model_connection_id: Some(Uuid::from_u128(21)),
-            reasoning_effort: ReasoningEffort::High,
-            codex_subagents: vec![
-                CodexSubagentDefinition {
-                    name: "reviewer".into(),
-                    description: "Reviews implementation changes".into(),
-                    developer_instructions: "# Review\n\nCheck correctness first.".into(),
-                    model_connection_id: Some(Uuid::from_u128(22)),
-                    reasoning_effort: Some(ReasoningEffort::Max),
-                    enabled: true,
-                    disabled_reason: None,
+            revision: 3,
+            instructions: "Use the configured model".into(),
+            model_selection: Some(selection),
+            model_settings: main_settings,
+            codex_subagents: vec![CodexSubagentDefinition {
+                name: "reviewer".into(),
+                description: "Reviews changes".into(),
+                developer_instructions: "# Review".into(),
+                model_selection: None,
+                model_settings_override: AgentModelSettingsOverride {
+                    reasoning_effort: ModelSettingOverride::Value(ReasoningEffort::Max),
+                    ..AgentModelSettingsOverride::default()
                 },
-                CodexSubagentDefinition {
-                    name: "researcher".into(),
-                    description: "Researches primary sources".into(),
-                    developer_instructions: "# Research\n\nCite sources.".into(),
-                    model_connection_id: None,
-                    reasoning_effort: None,
-                    enabled: false,
-                    disabled_reason: Some("model_connection_deleted".into()),
-                },
-            ],
-            model_connections: vec![
-                ModelConnectionOptionDto {
-                    id: Uuid::from_u128(21),
-                    name: "Agent Default".into(),
-                    model_id: "gpt-test".into(),
-                    upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
-                    parameters: ModelConnectionParameters::default(),
-                    request_parameters: ModelConnectionRequestParameters::default(),
-                    scope: ModelConnectionScope::Personal,
-                    status: ModelConnectionStatus::Enabled,
-                },
-                ModelConnectionOptionDto {
-                    id: Uuid::from_u128(22),
-                    name: "Reviewer Override".into(),
-                    model_id: "gpt-review".into(),
-                    upstream_protocol: ModelUpstreamProtocol::AnthropicMessages,
-                    parameters: ModelConnectionParameters {
-                        verbosity: ModelVerbosity::High,
-                        context_window_tokens: Some(200_000),
-                        ..ModelConnectionParameters::default()
-                    },
-                    request_parameters: ModelConnectionRequestParameters::for_protocol(
-                        ModelUpstreamProtocol::AnthropicMessages,
-                    ),
-                    scope: ModelConnectionScope::Global,
-                    status: ModelConnectionStatus::Enabled,
-                },
-            ],
-            model_policy: json!({ "provider": "hub-proxy", "model": "gpt-test" }),
-            sandbox_policy: json!({ "network_access": false, "mode": "workspace-write" }),
-            skills: vec![managed.clone(), managed_docs.clone()],
-            mcp_allowlist: json!([
-                { "name": "github", "command": "gh-mcp", "secrets": { "TOKEN": "secret-a" } },
-                { "name": "files", "command": "fs-mcp", "args": ["--root", "."] }
-            ]),
+                enabled: true,
+                disabled_reason: None,
+            }],
+            model_bindings: vec![main_binding, reviewer_binding],
+            model_policy: json!({ "provider": "hub-proxy" }),
+            sandbox_policy: json!({ "mode": "workspace-write" }),
+            skills: Vec::new(),
+            mcp_allowlist: json!([{
+                "name": "repo",
+                "secrets": { "TOKEN": "first-secret" }
+            }]),
         };
-        let fingerprint = execution_configuration_fingerprint(&configuration).unwrap();
 
+        let fingerprint = execution_configuration_fingerprint(&configuration).unwrap();
         let mut reordered = configuration.clone();
-        reordered.skills = vec![managed_docs, managed];
-        reordered.mcp_allowlist.as_array_mut().unwrap().reverse();
-        reordered.codex_subagents.reverse();
-        reordered.model_connections.reverse();
+        reordered.model_bindings.reverse();
+        reordered.model_bindings[0].id = Uuid::from_u128(30);
+        reordered.model_bindings[0].run_id = Uuid::from_u128(31);
+        reordered.mcp_allowlist[0]["secrets"]["TOKEN"] = json!("second-secret");
         assert_eq!(
             execution_configuration_fingerprint(&reordered).unwrap(),
             fingerprint
         );
 
-        let mut shared_skill_edit = configuration.clone();
-        shared_skill_edit.skills[0].revision += 1;
+        let mut changed = configuration.clone();
+        changed.model_settings.reasoning_effort = ReasoningEffort::Ultra;
+        changed.model_bindings[0].model_settings.reasoning_effort = ReasoningEffort::Ultra;
         assert_ne!(
-            execution_configuration_fingerprint(&shared_skill_edit).unwrap(),
+            execution_configuration_fingerprint(&changed).unwrap(),
             fingerprint
         );
 
-        let mut model_id_edit = configuration.clone();
-        model_id_edit.model_connections[0].model_id = "gpt-test-v2".into();
-        assert_ne!(
-            execution_configuration_fingerprint(&model_id_edit).unwrap(),
-            fingerprint
-        );
-
-        let mut model_parameter_edit = configuration.clone();
-        model_parameter_edit.model_connections[0]
-            .parameters
-            .reasoning_summary = ModelReasoningSummary::Concise;
-        assert_ne!(
-            execution_configuration_fingerprint(&model_parameter_edit).unwrap(),
-            fingerprint
-        );
-
-        let mut reasoning_edit = configuration.clone();
-        reasoning_edit.reasoning_effort = ReasoningEffort::Ultra;
-        assert_ne!(
-            execution_configuration_fingerprint(&reasoning_edit).unwrap(),
-            fingerprint
-        );
-
-        let mut subagent_edit = configuration.clone();
-        subagent_edit.codex_subagents[0].developer_instructions =
-            "# Review\n\nCheck correctness and security.".into();
-        assert_ne!(
-            execution_configuration_fingerprint(&subagent_edit).unwrap(),
-            fingerprint
-        );
-
-        let mut secret_only_without_revision = configuration.clone();
-        secret_only_without_revision.mcp_allowlist[0]["secrets"]["TOKEN"] = json!("guessable");
-        assert_eq!(
-            execution_configuration_fingerprint(&secret_only_without_revision).unwrap(),
-            fingerprint
-        );
-        secret_only_without_revision.revision += 1;
-        assert_ne!(
-            execution_configuration_fingerprint(&secret_only_without_revision).unwrap(),
-            fingerprint
-        );
-    }
-
-    #[test]
-    fn execution_configuration_rejects_invalid_model_references_and_subagents() {
-        let connection_id = Uuid::from_u128(31);
-        let configuration = AgentExecutionConfigurationDto {
-            revision: 1,
-            instructions: "Use typed model configuration".into(),
-            default_model_connection_id: Some(connection_id),
-            reasoning_effort: ReasoningEffort::Medium,
-            codex_subagents: vec![CodexSubagentDefinition {
-                name: "reviewer".into(),
-                description: "Reviews implementation changes".into(),
-                developer_instructions: "# Review\n\nCheck correctness first.".into(),
-                model_connection_id: Some(connection_id),
-                reasoning_effort: None,
-                enabled: true,
-                disabled_reason: None,
-            }],
-            model_connections: vec![ModelConnectionOptionDto {
-                id: connection_id,
-                name: "Agent Default".into(),
-                model_id: "gpt-test".into(),
-                upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
-                parameters: ModelConnectionParameters::default(),
-                request_parameters: ModelConnectionRequestParameters::default(),
-                scope: ModelConnectionScope::Personal,
-                status: ModelConnectionStatus::Enabled,
-            }],
-            model_policy: json!({ "provider": "hub-proxy" }),
-            sandbox_policy: json!({}),
-            skills: Vec::new(),
-            mcp_allowlist: json!([]),
-        };
-        assert!(execution_configuration_fingerprint(&configuration).is_ok());
-
-        let mut duplicate_connection = configuration.clone();
-        duplicate_connection
-            .model_connections
-            .push(duplicate_connection.model_connections[0].clone());
-        assert!(execution_configuration_fingerprint(&duplicate_connection).is_err());
-
-        let mut empty_connection_name = configuration.clone();
-        empty_connection_name.model_connections[0].name = "  ".into();
-        assert!(execution_configuration_fingerprint(&empty_connection_name).is_err());
-
-        let mut empty_model_id = configuration.clone();
-        empty_model_id.model_connections[0].model_id = String::new();
-        assert!(execution_configuration_fingerprint(&empty_model_id).is_err());
-
-        let mut missing_default = configuration.clone();
-        missing_default.default_model_connection_id = Some(Uuid::from_u128(32));
-        assert!(execution_configuration_fingerprint(&missing_default).is_err());
-
-        let mut missing_override = configuration.clone();
-        missing_override.codex_subagents[0].model_connection_id = Some(Uuid::from_u128(32));
-        assert!(execution_configuration_fingerprint(&missing_override).is_err());
-
-        let mut duplicate_subagent = configuration.clone();
-        let mut duplicate = duplicate_subagent.codex_subagents[0].clone();
-        duplicate.name = " REVIEWER ".into();
-        duplicate_subagent.codex_subagents.push(duplicate);
-        assert!(execution_configuration_fingerprint(&duplicate_subagent).is_err());
-
-        let mut empty_subagent_name = configuration.clone();
-        empty_subagent_name.codex_subagents[0].name = " ".into();
-        assert!(execution_configuration_fingerprint(&empty_subagent_name).is_err());
-
-        let mut empty_description = configuration.clone();
-        empty_description.codex_subagents[0].description = " ".into();
-        assert!(execution_configuration_fingerprint(&empty_description).is_err());
-
-        let mut empty_instructions = configuration.clone();
-        empty_instructions.codex_subagents[0].developer_instructions = String::new();
-        assert!(execution_configuration_fingerprint(&empty_instructions).is_err());
-
-        let mut enabled_with_reason = configuration.clone();
-        enabled_with_reason.codex_subagents[0].disabled_reason = Some("unexpected".into());
-        assert!(execution_configuration_fingerprint(&enabled_with_reason).is_err());
-
-        let mut disabled_without_reason = configuration.clone();
-        disabled_without_reason.codex_subagents[0].enabled = false;
-        assert!(execution_configuration_fingerprint(&disabled_without_reason).is_err());
-
-        let mut disabled_with_empty_reason = configuration.clone();
-        disabled_with_empty_reason.codex_subagents[0].enabled = false;
-        disabled_with_empty_reason.codex_subagents[0].disabled_reason = Some(" ".into());
-        assert!(execution_configuration_fingerprint(&disabled_with_empty_reason).is_err());
-
-        let mut disabled_without_override = configuration;
-        disabled_without_override.codex_subagents[0].enabled = false;
-        disabled_without_override.codex_subagents[0].disabled_reason =
-            Some("model_connection_deleted".into());
-        disabled_without_override.codex_subagents[0].model_connection_id = None;
-        assert!(execution_configuration_fingerprint(&disabled_without_override).is_ok());
+        let mut missing_main = configuration;
+        missing_main.model_bindings.remove(0);
+        assert!(execution_configuration_fingerprint(&missing_main).is_err());
     }
 
     #[test]
@@ -3344,10 +3102,10 @@ mod tests {
         let configuration = AgentExecutionConfigurationDto {
             revision: 1,
             instructions: String::new(),
-            default_model_connection_id: None,
-            reasoning_effort: ReasoningEffort::Default,
+            model_selection: None,
+            model_settings: AgentModelSettings::default(),
             codex_subagents: Vec::new(),
-            model_connections: Vec::new(),
+            model_bindings: Vec::new(),
             model_policy: json!({}),
             sandbox_policy: json!({}),
             skills: vec![AgentExecutionSkillDto {

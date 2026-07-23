@@ -1,12 +1,20 @@
-import { ArrowDown, ArrowUp, Bot, Pencil, Plus, Save, Search, Send, Trash2 } from 'lucide-react';
+import { ArrowDown, ArrowUp, Bot, Pencil, Plus, Save, Search, Trash2 } from 'lucide-react';
 import { ComponentType, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Agent,
   api,
   ApiError,
+  type AgentModelSettings,
+  type AgentModelSettingsOverride,
   type CodexSubagentDefinition,
   type ModelConnectionOption,
   type ModelConnectionOptions,
+  type ModelReasoningSummary,
+  type ModelReasoningSummarySupport,
+  type ModelRequestSettings,
+  type ModelSelection,
+  type ModelUpstreamProtocol,
+  type ModelVerbosity,
   type ReasoningEffort,
   Run,
   Runtime,
@@ -93,35 +101,229 @@ const reasoningEfforts: ReasoningEffort[] = [
   'ultra'
 ];
 
-function reasoningEffortLabel(value: ReasoningEffort, t: ReturnType<typeof useI18n>['t']) {
-  const keys = {
-    default: 'reasoningDefault',
-    none: 'reasoningNone',
-    minimal: 'reasoningMinimal',
-    low: 'reasoningLow',
-    medium: 'reasoningMedium',
-    high: 'reasoningHigh',
-    xhigh: 'reasoningXhigh',
-    max: 'reasoningMax',
-    ultra: 'reasoningUltra'
-  } as const;
-  return t(keys[value]);
+const reasoningSummaries: ModelReasoningSummary[] = ['default', 'auto', 'concise', 'detailed', 'none'];
+const verbosities: ModelVerbosity[] = ['default', 'low', 'medium', 'high'];
+const summarySupports: ModelReasoningSummarySupport[] = ['auto', 'supported', 'unsupported'];
+
+const automaticAgentModelSettings: AgentModelSettings = {
+  reasoning_effort: 'default',
+  reasoning_summary: 'default',
+  verbosity: 'default',
+  context_window_tokens: null,
+  auto_compact_token_limit: null,
+  reasoning_summary_support: 'auto',
+  service_tier: null,
+  request_max_retries: null,
+  stream_max_retries: null,
+  stream_idle_timeout_ms: null,
+  request_settings: { protocol: 'openai_responses' }
+};
+
+function requestSettingsFor(apiType: ModelUpstreamProtocol): ModelRequestSettings {
+  if (apiType === 'openai_chat_completions') {
+    return { protocol: apiType, temperature: null, top_p: null, max_completion_tokens: null };
+  }
+  if (apiType === 'anthropic_messages') {
+    return { protocol: apiType, temperature: null, top_p: null, max_tokens: null };
+  }
+  return { protocol: apiType };
+}
+
+function selectedOption(selection: ModelSelection | null, options: ModelConnectionOption[]) {
+  if (!selection) return undefined;
+  return options.find((option) => option.connection_id === selection.connection_id && option.model_id === selection.model_id);
+}
+
+function selectionValue(selection: ModelSelection | null) {
+  return selection ? `${selection.connection_id}\n${selection.model_id}` : '';
+}
+
+function selectionFromValue(value: string, options: ModelConnectionOption[]) {
+  const option = options.find((candidate) => `${candidate.connection_id}\n${candidate.model_id}` === value);
+  return option ? { connection_id: option.connection_id, model_id: option.model_id } : null;
+}
+
+function settingsForSelection(settings: AgentModelSettings, selection: ModelSelection | null, options: ModelConnectionOption[]) {
+  const apiType = selectedOption(selection, options)?.api_type ?? 'openai_responses';
+  return settings.request_settings.protocol === apiType
+    ? settings
+    : { ...settings, request_settings: requestSettingsFor(apiType) };
+}
+
+function optionalNumber(value: string) {
+  return value.trim() ? Number(value) : null;
 }
 
 function modelOptionLabel(option: ModelConnectionOption, t: ReturnType<typeof useI18n>['t']) {
   const scope = option.scope === 'global' ? t('modelScopeGlobal') : t('modelScopePersonal');
   const status = option.status === 'disabled' ? ` · ${t('disabled')}` : '';
-  return `${option.name} · ${option.model_id} · ${scope}${status}`;
+  return `${option.connection_name} · ${option.model_id} · ${scope}${status}`;
 }
 
 function modelName(
-  modelConnectionId: string | null,
+  selection: ModelSelection | null,
   options: ModelConnectionOption[],
   fallback: string
 ) {
-  if (!modelConnectionId) return fallback;
-  const option = options.find((candidate) => candidate.id === modelConnectionId);
-  return option ? `${option.name} · ${option.model_id}` : fallback;
+  if (!selection) return fallback;
+  const option = selectedOption(selection, options);
+  return option ? `${option.connection_name} · ${option.model_id}` : `${selection.connection_id} · ${selection.model_id}`;
+}
+
+function settingValue(value: unknown, t: ReturnType<typeof useI18n>['t']) {
+  if (value === null || value === undefined) return t('modelParameterAutomatic');
+  if (typeof value === 'object') return JSON.stringify(value);
+  return String(value);
+}
+
+function AgentModelSettingsFields({
+  settings,
+  apiType,
+  disabled,
+  onChange
+}: {
+  settings: AgentModelSettings;
+  apiType: ModelUpstreamProtocol;
+  disabled: boolean;
+  onChange: (settings: AgentModelSettings) => void;
+}) {
+  const { t } = useI18n();
+  const requestSettings = settings.request_settings.protocol === apiType
+    ? settings.request_settings
+    : requestSettingsFor(apiType);
+  const update = <K extends keyof AgentModelSettings>(key: K, value: AgentModelSettings[K]) => onChange({ ...settings, [key]: value });
+  const updateRequest = (value: ModelRequestSettings) => onChange({ ...settings, request_settings: value });
+  const source = (value: unknown) => <small className="agent-setting-effective">{t('effectiveValue')}: {settingValue(value, t)} · {value === null || value === 'default' || value === 'auto' ? t('sourceAutomatic') : t('sourceAgent')}</small>;
+
+  return <div className="agent-model-settings">
+    <fieldset><legend>{t('modelParameterGenerationGroup')}</legend><div className="agent-model-setting-grid">
+      <label>{t('reasoningEffort')}<select disabled={disabled} value={settings.reasoning_effort} onChange={(event) => update('reasoning_effort', event.target.value as ReasoningEffort)}>{reasoningEfforts.map((value) => <option key={value} value={value}>{value}</option>)}</select>{source(settings.reasoning_effort)}</label>
+      <label>{t('reasoningSummary')}<select disabled={disabled} value={settings.reasoning_summary} onChange={(event) => update('reasoning_summary', event.target.value as ModelReasoningSummary)}>{reasoningSummaries.map((value) => <option key={value} value={value}>{value}</option>)}</select>{source(settings.reasoning_summary)}</label>
+      <label>{t('verbosity')}<select disabled={disabled} value={settings.verbosity} onChange={(event) => update('verbosity', event.target.value as ModelVerbosity)}>{verbosities.map((value) => <option key={value} value={value}>{value}</option>)}</select>{source(settings.verbosity)}</label>
+      <label>{t('reasoningSummarySupport')}<select disabled={disabled} value={settings.reasoning_summary_support} onChange={(event) => update('reasoning_summary_support', event.target.value as ModelReasoningSummarySupport)}>{summarySupports.map((value) => <option key={value} value={value}>{value}</option>)}</select>{source(settings.reasoning_summary_support)}</label>
+      <label>{t('serviceTier')}<input disabled={disabled} maxLength={64} value={settings.service_tier ?? ''} placeholder={t('modelParameterAutomatic')} onChange={(event) => update('service_tier', event.target.value || null)} />{source(settings.service_tier)}</label>
+    </div></fieldset>
+    <fieldset><legend>{t('modelParameterContextGroup')}</legend><div className="agent-model-setting-grid">
+      <label>{t('contextWindowTokens')}<input disabled={disabled} type="number" min={1} step={1} value={settings.context_window_tokens ?? ''} placeholder={t('modelParameterAutomatic')} onChange={(event) => update('context_window_tokens', optionalNumber(event.target.value))} />{source(settings.context_window_tokens)}</label>
+      <label>{t('autoCompactTokenLimit')}<input disabled={disabled} type="number" min={1} max={settings.context_window_tokens ?? undefined} step={1} value={settings.auto_compact_token_limit ?? ''} placeholder={t('modelParameterAutomatic')} onChange={(event) => update('auto_compact_token_limit', optionalNumber(event.target.value))} />{source(settings.auto_compact_token_limit)}</label>
+    </div></fieldset>
+    <fieldset><legend>{t('modelParameterReliabilityGroup')}</legend><div className="agent-model-setting-grid">
+      <label>{t('requestMaxRetries')}<input disabled={disabled} type="number" min={0} max={100} step={1} value={settings.request_max_retries ?? ''} placeholder={t('modelParameterAutomatic')} onChange={(event) => update('request_max_retries', optionalNumber(event.target.value))} />{source(settings.request_max_retries)}</label>
+      <label>{t('streamMaxRetries')}<input disabled={disabled} type="number" min={0} max={100} step={1} value={settings.stream_max_retries ?? ''} placeholder={t('modelParameterAutomatic')} onChange={(event) => update('stream_max_retries', optionalNumber(event.target.value))} />{source(settings.stream_max_retries)}</label>
+      <label>{t('streamIdleTimeoutMs')}<input disabled={disabled} type="number" min={1} step={1} value={settings.stream_idle_timeout_ms ?? ''} placeholder={t('modelParameterAutomatic')} onChange={(event) => update('stream_idle_timeout_ms', optionalNumber(event.target.value))} />{source(settings.stream_idle_timeout_ms)}</label>
+    </div></fieldset>
+    <fieldset><legend>{t('modelRequestParametersGroup')} · <code>{apiType}</code></legend>
+      {apiType === 'openai_responses' ? <p className="agent-setting-note">{t('responsesRequestSettingsAutomatic')}</p> : <div className="agent-model-setting-grid">
+        <label><code>temperature</code><input aria-label="temperature" disabled={disabled} type="number" min={0} max={apiType === 'anthropic_messages' ? 1 : 2} step="any" value={'temperature' in requestSettings ? requestSettings.temperature ?? '' : ''} onChange={(event) => {
+          if (!('temperature' in requestSettings)) return;
+          updateRequest({ ...requestSettings, temperature: optionalNumber(event.target.value), ...(apiType === 'anthropic_messages' && event.target.value ? { top_p: null } : {}) });
+        }} />{source('temperature' in requestSettings ? requestSettings.temperature : null)}</label>
+        <label><code>top_p</code><input aria-label="top_p" disabled={disabled} type="number" min={0} max={1} step="any" value={'top_p' in requestSettings ? requestSettings.top_p ?? '' : ''} onChange={(event) => {
+          if (!('top_p' in requestSettings)) return;
+          updateRequest({ ...requestSettings, top_p: optionalNumber(event.target.value), ...(apiType === 'anthropic_messages' && event.target.value ? { temperature: null } : {}) });
+        }} />{source('top_p' in requestSettings ? requestSettings.top_p : null)}</label>
+        {apiType === 'openai_chat_completions' && requestSettings.protocol === apiType && <label><code>max_completion_tokens</code><input aria-label="max_completion_tokens" disabled={disabled} type="number" min={1} step={1} value={requestSettings.max_completion_tokens ?? ''} onChange={(event) => updateRequest({ ...requestSettings, max_completion_tokens: optionalNumber(event.target.value) })} />{source(requestSettings.max_completion_tokens)}</label>}
+        {apiType === 'anthropic_messages' && requestSettings.protocol === apiType && <label><code>max_tokens</code><input aria-label="max_tokens" disabled={disabled} type="number" min={1} step={1} value={requestSettings.max_tokens ?? ''} onChange={(event) => updateRequest({ ...requestSettings, max_tokens: optionalNumber(event.target.value) })} />{source(requestSettings.max_tokens)}</label>}
+      </div>}
+    </fieldset>
+  </div>;
+}
+
+type OverrideKey = Exclude<keyof AgentModelSettingsOverride, 'request_settings'>;
+
+function overrideMode(overrides: AgentModelSettingsOverride, key: keyof AgentModelSettingsOverride) {
+  return Object.hasOwn(overrides, key) ? overrides[key] === null ? 'automatic' : 'override' : 'inherit';
+}
+
+function changeOverrideMode(
+  overrides: AgentModelSettingsOverride,
+  key: keyof AgentModelSettingsOverride,
+  mode: string,
+  fallback: unknown
+) {
+  if (mode === 'inherit') {
+    const next = { ...overrides };
+    delete next[key];
+    return next;
+  }
+  return { ...overrides, [key]: mode === 'automatic' ? null : fallback };
+}
+
+function effectiveOverrideValue(
+  overrides: AgentModelSettingsOverride,
+  parent: AgentModelSettings,
+  key: OverrideKey
+) {
+  const mode = overrideMode(overrides, key);
+  if (mode === 'inherit') return { value: parent[key], source: 'sourceAgent' as const };
+  if (mode === 'automatic') return { value: automaticAgentModelSettings[key], source: 'sourceAutomatic' as const };
+  return { value: overrides[key], source: 'sourceSubagent' as const };
+}
+
+function SubagentModelSettingsFields({
+  overrides,
+  parent,
+  apiType,
+  protocolChanged,
+  disabled,
+  onChange
+}: {
+  overrides: AgentModelSettingsOverride;
+  parent: AgentModelSettings;
+  apiType: ModelUpstreamProtocol;
+  protocolChanged: boolean;
+  disabled: boolean;
+  onChange: (overrides: AgentModelSettingsOverride) => void;
+}) {
+  const { t } = useI18n();
+  const setValue = (key: OverrideKey, value: unknown) => onChange({ ...overrides, [key]: value });
+  const source = (key: OverrideKey) => {
+    const effective = effectiveOverrideValue(overrides, parent, key);
+    return <small className="agent-setting-effective">{t('effectiveValue')}: {settingValue(effective.value, t)} · {t(effective.source)}</small>;
+  };
+  const modeSelect = (key: OverrideKey, label: string, fallback: unknown) => <select className="agent-override-mode" aria-label={`${label} ${t('overrideMode')}`} disabled={disabled} value={overrideMode(overrides, key)} onChange={(event) => onChange(changeOverrideMode(overrides, key, event.target.value, fallback))}><option value="inherit">{t('inheritAgentSetting')}</option><option value="automatic">{t('modelParameterAutomatic')}</option><option value="override">{t('overrideValue')}</option></select>;
+  const enumField = <T extends string>(key: OverrideKey, label: string, values: T[], fallback: T) => <label>{label}<span className="agent-override-controls">{modeSelect(key, label, fallback)}{overrideMode(overrides, key) === 'override' && <select disabled={disabled} value={String(overrides[key] ?? fallback)} onChange={(event) => setValue(key, event.target.value)}>{values.map((value) => <option key={value} value={value}>{value}</option>)}</select>}</span>{source(key)}</label>;
+  const numberField = (key: OverrideKey, label: string, min: number, max?: number) => <label>{label}<span className="agent-override-controls">{modeSelect(key, label, min)}{overrideMode(overrides, key) === 'override' && <input disabled={disabled} type="number" min={min} max={max} step={1} value={String(overrides[key] ?? min)} onChange={(event) => setValue(key, Number(event.target.value))} />}</span>{source(key)}</label>;
+  const requestMode = overrideMode(overrides, 'request_settings');
+  const parentRequest = parent.request_settings.protocol === apiType ? parent.request_settings : requestSettingsFor(apiType);
+  const effectiveRequest = requestMode === 'override' && overrides.request_settings
+    ? overrides.request_settings
+    : requestMode === 'inherit' && !protocolChanged ? parentRequest : requestSettingsFor(apiType);
+  const requestSource = requestMode === 'override' ? t('sourceSubagent') : requestMode === 'inherit' && !protocolChanged ? t('sourceAgent') : t('sourceAutomatic');
+
+  return <div className="agent-model-settings agent-subagent-settings">
+    <fieldset><legend>{t('modelParameterGenerationGroup')}</legend><div className="agent-model-setting-grid">
+      {enumField('reasoning_effort', t('reasoningEffort'), reasoningEfforts, parent.reasoning_effort)}
+      {enumField('reasoning_summary', t('reasoningSummary'), reasoningSummaries, parent.reasoning_summary)}
+      {enumField('verbosity', t('verbosity'), verbosities, parent.verbosity)}
+      {enumField('reasoning_summary_support', t('reasoningSummarySupport'), summarySupports, parent.reasoning_summary_support)}
+      <label>{t('serviceTier')}<span className="agent-override-controls">{modeSelect('service_tier', t('serviceTier'), parent.service_tier ?? 'default')}{overrideMode(overrides, 'service_tier') === 'override' && <input disabled={disabled} maxLength={64} value={String(overrides.service_tier ?? '')} onChange={(event) => setValue('service_tier', event.target.value)} />}</span>{source('service_tier')}</label>
+    </div></fieldset>
+    <fieldset><legend>{t('modelParameterContextGroup')}</legend><div className="agent-model-setting-grid">
+      {numberField('context_window_tokens', t('contextWindowTokens'), 1)}
+      {numberField('auto_compact_token_limit', t('autoCompactTokenLimit'), 1)}
+    </div></fieldset>
+    <fieldset><legend>{t('modelParameterReliabilityGroup')}</legend><div className="agent-model-setting-grid">
+      {numberField('request_max_retries', t('requestMaxRetries'), 0, 100)}
+      {numberField('stream_max_retries', t('streamMaxRetries'), 0, 100)}
+      {numberField('stream_idle_timeout_ms', t('streamIdleTimeoutMs'), 1)}
+    </div></fieldset>
+    <fieldset><legend>{t('modelRequestParametersGroup')} · <code>{apiType}</code></legend>
+      <label>{t('overrideMode')}<select disabled={disabled} value={requestMode} onChange={(event) => onChange(changeOverrideMode(overrides, 'request_settings', event.target.value, requestSettingsFor(apiType)))}><option value="inherit">{t('inheritAgentSetting')}</option><option value="automatic">{t('modelParameterAutomatic')}</option><option value="override">{t('overrideValue')}</option></select><small className="agent-setting-effective">{t('effectiveValue')}: {settingValue(effectiveRequest, t)} · {requestSource}</small></label>
+      {requestMode === 'override' && (apiType === 'openai_responses' ? <p className="agent-setting-note">{t('responsesRequestSettingsAutomatic')}</p> : <div className="agent-model-setting-grid">
+        <label><code>temperature</code><input aria-label="temperature" disabled={disabled} type="number" min={0} max={apiType === 'anthropic_messages' ? 1 : 2} step="any" value={'temperature' in effectiveRequest ? effectiveRequest.temperature ?? '' : ''} onChange={(event) => {
+          if (!('temperature' in effectiveRequest)) return;
+          onChange({ ...overrides, request_settings: { ...effectiveRequest, temperature: optionalNumber(event.target.value), ...(apiType === 'anthropic_messages' && event.target.value ? { top_p: null } : {}) } });
+        }} /></label>
+        <label><code>top_p</code><input aria-label="top_p" disabled={disabled} type="number" min={0} max={1} step="any" value={'top_p' in effectiveRequest ? effectiveRequest.top_p ?? '' : ''} onChange={(event) => {
+          if (!('top_p' in effectiveRequest)) return;
+          onChange({ ...overrides, request_settings: { ...effectiveRequest, top_p: optionalNumber(event.target.value), ...(apiType === 'anthropic_messages' && event.target.value ? { temperature: null } : {}) } });
+        }} /></label>
+        {apiType === 'openai_chat_completions' && effectiveRequest.protocol === apiType && <label><code>max_completion_tokens</code><input aria-label="max_completion_tokens" disabled={disabled} type="number" min={1} step={1} value={effectiveRequest.max_completion_tokens ?? ''} onChange={(event) => onChange({ ...overrides, request_settings: { ...effectiveRequest, max_completion_tokens: optionalNumber(event.target.value) } })} /></label>}
+        {apiType === 'anthropic_messages' && effectiveRequest.protocol === apiType && <label><code>max_tokens</code><input aria-label="max_tokens" disabled={disabled} type="number" min={1} step={1} value={effectiveRequest.max_tokens ?? ''} onChange={(event) => onChange({ ...overrides, request_settings: { ...effectiveRequest, max_tokens: optionalNumber(event.target.value) } })} /></label>}
+      </div>)}
+    </fieldset>
+  </div>;
 }
 
 type SubagentDialogState = {
@@ -135,8 +337,8 @@ function emptySubagent(): CodexSubagentDefinition {
     name: '',
     description: '',
     developer_instructions: '',
-    model_connection_id: null,
-    reasoning_effort: null
+    model_selection: null,
+    model_settings_override: {}
   };
 }
 
@@ -170,8 +372,8 @@ function SubagentTable({
       <tbody>{definitions.map((definition, index) => <tr key={`${definition.name}-${index}`}>
         <td><strong>{definition.name}</strong></td>
         <td>{definition.description}</td>
-        <td>{modelName(definition.model_connection_id, modelOptions, t('inheritAgentModel'))}</td>
-        <td>{definition.reasoning_effort ? reasoningEffortLabel(definition.reasoning_effort, t) : t('inheritAgentReasoning')}</td>
+        <td>{modelName(definition.model_selection, modelOptions, t('inheritAgentModel'))}</td>
+        <td>{Object.keys(definition.model_settings_override).length ? t('subagentOverrideCount').replace('{count}', String(Object.keys(definition.model_settings_override).length)) : t('inheritAllAgentSettings')}</td>
         <td>{definition.enabled === false ? <span title={definition.disabled_reason ?? undefined}>{t('disabled')}</span> : t('enabled')}</td>
         {canManage && <td className="agent-subagent-actions-column"><div className="button-row agent-subagent-actions"><button type="button" className="icon-button" disabled={disabled} aria-label={`${t('editCodexSubagent')}: ${definition.name}`} title={`${t('editCodexSubagent')}: ${definition.name}`} onClick={() => onEdit(index)}><Pencil size={16} /></button><button type="button" className="icon-button" disabled={disabled} aria-label={`${t('delete')} ${definition.name}`} title={`${t('delete')} ${definition.name}`} onClick={() => onDelete(index)}><Trash2 size={16} /></button></div></td>}
       </tr>)}{definitions.length === 0 && <tr><td colSpan={canManage ? 6 : 5}><div className="compact-empty">{t('noCodexSubagents')}</div></td></tr>}</tbody>
@@ -183,6 +385,8 @@ function SubagentDialog({
   dialog,
   definitions,
   modelOptions,
+  parentSelection,
+  parentSettings,
   formId,
   busy,
   onChange,
@@ -192,6 +396,8 @@ function SubagentDialog({
   dialog: SubagentDialogState;
   definitions: CodexSubagentDefinition[];
   modelOptions: ModelConnectionOption[];
+  parentSelection: ModelSelection | null;
+  parentSettings: AgentModelSettings;
   formId: string;
   busy: boolean;
   onChange: (dialog: SubagentDialogState) => void;
@@ -200,6 +406,10 @@ function SubagentDialog({
 }) {
   const { t } = useI18n();
   const nameRef = useRef<HTMLInputElement>(null);
+  const effectiveSelection = dialog.draft.model_selection ?? parentSelection;
+  const parentApiType = selectedOption(parentSelection, modelOptions)?.api_type ?? 'openai_responses';
+  const effectiveApiType = selectedOption(effectiveSelection, modelOptions)?.api_type ?? parentApiType;
+  const protocolChanged = Boolean(dialog.draft.model_selection && effectiveApiType !== parentApiType);
 
   function update(update: Partial<CodexSubagentDefinition>) {
     onChange({ ...dialog, draft: { ...dialog.draft, ...update }, error: '' });
@@ -239,8 +449,11 @@ function SubagentDialog({
       <label>{t('subagentName')}<input ref={nameRef} required maxLength={64} disabled={busy} value={dialog.draft.name} onChange={(event) => update({ name: event.target.value })} /></label>
       <label>{t('subagentDescription')}<textarea required maxLength={512} disabled={busy} value={dialog.draft.description} onChange={(event) => update({ description: event.target.value })} /></label>
       <MarkdownEditor label={t('developerInstructions')} required disabled={busy} value={dialog.draft.developer_instructions} onChange={(developerInstructions) => update({ developer_instructions: developerInstructions })} />
-      <label>{t('subagentModelOverride')}<select disabled={busy} value={dialog.draft.model_connection_id ?? ''} onChange={(event) => update({ model_connection_id: event.target.value || null })}><option value="">{t('inheritAgentModel')}</option>{modelOptions.map((option) => <option key={option.id} value={option.id} disabled={option.status === 'disabled' && option.id !== dialog.draft.model_connection_id}>{modelOptionLabel(option, t)}</option>)}</select></label>
-      <label>{t('subagentReasoningOverride')}<select disabled={busy} value={dialog.draft.reasoning_effort ?? ''} onChange={(event) => update({ reasoning_effort: event.target.value ? event.target.value as ReasoningEffort : null })}><option value="">{t('inheritAgentReasoning')}</option>{reasoningEfforts.map((effort) => <option key={effort} value={effort}>{reasoningEffortLabel(effort, t)}</option>)}</select></label>
+      <label>{t('subagentModelOverride')}<select disabled={busy} value={selectionValue(dialog.draft.model_selection)} onChange={(event) => update({ model_selection: selectionFromValue(event.target.value, modelOptions) })}><option value="">{t('inheritAgentModel')}</option>{modelOptions.map((option) => {
+        const value = selectionValue({ connection_id: option.connection_id, model_id: option.model_id });
+        return <option key={value} value={value} disabled={option.status === 'disabled' && value !== selectionValue(dialog.draft.model_selection)}>{modelOptionLabel(option, t)}</option>;
+      })}</select><small className="agent-setting-effective">{t('effectiveValue')}: {modelName(effectiveSelection, modelOptions, t('modelNotConfigured'))} · {dialog.draft.model_selection ? t('sourceSubagent') : t('sourceAgent')}</small></label>
+      <SubagentModelSettingsFields overrides={dialog.draft.model_settings_override} parent={parentSettings} apiType={effectiveApiType} protocolChanged={protocolChanged} disabled={busy} onChange={(modelSettingsOverride) => update({ model_settings_override: modelSettingsOverride })} />
       {dialog.error && <div className="error" role="alert">{dialog.error}</div>}
     </form>
   </FormDialog>;
@@ -384,11 +597,11 @@ function CreateAgentModal({ currentUser, navigate, onClose }: { currentUser: Use
   const [users, setUsers] = useState<User[]>([]);
   const [usersLoading, setUsersLoading] = useState(true);
   const [usersError, setUsersError] = useState(false);
-  const [modelOptions, setModelOptions] = useState<ModelConnectionOptions>({ items: [], system_default_model_connection_id: null });
+  const [modelOptions, setModelOptions] = useState<ModelConnectionOptions>({ items: [], system_default: null });
   const [modelsLoading, setModelsLoading] = useState(true);
   const [modelsError, setModelsError] = useState(false);
-  const [defaultModelConnectionId, setDefaultModelConnectionId] = useState<string | null>(null);
-  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>('default');
+  const [modelSelection, setModelSelection] = useState<ModelSelection | null>(null);
+  const [modelSettings, setModelSettings] = useState<AgentModelSettings>(automaticAgentModelSettings);
   const [codexSubagents, setCodexSubagents] = useState<CodexSubagentDefinition[]>([]);
   const [subagentDialog, setSubagentDialog] = useState<SubagentDialogState | null>(null);
   const [pending, setPending] = useState(false);
@@ -426,7 +639,8 @@ function CreateAgentModal({ currentUser, navigate, onClose }: { currentUser: Use
     api.modelConnectionOptions(controller.signal).then((loaded) => {
       if (controller.signal.aborted || !mountedRef.current) return;
       setModelOptions(loaded);
-      setDefaultModelConnectionId(loaded.system_default_model_connection_id);
+      setModelSelection(loaded.system_default);
+      setModelSettings((current) => settingsForSelection(current, loaded.system_default, loaded.items));
       setModelsLoading(false);
     }).catch(() => {
       if (controller.signal.aborted || !mountedRef.current) return;
@@ -465,8 +679,8 @@ function CreateAgentModal({ currentUser, navigate, onClose }: { currentUser: Use
         instructions,
         visibility,
         public_to: visibility === 'public_to' ? publicTo : [],
-        default_model_connection_id: defaultModelConnectionId,
-        reasoning_effort: reasoningEffort,
+        model_selection: modelSelection,
+        model_settings: modelSettings,
         codex_subagents: codexSubagents
       }, controller.signal);
       if (controller.signal.aborted || !mountedRef.current) return;
@@ -513,7 +727,14 @@ function CreateAgentModal({ currentUser, navigate, onClose }: { currentUser: Use
         <MarkdownEditor label={t('instructions')} required value={instructions} onChange={setInstructions} />
         {modelsLoading ? <div className="compact-empty" aria-live="polite">{t('modelOptionsLoading')}</div>
           : modelsError ? <div className="error agent-model-options-error" role="alert"><span>{t('modelOptionsLoadFailed')}</span><button type="button" className="text-button" onClick={loadModels}>{t('retry')}</button></div>
-            : <div className="agent-model-fields"><label>{t('defaultModelConnection')}<select value={defaultModelConnectionId ?? ''} onChange={(event) => setDefaultModelConnectionId(event.target.value || null)}><option value="">{t('modelNotConfigured')}</option>{modelOptions.items.map((option) => <option key={option.id} value={option.id} disabled={option.status === 'disabled' && option.id !== defaultModelConnectionId}>{modelOptionLabel(option, t)}</option>)}</select></label><label>{t('reasoningEffort')}<select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}>{reasoningEfforts.map((effort) => <option key={effort} value={effort}>{reasoningEffortLabel(effort, t)}</option>)}</select></label></div>}
+            : <><label>{t('agentModelSelection')}<select value={selectionValue(modelSelection)} onChange={(event) => {
+              const selection = selectionFromValue(event.target.value, modelOptions.items);
+              setModelSelection(selection);
+              setModelSettings((current) => settingsForSelection(current, selection, modelOptions.items));
+            }}><option value="">{t('modelNotConfigured')}</option>{modelOptions.items.map((option) => {
+              const value = selectionValue({ connection_id: option.connection_id, model_id: option.model_id });
+              return <option key={value} value={value} disabled={option.status === 'disabled' && value !== selectionValue(modelSelection)}>{modelOptionLabel(option, t)}</option>;
+            })}</select></label><AgentModelSettingsFields settings={modelSettings} apiType={selectedOption(modelSelection, modelOptions.items)?.api_type ?? 'openai_responses'} disabled={pending} onChange={setModelSettings} /></>}
         <section className="agent-subagent-section">
           <div className="agent-subagent-heading"><span className="field-label">{t('codexSubagents')}</span><button type="button" className="secondary" disabled={pending || modelsLoading || modelsError || codexSubagents.length >= 32} onClick={() => openSubagent(null)}><Plus size={16} /> {t('addCodexSubagent')}</button></div>
           <SubagentTable definitions={codexSubagents} modelOptions={modelOptions.items} canManage disabled={pending} onEdit={openSubagent} onDelete={deleteSubagent} />
@@ -524,7 +745,7 @@ function CreateAgentModal({ currentUser, navigate, onClose }: { currentUser: Use
         {error && <div className="error" role="alert">{t('agentCreateFailed')}</div>}
       </form>
   </FormDialog>
-  {subagentDialog && <SubagentDialog dialog={subagentDialog} definitions={codexSubagents} modelOptions={modelOptions.items} formId="create-agent-subagent-form" busy={pending} onChange={setSubagentDialog} onCommit={commitSubagent} onClose={() => setSubagentDialog(null)} />}
+  {subagentDialog && <SubagentDialog dialog={subagentDialog} definitions={codexSubagents} modelOptions={modelOptions.items} parentSelection={modelSelection} parentSettings={modelSettings} formId="create-agent-subagent-form" busy={pending} onChange={setSubagentDialog} onCommit={commitSubagent} onClose={() => setSubagentDialog(null)} />}
   </>;
 }
 
@@ -620,15 +841,15 @@ function sameIds(left: string[], right: string[]) {
 }
 
 type AgentModelDraft = {
-  defaultModelConnectionId: string | null;
-  reasoningEffort: ReasoningEffort;
+  modelSelection: ModelSelection | null;
+  modelSettings: AgentModelSettings;
   codexSubagents: CodexSubagentDefinition[];
 };
 
 function agentModelDraft(agent: Agent): AgentModelDraft {
   return {
-    defaultModelConnectionId: agent.default_model_connection_id,
-    reasoningEffort: agent.reasoning_effort,
+    modelSelection: agent.model_selection,
+    modelSettings: agent.model_settings,
     codexSubagents: agent.codex_subagents
   };
 }
@@ -656,14 +877,13 @@ export function AgentPage({
   const [runtimes, setRuntimes] = useState<Runtime[]>([]);
   const [skills, setSkills] = useState<Skill[]>([]);
   const [users, setUsers] = useState<User[]>([]);
-  const [modelOptions, setModelOptions] = useState<ModelConnectionOptions>({ items: [], system_default_model_connection_id: null });
+  const [modelOptions, setModelOptions] = useState<ModelConnectionOptions>({ items: [], system_default: null });
   const [selectedRun, setSelectedRun] = useState<Run | null>(null);
   const [activeTab, setActiveTab] = useState<DetailTab>('activity');
   const [loadError, setLoadError] = useState(false);
   const [loadRetry, setLoadRetry] = useState(0);
   const [error, setError] = useState('');
   const [configPending, setConfigPending] = useState(false);
-  const [runPending, setRunPending] = useState(false);
   const [skillsDialogOpen, setSkillsDialogOpen] = useState(false);
   const [mcpDialog, setMcpDialog] = useState<McpDialogState | null>(null);
   const [subagentDialog, setSubagentDialog] = useState<SubagentDialogState | null>(null);
@@ -672,24 +892,19 @@ export function AgentPage({
   const [instructionBase, setInstructionBase] = useState({ name: '', instructions: '' });
   const [managedSkillDraft, setManagedSkillDraft] = useState<string[]>([]);
   const [managedSkillBase, setManagedSkillBase] = useState<string[]>([]);
-  const [modelDraft, setModelDraft] = useState<AgentModelDraft>({ defaultModelConnectionId: null, reasoningEffort: 'default', codexSubagents: [] });
-  const [modelBase, setModelBase] = useState<AgentModelDraft>({ defaultModelConnectionId: null, reasoningEffort: 'default', codexSubagents: [] });
+  const [modelDraft, setModelDraft] = useState<AgentModelDraft>({ modelSelection: null, modelSettings: automaticAgentModelSettings, codexSubagents: [] });
+  const [modelBase, setModelBase] = useState<AgentModelDraft>({ modelSelection: null, modelSettings: automaticAgentModelSettings, codexSubagents: [] });
   const [accessDraft, setAccessDraft] = useState({ visibility: 'private', publicTo: [] as string[], runtimeId: null as string | null });
   const [accessBase, setAccessBase] = useState({ visibility: 'private', publicTo: [] as string[], runtimeId: null as string | null });
-  const [message, setMessage] = useState(() => t('defaultRunMessage'));
-  const [continueThread, setContinueThread] = useState(false);
 
   const mounted = useRef(true);
   const loadGeneration = useRef(0);
   const mutationGeneration = useRef(0);
-  const runGeneration = useRef(0);
   const loadController = useRef<AbortController | null>(null);
   const mutationController = useRef<AbortController | null>(null);
-  const runController = useRef<AbortController | null>(null);
   const refreshController = useRef<AbortController | null>(null);
   const refreshPromise = useRef<Promise<void> | null>(null);
   const configPendingRef = useRef(false);
-  const runPendingRef = useRef(false);
   const firstSkillRef = useRef<HTMLInputElement>(null);
   const mcpNameRef = useRef<HTMLInputElement>(null);
 
@@ -748,7 +963,7 @@ export function AgentPage({
       api.users(controller.signal),
       agentRequest.then((loadedAgent) => loadedAgent.can_manage
         ? api.agentModelConnectionOptions(agentId, controller.signal)
-        : { items: [], system_default_model_connection_id: null })
+        : { items: [], system_default: null })
     ]).then(([loadedAgent, loadedRuns, loadedRuntimes, loadedSkills, loadedUsers, loadedModelOptions]) => {
       if (controller.signal.aborted || !mounted.current || generation !== loadGeneration.current) return;
       applyLoadedAgent(loadedAgent);
@@ -792,11 +1007,9 @@ export function AgentPage({
       if (refreshController.current || configPendingRef.current) return;
       const controller = new AbortController();
       refreshController.current = controller;
-      const generation = runGeneration.current;
-      const runWasPending = runPendingRef.current;
       try {
         const latest = await api.runs(agentId, controller.signal);
-        if (!active || controller.signal.aborted || runWasPending || generation !== runGeneration.current) return;
+        if (!active || controller.signal.aborted) return;
         setRuns(latest);
         setSelectedRun((current) => latest.find((run) => run.id === current?.id) ?? latest[0] ?? null);
       } catch {
@@ -817,7 +1030,6 @@ export function AgentPage({
       active = false;
       refreshController.current?.abort();
       refreshController.current = null;
-      runGeneration.current += 1;
       window.clearInterval(timer);
     };
   }, [agentId, loadedAgentId]);
@@ -826,7 +1038,6 @@ export function AgentPage({
     mounted.current = false;
     loadController.current?.abort();
     mutationController.current?.abort();
-    runController.current?.abort();
     refreshController.current?.abort();
   }, []);
 
@@ -857,8 +1068,8 @@ export function AgentPage({
       if (tab === 'instructions') next = { ...next, ...instructionDraft };
       if (tab === 'models') next = {
         ...next,
-        default_model_connection_id: modelDraft.defaultModelConnectionId,
-        reasoning_effort: modelDraft.reasoningEffort,
+        model_selection: modelDraft.modelSelection,
+        model_settings: modelDraft.modelSettings,
         codex_subagents: modelDraft.codexSubagents
       };
       if (tab === 'skills') next = { ...next, managed_skill_ids: managedSkillDraft };
@@ -1028,7 +1239,6 @@ export function AgentPage({
     if (!window.confirm(t('confirmDeleteAgent').replace('{name}', agent.name))) return;
     const operation = beginConfigMutation();
     if (!operation) return;
-    runGeneration.current += 1;
     const pendingRefresh = refreshPromise.current;
     refreshController.current?.abort();
     refreshController.current = null;
@@ -1041,39 +1251,6 @@ export function AgentPage({
     } catch {
       if (!operation.controller.signal.aborted && mounted.current) setError(t('genericError'));
       finishConfigMutation(operation.controller, operation.generation);
-    }
-  }
-
-  async function startRun(event: FormEvent) {
-    event.preventDefault();
-    if (!agent?.can_invoke || runPendingRef.current) return;
-    runPendingRef.current = true;
-    setRunPending(true);
-    setError('');
-    runController.current?.abort();
-    const controller = new AbortController();
-    runController.current = controller;
-    const generation = ++runGeneration.current;
-    refreshController.current?.abort();
-    refreshController.current = null;
-    try {
-      const run = await api.createRun(
-        agentId,
-        message,
-        continueThread ? selectedRun?.hub_session_id ?? null : null,
-        continueThread ? selectedRun?.id ?? null : null,
-        controller.signal
-      );
-      if (controller.signal.aborted || !mounted.current || generation !== runGeneration.current) return;
-      setRuns((current) => [run, ...current.filter((item) => item.id !== run.id)]);
-      setSelectedRun(run);
-    } catch {
-      if (!controller.signal.aborted && mounted.current) setError(t('genericError'));
-    } finally {
-      if (mounted.current && generation === runGeneration.current) {
-        runPendingRef.current = false;
-        setRunPending(false);
-      }
     }
   }
 
@@ -1095,7 +1272,7 @@ export function AgentPage({
       <aside className="agent-inspector" role="complementary" aria-label={t('agentInspector')}>
         <section className="agent-identity"><Bot size={28} /><div><strong>{agent.name}</strong><span>{agent.instructions}</span></div></section>
         <section><h2>{t('agentInspectorRuntime')}</h2><dl><div><dt>{t('agentAvailability')}</dt><dd>{availabilityLabel(availability, t)}</dd></div><div><dt>{t('runtime')}</dt><dd>{runtime?.hostname ?? availabilityLabel(availability, t)}</dd></div></dl></section>
-        <section><h2>{t('agentInspectorModel')}</h2><dl><div><dt>{t('defaultModelConnection')}</dt><dd>{modelName(agent.default_model_connection_id, modelOptions.items, t('modelNotConfigured'))}</dd></div><div><dt>{t('reasoningEffort')}</dt><dd>{reasoningEffortLabel(agent.reasoning_effort, t)}</dd></div><div><dt>{t('codexSubagents')}</dt><dd>{agent.codex_subagents.length}</dd></div></dl></section>
+        <section><h2>{t('agentInspectorModel')}</h2><dl><div><dt>{t('agentModelSelection')}</dt><dd>{modelName(agent.model_selection, modelOptions.items, t('modelNotConfigured'))}</dd></div><div><dt>{t('reasoningEffort')}</dt><dd>{agent.model_settings.reasoning_effort}</dd></div><div><dt>{t('codexSubagents')}</dt><dd>{agent.codex_subagents.length}</dd></div></dl></section>
         <section><h2>{t('agentInspectorAccess')}</h2><dl><div><dt>{t('visibility')}</dt><dd>{visibilityLabel(agent.visibility, t)}</dd></div>{agent.visibility === 'public_to' && <div><dt>{t('agentPublicTo')}</dt><dd>{agent.public_to.length}</dd></div>}</dl></section>
         <section><h2>{t('managedSkills')}</h2><div className="agent-skill-chips">{managedSkills.map((skill) => <span key={skill.id}>{skill.name}</span>)}{managedSkills.length === 0 && <span>{t('none')}</span>}</div></section>
         <section><h2>{t('details')}</h2><dl><div><dt>{t('created')}</dt><dd>{new Date(agent.created_at).toLocaleString(locale)}</dd></div><div><dt>{t('updated')}</dt><dd>{new Date(agent.updated_at).toLocaleString(locale)}</dd></div></dl></section>
@@ -1104,16 +1281,22 @@ export function AgentPage({
         <div className="agent-tabs" role="tablist" aria-label={t('agentDetailSections')}>{detailTabs.map((tab) => <button key={tab.id} id={`agent-tab-${tab.id}`} type="button" role="tab" aria-selected={activeTab === tab.id} aria-controls={`agent-panel-${tab.id}`} disabled={configPending && activeTab !== tab.id} onClick={() => setActiveTab(tab.id)}>{t(tab.key)}</button>)}</div>
         <div className="agent-panels">
           <section id="agent-panel-activity" role="tabpanel" aria-labelledby="agent-tab-activity" aria-label={t('tabActivity')} hidden={activeTab !== 'activity'}>
-            {agent.can_invoke && <form className="stack agent-run-composer" onSubmit={startRun}><label>{t('message')}<textarea value={message} onChange={(event) => setMessage(event.target.value)} /></label><label className="check-row"><input type="checkbox" checked={continueThread} disabled={!selectedRunForAgent || runPending} onChange={(event) => setContinueThread(event.target.checked)} /> {t('continueThread')}</label><button className="primary" disabled={runPending}><Send size={16} /> {runPending ? t('startingRun') : t('startRun')}</button></form>}
             <div className="agent-activity-grid"><section><h2>{t('runHistory')}</h2><div className="list run-list">{runs.map((run) => <button className={`list-row ${selectedRunForAgent?.id === run.id ? 'selected' : ''}`} data-run-id={run.id} key={run.id} onClick={() => setSelectedRun(run)}><strong>{runStatusLabel(run.status, t)}</strong><span>{runSourceLabel(run.source, t)} · {run.initial_message}</span></button>)}{runs.length === 0 && <div className="compact-empty">{t('noRuns')}</div>}</div></section><section className="agent-console">{selectedRunForAgent ? <RunConsole run={selectedRunForAgent} /> : <div className="compact-empty">{t('noRuns')}</div>}</section></div>
           </section>
           <section id="agent-panel-instructions" role="tabpanel" aria-labelledby="agent-tab-instructions" aria-label={t('tabInstructions')} hidden={activeTab !== 'instructions'}>{agent.can_manage ? <form className="stack" onSubmit={(event) => saveAgentTab(event, 'instructions')}><label>{t('name')}<input disabled={configPending} value={instructionDraft.name} onChange={(event) => setInstructionDraft((current) => ({ ...current, name: event.target.value }))} /></label><MarkdownEditor label={t('instructions')} disabled={configPending} value={instructionDraft.instructions} onChange={(instructions) => setInstructionDraft((current) => ({ ...current, instructions }))} /><button className="primary" disabled={configPending || !instructionDirty}><Save size={16} /> {configPending ? t('saving') : t('saveAgent')}</button></form> : <div className="agent-readonly"><h2>{agent.name}</h2><p>{agent.instructions}</p></div>}</section>
           <section id="agent-panel-models" role="tabpanel" aria-labelledby="agent-tab-models" aria-label={t('tabModels')} hidden={activeTab !== 'models'}>
             {agent.can_manage ? <form className="stack" onSubmit={(event) => saveAgentTab(event, 'models')}>
-              <div className="agent-model-fields"><label>{t('defaultModelConnection')}<select disabled={configPending} value={modelDraft.defaultModelConnectionId ?? ''} onChange={(event) => setModelDraft((current) => ({ ...current, defaultModelConnectionId: event.target.value || null }))}><option value="">{t('modelNotConfigured')}</option>{modelOptions.items.map((option) => <option key={option.id} value={option.id} disabled={option.status === 'disabled' && option.id !== modelDraft.defaultModelConnectionId}>{modelOptionLabel(option, t)}</option>)}</select></label><label>{t('reasoningEffort')}<select disabled={configPending} value={modelDraft.reasoningEffort} onChange={(event) => setModelDraft((current) => ({ ...current, reasoningEffort: event.target.value as ReasoningEffort }))}>{reasoningEfforts.map((effort) => <option key={effort} value={effort}>{reasoningEffortLabel(effort, t)}</option>)}</select></label></div>
+              <label>{t('agentModelSelection')}<select disabled={configPending} value={selectionValue(modelDraft.modelSelection)} onChange={(event) => setModelDraft((current) => {
+                const modelSelection = selectionFromValue(event.target.value, modelOptions.items);
+                return { ...current, modelSelection, modelSettings: settingsForSelection(current.modelSettings, modelSelection, modelOptions.items) };
+              })}><option value="">{t('modelNotConfigured')}</option>{modelOptions.items.map((option) => {
+                const value = selectionValue({ connection_id: option.connection_id, model_id: option.model_id });
+                return <option key={value} value={value} disabled={option.status === 'disabled' && value !== selectionValue(modelDraft.modelSelection)}>{modelOptionLabel(option, t)}</option>;
+              })}</select></label>
+              <AgentModelSettingsFields settings={modelDraft.modelSettings} apiType={selectedOption(modelDraft.modelSelection, modelOptions.items)?.api_type ?? 'openai_responses'} disabled={configPending} onChange={(modelSettings) => setModelDraft((current) => ({ ...current, modelSettings }))} />
               <section className="agent-subagent-section"><div className="agent-subagent-heading"><span className="field-label">{t('codexSubagents')}</span><button type="button" className="secondary" disabled={configPending || modelDraft.codexSubagents.length >= 32} onClick={() => openSubagentDialog(null)}><Plus size={16} /> {t('addCodexSubagent')}</button></div><SubagentTable definitions={modelDraft.codexSubagents} modelOptions={modelOptions.items} canManage disabled={configPending} onEdit={openSubagentDialog} onDelete={deleteSubagentDefinition} /></section>
               <button className="primary" disabled={configPending || !modelDirty}><Save size={16} /> {configPending ? t('saving') : t('saveAgent')}</button>
-            </form> : <div className="stack agent-readonly"><dl className="agent-model-summary"><div><dt>{t('defaultModelConnection')}</dt><dd>{modelName(agent.default_model_connection_id, modelOptions.items, t('modelNotConfigured'))}</dd></div><div><dt>{t('reasoningEffort')}</dt><dd>{reasoningEffortLabel(agent.reasoning_effort, t)}</dd></div></dl><SubagentTable definitions={agent.codex_subagents} modelOptions={modelOptions.items} canManage={false} disabled onEdit={() => undefined} onDelete={() => undefined} /></div>}
+            </form> : <div className="stack agent-readonly"><dl className="agent-model-summary"><div><dt>{t('agentModelSelection')}</dt><dd>{modelName(agent.model_selection, modelOptions.items, t('modelNotConfigured'))}</dd></div><div><dt>{t('reasoningEffort')}</dt><dd>{agent.model_settings.reasoning_effort}</dd></div></dl><SubagentTable definitions={agent.codex_subagents} modelOptions={modelOptions.items} canManage={false} disabled onEdit={() => undefined} onDelete={() => undefined} /></div>}
           </section>
           <section id="agent-panel-skills" role="tabpanel" aria-labelledby="agent-tab-skills" aria-label={t('tabSkills')} hidden={activeTab !== 'skills'}>
             {agent.can_manage && <div className="button-row agent-panel-actions"><button type="button" className="secondary" disabled={configPending} onClick={openSkillsDialog}><Pencil size={16} /> {t('editManagedSkills')}</button></div>}
@@ -1175,6 +1358,6 @@ export function AgentPage({
       {mcpDialog.error && <div className="error" role="alert">{mcpDialog.error}</div>}
     </form>
   </FormDialog>}
-  {subagentDialog && <SubagentDialog dialog={subagentDialog} definitions={modelDraft.codexSubagents} modelOptions={modelOptions.items} formId="agent-subagent-form" busy={configPending} onChange={setSubagentDialog} onCommit={commitSubagent} onClose={() => setSubagentDialog(null)} />}
+  {subagentDialog && <SubagentDialog dialog={subagentDialog} definitions={modelDraft.codexSubagents} modelOptions={modelOptions.items} parentSelection={modelDraft.modelSelection} parentSettings={modelDraft.modelSettings} formId="agent-subagent-form" busy={configPending} onChange={setSubagentDialog} onCommit={commitSubagent} onClose={() => setSubagentDialog(null)} />}
   </>;
 }

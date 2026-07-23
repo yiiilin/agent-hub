@@ -46,8 +46,8 @@ function updatePayload(agent, overrides = {}) {
     visibility: agent.visibility,
     public_to: agent.public_to,
     runtime_id: agent.runtime_id,
-    default_model_connection_id: agent.default_model_connection_id,
-    reasoning_effort: agent.reasoning_effort,
+    model_selection: agent.model_selection,
+    model_settings: agent.model_settings,
     codex_subagents: agent.codex_subagents,
     sandbox_policy: agent.sandbox_policy,
     managed_skill_ids: agent.managed_skill_ids,
@@ -205,9 +205,14 @@ export default async function agentSkillMcpApiScenario(context) {
     await target.client.get(`/api/skills/${bulkTwo.id}`, { expectedStatus: 404 });
 
     const { data: modelOptions } = await target.client.get('/api/model-connections/options');
-    const defaultModelId = modelOptions.system_default_model_connection_id
-      ?? modelOptions.items.find((item) => item.status === 'enabled')?.id;
-    assert.match(defaultModelId, UUID_PATTERN, 'A fake-provider Model Connection must be available');
+    const fallbackModel = modelOptions.items.find((item) => item.status === 'enabled');
+    const defaultSelection = modelOptions.system_default ?? (fallbackModel ? {
+      connection_id: fallbackModel.connection_id,
+      model_id: fallbackModel.model_id
+    } : null);
+    assert.match(defaultSelection?.connection_id, UUID_PATTERN,
+      'A fake-provider Model Connection must be available');
+    assert.equal(typeof defaultSelection?.model_id, 'string');
 
     const configuredName = context.unique('QA configured Agent');
     const { data: configuredAgent } = await target.client.post('/api/agents', {
@@ -215,24 +220,27 @@ export default async function agentSkillMcpApiScenario(context) {
       instructions: '# QA Agent Instructions\n\nInitial instructions.',
       visibility: 'public_to',
       public_to: [outsider.user.id],
-      default_model_connection_id: defaultModelId,
-      reasoning_effort: 'high',
+      model_selection: defaultSelection,
+      model_settings: { reasoning_effort: 'high' },
       codex_subagents: [{
         name: 'reviewer',
         description: 'Reviews the current QA change.',
         developer_instructions: 'Review the QA change for correctness.',
-        model_connection_id: defaultModelId,
-        reasoning_effort: 'max'
+        model_selection: defaultSelection,
+        model_settings_override: { reasoning_effort: 'max' }
       }]
     });
     createdAgentIds.push(configuredAgent.id);
     assert.equal(configuredAgent.visibility, 'public_to');
     assert.deepEqual(configuredAgent.public_to, [outsider.user.id]);
-    assert.equal(configuredAgent.default_model_connection_id, defaultModelId);
-    assert.equal(configuredAgent.reasoning_effort, 'high');
+    assert.deepEqual(configuredAgent.model_selection, defaultSelection);
+    assert.equal(configuredAgent.model_settings.reasoning_effort, 'high');
     assert.equal(configuredAgent.codex_subagents[0].name, 'reviewer');
     const { data: configuredOptions } = await target.client.get(`/api/agents/${configuredAgent.id}/model-options`);
-    assert.equal(configuredOptions.items.some((item) => item.id === defaultModelId), true);
+    assert.equal(configuredOptions.items.some((item) => (
+      item.connection_id === defaultSelection.connection_id
+      && item.model_id === defaultSelection.model_id
+    )), true);
 
   const targetView = (await outsider.client.get(`/api/agents/${configuredAgent.id}`)).data;
     assert.equal(targetView.can_invoke, true);

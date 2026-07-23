@@ -12,8 +12,8 @@
 6. Runtime 持久化 native Thread ID；Hub Run 仅用于调度和审计，不充当 Codex Thread、Workspace 或进程边界。
 7. app-server 子进程的超时、取消和异常路径必须确定性回收；`app-server` 失败不得静默回退到 fake driver。
 8. Turn 结束后，Session 默认保持在线十五分钟；新 Turn 复用同一进程。仅在保存 Bundle、Runtime drain、版本切换或错误回收时停止进程。
-9. Agent、Skill、Model Connection reference、详细 Codex 参数、协议专属请求参数和 Codex Subagent files 只在 Turn 之间按有效配置 fingerprint 同步；同步文件本身不重启 app-server。已加载 native Thread 的 fingerprint 变化时，Runtime 在下一 Turn 前先执行 `thread/unsubscribe`，再对同一 Thread 执行强制 cold `thread/resume` 以重读最新配置，最后才执行 `turn/start`。Skill 删除产生的 `refresh_configuration` 在 idle 立即执行，active Turn 终态后执行。
-10. Runtime 为默认模型和子 Agent override 生成多个受控 provider/agent 配置，写入所选连接的 reasoning、summary、verbosity、context、compaction、summary capability、service tier 及 provider retry/idle 参数；自动值省略。协议专属请求参数不写入 Codex TOML，Runtime 对每个连接始终发送 Responses 请求，Hub/Gateway 在请求时处理上游协议。所有 provider 都指向 Runtime loopback proxy，真实 provider URL/API Key 不写入 `CODEX_HOME`。
+9. Agent、Skill、Agent Model Selection/Settings 和 Codex Subagent files 只在 Turn 之间按有效配置 fingerprint 同步；同步文件本身不重启 app-server。已加载 native Thread 的 fingerprint 变化时，Runtime 在下一 Turn 前先执行 `thread/unsubscribe`，再对同一 Thread 执行强制 cold `thread/resume` 以重读最新配置，最后才执行 `turn/start`。Skill 删除产生的 `refresh_configuration` 在 idle 立即执行，active Turn 终态后执行。
+10. Hub 在 Run 创建时解析主 Agent 和显式 Subagent 的有效配置，并生成不可变 Run Model Bindings。Runtime 为每个 binding 生成受控 provider/agent 配置，写入 reasoning、summary、verbosity、context、compaction、summary capability、service tier 及 provider retry/idle 参数；自动值省略。协议专属 request settings 不写入 Codex TOML，Runtime 始终发送 Responses 请求，并在 loopback header 中携带 binding ID。所有 provider 都指向 Runtime loopback proxy，真实 provider URL/API Key 和 Model API Connection ID 不写入 `CODEX_HOME`。
 11. Runtime 的系统流量只访问 Hub。Codex 任务产生的网络流量遵循 Agent sandbox；Runtime 不直接访问 provider、GitHub 或 S3。
 
 ## 协议顺序
@@ -48,10 +48,10 @@ connect -> initialize -> initialized
 - 长 Turn 期间 Runtime heartbeat 不间断；异常和取消后不存在遗留 app-server 进程。
 - active Codex 版本切换不打断当前 Turn；下一 Turn 才使用新版本。
 - 删除已绑定 Skill 后，受影响 idle Session 原子移除 Hub-owned 派生文件；active Turn 保持旧文件直到终态，全过程不重启 app-server。
-- Agent 默认模型和自定义子 Agent 配置可 materialize 为 Codex 原生配置；全部详细参数通过安装版 Codex 的 `--strict-config` 校验。推理强度遵循“子 Agent > Agent > Model Connection > Codex 自动值”，协议专属请求参数在 Gateway envelope 中随下一 Turn 的连接快照生效，连接变更只在约定的 request/Turn 边界生效。
+- Agent 默认模型和自定义子 Agent 配置可从 Run binding materialize 为 Codex 原生配置；全部详细参数通过安装版 Codex 的 `--strict-config` 校验。逐字段优先级为“Subagent override > Agent value > Codex/provider 自动值”，协议专属 request settings 在 Gateway envelope 中使用 binding snapshot；Runtime 只发送 binding ID，两个共享 connection/model 但参数不同的 binding 必须生成不同 provider 配置。
 
 ## 测试计划
 
-- Rust：使用 fake app-server 验证初始化、start/resume、start/steer/interrupt、响应 ID、事件映射、失败不 fallback、超时和进程回收。
+- Rust：使用 fake app-server 验证初始化、start/resume、start/steer/interrupt、响应 ID、事件映射、binding-only loopback routing、不同 binding 配置、失败不 fallback、超时和进程回收。
 - Frontend：构建通过。
 - 浏览器：Session 继续对话、活动 Turn 引导和显式停止链路通过。

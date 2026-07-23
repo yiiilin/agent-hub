@@ -121,7 +121,7 @@ func (s *server) proxyAnthropic(w http.ResponseWriter, r *http.Request, envelope
 	}
 	request.Provider = schemas.Anthropic
 	request.Fallbacks = nil
-	mergeAnthropicRequestParameters(request, envelope.RequestParameters)
+	mergeAnthropicRequestSettings(request, envelope.RequestSettings)
 	requestURL := upstreamRequestURL(endpoint, "/v1/messages", envelope.Query)
 	stream := wireRequest.Stream != nil && *wireRequest.Stream
 	if stream {
@@ -131,20 +131,20 @@ func (s *server) proxyAnthropic(w http.ResponseWriter, r *http.Request, envelope
 	s.proxyAnthropicJSON(w, r, envelope, bifrostCtx, requestURL, request, safeHeaders)
 }
 
-func mergeAnthropicRequestParameters(request *schemas.BifrostResponsesRequest, parameters modelRequestParameters) {
+func mergeAnthropicRequestSettings(request *schemas.BifrostResponsesRequest, settings modelRequestSettings) {
 	if request.Params == nil {
 		request.Params = &schemas.ResponsesParameters{}
 	}
-	if parameters.Temperature != nil {
-		request.Params.Temperature = parameters.Temperature
+	if settings.Temperature != nil {
+		request.Params.Temperature = settings.Temperature
 		request.Params.TopP = nil
 	}
-	if parameters.TopP != nil {
-		request.Params.TopP = parameters.TopP
+	if settings.TopP != nil {
+		request.Params.TopP = settings.TopP
 		request.Params.Temperature = nil
 	}
-	if parameters.MaxTokens != nil {
-		value := int(*parameters.MaxTokens)
+	if settings.MaxTokens != nil {
+		value := int(*settings.MaxTokens)
 		request.Params.MaxOutputTokens = &value
 	}
 }

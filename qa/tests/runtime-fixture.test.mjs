@@ -94,6 +94,9 @@ test('QA Compose uses the in-network Codex release fixture over explicitly allow
     'http://fake-model-provider:8080/codex'
   );
   assert.equal(harness.environment.HUB_CODEX_GITHUB_ALLOW_HTTP, 'true');
+  assert.match(harness.environment.HUB_NETWORK_SUBNET, /^10\.(?:1[2-9]\d|2[0-4]\d|25[0-5])\.\d{1,3}\.0\/24$/);
+  assert.match(harness.environment.MODEL_NETWORK_SUBNET, /^10\.(?:1[2-9]\d|2[0-4]\d|25[0-5])\.\d{1,3}\.0\/24$/);
+  assert.notEqual(harness.environment.HUB_NETWORK_SUBNET, harness.environment.MODEL_NETWORK_SUBNET);
 });
 
 test('fake model provider preserves Responses success, error, auth, and usage behavior', async (t) => {
@@ -205,13 +208,22 @@ test('fake Codex uses the configured default provider when another provider sort
   mkdirSync(codexHome, { recursive: true });
   mkdirSync(cwd, { recursive: true });
 
-  const decoyConnectionId = '00000000-0000-0000-0000-000000000001';
-  const defaultConnectionId = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
-  const receivedConnectionIds = [];
+  const decoyBindingId = '00000000-0000-0000-0000-000000000001';
+  const defaultBindingId = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
+  const receivedBindingIds = [];
   const server = createServer((request, response) => {
-    receivedConnectionIds.push(request.headers['x-agent-hub-model-connection-id']);
+    receivedBindingIds.push(request.headers['x-agent-hub-model-binding-id']);
     response.writeHead(200, { 'content-type': 'application/json' });
-    response.end(JSON.stringify({ output_text: 'default provider selected' }));
+    response.end(JSON.stringify({
+      id: 'resp_chat_converted',
+      object: 'response',
+      status: 'completed',
+      output: [{
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: 'default provider selected' }]
+      }]
+    }));
   });
   const baseURL = await listen(server);
   t.after(() => close(server));
@@ -224,13 +236,13 @@ model_provider = "agent_hub_ffffffffffffffffffffffffffffffff"
 base_url = "${baseURL}/v1"
 
 [model_providers.agent_hub_00000000000000000000000000000001.http_headers]
-x-agent-hub-model-connection-id = "${decoyConnectionId}"
+x-agent-hub-model-binding-id = "${decoyBindingId}"
 
 [model_providers.agent_hub_ffffffffffffffffffffffffffffffff]
 base_url = "${baseURL}/v1"
 
 [model_providers.agent_hub_ffffffffffffffffffffffffffffffff.http_headers]
-x-agent-hub-model-connection-id = "${defaultConnectionId}"
+x-agent-hub-model-binding-id = "${defaultBindingId}"
 `);
 
   const threadId = 'fake-app-server-thread-fixture-session';
@@ -281,7 +293,7 @@ x-agent-hub-model-connection-id = "${defaultConnectionId}"
   });
 
   assert.equal(exitCode, 0, stderr);
-  assert.deepEqual(receivedConnectionIds, [defaultConnectionId]);
+  assert.deepEqual(receivedBindingIds, [defaultBindingId]);
   const messages = stdout.trim().split('\n').map((line) => JSON.parse(line));
   assert.equal(
     messages.some((message) => message.method === 'turn/completed'

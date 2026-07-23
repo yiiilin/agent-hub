@@ -7,14 +7,26 @@ type AgentFixture = {
   visibility: string;
   public_to: string[];
   runtime_id: string | null;
-  default_model_connection_id: string | null;
-  reasoning_effort: 'default' | 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  model_selection: { connection_id: string; model_id: string } | null;
+  model_settings: {
+    reasoning_effort: 'default' | 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+    reasoning_summary: 'default' | 'auto' | 'concise' | 'detailed' | 'none';
+    verbosity: 'default' | 'low' | 'medium' | 'high';
+    context_window_tokens: number | null;
+    auto_compact_token_limit: number | null;
+    reasoning_summary_support: 'auto' | 'supported' | 'unsupported';
+    service_tier: string | null;
+    request_max_retries: number | null;
+    stream_max_retries: number | null;
+    stream_idle_timeout_ms: number | null;
+    request_settings: { protocol: 'openai_responses' } | { protocol: 'openai_chat_completions'; temperature: number | null; top_p: number | null; max_completion_tokens: number | null } | { protocol: 'anthropic_messages'; temperature: number | null; top_p: number | null; max_tokens: number | null };
+  };
   codex_subagents: Array<{
     name: string;
     description: string;
     developer_instructions: string;
-    model_connection_id: string | null;
-    reasoning_effort: AgentFixture['reasoning_effort'] | null;
+    model_selection: AgentFixture['model_selection'];
+    model_settings_override: Record<string, unknown>;
     enabled?: boolean;
     disabled_reason?: string | null;
   }>;
@@ -66,10 +78,17 @@ const globalModelId = '21000000-0000-0000-0000-000000000001';
 const personalModelId = '21000000-0000-0000-0000-000000000002';
 const modelOptions = {
   items: [
-    { id: globalModelId, name: 'Global GPT', model_id: 'gpt-global', scope: 'global', status: 'enabled' },
-    { id: personalModelId, name: 'Personal GPT', model_id: 'gpt-personal', scope: 'personal', status: 'enabled' }
+    { connection_id: globalModelId, connection_name: 'Global GPT', model_id: 'gpt-global', api_type: 'openai_responses', scope: 'global', status: 'enabled' },
+    { connection_id: personalModelId, connection_name: 'Personal GPT', model_id: 'gpt-personal', api_type: 'openai_chat_completions', scope: 'personal', status: 'enabled' }
   ],
-  system_default_model_connection_id: globalModelId
+  system_default: { connection_id: globalModelId, model_id: 'gpt-global' }
+};
+
+const automaticModelSettings: AgentFixture['model_settings'] = {
+  reasoning_effort: 'default', reasoning_summary: 'default', verbosity: 'default',
+  context_window_tokens: null, auto_compact_token_limit: null, reasoning_summary_support: 'auto',
+  service_tier: null, request_max_retries: null, stream_max_retries: null, stream_idle_timeout_ms: null,
+  request_settings: { protocol: 'openai_responses' }
 };
 
 function agentFixture(overrides: Partial<AgentFixture> & Pick<AgentFixture, 'id' | 'name'>): AgentFixture {
@@ -78,8 +97,8 @@ function agentFixture(overrides: Partial<AgentFixture> & Pick<AgentFixture, 'id'
     visibility: 'private',
     public_to: [],
     runtime_id: null,
-    default_model_connection_id: null,
-    reasoning_effort: 'default',
+    model_selection: null,
+    model_settings: automaticModelSettings,
     codex_subagents: [],
     owner_id: currentUser.id,
     is_owner: true,
@@ -282,15 +301,16 @@ test('create Agent modal traps focus, restores its opener, redacts errors, and s
   dialog = page.getByRole('dialog', { name: 'Create Agent' });
   await dialog.getByLabel('Name', { exact: true }).fill(created.name);
   await dialog.getByLabel('Instructions').fill('Created through the modal test.');
-  await expect(dialog.getByLabel('Default model connection')).toHaveValue(globalModelId);
+  await expect(dialog.getByLabel('Model API Connection and model')).toHaveValue(`${globalModelId}\ngpt-global`);
   await dialog.getByLabel('Reasoning effort').selectOption('high');
   await dialog.getByRole('button', { name: 'Add subagent' }).click();
   const subagentDialog = page.getByRole('dialog', { name: 'Add subagent' });
   await subagentDialog.getByLabel('Subagent name').fill('reviewer');
   await subagentDialog.getByLabel('Description').fill('Reviews the current change.');
   await subagentDialog.getByRole('textbox', { name: 'Developer instructions' }).fill('Review the diff and report blocking findings.');
-  await subagentDialog.getByLabel('Model override').selectOption(personalModelId);
-  await subagentDialog.getByLabel('Reasoning override').selectOption('max');
+  await subagentDialog.getByLabel('Model override').selectOption(`${personalModelId}\ngpt-personal`);
+  await subagentDialog.getByLabel('Reasoning effort Setting source').selectOption('override');
+  await subagentDialog.locator('label').filter({ hasText: 'Reasoning effort' }).locator('select').nth(1).selectOption('max');
   await subagentDialog.getByRole('button', { name: 'Save changes' }).click();
   await expect(dialog.getByRole('table', { name: 'Codex subagents' })).toContainText('reviewer');
   await dialog.getByLabel('Visibility').selectOption('public_to');
@@ -314,14 +334,14 @@ test('create Agent modal traps focus, restores its opener, redacts errors, and s
   await expect(page).toHaveURL(`/agents/${created.id}`);
   expect(createRequests).toBe(2);
   expect(createBodies[1]).toMatchObject({
-    default_model_connection_id: globalModelId,
-    reasoning_effort: 'high',
+    model_selection: { connection_id: globalModelId, model_id: 'gpt-global' },
+    model_settings: expect.objectContaining({ reasoning_effort: 'high' }),
     codex_subagents: [{
       name: 'reviewer',
       description: 'Reviews the current change.',
       developer_instructions: 'Review the diff and report blocking findings.',
-      model_connection_id: personalModelId,
-      reasoning_effort: 'max'
+      model_selection: { connection_id: personalModelId, model_id: 'gpt-personal' },
+      model_settings_override: { reasoning_effort: 'max' }
     }]
   });
 });
@@ -400,7 +420,6 @@ type DetailApiOptions = {
   users?: typeof currentUser[];
   onPatch?: (route: Route, body: Record<string, unknown>) => Promise<void>;
   onDelete?: (route: Route) => Promise<void>;
-  onRun?: (route: Route, body: Record<string, unknown>) => Promise<void>;
   onRuns?: (route: Route, requestCount: number) => Promise<void>;
 };
 
@@ -429,16 +448,6 @@ async function installDetailApi(page: Page, options: DetailApiOptions = {}) {
       runsRequestCount += 1;
       if (options.onRuns) return options.onRuns(route, runsRequestCount);
       return route.fulfill({ json: options.runs ?? [] });
-    }
-    if (path === `/api/agents/${agent.id}/runs` && request.method() === 'POST') {
-      const body = request.postDataJSON() as Record<string, unknown>;
-      if (options.onRun) return options.onRun(route, body);
-      return route.fulfill({ json: {
-        id: '60000000-0000-0000-0000-000000000001', agent_id: agent.id, automation_id: null,
-        integration_session_id: null, parent_run_id: null, runtime_id: null, status: 'completed',
-        initial_message: body.message, session_id: null, work_dir_ref: null, source: 'console',
-        created_at: '2026-07-11T05:00:00.000Z', updated_at: '2026-07-11T05:00:00.000Z'
-      } });
     }
     if (path === '/api/runtimes') return route.fulfill({ json: runtimes });
     if (path === '/api/skills') return route.fulfill({ json: detailSkills });
@@ -479,14 +488,14 @@ test('agent detail uses the six-tab IA and stacks the inspector first on mobile'
 test('models panel edits the Agent default, reasoning, and Codex subagent definitions', async ({ page }) => {
   const agent = ownerDetail({
     id: '50000000-0000-0000-0000-000000000055',
-    default_model_connection_id: globalModelId,
-    reasoning_effort: 'medium',
+    model_selection: { connection_id: globalModelId, model_id: 'gpt-global' },
+    model_settings: { ...automaticModelSettings, reasoning_effort: 'medium' },
     codex_subagents: [{
       name: 'reviewer',
       description: 'Reviews the current change.',
       developer_instructions: 'Review the diff.',
-      model_connection_id: null,
-      reasoning_effort: null
+      model_selection: null,
+      model_settings_override: {}
     }]
   });
   const patches: Record<string, unknown>[] = [];
@@ -501,29 +510,33 @@ test('models panel edits the Agent default, reasoning, and Codex subagent defini
   await page.goto(`/agents/${agent.id}`);
   await page.getByRole('tab', { name: 'Models' }).click();
   const panel = page.getByRole('tabpanel', { name: 'Models' });
-  await expect(panel.getByLabel('Default model connection')).toHaveValue(globalModelId);
+  await expect(panel.getByLabel('Model API Connection and model')).toHaveValue(`${globalModelId}\ngpt-global`);
   await expect(panel.getByLabel('Reasoning effort')).toHaveValue('medium');
+  await expect(panel.getByLabel('Reasoning effort').locator('option')).toHaveText([
+    'default', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'
+  ]);
   await expect(panel.getByRole('table', { name: 'Codex subagents' })).toContainText('reviewer');
 
   await panel.getByRole('button', { name: 'Edit subagent: reviewer' }).click();
   const dialog = page.getByRole('dialog', { name: 'Edit subagent: reviewer' });
   await dialog.getByLabel('Developer instructions').fill('Review the diff and identify release blockers.');
-  await dialog.getByLabel('Model override').selectOption(personalModelId);
-  await dialog.getByLabel('Reasoning override').selectOption('ultra');
+  await dialog.getByLabel('Model override').selectOption(`${personalModelId}\ngpt-personal`);
+  await dialog.getByLabel('Reasoning effort Setting source').selectOption('override');
+  await dialog.locator('label').filter({ hasText: 'Reasoning effort' }).locator('select').nth(1).selectOption('ultra');
   await dialog.getByRole('button', { name: 'Save changes' }).click();
 
-  await panel.getByLabel('Default model connection').selectOption(personalModelId);
+  await panel.getByLabel('Model API Connection and model').selectOption(`${personalModelId}\ngpt-personal`);
   await panel.getByLabel('Reasoning effort').selectOption('max');
   await panel.getByRole('button', { name: 'Save agent' }).click();
   await expect.poll(() => patches.length).toBe(1);
   expect(patches[0]).toMatchObject({
-    default_model_connection_id: personalModelId,
-    reasoning_effort: 'max',
+    model_selection: { connection_id: personalModelId, model_id: 'gpt-personal' },
+    model_settings: expect.objectContaining({ reasoning_effort: 'max' }),
     codex_subagents: [{
       name: 'reviewer',
       developer_instructions: 'Review the diff and identify release blockers.',
-      model_connection_id: personalModelId,
-      reasoning_effort: 'ultra'
+      model_selection: { connection_id: personalModelId, model_id: 'gpt-personal' },
+      model_settings_override: { reasoning_effort: 'ultra' }
     }]
   });
   expect(patches[0]).not.toHaveProperty('model_policy');
@@ -786,45 +799,25 @@ test('agent detail keeps tab drafts mounted and blocks dirty or pending navigati
   await expect(instructionsPanel.getByRole('button', { name: 'Save agent' })).toBeDisabled();
 });
 
-test('config save does not invalidate a run POST that is still pending', async ({ page }) => {
+test('agent activity is read-only run history', async ({ page }) => {
   const agent = ownerDetail({ id: '50000000-0000-0000-0000-000000000042' });
-  let releaseRun!: () => void;
-  const heldRun = new Promise<void>((resolve) => { releaseRun = resolve; });
-  let runStarted!: () => void;
-  const started = new Promise<void>((resolve) => { runStarted = resolve; });
-  await installDetailApi(page, {
-    agent,
-    onPatch: async (route, body) => route.fulfill({ json: { ...agent, ...body, updated_at: '2026-07-11T08:00:00.000Z' } }),
-    onRun: async (route, body) => {
-      runStarted();
-      await heldRun;
-      await route.fulfill({ json: {
-        id: '60000000-0000-0000-0000-000000000042', agent_id: agent.id, automation_id: null,
-        integration_session_id: null, parent_run_id: null, runtime_id: null, status: 'completed',
-        initial_message: body.message, session_id: null, work_dir_ref: null, source: 'console',
-        created_at: agent.created_at, updated_at: agent.updated_at
-      } });
-    }
-  });
+  const historicalRun = {
+    id: '60000000-0000-0000-0000-000000000042', agent_id: agent.id, automation_id: null,
+    integration_session_id: null, parent_run_id: null, runtime_id: null, status: 'completed',
+    initial_message: 'Historical run from a previous conversation', session_id: 'session-history',
+    work_dir_ref: null, source: 'console', created_at: agent.created_at, updated_at: agent.updated_at
+  };
+  await installDetailApi(page, { agent, runs: [historicalRun] });
   await page.goto(`/agents/${agent.id}`);
   const activity = page.getByRole('tabpanel', { name: 'Activity' });
-  await activity.getByLabel('Message').fill('Run while configuration saves');
-  await activity.getByRole('button', { name: 'Start run' }).click();
-  await started;
-
-  await page.getByRole('tab', { name: 'Instructions' }).click();
-  const instructions = page.getByRole('tabpanel', { name: 'Instructions' });
-  await instructions.getByRole('textbox', { name: 'Instructions' }).fill('Configuration saved during run POST.');
-  await instructions.getByRole('button', { name: 'Save agent' }).click();
-  await expect(instructions.getByRole('button', { name: 'Save agent' })).toBeDisabled();
-
-  releaseRun();
-  await page.getByRole('tab', { name: 'Activity' }).click();
+  await expect(activity.getByText(historicalRun.initial_message)).toBeVisible();
   await expect(activity.getByText('Console result')).toBeVisible();
-  await expect(activity.getByRole('button', { name: 'Start run' })).toBeEnabled();
+  await expect(activity.getByRole('button', { name: 'Start run' })).toHaveCount(0);
+  await expect(activity.getByLabel('Message', { exact: true })).toHaveCount(0);
+  await expect(activity.getByRole('checkbox', { name: 'Continue selected thread' })).toHaveCount(0);
 });
 
-test('agent detail controls match manage, administer, and invoke permissions across the six tabs', async ({ page }) => {
+test('agent detail controls match manage and administer permissions while activity remains read-only', async ({ page }) => {
   const cases = [
     { id: '50000000-0000-0000-0000-000000000011', owner: true, manage: true, administer: true, invoke: true },
     { id: '50000000-0000-0000-0000-000000000012', owner: false, manage: true, administer: true, invoke: false },
@@ -845,11 +838,12 @@ test('agent detail controls match manage, administer, and invoke permissions acr
     await page.goto(`/agents/${agent.id}`);
     await expect(page.getByRole('tablist', { name: 'Agent detail sections' }).getByRole('tab')).toHaveCount(6);
     await expect(page.getByRole('button', { name: 'Delete agent', exact: true })).toHaveCount(permission.administer ? 1 : 0);
-    await expect(page.getByRole('button', { name: 'Start run' })).toHaveCount(permission.invoke ? 1 : 0);
+    await expect(page.getByRole('tabpanel', { name: 'Activity' }).getByRole('button', { name: 'Start run' })).toHaveCount(0);
+    await expect(page.getByRole('tabpanel', { name: 'Activity' }).getByLabel('Message', { exact: true })).toHaveCount(0);
     await page.getByRole('tab', { name: 'Instructions' }).click();
     await expect(page.getByRole('tabpanel', { name: 'Instructions' }).getByLabel('Name', { exact: true })).toHaveCount(permission.manage ? 1 : 0);
     await page.getByRole('tab', { name: 'Models' }).click();
-    await expect(page.getByRole('tabpanel', { name: 'Models' }).getByLabel('Default model connection')).toHaveCount(permission.manage ? 1 : 0);
+    await expect(page.getByRole('tabpanel', { name: 'Models' }).getByLabel('Model API Connection and model')).toHaveCount(permission.manage ? 1 : 0);
     await page.getByRole('tab', { name: 'Skills' }).click();
     await expect(page.getByRole('tabpanel', { name: 'Skills' }).getByRole('button', { name: 'Edit managed skills' })).toHaveCount(permission.manage ? 1 : 0);
     await page.getByRole('tab', { name: 'MCP', exact: true }).click();
@@ -859,11 +853,18 @@ test('agent detail controls match manage, administer, and invoke permissions acr
   }
 });
 
-test('agent tabs keep real instructions, access, run, and console requests', async ({ page }) => {
+test('agent tabs keep real instructions, access, and read-only activity history', async ({ page }) => {
   const patches: Record<string, unknown>[] = [];
   const agent = ownerDetail();
+  const historicalRun = {
+    id: '60000000-0000-0000-0000-000000000043', agent_id: agent.id, automation_id: null,
+    integration_session_id: null, parent_run_id: null, runtime_id: null, status: 'completed',
+    initial_message: 'Existing activity history', session_id: 'history-session', work_dir_ref: null,
+    source: 'console', created_at: agent.created_at, updated_at: agent.updated_at
+  };
   await installDetailApi(page, {
     agent,
+    runs: [historicalRun],
     onPatch: async (route, body) => {
       patches.push(body);
       await route.fulfill({ json: { ...agent, ...body, updated_at: '2026-07-11T07:00:00.000Z' } });
@@ -885,9 +886,9 @@ test('agent tabs keep real instructions, access, run, and console requests', asy
 
   await page.getByRole('tab', { name: 'Activity' }).click();
   panel = page.getByRole('tabpanel', { name: 'Activity' });
-  await panel.getByLabel('Message').fill('Run from the detail tabs');
-  await panel.getByRole('button', { name: 'Start run' }).click();
+  await expect(panel.getByText(historicalRun.initial_message)).toBeVisible();
   await expect(panel.getByText('Console result')).toBeVisible();
+  await expect(panel.getByRole('button', { name: 'Start run' })).toHaveCount(0);
 
   expect(patches).toHaveLength(2);
   expect(patches[0]).toMatchObject({ name: 'Edited detail agent', instructions: 'Edited instructions.' });
@@ -963,36 +964,6 @@ test('dirty detail confirms browser back and logout before leaving', async ({ pa
   await page.getByRole('button', { name: 'Log out' }).click();
   await expect(page).toHaveURL('/login');
   expect(logoutRequests).toBe(1);
-});
-
-test('run submission is independently serialized without locking configuration tabs', async ({ page }) => {
-  const agent = ownerDetail({ id: '50000000-0000-0000-0000-000000000041' });
-  let runRequests = 0;
-  let releaseRun!: () => void;
-  const heldRun = new Promise<void>((resolve) => { releaseRun = resolve; });
-  await installDetailApi(page, {
-    agent,
-    onRun: async (route, body) => {
-      runRequests += 1;
-      await heldRun;
-      await route.fulfill({ json: {
-        id: '60000000-0000-0000-0000-000000000041', agent_id: agent.id, automation_id: null,
-        integration_session_id: null, parent_run_id: null, runtime_id: null, status: 'completed',
-        initial_message: body.message, session_id: null, work_dir_ref: null, source: 'console',
-        created_at: agent.created_at, updated_at: agent.updated_at
-      } });
-    }
-  });
-  await page.goto(`/agents/${agent.id}`);
-  const activity = page.getByRole('tabpanel', { name: 'Activity' });
-  await activity.getByLabel('Message').fill('Serialized run');
-  await activity.getByRole('button', { name: 'Start run' }).click();
-  await expect(activity.getByRole('button', { name: 'Starting...' })).toBeDisabled();
-  await expect(page.getByRole('tab', { name: 'Instructions' })).toBeEnabled();
-  await expect.poll(() => runRequests).toBe(1);
-  releaseRun();
-  await expect(activity.getByText('Console result')).toBeVisible();
-  expect(runRequests).toBe(1);
 });
 
 test('agent pages localize and stay overflow-free at 1280, 1440, and 390 pixels', async ({ page }) => {

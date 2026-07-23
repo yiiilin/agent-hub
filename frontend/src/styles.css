@@ -337,6 +337,16 @@ textarea {
 .agent-create-modal .modal-header .icon-button { flex: 0 0 auto; }
 .agent-model-fields { min-width: 0; display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(180px, .65fr); gap: 12px; }
 .agent-model-fields > label { min-width: 0; }
+.agent-model-settings { min-width: 0; display: grid; gap: 12px; }
+.agent-model-settings fieldset { min-width: 0; margin: 0; border: 1px solid #d8e2ed; border-radius: 6px; padding: 12px; background: #fbfcfe; }
+.agent-model-settings legend { padding: 0 5px; color: #4f6075; font-size: 12px; font-weight: 700; }
+.agent-model-setting-grid { min-width: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.agent-model-setting-grid > label, .agent-model-settings > fieldset > label { min-width: 0; display: grid; gap: 5px; color: #536276; font-size: 13px; font-weight: 700; }
+.agent-setting-effective { min-width: 0; color: #738096; font-size: 11px; font-weight: 400; line-height: 1.35; overflow-wrap: anywhere; }
+.agent-setting-note { margin: 0; color: #68768a; font-size: 13px; line-height: 1.5; }
+.agent-override-controls { min-width: 0; display: grid; grid-template-columns: minmax(120px, .75fr) minmax(0, 1fr); gap: 8px; }
+.agent-override-controls:has(.agent-override-mode:only-child) { grid-template-columns: minmax(0, 1fr); }
+.agent-subagent-settings { gap: 10px; }
 .agent-model-options-error { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .agent-subagent-section { min-width: 0; display: grid; gap: 8px; }
 .agent-subagent-heading { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -1232,6 +1242,8 @@ textarea {
   .agent-detail-header .secondary { width: auto; flex: 0 0 auto; }
   .agent-panels > [role="tabpanel"] { padding: 14px 12px; }
   .agent-model-fields { grid-template-columns: minmax(0, 1fr); }
+  .agent-model-setting-grid { grid-template-columns: minmax(0, 1fr); }
+  .agent-override-controls { grid-template-columns: minmax(0, 1fr); }
   .agent-subagent-heading { align-items: flex-start; }
   .agent-subagent-heading .secondary { width: auto; }
   .agent-model-summary > div { grid-template-columns: minmax(0, 1fr); gap: 3px; }

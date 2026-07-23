@@ -55,9 +55,9 @@ model_content() {
     echo "missing model proxy base_url" >&2
     return 1
   fi
-  connection_id="$(provider_value x-agent-hub-model-connection-id)"
-  if [ -z "$connection_id" ]; then
-    echo "missing model proxy connection id" >&2
+  binding_id="$(provider_value x-agent-hub-model-binding-id)"
+  if [ -z "$binding_id" ]; then
+    echo "missing model proxy binding id" >&2
     return 1
   fi
 
@@ -67,13 +67,25 @@ model_content() {
   }')"
   response="$(curl -fsS \
     -H 'Content-Type: application/json' \
-    -H "x-agent-hub-model-connection-id: ${connection_id}" \
+    -H "x-agent-hub-model-binding-id: ${binding_id}" \
     --data-binary "$request_body" \
     "${base_url}/responses")"
   content="$(printf '%s\n' "$response" | jq -er '
-    .output_text | select(type == "string" and length > 0)
+    if ((.output_text? | type) == "string" and (.output_text | length) > 0) then
+      .output_text
+    else
+      [
+        (.output? // [])[]?
+        | (.content? // [])[]?
+        | select(.type == "output_text")
+        | .text
+        | select(type == "string")
+      ]
+      | join("")
+    end
+    | select(type == "string" and length > 0)
   ' 2>/dev/null)" || {
-    echo "missing output_text from model proxy" >&2
+    echo "missing output text from model proxy" >&2
     return 1
   }
   printf '%s\n' "$content"

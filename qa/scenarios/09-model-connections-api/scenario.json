@@ -1,5 +1,5 @@
 {
-  "name": "Model Connection, Responses accounting, and deletion lifecycle",
+  "name": "Model API Connections, immutable bindings, and retained accounting",
   "type": "api",
   "timeout_ms": 300000,
   "covers": [
@@ -11,5 +11,5 @@
     "MDL-006",
     "MDL-007"
   ],
-  "restores": ["system_default_model_connection"]
+  "restores": ["system_default_model_selection"]
 }

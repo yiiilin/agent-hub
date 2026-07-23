@@ -34,12 +34,71 @@ export type ReasoningEffort =
   | 'max'
   | 'ultra';
 
+export type ModelSelection = {
+  connection_id: string;
+  model_id: string;
+};
+
+export type ModelReasoningSummary = 'default' | 'auto' | 'concise' | 'detailed' | 'none';
+
+export type ModelVerbosity = 'default' | 'low' | 'medium' | 'high';
+
+export type ModelReasoningSummarySupport = 'auto' | 'supported' | 'unsupported';
+
+export type ModelUpstreamProtocol =
+  | 'openai_responses'
+  | 'openai_chat_completions'
+  | 'anthropic_messages';
+
+export type ModelRequestSettings =
+  | { protocol: 'openai_responses' }
+  | {
+      protocol: 'openai_chat_completions';
+      temperature: number | null;
+      top_p: number | null;
+      max_completion_tokens: number | null;
+    }
+  | {
+      protocol: 'anthropic_messages';
+      temperature: number | null;
+      top_p: number | null;
+      max_tokens: number | null;
+    };
+
+export type AgentModelSettings = {
+  reasoning_effort: ReasoningEffort;
+  reasoning_summary: ModelReasoningSummary;
+  verbosity: ModelVerbosity;
+  context_window_tokens: number | null;
+  auto_compact_token_limit: number | null;
+  reasoning_summary_support: ModelReasoningSummarySupport;
+  service_tier: string | null;
+  request_max_retries: number | null;
+  stream_max_retries: number | null;
+  stream_idle_timeout_ms: number | null;
+  request_settings: ModelRequestSettings;
+};
+
+export type AgentModelSettingsOverride = Partial<{
+  reasoning_effort: ReasoningEffort | null;
+  reasoning_summary: ModelReasoningSummary | null;
+  verbosity: ModelVerbosity | null;
+  context_window_tokens: number | null;
+  auto_compact_token_limit: number | null;
+  reasoning_summary_support: ModelReasoningSummarySupport | null;
+  service_tier: string | null;
+  request_max_retries: number | null;
+  stream_max_retries: number | null;
+  stream_idle_timeout_ms: number | null;
+  request_settings: ModelRequestSettings | null;
+}>;
+
 export type CodexSubagentDefinition = {
   name: string;
   description: string;
   developer_instructions: string;
-  model_connection_id: string | null;
-  reasoning_effort: ReasoningEffort | null;
+  model_selection: ModelSelection | null;
+  model_settings_override: AgentModelSettingsOverride;
   enabled?: boolean;
   disabled_reason?: string | null;
 };
@@ -51,8 +110,8 @@ export type Agent = {
   visibility: string;
   public_to: string[];
   runtime_id: string | null;
-  default_model_connection_id: string | null;
-  reasoning_effort: ReasoningEffort;
+  model_selection: ModelSelection | null;
+  model_settings: AgentModelSettings;
   codex_subagents: CodexSubagentDefinition[];
   owner_id: string;
   is_owner: boolean;
@@ -360,57 +419,16 @@ export type ModelConnectionScope = 'global' | 'personal';
 
 export type ModelConnectionStatus = 'enabled' | 'disabled';
 
-export type ModelUpstreamProtocol =
-  | 'openai_responses'
-  | 'openai_chat_completions'
-  | 'anthropic_messages';
-
-export type ModelReasoningSummary = 'default' | 'auto' | 'concise' | 'detailed' | 'none';
-
-export type ModelVerbosity = 'default' | 'low' | 'medium' | 'high';
-
-export type ModelReasoningSummarySupport = 'auto' | 'supported' | 'unsupported';
-
-export type ModelConnectionParameters = {
-  reasoning_effort: ReasoningEffort;
-  reasoning_summary: ModelReasoningSummary;
-  verbosity: ModelVerbosity;
-  context_window_tokens: number | null;
-  auto_compact_token_limit: number | null;
-  reasoning_summary_support: ModelReasoningSummarySupport;
-  service_tier: string | null;
-  request_max_retries: number | null;
-  stream_max_retries: number | null;
-  stream_idle_timeout_ms: number | null;
-};
-
-export type ModelConnectionRequestParameters =
-  | { protocol: 'openai_responses' }
-  | {
-      protocol: 'openai_chat_completions';
-      temperature: number | null;
-      top_p: number | null;
-      max_completion_tokens: number | null;
-    }
-  | {
-      protocol: 'anthropic_messages';
-      temperature: number | null;
-      top_p: number | null;
-      max_tokens: number | null;
-    };
-
 export type ModelConnection = {
   id: string;
   owner_id: string | null;
   scope: ModelConnectionScope;
   name: string;
   base_url: string;
-  model_id: string;
-  upstream_protocol: ModelUpstreamProtocol;
-  parameters: ModelConnectionParameters;
-  request_parameters: ModelConnectionRequestParameters;
+  api_type: ModelUpstreamProtocol;
+  allowed_model_ids: string[];
   status: ModelConnectionStatus;
-  is_system_default: boolean;
+  has_api_key: boolean;
   created_at: string;
   updated_at: string;
 };
@@ -419,10 +437,8 @@ export type CreateModelConnectionRequest = {
   scope: ModelConnectionScope;
   name: string;
   base_url: string;
-  model_id: string;
-  upstream_protocol: ModelUpstreamProtocol;
-  parameters: ModelConnectionParameters;
-  request_parameters: ModelConnectionRequestParameters;
+  api_type: ModelUpstreamProtocol;
+  allowed_model_ids: string[];
   api_key: string;
 };
 
@@ -431,8 +447,8 @@ export type CreateConfiguredAgentRequest = {
   instructions: string;
   visibility: string;
   public_to: string[];
-  default_model_connection_id: string | null;
-  reasoning_effort: ReasoningEffort;
+  model_selection: ModelSelection | null;
+  model_settings: AgentModelSettings;
   codex_subagents: CodexSubagentDefinition[];
 };
 
@@ -440,27 +456,22 @@ export type UpdateModelConnectionRequest = Pick<
   CreateModelConnectionRequest,
   | 'name'
   | 'base_url'
-  | 'model_id'
-  | 'upstream_protocol'
-  | 'parameters'
-  | 'request_parameters'
+  | 'api_type'
+  | 'allowed_model_ids'
 > & { api_key?: string };
 
-export type ModelConnectionOption = Pick<
-  ModelConnection,
-  | 'id'
-  | 'name'
-  | 'model_id'
-  | 'upstream_protocol'
-  | 'parameters'
-  | 'request_parameters'
-  | 'scope'
-  | 'status'
->;
+export type ModelConnectionOption = {
+  connection_id: string;
+  connection_name: string;
+  model_id: string;
+  api_type: ModelUpstreamProtocol;
+  scope: ModelConnectionScope;
+  status: ModelConnectionStatus;
+};
 
 export type ModelConnectionOptions = {
   items: ModelConnectionOption[];
-  system_default_model_connection_id: string | null;
+  system_default: ModelSelection | null;
 };
 
 export type ModelConnectionTestResult = {
@@ -468,10 +479,12 @@ export type ModelConnectionTestResult = {
   status_code: number | null;
   error_code: string | null;
   message: string | null;
+  response_text: string | null;
+  response_time_ms: number;
 };
 
-export type SystemDefaultModelConnection = {
-  model_connection_id: string | null;
+export type SystemDefaultModelSelection = {
+  selection: ModelSelection | null;
 };
 
 export type ModelConnectionSnapshot = {
@@ -479,7 +492,7 @@ export type ModelConnectionSnapshot = {
   scope: ModelConnectionScope;
   name: string;
   model_id: string;
-  upstream_protocol: ModelUpstreamProtocol;
+  api_type: ModelUpstreamProtocol;
 };
 
 export type ModelAgentSnapshot = {
@@ -865,9 +878,10 @@ export const api = {
   updateModelConnection: (
     modelConnectionId: string,
     connection: UpdateModelConnectionRequest,
+    force = false,
     signal?: AbortSignal
-  ) => request<ModelConnection>(`/api/model-connections/${modelConnectionId}`, {
-    method: 'PATCH',
+  ) => request<ModelConnection>(`/api/model-connections/${modelConnectionId}${force ? '?force=true' : ''}`, {
+    method: 'PUT',
     body: JSON.stringify(connection),
     signal
   }),
@@ -880,9 +894,10 @@ export const api = {
     body: JSON.stringify({ status }),
     signal
   }),
-  testModelConnection: (modelConnectionId: string, signal?: AbortSignal) =>
+  testModelConnection: (modelConnectionId: string, modelId: string, message: string, signal?: AbortSignal) =>
     request<ModelConnectionTestResult>(`/api/model-connections/${modelConnectionId}/test`, {
       method: 'POST',
+      body: JSON.stringify({ model_id: modelId, message }),
       signal
     }),
   deleteModelConnection: (modelConnectionId: string, signal?: AbortSignal) =>
@@ -895,14 +910,14 @@ export const api = {
       method: 'POST',
       signal
     }),
-  systemDefaultModelConnection: (signal?: AbortSignal) =>
-    request<SystemDefaultModelConnection>('/api/model-connections/system-default', { signal }),
-  setSystemDefaultModelConnection: (
-    modelConnectionId: string | null,
+  systemDefaultModelSelection: (signal?: AbortSignal) =>
+    request<SystemDefaultModelSelection>('/api/model-connections/system-default', { signal }),
+  setSystemDefaultModelSelection: (
+    selection: ModelSelection | null,
     signal?: AbortSignal
-  ) => request<SystemDefaultModelConnection>('/api/model-connections/system-default', {
+  ) => request<SystemDefaultModelSelection>('/api/model-connections/system-default', {
     method: 'PUT',
-    body: JSON.stringify({ model_connection_id: modelConnectionId }),
+    body: JSON.stringify({ selection }),
     signal
   }),
   modelUsageSummary: (query: ModelLedgerQuery = {}, signal?: AbortSignal) =>
@@ -936,8 +951,8 @@ export const api = {
         visibility: agent.visibility,
         public_to: agent.public_to,
         runtime_id: agent.runtime_id,
-        default_model_connection_id: agent.default_model_connection_id,
-        reasoning_effort: agent.reasoning_effort,
+        model_selection: agent.model_selection,
+        model_settings: agent.model_settings,
         codex_subagents: agent.codex_subagents,
         sandbox_policy: agent.sandbox_policy,
         managed_skill_ids: agent.managed_skill_ids,

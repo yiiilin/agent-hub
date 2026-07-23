@@ -412,37 +412,275 @@ BEGIN
 END
 $$;
 
-CREATE FUNCTION public.validate_agent_default_model_connection() RETURNS trigger
+CREATE FUNCTION public.validate_allowed_model_ids(model_ids text[]) RETURNS boolean
+    LANGUAGE plpgsql IMMUTABLE
+    AS $$
+DECLARE
+    model_id text;
+    seen text[] := ARRAY[]::text[];
+BEGIN
+    IF model_ids IS NULL OR cardinality(model_ids) NOT BETWEEN 1 AND 256 THEN
+        RETURN false;
+    END IF;
+    FOREACH model_id IN ARRAY model_ids LOOP
+        IF model_id IS NULL
+           OR model_id <> btrim(model_id)
+           OR char_length(model_id) NOT BETWEEN 1 AND 255
+           OR model_id ~ '[[:cntrl:]]'
+           OR model_id = ANY(seen) THEN
+            RETURN false;
+        END IF;
+        seen := array_append(seen, model_id);
+    END LOOP;
+    RETURN true;
+END
+$$;
+
+CREATE FUNCTION public.jsonb_optional_number_in_range(
+    settings jsonb,
+    field_name text,
+    minimum numeric,
+    maximum numeric,
+    integer_only boolean DEFAULT false
+) RETURNS boolean
+    LANGUAGE plpgsql IMMUTABLE
+    AS $$
+DECLARE
+    number_value numeric;
+BEGIN
+    IF NOT settings ? field_name OR settings->field_name = 'null'::jsonb THEN
+        RETURN true;
+    END IF;
+    IF jsonb_typeof(settings->field_name) <> 'number' THEN
+        RETURN false;
+    END IF;
+    number_value := (settings->>field_name)::numeric;
+    RETURN number_value BETWEEN minimum AND maximum
+       AND (NOT integer_only OR trunc(number_value) = number_value);
+END
+$$;
+
+CREATE FUNCTION public.validate_model_request_settings(settings jsonb) RETURNS boolean
+    LANGUAGE plpgsql IMMUTABLE
+    AS $$
+DECLARE
+    protocol text;
+BEGIN
+    IF settings IS NULL OR jsonb_typeof(settings) <> 'object' THEN
+        RETURN false;
+    END IF;
+    protocol := settings->>'protocol';
+    IF protocol = 'openai_responses' THEN
+        RETURN settings = '{"protocol":"openai_responses"}'::jsonb;
+    ELSIF protocol = 'openai_chat_completions' THEN
+        RETURN settings - ARRAY[
+                   'protocol', 'temperature', 'top_p', 'max_completion_tokens'
+               ] = '{}'::jsonb
+           AND public.jsonb_optional_number_in_range(settings, 'temperature', 0, 2)
+           AND public.jsonb_optional_number_in_range(settings, 'top_p', 0, 1)
+           AND public.jsonb_optional_number_in_range(
+                   settings, 'max_completion_tokens', 1, 9223372036854775807, true
+               );
+    ELSIF protocol = 'anthropic_messages' THEN
+        RETURN settings - ARRAY[
+                   'protocol', 'temperature', 'top_p', 'max_tokens'
+               ] = '{}'::jsonb
+           AND public.jsonb_optional_number_in_range(settings, 'temperature', 0, 1)
+           AND public.jsonb_optional_number_in_range(settings, 'top_p', 0, 1)
+           AND public.jsonb_optional_number_in_range(
+                   settings, 'max_tokens', 1, 9223372036854775807, true
+               )
+           AND NOT (
+               jsonb_typeof(settings->'temperature') = 'number'
+               AND jsonb_typeof(settings->'top_p') = 'number'
+           );
+    END IF;
+    RETURN false;
+END
+$$;
+
+CREATE FUNCTION public.validate_agent_model_settings(settings jsonb) RETURNS boolean
+    LANGUAGE plpgsql IMMUTABLE
+    AS $$
+BEGIN
+    IF settings IS NULL
+       OR jsonb_typeof(settings) <> 'object'
+       OR NOT settings ?& ARRAY[
+           'reasoning_effort', 'reasoning_summary', 'verbosity',
+           'context_window_tokens', 'auto_compact_token_limit',
+           'reasoning_summary_support', 'service_tier',
+           'request_max_retries', 'stream_max_retries',
+           'stream_idle_timeout_ms', 'request_settings'
+       ]
+       OR settings - ARRAY[
+           'reasoning_effort', 'reasoning_summary', 'verbosity',
+           'context_window_tokens', 'auto_compact_token_limit',
+           'reasoning_summary_support', 'service_tier',
+           'request_max_retries', 'stream_max_retries',
+           'stream_idle_timeout_ms', 'request_settings'
+       ] <> '{}'::jsonb THEN
+        RETURN false;
+    END IF;
+    RETURN settings->>'reasoning_effort' = ANY(ARRAY[
+               'default', 'none', 'minimal', 'low', 'medium', 'high',
+               'xhigh', 'max', 'ultra'
+           ])
+       AND settings->>'reasoning_summary' = ANY(ARRAY[
+               'default', 'auto', 'concise', 'detailed', 'none'
+           ])
+       AND settings->>'verbosity' = ANY(ARRAY['default', 'low', 'medium', 'high'])
+       AND settings->>'reasoning_summary_support' = ANY(ARRAY[
+               'auto', 'supported', 'unsupported'
+           ])
+       AND public.jsonb_optional_number_in_range(
+               settings, 'context_window_tokens', 1, 9223372036854775807, true
+           )
+       AND public.jsonb_optional_number_in_range(
+               settings, 'auto_compact_token_limit', 1, 9223372036854775807, true
+           )
+       AND (
+           jsonb_typeof(settings->'context_window_tokens') <> 'number'
+           OR jsonb_typeof(settings->'auto_compact_token_limit') <> 'number'
+           OR (settings->>'auto_compact_token_limit')::numeric
+                <= (settings->>'context_window_tokens')::numeric
+       )
+       AND (
+           settings->'service_tier' = 'null'::jsonb
+           OR (
+               jsonb_typeof(settings->'service_tier') = 'string'
+               AND btrim(settings->>'service_tier') <> ''
+               AND char_length(settings->>'service_tier') <= 64
+           )
+       )
+       AND public.jsonb_optional_number_in_range(
+               settings, 'request_max_retries', 0, 100, true
+           )
+       AND public.jsonb_optional_number_in_range(
+               settings, 'stream_max_retries', 0, 100, true
+           )
+       AND public.jsonb_optional_number_in_range(
+               settings, 'stream_idle_timeout_ms', 1, 9223372036854775807, true
+           )
+       AND public.validate_model_request_settings(settings->'request_settings');
+END
+$$;
+
+CREATE FUNCTION public.validate_agent_model_settings_override(settings jsonb) RETURNS boolean
+    LANGUAGE plpgsql IMMUTABLE
+    AS $$
+BEGIN
+    IF settings IS NULL
+       OR jsonb_typeof(settings) <> 'object'
+       OR settings - ARRAY[
+           'reasoning_effort', 'reasoning_summary', 'verbosity',
+           'context_window_tokens', 'auto_compact_token_limit',
+           'reasoning_summary_support', 'service_tier',
+           'request_max_retries', 'stream_max_retries',
+           'stream_idle_timeout_ms', 'request_settings'
+       ] <> '{}'::jsonb THEN
+        RETURN false;
+    END IF;
+    RETURN (
+           NOT settings ? 'reasoning_effort'
+           OR settings->'reasoning_effort' = 'null'::jsonb
+           OR settings->>'reasoning_effort' = ANY(ARRAY[
+               'default', 'none', 'minimal', 'low', 'medium', 'high',
+               'xhigh', 'max', 'ultra'
+           ])
+       )
+       AND (
+           NOT settings ? 'reasoning_summary'
+           OR settings->'reasoning_summary' = 'null'::jsonb
+           OR settings->>'reasoning_summary' = ANY(ARRAY[
+               'default', 'auto', 'concise', 'detailed', 'none'
+           ])
+       )
+       AND (
+           NOT settings ? 'verbosity'
+           OR settings->'verbosity' = 'null'::jsonb
+           OR settings->>'verbosity' = ANY(ARRAY['default', 'low', 'medium', 'high'])
+       )
+       AND (
+           NOT settings ? 'reasoning_summary_support'
+           OR settings->'reasoning_summary_support' = 'null'::jsonb
+           OR settings->>'reasoning_summary_support' = ANY(ARRAY[
+               'auto', 'supported', 'unsupported'
+           ])
+       )
+       AND public.jsonb_optional_number_in_range(
+               settings, 'context_window_tokens', 1, 9223372036854775807, true
+           )
+       AND public.jsonb_optional_number_in_range(
+               settings, 'auto_compact_token_limit', 1, 9223372036854775807, true
+           )
+       AND (
+           NOT settings ? 'service_tier'
+           OR settings->'service_tier' = 'null'::jsonb
+           OR (
+               jsonb_typeof(settings->'service_tier') = 'string'
+               AND btrim(settings->>'service_tier') <> ''
+               AND char_length(settings->>'service_tier') <= 64
+           )
+       )
+       AND public.jsonb_optional_number_in_range(
+               settings, 'request_max_retries', 0, 100, true
+           )
+       AND public.jsonb_optional_number_in_range(
+               settings, 'stream_max_retries', 0, 100, true
+           )
+       AND public.jsonb_optional_number_in_range(
+               settings, 'stream_idle_timeout_ms', 1, 9223372036854775807, true
+           )
+       AND (
+           NOT settings ? 'request_settings'
+           OR settings->'request_settings' = 'null'::jsonb
+           OR public.validate_model_request_settings(settings->'request_settings')
+       );
+END
+$$;
+
+CREATE FUNCTION public.validate_agent_model_selection() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
-    IF NEW.default_model_connection_id IS NULL THEN
+    IF NEW.model_connection_id IS NULL AND NEW.model_id IS NULL THEN
         RETURN NEW;
+    END IF;
+    IF NEW.model_connection_id IS NULL OR NEW.model_id IS NULL THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            MESSAGE = 'Agent model selection requires both connection and model id';
     END IF;
     IF NOT EXISTS (
         SELECT 1
         FROM model_connections
-        WHERE id = NEW.default_model_connection_id
+        WHERE id = NEW.model_connection_id
           AND enabled = true
-          AND deleted_at IS NULL
+          AND NEW.model_id = ANY(allowed_model_ids)
+          AND ((NEW.model_settings->'request_settings')->>'protocol') = api_type
           AND (scope = 'global' OR owner_id = NEW.owner_id)
     ) THEN
         RAISE EXCEPTION USING
             ERRCODE = '23514',
-            MESSAGE = 'Agent model must be an enabled Global or owner Personal Model Connection';
+            MESSAGE = 'Agent model selection must be an allowed model on an enabled Global or owner Personal Model API Connection';
     END IF;
     RETURN NEW;
 END
 $$;
 
-CREATE FUNCTION public.validate_subagent_model_connection() RETURNS trigger
+CREATE FUNCTION public.validate_subagent_model_selection() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 DECLARE
     agent_owner_id UUID;
 BEGIN
-    IF NEW.model_connection_id IS NULL THEN
+    IF NEW.model_connection_id IS NULL AND NEW.model_id IS NULL THEN
         RETURN NEW;
+    END IF;
+    IF NEW.model_connection_id IS NULL OR NEW.model_id IS NULL THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            MESSAGE = 'subagent model selection requires both connection and model id';
     END IF;
     SELECT owner_id INTO agent_owner_id FROM agents WHERE id = NEW.agent_id;
     IF agent_owner_id IS NULL OR NOT EXISTS (
@@ -450,18 +688,18 @@ BEGIN
         FROM model_connections
         WHERE id = NEW.model_connection_id
           AND enabled = true
-          AND deleted_at IS NULL
+          AND NEW.model_id = ANY(allowed_model_ids)
           AND (scope = 'global' OR owner_id = agent_owner_id)
     ) THEN
         RAISE EXCEPTION USING
             ERRCODE = '23514',
-            MESSAGE = 'subagent model must be an enabled Global or Agent-owner Personal Model Connection';
+            MESSAGE = 'subagent model selection must be an allowed model on an enabled Global or Agent-owner Personal Model API Connection';
     END IF;
     RETURN NEW;
 END
 $$;
 
-CREATE FUNCTION public.validate_system_default_model_connection() RETURNS trigger
+CREATE FUNCTION public.validate_system_default_model_selection() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
 BEGIN
@@ -471,11 +709,84 @@ BEGIN
         WHERE id = NEW.model_connection_id
           AND scope = 'global'
           AND enabled = true
-          AND deleted_at IS NULL
+          AND NEW.model_id = ANY(allowed_model_ids)
     ) THEN
         RAISE EXCEPTION USING
             ERRCODE = '23514',
-            MESSAGE = 'system default must reference an enabled Global Model Connection';
+            MESSAGE = 'system default must reference an allowed model on an enabled Global Model API Connection';
+    END IF;
+    RETURN NEW;
+END
+$$;
+
+CREATE FUNCTION public.protect_run_model_binding() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    RAISE EXCEPTION USING
+        ERRCODE = '55000',
+        MESSAGE = 'Run Model Bindings are immutable';
+END
+$$;
+
+CREATE FUNCTION public.validate_run_model_binding() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM model_connections
+        WHERE id = NEW.model_connection_id
+          AND enabled = true
+          AND deleted_at IS NULL
+          AND NEW.model_id = ANY(allowed_model_ids)
+          AND NEW.api_type = api_type
+          AND NEW.connection_name_snapshot = name
+          AND NEW.connection_scope_snapshot = scope
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23514',
+            MESSAGE = 'Run Model Binding must snapshot an enabled allowed Model API Connection selection';
+    END IF;
+    RETURN NEW;
+END
+$$;
+
+CREATE FUNCTION public.protect_model_connection_references() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.api_type IS DISTINCT FROM OLD.api_type AND (
+        EXISTS (SELECT 1 FROM agents WHERE model_connection_id = OLD.id)
+        OR EXISTS (
+            SELECT 1 FROM codex_subagent_definitions
+            WHERE model_connection_id = OLD.id
+        )
+        OR EXISTS (
+            SELECT 1 FROM system_default_model_selection
+            WHERE model_connection_id = OLD.id
+        )
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23503',
+            MESSAGE = 'referenced Model API Connection type cannot change';
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM agents
+        WHERE model_connection_id = OLD.id
+          AND NOT (model_id = ANY(NEW.allowed_model_ids))
+    ) OR EXISTS (
+        SELECT 1 FROM codex_subagent_definitions
+        WHERE model_connection_id = OLD.id
+          AND NOT (model_id = ANY(NEW.allowed_model_ids))
+    ) OR EXISTS (
+        SELECT 1 FROM system_default_model_selection
+        WHERE model_connection_id = OLD.id
+          AND NOT (model_id = ANY(NEW.allowed_model_ids))
+    ) THEN
+        RAISE EXCEPTION USING
+            ERRCODE = '23503',
+            MESSAGE = 'referenced Allowed Model ID cannot be removed';
     END IF;
     RETURN NEW;
 END
@@ -501,10 +812,24 @@ CREATE TABLE public.agents (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     public_to uuid[] DEFAULT '{}'::uuid[] NOT NULL,
     execution_config_revision bigint DEFAULT 1 NOT NULL,
-    default_model_connection_id uuid,
-    reasoning_effort text DEFAULT 'default'::text NOT NULL,
+    model_connection_id uuid,
+    model_id text,
+    model_settings jsonb DEFAULT '{
+        "reasoning_effort":"default",
+        "reasoning_summary":"default",
+        "verbosity":"default",
+        "context_window_tokens":null,
+        "auto_compact_token_limit":null,
+        "reasoning_summary_support":"auto",
+        "service_tier":null,
+        "request_max_retries":null,
+        "stream_max_retries":null,
+        "stream_idle_timeout_ms":null,
+        "request_settings":{"protocol":"openai_responses"}
+    }'::jsonb NOT NULL,
     CONSTRAINT agents_execution_config_revision_positive CHECK ((execution_config_revision > 0)),
-    CONSTRAINT agents_reasoning_effort_check CHECK ((reasoning_effort = ANY (ARRAY['default'::text, 'none'::text, 'minimal'::text, 'low'::text, 'medium'::text, 'high'::text, 'xhigh'::text, 'max'::text, 'ultra'::text]))),
+    CONSTRAINT agents_model_selection_shape_check CHECK (((model_connection_id IS NULL) = (model_id IS NULL))),
+    CONSTRAINT agents_model_settings_check CHECK (public.validate_agent_model_settings(model_settings)),
     CONSTRAINT agents_visibility_check CHECK ((visibility = ANY (ARRAY['private'::text, 'public_to'::text, 'public'::text])))
 );
 
@@ -566,7 +891,8 @@ CREATE TABLE public.codex_subagent_definitions (
     description text NOT NULL,
     developer_instructions text NOT NULL,
     model_connection_id uuid,
-    reasoning_effort text,
+    model_id text,
+    model_settings_override jsonb DEFAULT '{}'::jsonb NOT NULL,
     enabled boolean DEFAULT true NOT NULL,
     disabled_reason text,
     created_at timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
@@ -574,8 +900,11 @@ CREATE TABLE public.codex_subagent_definitions (
     CONSTRAINT codex_subagent_description_nonempty CHECK ((btrim(description) <> ''::text)),
     CONSTRAINT codex_subagent_disabled_shape_check CHECK ((((enabled = true) AND (disabled_reason IS NULL)) OR ((enabled = false) AND (disabled_reason IS NOT NULL) AND (btrim(disabled_reason) <> ''::text)))),
     CONSTRAINT codex_subagent_instructions_nonempty CHECK ((btrim(developer_instructions) <> ''::text)),
+    CONSTRAINT codex_subagent_model_selection_shape_check CHECK (((model_connection_id IS NULL) = (model_id IS NULL))),
+    CONSTRAINT codex_subagent_model_settings_override_check CHECK (public.validate_agent_model_settings_override(model_settings_override)),
     CONSTRAINT codex_subagent_name_nonempty CHECK ((btrim(name) <> ''::text)),
-    CONSTRAINT codex_subagent_reasoning_effort_check CHECK (((reasoning_effort IS NULL) OR (reasoning_effort = ANY (ARRAY['default'::text, 'none'::text, 'minimal'::text, 'low'::text, 'medium'::text, 'high'::text, 'xhigh'::text, 'max'::text, 'ultra'::text]))))
+    CONSTRAINT codex_subagent_name_not_reserved CHECK ((lower(btrim(name)) <> 'main'::text)),
+    CONSTRAINT codex_subagent_model_id_nonempty CHECK ((model_id IS NULL OR btrim(model_id) <> ''::text))
 );
 
 CREATE TABLE public.codex_version_artifacts (
@@ -815,6 +1144,8 @@ CREATE TABLE public.model_call_errors (
     model_connection_scope_snapshot text NOT NULL,
     model_connection_name_snapshot text NOT NULL,
     model_id_snapshot text NOT NULL,
+    api_type_snapshot text NOT NULL,
+    request_settings_snapshot jsonb NOT NULL,
     agent_id uuid,
     agent_name_snapshot text,
     subject_type text NOT NULL,
@@ -828,6 +1159,8 @@ CREATE TABLE public.model_call_errors (
     CONSTRAINT model_call_errors_kind_nonempty CHECK ((btrim(error_kind) <> ''::text)),
     CONSTRAINT model_call_errors_message_length CHECK (((btrim(message) <> ''::text) AND (char_length(message) <= 2048))),
     CONSTRAINT model_call_errors_response_status_check CHECK ((response_status = ANY (ARRAY['failed'::text, 'incomplete'::text, 'cancelled'::text, 'transport_error'::text, 'protocol_error'::text]))),
+    CONSTRAINT model_call_errors_api_type_snapshot_check CHECK ((api_type_snapshot = ANY (ARRAY['openai_responses'::text, 'openai_chat_completions'::text, 'anthropic_messages'::text]))),
+    CONSTRAINT model_call_errors_request_settings_snapshot_check CHECK ((public.validate_model_request_settings(request_settings_snapshot) AND ((request_settings_snapshot->>'protocol') = api_type_snapshot))),
     CONSTRAINT model_call_errors_scope_check CHECK ((model_connection_scope_snapshot = ANY (ARRAY['global'::text, 'personal'::text]))),
     CONSTRAINT model_call_errors_snapshot_nonempty CHECK (((btrim(model_connection_name_snapshot) <> ''::text) AND (btrim(model_id_snapshot) <> ''::text) AND ((agent_name_snapshot IS NULL) OR (btrim(agent_name_snapshot) <> ''::text)))),
     CONSTRAINT model_call_errors_subject_type_check CHECK ((subject_type = ANY (ARRAY['user'::text, 'integration_app'::text, 'system'::text])))
@@ -839,7 +1172,8 @@ CREATE TABLE public.model_connections (
     owner_id uuid,
     name text NOT NULL,
     base_url text,
-    model_id text NOT NULL,
+    api_type text NOT NULL,
+    allowed_model_ids text[] NOT NULL,
     api_key_ciphertext bytea,
     api_key_nonce bytea,
     enabled boolean DEFAULT true NOT NULL,
@@ -847,8 +1181,9 @@ CREATE TABLE public.model_connections (
     deleted_at timestamp(3) with time zone,
     created_at timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
     updated_at timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    CONSTRAINT model_connections_allowed_model_ids_check CHECK (public.validate_allowed_model_ids(allowed_model_ids)),
+    CONSTRAINT model_connections_api_type_check CHECK ((api_type = ANY (ARRAY['openai_responses'::text, 'openai_chat_completions'::text, 'anthropic_messages'::text]))),
     CONSTRAINT model_connections_executable_shape_check CHECK ((((deleted_at IS NULL) AND (base_url IS NOT NULL) AND (btrim(base_url) <> ''::text) AND (api_key_ciphertext IS NOT NULL) AND (octet_length(api_key_ciphertext) >= 17) AND (api_key_nonce IS NOT NULL) AND (octet_length(api_key_nonce) = 12)) OR ((deleted_at IS NOT NULL) AND (enabled = false) AND (base_url IS NULL) AND (api_key_ciphertext IS NULL) AND (api_key_nonce IS NULL)))),
-    CONSTRAINT model_connections_model_id_nonempty CHECK ((btrim(model_id) <> ''::text)),
     CONSTRAINT model_connections_name_nonempty CHECK ((btrim(name) <> ''::text)),
     CONSTRAINT model_connections_owner_shape_check CHECK ((((scope = 'global'::text) AND (owner_id IS NULL)) OR ((scope = 'personal'::text) AND ((owner_id IS NOT NULL) OR (deleted_at IS NOT NULL))))),
     CONSTRAINT model_connections_scope_check CHECK ((scope = ANY (ARRAY['global'::text, 'personal'::text])))
@@ -863,6 +1198,8 @@ CREATE TABLE public.model_token_usage (
     model_connection_scope_snapshot text NOT NULL,
     model_connection_name_snapshot text NOT NULL,
     model_id_snapshot text NOT NULL,
+    api_type_snapshot text NOT NULL,
+    request_settings_snapshot jsonb NOT NULL,
     agent_id uuid,
     agent_name_snapshot text,
     subject_type text NOT NULL,
@@ -877,6 +1214,8 @@ CREATE TABLE public.model_token_usage (
     reasoning_tokens bigint DEFAULT 0 NOT NULL,
     super_admin_protected boolean DEFAULT false NOT NULL,
     CONSTRAINT model_token_usage_counts_check CHECK (((input_tokens >= 0) AND (output_tokens >= 0) AND (total_tokens >= 0) AND (cached_tokens >= 0) AND (reasoning_tokens >= 0) AND (total_tokens = (input_tokens + output_tokens)) AND (cached_tokens <= input_tokens) AND (reasoning_tokens <= output_tokens))),
+    CONSTRAINT model_token_usage_api_type_snapshot_check CHECK ((api_type_snapshot = ANY (ARRAY['openai_responses'::text, 'openai_chat_completions'::text, 'anthropic_messages'::text]))),
+    CONSTRAINT model_token_usage_request_settings_snapshot_check CHECK ((public.validate_model_request_settings(request_settings_snapshot) AND ((request_settings_snapshot->>'protocol') = api_type_snapshot))),
     CONSTRAINT model_token_usage_response_status_check CHECK ((response_status = ANY (ARRAY['completed'::text, 'failed'::text, 'incomplete'::text, 'cancelled'::text]))),
     CONSTRAINT model_token_usage_scope_check CHECK ((model_connection_scope_snapshot = ANY (ARRAY['global'::text, 'personal'::text]))),
     CONSTRAINT model_token_usage_snapshot_nonempty CHECK (((btrim(model_connection_name_snapshot) <> ''::text) AND (btrim(model_id_snapshot) <> ''::text) AND ((agent_name_snapshot IS NULL) OR (btrim(agent_name_snapshot) <> ''::text)))),
@@ -961,11 +1300,23 @@ CREATE SEQUENCE public.run_events_seq_seq
 
 ALTER SEQUENCE public.run_events_seq_seq OWNED BY public.run_events.seq;
 
-CREATE TABLE public.run_model_connection_snapshots (
+CREATE TABLE public.run_model_bindings (
+    id uuid NOT NULL,
     run_id uuid NOT NULL,
+    binding_key text NOT NULL,
     model_connection_id uuid NOT NULL,
+    connection_name_snapshot text NOT NULL,
+    connection_scope_snapshot text NOT NULL,
     model_id text NOT NULL,
-    CONSTRAINT run_model_connection_snapshots_model_id_nonempty CHECK ((btrim(model_id) <> ''::text))
+    api_type text NOT NULL,
+    model_settings jsonb NOT NULL,
+    created_at timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    CONSTRAINT run_model_bindings_api_type_check CHECK ((api_type = ANY (ARRAY['openai_responses'::text, 'openai_chat_completions'::text, 'anthropic_messages'::text]))),
+    CONSTRAINT run_model_bindings_binding_key_nonempty CHECK (((btrim(binding_key) <> ''::text) AND (char_length(binding_key) <= 128))),
+    CONSTRAINT run_model_bindings_model_id_nonempty CHECK ((btrim(model_id) <> ''::text)),
+    CONSTRAINT run_model_bindings_model_settings_check CHECK ((public.validate_agent_model_settings(model_settings) AND (((model_settings->'request_settings')->>'protocol') = api_type))),
+    CONSTRAINT run_model_bindings_scope_check CHECK ((connection_scope_snapshot = ANY (ARRAY['global'::text, 'personal'::text]))),
+    CONSTRAINT run_model_bindings_snapshot_nonempty CHECK ((btrim(connection_name_snapshot) <> ''::text))
 );
 
 CREATE TABLE public.runs (
@@ -1081,12 +1432,14 @@ CREATE TABLE public.skills (
     CONSTRAINT skills_revision_positive CHECK ((revision > 0))
 );
 
-CREATE TABLE public.system_default_model_connection (
+CREATE TABLE public.system_default_model_selection (
     singleton boolean DEFAULT true NOT NULL,
     model_connection_id uuid NOT NULL,
+    model_id text NOT NULL,
     updated_by uuid,
     updated_at timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
-    CONSTRAINT system_default_model_connection_singleton_check CHECK (singleton)
+    CONSTRAINT system_default_model_selection_model_id_nonempty CHECK ((btrim(model_id) <> ''::text)),
+    CONSTRAINT system_default_model_selection_singleton_check CHECK (singleton)
 );
 
 CREATE TABLE public.user_erasure_audit (
@@ -1281,8 +1634,11 @@ ALTER TABLE ONLY public.run_events
 ALTER TABLE ONLY public.run_events
     ADD CONSTRAINT run_events_pkey PRIMARY KEY (seq);
 
-ALTER TABLE ONLY public.run_model_connection_snapshots
-    ADD CONSTRAINT run_model_connection_snapshots_pkey PRIMARY KEY (run_id, model_connection_id);
+ALTER TABLE ONLY public.run_model_bindings
+    ADD CONSTRAINT run_model_bindings_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.run_model_bindings
+    ADD CONSTRAINT run_model_bindings_run_key_unique UNIQUE (run_id, binding_key);
 
 ALTER TABLE ONLY public.runs
     ADD CONSTRAINT runs_id_hub_session_key UNIQUE (id, hub_session_id);
@@ -1317,11 +1673,8 @@ ALTER TABLE ONLY public.sessions
 ALTER TABLE ONLY public.skills
     ADD CONSTRAINT skills_pkey PRIMARY KEY (id);
 
-ALTER TABLE ONLY public.system_default_model_connection
-    ADD CONSTRAINT system_default_model_connection_model_connection_id_key UNIQUE (model_connection_id);
-
-ALTER TABLE ONLY public.system_default_model_connection
-    ADD CONSTRAINT system_default_model_connection_pkey PRIMARY KEY (singleton);
+ALTER TABLE ONLY public.system_default_model_selection
+    ADD CONSTRAINT system_default_model_selection_pkey PRIMARY KEY (singleton);
 
 ALTER TABLE ONLY public.user_erasure_audit
     ADD CONSTRAINT user_erasure_audit_pkey PRIMARY KEY (erased_user_id);
@@ -1340,7 +1693,7 @@ ALTER TABLE ONLY public.users
 
 CREATE INDEX agent_skills_skill_idx ON public.agent_skills USING btree (skill_id);
 
-CREATE INDEX agents_default_model_connection_idx ON public.agents USING btree (default_model_connection_id) WHERE (default_model_connection_id IS NOT NULL);
+CREATE INDEX agents_model_selection_idx ON public.agents USING btree (model_connection_id, model_id) WHERE (model_connection_id IS NOT NULL);
 
 CREATE INDEX agents_public_to_idx ON public.agents USING gin (public_to);
 
@@ -1410,7 +1763,7 @@ CREATE INDEX model_token_usage_user_occurred_idx ON public.model_token_usage USI
 
 CREATE INDEX run_events_run_seq_idx ON public.run_events USING btree (run_id, seq);
 
-CREATE INDEX run_model_connection_snapshots_connection_idx ON public.run_model_connection_snapshots USING btree (model_connection_id, run_id);
+CREATE INDEX run_model_bindings_connection_idx ON public.run_model_bindings USING btree (model_connection_id, run_id);
 
 CREATE INDEX runs_agent_created_idx ON public.runs USING btree (agent_id, created_at DESC);
 
@@ -1444,11 +1797,11 @@ CREATE INDEX user_erasure_jobs_requested_idx ON public.user_erasure_jobs USING b
 
 CREATE UNIQUE INDEX users_email_normalized_key ON public.users USING btree (lower(btrim(email))) WHERE (email IS NOT NULL);
 
-CREATE TRIGGER agents_default_model_connection_validate BEFORE INSERT OR UPDATE OF owner_id, default_model_connection_id ON public.agents FOR EACH ROW EXECUTE FUNCTION public.validate_agent_default_model_connection();
+CREATE TRIGGER agents_model_selection_validate BEFORE INSERT OR UPDATE OF owner_id, model_connection_id, model_id, model_settings ON public.agents FOR EACH ROW EXECUTE FUNCTION public.validate_agent_model_selection();
 
 CREATE TRIGGER agents_protect_super_admin_model_accounting BEFORE DELETE ON public.agents FOR EACH ROW EXECUTE FUNCTION public.protect_super_admin_model_accounting_before_agent_delete();
 
-CREATE TRIGGER codex_subagent_model_connection_validate BEFORE INSERT OR UPDATE OF agent_id, model_connection_id ON public.codex_subagent_definitions FOR EACH ROW EXECUTE FUNCTION public.validate_subagent_model_connection();
+CREATE TRIGGER codex_subagent_model_selection_validate BEFORE INSERT OR UPDATE OF agent_id, model_connection_id, model_id, model_settings_override ON public.codex_subagent_definitions FOR EACH ROW EXECUTE FUNCTION public.validate_subagent_model_selection();
 
 CREATE TRIGGER hub_session_messages_assign_sequence BEFORE INSERT ON public.hub_session_messages FOR EACH ROW EXECUTE FUNCTION public.assign_hub_session_message_sequence();
 
@@ -1462,11 +1815,17 @@ CREATE TRIGGER model_call_errors_protect BEFORE DELETE OR UPDATE ON public.model
 
 CREATE TRIGGER model_token_usage_protect BEFORE DELETE OR UPDATE ON public.model_token_usage FOR EACH ROW EXECUTE FUNCTION public.protect_model_ledger_row();
 
+CREATE TRIGGER model_connections_protect_references BEFORE UPDATE OF api_type, allowed_model_ids ON public.model_connections FOR EACH ROW EXECUTE FUNCTION public.protect_model_connection_references();
+
 CREATE TRIGGER oauth_apps_protect_super_admin_model_accounting BEFORE DELETE ON public.oauth_apps FOR EACH ROW EXECUTE FUNCTION public.protect_super_admin_model_accounting_before_app_delete();
 
 CREATE TRIGGER runs_hub_session_links BEFORE INSERT OR UPDATE OF hub_session_id, hub_turn_id, hub_message_id, owner_id, agent_id ON public.runs FOR EACH ROW EXECUTE FUNCTION public.enforce_hub_run_session_links();
 
-CREATE TRIGGER system_default_model_connection_validate BEFORE INSERT OR UPDATE OF model_connection_id ON public.system_default_model_connection FOR EACH ROW EXECUTE FUNCTION public.validate_system_default_model_connection();
+CREATE TRIGGER run_model_bindings_validate BEFORE INSERT ON public.run_model_bindings FOR EACH ROW EXECUTE FUNCTION public.validate_run_model_binding();
+
+CREATE TRIGGER run_model_bindings_protect BEFORE UPDATE ON public.run_model_bindings FOR EACH ROW EXECUTE FUNCTION public.protect_run_model_binding();
+
+CREATE TRIGGER system_default_model_selection_validate BEFORE INSERT OR UPDATE OF model_connection_id, model_id ON public.system_default_model_selection FOR EACH ROW EXECUTE FUNCTION public.validate_system_default_model_selection();
 
 CREATE TRIGGER users_anonymize_model_accounting BEFORE DELETE ON public.users FOR EACH ROW EXECUTE FUNCTION public.anonymize_model_accounting_before_user_delete();
 
@@ -1477,7 +1836,7 @@ ALTER TABLE ONLY public.agent_skills
     ADD CONSTRAINT agent_skills_skill_id_fkey FOREIGN KEY (skill_id) REFERENCES public.skills(id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.agents
-    ADD CONSTRAINT agents_default_model_connection_id_fkey FOREIGN KEY (default_model_connection_id) REFERENCES public.model_connections(id) ON DELETE SET NULL;
+    ADD CONSTRAINT agents_model_connection_id_fkey FOREIGN KEY (model_connection_id) REFERENCES public.model_connections(id) ON DELETE RESTRICT;
 
 ALTER TABLE ONLY public.agents
     ADD CONSTRAINT agents_owner_id_fkey FOREIGN KEY (owner_id) REFERENCES public.users(id) ON DELETE CASCADE;
@@ -1507,7 +1866,7 @@ ALTER TABLE ONLY public.codex_subagent_definitions
     ADD CONSTRAINT codex_subagent_definitions_agent_id_fkey FOREIGN KEY (agent_id) REFERENCES public.agents(id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.codex_subagent_definitions
-    ADD CONSTRAINT codex_subagent_definitions_model_connection_id_fkey FOREIGN KEY (model_connection_id) REFERENCES public.model_connections(id) ON DELETE SET NULL;
+    ADD CONSTRAINT codex_subagent_definitions_model_connection_id_fkey FOREIGN KEY (model_connection_id) REFERENCES public.model_connections(id) ON DELETE RESTRICT;
 
 ALTER TABLE ONLY public.embed_sessions
     ADD CONSTRAINT embed_sessions_agent_id_fkey FOREIGN KEY (agent_id) REFERENCES public.agents(id) ON DELETE CASCADE;
@@ -1674,11 +2033,11 @@ ALTER TABLE ONLY public.run_events
 ALTER TABLE ONLY public.run_events
     ADD CONSTRAINT run_events_run_id_fkey FOREIGN KEY (run_id) REFERENCES public.runs(id) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.run_model_connection_snapshots
-    ADD CONSTRAINT run_model_connection_snapshots_model_connection_id_fkey FOREIGN KEY (model_connection_id) REFERENCES public.model_connections(id) ON DELETE RESTRICT;
+ALTER TABLE ONLY public.run_model_bindings
+    ADD CONSTRAINT run_model_bindings_model_connection_id_fkey FOREIGN KEY (model_connection_id) REFERENCES public.model_connections(id) ON DELETE RESTRICT;
 
-ALTER TABLE ONLY public.run_model_connection_snapshots
-    ADD CONSTRAINT run_model_connection_snapshots_run_id_fkey FOREIGN KEY (run_id) REFERENCES public.runs(id) ON DELETE CASCADE;
+ALTER TABLE ONLY public.run_model_bindings
+    ADD CONSTRAINT run_model_bindings_run_id_fkey FOREIGN KEY (run_id) REFERENCES public.runs(id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.runs
     ADD CONSTRAINT runs_agent_id_fkey FOREIGN KEY (agent_id) REFERENCES public.agents(id) ON DELETE CASCADE;
@@ -1740,11 +2099,11 @@ ALTER TABLE ONLY public.sessions
 ALTER TABLE ONLY public.skills
     ADD CONSTRAINT skills_owner_id_fkey FOREIGN KEY (owner_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.system_default_model_connection
-    ADD CONSTRAINT system_default_model_connection_model_connection_id_fkey FOREIGN KEY (model_connection_id) REFERENCES public.model_connections(id) ON DELETE CASCADE;
+ALTER TABLE ONLY public.system_default_model_selection
+    ADD CONSTRAINT system_default_model_selection_model_connection_id_fkey FOREIGN KEY (model_connection_id) REFERENCES public.model_connections(id) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.system_default_model_connection
-    ADD CONSTRAINT system_default_model_connection_updated_by_fkey FOREIGN KEY (updated_by) REFERENCES public.users(id) ON DELETE SET NULL;
+ALTER TABLE ONLY public.system_default_model_selection
+    ADD CONSTRAINT system_default_model_selection_updated_by_fkey FOREIGN KEY (updated_by) REFERENCES public.users(id) ON DELETE SET NULL;
 
 ALTER TABLE ONLY public.user_erasure_bundle_objects
     ADD CONSTRAINT user_erasure_bundle_objects_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.user_erasure_jobs(user_id) ON DELETE CASCADE;

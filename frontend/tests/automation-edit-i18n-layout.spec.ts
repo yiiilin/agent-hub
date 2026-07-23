@@ -1,4 +1,19 @@
 import { expect, request, test } from '@playwright/test';
+import type { AgentModelSettings } from '../src/api/client';
+
+const automaticModelSettings: AgentModelSettings = {
+  reasoning_effort: 'default',
+  reasoning_summary: 'default',
+  verbosity: 'default',
+  context_window_tokens: null,
+  auto_compact_token_limit: null,
+  reasoning_summary_support: 'auto',
+  service_tier: null,
+  request_max_retries: null,
+  stream_max_retries: null,
+  stream_idle_timeout_ms: null,
+  request_settings: { protocol: 'openai_responses' }
+};
 
 type OwnedAgentFixture = {
   agent: { id: string; name: string; owner_id: string; [key: string]: unknown };
@@ -11,7 +26,8 @@ async function createOwnedAgentFixture(page: import('@playwright/test').Page, la
     scope: 'personal',
     name: `${label} model ${suffix}`,
     base_url: 'http://fake-model-provider:8080',
-    model_id: 'hub-proxy-smoke',
+    api_type: 'openai_responses',
+    allowed_model_ids: ['hub-proxy-smoke'],
     api_key: 'dev-model-provider-api-key'
   } });
   expect(modelResponse.ok()).toBeTruthy();
@@ -21,8 +37,8 @@ async function createOwnedAgentFixture(page: import('@playwright/test').Page, la
     instructions: 'Own the Automation test fixtures.',
     visibility: 'private',
     public_to: [],
-    default_model_connection_id: model.id,
-    reasoning_effort: 'default',
+    model_selection: { connection_id: model.id, model_id: 'hub-proxy-smoke' },
+    model_settings: automaticModelSettings,
     codex_subagents: []
   } });
   expect(agentResponse.ok()).toBeTruthy();
@@ -760,11 +776,9 @@ test('agent load errors and creation defaults are localized on first entry', asy
   await page.unroute(`**/api/agents/${ownedAgent.id}`);
   await page.goto(`/agents/${ownedAgent.id}`);
   const activityPanel = page.getByRole('tabpanel', { name: '活动', exact: true });
-  const messageInput = activityPanel.getByRole('textbox', { name: '消息', exact: true });
-  await expect(messageInput).toHaveValue('审查当前代码仓库并报告变更。');
-  await messageInput.fill('用户自定义运行消息');
+  await expect(activityPanel.getByRole('textbox', { name: '消息', exact: true })).toHaveCount(0);
   await page.getByLabel('语言').selectOption('en');
-  await expect(page.getByRole('tabpanel', { name: 'Activity', exact: true }).getByRole('textbox', { name: 'Message', exact: true })).toHaveValue('用户自定义运行消息');
+  await expect(page.getByRole('tabpanel', { name: 'Activity', exact: true }).getByRole('textbox', { name: 'Message', exact: true })).toHaveCount(0);
   await page.getByLabel('Language').selectOption('zh-CN');
 
   await page.getByRole('button', { name: '集成应用', exact: true }).click();
