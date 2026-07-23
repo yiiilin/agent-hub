@@ -210,20 +210,28 @@ test('fake Codex uses the configured default provider when another provider sort
 
   const decoyBindingId = '00000000-0000-0000-0000-000000000001';
   const defaultBindingId = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
-  const receivedBindingIds = [];
+  const receivedRequests = [];
   const server = createServer((request, response) => {
-    receivedBindingIds.push(request.headers['x-agent-hub-model-binding-id']);
-    response.writeHead(200, { 'content-type': 'application/json' });
-    response.end(JSON.stringify({
-      id: 'resp_chat_converted',
-      object: 'response',
-      status: 'completed',
-      output: [{
-        type: 'message',
-        role: 'assistant',
-        content: [{ type: 'output_text', text: 'default provider selected' }]
-      }]
-    }));
+    let body = '';
+    request.setEncoding('utf8');
+    request.on('data', (chunk) => { body += chunk; });
+    request.on('end', () => {
+      receivedRequests.push({
+        bindingId: request.headers['x-agent-hub-model-binding-id'],
+        body: JSON.parse(body)
+      });
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({
+        id: 'resp_chat_converted',
+        object: 'response',
+        status: 'completed',
+        output: [{
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'default provider selected' }]
+        }]
+      }));
+    });
   });
   const baseURL = await listen(server);
   t.after(() => close(server));
@@ -293,7 +301,14 @@ x-agent-hub-model-binding-id = "${defaultBindingId}"
   });
 
   assert.equal(exitCode, 0, stderr);
-  assert.deepEqual(receivedBindingIds, [defaultBindingId]);
+  assert.deepEqual(receivedRequests, [{
+    bindingId: defaultBindingId,
+    body: {
+      model: 'default-model',
+      input: 'Use the configured default provider.',
+      max_output_tokens: 256
+    }
+  }]);
   const messages = stdout.trim().split('\n').map((line) => JSON.parse(line));
   assert.equal(
     messages.some((message) => message.method === 'turn/completed'

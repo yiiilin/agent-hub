@@ -29,6 +29,11 @@ ensure_transcript() {
 model_content() {
   prompt="${1:-fake codex smoke}"
   config_path="${CODEX_HOME}/config.toml"
+  model_id="$(sed -n 's/^model = "\(.*\)"$/\1/p' "$config_path" | head -n 1)"
+  if [ -z "$model_id" ]; then
+    echo "missing default model" >&2
+    return 1
+  fi
   model_provider="$(sed -n 's/^model_provider = "\(.*\)"$/\1/p' "$config_path" | head -n 1)"
   if [ -z "$model_provider" ]; then
     echo "missing default model provider" >&2
@@ -61,9 +66,10 @@ model_content() {
     return 1
   fi
 
-  request_body="$(jq -cn --arg prompt "$prompt" '{
-    model: "hub-proxy-smoke",
-    input: [{role: "user", content: [{type: "input_text", text: $prompt}]}]
+  request_body="$(jq -cn --arg model "$model_id" --arg prompt "$prompt" '{
+    model: $model,
+    input: $prompt,
+    max_output_tokens: 256
   }')"
   response="$(curl -fsS \
     -H 'Content-Type: application/json' \
