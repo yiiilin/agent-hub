@@ -29,7 +29,7 @@ while [ "$#" -gt 0 ]; do
     --no-extensions|--no-themes|--no-prompt-templates|--no-context-files|--approve|--no-approve)
       shift
       ;;
-    --tools|--exclude-tools|--thinking|--name)
+    --tools|--exclude-tools|--thinking|--name|--extension|-e)
       [ -n "${2:-}" ] || { echo "$1 requires a value" >&2; exit 64; }
       shift 2
       ;;
@@ -137,6 +137,18 @@ emit_completion() {
   held_turn="false"
 }
 
+emit_integration_tool_request() {
+  arguments='{"message":"fixture:integration","attachments":[{"kind":"text","name":"qa-note.txt","content_type":"text/plain","size_bytes":32,"text":"quoted text, arrays [1, 2], and a second line\nkept exactly","url":null}]}'
+  jq -cn --argjson arguments "$arguments" '{type:"tool_execution_start",toolCallId:"platform|tool-call|fc_integration_echo",toolName:"echo",args:$arguments}'
+  jq -cn --argjson arguments "$arguments" '{type:"tool_execution_end",toolCallId:"platform|tool-call|fc_integration_echo",toolName:"echo",args:$arguments,result:{content:[{type:"text",text:"Integration tool request delegated to Agent Hub."}],details:{pending:true},terminate:true},isError:false}'
+  jq -cn --argjson arguments "$arguments" '{type:"turn_end",message:{role:"assistant",content:[{type:"toolCall",id:"platform|tool-call|fc_integration_echo",name:"echo",arguments:$arguments}],stopReason:"toolUse",usage:{input:42,output:12,totalTokens:54}},toolResults:[]}'
+  jq -cn '{type:"agent_end",messages:[],willRetry:false}'
+  jq -cn '{type:"agent_settled"}'
+  append_session_event "assistant"
+  active_turn="false"
+  held_turn="false"
+}
+
 emit_failure() {
   jq -cn '{type:"message_update",message:{role:"assistant"},assistantMessageEvent:{type:"error",reason:"error",error:{role:"assistant",content:[],stopReason:"error"}}}'
   jq -cn '{type:"turn_end",message:{role:"assistant",content:[],usage:{input:7,output:0,totalTokens:7},stopReason:"error"},toolResults:[]}'
@@ -217,6 +229,8 @@ while IFS= read -r line; do
         held_turn="true"
       elif [ "$prompt" = "fixture:fail" ]; then
         emit_failure
+      elif [ "${prompt#fixture:integration}" != "$prompt" ]; then
+        emit_integration_tool_request
       else
         if [ "$prompt" = "fixture:retry" ]; then
           emit_retry_and_compaction

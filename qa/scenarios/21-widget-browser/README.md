@@ -2,8 +2,8 @@
 
 Type: `browser`
 
-Uses the real Widget, backend, PostgreSQL, Runtime, fake Codex app-server, and
-fake Responses provider. The scenario creates two private Agents and one scoped
+Uses the real Widget, backend, PostgreSQL, Runtime, Pi standalone, and a fake
+Responses provider. The scenario creates two private Agents and one scoped
 Widget session for each Agent through authenticated public APIs.
 
 The browser embeds `/widget` in a host page and verifies the parent protocol:

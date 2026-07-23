@@ -4,6 +4,21 @@ import { withBrowser } from '../../support/browser.mjs';
 
 const COMPLETION_TEXT = 'Fake Codex completed run through the Hub model proxy.';
 
+async function createComposeModelFixture(client, context) {
+  const { data: connection } = await client.post('/api/model-connections', {
+    scope: 'personal',
+    name: context.unique('QA Widget browser model'),
+    base_url: 'http://fake-model-provider:8080',
+    api_type: 'openai_responses',
+    allowed_model_ids: ['hub-proxy-smoke'],
+    api_key: 'dev-model-provider-api-key'
+  });
+  return {
+    connectionId: connection.id,
+    selection: { connection_id: connection.id, model_id: 'hub-proxy-smoke' }
+  };
+}
+
 async function waitForHostMessage(page, accept, description) {
   return poll(async () => {
     const messages = await page.evaluate(() => (
@@ -44,13 +59,17 @@ export default async function widgetBrowserScenario(scenarioContext) {
   await loginAsAdmin(adminClient);
 
   const agents = [];
+  let modelConnectionId = null;
   try {
+    const modelFixture = await createComposeModelFixture(adminClient, scenarioContext);
+    modelConnectionId = modelFixture.connectionId;
     for (const suffix of ['Alpha', 'Beta']) {
       const { data: agent } = await adminClient.post('/api/agents', {
         name: scenarioContext.unique(`QA Widget ${suffix}`),
         instructions: `Widget browser fixture ${suffix}.`,
         visibility: 'private',
-        public_to: []
+        public_to: [],
+        model_selection: modelFixture.selection
       });
       agents.push(agent);
     }
@@ -285,8 +304,16 @@ export default async function widgetBrowserScenario(scenarioContext) {
       }
     });
   } finally {
-    for (const agent of agents.reverse()) {
-      await adminClient.delete(`/api/agents/${agent.id}`, { expectedStatus: [204, 404] });
+    try {
+      for (const agent of agents.reverse()) {
+        await adminClient.delete(`/api/agents/${agent.id}`, { expectedStatus: [204, 404] });
+      }
+    } finally {
+      if (modelConnectionId) {
+        await adminClient.delete(`/api/model-connections/${modelConnectionId}`, {
+          expectedStatus: [204, 404]
+        });
+      }
     }
   }
 }

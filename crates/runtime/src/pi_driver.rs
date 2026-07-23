@@ -16,17 +16,17 @@ use std::{
     },
 };
 
-use agent_hub_shared::{AgentDto, AppendRunEventRequest, ClaimRunResponse};
+use agent_hub_shared::{AgentDto, AppendRunEventRequest, ClaimRunResponse, IntegrationContextDto};
 use anyhow::Context;
 use serde_json::{json, Value};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use super::{
     model_binding, pi_model_provider_name, pi_thinking_level,
-    send_app_server_event_with_backpressure, terminate_child_process_tree, AppServerCancellation,
-    AppServerRunResult, PendingInterruptResponse, PendingSteerResponse, RunEnv,
-    SessionInterruptOutcome, SessionSteerOutcome, SessionSupervisorCommand,
-    APP_SERVER_EVENT_QUEUE_CAPACITY,
+    send_app_server_event_with_backpressure, stable_tool_request_uuid,
+    terminate_child_process_tree, AppServerCancellation, AppServerRunResult,
+    PendingInterruptResponse, PendingSteerResponse, RunEnv, SessionInterruptOutcome,
+    SessionSteerOutcome, SessionSupervisorCommand, APP_SERVER_EVENT_QUEUE_CAPACITY,
 };
 
 const PI_SESSION_DIRECTORY: &str = "sessions";
@@ -34,6 +34,37 @@ const PI_AGENT_DIRECTORY: &str = ".pi/agent";
 const PI_HOME_DIRECTORY: &str = ".pi/home";
 const PI_TEMP_DIRECTORY: &str = ".pi/tmp";
 const PI_PROCESS_PATH: &str = "/usr/bin:/bin";
+const PI_INTEGRATION_EXTENSION_FILE: &str = "agent-hub-integration-tools.mjs";
+const PI_INTEGRATION_TOOLS_FILE: &str = "agent-hub-integration-tools.json";
+const PI_INTEGRATION_CONTEXT_LABEL: &str = "Agent Hub Integration context (JSON):";
+const PI_BUILTIN_TOOL_NAMES: &[&str] = &["read", "grep", "find", "ls", "edit", "write", "bash"];
+const PI_INTEGRATION_EXTENSION_SOURCE: &str = r#"import { readFileSync } from "node:fs";
+
+const definitions = JSON.parse(
+  readFileSync(new URL("./agent-hub-integration-tools.json", import.meta.url), "utf8"),
+);
+
+export default function registerAgentHubIntegrationTools(pi) {
+  for (const definition of definitions) {
+    pi.registerTool({
+      name: definition.name,
+      label: definition.label,
+      description: definition.description,
+      parameters: definition.parameters,
+      async execute() {
+        return {
+          content: [{
+            type: "text",
+            text: "Integration tool request delegated to Agent Hub.",
+          }],
+          details: { pending: true },
+          terminate: true,
+        };
+      },
+    });
+  }
+}
+"#;
 
 fn pi_agent_directory(run_env: &RunEnv) -> PathBuf {
     run_env.codex_home.join(PI_AGENT_DIRECTORY)
@@ -45,6 +76,144 @@ fn pi_home_directory(run_env: &RunEnv) -> PathBuf {
 
 fn pi_temp_directory(run_env: &RunEnv) -> PathBuf {
     run_env.codex_home.join(PI_TEMP_DIRECTORY)
+}
+
+fn pi_integration_extension_path(run_env: &RunEnv) -> PathBuf {
+    pi_agent_directory(run_env).join(PI_INTEGRATION_EXTENSION_FILE)
+}
+
+fn pi_integration_tools_path(run_env: &RunEnv) -> PathBuf {
+    pi_agent_directory(run_env).join(PI_INTEGRATION_TOOLS_FILE)
+}
+
+fn normalized_integration_tools(
+    context: Option<&IntegrationContextDto>,
+) -> anyhow::Result<Vec<Value>> {
+    let Some(context) = context else {
+        return Ok(Vec::new());
+    };
+    let tools = context
+        .tools
+        .as_array()
+        .context("Integration tools must be an array")?;
+    let mut names = HashSet::new();
+    let mut normalized = Vec::with_capacity(tools.len());
+    for tool in tools {
+        let name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .context("Integration tool name is required")?;
+        anyhow::ensure!(
+            !name.contains(','),
+            "Integration tool name cannot contain a comma"
+        );
+        anyhow::ensure!(
+            !PI_BUILTIN_TOOL_NAMES.contains(&name),
+            "Integration tool name conflicts with a Pi built-in tool"
+        );
+        anyhow::ensure!(
+            names.insert(name.to_owned()),
+            "Integration tool names must be unique"
+        );
+        let description = match tool.get("description") {
+            Some(Value::String(description)) => description.clone(),
+            Some(Value::Null) | None => String::new(),
+            Some(_) => anyhow::bail!("Integration tool description must be a string"),
+        };
+        let parameters = match tool.get("parameters") {
+            Some(parameters @ Value::Object(_)) => parameters.clone(),
+            Some(Value::Null) | None => json!({ "type": "object" }),
+            Some(_) => anyhow::bail!("Integration tool parameters must be a JSON object"),
+        };
+        normalized.push(json!({
+            "name": name,
+            "label": name,
+            "description": description,
+            "parameters": parameters
+        }));
+    }
+    Ok(normalized)
+}
+
+fn integration_tool_names(context: Option<&IntegrationContextDto>) -> anyhow::Result<Vec<String>> {
+    normalized_integration_tools(context).map(|tools| {
+        tools
+            .into_iter()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+            .collect()
+    })
+}
+
+fn remove_file_if_present(path: &Path) -> anyhow::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+fn replace_private_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let parent = path
+            .parent()
+            .context("private file has no parent directory")?;
+        let filename = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .context("private file name is not valid UTF-8")?;
+        let temporary = parent.join(format!(".{filename}.{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| -> anyhow::Result<()> {
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&temporary)
+                .with_context(|| {
+                    format!("create temporary private file {}", temporary.display())
+                })?;
+            file.write_all(contents)
+                .with_context(|| format!("write temporary private file {}", temporary.display()))?;
+            drop(file);
+            fs::rename(&temporary, path)
+                .with_context(|| format!("replace private file {}", path.display()))?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (path, contents);
+        anyhow::bail!("private config files require a Unix runtime");
+    }
+}
+
+pub(super) fn materialize_integration_tools(
+    run_env: &RunEnv,
+    context: Option<&IntegrationContextDto>,
+) -> anyhow::Result<()> {
+    let tools = normalized_integration_tools(context)?;
+    let extension_path = pi_integration_extension_path(run_env);
+    let tools_path = pi_integration_tools_path(run_env);
+    if tools.is_empty() {
+        remove_file_if_present(&extension_path)?;
+        remove_file_if_present(&tools_path)?;
+        return Ok(());
+    }
+
+    prepare_private_directory(&pi_agent_directory(run_env), "Pi Agent directory")?;
+    replace_private_file(&tools_path, &serde_json::to_vec_pretty(&tools)?)
+        .context("write Integration tools catalog")?;
+    replace_private_file(&extension_path, PI_INTEGRATION_EXTENSION_SOURCE.as_bytes())
+        .context("write Integration tools Extension")?;
+    Ok(())
 }
 
 fn prepare_private_directory(path: &Path, purpose: &str) -> anyhow::Result<()> {
@@ -569,7 +738,12 @@ impl PersistentPiRpcProcess {
             .arg("rpc")
             .arg("--session-dir")
             .arg(&session_dir)
-            .arg("--no-extensions")
+            .arg("--no-extensions");
+        let integration_extension = pi_integration_extension_path(run_env);
+        if integration_extension.is_file() {
+            command.arg("--extension").arg(&integration_extension);
+        }
+        command
             .arg("--no-themes")
             .arg("--no-prompt-templates")
             .arg("--tools")
@@ -749,7 +923,13 @@ impl PersistentPiRpcProcess {
     ) -> anyhow::Result<AppServerRunResult> {
         self.ensure_running()?;
         let started_at = Instant::now();
-        let mut state = PiRunState::new(claim.run.id, self.session_id.clone());
+        let mut state = PiRunState::new(
+            claim.run.id,
+            self.session_id.clone(),
+            integration_tool_names(claim.integration_context.as_ref())?
+                .into_iter()
+                .collect(),
+        );
         self.configure_run(claim, &mut state, started_at, event_tx)?;
 
         let prompt = pi_prompt_text(claim)?;
@@ -1066,6 +1246,8 @@ struct PiRunState {
     tool_started: HashSet<String>,
     tool_ended: HashSet<String>,
     tool_outputs: BTreeMap<String, String>,
+    integration_tool_names: HashSet<String>,
+    integration_tool_requested: bool,
     retry_started: HashSet<u64>,
     retry_ended: HashSet<u64>,
     compaction_generation: u64,
@@ -1073,7 +1255,11 @@ struct PiRunState {
 }
 
 impl PiRunState {
-    fn new(run_id: uuid::Uuid, session_id: String) -> Self {
+    fn new(
+        run_id: uuid::Uuid,
+        session_id: String,
+        integration_tool_names: HashSet<String>,
+    ) -> Self {
         Self {
             run_id,
             session_id,
@@ -1093,6 +1279,8 @@ impl PiRunState {
             tool_started: HashSet::new(),
             tool_ended: HashSet::new(),
             tool_outputs: BTreeMap::new(),
+            integration_tool_names,
+            integration_tool_requested: false,
             retry_started: HashSet::new(),
             retry_ended: HashSet::new(),
             compaction_generation: 0,
@@ -1266,6 +1454,7 @@ impl PiRunState {
             self.final_status = match stop_reason {
                 "aborted" => "interrupted".into(),
                 "error" => "failed".into(),
+                "toolUse" if self.integration_tool_requested => "waiting_tool".into(),
                 "stop" | "length" | "toolUse" => "completed".into(),
                 _ => anyhow::bail!("Pi turn_end has an unsupported stop reason"),
             };
@@ -1323,6 +1512,16 @@ impl PiRunState {
             return Ok(());
         }
         let args = value.get("args").cloned().unwrap_or_else(|| json!({}));
+        if self.integration_tool_names.contains(tool_name) {
+            self.integration_tool_requested = true;
+            self.events.push(pi_integration_tool_request(
+                self.run_id,
+                tool_call_id,
+                tool_name,
+                args,
+            ));
+            return Ok(());
+        }
         self.events.push(pi_tool_event(
             tool_call_id,
             tool_name,
@@ -1344,6 +1543,9 @@ impl PiRunState {
             !self.tool_ended.contains(tool_call_id),
             "Pi tool update arrived after tool end"
         );
+        if self.integration_tool_names.contains(tool_name) {
+            return Ok(());
+        }
         let output = pi_result_text(value.get("partialResult"));
         let previous = self
             .tool_outputs
@@ -1376,6 +1578,9 @@ impl PiRunState {
             "Pi tool end arrived before tool start"
         );
         if !self.tool_ended.insert(tool_call_id.to_owned()) {
+            return Ok(());
+        }
+        if self.integration_tool_names.contains(tool_name) {
             return Ok(());
         }
         let output = pi_result_text(value.get("result"));
@@ -1561,6 +1766,16 @@ pub(super) fn pi_tool_allowlist(agent: &AgentDto) -> Vec<String> {
     tools.into_iter().map(str::to_owned).collect()
 }
 
+pub(super) fn pi_tool_allowlist_for_claim(claim: &ClaimRunResponse) -> anyhow::Result<Vec<String>> {
+    let mut tools = pi_tool_allowlist(&claim.agent);
+    for name in integration_tool_names(claim.integration_context.as_ref())? {
+        if !tools.contains(&name) {
+            tools.push(name);
+        }
+    }
+    Ok(tools)
+}
+
 pub(super) fn discover_session_file(
     pi_home: &Path,
     expected_session_id: &str,
@@ -1601,7 +1816,7 @@ pub(super) fn discover_session_file(
     matched.context("Pi Session recovery file was not found")
 }
 
-fn pi_prompt_text(claim: &ClaimRunResponse) -> anyhow::Result<String> {
+pub(super) fn pi_prompt_text(claim: &ClaimRunResponse) -> anyhow::Result<String> {
     let mut messages = claim
         .session_context
         .as_ref()
@@ -1614,12 +1829,23 @@ fn pi_prompt_text(claim: &ClaimRunResponse) -> anyhow::Result<String> {
         .filter(|text| !text.trim().is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
-    let prompt = if prompt.trim().is_empty() {
+    let mut prompt = if prompt.trim().is_empty() {
         claim.run.initial_message.trim().to_owned()
     } else {
         prompt
     };
     anyhow::ensure!(!prompt.is_empty(), "Pi prompt must not be empty");
+    if let Some(context) = &claim.integration_context {
+        let envelope = json!({
+            "message": prompt,
+            "attachments": context.attachments,
+            "tool_result": context.tool_result
+        });
+        prompt.push_str("\n\n");
+        prompt.push_str(PI_INTEGRATION_CONTEXT_LABEL);
+        prompt.push('\n');
+        prompt.push_str(&serde_json::to_string(&envelope)?);
+    }
     Ok(prompt)
 }
 
@@ -1795,6 +2021,32 @@ fn pi_tool_event(
         role: Some("assistant".into()),
         content: None,
         payload,
+        waiting_tool: None,
+    }
+}
+
+fn pi_integration_tool_request(
+    run_id: uuid::Uuid,
+    tool_call_id: &str,
+    tool_name: &str,
+    arguments: Value,
+) -> AppendRunEventRequest {
+    let source_id = tool_call_id
+        .rsplit_once('|')
+        .filter(|(_, item_id)| item_id.starts_with("fc_"))
+        .map_or(tool_call_id, |(call_id, _)| call_id);
+    let tool_request_id =
+        stable_tool_request_uuid(run_id, tool_name, Some(source_id), &arguments).to_string();
+    AppendRunEventRequest {
+        event_type: "tool_request".into(),
+        role: Some("assistant".into()),
+        content: Some(format!("Pi requested {tool_name} tool")),
+        payload: json!({
+            "tool_request_id": tool_request_id,
+            "source_id": source_id,
+            "tool_name": tool_name,
+            "arguments": arguments
+        }),
         waiting_tool: None,
     }
 }

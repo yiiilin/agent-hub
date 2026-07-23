@@ -11,6 +11,21 @@ function uniqueSlug(context, prefix) {
     .replace(/^-|-$/g, '');
 }
 
+async function createComposeModelFixture(client, context) {
+  const { data: connection } = await client.post('/api/model-connections', {
+    scope: 'personal',
+    name: context.unique('QA Integration model'),
+    base_url: 'http://fake-model-provider:8080',
+    api_type: 'openai_responses',
+    allowed_model_ids: ['hub-proxy-smoke'],
+    api_key: 'dev-model-provider-api-key'
+  });
+  return {
+    connectionId: connection.id,
+    selection: { connection_id: connection.id, model_id: 'hub-proxy-smoke' }
+  };
+}
+
 function assertUuid(value, label) {
   assert.match(value, UUID_PATTERN, `${label} must be a UUID`);
 }
@@ -243,6 +258,7 @@ export default async function integrationsOauthApiScenario(context) {
   let concurrencySession = null;
   let appAccessToken = null;
   let liveSse = null;
+  let modelConnectionId = null;
   let scenarioError = null;
   const cleanupErrors = [];
 
@@ -257,17 +273,22 @@ export default async function integrationsOauthApiScenario(context) {
     ));
     assert.ok(mockChannel, 'Mock OIDC trusted channel must be available');
 
+    const modelFixture = await createComposeModelFixture(ownerClient, context);
+    modelConnectionId = modelFixture.connectionId;
+
     ({ data: primaryAgent } = await ownerClient.post('/api/agents', {
       name: context.unique('QA Integration Primary Agent'),
       instructions: 'Exercise OAuth, Session continuation, tools, and revocation.',
       visibility: 'private',
-      public_to: []
+      public_to: [],
+      model_selection: modelFixture.selection
     }));
     ({ data: secondaryAgent } = await ownerClient.post('/api/agents', {
       name: context.unique('QA Integration Secondary Agent'),
       instructions: 'Exercise unaffected delegation and concurrent message serialization.',
       visibility: 'private',
-      public_to: []
+      public_to: [],
+      model_selection: modelFixture.selection
     }));
     agentIds.push(primaryAgent.id, secondaryAgent.id);
     assertUuid(primaryAgent.id, 'Primary Agent id');
@@ -624,7 +645,7 @@ export default async function integrationsOauthApiScenario(context) {
     const toolRequestId = toolRequestEvent.payload.tool_request_id;
     assertUuid(toolRequestId, 'Tool request id');
     assert.equal(toolRequestEvent.payload.tool_name, 'echo');
-    assert.equal(toolRequestEvent.payload.source_id, 'platform-tool-call');
+    assert.equal(toolRequestEvent.payload.source_id, 'platform|tool-call');
     assert.equal(toolRequestEvent.payload.arguments.message, messageContent);
     assert.deepEqual(toolRequestEvent.payload.arguments.attachments, [
       { ...attachments[0], url: null },
@@ -886,6 +907,14 @@ export default async function integrationsOauthApiScenario(context) {
     for (const agentId of agentIds.toReversed()) {
       await cleanupResource(
         () => ownerClient.delete(`/api/agents/${agentId}`, { expectedStatus: [204, 404] }),
+        cleanupErrors
+      );
+    }
+    if (modelConnectionId) {
+      await cleanupResource(
+        () => ownerClient.delete(`/api/model-connections/${modelConnectionId}`, {
+          expectedStatus: [204, 404]
+        }),
         cleanupErrors
       );
     }

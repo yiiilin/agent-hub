@@ -2317,7 +2317,7 @@ async fn execute_managed_run_inner(
             metadata,
             config.codex_bin.clone(),
             run_env.clone(),
-            pi_driver::pi_tool_allowlist(&claim.agent),
+            pi_driver::pi_tool_allowlist_for_claim(&claim)?,
             config.app_server_timeout,
             Some(model_proxy),
         )
@@ -7791,11 +7791,12 @@ async fn prepare_run_env_with_local_skills(
         local_skills_dir,
     )
     .await?;
-
-    Ok(RunEnv {
+    let run_env = RunEnv {
         workdir: paths.workspace,
         codex_home: paths.codex,
-    })
+    };
+    pi_driver::materialize_integration_tools(&run_env, claim.integration_context.as_ref())?;
+    Ok(run_env)
 }
 
 const MATERIALIZATION_MARKER_FILE: &str = ".agent-hub-materialization.json";
@@ -13018,6 +13019,230 @@ done
 
         drop(process);
         assert_process_group_reaped_or_clean_up(&pid_file);
+    }
+
+    #[tokio::test]
+    async fn persistent_pi_rpc_process_maps_integration_tools_to_waiting_requests() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("pi-integration-tool.pid");
+        let pi_bin = write_fake_pi_wrapper(&temp, &pid_file, &["FAKE_PI_DISABLE_MODEL=1"]);
+        let mut claim = test_claim();
+        claim.run.initial_message = "fixture:integration".into();
+        claim.run.integration_session_id = Some(Uuid::new_v4());
+        claim.integration_context = Some(IntegrationContextDto {
+            tools: json!([{
+                "name": "echo",
+                "description": "Echo integration input",
+                "parameters": { "type": "object" }
+            }]),
+            attachments: json!([{
+                "kind": "text",
+                "name": "qa-note.txt",
+                "content_type": "text/plain",
+                "size_bytes": 32,
+                "text": "quoted text, arrays [1, 2], and a second line\nkept exactly",
+                "url": null
+            }]),
+            tool_result: None,
+        });
+        let run_env = prepare_run_env(temp.path(), &claim, Some("http://127.0.0.1:1/v1"))
+            .await
+            .unwrap();
+        let mut process = pi_driver::PersistentPiRpcProcess::start(
+            pi_bin.to_str().unwrap(),
+            &run_env,
+            None,
+            &pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap(),
+            Duration::from_secs(2),
+            Arc::new(AppServerCancellation::default()),
+        )
+        .unwrap();
+
+        let result = process.execute(&claim, None).unwrap();
+        assert_eq!(result.final_status, "waiting_tool");
+        let requests = result
+            .events
+            .iter()
+            .filter(|event| event.event_type == "tool_request")
+            .collect::<Vec<_>>();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].payload["source_id"], "platform|tool-call");
+        assert_eq!(requests[0].payload["tool_name"], "echo");
+        assert_eq!(
+            requests[0].payload["tool_request_id"],
+            stable_tool_request_uuid(
+                claim.run.id,
+                "echo",
+                Some("platform|tool-call"),
+                &requests[0].payload["arguments"],
+            )
+            .to_string()
+        );
+        assert_eq!(
+            requests[0].payload["arguments"],
+            json!({
+                "message": "fixture:integration",
+                "attachments": [{
+                    "kind": "text",
+                    "name": "qa-note.txt",
+                    "content_type": "text/plain",
+                    "size_bytes": 32,
+                    "text": "quoted text, arrays [1, 2], and a second line\nkept exactly",
+                    "url": null
+                }]
+            })
+        );
+        assert!(!result.events.iter().any(|event| {
+            event.event_type == "item" && event.payload["item_id"] == "platform-tool-call"
+        }));
+
+        drop(process);
+        assert_process_group_reaped_or_clean_up(&pid_file);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pi_integration_tools_materialize_as_data_and_empty_catalog_removes_bridge() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut claim = test_claim();
+        claim.integration_context = Some(IntegrationContextDto {
+            tools: json!([{
+                "name": "echo",
+                "description": "Echo quotes like `x` without becoming code.",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "message": { "type": "string" } },
+                    "required": ["message"]
+                }
+            }]),
+            attachments: json!([]),
+            tool_result: None,
+        });
+
+        let run_env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
+        let agent_dir = run_env.codex_home.join(".pi/agent");
+        let catalog_path = agent_dir.join("agent-hub-integration-tools.json");
+        let extension_path = agent_dir.join("agent-hub-integration-tools.mjs");
+        let catalog: Value =
+            serde_json::from_slice(&fs::read(&catalog_path).await.unwrap()).unwrap();
+        assert_eq!(catalog[0]["name"], "echo");
+        assert_eq!(
+            catalog[0]["description"],
+            "Echo quotes like `x` without becoming code."
+        );
+        let extension = fs::read_to_string(&extension_path).await.unwrap();
+        assert!(extension.contains("pi.registerTool"));
+        assert!(!extension.contains("Echo quotes like `x` without becoming code."));
+        assert_eq!(
+            fs::metadata(&catalog_path)
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap(),
+            ["read", "grep", "find", "ls", "edit", "write", "bash", "echo"]
+        );
+
+        let catalog_sentinel = temp.path().join("catalog-sentinel");
+        let extension_sentinel = temp.path().join("extension-sentinel");
+        fs::write(&catalog_sentinel, b"catalog sentinel")
+            .await
+            .unwrap();
+        fs::write(&extension_sentinel, b"extension sentinel")
+            .await
+            .unwrap();
+        fs::remove_file(&catalog_path).await.unwrap();
+        fs::remove_file(&extension_path).await.unwrap();
+        symlink(&catalog_sentinel, &catalog_path).unwrap();
+        symlink(&extension_sentinel, &extension_path).unwrap();
+        pi_driver::materialize_integration_tools(&run_env, claim.integration_context.as_ref())
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(&catalog_sentinel).await.unwrap(),
+            "catalog sentinel"
+        );
+        assert_eq!(
+            fs::read_to_string(&extension_sentinel).await.unwrap(),
+            "extension sentinel"
+        );
+        assert!(fs::symlink_metadata(&catalog_path)
+            .await
+            .unwrap()
+            .file_type()
+            .is_file());
+        assert!(fs::symlink_metadata(&extension_path)
+            .await
+            .unwrap()
+            .file_type()
+            .is_file());
+
+        claim.integration_context.as_mut().unwrap().tools = json!([{ "name": "bash" }]);
+        assert_eq!(
+            pi_driver::materialize_integration_tools(&run_env, claim.integration_context.as_ref())
+                .unwrap_err()
+                .to_string(),
+            "Integration tool name conflicts with a Pi built-in tool"
+        );
+        assert_eq!(
+            pi_driver::pi_tool_allowlist_for_claim(&claim)
+                .unwrap_err()
+                .to_string(),
+            "Integration tool name conflicts with a Pi built-in tool"
+        );
+
+        claim.run.id = Uuid::new_v4();
+        claim.integration_context.as_mut().unwrap().tools = json!([]);
+        prepare_run_env(temp.path(), &claim, None).await.unwrap();
+        assert!(!catalog_path.exists());
+        assert!(!extension_path.exists());
+    }
+
+    #[test]
+    fn pi_prompt_preserves_structured_integration_attachments_and_tool_result() {
+        let mut claim = test_claim();
+        claim.run.initial_message = "message with \"quotes\" and a second line\nkept".into();
+        claim.integration_context = Some(IntegrationContextDto {
+            tools: json!([]),
+            attachments: json!([{
+                "kind": "url",
+                "name": "reference",
+                "content_type": "text/html",
+                "size_bytes": 0,
+                "text": null,
+                "url": "https://example.com/reference?source=qa"
+            }]),
+            tool_result: Some(json!({
+                "text": "tool result with \"quotes\"",
+                "nested": { "values": [1, true, null, { "line": "first\nsecond" }] }
+            })),
+        });
+
+        let prompt = pi_driver::pi_prompt_text(&claim).unwrap();
+        let (_, encoded) = prompt
+            .split_once("Agent Hub Integration context (JSON):\n")
+            .unwrap();
+        let envelope: Value = serde_json::from_str(encoded).unwrap();
+        assert_eq!(envelope["message"], claim.run.initial_message);
+        assert_eq!(
+            envelope["attachments"],
+            claim.integration_context.as_ref().unwrap().attachments
+        );
+        assert_eq!(
+            envelope["tool_result"],
+            claim
+                .integration_context
+                .as_ref()
+                .unwrap()
+                .tool_result
+                .clone()
+                .unwrap()
+        );
     }
 
     #[tokio::test]
