@@ -130,7 +130,7 @@ type AgentConfiguration = Pick<Agent,
   | 'runtime_id'
   | 'model_selection'
   | 'model_settings'
-  | 'codex_subagents'
+  | 'subagents'
   | 'sandbox_policy'
   | 'managed_skill_ids'
   | 'mcp_allowlist'
@@ -144,7 +144,7 @@ function createAgentRequest(name: string, instructions: string) {
     public_to: [],
     model_selection: null,
     model_settings: automaticModelSettings,
-    codex_subagents: []
+    subagents: []
   };
 }
 
@@ -158,7 +158,7 @@ function updateAgentRequest(agent: AgentConfiguration, changes: Partial<AgentCon
     runtime_id: updated.runtime_id,
     model_selection: updated.model_selection,
     model_settings: updated.model_settings,
-    codex_subagents: updated.codex_subagents,
+    subagents: updated.subagents,
     sandbox_policy: updated.sandbox_policy,
     managed_skill_ids: updated.managed_skill_ids,
     mcp_allowlist: updated.mcp_allowlist
@@ -180,7 +180,7 @@ function consoleAgentFixture(agentId: string, ownerId: string, now: string) {
     can_invoke: true,
     model_selection: null,
     model_settings: automaticModelSettings,
-    codex_subagents: [],
+    subagents: [],
     model_policy: {},
     sandbox_policy: {},
     managed_skill_ids: [],
@@ -204,7 +204,7 @@ function runFixture(runId: string, agentId: string, now: string, status: string,
     session_ownership_generation: null,
     status,
     initial_message: initialMessage,
-    session_id: null,
+    native_session_id: null,
     work_dir_ref: null,
     source: 'console',
     created_at: now,
@@ -305,7 +305,7 @@ test('owner, admin, public, and public_to permissions stay isolated', async ({ b
     expect(adminPrivateView.runtime_id).toBe(memberRuntimes[0]?.id ?? null);
     expect(adminPrivateView.model_selection).toEqual(memberPrivate.model_selection);
     expect(adminPrivateView.model_settings.reasoning_effort).toBe('high');
-    expect(adminPrivateView.codex_subagents).toEqual([]);
+    expect(adminPrivateView.subagents).toEqual([]);
     expect(adminPrivateView.sandbox_policy).toMatchObject({ private_marker: 'sandbox-secret' });
     expect(adminPrivateView.managed_skill_ids).toEqual([]);
     expect(adminPrivateView.mcp_allowlist).toEqual([{ name: 'private-mcp', command: 'private-command' }]);
@@ -356,7 +356,7 @@ test('owner, admin, public, and public_to permissions stay isolated', async ({ b
     expect(publicView.can_manage).toBe(false);
     expect(publicView.model_selection).toBeNull();
     expect(publicView.model_settings.reasoning_effort).toBe('default');
-    expect(publicView.codex_subagents).toEqual([]);
+    expect(publicView.subagents).toEqual([]);
     expect(publicView.sandbox_policy).toEqual({});
     expect(publicView.managed_skill_ids).toEqual([]);
     expect(publicView.mcp_allowlist).toEqual([]);
@@ -369,7 +369,7 @@ test('owner, admin, public, and public_to permissions stay isolated', async ({ b
     });
     expect(publicRun.ok()).toBeTruthy();
     expect((await publicRun.json() as { hub_session_id: string | null }).hub_session_id).toBeTruthy();
-    await expect(memberPage.getByText('Fake Codex completed run')).toBeVisible({ timeout: 30_000 });
+    await expect(memberPage.getByText('completed run')).toBeVisible({ timeout: 30_000 });
 
     await memberPage.goto(`/agents/${sharedAgentId}`);
     await expect(memberPage.getByRole('heading', { name: sharedName, level: 1 })).toBeVisible();
@@ -380,7 +380,7 @@ test('owner, admin, public, and public_to permissions stay isolated', async ({ b
     });
     expect(sharedRun.ok()).toBeTruthy();
     expect((await sharedRun.json() as { hub_session_id: string | null }).hub_session_id).toBeTruthy();
-    await expect(memberPage.getByText('Fake Codex completed run')).toBeVisible({ timeout: 30_000 });
+    await expect(memberPage.getByText('completed run')).toBeVisible({ timeout: 30_000 });
 
     outsiderContext = await browser.newContext({ baseURL });
     const outsiderPage = await outsiderContext.newPage();

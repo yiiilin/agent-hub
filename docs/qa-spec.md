@@ -9,7 +9,7 @@ Agent Hub V1 的每项功能必须能追溯到自动化证据。QA 不要求把�
 - `docs/*-spec.md` 中仍有效的范围与验收标准；
 - `/openapi.json` 暴露的公共、用户、集成和 Runtime API；
 - 管理台当前可达页面、对话 Widget 和嵌入协议；
-- `docs/session-runtime-spec.md` 定义的 Session、Runtime、Bundle 和 Codex 生命周期。
+- `docs/session-runtime-spec.md` 定义的 Session、Runtime、Bundle 和 Execution Engine 生命周期。
 
 文档明确列为非目标的能力不进入覆盖目录。
 
@@ -18,7 +18,7 @@ Agent Hub V1 的每项功能必须能追溯到自动化证据。QA 不要求把�
 | 层级 | 主要职责 |
 | --- | --- |
 | Rust | 纯逻辑、序列化、数据库约束、协议状态机、并发与安全边界 |
-| API QA | 真实 PostgreSQL、Hub、Runtime、fake Codex、fake Responses provider 和 Mock OIDC 的契约与负路径 |
+| API QA | 真实 PostgreSQL、Hub、Runtime、fake Pi RPC、fake model provider 和 Mock OIDC 的契约与负路径 |
 | Browser QA | 真实前端与后端关键工作流、交互状态、desktop/390px、i18n、console/network |
 
 覆盖完成必须同时满足：
@@ -36,11 +36,11 @@ Agent Hub V1 的每项功能必须能追溯到自动化证据。QA 不要求把�
 - Platform bootstrap、health/readiness、OpenAPI 和导航。
 - Password、Mock OIDC、browser session、API Key 和 Embed JWT 认证。
 - Administration 用户、角色、认证策略、External Platform 和 Authentication Channel。
-- Agent 生命周期、visibility、Runtime 约束、Markdown、Codex Subagent Definition 和历史只读。
+- Agent 生命周期、visibility、Runtime 约束、Markdown、Subagent Definition 和历史只读。
 - Hub-managed Skill、Agent 绑定、批量删除、refresh fencing 和 MCP secret。
 - Global/Personal Model Connection、System Default、透明 Responses proxy、usage/error ledger。
-- Session、Message、Run、Turn、SSE、steer、interrupt、Thread 和 Workspace 隔离。
-- Runtime enrollment、credential、ownership、drain/delete、Session Bundle、recovery 和 Codex rollout。
+- Session、Message、Run、Turn、SSE、steer、interrupt、Native Session 和 Workspace 隔离。
+- Runtime enrollment、credential、ownership、drain/delete、Session Bundle、recovery 和 Runtime Engine 版本。
 - Automation CRUD、manual/webhook/interval/cron、scheduler 和 Run history。
 - Integration App、OAuth、External Session、SSE、attachment、tool request/result 和权限失效。
 - Widget session、origin 隔离、session select、message submit、stop 和 `postMessage`。
@@ -61,7 +61,7 @@ Agent Hub V1 的每项功能必须能追溯到自动化证据。QA 不要求把�
 
 ## 测试环境
 
-全部场景使用本地 fake Codex、fake Responses provider、Mock OIDC 和 S3-compatible 开发存储，不访问真实 AI、OAuth、S3 或 GitHub 服务。不得为测试新增绕过生产认证或授权的后门。
+全部场景使用本地 fake Pi RPC、fake model provider、Mock OIDC 和 S3-compatible 开发存储，不访问真实 AI、OAuth、S3 或 GitHub 服务。不得为测试新增绕过生产认证或授权的后门。
 
 一次完整运行只启动一套隔离 Compose 环境。普通场景失败后继续运行其余场景；若 worker 触发 OS-level hard timeout，则当前场景记为 `failed`，后续已选择场景全部记为 `not_run` 并注明共享环境可能已污染，且不得再启动 worker。随后仍按正常流程 teardown 这一套 Compose；运行结束或收到信号时删除容器、网络和 QA 数据卷。暖缓存完整运行目标不超过十分钟。
 

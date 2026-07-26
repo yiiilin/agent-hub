@@ -46,7 +46,7 @@ function updateAgentPayload(agent, overrides = {}) {
     runtime_id: agent.runtime_id,
     model_selection: agent.model_selection,
     model_settings: agent.model_settings,
-    codex_subagents: agent.codex_subagents,
+    subagents: agent.subagents,
     sandbox_policy: agent.sandbox_policy,
     managed_skill_ids: agent.managed_skill_ids,
     mcp_allowlist: agent.mcp_allowlist,
@@ -84,7 +84,7 @@ async function registerRuntime(runtimeClient, enrollment, template, hostname, la
   const { data } = await runtimeClient.post('/api/runtime/register', {
     hostname,
     labels: ['qa', label],
-    codex_version: template.codex_version,
+    engine_version: template.engine_version,
     capabilities: structuredClone(template.capabilities),
     sandbox_mode: template.sandbox_mode
   }, {
@@ -105,7 +105,7 @@ async function expectRegistrationRejected(runtimeClient, token, template, contex
   const response = await runtimeClient.post('/api/runtime/register', {
     hostname: uniqueSlug(context, `qa-rejected-${label}`),
     labels: ['qa', 'rejected'],
-    codex_version: template.codex_version,
+    engine_version: template.engine_version,
     capabilities: structuredClone(template.capabilities),
     sandbox_mode: template.sandbox_mode
   }, {
@@ -201,7 +201,7 @@ async function driveClaimedRun({
     assert.equal([403, 409].includes(rejected.status), true);
   }
 
-  const nativeThreadId = uniqueSlug(context, 'qa-native-thread');
+  const nativeSessionId = uniqueSlug(context, 'qa-native-thread');
   const nativeTurnId = uniqueSlug(context, 'qa-native-turn');
   const { data: turnStarted } = await runtimeClient.post(
     `/api/runtime/runs/${expectedRun.id}/events`,
@@ -212,7 +212,7 @@ async function driveClaimedRun({
         role: null,
         content: null,
         payload: {
-          native_thread_id: nativeThreadId,
+          native_session_id: nativeSessionId,
           native_turn_id: nativeTurnId
         }
       }
@@ -220,7 +220,7 @@ async function driveClaimedRun({
     { headers: bearer(credential) }
   );
   assert.equal(turnStarted.event_type, 'turn_started');
-  assert.equal(turnStarted.payload.native_thread_id, nativeThreadId);
+  assert.equal(turnStarted.payload.native_session_id, nativeSessionId);
   assert.equal(turnStarted.payload.native_turn_id, nativeTurnId);
 
   const output = uniqueSlug(context, 'qa-runtime-output');
@@ -245,7 +245,7 @@ async function driveClaimedRun({
     ownership_generation: generation,
     payload: {
       status: 'completed',
-      session_id: nativeThreadId,
+      native_session_id: nativeSessionId,
       work_dir_ref: `qa/${uniqueSlug(context, 'runtime-work')}`
     }
   };
@@ -266,7 +266,7 @@ async function driveClaimedRun({
   assert.equal(completed.status, 'completed');
   assert.equal(completed.runtime_id, runtimeId);
   assert.equal(completed.session_ownership_generation, generation);
-  assert.equal(completed.session_id, nativeThreadId);
+  assert.equal(completed.native_session_id, nativeSessionId);
   assert.equal(completed.work_dir_ref, completionBody.payload.work_dir_ref);
 
   const { data: publicRun } = await adminClient.get(`/api/runs/${expectedRun.id}`);
@@ -278,7 +278,7 @@ async function driveClaimedRun({
   assertStrictlyIncreasing(publicEvents, 'Public Run events');
   const publicTurnStarted = publicEvents.find((event) => event.event_type === 'turn_started');
   assert.equal(Boolean(publicTurnStarted), true, 'Public events must expose turn_started');
-  assert.equal(publicTurnStarted.payload.native_thread_id, nativeThreadId);
+  assert.equal(publicTurnStarted.payload.native_session_id, nativeSessionId);
   assert.equal(publicTurnStarted.payload.native_turn_id, nativeTurnId);
   assert.equal(
     publicEvents.some((event) => event.event_type === 'message'
@@ -299,11 +299,11 @@ async function driveClaimedRun({
     `/api/sessions/${expectedRun.hub_session_id}`
   );
   assert.equal(publicSession.lifecycle_status, 'online');
-  assert.equal(publicSession.native_thread_id, nativeThreadId);
+  assert.equal(publicSession.native_session_id, nativeSessionId);
   assert.equal(publicSession.runtime_owner_id, runtimeId);
   assert.equal(publicSession.ownership_generation, generation);
   assert.equal(publicSession.active_turn_id, null);
-  return { generation, nativeThreadId };
+  return { generation, nativeSessionId };
 }
 
 async function cleanupResource(action, errors) {

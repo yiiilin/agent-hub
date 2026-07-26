@@ -10,13 +10,13 @@ when the new `parameters` object is omitted or all values are automatic.
 The supported connection defaults are reasoning effort, reasoning summary,
 verbosity, context window, automatic compaction threshold, reasoning-summary
 capability, service tier, request retries, stream retries, and stream idle
-timeout. Agent and Codex subagent reasoning settings remain overrides. The Hub
+timeout. Agent and Subagent reasoning settings remain overrides. The Hub
 and Model Gateway must not parse or rewrite request bodies to inject sampling,
 output-limit, or tool-choice parameters.
 
 ## Effective Settings
 
-- Reasoning effort precedence is Codex subagent override, Agent override,
+- Reasoning effort precedence is Subagent override, Agent override,
   selected Model Connection default, then Codex model metadata.
 - Other model settings come from the Model Connection selected by the main or
   subagent. Unset values are omitted from generated TOML.

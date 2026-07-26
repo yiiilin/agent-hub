@@ -4,8 +4,8 @@ Type: `browser`
 
 This scenario uses the real Compose backend-hosted frontend and PostgreSQL database.
 It registers a unique member through the public password API, signs in as the
-seeded Super Administrator through the browser, and verifies all four
-Administration tabs without mutating the Codex rollout.
+seeded Super Administrator through the browser, and verifies all three
+Administration tabs.
 
 The browser changes and saves one authentication-policy value, creates and
 renames a uniquely keyed External Platform, and creates then edits its nested

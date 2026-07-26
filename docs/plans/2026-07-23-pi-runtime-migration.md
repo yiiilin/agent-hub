@@ -19,7 +19,7 @@ steering, interruption, and idle Bundle lifecycle.
   OpenAI Responses endpoint; Hub keeps protocol conversion, provider keys,
   token accounting, error records, and per-Run binding authentication.
 - Managed Skills and Agent instructions continue to be materialized for each
-  Session. MCP and Codex subagents are deliberately disabled for Pi in this
+  Session. MCP and Subagents are deliberately disabled for Pi in this
   iteration.
 - Existing public DTO, database, API, and console field names remain stable.
   Compatibility-named `codex_*` fields temporarily report the Pi artifact

@@ -20,7 +20,7 @@ function session(id: string, agentId: string, agentName: string, origin: 'hub_na
       ? { kind: 'hub_native' }
       : { kind: 'external', platform_id: 'platform-one', tenant_id: 'tenant-one', external_identity_id: 'identity-one' },
     lifecycle_status: 'online',
-    native_thread_id: `thread-${id}`,
+    native_session_id: `session-${id}`,
     active_turn_id: null as string | null,
     history_checkpoint: 2,
     configuration_fingerprint: null,
@@ -60,7 +60,7 @@ async function installSessionApi(page: Page) {
   const historical = session('historical', deletedAgentId, 'Deleted Agent', 'hub_native', {
     lifecycle_status: 'historical',
     agent_deleted_at: now,
-    native_thread_id: null,
+    native_session_id: null,
     runtime_owner_id: null
   });
   const multiTurn = session('multi-turn', activeAgentId, 'Multi-turn Agent', 'hub_native');
@@ -135,7 +135,7 @@ async function installSessionApi(page: Page) {
       return route.fulfill({ json: {
         id: 'run-new', agent_id: newAgentId, automation_id: null, integration_session_id: null, hub_session_id: 'new-session', hub_message_id: messages['new-session'][0].id,
         hub_turn_id: 'turn-new', session_ownership_generation: 0, parent_run_id: null, runtime_id: null, status: 'pending', initial_message: createBody.message,
-        session_id: null, work_dir_ref: null, source: 'console', created_at: now, updated_at: now
+        native_session_id: null, work_dir_ref: null, source: 'console', created_at: now, updated_at: now
       } });
     }
     if (path === '/api/sessions/new-session' && request.method() === 'GET') {

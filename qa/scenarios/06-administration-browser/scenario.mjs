@@ -58,14 +58,6 @@ export default async function administrationBrowserScenario(context) {
         { method: 'GET', pathname: '/api/auth/me', status: 401, times: 1 }
       ]
     }, async ({ page, browserErrors }) => {
-      const codexMutations = [];
-      page.on('request', (request) => {
-        const pathname = new URL(request.url()).pathname;
-        if (pathname.startsWith('/api/admin/codex-version-rollout') && request.method() !== 'GET') {
-          codexMutations.push(`${request.method()} ${pathname}`);
-        }
-      });
-
       await page.goto('/login', { waitUntil: 'domcontentloaded' });
       await page.getByLabel('Email').fill('admin@example.com');
       await page.getByLabel('Password').fill('admin123');
@@ -75,7 +67,7 @@ export default async function administrationBrowserScenario(context) {
       await page.goto('/administration', { waitUntil: 'domcontentloaded' });
       await assertVisible(page.getByRole('heading', { name: 'Administration', level: 1 }), 'Administration title');
       const tablist = page.getByRole('tablist', { name: 'Administration' });
-      assert.equal(await tablist.getByRole('tab').count(), 4, 'Administration must expose four tabs');
+      assert.equal(await tablist.getByRole('tab').count(), 3, 'Administration must expose three tabs');
 
       const authenticationTab = tablist.getByRole('tab', { name: 'Authentication', exact: true });
       assert.equal(await authenticationTab.getAttribute('aria-selected'), 'true');
@@ -103,12 +95,6 @@ export default async function administrationBrowserScenario(context) {
         email_verification_required: !policySnapshot.email_verification_required
       });
       await assertNoHorizontalOverflow(page, 'Administration desktop policy');
-
-      const codexTab = tablist.getByRole('tab', { name: 'Codex version', exact: true });
-      await codexTab.click();
-      assert.equal(await codexTab.getAttribute('aria-selected'), 'true');
-      await assertVisible(page.getByRole('heading', { name: 'Codex version rollout' }), 'Codex version tab');
-      assert.deepEqual(codexMutations, [], 'Codex rollout must remain read-only');
 
       const platformKey = uniqueSlug(context, 'qa-browser-platform');
       const platformName = context.unique('QA Browser Platform');
@@ -309,7 +295,6 @@ export default async function administrationBrowserScenario(context) {
       const erasureEntry = page.locator('.erasure-history > div').filter({ hasText: historyIdentity }).first();
       await assertVisible(erasureEntry, 'User erasure history entry');
       await assertNoHorizontalOverflow(page, 'Administration 390px erasure history');
-      assert.deepEqual(codexMutations, [], 'Codex rollout must not receive mutation requests');
       assert.deepEqual(browserErrors, [], 'Browser diagnostics must remain empty');
     });
   } finally {

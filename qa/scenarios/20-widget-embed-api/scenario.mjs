@@ -334,7 +334,7 @@ export default async function widgetEmbedApiScenario(context) {
     assert.equal(rejectedPreflight.allowedOrigin, null);
 
     activeRunToken = primaryLinkSession.token;
-    const widgetMessage = context.unique('QA Widget message through fake Codex');
+    const widgetMessage = context.unique('QA Widget message through fake provider');
     const { data: messageRun } = await widgetClient.post('/api/widget/runs', {
       message: widgetMessage,
       hub_session_id: null,

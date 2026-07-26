@@ -3,6 +3,8 @@
   "type": "api",
   "timeout_ms": 240000,
   "covers": [
+    "SES-003",
+    "SES-008",
     "BND-002",
     "BND-003",
     "REC-001"

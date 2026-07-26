@@ -682,7 +682,7 @@ test('summary JSON and JUnit expose selected and overall coverage with gaps', as
   assert.match(junit, /&quot;missing_required_layers&quot;/);
 });
 
-test('--coverage reports current repository as 74/74 without invoking Docker', (t) => {
+test('--coverage reports current repository as 73/73 without invoking Docker', (t) => {
   const root = mkdtempSync(join(tmpdir(), 'agent-hub-coverage-command-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const bin = join(root, 'bin');
@@ -700,8 +700,8 @@ test('--coverage reports current repository as 74/74 without invoking Docker', (
   assert.equal(readFileSync(join(repoRoot, 'qa', 'runner.mjs'), 'utf8').includes("./support/browser.mjs"), false);
   const overall = result.stdout.match(/Overall repository coverage: (\d+)\/(\d+) fully covered/);
   assert.ok(overall, result.stdout);
-  assert.equal(Number(overall[1]), 74);
-  assert.equal(Number(overall[2]), 74);
+  assert.equal(Number(overall[1]), 73);
+  assert.equal(Number(overall[2]), 73);
   assert.match(result.stdout, /Coverage validation passed\./);
   assert.equal(result.stdout.includes('Unmapped OpenAPI operations'), false);
   assert.equal(result.stdout.includes('Unmapped UI routes'), false);

@@ -132,8 +132,8 @@ async function waitForNativePiSession(request, sessionId, description) {
   return poll(
     () => getJson(request, `/api/sessions/${sessionId}`, `Session ${sessionId}`),
     (session) => session.active_turn_id === null
-      && typeof session.native_thread_id === 'string'
-      && session.native_thread_id.length > 0,
+      && typeof session.native_session_id === 'string'
+      && session.native_session_id.length > 0,
     { timeoutMs: 60_000, description }
   );
 }
@@ -212,7 +212,7 @@ export default async function sessionsBrowserScenario(scenarioContext) {
         independentRun.hub_session_id,
         'second Pi Turn to retain the first native Session id'
       );
-      assert.equal(independentCompleted.native_thread_id, independentSession.native_thread_id);
+      assert.equal(independentCompleted.native_session_id, independentSession.native_session_id);
 
       await page.reload({ waitUntil: 'domcontentloaded' });
       const independentReloadList = page.getByRole('complementary', { name: 'Session list' });
@@ -233,7 +233,7 @@ export default async function sessionsBrowserScenario(scenarioContext) {
         continuedRun.hub_session_id,
         'second completed Pi Session to expose its native Session id'
       );
-      assert.notEqual(continuedSession.native_thread_id, independentSession.native_thread_id);
+      assert.notEqual(continuedSession.native_session_id, independentSession.native_session_id);
       await assertMessageVisible(detail, continuedMessage);
       const continuedAssistantMessages = detail.locator('.session-bubble.role-assistant .session-message-text');
       await continuedAssistantMessages.first().waitFor();
@@ -254,7 +254,7 @@ export default async function sessionsBrowserScenario(scenarioContext) {
         continuedRun.hub_session_id,
         'second Turn in the second Pi Session to retain its native Session id'
       );
-      assert.equal(continuedCompleted.native_thread_id, continuedSession.native_thread_id);
+      assert.equal(continuedCompleted.native_session_id, continuedSession.native_session_id);
       await assertNoHorizontalOverflow(page, 'Sessions 1280px');
 
       const search = list.getByRole('textbox', { name: 'Search sessions' });
@@ -277,7 +277,7 @@ export default async function sessionsBrowserScenario(scenarioContext) {
         (session) => session.lifecycle_status === 'historical' && Boolean(session.agent_deleted_at),
         { timeoutMs: 30_000, description: 'Pi Session to become historical after Agent deletion' }
       );
-      assert.equal(historicalSession.native_thread_id, continuedSession.native_thread_id);
+      assert.equal(historicalSession.native_session_id, continuedSession.native_session_id);
 
       await page.reload({ waitUntil: 'domcontentloaded' });
       const reloadedList = page.getByRole('complementary', { name: 'Session list' });

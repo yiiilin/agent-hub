@@ -3,20 +3,19 @@ import { dirname } from 'node:path';
 import { expect, test } from '@playwright/test';
 import { composeArgs } from './e2e-compose';
 
-function runtimeFileProbe(workDirRef: string, secret: string) {
+function runtimeMcpSecretProbe(workDirRef: string, secret: string) {
   const runRoot = dirname(workDirRef);
   const script = `
 set -eu
-config="${runRoot}/codex/config.toml"
-allowlist="${runRoot}/codex/mcp-allowlist.json"
-mode="$(stat -c '%a' "$config")"
-config_has_secret=no
-allowlist_has_secret=no
-allowlist_has_redaction=no
-grep -F "$MCP_SECRET" "$config" >/dev/null && config_has_secret=yes
-grep -F "$MCP_SECRET" "$allowlist" >/dev/null && allowlist_has_secret=yes
-grep -F "********" "$allowlist" >/dev/null && allowlist_has_redaction=yes
-printf '{"mode":"%s","configHasSecret":"%s","allowlistHasSecret":"%s","allowlistHasRedaction":"%s"}' "$mode" "$config_has_secret" "$allowlist_has_secret" "$allowlist_has_redaction"
+agent_dir="${runRoot}/engine-state/.pi/agent"
+models="$agent_dir/models.json"
+test -f "$models"
+models_mode="$(stat -c '%a' "$models")"
+engine_state_has_secret=no
+mcp_allowlist_materialized=no
+grep -R -F "$MCP_SECRET" "$agent_dir" >/dev/null 2>&1 && engine_state_has_secret=yes
+test -e "$agent_dir/mcp-allowlist.json" && mcp_allowlist_materialized=yes
+printf '{"modelsMode":"%s","engineStateHasSecret":"%s","mcpAllowlistMaterialized":"%s"}' "$models_mode" "$engine_state_has_secret" "$mcp_allowlist_materialized"
 `;
   return JSON.parse(execFileSync('docker', [
     ...composeArgs(),
@@ -47,7 +46,7 @@ function runtimeSessionRootExists(workDirRef: string) {
   return output === 'yes';
 }
 
-test('MCP secrets are redacted in the console and injected into the per-run runtime config', async ({ page }) => {
+test('MCP secrets are redacted in the console and excluded from Pi runtime materialization', async ({ page }) => {
   await page.goto('/login');
   await page.getByLabel('Email').fill('admin@example.com');
   await page.getByLabel('Password').fill('admin123');
@@ -126,7 +125,7 @@ test('MCP secrets are redacted in the console and injected into the per-run runt
 
     await page.getByRole('tab', { name: 'Activity' }).click();
     await expect(page.locator(`[data-run-id="${createdRun.id}"]`)).toBeVisible({ timeout: 30_000 });
-    await expect(page.getByText('Fake Codex completed run')).toBeVisible({ timeout: 30_000 });
+    await expect(page.getByText('completed run')).toBeVisible({ timeout: 30_000 });
     await expect(page.locator('.status.completed')).toBeVisible({ timeout: 30_000 });
     const completedRunResponse = await page.request.get(`/api/runs/${createdRun.id}`);
     expect(completedRunResponse.ok()).toBeTruthy();
@@ -136,12 +135,11 @@ test('MCP secrets are redacted in the console and injected into the per-run runt
     if (!runWorkDirRef) throw new Error('run work directory is missing');
     workDirRef = runWorkDirRef;
 
-    const probe = runtimeFileProbe(runWorkDirRef, secret);
+    const probe = runtimeMcpSecretProbe(runWorkDirRef, secret);
     expect(probe).toEqual({
-      mode: '600',
-      configHasSecret: 'yes',
-      allowlistHasSecret: 'no',
-      allowlistHasRedaction: 'yes'
+      modelsMode: '600',
+      engineStateHasSecret: 'no',
+      mcpAllowlistMaterialized: 'no'
     });
     const events = await page.evaluate(async (runId) => {
       const response = await fetch(`/api/runs/${runId}/events`);

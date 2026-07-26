@@ -17,14 +17,14 @@ const BUNDLE_FORMAT_VERSION: u32 = 1;
 #[derive(Debug, Clone)]
 pub(crate) struct SessionBundleCreateSpec {
     pub session_id: Uuid,
-    pub native_thread_id: String,
+    pub native_session_id: String,
     pub history_checkpoint: i64,
     pub bundle_generation: i64,
     pub ownership_generation: i64,
-    pub producing_codex_version: String,
+    pub producing_engine_version: String,
     pub created_at: DateTime<Utc>,
     pub workspace: PathBuf,
-    pub codex_home: PathBuf,
+    pub engine_state_root: PathBuf,
     pub archive_path: PathBuf,
 }
 
@@ -41,14 +41,14 @@ pub(crate) struct SessionBundleArtifact {
 pub(crate) struct SessionBundleManifest {
     pub format_version: u32,
     pub session_id: Uuid,
-    pub native_thread_id: String,
+    pub native_session_id: String,
     pub history_checkpoint: i64,
     pub bundle_generation: i64,
     pub ownership_generation: i64,
-    pub producing_codex_version: String,
+    pub producing_engine_version: String,
     pub created_at: DateTime<Utc>,
     pub workspace: BundleTreeDeclaration,
-    pub codex_thread: BundleTreeDeclaration,
+    pub native_session: BundleTreeDeclaration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -107,18 +107,19 @@ pub(crate) fn create_session_bundle(
 ) -> Result<SessionBundleArtifact> {
     validate_create_spec(spec)?;
     let workspace_entries = collect_tree_entries(&spec.workspace, |_, _| true)?;
-    let codex_entries = collect_pi_session_entries(&spec.codex_home, &spec.native_thread_id)?;
+    let native_session_entries =
+        collect_pi_session_entries(&spec.engine_state_root, &spec.native_session_id)?;
     let manifest = SessionBundleManifest {
         format_version: BUNDLE_FORMAT_VERSION,
         session_id: spec.session_id,
-        native_thread_id: spec.native_thread_id.clone(),
+        native_session_id: spec.native_session_id.clone(),
         history_checkpoint: spec.history_checkpoint,
         bundle_generation: spec.bundle_generation,
         ownership_generation: spec.ownership_generation,
-        producing_codex_version: spec.producing_codex_version.trim().to_owned(),
+        producing_engine_version: spec.producing_engine_version.trim().to_owned(),
         created_at: spec.created_at,
         workspace: declare_tree(&spec.workspace, &workspace_entries)?,
-        codex_thread: declare_tree(&spec.codex_home, &codex_entries)?,
+        native_session: declare_tree(&spec.engine_state_root, &native_session_entries)?,
     };
 
     let parent = spec
@@ -150,8 +151,12 @@ pub(crate) fn create_session_bundle(
             .append_data(&mut header, "manifest.json", manifest_bytes.as_slice())
             .context("append Session Bundle manifest")?;
 
-        append_virtual_directory(&mut archive, "codex-thread", spec.created_at)?;
-        append_entries(&mut archive, &codex_entries, Path::new("codex-thread"))?;
+        append_virtual_directory(&mut archive, "native-session", spec.created_at)?;
+        append_entries(
+            &mut archive,
+            &native_session_entries,
+            Path::new("native-session"),
+        )?;
         let encoder = archive.into_inner().context("finish tar archive")?;
         let writer = encoder.finish().context("finish zstd stream")?;
         let (file, checksum, size) = writer.finish();
@@ -224,14 +229,16 @@ pub(crate) fn restore_session_bundle(
             "Session Bundle history checkpoint does not match Hub metadata"
         );
         let workspace_entries = collect_tree_entries(&temporary.join("workspace"), |_, _| true)?;
-        let codex_entries = collect_tree_entries(&temporary.join("codex"), |_, _| true)?;
+        let native_session_entries =
+            collect_tree_entries(&temporary.join("engine-state"), |_, _| true)?;
         anyhow::ensure!(
             declare_tree(&temporary.join("workspace"), &workspace_entries)? == manifest.workspace,
             "Session Bundle Workspace declaration does not match its contents"
         );
         anyhow::ensure!(
-            declare_tree(&temporary.join("codex"), &codex_entries)? == manifest.codex_thread,
-            "Session Bundle Codex Thread declaration does not match its contents"
+            declare_tree(&temporary.join("engine-state"), &native_session_entries)?
+                == manifest.native_session,
+            "Session Bundle Native Session declaration does not match its contents"
         );
         Ok(manifest)
     });
@@ -253,8 +260,8 @@ pub(crate) fn restore_session_bundle(
 fn validate_create_spec(spec: &SessionBundleCreateSpec) -> Result<()> {
     anyhow::ensure!(!spec.session_id.is_nil(), "Session id must not be nil");
     anyhow::ensure!(
-        !spec.native_thread_id.trim().is_empty(),
-        "native Thread id must not be empty"
+        !spec.native_session_id.trim().is_empty(),
+        "native Session id must not be empty"
     );
     anyhow::ensure!(spec.history_checkpoint >= 0, "invalid history checkpoint");
     anyhow::ensure!(spec.bundle_generation > 0, "invalid Bundle generation");
@@ -263,16 +270,16 @@ fn validate_create_spec(spec: &SessionBundleCreateSpec) -> Result<()> {
         "invalid ownership generation"
     );
     anyhow::ensure!(
-        !spec.producing_codex_version.trim().is_empty(),
-        "producing Codex version must not be empty"
+        !spec.producing_engine_version.trim().is_empty(),
+        "producing Engine version must not be empty"
     );
     anyhow::ensure!(
         spec.workspace.is_dir(),
         "Workspace directory is unavailable"
     );
     anyhow::ensure!(
-        spec.codex_home.is_dir(),
-        "Codex home directory is unavailable"
+        spec.engine_state_root.is_dir(),
+        "Engine state root directory is unavailable"
     );
     Ok(())
 }
@@ -318,7 +325,7 @@ where
 
 fn collect_pi_session_entries(
     pi_home: &Path,
-    expected_session_id: &str,
+    expected_native_session_id: &str,
 ) -> Result<Vec<BundleSourceEntry>> {
     let session_dir = pi_home.join("sessions");
     anyhow::ensure!(
@@ -341,7 +348,7 @@ fn collect_pi_session_entries(
         {
             continue;
         }
-        if read_pi_session_id(&entry.path())?.as_deref() != Some(expected_session_id) {
+        if read_pi_session_id(&entry.path())?.as_deref() != Some(expected_native_session_id) {
             continue;
         }
         anyhow::ensure!(
@@ -490,7 +497,7 @@ fn restore_archive_into(archive_path: &Path, destination: &Path) -> Result<Sessi
     let mut symlinks = BTreeSet::new();
     let mut manifest = None;
     let mut saw_workspace_root = false;
-    let mut saw_codex_thread_root = false;
+    let mut saw_native_session_root = false;
     let mut saw_pi_sessions_root = false;
     let mut pi_session_file = None;
     for entry in archive
@@ -561,14 +568,14 @@ fn restore_archive_into(archive_path: &Path, destination: &Path) -> Result<Sessi
                 saw_workspace_root = true;
             }
             destination.join("workspace").join(components.as_path())
-        } else if top == "codex-thread" {
-            if archive_path == Path::new("codex-thread") {
+        } else if top == "native-session" {
+            if archive_path == Path::new("native-session") {
                 anyhow::ensure!(
                     entry_type.is_dir(),
-                    "Session Bundle codex-thread/ must be a directory"
+                    "Session Bundle native-session/ must be a directory"
                 );
-                saw_codex_thread_root = true;
-            } else if archive_path == Path::new("codex-thread/sessions") {
+                saw_native_session_root = true;
+            } else if archive_path == Path::new("native-session/sessions") {
                 anyhow::ensure!(
                     entry_type.is_dir(),
                     "Session Bundle Pi sessions/ must be a directory"
@@ -576,7 +583,7 @@ fn restore_archive_into(archive_path: &Path, destination: &Path) -> Result<Sessi
                 saw_pi_sessions_root = true;
             } else {
                 let relative = archive_path
-                    .strip_prefix("codex-thread")
+                    .strip_prefix("native-session")
                     .context("read Pi recovery path")?;
                 anyhow::ensure!(
                     entry_type.is_file()
@@ -588,9 +595,9 @@ fn restore_archive_into(archive_path: &Path, destination: &Path) -> Result<Sessi
                     pi_session_file.is_none(),
                     "Session Bundle contains multiple Pi recovery files"
                 );
-                pi_session_file = Some(destination.join("codex").join(relative));
+                pi_session_file = Some(destination.join("engine-state").join(relative));
             }
-            destination.join("codex").join(components.as_path())
+            destination.join("engine-state").join(components.as_path())
         } else {
             anyhow::bail!("Session Bundle contains an unexpected top-level entry");
         };
@@ -606,8 +613,8 @@ fn restore_archive_into(archive_path: &Path, destination: &Path) -> Result<Sessi
         "Session Bundle is missing workspace/ directory"
     );
     anyhow::ensure!(
-        saw_codex_thread_root,
-        "Session Bundle is missing codex-thread/ directory"
+        saw_native_session_root,
+        "Session Bundle is missing native-session/ directory"
     );
     anyhow::ensure!(
         saw_pi_sessions_root,
@@ -617,7 +624,7 @@ fn restore_archive_into(archive_path: &Path, destination: &Path) -> Result<Sessi
     let manifest: SessionBundleManifest =
         manifest.context("Session Bundle is missing manifest.json")?;
     anyhow::ensure!(
-        read_pi_session_id(&pi_session_file)?.as_deref() == Some(&manifest.native_thread_id),
+        read_pi_session_id(&pi_session_file)?.as_deref() == Some(&manifest.native_session_id),
         "Session Bundle Pi recovery file does not match its native Session id"
     );
     Ok(manifest)
@@ -728,18 +735,18 @@ mod tests {
     fn write_declared_bundle(
         archive_path: &Path,
         workspace: &Path,
-        codex_home: &Path,
+        engine_state_root: &Path,
         manifest: &SessionBundleManifest,
     ) -> (String, u64) {
         let workspace_entries = collect_tree_entries(workspace, |_, _| true).unwrap();
-        let codex_entries = collect_tree_entries(codex_home, |_, _| true).unwrap();
+        let native_session_entries = collect_tree_entries(engine_state_root, |_, _| true).unwrap();
         assert_eq!(
             declare_tree(workspace, &workspace_entries).unwrap(),
             manifest.workspace
         );
         assert_eq!(
-            declare_tree(codex_home, &codex_entries).unwrap(),
-            manifest.codex_thread
+            declare_tree(engine_state_root, &native_session_entries).unwrap(),
+            manifest.native_session
         );
 
         let file = fs::File::create(archive_path).unwrap();
@@ -762,71 +769,84 @@ mod tests {
             )
             .unwrap();
 
-        append_virtual_directory(&mut archive, "codex-thread", manifest.created_at).unwrap();
-        append_entries(&mut archive, &codex_entries, Path::new("codex-thread")).unwrap();
+        append_virtual_directory(&mut archive, "native-session", manifest.created_at).unwrap();
+        append_entries(
+            &mut archive,
+            &native_session_entries,
+            Path::new("native-session"),
+        )
+        .unwrap();
         archive.into_inner().unwrap().finish().unwrap();
         checksum_file(archive_path).unwrap()
     }
 
     #[test]
-    fn session_bundle_round_trip_preserves_workspace_and_only_thread_recovery_data() {
+    fn session_bundle_round_trip_preserves_workspace_and_only_native_session_recovery_data() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");
         let workspace = source.join("workspace");
-        let codex_home = source.join("codex");
+        let engine_state_root = source.join("engine-state");
         fs::create_dir_all(workspace.join(".git")).unwrap();
-        fs::create_dir_all(codex_home.join("sessions")).unwrap();
-        fs::create_dir_all(codex_home.join(".pi/agent/skills/private-skill")).unwrap();
-        fs::create_dir_all(codex_home.join(".pi/agent/extensions")).unwrap();
-        fs::create_dir_all(codex_home.join(".pi/agent/cache")).unwrap();
+        fs::create_dir_all(engine_state_root.join("sessions")).unwrap();
+        fs::create_dir_all(engine_state_root.join(".pi/agent/skills/private-skill")).unwrap();
+        fs::create_dir_all(engine_state_root.join(".pi/agent/extensions")).unwrap();
+        fs::create_dir_all(engine_state_root.join(".pi/agent/cache")).unwrap();
         fs::write(workspace.join("README.md"), "workspace\n").unwrap();
         fs::write(workspace.join(".hidden"), "hidden\n").unwrap();
         fs::write(workspace.join(".git/config"), "[core]\n").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink("README.md", workspace.join("readme-link")).unwrap();
 
-        let thread_id = "019bf9b2-7a4d-7000-8000-000000000001";
+        let native_session_id = "019bf9b2-7a4d-7000-8000-000000000001";
         fs::write(
-            codex_home.join("sessions/pi-session.jsonl"),
-            format!("{{\"type\":\"session\",\"id\":\"{thread_id}\"}}\n"),
+            engine_state_root.join("sessions/pi-session.jsonl"),
+            format!("{{\"type\":\"session\",\"id\":\"{native_session_id}\"}}\n"),
         )
         .unwrap();
         fs::write(
-            codex_home.join(format!("sessions/decoy-{thread_id}.jsonl")),
+            engine_state_root.join(format!("sessions/decoy-{native_session_id}.jsonl")),
             "{\"type\":\"session\",\"id\":\"another-session\"}\n",
         )
         .unwrap();
         fs::write(
-            codex_home.join(".pi/agent/models.json"),
+            engine_state_root.join(".pi/agent/models.json"),
             "model proxy token\n",
         )
         .unwrap();
-        fs::write(codex_home.join(".pi/agent/auth.json"), "provider secret\n").unwrap();
-        fs::write(codex_home.join(".pi/agent/settings.json"), "settings\n").unwrap();
         fs::write(
-            codex_home.join(".pi/agent/skills/private-skill/SKILL.md"),
+            engine_state_root.join(".pi/agent/auth.json"),
+            "provider secret\n",
+        )
+        .unwrap();
+        fs::write(
+            engine_state_root.join(".pi/agent/settings.json"),
+            "settings\n",
+        )
+        .unwrap();
+        fs::write(
+            engine_state_root.join(".pi/agent/skills/private-skill/SKILL.md"),
             "regenerated skill\n",
         )
         .unwrap();
         fs::write(
-            codex_home.join(".pi/agent/extensions/provider.ts"),
+            engine_state_root.join(".pi/agent/extensions/provider.ts"),
             "generated extension\n",
         )
         .unwrap();
-        fs::write(codex_home.join(".pi/agent/cache/data"), "cache\n").unwrap();
+        fs::write(engine_state_root.join(".pi/agent/cache/data"), "cache\n").unwrap();
 
         let session_id = Uuid::new_v4();
         let archive = temp.path().join("staging/session.tar.zst");
         let artifact = create_session_bundle(&SessionBundleCreateSpec {
             session_id,
-            native_thread_id: thread_id.to_owned(),
+            native_session_id: native_session_id.to_owned(),
             history_checkpoint: 12,
             bundle_generation: 3,
             ownership_generation: 7,
-            producing_codex_version: "0.81.1".into(),
+            producing_engine_version: "0.81.1".into(),
             created_at: Utc.with_ymd_and_hms(2026, 7, 16, 1, 2, 3).unwrap(),
             workspace: workspace.clone(),
-            codex_home: codex_home.clone(),
+            engine_state_root: engine_state_root.clone(),
             archive_path: archive.clone(),
         })
         .unwrap();
@@ -846,7 +866,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(manifest.session_id, session_id);
-        assert_eq!(manifest.native_thread_id, thread_id);
+        assert_eq!(manifest.native_session_id, native_session_id);
         assert_eq!(
             fs::read_to_string(restored.join("workspace/README.md")).unwrap(),
             "workspace\n"
@@ -864,52 +884,56 @@ mod tests {
             fs::read_link(restored.join("workspace/readme-link")).unwrap(),
             std::path::PathBuf::from("README.md")
         );
-        assert!(restored.join("codex/sessions/pi-session.jsonl").is_file());
+        assert!(restored
+            .join("engine-state/sessions/pi-session.jsonl")
+            .is_file());
         assert!(!restored
-            .join(format!("codex/sessions/decoy-{thread_id}.jsonl"))
+            .join(format!(
+                "engine-state/sessions/decoy-{native_session_id}.jsonl"
+            ))
             .exists());
-        assert!(!restored.join("codex/.pi").exists());
+        assert!(!restored.join("engine-state/.pi").exists());
     }
 
     #[test]
     fn session_bundle_restore_rejects_regenerable_pi_state_even_when_declared() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("source/workspace");
-        let codex_home = temp.path().join("source/codex");
+        let engine_state_root = temp.path().join("source/engine-state");
         fs::create_dir_all(&workspace).unwrap();
-        fs::create_dir_all(codex_home.join("sessions")).unwrap();
-        fs::create_dir_all(codex_home.join(".pi/agent")).unwrap();
+        fs::create_dir_all(engine_state_root.join("sessions")).unwrap();
+        fs::create_dir_all(engine_state_root.join(".pi/agent")).unwrap();
         fs::write(workspace.join("result.txt"), "workspace\n").unwrap();
         let session_id = Uuid::new_v4();
         let native_session_id = "pi-native-session";
         fs::write(
-            codex_home.join("sessions/recovery.jsonl"),
+            engine_state_root.join("sessions/recovery.jsonl"),
             format!("{{\"type\":\"session\",\"id\":\"{native_session_id}\"}}\n"),
         )
         .unwrap();
         fs::write(
-            codex_home.join(".pi/agent/models.json"),
+            engine_state_root.join(".pi/agent/models.json"),
             "must never restore\n",
         )
         .unwrap();
 
         let workspace_entries = collect_tree_entries(&workspace, |_, _| true).unwrap();
-        let codex_entries = collect_tree_entries(&codex_home, |_, _| true).unwrap();
+        let native_session_entries = collect_tree_entries(&engine_state_root, |_, _| true).unwrap();
         let manifest = SessionBundleManifest {
             format_version: BUNDLE_FORMAT_VERSION,
             session_id,
-            native_thread_id: native_session_id.into(),
+            native_session_id: native_session_id.into(),
             history_checkpoint: 9,
             bundle_generation: 2,
             ownership_generation: 3,
-            producing_codex_version: "0.81.1".into(),
+            producing_engine_version: "0.81.1".into(),
             created_at: Utc.with_ymd_and_hms(2026, 7, 23, 1, 2, 3).unwrap(),
             workspace: declare_tree(&workspace, &workspace_entries).unwrap(),
-            codex_thread: declare_tree(&codex_home, &codex_entries).unwrap(),
+            native_session: declare_tree(&engine_state_root, &native_session_entries).unwrap(),
         };
         let archive_path = temp.path().join("declared-secret.tar.zst");
         let (checksum, size) =
-            write_declared_bundle(&archive_path, &workspace, &codex_home, &manifest);
+            write_declared_bundle(&archive_path, &workspace, &engine_state_root, &manifest);
         let destination = temp.path().join("restored");
 
         let error =
@@ -933,14 +957,14 @@ mod tests {
         let manifest = SessionBundleManifest {
             format_version: BUNDLE_FORMAT_VERSION,
             session_id,
-            native_thread_id: "thread-malicious".into(),
+            native_session_id: "thread-malicious".into(),
             history_checkpoint: 1,
             bundle_generation: 1,
             ownership_generation: 1,
-            producing_codex_version: "0.104.0".into(),
+            producing_engine_version: "0.104.0".into(),
             created_at: Utc.with_ymd_and_hms(2026, 7, 16, 1, 2, 3).unwrap(),
             workspace: empty_tree.clone(),
-            codex_thread: empty_tree,
+            native_session: empty_tree,
         };
         let file = fs::File::create(&archive_path).unwrap();
         let encoder = zstd::Encoder::new(file, 1).unwrap();
@@ -966,13 +990,17 @@ mod tests {
                 manifest_bytes.as_slice(),
             )
             .unwrap();
-        let mut codex_header = tar::Header::new_gnu();
-        codex_header.set_entry_type(tar::EntryType::Directory);
-        codex_header.set_mode(0o700);
-        codex_header.set_size(0);
-        codex_header.set_cksum();
+        let mut native_session_header = tar::Header::new_gnu();
+        native_session_header.set_entry_type(tar::EntryType::Directory);
+        native_session_header.set_mode(0o700);
+        native_session_header.set_size(0);
+        native_session_header.set_cksum();
         archive
-            .append_data(&mut codex_header, "codex-thread", std::io::empty())
+            .append_data(
+                &mut native_session_header,
+                "native-session",
+                std::io::empty(),
+            )
             .unwrap();
         archive.into_inner().unwrap().finish().unwrap();
         let (checksum, size) = checksum_file(&archive_path).unwrap();
@@ -1076,26 +1104,26 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
-        let codex_home = temp.path().join("codex");
-        let thread_id = "019bf9b2-7a4d-7000-8000-000000000002";
+        let engine_state_root = temp.path().join("engine-state");
+        let native_session_id = "019bf9b2-7a4d-7000-8000-000000000002";
         fs::create_dir_all(&workspace).unwrap();
-        fs::create_dir_all(codex_home.join("sessions")).unwrap();
+        fs::create_dir_all(engine_state_root.join("sessions")).unwrap();
         fs::write(
-            codex_home.join("sessions/recovery.jsonl"),
-            format!("{{\"type\":\"session\",\"id\":\"{thread_id}\"}}\n"),
+            engine_state_root.join("sessions/recovery.jsonl"),
+            format!("{{\"type\":\"session\",\"id\":\"{native_session_id}\"}}\n"),
         )
         .unwrap();
         std::os::unix::fs::symlink("../../outside", workspace.join("escape")).unwrap();
         let spec = SessionBundleCreateSpec {
             session_id: Uuid::new_v4(),
-            native_thread_id: thread_id.into(),
+            native_session_id: native_session_id.into(),
             history_checkpoint: 1,
             bundle_generation: 1,
             ownership_generation: 1,
-            producing_codex_version: "0.104.0".into(),
+            producing_engine_version: "0.104.0".into(),
             created_at: Utc::now(),
             workspace: workspace.clone(),
-            codex_home: codex_home.clone(),
+            engine_state_root: engine_state_root.clone(),
             archive_path: temp.path().join("escape.tar.zst"),
         };
         let error = create_session_bundle(&spec).expect_err("escaping link must be rejected");
@@ -1117,27 +1145,27 @@ mod tests {
     fn session_bundle_restore_rejects_compressed_size_and_checksum_mismatch_without_output() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
-        let codex_home = temp.path().join("codex");
-        let thread_id = "019bf9b2-7a4d-7000-8000-000000000003";
+        let engine_state_root = temp.path().join("engine-state");
+        let native_session_id = "019bf9b2-7a4d-7000-8000-000000000003";
         fs::create_dir_all(&workspace).unwrap();
-        fs::create_dir_all(codex_home.join("sessions")).unwrap();
+        fs::create_dir_all(engine_state_root.join("sessions")).unwrap();
         fs::write(workspace.join("file.txt"), "content").unwrap();
         fs::write(
-            codex_home.join("sessions/recovery.jsonl"),
-            format!("{{\"type\":\"session\",\"id\":\"{thread_id}\"}}\n"),
+            engine_state_root.join("sessions/recovery.jsonl"),
+            format!("{{\"type\":\"session\",\"id\":\"{native_session_id}\"}}\n"),
         )
         .unwrap();
         let session_id = Uuid::new_v4();
         let artifact = create_session_bundle(&SessionBundleCreateSpec {
             session_id,
-            native_thread_id: thread_id.into(),
+            native_session_id: native_session_id.into(),
             history_checkpoint: 4,
             bundle_generation: 1,
             ownership_generation: 2,
-            producing_codex_version: "0.104.0".into(),
+            producing_engine_version: "0.104.0".into(),
             created_at: Utc::now(),
             workspace,
-            codex_home,
+            engine_state_root,
             archive_path: temp.path().join("bundle.tar.zst"),
         })
         .unwrap();

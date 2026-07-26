@@ -194,7 +194,7 @@ type AgentConfiguration = Pick<Agent,
   | 'runtime_id'
   | 'model_selection'
   | 'model_settings'
-  | 'codex_subagents'
+  | 'subagents'
   | 'sandbox_policy'
   | 'managed_skill_ids'
   | 'mcp_allowlist'
@@ -213,7 +213,7 @@ async function setAgentRuntime(api: APIRequestContext, agentId: string, runtimeI
       runtime_id: runtimeId,
       model_selection: current.model_selection,
       model_settings: current.model_settings,
-      codex_subagents: current.codex_subagents,
+      subagents: current.subagents,
       sandbox_policy: current.sandbox_policy,
       managed_skill_ids: current.managed_skill_ids,
       mcp_allowlist: current.mcp_allowlist
@@ -430,8 +430,9 @@ test('Integration App OAuth API runs messages, attachments, and tool results', a
     await widgetPage.goto(`${baseURL}/widget#token=${widgetToken}`);
     await expect(widgetPage).toHaveURL(`${baseURL}/widget`);
     await expect(widgetPage.getByText(agentName)).toBeVisible();
+    await widgetPage.getByRole('textbox', { name: 'Message' }).fill('Run through the integration Widget');
     await widgetPage.getByRole('button', { name: 'Send' }).click();
-    await expect(widgetPage.getByText('Fake Codex completed run')).toBeVisible({ timeout: 30_000 });
+    await expect(widgetPage.getByText('completed run')).toBeVisible({ timeout: 30_000 });
 
     const sessionResponse = await api.post('/api/integrations/sessions', {
       headers: { Authorization: `Bearer ${accessToken}` },
@@ -482,7 +483,7 @@ test('Integration App OAuth API runs messages, attachments, and tool results', a
       data: {
         hostname: runtimeHostname,
         labels: ['playwright', 'integration-conflict-fixture'],
-        codex_version: 'non-executing-e2e-fixture',
+        engine_version: 'non-executing-e2e-fixture',
         capabilities: { model_proxy: true, mcp_allowlist: false },
         sandbox_mode: 'workspace-write'
       }

@@ -31,8 +31,11 @@ export class ComposeHarness {
     this.environment = {
       ...process.env,
       FRONTEND_PORT: '0',
-      HUB_CODEX_GITHUB_API_BASE: 'http://fake-model-provider:8080/codex',
-      HUB_CODEX_GITHUB_ALLOW_HTTP: 'true',
+      SEED_DEV_USER: 'true',
+      SEED_DEV_MODEL_CONNECTION: 'true',
+      DEV_MODEL_PROVIDER_BASE_URL: 'http://fake-model-provider:8080',
+      DEV_MODEL_PROVIDER_MODEL_IDS: 'hub-proxy-smoke,hub-proxy-smoke-fast',
+      DEV_MODEL_PROVIDER_API_KEY: 'dev-model-provider-api-key',
       HUB_NETWORK_SUBNET: hubNetworkSubnet,
       MODEL_NETWORK_SUBNET: modelNetworkSubnet
     };

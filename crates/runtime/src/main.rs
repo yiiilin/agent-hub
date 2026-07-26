@@ -1,10 +1,9 @@
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     env, fs as stdfs,
-    io::{BufRead, BufReader, Read, Write},
+    io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc, Arc,
@@ -41,22 +40,21 @@ use tracing::{info, warn};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+#[cfg(test)]
+use std::io::Read;
+
 mod pi_driver;
 mod session_bundle;
 
-#[cfg(test)]
-const REDACTED_SECRET: &str = "********";
-const DEFAULT_APP_SERVER_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_ENGINE_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_MODEL_PROXY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(900);
 const CHECKPOINT_RETRY_DELAY: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_ONLINE_SESSIONS: usize = 4;
-const APP_SERVER_EVENT_QUEUE_CAPACITY: usize = 64;
+const ENGINE_EVENT_QUEUE_CAPACITY: usize = 64;
 const SESSION_SUPERVISOR_METADATA_FILE: &str = "session.json";
 const SESSION_CLEANUP_DIRECTORY: &str = "session-cleanups";
 const SESSION_CLEANUP_STATE_FILE: &str = "state.json";
-const MAX_CODEX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_CODEX_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Clone)]
 struct Config {
@@ -66,11 +64,10 @@ struct Config {
     work_root: PathBuf,
     hostname: String,
     poll_interval: Duration,
-    codex_driver: String,
-    codex_source: String,
-    codex_bin: String,
-    codex_version: String,
-    app_server_timeout: Duration,
+    engine_driver: String,
+    engine_bin: String,
+    engine_version: String,
+    engine_timeout: Duration,
     model_proxy_idle_timeout: Duration,
     session_idle_timeout: Duration,
     max_online_sessions: usize,
@@ -81,48 +78,11 @@ struct Config {
     health_bind_addr: SocketAddr,
 }
 
-#[derive(Debug, Clone)]
-struct RuntimeCodexState {
-    current_version: String,
-    candidate_version: Option<String>,
-    candidate_status: Option<String>,
-    candidate_error: Option<String>,
-    candidate_binary: Option<PathBuf>,
-}
-
-impl RuntimeCodexState {
-    fn new(config: &Config) -> Self {
-        Self {
-            current_version: config.codex_version.clone(),
-            candidate_version: None,
-            candidate_status: None,
-            candidate_error: None,
-            candidate_binary: None,
-        }
-    }
-
-    fn heartbeat_status(&self) -> RuntimeCodexStatusDto {
-        RuntimeCodexStatusDto {
-            current_version: self.current_version.clone(),
-            candidate_version: self.candidate_version.clone(),
-            candidate_status: self.candidate_status.clone(),
-            candidate_error: self.candidate_error.clone(),
-        }
-    }
-
-    fn clear_candidate(&mut self) {
-        self.candidate_version = None;
-        self.candidate_status = None;
-        self.candidate_error = None;
-        self.candidate_binary = None;
-    }
-}
-
 #[derive(Debug)]
-struct AppServerRunResult {
+struct EngineRunResult {
     events: Vec<AppendRunEventRequest>,
     final_status: String,
-    session_id: Option<String>,
+    native_session_id: Option<String>,
     native_turn_id: Option<String>,
 }
 
@@ -376,13 +336,13 @@ struct StoredRuntimeCredential {
 }
 
 #[derive(Default)]
-struct AppServerCancellation {
+struct EngineCancellation {
     cancelled: AtomicBool,
     #[cfg(unix)]
     process_group_id: AtomicI32,
 }
 
-impl AppServerCancellation {
+impl EngineCancellation {
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
         #[cfg(unix)]
@@ -431,11 +391,22 @@ impl AppServerCancellation {
     }
 }
 
-struct AppServerCancellationGuard(Arc<AppServerCancellation>);
+fn terminate_child_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        kill_process_group(child.id() as i32);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
 
-impl Drop for AppServerCancellationGuard {
-    fn drop(&mut self) {
-        self.0.cancel();
+#[cfg(unix)]
+fn kill_process_group(process_group_id: i32) {
+    unsafe {
+        libc::kill(-process_group_id, libc::SIGKILL);
     }
 }
 
@@ -469,18 +440,15 @@ async fn main() -> anyhow::Result<()> {
     let (_health_addr, _health_server) =
         start_runtime_health_server(config.health_bind_addr, Arc::clone(&health)).await?;
     fs::create_dir_all(&config.work_root).await?;
-    resolve_codex_binary(&mut config).await?;
+    resolve_engine_binary(&mut config).await?;
     gc_expired_run_dirs(&config.work_root, config.workdir_ttl, SystemTime::now()).await?;
     run_loop(config, health).await
 }
 
 impl Config {
     fn from_env() -> anyhow::Result<Self> {
-        let codex_driver = validate_codex_driver(
-            &env::var("RUNTIME_CODEX_DRIVER").unwrap_or_else(|_| "fake".into()),
-        )?;
-        let codex_source = validate_codex_source(
-            &env::var("RUNTIME_CODEX_SOURCE").unwrap_or_else(|_| "path".into()),
+        let engine_driver = validate_engine_driver(
+            &env::var("RUNTIME_ENGINE_DRIVER").unwrap_or_else(|_| "fake".into()),
         )?;
         let workdir_ttl_secs = env::var("RUNTIME_WORKDIR_TTL_SECS")
             .ok()
@@ -529,18 +497,17 @@ impl Config {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(1000),
             ),
-            codex_driver,
-            codex_source,
-            codex_bin: env::var("CODEX_BIN").unwrap_or_else(|_| "codex".into()),
-            codex_version: env::var("RUNTIME_CODEX_VERSION")
+            engine_driver,
+            engine_bin: env::var("ENGINE_BIN").unwrap_or_else(|_| "pi".into()),
+            engine_version: env::var("RUNTIME_ENGINE_VERSION")
                 .ok()
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| "unmanaged".into()),
-            app_server_timeout: Duration::from_secs(
-                env::var("RUNTIME_APP_SERVER_TIMEOUT_SECS")
+            engine_timeout: Duration::from_secs(
+                env::var("RUNTIME_ENGINE_TIMEOUT_SECS")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(DEFAULT_APP_SERVER_TIMEOUT.as_secs()),
+                    .unwrap_or(DEFAULT_ENGINE_TIMEOUT.as_secs()),
             ),
             model_proxy_idle_timeout: Duration::from_secs(model_proxy_idle_timeout_secs),
             session_idle_timeout,
@@ -585,29 +552,19 @@ fn parse_session_idle_timeout(value: Option<&str>) -> anyhow::Result<Duration> {
     Ok(Duration::from_secs(seconds))
 }
 
-fn validate_codex_driver(value: &str) -> anyhow::Result<String> {
+fn validate_engine_driver(value: &str) -> anyhow::Result<String> {
     match value {
-        "fake" | "app-server" => Ok(value.to_owned()),
-        _ => anyhow::bail!("RUNTIME_CODEX_DRIVER must be 'fake' or 'app-server'"),
+        "fake" | "pi" => Ok(value.to_owned()),
+        _ => anyhow::bail!("RUNTIME_ENGINE_DRIVER must be 'fake' or 'pi'"),
     }
 }
 
-fn validate_codex_source(value: &str) -> anyhow::Result<String> {
-    match value {
-        "path" => Ok(value.to_owned()),
-        _ => anyhow::bail!(
-            "RUNTIME_CODEX_SOURCE must be 'path'; managed Codex updates are downloaded through Hub"
-        ),
-    }
-}
-
-async fn resolve_codex_binary(config: &mut Config) -> anyhow::Result<()> {
-    if config.codex_driver != "app-server" {
+async fn resolve_engine_binary(config: &mut Config) -> anyhow::Result<()> {
+    if config.engine_driver != "pi" {
         return Ok(());
     }
-    debug_assert_eq!(config.codex_source, "path");
-    config.codex_bin = locate_executable(&config.codex_bin)
-        .with_context(|| format!("locate Codex binary: {}", config.codex_bin))?
+    config.engine_bin = locate_executable(&config.engine_bin)
+        .with_context(|| format!("locate Execution Engine binary: {}", config.engine_bin))?
         .display()
         .to_string();
     Ok(())
@@ -618,299 +575,29 @@ fn locate_executable(value: &str) -> anyhow::Result<PathBuf> {
     if candidate.components().count() > 1 {
         return executable_file(candidate);
     }
-    let path = env::var_os("PATH").context("PATH is required to locate Codex")?;
+    let path = env::var_os("PATH").context("PATH is required to locate Execution Engine")?;
     for directory in env::split_paths(&path) {
         let candidate = directory.join(value);
         if let Ok(path) = executable_file(candidate) {
             return Ok(path);
         }
     }
-    anyhow::bail!("Codex executable was not found in PATH")
+    anyhow::bail!("Execution Engine executable was not found in PATH")
 }
 
 fn executable_file(path: PathBuf) -> anyhow::Result<PathBuf> {
     let metadata = stdfs::metadata(&path)?;
     if !metadata.is_file() {
-        anyhow::bail!("Codex path is not a file");
+        anyhow::bail!("Execution Engine path is not a file");
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if metadata.permissions().mode() & 0o111 == 0 {
-            anyhow::bail!("Codex path is not executable");
+            anyhow::bail!("Execution Engine path is not executable");
         }
     }
     Ok(stdfs::canonicalize(path)?)
-}
-
-async fn verify_codex_compatibility(
-    binary: &Path,
-    expected_version: &str,
-    timeout: Duration,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(!timeout.is_zero(), "Codex compatibility timeout is zero");
-    let version = tokio::time::timeout(
-        timeout,
-        tokio::process::Command::new(binary)
-            .arg("--version")
-            .output(),
-    )
-    .await
-    .context("Codex --version compatibility check timed out")??;
-    anyhow::ensure!(
-        version.status.success(),
-        "Codex --version compatibility check failed"
-    );
-    let stdout =
-        String::from_utf8(version.stdout).context("Codex --version output is not UTF-8")?;
-    anyhow::ensure!(
-        stdout
-            .split_whitespace()
-            .any(|component| component == expected_version),
-        "Codex version mismatch: expected {expected_version}, got {}",
-        stdout.trim()
-    );
-    let app_server = tokio::time::timeout(
-        timeout,
-        tokio::process::Command::new(binary)
-            .arg("app-server")
-            .arg("--help")
-            .output(),
-    )
-    .await
-    .context("Codex app-server compatibility check timed out")??;
-    anyhow::ensure!(
-        app_server.status.success(),
-        "Codex app-server compatibility check failed"
-    );
-    Ok(())
-}
-
-async fn install_managed_codex_artifact(
-    work_root: &Path,
-    client: &HubClient,
-    artifact: &CodexVersionArtifactDto,
-    compatibility_timeout: Duration,
-) -> anyhow::Result<PathBuf> {
-    validate_managed_codex_version(&artifact.version)?;
-    anyhow::ensure!(
-        artifact.os == std::env::consts::OS && artifact.architecture == std::env::consts::ARCH,
-        "Hub returned a Codex artifact for another Runtime platform"
-    );
-    anyhow::ensure!(
-        artifact.size_bytes > 0 && artifact.size_bytes <= MAX_CODEX_ARTIFACT_BYTES,
-        "Codex artifact size is outside the supported limit"
-    );
-    let binary_name = if cfg!(windows) { "codex.exe" } else { "codex" };
-    let install_root = work_root.join("bin").join(&artifact.version);
-    let installed = install_root.join(binary_name);
-    if tokio::fs::try_exists(&installed).await? {
-        verify_codex_compatibility(&installed, &artifact.version, compatibility_timeout).await?;
-        return Ok(installed);
-    }
-
-    let staging =
-        work_root
-            .join("bin")
-            .join(format!(".staging-{}-{}", artifact.version, Uuid::new_v4()));
-    tokio::fs::create_dir_all(&staging).await?;
-    let result = async {
-        let compressed_path = staging.join("codex.zst");
-        let response = client
-            .http
-            .get(format!(
-                "{}/api/runtime/codex/artifacts/{}/{}/{}",
-                client.hub_url, artifact.version, artifact.os, artifact.architecture
-            ))
-            .bearer_auth(client.runtime_credential())
-            .send()
-            .await?
-            .error_for_status()?;
-        if let Some(length) = response.content_length() {
-            anyhow::ensure!(
-                length == artifact.size_bytes,
-                "Codex artifact size mismatch"
-            );
-        }
-        let mut compressed = fs::File::create(&compressed_path).await?;
-        let mut stream = response.bytes_stream();
-        let mut hasher = Sha256::new();
-        let mut size = 0_u64;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            size = size
-                .checked_add(chunk.len() as u64)
-                .context("Codex artifact size overflow")?;
-            anyhow::ensure!(
-                size <= artifact.size_bytes && size <= MAX_CODEX_ARTIFACT_BYTES,
-                "Codex artifact size mismatch"
-            );
-            hasher.update(&chunk);
-            compressed.write_all(&chunk).await?;
-        }
-        compressed.flush().await?;
-        anyhow::ensure!(size == artifact.size_bytes, "Codex artifact size mismatch");
-        let actual_sha256 = format!("{:x}", hasher.finalize());
-        anyhow::ensure!(
-            actual_sha256 == artifact.sha256,
-            "Codex artifact SHA-256 mismatch"
-        );
-
-        let staged_binary = staging.join(binary_name);
-        let compressed_path_for_decode = compressed_path.clone();
-        let staged_binary_for_decode = staged_binary.clone();
-        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let source = stdfs::File::open(compressed_path_for_decode)?;
-            let decoder = zstd::stream::read::Decoder::new(source)?;
-            let mut limited = decoder.take(MAX_CODEX_BINARY_BYTES + 1);
-            let mut destination = stdfs::File::create(staged_binary_for_decode)?;
-            let written = std::io::copy(&mut limited, &mut destination)?;
-            anyhow::ensure!(
-                written <= MAX_CODEX_BINARY_BYTES,
-                "Codex binary exceeds the supported size limit"
-            );
-            destination.flush()?;
-            Ok(())
-        })
-        .await??;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = stdfs::metadata(&staged_binary)?.permissions();
-            permissions.set_mode(0o755);
-            stdfs::set_permissions(&staged_binary, permissions)?;
-        }
-        verify_codex_compatibility(&staged_binary, &artifact.version, compatibility_timeout)
-            .await?;
-        fs::remove_file(&compressed_path).await?;
-        fs::create_dir_all(work_root.join("bin")).await?;
-        match fs::rename(&staging, &install_root).await {
-            Ok(()) => Ok(installed.clone()),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let _ = fs::remove_dir_all(&staging).await;
-                verify_codex_compatibility(&installed, &artifact.version, compatibility_timeout)
-                    .await?;
-                Ok(installed.clone())
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
-    .await;
-    if result.is_err() {
-        let _ = fs::remove_dir_all(&staging).await;
-    }
-    result
-}
-
-async fn apply_runtime_codex_rollout(
-    config: &mut Config,
-    client: &HubClient,
-    rollout: &mut RuntimeCodexState,
-    manager: Option<&SessionSupervisorManager>,
-    command: &RuntimeCodexRolloutCommandDto,
-) {
-    if config.codex_driver == "app-server" {
-        // The compatibility-named app-server driver now runs Pi RPC. Keep
-        // accepting the Hub DTO, but Pi images are pinned at build time.
-        rollout.clear_candidate();
-        return;
-    }
-    let active_catch_up = command.target_artifact.as_ref().is_some_and(|artifact| {
-        command.active_version.as_deref() == Some(artifact.version.as_str())
-            && artifact.version != rollout.current_version
-    });
-
-    if let Some(artifact) = command.target_artifact.as_ref() {
-        let is_same_ready_candidate = rollout.candidate_version.as_deref()
-            == Some(artifact.version.as_str())
-            && rollout.candidate_status.as_deref() == Some("ready")
-            && rollout
-                .candidate_binary
-                .as_ref()
-                .is_some_and(|path| path.exists());
-        let is_same_failed_candidate = rollout.candidate_version.as_deref()
-            == Some(artifact.version.as_str())
-            && rollout.candidate_status.as_deref() == Some("failed")
-            && !active_catch_up;
-        if !is_same_ready_candidate && !is_same_failed_candidate {
-            match install_managed_codex_artifact(
-                &config.work_root,
-                client,
-                artifact,
-                config.app_server_timeout,
-            )
-            .await
-            {
-                Ok(binary) => {
-                    rollout.candidate_version = Some(artifact.version.clone());
-                    rollout.candidate_status = Some("ready".into());
-                    rollout.candidate_error = None;
-                    rollout.candidate_binary = Some(binary);
-                }
-                Err(error) if active_catch_up => {
-                    warn!(
-                        version = %artifact.version,
-                        error = %error,
-                        "Active Codex artifact could not be installed yet"
-                    );
-                    return;
-                }
-                Err(error) => {
-                    rollout.candidate_version = Some(artifact.version.clone());
-                    rollout.candidate_status = Some("failed".into());
-                    rollout.candidate_error = Some(error.to_string());
-                    rollout.candidate_binary = None;
-                }
-            }
-        }
-    }
-
-    let Some(active_version) = command.active_version.as_deref() else {
-        return;
-    };
-    if active_version == rollout.current_version {
-        return;
-    }
-    let Some(binary) = (rollout.candidate_version.as_deref() == Some(active_version)
-        && rollout.candidate_status.as_deref() == Some("ready"))
-    .then(|| rollout.candidate_binary.clone())
-    .flatten() else {
-        return;
-    };
-    if !binary.exists() {
-        return;
-    }
-    if let Err(error) =
-        verify_codex_compatibility(&binary, active_version, config.app_server_timeout).await
-    {
-        warn!(version = %active_version, error = %error, "Active Codex artifact failed its final compatibility check");
-        return;
-    }
-    if let Some(manager) = manager {
-        if let Err(error) =
-            manager.request_version_switch_checkpoints(active_version, &rollout.current_version)
-        {
-            warn!(error = %error, "Could not arm Session checkpoints for Codex version switch");
-            return;
-        }
-    }
-    config.codex_bin = binary.display().to_string();
-    config.codex_version = active_version.to_owned();
-    rollout.current_version = active_version.to_owned();
-    rollout.clear_candidate();
-}
-
-fn validate_managed_codex_version(version: &str) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !version.is_empty()
-            && version != "latest"
-            && version.len() <= 64
-            && version
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')),
-        "Codex version must be a concrete release version"
-    );
-    Ok(())
 }
 
 async fn gc_expired_run_dirs(root: &Path, ttl: Duration, now: SystemTime) -> anyhow::Result<usize> {
@@ -1068,22 +755,22 @@ fn runtime_register_request(config: &Config) -> RuntimeRegisterRequest {
     let (effective_sandbox_mode, sandbox_downgraded) = effective_sandbox_mode(config);
     RuntimeRegisterRequest {
         hostname: config.hostname.clone(),
-        labels: vec!["local".into(), format!("driver:{}", config.codex_driver)],
-        codex_version: if config.codex_driver == "app-server" {
-            config.codex_version.clone()
+        labels: vec!["local".into(), format!("driver:{}", config.engine_driver)],
+        engine_version: if config.engine_driver == "pi" {
+            config.engine_version.clone()
         } else {
-            "fake-codex-0.1".into()
+            "fake-engine-0.1".into()
         },
         capabilities: json!({
-            "driver": config.codex_driver,
-            "codex_source": config.codex_source,
+            "driver": config.engine_driver,
             "platform": {
                 "os": std::env::consts::OS,
                 "architecture": std::env::consts::ARCH
             },
             "model_proxy": true,
             "mcp_allowlist": false,
-            "thread_resume": true,
+            "subagents": false,
+            "native_session_resume": true,
             "local_skills": config.local_skills_dir.is_some(),
             "sandbox_downgraded": sandbox_downgraded,
             "sandbox_downgrade_reason": config.sandbox_downgrade_reason,
@@ -1148,7 +835,6 @@ async fn run_registered_cycle(
     health: &RuntimeHealth,
 ) -> anyhow::Result<()> {
     let mut last_gc = Instant::now();
-    let mut codex_rollout = RuntimeCodexState::new(config);
     let dispatcher = RuntimeRunDispatcher::default();
     let command_dispatcher = Arc::new(RuntimeSessionCommandDispatcher::default());
     let mut manager: Option<Arc<SessionSupervisorManager>> = None;
@@ -1159,29 +845,22 @@ async fn run_registered_cycle(
                 warn!(error = %error, "Session worker task stopped unexpectedly");
             }
         }
-        let heartbeat = match send_runtime_heartbeat(
-            config,
-            client,
-            stored,
-            manager.as_deref(),
-            &codex_rollout,
-        )
-        .await
-        {
-            Ok(heartbeat) => {
-                health.mark_registered();
-                Some(heartbeat)
-            }
-            Err(err) if is_auth_loss(&err) => {
-                health.mark_unregistered();
-                warn!(error = %err, "Runtime credential rejected; enrollment is not retried");
-                None
-            }
-            Err(err) => {
-                warn!(error = %err, "heartbeat failed");
-                None
-            }
-        };
+        let heartbeat =
+            match send_runtime_heartbeat(config, client, stored, manager.as_deref()).await {
+                Ok(heartbeat) => {
+                    health.mark_registered();
+                    Some(heartbeat)
+                }
+                Err(err) if is_auth_loss(&err) => {
+                    health.mark_unregistered();
+                    warn!(error = %err, "Runtime credential rejected; enrollment is not retried");
+                    None
+                }
+                Err(err) => {
+                    warn!(error = %err, "heartbeat failed");
+                    None
+                }
+            };
         if let Some(heartbeat) = heartbeat {
             let (session_manager, cleanups) = if let Some(manager) = &manager {
                 (
@@ -1216,14 +895,6 @@ async fn run_registered_cycle(
                     remove_hub_fenced_session_cleanup(&cleanup_manager, cleanup).await;
                 });
             }
-            apply_runtime_codex_rollout(
-                config,
-                client,
-                &mut codex_rollout,
-                Some(&session_manager),
-                &heartbeat.codex_rollout,
-            )
-            .await;
             command_dispatcher.enqueue(
                 client,
                 &session_manager,
@@ -1252,7 +923,7 @@ async fn run_registered_cycle(
             let checkpoint_transport = HubRuntimeCheckpointTransport {
                 client: client.clone(),
                 work_root: config.work_root.clone(),
-                producing_codex_version: config.codex_version.clone(),
+                producing_engine_version: config.engine_version.clone(),
             };
             if let Err(error) = drive_runtime_checkpoints(manager, &checkpoint_transport).await {
                 warn!(error = %error, "failed to drive Session checkpoints");
@@ -1333,10 +1004,10 @@ async fn apply_runtime_session_command(
                 message.id == command.command_id,
                 "steer command id does not match its Hub message"
             );
-            let native_thread_id = command
-                .native_thread_id
+            let native_session_id = command
+                .native_session_id
                 .as_deref()
-                .context("steer command is missing its native Thread id")?;
+                .context("steer command is missing its Native Session id")?;
             let native_turn_id = command
                 .native_turn_id
                 .clone()
@@ -1345,7 +1016,7 @@ async fn apply_runtime_session_command(
                 .steer(
                     command.session_id,
                     command.ownership_generation,
-                    native_thread_id,
+                    native_session_id,
                     native_turn_id,
                     message.id,
                     message.content.clone(),
@@ -1367,10 +1038,10 @@ async fn apply_runtime_session_command(
             }
         }
         "interrupt" => {
-            let native_thread_id = command
-                .native_thread_id
+            let native_session_id = command
+                .native_session_id
                 .as_deref()
-                .context("interrupt command is missing its native Thread id")?;
+                .context("interrupt command is missing its Native Session id")?;
             let native_turn_id = command
                 .native_turn_id
                 .clone()
@@ -1379,7 +1050,7 @@ async fn apply_runtime_session_command(
                 .interrupt(
                     command.session_id,
                     command.ownership_generation,
-                    native_thread_id,
+                    native_session_id,
                     native_turn_id,
                 )
                 .await?;
@@ -1404,7 +1075,7 @@ async fn run_claim_worker(
     let run_id = claim.run.id;
     let session_id = claim.run.hub_session_id;
     let ownership_generation = claim.run.session_ownership_generation;
-    let result = if config.codex_driver == "app-server" {
+    let result = if config.engine_driver == "pi" {
         execute_managed_run(&config, &client, Arc::clone(&manager), claim).await
     } else {
         let result = execute_run(&config, &client, claim.clone()).await;
@@ -1474,12 +1145,10 @@ async fn send_runtime_heartbeat(
     client: &HubClient,
     stored: &mut StoredRuntimeCredential,
     manager: Option<&SessionSupervisorManager>,
-    codex_rollout: &RuntimeCodexState,
 ) -> anyhow::Result<RuntimeHeartbeatResponse> {
-    let mut request = manager
+    let request = manager
         .map(SessionSupervisorManager::heartbeat_request)
         .unwrap_or_default();
-    request.codex_status = Some(codex_rollout.heartbeat_status());
     let heartbeat =
         reconcile_runtime_credential_with_request(config, client, stored, &request).await?;
     if let Some(manager) = manager {
@@ -1769,8 +1438,8 @@ impl HubClient {
                 artifact.manifest.history_checkpoint,
             )
             .header(
-                "x-agent-hub-producing-codex-version",
-                &artifact.manifest.producing_codex_version,
+                "x-agent-hub-producing-engine-version",
+                &artifact.manifest.producing_engine_version,
             )
             .header(
                 "x-agent-hub-bundle-created-at",
@@ -1927,7 +1596,7 @@ impl HubClient {
             ownership_generation,
             CompleteRunRequest {
                 status: "failed".into(),
-                session_id: None,
+                native_session_id: None,
                 work_dir_ref: None,
             },
         )
@@ -1976,42 +1645,20 @@ async fn execute_run(
     info!(
         run_id = %claim.run.id,
         workdir = %run_env.workdir.display(),
-        codex_home = %run_env.codex_home.display(),
+        engine_state_root = %run_env.engine_state_root.display(),
         "claimed run"
     );
 
     let mut last_heartbeat = Instant::now();
-    let app_server_result = if config.codex_driver == "app-server" {
-        Some(
-            execute_app_server_with_streaming(
-                config,
-                client,
-                &claim,
-                &run_env,
-                &mut last_heartbeat,
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
-    let (events, final_status, session_id) = if let Some(result) = app_server_result {
-        (result.events, result.final_status, result.session_id)
-    } else {
-        let (events, final_status) = fake_codex_events(&claim);
-        (
-            events,
-            final_status,
-            Some(format!("fake-session-{}", claim.run.id)),
-        )
-    };
+    let (events, final_status) = fake_engine_events(&claim);
+    let native_session_id = Some(format!("fake-session-{}", claim.run.id));
     finish_claimed_run(
         client,
         &claim,
         &run_env,
         events,
         final_status,
-        session_id,
+        native_session_id,
         &mut last_heartbeat,
     )
     .await
@@ -2023,7 +1670,7 @@ async fn finish_claimed_run(
     run_env: &RunEnv,
     events: Vec<AppendRunEventRequest>,
     final_status: String,
-    session_id: Option<String>,
+    native_session_id: Option<String>,
     last_heartbeat: &mut Instant,
 ) -> anyhow::Result<()> {
     let ownership_generation = claim
@@ -2051,7 +1698,7 @@ async fn finish_claimed_run(
         claim,
         tool_request_events,
         &final_status,
-        session_id.as_deref(),
+        native_session_id.as_deref(),
         &work_dir_ref,
     )?;
     if let Some(batch) = tool_request_batch {
@@ -2064,7 +1711,7 @@ async fn finish_claimed_run(
                 ownership_generation,
                 CompleteRunRequest {
                     status: final_status,
-                    session_id,
+                    native_session_id,
                     work_dir_ref: Some(work_dir_ref),
                 },
             )
@@ -2077,7 +1724,7 @@ async fn finish_claimed_run(
                 ownership_generation,
                 CompleteRunRequest {
                     status: final_status,
-                    session_id,
+                    native_session_id,
                     work_dir_ref: Some(work_dir_ref),
                 },
             )
@@ -2096,7 +1743,7 @@ async fn finish_claimed_run(
 fn session_supervisor_metadata_for_claim(
     runtime_id: Uuid,
     claim: &ClaimRunResponse,
-    codex_version: &str,
+    engine_version: &str,
 ) -> anyhow::Result<SessionSupervisorMetadata> {
     let session_id = claim
         .run
@@ -2120,11 +1767,11 @@ fn session_supervisor_metadata_for_claim(
         checkpoint_reason: None,
         checkpoint_retry_unix_ms: None,
         hub_checkpoint_attempt_id: None,
-        codex_version: codex_version.to_owned(),
-        native_thread_id: claim
+        engine_version: engine_version.to_owned(),
+        native_session_id: claim
             .session_context
             .as_ref()
-            .and_then(|context| context.session.native_thread_id.clone()),
+            .and_then(|context| context.session.native_session_id.clone()),
     })
 }
 
@@ -2198,17 +1845,17 @@ async fn restore_claim_session_bundle_if_needed(
         anyhow::ensure!(
             manifest.bundle_generation == current.generation
                 && manifest.ownership_generation == current.ownership_generation
-                && manifest.producing_codex_version == current.producing_codex_version,
+                && manifest.producing_engine_version == current.producing_engine_version,
             "Session Bundle manifest does not match Hub Bundle metadata"
         );
         anyhow::ensure!(
-            context.session.native_thread_id.as_deref() == Some(&manifest.native_thread_id),
-            "Session Bundle native Thread does not match Hub Session"
+            context.session.native_session_id.as_deref() == Some(&manifest.native_session_id),
+            "Session Bundle Native Session does not match Hub Session"
         );
         let metadata = session_supervisor_metadata_for_claim(
             configured_runtime_id(claim)?,
             claim,
-            &config.codex_version,
+            &config.engine_version,
         )?;
         persist_session_supervisor_metadata(&restore_root, &metadata).await?;
 
@@ -2279,8 +1926,8 @@ async fn execute_managed_run_inner(
     mut claim: ClaimRunResponse,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
-        config.codex_driver == "app-server",
-        "persistent Session execution requires the app-server driver"
+        config.engine_driver == "pi",
+        "persistent Session execution requires the Pi driver"
     );
     ensure_atomic_tool_request_protocol(client, &claim)?;
     let session_id = claim
@@ -2311,14 +1958,14 @@ async fn execute_managed_run_inner(
     )
     .await?;
     let metadata =
-        session_supervisor_metadata_for_claim(manager.runtime_id, &claim, &config.codex_version)?;
+        session_supervisor_metadata_for_claim(manager.runtime_id, &claim, &config.engine_version)?;
     manager
         .ensure_pi(
             metadata,
-            config.codex_bin.clone(),
+            config.engine_bin.clone(),
             run_env.clone(),
             pi_driver::pi_tool_allowlist_for_claim(&claim)?,
-            config.app_server_timeout,
+            config.engine_timeout,
             Some(model_proxy),
         )
         .await?;
@@ -2347,12 +1994,12 @@ async fn execute_managed_run_inner(
         run_id = %claim.run.id,
         session_id = %session_id,
         workdir = %run_env.workdir.display(),
-        codex_home = %run_env.codex_home.display(),
+        engine_state_root = %run_env.engine_state_root.display(),
         "claimed persistent Session run"
     );
 
     let mut last_heartbeat = Instant::now();
-    let result = execute_managed_app_server_with_streaming(
+    let result = execute_managed_pi_with_streaming(
         client,
         Arc::clone(&manager),
         &claim,
@@ -2365,16 +2012,16 @@ async fn execute_managed_run_inner(
         session_id = %session_id,
         native_turn_id = result.native_turn_id.as_deref().unwrap_or("unbound"),
         final_status = %result.final_status,
-        "native Codex Turn finished"
+        "native Pi Turn finished"
     );
     manager
-        .update_native_thread_id(
+        .update_native_session_id(
             session_id,
             claim
                 .run
                 .session_ownership_generation
                 .context("claimed Run is missing its Session ownership generation")?,
-            result.session_id.as_deref(),
+            result.native_session_id.as_deref(),
         )
         .await?;
     finish_claimed_run(
@@ -2383,20 +2030,20 @@ async fn execute_managed_run_inner(
         &run_env,
         result.events,
         result.final_status,
-        result.session_id,
+        result.native_session_id,
         &mut last_heartbeat,
     )
     .await
 }
 
-async fn execute_managed_app_server_with_streaming(
+async fn execute_managed_pi_with_streaming(
     client: &HubClient,
     manager: Arc<SessionSupervisorManager>,
     claim: &ClaimRunResponse,
     last_heartbeat: &mut Instant,
     heartbeat_interval: Duration,
-) -> anyhow::Result<AppServerRunResult> {
-    let (event_tx, mut event_rx) = app_server_event_channel();
+) -> anyhow::Result<EngineRunResult> {
+    let (event_tx, mut event_rx) = engine_event_channel();
     let mut deferred_tool_requests = Vec::new();
     let ownership_generation = claim
         .run
@@ -2421,7 +2068,7 @@ async fn execute_managed_app_server_with_streaming(
         tokio::select! {
             Some(event) = event_rx.recv() => {
                 let turn_started = event.event_type == "turn_started";
-                persist_managed_native_thread_from_event(
+                persist_managed_native_session_from_event(
                     &manager,
                     session_id,
                     ownership_generation,
@@ -2460,7 +2107,7 @@ async fn execute_managed_app_server_with_streaming(
                 let mut result = result??;
                 while let Ok(event) = event_rx.try_recv() {
                     let turn_started = event.event_type == "turn_started";
-                    persist_managed_native_thread_from_event(
+                    persist_managed_native_session_from_event(
                         &manager,
                         session_id,
                         ownership_generation,
@@ -2488,7 +2135,7 @@ async fn execute_managed_app_server_with_streaming(
     }
 }
 
-async fn persist_managed_native_thread_from_event(
+async fn persist_managed_native_session_from_event(
     manager: &SessionSupervisorManager,
     session_id: Uuid,
     ownership_generation: i64,
@@ -2497,124 +2144,43 @@ async fn persist_managed_native_thread_from_event(
     if event.event_type != "turn_started" {
         return Ok(());
     }
-    let native_thread_id = event
+    let native_session_id = event
         .payload
-        .get("native_thread_id")
+        .get("native_session_id")
         .and_then(serde_json::Value::as_str)
-        .context("turn_started event is missing native Thread id")?;
+        .context("turn_started event is missing Native Session id")?;
     manager
-        .update_native_thread_id(session_id, ownership_generation, Some(native_thread_id))
+        .update_native_session_id(session_id, ownership_generation, Some(native_session_id))
         .await
 }
 
-async fn execute_app_server_with_streaming(
-    config: &Config,
-    client: &HubClient,
-    claim: &ClaimRunResponse,
-    run_env: &RunEnv,
-    last_heartbeat: &mut Instant,
-) -> anyhow::Result<AppServerRunResult> {
-    execute_app_server_with_streaming_with_heartbeat_interval(
-        config,
-        client,
-        claim,
-        run_env,
-        last_heartbeat,
-        Duration::from_secs(10),
-    )
-    .await
-}
-
-async fn execute_app_server_with_streaming_with_heartbeat_interval(
-    config: &Config,
-    client: &HubClient,
-    claim: &ClaimRunResponse,
-    run_env: &RunEnv,
-    last_heartbeat: &mut Instant,
-    heartbeat_interval: Duration,
-) -> anyhow::Result<AppServerRunResult> {
-    let (event_tx, mut event_rx) = app_server_event_channel();
-    let mut deferred_tool_requests = Vec::new();
-    let cancellation = Arc::new(AppServerCancellation::default());
-    let _cancellation_guard = AppServerCancellationGuard(Arc::clone(&cancellation));
-    let config = config.clone();
-    let ownership_generation = claim
-        .run
-        .session_ownership_generation
-        .context("claimed Run is missing its Session ownership generation")?;
-    let claim = claim.clone();
-    let run_env = run_env.clone();
-    let run_id = claim.run.id;
-    let driver_cancellation = Arc::clone(&cancellation);
-    let mut driver = tokio::spawn(async move {
-        run_app_server_driver(
-            &config,
-            &claim,
-            &run_env,
-            Some(event_tx),
-            driver_cancellation,
-        )
-        .await
-    });
-    let mut heartbeat = tokio::time::interval_at(
-        tokio::time::Instant::now() + heartbeat_interval,
-        heartbeat_interval,
-    );
-
-    loop {
-        tokio::select! {
-            Some(event) = event_rx.recv() => {
-                if let Some(event) = defer_tool_request(event, &mut deferred_tool_requests) {
-                    if let Err(error) = append_streamed_event(
-                        client,
-                        run_id,
-                        ownership_generation,
-                        event,
-                        last_heartbeat,
-                    ).await {
-                        event_rx.close();
-                        cancel_app_server_driver(&cancellation, &mut driver).await;
-                        return Err(error);
-                    }
-                }
-            }
-            _ = heartbeat.tick() => {
-                match client.heartbeat().await {
-                    Ok(()) => *last_heartbeat = Instant::now(),
-                    Err(error) => {
-                        event_rx.close();
-                        cancel_app_server_driver(&cancellation, &mut driver).await;
-                        return Err(error);
-                    }
-                }
-            }
-            result = &mut driver => {
-                let mut result = result??;
-                while let Ok(event) = event_rx.try_recv() {
-                    if let Some(event) = defer_tool_request(event, &mut deferred_tool_requests) {
-                        append_streamed_event(
-                            client,
-                            run_id,
-                            ownership_generation,
-                            event,
-                            last_heartbeat,
-                        ).await?;
-                    }
-                }
-                if result.final_status == "waiting_tool" {
-                    result.events.extend(deferred_tool_requests);
-                }
-                return Ok(result);
-            }
-        }
-    }
-}
-
-fn app_server_event_channel() -> (
+fn engine_event_channel() -> (
     tokio_mpsc::Sender<AppendRunEventRequest>,
     tokio_mpsc::Receiver<AppendRunEventRequest>,
 ) {
-    tokio_mpsc::channel(APP_SERVER_EVENT_QUEUE_CAPACITY)
+    tokio_mpsc::channel(ENGINE_EVENT_QUEUE_CAPACITY)
+}
+
+fn send_engine_event_with_backpressure(
+    event_tx: &tokio_mpsc::Sender<AppendRunEventRequest>,
+    mut event: AppendRunEventRequest,
+    cancellation: &EngineCancellation,
+) -> anyhow::Result<()> {
+    loop {
+        if cancellation.is_cancelled() {
+            anyhow::bail!("stream Execution Engine event cancelled");
+        }
+        match event_tx.try_send(event) {
+            Ok(()) => return Ok(()),
+            Err(tokio_mpsc::error::TrySendError::Full(returned)) => {
+                event = returned;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
+                anyhow::bail!("stream Execution Engine event receiver closed");
+            }
+        }
+    }
 }
 
 fn defer_tool_request(
@@ -2633,7 +2199,7 @@ fn build_tool_request_batch(
     claim: &ClaimRunResponse,
     events: Vec<AppendRunEventRequest>,
     final_status: &str,
-    session_id: Option<&str>,
+    native_session_id: Option<&str>,
     work_dir_ref: &str,
 ) -> anyhow::Result<Option<FinalizeToolRequestsRequest>> {
     if final_status != "waiting_tool" {
@@ -2657,20 +2223,12 @@ fn build_tool_request_batch(
     }
     Ok(Some(FinalizeToolRequestsRequest {
         integration_session_id,
-        session_id: session_id
-            .context("waiting tool run is missing a session id")?
+        native_session_id: native_session_id
+            .context("waiting tool run is missing a Native Session id")?
             .to_owned(),
         work_dir_ref: work_dir_ref.to_owned(),
         tool_requests,
     }))
-}
-
-async fn cancel_app_server_driver(
-    cancellation: &AppServerCancellation,
-    driver: &mut JoinHandle<anyhow::Result<AppServerRunResult>>,
-) {
-    cancellation.cancel();
-    let _ = driver.await;
 }
 
 async fn append_streamed_event(
@@ -2940,762 +2498,6 @@ fn is_sensitive_model_header(name: &HeaderName) -> bool {
         || name.contains("secret")
 }
 
-async fn run_app_server_driver(
-    config: &Config,
-    claim: &ClaimRunResponse,
-    run_env: &RunEnv,
-    event_tx: Option<tokio_mpsc::Sender<AppendRunEventRequest>>,
-    cancellation: Arc<AppServerCancellation>,
-) -> anyhow::Result<AppServerRunResult> {
-    let codex_bin = config.codex_bin.clone();
-    let run_env = run_env.clone();
-    let claim = claim.clone();
-    let timeout = config.app_server_timeout;
-    tokio::task::spawn_blocking(move || {
-        run_app_server_process_with_cancellation(
-            &codex_bin,
-            &run_env,
-            &claim,
-            timeout,
-            event_tx,
-            cancellation,
-        )
-    })
-    .await?
-}
-
-#[cfg(test)]
-fn app_server_request_lines(
-    claim: &ClaimRunResponse,
-    run_env: &RunEnv,
-) -> anyhow::Result<Vec<String>> {
-    let requests = vec![
-        app_server_initialize_request(),
-        json!({ "jsonrpc": "2.0", "method": "initialized" }),
-        app_server_thread_start_request(claim, run_env),
-        app_server_turn_start_request(claim, "thread-placeholder"),
-    ];
-    requests
-        .into_iter()
-        .map(|request| serde_json::to_string(&request).context("serialize JSON-RPC request"))
-        .collect()
-}
-
-fn app_server_initialize_request() -> serde_json::Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "clientInfo": {
-                "name": "agent-hub-runtime",
-                "version": env!("CARGO_PKG_VERSION")
-            },
-            "capabilities": {}
-        }
-    })
-}
-
-fn app_server_thread_start_request(
-    claim: &ClaimRunResponse,
-    run_env: &RunEnv,
-) -> serde_json::Value {
-    let mut params = json!({
-        "cwd": run_env.workdir,
-        "approvalPolicy": "never",
-        "sandbox": codex_thread_sandbox_name(&claim.agent),
-        "developerInstructions": claim.agent.instructions
-    });
-    if let Some((model, provider)) = app_server_default_model_configuration(claim) {
-        params["model"] = json!(model);
-        params["modelProvider"] = json!(provider);
-    }
-    let method = if let Some(resume) = &claim.resume {
-        params["threadId"] = json!(resume.thread_id);
-        "thread/resume"
-    } else {
-        "thread/start"
-    };
-    json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": method,
-        "params": params
-    })
-}
-
-fn app_server_thread_unsubscribe_request(thread_id: &str) -> serde_json::Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": 0,
-        "method": "thread/unsubscribe",
-        "params": { "threadId": thread_id }
-    })
-}
-
-fn app_server_thread_refresh_request(
-    claim: &ClaimRunResponse,
-    run_env: &RunEnv,
-    thread_id: &str,
-) -> serde_json::Value {
-    let mut request = app_server_thread_start_request(claim, run_env);
-    request["method"] = json!("thread/resume");
-    request["params"]["threadId"] = json!(thread_id);
-    request["params"]["excludeTurns"] = json!(true);
-    // An empty override forces an unsubscribed idle Thread through cold resume
-    // without changing any setting, so Codex reloads config and agent files.
-    request["params"]["config"] = json!({});
-    request
-}
-
-fn app_server_default_model_configuration(claim: &ClaimRunResponse) -> Option<(&str, String)> {
-    let binding = model_binding(&claim.execution_configuration, "main").ok()?;
-    Some((binding.model_id.as_str(), model_provider_name(binding.id)))
-}
-
-fn app_server_turn_start_request(claim: &ClaimRunResponse, thread_id: &str) -> serde_json::Value {
-    let mut queued_messages = claim
-        .session_context
-        .as_ref()
-        .map(|context| context.messages.iter().collect::<Vec<_>>())
-        .unwrap_or_default();
-    queued_messages.sort_by_key(|message| message.sequence);
-    let mut input = queued_messages
-        .into_iter()
-        .filter_map(|message| message.content.as_deref())
-        .filter(|text| !text.trim().is_empty())
-        .map(|text| {
-            json!({
-                "type": "text",
-                "text": text,
-                "text_elements": []
-            })
-        })
-        .collect::<Vec<_>>();
-    if input.is_empty() {
-        input.push(json!({
-            "type": "text",
-            "text": claim.run.initial_message,
-            "text_elements": []
-        }));
-    }
-    let mut params = json!({
-        "threadId": thread_id,
-        "input": input,
-        "source": claim.run.source,
-        "sandboxPolicy": codex_sandbox_policy(&claim.agent),
-        "metadata": {
-            "agent_hub_run_id": claim.run.id,
-            "integration_context": claim.integration_context
-        }
-    });
-    if let Some(context) = &claim.integration_context {
-        params["dynamicTools"] = context.tools.clone();
-    }
-    if let Some((model, _)) = app_server_default_model_configuration(claim) {
-        params["model"] = json!(model);
-    }
-    if let Some(effort) = model_binding(&claim.execution_configuration, "main")
-        .ok()
-        .and_then(|binding| codex_reasoning_effort(binding.model_settings.reasoning_effort))
-    {
-        params["effort"] = json!(effort);
-    }
-    json!({
-        "jsonrpc": "2.0",
-        "id": 3,
-        "method": "turn/start",
-        "params": params
-    })
-}
-
-fn app_server_turn_steer_request(
-    thread_id: &str,
-    expected_turn_id: &str,
-    client_user_message_id: Uuid,
-    input: &[String],
-) -> serde_json::Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": 0,
-        "method": "turn/steer",
-        "params": {
-            "threadId": thread_id,
-            "expectedTurnId": expected_turn_id,
-            "clientUserMessageId": client_user_message_id,
-            "input": input.iter().map(|text| json!({
-                "type": "text",
-                "text": text,
-                "text_elements": []
-            })).collect::<Vec<_>>()
-        }
-    })
-}
-
-fn app_server_steer_response(
-    response: &serde_json::Value,
-    expected_turn_id: &str,
-) -> anyhow::Result<SessionSteerOutcome> {
-    if let Some(error) = response.get("error") {
-        let message = error
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        if message == "no active turn to steer"
-            || (message.starts_with("expected active turn id ") && message.contains(" but found "))
-        {
-            return Ok(SessionSteerOutcome::TurnEnded);
-        }
-        anyhow::bail!("Codex app-server rejected turn/steer");
-    }
-    let turn_id = response
-        .get("result")
-        .and_then(|result| result.get("turnId"))
-        .and_then(serde_json::Value::as_str)
-        .context("Codex app-server turn/steer response is missing turnId")?;
-    anyhow::ensure!(
-        turn_id == expected_turn_id,
-        "Codex app-server turn/steer response changed the expected Turn"
-    );
-    Ok(SessionSteerOutcome::Applied)
-}
-
-fn app_server_turn_interrupt_request(thread_id: &str, turn_id: &str) -> serde_json::Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": 0,
-        "method": "turn/interrupt",
-        "params": {
-            "threadId": thread_id,
-            "turnId": turn_id
-        }
-    })
-}
-
-fn app_server_interrupt_response(response: &serde_json::Value) -> anyhow::Result<()> {
-    if response.get("error").is_some() {
-        anyhow::bail!("Codex app-server rejected turn/interrupt");
-    }
-    response
-        .get("result")
-        .context("Codex app-server turn/interrupt response is missing result")?;
-    Ok(())
-}
-
-#[cfg(test)]
-fn run_app_server_process(
-    codex_bin: &str,
-    workdir: &Path,
-    codex_home: &Path,
-    claim: &ClaimRunResponse,
-    timeout: Duration,
-    event_tx: Option<tokio_mpsc::Sender<AppendRunEventRequest>>,
-) -> anyhow::Result<AppServerRunResult> {
-    let run_env = RunEnv {
-        workdir: workdir.to_path_buf(),
-        codex_home: codex_home.to_path_buf(),
-    };
-    run_app_server_process_with_cancellation(
-        codex_bin,
-        &run_env,
-        claim,
-        timeout,
-        event_tx,
-        Arc::new(AppServerCancellation::default()),
-    )
-}
-
-fn run_app_server_process_with_cancellation(
-    codex_bin: &str,
-    run_env: &RunEnv,
-    claim: &ClaimRunResponse,
-    timeout: Duration,
-    event_tx: Option<tokio_mpsc::Sender<AppendRunEventRequest>>,
-    cancellation: Arc<AppServerCancellation>,
-) -> anyhow::Result<AppServerRunResult> {
-    let mut process = PersistentAppServerProcess::start(codex_bin, run_env, timeout, cancellation)
-        .context("Codex app-server failed")?;
-    process
-        .execute(claim, event_tx)
-        .context("Codex app-server failed")
-}
-
-struct PersistentAppServerProcess {
-    run_env: RunEnv,
-    thread_id: Option<String>,
-    configuration_fingerprint: Option<String>,
-    next_request_id: u64,
-    child: Option<std::process::Child>,
-    stdin: Option<std::process::ChildStdin>,
-    line_rx: Option<mpsc::Receiver<anyhow::Result<String>>>,
-    stdout_reader: Option<std::thread::JoinHandle<()>>,
-    stderr_reader: Option<std::thread::JoinHandle<Result<usize, std::io::Error>>>,
-    cancellation: Arc<AppServerCancellation>,
-    timeout: Duration,
-}
-
-impl PersistentAppServerProcess {
-    fn start(
-        codex_bin: &str,
-        run_env: &RunEnv,
-        timeout: Duration,
-        cancellation: Arc<AppServerCancellation>,
-    ) -> anyhow::Result<Self> {
-        let mut command = Command::new(codex_bin);
-        command
-            .env_clear()
-            .arg("app-server")
-            .arg("--listen")
-            .arg("stdio://")
-            .current_dir(&run_env.workdir)
-            .env("CODEX_HOME", &run_env.codex_home)
-            .env("HOME", &run_env.codex_home)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for key in [
-            "PATH",
-            "LANG",
-            "LC_ALL",
-            "SSL_CERT_FILE",
-            "SSL_CERT_DIR",
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "NO_PROXY",
-        ] {
-            if let Some(value) = env::var_os(key) {
-                command.env(key, value);
-            }
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("spawn Codex app-server: {codex_bin}"))?;
-        cancellation.register_child(&child);
-
-        let stdout = child
-            .stdout
-            .take()
-            .context("open Codex app-server stdout")?;
-        let mut stderr = child
-            .stderr
-            .take()
-            .context("open Codex app-server stderr")?;
-        let (line_tx, line_rx) =
-            mpsc::sync_channel::<anyhow::Result<String>>(APP_SERVER_EVENT_QUEUE_CAPACITY);
-        let stdout_reader = std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines() {
-                if line_tx
-                    .send(line.context("read Codex app-server stdout line"))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-        let stderr_reader = std::thread::spawn(move || {
-            let mut total = 0_usize;
-            let mut buffer = [0_u8; 8192];
-            loop {
-                let read = stderr.read(&mut buffer)?;
-                if read == 0 {
-                    return Ok::<usize, std::io::Error>(total);
-                }
-                total = total.saturating_add(read);
-            }
-        });
-        let stdin = child.stdin.take().context("open Codex app-server stdin")?;
-        let mut process = Self {
-            run_env: run_env.clone(),
-            thread_id: None,
-            configuration_fingerprint: None,
-            next_request_id: 1,
-            child: Some(child),
-            stdin: Some(stdin),
-            line_rx: Some(line_rx),
-            stdout_reader: Some(stdout_reader),
-            stderr_reader: Some(stderr_reader),
-            cancellation,
-            timeout,
-        };
-        if let Err(error) = process.initialize() {
-            process.shutdown();
-            return Err(error);
-        }
-        Ok(process)
-    }
-
-    #[cfg(test)]
-    fn child_id(&self) -> u32 {
-        self.child.as_ref().map_or(0, std::process::Child::id)
-    }
-
-    #[cfg(test)]
-    fn ensure_running(&mut self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !self.cancellation.is_cancelled(),
-            "Codex app-server is cancelled"
-        );
-        let child = self
-            .child
-            .as_mut()
-            .context("Codex app-server process is closed")?;
-        if let Some(status) = child.try_wait().context("poll Codex app-server")? {
-            anyhow::bail!("Codex app-server exited with status {status}");
-        }
-        Ok(())
-    }
-
-    fn initialize(&mut self) -> anyhow::Result<()> {
-        let request_id = self.send_request(app_server_initialize_request())?;
-        let started_at = Instant::now();
-        let mut state = AppServerState::new(Uuid::nil());
-        state.expect_response(request_id, AppServerResponseKind::Initialize);
-        while !state.initialized {
-            let line = self.recv(started_at)?;
-            state.handle_value(&serde_json::from_str(&line).context("parse app-server JSON")?)?;
-        }
-        self.send(&json!({ "jsonrpc": "2.0", "method": "initialized" }))
-    }
-
-    fn execute(
-        &mut self,
-        claim: &ClaimRunResponse,
-        event_tx: Option<tokio_mpsc::Sender<AppendRunEventRequest>>,
-    ) -> anyhow::Result<AppServerRunResult> {
-        let result = self.execute_inner(claim, &event_tx, None, None);
-        if result.is_err() {
-            self.shutdown();
-        }
-        result
-    }
-
-    #[cfg(test)]
-    fn execute_controlled(
-        &mut self,
-        claim: &ClaimRunResponse,
-        event_tx: Option<tokio_mpsc::Sender<AppendRunEventRequest>>,
-        command_rx: &mpsc::Receiver<SessionSupervisorCommand>,
-        deferred_commands: &mut VecDeque<SessionSupervisorCommand>,
-    ) -> anyhow::Result<AppServerRunResult> {
-        let result =
-            self.execute_inner(claim, &event_tx, Some(command_rx), Some(deferred_commands));
-        if result.is_err() {
-            self.shutdown();
-        }
-        result
-    }
-
-    fn execute_inner(
-        &mut self,
-        claim: &ClaimRunResponse,
-        event_tx: &Option<tokio_mpsc::Sender<AppendRunEventRequest>>,
-        command_rx: Option<&mpsc::Receiver<SessionSupervisorCommand>>,
-        mut deferred_commands: Option<&mut VecDeque<SessionSupervisorCommand>>,
-    ) -> anyhow::Result<AppServerRunResult> {
-        let started_at = Instant::now();
-        let mut state = AppServerState::new(claim.run.id);
-        let driver_configuration_fingerprint = driver_configuration_fingerprint(claim);
-        anyhow::ensure!(self.child.is_some(), "Codex app-server is not running");
-        let reused_thread = self.thread_id.is_some();
-        let thread_id = if let Some(thread_id) = self.thread_id.clone() {
-            state.thread_id = Some(thread_id.clone());
-            thread_id
-        } else {
-            let thread_request = app_server_thread_start_request(claim, &self.run_env);
-            let request_id = self.send_request(thread_request)?;
-            state.expect_response(request_id, AppServerResponseKind::Thread);
-            while state.thread_id.is_none() {
-                let line = self.recv(started_at)?;
-                state
-                    .handle_value(&serde_json::from_str(&line).context("parse app-server JSON")?)?;
-                state.flush_events(event_tx, &self.cancellation)?;
-            }
-            let thread_id = state.thread_id.clone().context("missing Codex thread id")?;
-            self.thread_id = Some(thread_id.clone());
-            self.configuration_fingerprint = Some(driver_configuration_fingerprint.clone());
-            thread_id
-        };
-        if reused_thread
-            && self.configuration_fingerprint.as_deref()
-                != Some(driver_configuration_fingerprint.as_str())
-        {
-            self.refresh_thread_configuration(
-                claim,
-                &thread_id,
-                &driver_configuration_fingerprint,
-                &mut state,
-                started_at,
-                event_tx,
-            )?;
-        }
-        let request_id = self.send_request(app_server_turn_start_request(claim, &thread_id))?;
-        state.expect_response(request_id, AppServerResponseKind::TurnStart);
-        let mut pending_steers = BTreeMap::new();
-        let mut pending_interrupts = BTreeMap::new();
-        let mut accepted_interrupts: Vec<PendingInterruptResponse> = Vec::new();
-        loop {
-            if let Some(command_rx) = command_rx {
-                loop {
-                    match command_rx.try_recv() {
-                        Ok(SessionSupervisorCommand::Steer {
-                            expected_turn_id,
-                            client_user_message_id,
-                            input,
-                            response,
-                        }) => {
-                            if state.done
-                                || state.native_turn_id.as_deref()
-                                    != Some(expected_turn_id.as_str())
-                            {
-                                let _ = response.send(Ok(SessionSteerOutcome::TurnEnded));
-                                continue;
-                            }
-                            let request_id = self.send_request(app_server_turn_steer_request(
-                                &thread_id,
-                                &expected_turn_id,
-                                client_user_message_id,
-                                &input,
-                            ))?;
-                            pending_steers.insert(
-                                request_id,
-                                PendingSteerResponse {
-                                    expected_turn_id,
-                                    response,
-                                },
-                            );
-                        }
-                        Ok(command @ SessionSupervisorCommand::Execute { .. }) => {
-                            deferred_commands
-                                .as_deref_mut()
-                                .expect("controlled execution has a deferred command queue")
-                                .push_back(command);
-                        }
-                        Ok(command @ SessionSupervisorCommand::RefreshConfiguration { .. }) => {
-                            deferred_commands
-                                .as_deref_mut()
-                                .expect("controlled execution has a deferred command queue")
-                                .push_back(command);
-                        }
-                        Ok(SessionSupervisorCommand::Interrupt {
-                            expected_turn_id,
-                            response,
-                        }) => {
-                            if state.done
-                                || state.native_turn_id.as_deref()
-                                    != Some(expected_turn_id.as_str())
-                            {
-                                let _ = response.send(Ok(SessionInterruptOutcome::TurnEnded));
-                                continue;
-                            }
-                            let request_id = self.send_request(
-                                app_server_turn_interrupt_request(&thread_id, &expected_turn_id),
-                            )?;
-                            pending_interrupts.insert(
-                                request_id,
-                                PendingInterruptResponse {
-                                    expected_turn_id,
-                                    response,
-                                },
-                            );
-                        }
-                        Ok(SessionSupervisorCommand::Stop) => {
-                            anyhow::bail!("Session supervisor stopped during active Turn");
-                        }
-                        Err(mpsc::TryRecvError::Empty) => break,
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            anyhow::bail!("Session supervisor command channel disconnected");
-                        }
-                    }
-                }
-            }
-            if state.done && !accepted_interrupts.is_empty() {
-                for pending in accepted_interrupts.drain(..) {
-                    let outcome = if state.final_status == "interrupted"
-                        && state.native_turn_id.as_deref()
-                            == Some(pending.expected_turn_id.as_str())
-                    {
-                        SessionInterruptOutcome::Interrupted
-                    } else {
-                        SessionInterruptOutcome::TurnEnded
-                    };
-                    let _ = pending.response.send(Ok(outcome));
-                }
-            }
-            if state.done
-                && pending_steers.is_empty()
-                && pending_interrupts.is_empty()
-                && accepted_interrupts.is_empty()
-            {
-                break;
-            }
-            let line = if command_rx.is_some() {
-                match self.recv_once(started_at, Duration::from_millis(10))? {
-                    Some(line) => line,
-                    None => continue,
-                }
-            } else {
-                self.recv(started_at)?
-            };
-            let value: serde_json::Value =
-                serde_json::from_str(&line).context("parse app-server JSON")?;
-            let response_id = value.get("id").and_then(serde_json::Value::as_u64);
-            if let Some(pending) = response_id.and_then(|id| pending_steers.remove(&id)) {
-                let outcome = app_server_steer_response(&value, &pending.expected_turn_id);
-                let _ = pending.response.send(outcome);
-                continue;
-            }
-            if let Some(pending) = response_id.and_then(|id| pending_interrupts.remove(&id)) {
-                match app_server_interrupt_response(&value) {
-                    Ok(()) => accepted_interrupts.push(pending),
-                    Err(error) => {
-                        let _ = pending.response.send(Err(error));
-                    }
-                }
-                continue;
-            }
-            state.handle_value(&value)?;
-            state.flush_events(event_tx, &self.cancellation)?;
-        }
-        if state.events.is_empty() && state.streamed_events == 0 {
-            anyhow::bail!("Codex app-server produced no events");
-        }
-        Ok(state.finish())
-    }
-
-    fn refresh_thread_configuration(
-        &mut self,
-        claim: &ClaimRunResponse,
-        thread_id: &str,
-        driver_configuration_fingerprint: &str,
-        state: &mut AppServerState,
-        started_at: Instant,
-        event_tx: &Option<tokio_mpsc::Sender<AppendRunEventRequest>>,
-    ) -> anyhow::Result<()> {
-        let unsubscribe_id = self.send_request(app_server_thread_unsubscribe_request(thread_id))?;
-        self.wait_for_response(
-            state,
-            unsubscribe_id,
-            AppServerResponseKind::Acknowledgement,
-            started_at,
-            event_tx,
-        )?;
-
-        let resume_request = app_server_thread_refresh_request(claim, &self.run_env, thread_id);
-        let resume_id = self.send_request(resume_request)?;
-        self.wait_for_response(
-            state,
-            resume_id,
-            AppServerResponseKind::Thread,
-            started_at,
-            event_tx,
-        )?;
-        self.configuration_fingerprint = Some(driver_configuration_fingerprint.to_owned());
-        Ok(())
-    }
-
-    fn wait_for_response(
-        &mut self,
-        state: &mut AppServerState,
-        request_id: u64,
-        kind: AppServerResponseKind,
-        started_at: Instant,
-        event_tx: &Option<tokio_mpsc::Sender<AppendRunEventRequest>>,
-    ) -> anyhow::Result<()> {
-        state.expect_response(request_id, kind);
-        while state.pending_responses.contains_key(&request_id) {
-            let line = self.recv(started_at)?;
-            state.handle_value(&serde_json::from_str(&line).context("parse app-server JSON")?)?;
-            state.flush_events(event_tx, &self.cancellation)?;
-        }
-        Ok(())
-    }
-
-    fn send(&mut self, value: &serde_json::Value) -> anyhow::Result<()> {
-        let stdin = self
-            .stdin
-            .as_mut()
-            .context("Codex app-server stdin is closed")?;
-        send_app_server_value(stdin, value)
-    }
-
-    fn send_request(&mut self, mut value: serde_json::Value) -> anyhow::Result<u64> {
-        let request_id = self.next_request_id;
-        self.next_request_id = self
-            .next_request_id
-            .checked_add(1)
-            .context("Codex app-server request id overflow")?;
-        value["id"] = json!(request_id);
-        self.send(&value)?;
-        Ok(request_id)
-    }
-
-    fn recv(&mut self, started_at: Instant) -> anyhow::Result<String> {
-        loop {
-            if let Some(line) = self.recv_once(started_at, Duration::from_millis(50))? {
-                return Ok(line);
-            }
-        }
-    }
-
-    fn recv_once(&mut self, started_at: Instant, wait: Duration) -> anyhow::Result<Option<String>> {
-        let line_rx = self
-            .line_rx
-            .as_ref()
-            .context("Codex app-server stdout reader is closed")?;
-        let child = self
-            .child
-            .as_mut()
-            .context("Codex app-server process is closed")?;
-        recv_app_server_line_once(
-            line_rx,
-            child,
-            started_at,
-            self.timeout,
-            wait,
-            &self.cancellation,
-        )
-    }
-
-    fn shutdown(&mut self) {
-        self.cancellation.cancel();
-        self.stdin.take();
-        if let Some(mut child) = self.child.take() {
-            let child_id = child.id();
-            terminate_child_process_tree(&mut child);
-            self.cancellation.clear_child(child_id);
-        }
-        self.line_rx.take();
-        if let Some(reader) = self.stdout_reader.take() {
-            let _ = reader.join();
-        }
-        if let Some(reader) = self.stderr_reader.take() {
-            let _ = reader.join();
-        }
-    }
-}
-
-fn driver_configuration_fingerprint(claim: &ClaimRunResponse) -> String {
-    let mut bindings = claim
-        .execution_configuration
-        .model_bindings
-        .iter()
-        .map(|binding| (binding.binding_key.trim().to_lowercase(), binding.id))
-        .collect::<Vec<_>>();
-    bindings.sort();
-    format!("{}:{bindings:?}", claim.expected_configuration_fingerprint)
-}
-
-impl Drop for PersistentAppServerProcess {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionSteerOutcome {
     Applied,
@@ -3703,7 +2505,6 @@ enum SessionSteerOutcome {
 }
 
 struct PendingSteerResponse {
-    expected_turn_id: String,
     response: oneshot::Sender<anyhow::Result<SessionSteerOutcome>>,
 }
 
@@ -3722,11 +2523,10 @@ enum SessionSupervisorCommand {
     Execute {
         claim: Box<ClaimRunResponse>,
         event_tx: Option<tokio_mpsc::Sender<AppendRunEventRequest>>,
-        response: oneshot::Sender<anyhow::Result<AppServerRunResult>>,
+        response: oneshot::Sender<anyhow::Result<EngineRunResult>>,
     },
     Steer {
         expected_turn_id: String,
-        client_user_message_id: Uuid,
         input: Vec<String>,
         response: oneshot::Sender<anyhow::Result<SessionSteerOutcome>>,
     },
@@ -3744,15 +2544,13 @@ struct SessionSupervisor {
     session_id: Uuid,
     ownership_generation: i64,
     command_tx: mpsc::Sender<SessionSupervisorCommand>,
-    cancellation: Arc<AppServerCancellation>,
+    cancellation: Arc<EngineCancellation>,
     actor: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     terminal_error: Arc<std::sync::Mutex<Option<String>>>,
     stopped: AtomicBool,
 }
 
 enum PersistentSessionProcess {
-    #[cfg(test)]
-    Codex(PersistentAppServerProcess),
     Pi(pi_driver::PersistentPiRpcProcess),
 }
 
@@ -3763,12 +2561,8 @@ impl PersistentSessionProcess {
         event_tx: Option<tokio_mpsc::Sender<AppendRunEventRequest>>,
         command_rx: &mpsc::Receiver<SessionSupervisorCommand>,
         deferred_commands: &mut VecDeque<SessionSupervisorCommand>,
-    ) -> anyhow::Result<AppServerRunResult> {
+    ) -> anyhow::Result<EngineRunResult> {
         match self {
-            #[cfg(test)]
-            Self::Codex(process) => {
-                process.execute_controlled(claim, event_tx, command_rx, deferred_commands)
-            }
             Self::Pi(process) => {
                 process.execute_controlled(claim, event_tx, command_rx, deferred_commands)
             }
@@ -3777,20 +2571,12 @@ impl PersistentSessionProcess {
 
     fn ensure_running(&mut self) -> anyhow::Result<()> {
         match self {
-            #[cfg(test)]
-            Self::Codex(process) => process.ensure_running(),
             Self::Pi(process) => process.ensure_running(),
         }
     }
 }
 
 enum SessionProcessLaunch {
-    #[cfg(test)]
-    Codex {
-        binary: String,
-        run_env: RunEnv,
-        timeout: Duration,
-    },
     Pi {
         binary: String,
         run_env: RunEnv,
@@ -3803,24 +2589,15 @@ enum SessionProcessLaunch {
 impl SessionProcessLaunch {
     fn timeout(&self) -> Duration {
         match self {
-            #[cfg(test)]
-            Self::Codex { timeout, .. } => *timeout,
             Self::Pi { timeout, .. } => *timeout,
         }
     }
 
     fn start(
         self,
-        cancellation: Arc<AppServerCancellation>,
+        cancellation: Arc<EngineCancellation>,
     ) -> anyhow::Result<PersistentSessionProcess> {
         match self {
-            #[cfg(test)]
-            Self::Codex {
-                binary,
-                run_env,
-                timeout,
-            } => PersistentAppServerProcess::start(&binary, &run_env, timeout, cancellation)
-                .map(PersistentSessionProcess::Codex),
             Self::Pi {
                 binary,
                 run_env,
@@ -3841,49 +2618,6 @@ impl SessionProcessLaunch {
 }
 
 impl SessionSupervisor {
-    #[cfg(test)]
-    async fn start_app_server(
-        session_id: Uuid,
-        ownership_generation: i64,
-        codex_bin: String,
-        run_env: RunEnv,
-        timeout: Duration,
-    ) -> anyhow::Result<Arc<Self>> {
-        anyhow::ensure!(
-            ownership_generation > 0,
-            "ownership generation must be positive"
-        );
-        tokio::task::spawn_blocking(move || {
-            Self::start_app_server_blocking(
-                session_id,
-                ownership_generation,
-                codex_bin,
-                run_env,
-                timeout,
-            )
-        })
-        .await?
-    }
-
-    #[cfg(test)]
-    fn start_app_server_blocking(
-        session_id: Uuid,
-        ownership_generation: i64,
-        codex_bin: String,
-        run_env: RunEnv,
-        timeout: Duration,
-    ) -> anyhow::Result<Arc<Self>> {
-        Self::start_process_blocking(
-            session_id,
-            ownership_generation,
-            SessionProcessLaunch::Codex {
-                binary: codex_bin,
-                run_env,
-                timeout,
-            },
-        )
-    }
-
     async fn start_pi(
         session_id: Uuid,
         ownership_generation: i64,
@@ -3921,7 +2655,7 @@ impl SessionSupervisor {
         let startup_timeout = launch.timeout();
         let (command_tx, command_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        let cancellation = Arc::new(AppServerCancellation::default());
+        let cancellation = Arc::new(EngineCancellation::default());
         let actor_cancellation = Arc::clone(&cancellation);
         let terminal_error = Arc::new(std::sync::Mutex::new(None));
         let actor_terminal_error = Arc::clone(&terminal_error);
@@ -4010,7 +2744,7 @@ impl SessionSupervisor {
         &self,
         claim: ClaimRunResponse,
         event_tx: Option<tokio_mpsc::Sender<AppendRunEventRequest>>,
-    ) -> anyhow::Result<AppServerRunResult> {
+    ) -> anyhow::Result<EngineRunResult> {
         anyhow::ensure!(
             claim.run.hub_session_id == Some(self.session_id),
             "Run belongs to a different Hub Session"
@@ -4040,7 +2774,7 @@ impl SessionSupervisor {
         &self,
         ownership_generation: i64,
         expected_turn_id: String,
-        client_user_message_id: Uuid,
+        _client_user_message_id: Uuid,
         input: Vec<String>,
     ) -> anyhow::Result<SessionSteerOutcome> {
         anyhow::ensure!(
@@ -4063,7 +2797,6 @@ impl SessionSupervisor {
         self.command_tx
             .send(SessionSupervisorCommand::Steer {
                 expected_turn_id,
-                client_user_message_id,
                 input,
                 response,
             })
@@ -4183,14 +2916,12 @@ struct InterruptedRestoringRun {
 enum RuntimeCheckpointReason {
     Idle,
     Drain,
-    VersionSwitch,
 }
 
 fn checkpoint_reason_priority(reason: RuntimeCheckpointReason) -> u8 {
     match reason {
         RuntimeCheckpointReason::Idle => 0,
-        RuntimeCheckpointReason::VersionSwitch => 1,
-        RuntimeCheckpointReason::Drain => 2,
+        RuntimeCheckpointReason::Drain => 1,
     }
 }
 
@@ -4198,7 +2929,6 @@ impl RuntimeCheckpointReason {
     fn as_str(self) -> &'static str {
         match self {
             Self::Idle => "idle",
-            Self::VersionSwitch => "version_switch",
             Self::Drain => "drain",
         }
     }
@@ -4275,7 +3005,7 @@ impl RuntimeCheckpointTransport for UnavailableRuntimeCheckpointTransport {
 struct HubRuntimeCheckpointTransport {
     client: HubClient,
     work_root: PathBuf,
-    producing_codex_version: String,
+    producing_engine_version: String,
 }
 
 impl RuntimeCheckpointTransport for HubRuntimeCheckpointTransport {
@@ -4308,7 +3038,6 @@ impl RuntimeCheckpointTransport for HubRuntimeCheckpointTransport {
         };
         let effective_reason = match attempt.reason.as_str() {
             "idle" => RuntimeCheckpointReason::Idle,
-            "version_switch" => RuntimeCheckpointReason::VersionSwitch,
             "drain" => RuntimeCheckpointReason::Drain,
             other => {
                 return RuntimeCheckpointTransportOutcome {
@@ -4327,7 +3056,7 @@ impl RuntimeCheckpointTransport for HubRuntimeCheckpointTransport {
         let checkpoint_attempt_id = attempt.checkpoint_attempt_id;
         let bundle_generation = attempt.bundle_generation;
         let history_checkpoint = attempt.history_checkpoint;
-        let fallback_producing_codex_version = self.producing_codex_version.clone();
+        let fallback_producing_engine_version = self.producing_engine_version.clone();
         let artifact_result = tokio::task::spawn_blocking(move || {
             let metadata: SessionSupervisorMetadata = serde_json::from_slice(
                 &stdfs::read(paths.supervisor.join(SESSION_SUPERVISOR_METADATA_FILE))
@@ -4338,28 +3067,28 @@ impl RuntimeCheckpointTransport for HubRuntimeCheckpointTransport {
                 metadata.ownership_generation == ownership_generation,
                 "local Session checkpoint generation is stale"
             );
-            let producing_codex_version = if metadata.codex_version.trim().is_empty() {
-                fallback_producing_codex_version
+            let producing_engine_version = if metadata.engine_version.trim().is_empty() {
+                fallback_producing_engine_version
             } else {
-                metadata.codex_version.clone()
+                metadata.engine_version.clone()
             };
-            let native_thread_id = metadata
-                .native_thread_id
-                .context("Session checkpoint has no native Thread id")?;
+            let native_session_id = metadata
+                .native_session_id
+                .context("Session checkpoint has no Native Session id")?;
             let archive_path = paths.staging.join(format!(
                 "bundle-{}-{}.tar.zst",
                 bundle_generation, checkpoint_attempt_id
             ));
             session_bundle::create_session_bundle(&session_bundle::SessionBundleCreateSpec {
                 session_id,
-                native_thread_id,
+                native_session_id,
                 history_checkpoint,
                 bundle_generation,
                 ownership_generation,
-                producing_codex_version,
+                producing_engine_version,
                 created_at: chrono::Utc::now(),
                 workspace: paths.workspace,
-                codex_home: paths.codex,
+                engine_state_root: paths.engine_state,
                 archive_path,
             })
         })
@@ -4661,54 +3390,6 @@ impl SessionSupervisorManager {
                     entry.insert((ownership_generation, reason));
                 }
             }
-        }
-        Ok(())
-    }
-
-    fn request_version_switch_checkpoints(
-        &self,
-        active_version: &str,
-        old_version: &str,
-    ) -> anyhow::Result<()> {
-        let sessions = {
-            let mut records = self.records.lock().unwrap();
-            let mut sessions = Vec::new();
-            for record in records.values_mut() {
-                let (session_id, ownership_generation, should_checkpoint) = match &mut record.status
-                {
-                    ManagedSessionStatus::Cold { metadata }
-                    | ManagedSessionStatus::Ready { metadata, .. } => {
-                        if metadata.codex_version.trim().is_empty() {
-                            let mut backfilled = metadata.clone();
-                            backfilled.codex_version = old_version.to_owned();
-                            persist_session_supervisor_metadata_sync(&self.work_root, &backfilled)?;
-                            *metadata = backfilled;
-                        }
-                        (
-                            metadata.session_id,
-                            metadata.ownership_generation,
-                            metadata.codex_version != active_version,
-                        )
-                    }
-                    ManagedSessionStatus::Starting => (
-                        record.snapshot.session_id,
-                        record.snapshot.ownership_generation,
-                        true,
-                    ),
-                    ManagedSessionStatus::Blocked { .. } => continue,
-                };
-                if should_checkpoint {
-                    sessions.push((session_id, ownership_generation));
-                }
-            }
-            sessions
-        };
-        for (session_id, ownership_generation) in sessions {
-            self.request_checkpoint(
-                session_id,
-                ownership_generation,
-                RuntimeCheckpointReason::VersionSwitch,
-            )?;
         }
         Ok(())
     }
@@ -5318,7 +3999,7 @@ impl SessionSupervisorManager {
         let paths = SessionPaths::for_session(&self.work_root, snapshot.session_id);
         for path in [
             &paths.workspace,
-            &paths.codex,
+            &paths.engine_state,
             &paths.supervisor,
             &paths.staging,
         ] {
@@ -5355,10 +4036,10 @@ impl SessionSupervisorManager {
             ownership_generation > 0,
             "ownership generation must be positive"
         );
-        let native_thread_id = claim
+        let native_session_id = claim
             .session_context
             .as_ref()
-            .and_then(|context| context.session.native_thread_id.clone());
+            .and_then(|context| context.session.native_session_id.clone());
         let metadata = SessionSupervisorMetadata {
             format_version: 1,
             session_id,
@@ -5369,8 +4050,8 @@ impl SessionSupervisorManager {
             checkpoint_reason: None,
             checkpoint_retry_unix_ms: None,
             hub_checkpoint_attempt_id: None,
-            codex_version: String::new(),
-            native_thread_id: native_thread_id.clone(),
+            engine_version: String::new(),
+            native_session_id: native_session_id.clone(),
         };
         let mut records = self.records.lock().unwrap();
         if let Some(record) = records.get_mut(&session_id) {
@@ -5435,7 +4116,7 @@ impl SessionSupervisorManager {
                     session_id,
                     ownership_generation,
                     lifecycle_status: "restoring".into(),
-                    native_thread_id,
+                    native_session_id,
                     active_run_id: Some(claim.run.id),
                 },
                 status: ManagedSessionStatus::Cold { metadata },
@@ -5445,29 +4126,6 @@ impl SessionSupervisorManager {
         );
         self.idle_deadlines.lock().unwrap().remove(&session_id);
         Ok(())
-    }
-
-    #[cfg(test)]
-    async fn ensure_app_server(
-        &self,
-        metadata: SessionSupervisorMetadata,
-        codex_bin: String,
-        run_env: RunEnv,
-        timeout: Duration,
-        model_proxy: Option<Arc<LocalModelProxy>>,
-    ) -> anyhow::Result<Arc<SessionSupervisor>> {
-        let session_id = metadata.session_id;
-        let ownership_generation = metadata.ownership_generation;
-        self.ensure_session_supervisor(metadata, model_proxy, move || {
-            SessionSupervisor::start_app_server(
-                session_id,
-                ownership_generation,
-                codex_bin,
-                run_env,
-                timeout,
-            )
-        })
-        .await
     }
 
     async fn ensure_pi(
@@ -5481,11 +4139,13 @@ impl SessionSupervisorManager {
     ) -> anyhow::Result<Arc<SessionSupervisor>> {
         let session_id = metadata.session_id;
         let ownership_generation = metadata.ownership_generation;
-        let native_session_id = metadata.native_thread_id.clone();
+        let native_session_id = metadata.native_session_id.clone();
         self.ensure_session_supervisor(metadata, model_proxy, move || async move {
             let saved_session = native_session_id
                 .as_deref()
-                .map(|session_id| pi_driver::discover_session_file(&run_env.codex_home, session_id))
+                .map(|session_id| {
+                    pi_driver::discover_session_file(&run_env.engine_state_root, session_id)
+                })
                 .transpose()?;
             SessionSupervisor::start_pi(
                 session_id,
@@ -5527,7 +4187,7 @@ impl SessionSupervisorManager {
             session_id: metadata.session_id,
             ownership_generation: metadata.ownership_generation,
             lifecycle_status: metadata.lifecycle_status.clone(),
-            native_thread_id: metadata.native_thread_id.clone(),
+            native_session_id: metadata.native_session_id.clone(),
             active_run_id: None,
         };
         {
@@ -5720,7 +4380,7 @@ impl SessionSupervisorManager {
                     let ownership_generation = metadata.ownership_generation;
                     for path in [
                         &record.paths.workspace,
-                        &record.paths.codex,
+                        &record.paths.engine_state,
                         &record.paths.supervisor,
                         &record.paths.staging,
                     ] {
@@ -5760,7 +4420,7 @@ impl SessionSupervisorManager {
         &self,
         claim: ClaimRunResponse,
         event_tx: Option<tokio_mpsc::Sender<AppendRunEventRequest>>,
-    ) -> anyhow::Result<AppServerRunResult> {
+    ) -> anyhow::Result<EngineRunResult> {
         let session_id = claim
             .run
             .hub_session_id
@@ -5912,27 +4572,27 @@ impl SessionSupervisorManager {
         }
     }
 
-    async fn update_native_thread_id(
+    async fn update_native_session_id(
         &self,
         session_id: Uuid,
         ownership_generation: i64,
-        native_thread_id: Option<&str>,
+        native_session_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        let Some(native_thread_id) = native_thread_id else {
+        let Some(native_session_id) = native_session_id else {
             return Ok(());
         };
         let metadata = {
             let records = self.records.lock().unwrap();
             let record = records
                 .get(&session_id)
-                .context("Session disappeared before native thread persistence")?;
+                .context("Session disappeared before Native Session persistence")?;
             anyhow::ensure!(
                 record.snapshot.ownership_generation == ownership_generation,
-                "Session ownership changed before native thread persistence"
+                "Session ownership changed before Native Session persistence"
             );
             let mut metadata = match &record.status {
                 ManagedSessionStatus::Ready { metadata, .. }
-                    if metadata.native_thread_id.as_deref() == Some(native_thread_id) =>
+                    if metadata.native_session_id.as_deref() == Some(native_session_id) =>
                 {
                     return Ok(())
                 }
@@ -5947,26 +4607,26 @@ impl SessionSupervisorManager {
                     anyhow::bail!("Session supervisor is blocked: {reason}")
                 }
             };
-            metadata.native_thread_id = Some(native_thread_id.to_owned());
+            metadata.native_session_id = Some(native_session_id.to_owned());
             metadata
         };
         persist_session_supervisor_metadata(&self.work_root, &metadata).await?;
         let mut records = self.records.lock().unwrap();
         let record = records
             .get_mut(&session_id)
-            .context("Session disappeared after native thread persistence")?;
+            .context("Session disappeared after Native Session persistence")?;
         anyhow::ensure!(
             record.snapshot.ownership_generation == ownership_generation,
-            "Session ownership changed after native thread persistence"
+            "Session ownership changed after Native Session persistence"
         );
         let ManagedSessionStatus::Ready {
             metadata: current, ..
         } = &mut record.status
         else {
-            anyhow::bail!("Session stopped while native thread metadata was persisted");
+            anyhow::bail!("Session stopped while Native Session metadata was persisted");
         };
         *current = metadata.clone();
-        record.snapshot.native_thread_id = metadata.native_thread_id;
+        record.snapshot.native_session_id = metadata.native_session_id;
         Ok(())
     }
 
@@ -5974,7 +4634,7 @@ impl SessionSupervisorManager {
         &self,
         session_id: Uuid,
         ownership_generation: i64,
-        native_thread_id: &str,
+        native_session_id: &str,
         expected_turn_id: String,
         message_id: Uuid,
         content: String,
@@ -5995,8 +4655,8 @@ impl SessionSupervisorManager {
                     busy,
                 } => {
                     anyhow::ensure!(
-                        metadata.native_thread_id.as_deref() == Some(native_thread_id),
-                        "Steering Message native Thread does not match Session metadata"
+                        metadata.native_session_id.as_deref() == Some(native_session_id),
+                        "Steering Message Native Session does not match Session metadata"
                     );
                     if !*busy {
                         return Ok(SessionSteerOutcome::TurnEnded);
@@ -6083,18 +4743,6 @@ impl SessionSupervisorManager {
             }
         }
         let paths = SessionPaths::for_session(&self.work_root, session_id);
-        // Codex app-server remains test-only compatibility coverage. Release
-        // Pi runtimes never materialize its config because it may contain MCP
-        // credentials that Pi must not receive.
-        #[cfg(test)]
-        synchronize_execution_configuration(
-            &paths,
-            configuration,
-            configuration_fingerprint,
-            ModelConfigurationMaterialization::PreserveExisting,
-            local_skills_dir,
-        )
-        .await?;
         synchronize_pi_execution_configuration(
             &paths,
             configuration,
@@ -6109,7 +4757,7 @@ impl SessionSupervisorManager {
         &self,
         session_id: Uuid,
         ownership_generation: i64,
-        native_thread_id: &str,
+        native_session_id: &str,
         expected_turn_id: String,
     ) -> anyhow::Result<SessionInterruptOutcome> {
         let supervisor = {
@@ -6128,8 +4776,8 @@ impl SessionSupervisorManager {
                     busy,
                 } => {
                     anyhow::ensure!(
-                        metadata.native_thread_id.as_deref() == Some(native_thread_id),
-                        "Interrupt native Thread does not match Session metadata"
+                        metadata.native_session_id.as_deref() == Some(native_session_id),
+                        "Interrupt Native Session does not match Session metadata"
                     );
                     if !*busy {
                         return Ok(SessionInterruptOutcome::TurnEnded);
@@ -6247,7 +4895,6 @@ impl SessionSupervisorManager {
             accepts_session_commands: true,
             owned_sessions,
             cleaned_sessions,
-            codex_status: None,
         }
     }
 
@@ -6287,16 +4934,16 @@ impl SessionSupervisorManager {
                     unknown.push(snapshot.clone());
                     continue;
                 };
-                let native_thread_mismatch = match (&snapshot.native_thread_id, &record.status) {
+                let native_session_mismatch = match (&snapshot.native_session_id, &record.status) {
                     (
-                        Some(hub_thread_id),
+                        Some(hub_native_session_id),
                         ManagedSessionStatus::Cold { metadata }
                         | ManagedSessionStatus::Ready { metadata, .. },
-                    ) => metadata.native_thread_id.as_ref() != Some(hub_thread_id),
+                    ) => metadata.native_session_id.as_ref() != Some(hub_native_session_id),
                     _ => false,
                 };
                 if record.snapshot.ownership_generation != snapshot.ownership_generation
-                    || native_thread_mismatch
+                    || native_session_mismatch
                 {
                     if let ManagedSessionStatus::Ready { supervisor, .. } = &record.status {
                         supervisors_to_stop.push(Arc::clone(supervisor));
@@ -6306,8 +4953,8 @@ impl SessionSupervisorManager {
                     }
                     record.reserved_run_id = None;
                     record.status = ManagedSessionStatus::Blocked {
-                        reason: if native_thread_mismatch {
-                            "Hub native thread does not match local Session metadata".into()
+                        reason: if native_session_mismatch {
+                            "Hub Native Session does not match local Session metadata".into()
                         } else {
                             "Hub ownership generation changed during Runtime reconciliation".into()
                         },
@@ -6643,690 +5290,6 @@ impl Drop for SessionSupervisorManager {
     }
 }
 
-fn send_app_server_value(
-    stdin: &mut std::process::ChildStdin,
-    value: &serde_json::Value,
-) -> anyhow::Result<()> {
-    serde_json::to_writer(&mut *stdin, value).context("serialize Codex app-server request")?;
-    stdin.write_all(b"\n")?;
-    stdin.flush()?;
-    Ok(())
-}
-
-fn recv_app_server_line_once(
-    line_rx: &mpsc::Receiver<anyhow::Result<String>>,
-    child: &mut std::process::Child,
-    started_at: Instant,
-    timeout: Duration,
-    wait: Duration,
-    cancellation: &AppServerCancellation,
-) -> anyhow::Result<Option<String>> {
-    if cancellation.is_cancelled() {
-        terminate_child_process_tree(child);
-        anyhow::bail!("Codex app-server cancelled");
-    }
-    match line_rx.recv_timeout(wait) {
-        Ok(line) => return line.map(Some),
-        Err(mpsc::RecvTimeoutError::Timeout) => {}
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            anyhow::bail!("Codex app-server stdout closed before turn completed");
-        }
-    }
-    if let Some(status) = child.try_wait().context("poll Codex app-server")? {
-        anyhow::bail!("Codex app-server exited early with status {status}");
-    }
-    if started_at.elapsed() > timeout {
-        terminate_child_process_tree(child);
-        anyhow::bail!("Codex app-server timed out after {:?}", timeout);
-    }
-    Ok(None)
-}
-
-fn terminate_child_process_tree(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        kill_process_group(child.id() as i32);
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = child.kill();
-    }
-    let _ = child.wait();
-}
-
-#[cfg(unix)]
-fn kill_process_group(process_group_id: i32) {
-    unsafe {
-        libc::kill(-process_group_id, libc::SIGKILL);
-    }
-}
-
-#[derive(Clone, Copy)]
-enum AppServerResponseKind {
-    Initialize,
-    Acknowledgement,
-    Thread,
-    TurnStart,
-}
-
-struct AppServerState {
-    run_id: Uuid,
-    events: Vec<AppendRunEventRequest>,
-    final_status: String,
-    session_id: Option<String>,
-    thread_id: Option<String>,
-    native_turn_id: Option<String>,
-    turn_start_response_received: bool,
-    turn_started_emitted: bool,
-    pending_responses: BTreeMap<u64, AppServerResponseKind>,
-    initialized: bool,
-    assistant_text: String,
-    assistant_emitted: bool,
-    tool_request_ids: HashSet<String>,
-    tool_request_source_ids: HashSet<String>,
-    streamed_events: usize,
-    done: bool,
-}
-
-impl AppServerState {
-    fn new(run_id: Uuid) -> Self {
-        Self {
-            run_id,
-            events: Vec::new(),
-            final_status: "completed".into(),
-            session_id: None,
-            thread_id: None,
-            native_turn_id: None,
-            turn_start_response_received: false,
-            turn_started_emitted: false,
-            pending_responses: BTreeMap::new(),
-            initialized: false,
-            assistant_text: String::new(),
-            assistant_emitted: false,
-            tool_request_ids: HashSet::new(),
-            tool_request_source_ids: HashSet::new(),
-            streamed_events: 0,
-            done: false,
-        }
-    }
-
-    fn handle_value(&mut self, value: &serde_json::Value) -> anyhow::Result<()> {
-        if value.get("id").is_some() {
-            self.handle_response(value)?;
-        } else if let Some(method) = value.get("method").and_then(|value| value.as_str()) {
-            self.handle_notification(
-                method,
-                value.get("params").unwrap_or(&serde_json::Value::Null),
-            )?;
-        }
-        Ok(())
-    }
-
-    fn expect_response(&mut self, request_id: u64, kind: AppServerResponseKind) {
-        self.pending_responses.insert(request_id, kind);
-    }
-
-    fn handle_response(&mut self, value: &serde_json::Value) -> anyhow::Result<()> {
-        let Some(request_id) = value.get("id").and_then(serde_json::Value::as_u64) else {
-            return Ok(());
-        };
-        let Some(kind) = self.pending_responses.remove(&request_id) else {
-            return Ok(());
-        };
-        if value.get("error").is_some() {
-            anyhow::bail!("Codex app-server returned a JSON-RPC error");
-        }
-        let result = value
-            .get("result")
-            .context("Codex app-server response is missing result")?;
-        match kind {
-            AppServerResponseKind::Initialize => self.initialized = true,
-            AppServerResponseKind::Acknowledgement => {}
-            AppServerResponseKind::Thread => {
-                self.capture_thread(result.get("thread").unwrap_or(result));
-            }
-            AppServerResponseKind::TurnStart => {
-                self.capture_native_turn(result.get("turn").unwrap_or(result));
-                self.turn_start_response_received = true;
-                self.push_turn_started_event();
-            }
-        }
-        Ok(())
-    }
-
-    fn handle_notification(
-        &mut self,
-        method: &str,
-        params: &serde_json::Value,
-    ) -> anyhow::Result<()> {
-        if method != "thread/started" && !self.notification_matches_active_turn(method, params) {
-            return Ok(());
-        }
-        match method {
-            "thread/started" => self.capture_thread(params.get("thread").unwrap_or(params)),
-            "turn/started" => {
-                self.capture_native_turn(params.get("turn").unwrap_or(params));
-                self.push_turn_started_event();
-            }
-            "item/agentMessage/delta" => {
-                if let Some(delta) = params
-                    .get("delta")
-                    .or_else(|| params.get("text"))
-                    .and_then(|value| value.as_str())
-                {
-                    self.assistant_text.push_str(delta);
-                    self.events.push(AppendRunEventRequest {
-                        event_type: "message_delta".into(),
-                        role: Some("assistant".into()),
-                        content: Some(delta.to_owned()),
-                        payload: json!({ "stream": true }),
-                        waiting_tool: None,
-                    });
-                }
-            }
-            "item/agentMessage" | "item/agentMessage/completed" => {
-                if let Some(content) = agent_message_content(params) {
-                    self.push_assistant_message(content, params.clone());
-                }
-            }
-            "item/started" => {
-                let item = params.get("item").unwrap_or(params);
-                if let Some(event) = app_server_activity_event_from_item(item, "started") {
-                    self.push_item_event(event);
-                }
-            }
-            "item/completed" => {
-                let item = params.get("item").unwrap_or(params);
-                if let Some(event) = app_server_event_from_item(self.run_id, item, params.clone()) {
-                    self.push_item_event(event);
-                }
-            }
-            "item/commandExecution/outputDelta" => {
-                if let Some(event) = app_server_activity_delta_event(
-                    params,
-                    "commandExecution",
-                    "output_delta",
-                    "output",
-                ) {
-                    self.push_item_event(event);
-                }
-            }
-            "item/reasoning/summaryTextDelta" => {
-                if let Some(event) =
-                    app_server_activity_delta_event(params, "reasoning", "summary_delta", "summary")
-                {
-                    self.push_item_event(event);
-                }
-            }
-            "item/tool/call" | "item/toolCall" => {
-                if let Some(event) = app_server_event_from_item(self.run_id, params, params.clone())
-                {
-                    self.push_item_event(event);
-                }
-            }
-            "thread/tokenUsage/updated" => self.events.push(AppendRunEventRequest {
-                event_type: "usage".into(),
-                role: None,
-                content: None,
-                payload: params.clone(),
-                waiting_tool: None,
-            }),
-            "turn/completed" => {
-                self.handle_turn_completed(params)?;
-                self.done = true;
-            }
-            "error" => {
-                self.final_status = "failed".into();
-                self.events.push(AppendRunEventRequest {
-                    event_type: "status".into(),
-                    role: None,
-                    content: Some("failed".into()),
-                    payload: json!({ "kind": "app_server_error" }),
-                    waiting_tool: None,
-                });
-                self.done = true;
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn notification_matches_active_turn(&self, method: &str, params: &serde_json::Value) -> bool {
-        if let Some(thread_id) = params
-            .get("threadId")
-            .or_else(|| params.get("thread").and_then(|thread| thread.get("id")))
-            .and_then(serde_json::Value::as_str)
-        {
-            if self.thread_id.as_deref() != Some(thread_id) {
-                return false;
-            }
-        }
-        let turn_id = params
-            .get("turnId")
-            .or_else(|| params.get("turn").and_then(|turn| turn.get("id")))
-            .and_then(serde_json::Value::as_str);
-        let Some(turn_id) = turn_id else {
-            return true;
-        };
-        if method == "turn/started" && !self.turn_start_response_received {
-            return false;
-        }
-        self.native_turn_id.as_deref() == Some(turn_id)
-    }
-
-    fn capture_thread(&mut self, thread: &serde_json::Value) {
-        if self.thread_id.is_none() {
-            self.thread_id = thread
-                .get("id")
-                .or_else(|| thread.get("threadId"))
-                .and_then(|value| value.as_str())
-                .map(str::to_owned);
-        }
-        if let Some(session_id) = thread
-            .get("sessionId")
-            .or_else(|| thread.get("session_id"))
-            .and_then(|value| value.as_str())
-        {
-            self.session_id = Some(session_id.to_owned());
-        }
-    }
-
-    fn capture_native_turn(&mut self, turn: &serde_json::Value) {
-        if self.native_turn_id.is_none() {
-            self.native_turn_id = turn
-                .get("id")
-                .or_else(|| turn.get("turnId"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned);
-        }
-    }
-
-    fn push_turn_started_event(&mut self) {
-        if self.turn_started_emitted {
-            return;
-        }
-        let (Some(native_thread_id), Some(native_turn_id)) =
-            (self.thread_id.as_deref(), self.native_turn_id.as_deref())
-        else {
-            return;
-        };
-        self.events.push(AppendRunEventRequest {
-            event_type: "turn_started".into(),
-            role: None,
-            content: None,
-            payload: json!({
-                "native_thread_id": native_thread_id,
-                "native_turn_id": native_turn_id
-            }),
-            waiting_tool: None,
-        });
-        self.turn_started_emitted = true;
-    }
-
-    fn handle_turn_completed(&mut self, params: &serde_json::Value) -> anyhow::Result<()> {
-        let turn = params
-            .get("turn")
-            .context("missing Codex turn in turn/completed")?;
-        let status = turn
-            .get("status")
-            .and_then(|value| value.as_str())
-            .context("missing or invalid Codex turn status")?;
-        let turn_failed = match status {
-            "completed" => false,
-            "failed" | "interrupted" => true,
-            _ => anyhow::bail!("Codex app-server returned unsupported turn status"),
-        };
-        let mut event_payload = params.clone();
-        if turn_failed {
-            // 上游失败详情可能包含凭据，不得进入 Hub-facing event。
-            if let Some(turn) = event_payload
-                .get_mut("turn")
-                .and_then(|value| value.as_object_mut())
-            {
-                turn.remove("error");
-            }
-        }
-
-        if let Some(thread) = params.get("thread") {
-            self.capture_thread(thread);
-        }
-        if !self.assistant_emitted {
-            if let Some(content) = turn
-                .get("items")
-                .and_then(|items| items.as_array())
-                .and_then(|items| items.iter().find_map(agent_message_content))
-            {
-                self.push_assistant_message(content, event_payload.clone());
-            } else if !self.assistant_text.is_empty() {
-                self.push_assistant_message(self.assistant_text.clone(), event_payload.clone());
-            }
-        }
-        if let Some(items) = turn.get("items").and_then(|items| items.as_array()) {
-            for item in items {
-                if let Some(event) =
-                    app_server_event_from_item(self.run_id, item, event_payload.clone())
-                {
-                    if event.event_type == "tool_request" {
-                        self.push_item_event(event);
-                    }
-                }
-            }
-        }
-        self.final_status = if status == "interrupted" {
-            "interrupted".into()
-        } else if turn_failed {
-            "failed".into()
-        } else if !self.tool_request_ids.is_empty() {
-            "waiting_tool".into()
-        } else {
-            "completed".into()
-        };
-        Ok(())
-    }
-
-    fn push_assistant_message(&mut self, content: String, payload: serde_json::Value) {
-        self.events.push(AppendRunEventRequest {
-            event_type: "message".into(),
-            role: Some("assistant".into()),
-            content: Some(content),
-            payload,
-            waiting_tool: None,
-        });
-        self.assistant_emitted = true;
-    }
-
-    fn push_item_event(&mut self, event: AppendRunEventRequest) {
-        if event.event_type == "message" {
-            self.assistant_emitted = true;
-            self.events.push(event);
-            return;
-        }
-        if event.event_type == "tool_request" {
-            if let Some(source_id) = event
-                .payload
-                .get("source_id")
-                .and_then(|value| value.as_str())
-            {
-                if !self.tool_request_source_ids.insert(source_id.to_owned()) {
-                    return;
-                }
-            }
-            if let Some(tool_request_id) = event
-                .payload
-                .get("tool_request_id")
-                .and_then(|value| value.as_str())
-            {
-                if !self.tool_request_ids.insert(tool_request_id.to_owned()) {
-                    return;
-                }
-            }
-        }
-        self.events.push(event);
-    }
-
-    fn finish(mut self) -> AppServerRunResult {
-        self.session_id = self
-            .thread_id
-            .clone()
-            .or(self.session_id)
-            .or_else(|| Some(format!("app-server-session-{}", self.run_id)));
-        AppServerRunResult {
-            events: self.events,
-            final_status: self.final_status,
-            session_id: self.session_id,
-            native_turn_id: self.native_turn_id,
-        }
-    }
-
-    fn flush_events(
-        &mut self,
-        event_tx: &Option<tokio_mpsc::Sender<AppendRunEventRequest>>,
-        cancellation: &AppServerCancellation,
-    ) -> anyhow::Result<()> {
-        let Some(event_tx) = event_tx else {
-            return Ok(());
-        };
-        for event in self.events.drain(..) {
-            send_app_server_event_with_backpressure(event_tx, event, cancellation)?;
-            self.streamed_events += 1;
-        }
-        Ok(())
-    }
-}
-
-fn send_app_server_event_with_backpressure(
-    event_tx: &tokio_mpsc::Sender<AppendRunEventRequest>,
-    mut event: AppendRunEventRequest,
-    cancellation: &AppServerCancellation,
-) -> anyhow::Result<()> {
-    loop {
-        if cancellation.is_cancelled() {
-            anyhow::bail!("stream app-server event cancelled");
-        }
-        match event_tx.try_send(event) {
-            Ok(()) => return Ok(()),
-            Err(tokio_mpsc::error::TrySendError::Full(returned)) => {
-                event = returned;
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(tokio_mpsc::error::TrySendError::Closed(_)) => {
-                anyhow::bail!("stream app-server event receiver closed");
-            }
-        }
-    }
-}
-
-fn agent_message_content(item: &serde_json::Value) -> Option<String> {
-    let item_type = item
-        .get("type")
-        .or_else(|| item.get("item_type"))
-        .and_then(|value| value.as_str())?;
-    if item_type != "agentMessage" && item_type != "message" {
-        return None;
-    }
-    item.get("text")
-        .or_else(|| item.get("content"))
-        .and_then(|value| value.as_str())
-        .map(str::to_owned)
-}
-
-fn app_server_event_from_item(
-    run_id: Uuid,
-    item: &serde_json::Value,
-    payload: serde_json::Value,
-) -> Option<AppendRunEventRequest> {
-    if let Some(content) = agent_message_content(item) {
-        return Some(AppendRunEventRequest {
-            event_type: "message".into(),
-            role: Some("assistant".into()),
-            content: Some(content),
-            payload,
-            waiting_tool: None,
-        });
-    }
-    if let Some(event) = app_server_activity_event_from_item(item, "completed") {
-        return Some(event);
-    }
-    let item_type = item
-        .get("type")
-        .or_else(|| item.get("item_type"))
-        .and_then(|value| value.as_str())?;
-    if item_type != "toolRequest" && item_type != "functionCall" {
-        return None;
-    }
-    let tool_name = item
-        .get("toolName")
-        .or_else(|| item.get("name"))
-        .and_then(|value| value.as_str())
-        .unwrap_or("tool");
-    let source_id = item
-        .get("id")
-        .or_else(|| item.get("callId"))
-        .and_then(|value| value.as_str());
-    let arguments = item
-        .get("arguments")
-        .or_else(|| item.get("args"))
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    // 平台 source id 只用于去重；Hub 内部 id 必须始终绑定当前 run。
-    let tool_request_id =
-        stable_tool_request_uuid(run_id, tool_name, source_id, &arguments).to_string();
-    Some(AppendRunEventRequest {
-        event_type: "tool_request".into(),
-        role: Some("assistant".into()),
-        content: Some(format!("Codex requested {tool_name} tool")),
-        payload: json!({
-            "tool_request_id": tool_request_id,
-            "source_id": source_id,
-            "tool_name": tool_name,
-            "arguments": arguments
-        }),
-        waiting_tool: None,
-    })
-}
-
-fn app_server_activity_event_from_item(
-    item: &serde_json::Value,
-    phase: &str,
-) -> Option<AppendRunEventRequest> {
-    let item_type = item
-        .get("type")
-        .or_else(|| item.get("item_type"))
-        .and_then(|value| value.as_str())?;
-    let canonical_type = match item_type {
-        "plan" => "plan",
-        "reasoning" => "reasoning",
-        "commandExecution" | "command_execution" => "commandExecution",
-        "fileChange" | "file_change" => "fileChange",
-        "mcpToolCall" | "mcp_tool_call" => "mcpToolCall",
-        "dynamicToolCall" | "dynamic_tool_call" => "dynamicToolCall",
-        "collabAgentToolCall" | "collabToolCall" | "collab_tool_call" => "collabAgentToolCall",
-        "subAgentActivity" | "sub_agent_activity" => "subAgentActivity",
-        "webSearch" | "web_search" => "webSearch",
-        "imageView" | "image_view" => "imageView",
-        "imageGeneration" | "image_generation" => "imageGeneration",
-        "sleep" => "sleep",
-        "enteredReviewMode" | "entered_review_mode" => "enteredReviewMode",
-        "exitedReviewMode" | "exited_review_mode" => "exitedReviewMode",
-        "contextCompaction" | "context_compaction" => "contextCompaction",
-        _ => return None,
-    };
-
-    let mut activity = serde_json::Map::new();
-    activity.insert("item_type".into(), json!(canonical_type));
-    activity.insert("phase".into(), json!(phase));
-    copy_activity_field(&mut activity, item, "id", "item_id");
-    copy_activity_field(&mut activity, item, "status", "status");
-    copy_activity_field(&mut activity, item, "durationMs", "duration_ms");
-
-    match canonical_type {
-        "plan" => copy_activity_field(&mut activity, item, "text", "text"),
-        "reasoning" => {
-            let summary = match item.get("summary") {
-                Some(Value::String(summary)) => vec![json!(summary)],
-                Some(Value::Array(parts)) => parts
-                    .iter()
-                    .filter_map(|part| part.as_str().map(|part| json!(part)))
-                    .collect(),
-                _ => Vec::new(),
-            };
-            activity.insert("summary".into(), Value::Array(summary));
-        }
-        "commandExecution" => {
-            copy_activity_field(&mut activity, item, "command", "command");
-            copy_activity_field(&mut activity, item, "cwd", "cwd");
-            copy_activity_field(&mut activity, item, "aggregatedOutput", "output");
-            copy_activity_field(&mut activity, item, "exitCode", "exit_code");
-        }
-        "fileChange" => {
-            let changes = item
-                .get("changes")
-                .and_then(Value::as_array)
-                .map(|changes| {
-                    changes
-                        .iter()
-                        .filter_map(|change| {
-                            let path = change.get("path")?.as_str()?;
-                            Some(json!({
-                                "path": path,
-                                "kind": change.get("kind").cloned().unwrap_or(Value::Null)
-                            }))
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            activity.insert("changes".into(), Value::Array(changes));
-        }
-        "mcpToolCall" => {
-            copy_activity_field(&mut activity, item, "server", "server");
-            copy_activity_field(&mut activity, item, "tool", "tool");
-        }
-        "dynamicToolCall" => {
-            copy_activity_field(&mut activity, item, "namespace", "namespace");
-            copy_activity_field(&mut activity, item, "tool", "tool");
-            copy_activity_field(&mut activity, item, "success", "success");
-        }
-        "collabAgentToolCall" => {
-            copy_activity_field(&mut activity, item, "tool", "tool");
-            copy_activity_field(&mut activity, item, "model", "model");
-        }
-        "subAgentActivity" => {
-            copy_activity_field(&mut activity, item, "kind", "kind");
-            copy_activity_field(&mut activity, item, "agentPath", "agent_path");
-        }
-        "webSearch" => copy_activity_field(&mut activity, item, "query", "query"),
-        "imageView" => copy_activity_field(&mut activity, item, "path", "path"),
-        "imageGeneration" => {
-            copy_activity_field(&mut activity, item, "savedPath", "path");
-        }
-        "sleep" | "enteredReviewMode" | "exitedReviewMode" | "contextCompaction" => {}
-        _ => unreachable!(),
-    }
-
-    Some(AppendRunEventRequest {
-        event_type: "item".into(),
-        role: Some("assistant".into()),
-        content: None,
-        payload: Value::Object(activity),
-        waiting_tool: None,
-    })
-}
-
-fn app_server_activity_delta_event(
-    params: &serde_json::Value,
-    item_type: &str,
-    phase: &str,
-    field: &str,
-) -> Option<AppendRunEventRequest> {
-    let item_id = params.get("itemId")?.as_str()?;
-    let delta = params.get("delta")?.as_str()?;
-    Some(AppendRunEventRequest {
-        event_type: "item".into(),
-        role: Some("assistant".into()),
-        content: None,
-        payload: json!({
-            "item_id": item_id,
-            "item_type": item_type,
-            "phase": phase,
-            (field): delta
-        }),
-        waiting_tool: None,
-    })
-}
-
-fn copy_activity_field(
-    target: &mut serde_json::Map<String, Value>,
-    source: &serde_json::Value,
-    source_key: &str,
-    target_key: &str,
-) {
-    if let Some(value) = source.get(source_key) {
-        if !value.is_null() {
-            target.insert(target_key.into(), value.clone());
-        }
-    }
-}
-
 fn stable_tool_request_uuid(
     run_id: Uuid,
     tool_name: &str,
@@ -7345,51 +5308,17 @@ fn stable_tool_request_uuid(
     Uuid::from_slice(&digest[..16]).unwrap_or_else(|_| Uuid::new_v4())
 }
 
-fn codex_sandbox_name(agent: &AgentDto) -> &'static str {
-    match agent
-        .sandbox_policy
-        .get("mode")
-        .and_then(|value| value.as_str())
-        .unwrap_or("read-only")
-    {
-        "workspace-write" | "workspaceWrite" => "workspaceWrite",
-        "danger-full-access" | "dangerFullAccess" => "dangerFullAccess",
-        _ => "readOnly",
-    }
-}
-
-fn codex_thread_sandbox_name(agent: &AgentDto) -> &'static str {
-    // Thread settings use config-style names; Turn sandboxPolicy uses protocol camelCase.
-    match codex_sandbox_name(agent) {
-        "workspaceWrite" => "workspace-write",
-        "dangerFullAccess" => "danger-full-access",
-        _ => "read-only",
-    }
-}
-
-fn codex_sandbox_policy(agent: &AgentDto) -> serde_json::Value {
-    let network_access = agent
-        .sandbox_policy
-        .get("network_access")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-    json!({
-        "type": codex_sandbox_name(agent),
-        "networkAccess": network_access
-    })
-}
-
 #[derive(Clone)]
 struct RunEnv {
     workdir: PathBuf,
-    codex_home: PathBuf,
+    engine_state_root: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SessionPaths {
     root: PathBuf,
     workspace: PathBuf,
-    codex: PathBuf,
+    engine_state: PathBuf,
     supervisor: PathBuf,
     staging: PathBuf,
 }
@@ -7407,7 +5336,7 @@ impl SessionPaths {
         let root = root.join("sessions").join(session_id.to_string());
         Self {
             workspace: root.join("workspace"),
-            codex: root.join("codex"),
+            engine_state: root.join("engine-state"),
             supervisor: root.join("supervisor"),
             staging: root.join("staging"),
             root,
@@ -7431,8 +5360,8 @@ struct SessionSupervisorMetadata {
     #[serde(default)]
     hub_checkpoint_attempt_id: Option<Uuid>,
     #[serde(default)]
-    codex_version: String,
-    native_thread_id: Option<String>,
+    engine_version: String,
+    native_session_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -7481,11 +5410,6 @@ impl SessionRecoveryPlan {
     #[cfg(test)]
     fn record(&self, session_id: Uuid) -> Option<&LocalSessionRecoveryRecord> {
         self.records.get(&session_id)
-    }
-
-    #[cfg(test)]
-    fn available_new_session_slots(&self) -> usize {
-        self.max_online_sessions.saturating_sub(self.records.len())
     }
 }
 
@@ -7616,7 +5540,7 @@ fn persist_session_supervisor_metadata_sync(
 ) -> anyhow::Result<()> {
     let paths = SessionPaths::for_session(work_root, metadata.session_id);
     stdfs::create_dir_all(&paths.workspace)?;
-    stdfs::create_dir_all(&paths.codex)?;
+    stdfs::create_dir_all(&paths.engine_state)?;
     stdfs::create_dir_all(&paths.supervisor)?;
     stdfs::create_dir_all(&paths.staging)?;
     let destination = paths.supervisor.join(SESSION_SUPERVISOR_METADATA_FILE);
@@ -7715,9 +5639,12 @@ async fn plan_session_recovery(
                         }
                         _ => metadata.lifecycle_status == "online",
                     }
-                    && snapshot.native_thread_id.as_ref().is_none_or(|thread_id| {
-                        metadata.native_thread_id.as_ref() == Some(thread_id)
-                    }) =>
+                    && snapshot
+                        .native_session_id
+                        .as_ref()
+                        .is_none_or(|native_session_id| {
+                            metadata.native_session_id.as_ref() == Some(native_session_id)
+                        }) =>
             {
                 LocalSessionRecoveryStatus::Ready(metadata)
             }
@@ -7763,7 +5690,7 @@ async fn prepare_run_env_with_local_skills(
 ) -> anyhow::Result<RunEnv> {
     let paths = SessionPaths::for_claim(root, claim)?;
     fs::create_dir_all(&paths.workspace).await?;
-    fs::create_dir_all(&paths.codex).await?;
+    fs::create_dir_all(&paths.engine_state).await?;
     fs::create_dir_all(&paths.supervisor).await?;
     fs::create_dir_all(&paths.staging).await?;
     let runtime_fingerprint = execution_configuration_fingerprint(&claim.execution_configuration)
@@ -7772,17 +5699,6 @@ async fn prepare_run_env_with_local_skills(
         runtime_fingerprint == claim.expected_configuration_fingerprint,
         "Hub and Runtime execution configuration fingerprints differ"
     );
-    // Keep the legacy materializer available only for the converted Codex
-    // fixtures. The production Pi process uses the isolated Pi materializer.
-    #[cfg(test)]
-    synchronize_execution_configuration(
-        &paths,
-        &claim.execution_configuration,
-        &runtime_fingerprint,
-        ModelConfigurationMaterialization::RunBindings { model_base_url },
-        local_skills_dir,
-    )
-    .await?;
     synchronize_pi_execution_configuration(
         &paths,
         &claim.execution_configuration,
@@ -7793,33 +5709,14 @@ async fn prepare_run_env_with_local_skills(
     .await?;
     let run_env = RunEnv {
         workdir: paths.workspace,
-        codex_home: paths.codex,
+        engine_state_root: paths.engine_state,
     };
     pi_driver::materialize_integration_tools(&run_env, claim.integration_context.as_ref())?;
     Ok(run_env)
 }
 
-const MATERIALIZATION_MARKER_FILE: &str = ".agent-hub-materialization.json";
 const PI_MATERIALIZATION_MARKER_FILE: &str = ".agent-hub-materialization.json";
 const PI_AGENT_DIRECTORY: &str = ".pi/agent";
-
-#[cfg(test)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct ExecutionMaterializationMarker {
-    format_version: u32,
-    configuration_fingerprint: String,
-    materialization_sha256: String,
-    owned_skill_directories: Vec<String>,
-    #[serde(default)]
-    owned_agent_files: Vec<String>,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy)]
-enum ModelConfigurationMaterialization<'a> {
-    RunBindings { model_base_url: Option<&'a str> },
-    PreserveExisting,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct PiExecutionMaterializationMarker {
@@ -7839,108 +5736,6 @@ fn pi_agent_directory(pi_home: &Path) -> PathBuf {
     pi_home.join(PI_AGENT_DIRECTORY)
 }
 
-#[cfg(test)]
-async fn synchronize_execution_configuration(
-    paths: &SessionPaths,
-    configuration: &AgentExecutionConfigurationDto,
-    configuration_fingerprint: &str,
-    model_configuration: ModelConfigurationMaterialization<'_>,
-    local_skills_dir: Option<&Path>,
-) -> anyhow::Result<()> {
-    let stage = paths
-        .staging
-        .join(format!("execution-config-{}", Uuid::new_v4()));
-    let result: anyhow::Result<()> = async {
-        fs::create_dir_all(stage.join("skills")).await?;
-        fs::create_dir_all(stage.join("agents")).await?;
-        let instructions = format!("{}\n", configuration.instructions.trim_end());
-        fs::write(stage.join("AGENTS.md"), instructions.as_bytes())
-            .await
-            .context("stage Agent guidance")?;
-        let existing_marker = match model_configuration {
-            ModelConfigurationMaterialization::RunBindings { model_base_url } => {
-                let config_toml = render_codex_config(configuration, model_base_url)?;
-                write_private_file(&stage.join("config.toml"), config_toml.as_bytes())
-                    .context("stage per-Session Codex config")?;
-                None
-            }
-            ModelConfigurationMaterialization::PreserveExisting => {
-                let marker = validated_execution_materialization(&paths.codex)?;
-                let config_toml = render_codex_config_preserving_model_configuration(
-                    &paths.codex.join("config.toml"),
-                    &configuration.mcp_allowlist,
-                )?;
-                write_private_file(&stage.join("config.toml"), config_toml.as_bytes())
-                    .context("preserve per-Session Codex model configuration")?;
-                Some(marker)
-            }
-        };
-        fs::write(
-            stage.join("skills-manifest.json"),
-            serde_json::to_vec_pretty(&configuration.skills)?,
-        )
-        .await
-        .context("stage Skills manifest")?;
-        fs::write(
-            stage.join("mcp-allowlist.json"),
-            serde_json::to_vec_pretty(&redact_mcp_secrets(&configuration.mcp_allowlist))?,
-        )
-        .await
-        .context("stage redacted MCP allowlist")?;
-        if let Some(local_skills_dir) = local_skills_dir {
-            materialize_local_skills(&stage, local_skills_dir).await?;
-        }
-        let skills = serde_json::to_value(&configuration.skills)?;
-        // Hub Skills are applied last so an inline/managed Skill overrides runtime-local content.
-        materialize_skills(&stage, &skills).await?;
-        let owned_agent_files = materialize_codex_agents(&stage, configuration).await?;
-        if let Some(existing_marker) = &existing_marker {
-            preserve_codex_agent_model_configuration(
-                &paths.codex,
-                &stage,
-                &existing_marker.owned_agent_files,
-                &owned_agent_files,
-            )?;
-        }
-        let owned_skill_directories = skill_directory_entries(&stage.join("skills")).await?;
-        let materialization_sha256 =
-            execution_materialization_sha256(&stage, &owned_skill_directories, &owned_agent_files)?;
-        let marker = ExecutionMaterializationMarker {
-            format_version: 2,
-            configuration_fingerprint: configuration_fingerprint.to_owned(),
-            materialization_sha256,
-            owned_skill_directories,
-            owned_agent_files,
-        };
-        write_private_file(
-            &stage.join(MATERIALIZATION_MARKER_FILE),
-            &serde_json::to_vec_pretty(&marker)?,
-        )
-        .context("stage execution configuration marker")?;
-
-        if materialization_is_current(&paths.codex, &marker) {
-            return Ok(());
-        }
-        commit_execution_materialization(&paths.codex, &stage, &marker).await?;
-        Ok(())
-    }
-    .await;
-    if let Err(cleanup_error) = fs::remove_dir_all(&stage).await {
-        if cleanup_error.kind() != std::io::ErrorKind::NotFound {
-            if result.is_ok() {
-                return Err(cleanup_error)
-                    .context("remove execution configuration staging directory");
-            }
-            warn!(
-                path = %stage.display(),
-                error = %cleanup_error,
-                "failed to clean execution configuration staging directory"
-            );
-        }
-    }
-    result
-}
-
 async fn synchronize_pi_execution_configuration(
     paths: &SessionPaths,
     configuration: &AgentExecutionConfigurationDto,
@@ -7948,9 +5743,7 @@ async fn synchronize_pi_execution_configuration(
     model_configuration: PiModelConfigurationMaterialization<'_>,
     local_skills_dir: Option<&Path>,
 ) -> anyhow::Result<()> {
-    #[cfg(not(test))]
-    remove_legacy_codex_execution_materialization(&paths.codex).await?;
-    let agent_dir = pi_agent_directory(&paths.codex);
+    let agent_dir = pi_agent_directory(&paths.engine_state);
     let stage = paths
         .staging
         .join(format!("pi-execution-config-{}", Uuid::new_v4()));
@@ -8029,24 +5822,6 @@ async fn synchronize_pi_execution_configuration(
         }
     }
     result
-}
-
-#[cfg(not(test))]
-async fn remove_legacy_codex_execution_materialization(codex_home: &Path) -> anyhow::Result<()> {
-    for filename in [
-        "AGENTS.md",
-        "config.toml",
-        "skills-manifest.json",
-        "mcp-allowlist.json",
-        MATERIALIZATION_MARKER_FILE,
-        "skills",
-        "agents",
-    ] {
-        remove_materialized_path(&codex_home.join(filename))
-            .await
-            .with_context(|| format!("remove legacy Codex materialization {filename}"))?;
-    }
-    Ok(())
 }
 
 fn render_pi_models_json(
@@ -8325,105 +6100,6 @@ async fn skill_directory_entries(root: &Path) -> anyhow::Result<Vec<String>> {
     Ok(names)
 }
 
-#[cfg(test)]
-fn execution_materialization_sha256(
-    root: &Path,
-    skill_dirs: &[String],
-    agent_files: &[String],
-) -> anyhow::Result<String> {
-    let mut paths = [
-        "AGENTS.md",
-        "config.toml",
-        "skills-manifest.json",
-        "mcp-allowlist.json",
-    ]
-    .into_iter()
-    .map(|path| root.join(path))
-    .collect::<Vec<_>>();
-    for directory in skill_dirs {
-        paths.extend(
-            WalkDir::new(root.join("skills").join(directory))
-                .follow_links(false)
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .map(|entry| entry.into_path()),
-        );
-    }
-    paths.extend(
-        agent_files
-            .iter()
-            .map(|filename| root.join("agents").join(filename)),
-    );
-    paths.sort();
-    let mut digest = Sha256::new();
-    for path in paths {
-        let relative = path.strip_prefix(root)?;
-        let metadata = stdfs::symlink_metadata(&path)?;
-        digest.update(relative.to_string_lossy().as_bytes());
-        digest.update([0]);
-        if metadata.is_dir() {
-            digest.update(b"directory");
-        } else if metadata.is_file() {
-            digest.update(stdfs::read(&path)?);
-        } else {
-            anyhow::bail!("materialized configuration contains an unsupported file type");
-        }
-        digest.update([0]);
-    }
-    Ok(digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
-}
-
-#[cfg(test)]
-fn materialization_is_current(codex_home: &Path, desired: &ExecutionMaterializationMarker) -> bool {
-    let marker_path = codex_home.join(MATERIALIZATION_MARKER_FILE);
-    let Ok(marker) = stdfs::read(&marker_path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<ExecutionMaterializationMarker>(&bytes).ok())
-        .ok_or(())
-    else {
-        return false;
-    };
-    if marker != *desired || !private_file_permissions_are_valid(&marker_path) {
-        return false;
-    }
-    if !private_file_permissions_are_valid(&codex_home.join("config.toml")) {
-        return false;
-    }
-    if desired.owned_agent_files.iter().any(|filename| {
-        !is_owned_agent_filename(filename)
-            || !private_file_permissions_are_valid(&codex_home.join("agents").join(filename))
-    }) {
-        return false;
-    }
-    execution_materialization_sha256(
-        codex_home,
-        &desired.owned_skill_directories,
-        &desired.owned_agent_files,
-    )
-    .is_ok_and(|digest| digest == desired.materialization_sha256)
-}
-
-#[cfg(test)]
-fn validated_execution_materialization(
-    codex_home: &Path,
-) -> anyhow::Result<ExecutionMaterializationMarker> {
-    let marker: ExecutionMaterializationMarker = serde_json::from_slice(
-        &stdfs::read(codex_home.join(MATERIALIZATION_MARKER_FILE))
-            .context("read current execution configuration marker")?,
-    )
-    .context("parse current execution configuration marker")?;
-    anyhow::ensure!(
-        marker.format_version == 2 && materialization_is_current(codex_home, &marker),
-        "current execution configuration materialization is invalid"
-    );
-    Ok(marker)
-}
-
 #[cfg(unix)]
 fn private_file_permissions_are_valid(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -8434,119 +6110,6 @@ fn private_file_permissions_are_valid(path: &Path) -> bool {
 #[cfg(not(unix))]
 fn private_file_permissions_are_valid(_path: &Path) -> bool {
     false
-}
-
-#[cfg(test)]
-async fn commit_execution_materialization(
-    codex_home: &Path,
-    stage: &Path,
-    marker: &ExecutionMaterializationMarker,
-) -> anyhow::Result<()> {
-    fs::create_dir_all(codex_home.join("skills")).await?;
-    fs::create_dir_all(codex_home.join("agents")).await?;
-    let previous_owned = previous_owned_skill_directories(codex_home);
-    let previous_owned_agents = previous_owned_agent_files(codex_home);
-    for directory in &marker.owned_skill_directories {
-        let target = codex_home.join("skills").join(directory);
-        remove_materialized_path(&target).await?;
-        fs::rename(stage.join("skills").join(directory), &target)
-            .await
-            .with_context(|| format!("install managed Skill directory {directory}"))?;
-    }
-    for directory in previous_owned {
-        if !marker.owned_skill_directories.contains(&directory) {
-            remove_materialized_path(&codex_home.join("skills").join(directory)).await?;
-        }
-    }
-    for filename in &marker.owned_agent_files {
-        let target = codex_home.join("agents").join(filename);
-        remove_materialized_path(&target).await?;
-        fs::rename(stage.join("agents").join(filename), &target)
-            .await
-            .with_context(|| format!("install managed Codex agent file {filename}"))?;
-    }
-    for filename in previous_owned_agents {
-        if !marker.owned_agent_files.contains(&filename) {
-            remove_materialized_path(&codex_home.join("agents").join(filename)).await?;
-        }
-    }
-    for filename in [
-        "AGENTS.md",
-        "config.toml",
-        "skills-manifest.json",
-        "mcp-allowlist.json",
-    ] {
-        fs::rename(stage.join(filename), codex_home.join(filename))
-            .await
-            .with_context(|| format!("install {filename}"))?;
-    }
-    fs::rename(
-        stage.join(MATERIALIZATION_MARKER_FILE),
-        codex_home.join(MATERIALIZATION_MARKER_FILE),
-    )
-    .await
-    .context("commit execution configuration marker")?;
-    Ok(())
-}
-
-#[cfg(test)]
-fn previous_owned_skill_directories(codex_home: &Path) -> Vec<String> {
-    if let Ok(marker) = stdfs::read(codex_home.join(MATERIALIZATION_MARKER_FILE))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<ExecutionMaterializationMarker>(&bytes).ok())
-        .ok_or(())
-    {
-        if marker
-            .owned_skill_directories
-            .iter()
-            .all(|directory| is_single_normal_path_component(directory))
-        {
-            return marker.owned_skill_directories;
-        }
-    }
-    stdfs::read(codex_home.join("skills-manifest.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|value| value.as_array().cloned())
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|skill| {
-            skill
-                .get("name")
-                .and_then(Value::as_str)
-                .map(skill_directory_name)
-        })
-        .filter(|directory| is_single_normal_path_component(directory))
-        .collect()
-}
-
-#[cfg(test)]
-fn previous_owned_agent_files(codex_home: &Path) -> Vec<String> {
-    stdfs::read(codex_home.join(MATERIALIZATION_MARKER_FILE))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<ExecutionMaterializationMarker>(&bytes).ok())
-        .map(|marker| marker.owned_agent_files)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|filename| is_owned_agent_filename(filename))
-        .collect()
-}
-
-#[cfg(test)]
-fn is_owned_agent_filename(filename: &str) -> bool {
-    is_single_normal_path_component(filename)
-        && filename
-            .strip_suffix(".toml")
-            .is_some_and(is_valid_codex_agent_name)
-}
-
-#[cfg(test)]
-fn is_valid_codex_agent_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn is_single_normal_path_component(value: &str) -> bool {
@@ -8590,117 +6153,6 @@ fn copy_directory_snapshot(source: &Path, destination: &Path) -> anyhow::Result<
     Ok(())
 }
 
-#[cfg(test)]
-async fn materialize_codex_agents(
-    stage: &Path,
-    configuration: &AgentExecutionConfigurationDto,
-) -> anyhow::Result<Vec<String>> {
-    let mut owned_files = Vec::new();
-    let mut normalized_names = HashSet::new();
-    for subagent in configuration
-        .codex_subagents
-        .iter()
-        .filter(|subagent| subagent.enabled)
-    {
-        anyhow::ensure!(
-            is_valid_codex_agent_name(&subagent.name),
-            "Codex subagent name must use 1 to 64 ASCII letters, digits, hyphens, or underscores"
-        );
-        anyhow::ensure!(
-            normalized_names.insert(subagent.name.to_ascii_lowercase()),
-            "Codex subagent names must be unique ignoring case"
-        );
-        let filename = format!("{}.toml", subagent.name);
-        let contents = render_codex_agent(configuration, subagent)?;
-        write_private_file(&stage.join("agents").join(&filename), contents.as_bytes())
-            .with_context(|| format!("stage Codex agent file {filename}"))?;
-        owned_files.push(filename);
-    }
-    owned_files.sort();
-    Ok(owned_files)
-}
-
-#[cfg(test)]
-fn preserve_codex_agent_model_configuration(
-    codex_home: &Path,
-    stage: &Path,
-    existing_owned_files: &[String],
-    refreshed_owned_files: &[String],
-) -> anyhow::Result<()> {
-    const MODEL_CONFIGURATION_KEYS: &[&str] = &[
-        "model",
-        "model_provider",
-        "model_reasoning_effort",
-        "model_reasoning_summary",
-        "model_verbosity",
-        "model_context_window",
-        "model_auto_compact_token_limit",
-        "model_supports_reasoning_summaries",
-        "service_tier",
-    ];
-
-    for filename in refreshed_owned_files
-        .iter()
-        .filter(|filename| existing_owned_files.contains(filename))
-    {
-        let existing_path = codex_home.join("agents").join(filename);
-        let refreshed_path = stage.join("agents").join(filename);
-        let existing = stdfs::read_to_string(&existing_path)
-            .with_context(|| format!("read current Codex agent file {filename}"))?
-            .parse::<toml::Value>()
-            .with_context(|| format!("parse current Codex agent file {filename}"))?;
-        let mut refreshed = stdfs::read_to_string(&refreshed_path)
-            .with_context(|| format!("read refreshed Codex agent file {filename}"))?
-            .parse::<toml::Value>()
-            .with_context(|| format!("parse refreshed Codex agent file {filename}"))?;
-        let existing = existing
-            .as_table()
-            .context("current Codex agent configuration is not a TOML table")?;
-        let refreshed = refreshed
-            .as_table_mut()
-            .context("refreshed Codex agent configuration is not a TOML table")?;
-        for key in MODEL_CONFIGURATION_KEYS {
-            if let Some(value) = existing.get(*key) {
-                refreshed.insert((*key).to_owned(), value.clone());
-            }
-        }
-        let contents = toml::to_string(&toml::Value::Table(refreshed.clone()))
-            .context("serialize refreshed Codex agent config")?;
-        write_private_file(&refreshed_path, contents.as_bytes())
-            .with_context(|| format!("preserve Codex agent model configuration {filename}"))?;
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-fn render_codex_agent(
-    configuration: &AgentExecutionConfigurationDto,
-    subagent: &CodexSubagentDefinition,
-) -> anyhow::Result<String> {
-    let mut root = toml::map::Map::new();
-    root.insert("name".into(), toml::Value::String(subagent.name.clone()));
-    root.insert(
-        "description".into(),
-        toml::Value::String(subagent.description.clone()),
-    );
-    root.insert(
-        "developer_instructions".into(),
-        toml::Value::String(subagent.developer_instructions.clone()),
-    );
-    if let Ok(binding) = model_binding(configuration, &subagent.name) {
-        root.insert(
-            "model".into(),
-            toml::Value::String(binding.model_id.clone()),
-        );
-        root.insert(
-            "model_provider".into(),
-            toml::Value::String(model_provider_name(binding.id)),
-        );
-        apply_model_settings(&mut root, &binding.model_settings)?;
-    }
-    toml::to_string(&toml::Value::Table(root)).context("serialize Codex agent config")
-}
-
 fn write_private_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
@@ -8725,115 +6177,6 @@ fn write_private_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     }
 }
 
-#[cfg(test)]
-fn render_codex_config(
-    configuration: &AgentExecutionConfigurationDto,
-    model_base_url: Option<&str>,
-) -> anyhow::Result<String> {
-    let base_url = model_base_url.unwrap_or("http://127.0.0.1:0/v1");
-    let main_binding = model_binding(configuration, "main")?;
-    let mut root = toml::map::Map::new();
-    root.insert(
-        "model".into(),
-        toml::Value::String(main_binding.model_id.clone()),
-    );
-    root.insert(
-        "model_provider".into(),
-        toml::Value::String(model_provider_name(main_binding.id)),
-    );
-    apply_model_settings(&mut root, &main_binding.model_settings)?;
-
-    let mut model_providers = toml::map::Map::new();
-    for binding in &configuration.model_bindings {
-        let mut provider_config = toml::map::Map::new();
-        provider_config.insert(
-            "name".into(),
-            toml::Value::String(binding.connection_name_snapshot.clone()),
-        );
-        provider_config.insert("base_url".into(), toml::Value::String(base_url.to_owned()));
-        provider_config.insert("wire_api".into(), toml::Value::String("responses".into()));
-        provider_config.insert(
-            "http_headers".into(),
-            toml::Value::Table(toml::map::Map::from_iter([(
-                "x-agent-hub-model-binding-id".into(),
-                toml::Value::String(binding.id.to_string()),
-            )])),
-        );
-        if let Some(retries) = binding.model_settings.request_max_retries {
-            provider_config.insert(
-                "request_max_retries".into(),
-                toml::Value::Integer(i64::from(retries)),
-            );
-        }
-        if let Some(retries) = binding.model_settings.stream_max_retries {
-            provider_config.insert(
-                "stream_max_retries".into(),
-                toml::Value::Integer(i64::from(retries)),
-            );
-        }
-        if let Some(timeout_ms) = binding.model_settings.stream_idle_timeout_ms {
-            provider_config.insert(
-                "stream_idle_timeout_ms".into(),
-                toml::Value::Integer(
-                    i64::try_from(timeout_ms)
-                        .context("stream idle timeout exceeds TOML integer")?,
-                ),
-            );
-        }
-        model_providers.insert(
-            model_provider_name(binding.id),
-            toml::Value::Table(provider_config),
-        );
-    }
-    root.insert(
-        "model_providers".into(),
-        toml::Value::Table(model_providers),
-    );
-    root.insert(
-        "agents".into(),
-        toml::Value::Table(toml::map::Map::from_iter([
-            ("max_threads".into(), toml::Value::Integer(6)),
-            ("max_depth".into(), toml::Value::Integer(1)),
-        ])),
-    );
-    let mcp_servers = render_mcp_servers(&configuration.mcp_allowlist);
-    if !mcp_servers.is_empty() {
-        root.insert("mcp_servers".into(), toml::Value::Table(mcp_servers));
-    }
-    toml::to_string(&toml::Value::Table(root)).context("serialize Codex config")
-}
-
-#[cfg(test)]
-fn render_codex_config_preserving_model_configuration(
-    existing_path: &Path,
-    mcp_allowlist: &serde_json::Value,
-) -> anyhow::Result<String> {
-    let mut existing = stdfs::read_to_string(existing_path)
-        .context("read current per-Session Codex config")?
-        .parse::<toml::Value>()
-        .context("parse current per-Session Codex config")?;
-    let root = existing
-        .as_table_mut()
-        .context("current per-Session Codex config is not a TOML table")?;
-    let provider_name = root
-        .get("model_provider")
-        .and_then(toml::Value::as_str)
-        .context("current per-Session Codex config has no model provider")?;
-    anyhow::ensure!(
-        root.get("model_providers")
-            .and_then(toml::Value::as_table)
-            .is_some_and(|providers| providers.contains_key(provider_name)),
-        "current per-Session Codex provider route is missing"
-    );
-    let mcp_servers = render_mcp_servers(mcp_allowlist);
-    if mcp_servers.is_empty() {
-        root.remove("mcp_servers");
-    } else {
-        root.insert("mcp_servers".into(), toml::Value::Table(mcp_servers));
-    }
-    toml::to_string(&existing).context("serialize preserved per-Session Codex config")
-}
-
 fn model_binding<'a>(
     configuration: &'a AgentExecutionConfigurationDto,
     binding_key: &str,
@@ -8845,184 +6188,8 @@ fn model_binding<'a>(
         .context("required Run Model Binding is missing from execution configuration")
 }
 
-fn model_provider_name(binding_id: Uuid) -> String {
-    format!("agent_hub_{}", binding_id.simple())
-}
-
-#[cfg(test)]
-fn apply_model_settings(
-    root: &mut toml::map::Map<String, toml::Value>,
-    settings: &AgentModelSettings,
-) -> anyhow::Result<()> {
-    if let Some(effort) = codex_reasoning_effort(settings.reasoning_effort) {
-        root.insert(
-            "model_reasoning_effort".into(),
-            toml::Value::String(effort.into()),
-        );
-    }
-    if let Some(summary) = codex_reasoning_summary(settings.reasoning_summary) {
-        root.insert(
-            "model_reasoning_summary".into(),
-            toml::Value::String(summary.into()),
-        );
-    }
-    if let Some(verbosity) = codex_model_verbosity(settings.verbosity) {
-        root.insert(
-            "model_verbosity".into(),
-            toml::Value::String(verbosity.into()),
-        );
-    }
-    if let Some(tokens) = settings.context_window_tokens {
-        root.insert(
-            "model_context_window".into(),
-            toml::Value::Integer(
-                i64::try_from(tokens).context("model context window exceeds TOML integer")?,
-            ),
-        );
-    }
-    if let Some(tokens) = settings.auto_compact_token_limit {
-        root.insert(
-            "model_auto_compact_token_limit".into(),
-            toml::Value::Integer(
-                i64::try_from(tokens).context("model compact limit exceeds TOML integer")?,
-            ),
-        );
-    }
-    match settings.reasoning_summary_support {
-        ModelReasoningSummarySupport::Auto => {}
-        ModelReasoningSummarySupport::Supported => {
-            root.insert(
-                "model_supports_reasoning_summaries".into(),
-                toml::Value::Boolean(true),
-            );
-        }
-        ModelReasoningSummarySupport::Unsupported => {
-            root.insert(
-                "model_supports_reasoning_summaries".into(),
-                toml::Value::Boolean(false),
-            );
-        }
-    }
-    if let Some(service_tier) = &settings.service_tier {
-        root.insert(
-            "service_tier".into(),
-            toml::Value::String(service_tier.clone()),
-        );
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-fn codex_reasoning_summary(summary: ModelReasoningSummary) -> Option<&'static str> {
-    match summary {
-        ModelReasoningSummary::Default => None,
-        ModelReasoningSummary::Auto => Some("auto"),
-        ModelReasoningSummary::Concise => Some("concise"),
-        ModelReasoningSummary::Detailed => Some("detailed"),
-        ModelReasoningSummary::None => Some("none"),
-    }
-}
-
-#[cfg(test)]
-fn codex_model_verbosity(verbosity: ModelVerbosity) -> Option<&'static str> {
-    match verbosity {
-        ModelVerbosity::Default => None,
-        ModelVerbosity::Low => Some("low"),
-        ModelVerbosity::Medium => Some("medium"),
-        ModelVerbosity::High => Some("high"),
-    }
-}
-
-fn codex_reasoning_effort(effort: ReasoningEffort) -> Option<&'static str> {
-    match effort {
-        ReasoningEffort::Default => None,
-        ReasoningEffort::None => Some("none"),
-        ReasoningEffort::Minimal => Some("minimal"),
-        ReasoningEffort::Low => Some("low"),
-        ReasoningEffort::Medium => Some("medium"),
-        ReasoningEffort::High => Some("high"),
-        ReasoningEffort::Xhigh => Some("xhigh"),
-        ReasoningEffort::Max => Some("max"),
-        ReasoningEffort::Ultra => Some("ultra"),
-    }
-}
-
-#[cfg(test)]
-fn render_mcp_servers(mcp_allowlist: &serde_json::Value) -> toml::map::Map<String, toml::Value> {
-    let Some(servers) = mcp_allowlist.as_array() else {
-        return toml::map::Map::new();
-    };
-    let mut output = toml::map::Map::new();
-    for server in servers {
-        let Some(name) = server.get("name").and_then(|value| value.as_str()) else {
-            continue;
-        };
-        let command = server
-            .get("command")
-            .and_then(|value| value.as_str())
-            .unwrap_or(name);
-        let mut server_config = toml::map::Map::new();
-        server_config.insert("command".into(), toml::Value::String(command.to_owned()));
-        if let Some(args) = server.get("args").and_then(|value| value.as_array()) {
-            let rendered_args = args
-                .iter()
-                .filter_map(|value| value.as_str())
-                .map(|value| toml::Value::String(value.to_owned()))
-                .collect::<Vec<_>>();
-            server_config.insert("args".into(), toml::Value::Array(rendered_args));
-        }
-        let env_values = mcp_env_values(server);
-        if !env_values.is_empty() {
-            let mut environment = toml::map::Map::new();
-            for (key, value) in env_values {
-                environment.insert(key, toml::Value::String(value));
-            }
-            server_config.insert("env".into(), toml::Value::Table(environment));
-        }
-        output.insert(name.to_owned(), toml::Value::Table(server_config));
-    }
-    output
-}
-
-#[cfg(test)]
-fn mcp_env_values(server: &serde_json::Value) -> Vec<(String, String)> {
-    let mut values = Vec::new();
-    if let Some(entries) = server.get("secrets").and_then(|value| value.as_object()) {
-        for (key, value) in entries {
-            if let Some(value) = value.as_str() {
-                values.push((key.clone(), value.to_owned()));
-            }
-        }
-    }
-    values
-}
-
-#[cfg(test)]
-fn redact_mcp_secrets(value: &serde_json::Value) -> serde_json::Value {
-    let Some(servers) = value.as_array() else {
-        return json!([]);
-    };
-    serde_json::Value::Array(
-        servers
-            .iter()
-            .map(|server| {
-                let mut server = server.clone();
-                if let Some(secrets) = server
-                    .get_mut("secrets")
-                    .and_then(|value| value.as_object_mut())
-                {
-                    for value in secrets.values_mut() {
-                        *value = json!(REDACTED_SECRET);
-                    }
-                }
-                server
-            })
-            .collect(),
-    )
-}
-
 async fn materialize_skills(
-    codex_home: &Path,
+    engine_state_root: &Path,
     skills_manifest: &serde_json::Value,
 ) -> anyhow::Result<()> {
     let Some(skills) = skills_manifest.as_array() else {
@@ -9040,7 +6207,9 @@ async fn materialize_skills(
             .get("description")
             .and_then(|value| value.as_str())
             .unwrap_or("");
-        let skill_dir = codex_home.join("skills").join(skill_directory_name(name));
+        let skill_dir = engine_state_root
+            .join("skills")
+            .join(skill_directory_name(name));
         if fs::metadata(&skill_dir).await.is_ok() {
             fs::remove_dir_all(&skill_dir).await?;
         }
@@ -9054,7 +6223,10 @@ async fn materialize_skills(
     Ok(())
 }
 
-async fn materialize_local_skills(codex_home: &Path, source_root: &Path) -> anyhow::Result<()> {
+async fn materialize_local_skills(
+    engine_state_root: &Path,
+    source_root: &Path,
+) -> anyhow::Result<()> {
     let mut entries = match fs::read_dir(source_root).await {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -9070,7 +6242,9 @@ async fn materialize_local_skills(codex_home: &Path, source_root: &Path) -> anyh
         };
         let fallback = entry.file_name().to_string_lossy().into_owned();
         let name = local_skill_name(&markdown).unwrap_or(fallback);
-        let destination = codex_home.join("skills").join(skill_directory_name(&name));
+        let destination = engine_state_root
+            .join("skills")
+            .join(skill_directory_name(&name));
         if fs::metadata(&destination).await.is_ok() {
             fs::remove_dir_all(&destination).await?;
         }
@@ -9157,7 +6331,7 @@ fn render_skill_markdown(name: &str, description: &str, content: &str) -> String
     )
 }
 
-fn fake_codex_events(claim: &ClaimRunResponse) -> (Vec<AppendRunEventRequest>, String) {
+fn fake_engine_events(claim: &ClaimRunResponse) -> (Vec<AppendRunEventRequest>, String) {
     if claim.run.source == "integration:message"
         && claim
             .run
@@ -9179,14 +6353,14 @@ fn fake_codex_events(claim: &ClaimRunResponse) -> (Vec<AppendRunEventRequest>, S
                 AppendRunEventRequest {
                     event_type: "status".into(),
                     role: None,
-                    content: Some("initialized fake Codex app-server".into()),
+                    content: Some("initialized fake Execution Engine".into()),
                     payload: json!({ "phase": "initialize" }),
                     waiting_tool: None,
                 },
                 AppendRunEventRequest {
                     event_type: "tool_request".into(),
                     role: Some("assistant".into()),
-                    content: Some(format!("Fake Codex requested {tool_name} tool")),
+                    content: Some(format!("Fake Execution Engine requested {tool_name} tool")),
                     payload: json!({
                         "tool_request_id": Uuid::new_v4(),
                         "tool_name": tool_name,
@@ -9204,7 +6378,7 @@ fn fake_codex_events(claim: &ClaimRunResponse) -> (Vec<AppendRunEventRequest>, S
 
     let assistant_content = if claim.run.source == "integration:tool_result" {
         format!(
-            "Fake Codex completed integration tool result for agent '{}'. {}. Result: {}",
+            "Fake Execution Engine completed integration tool result for agent '{}'. {}. Result: {}",
             claim.agent.name,
             compact(&claim.run.initial_message),
             claim
@@ -9216,7 +6390,7 @@ fn fake_codex_events(claim: &ClaimRunResponse) -> (Vec<AppendRunEventRequest>, S
         )
     } else {
         format!(
-            "Fake Codex completed run for agent '{}'. Instructions loaded: {}. User said: {}",
+            "Fake Execution Engine completed run for agent '{}'. Instructions loaded: {}. User said: {}",
             claim.agent.name,
             compact(&claim.agent.instructions),
             compact(&claim.run.initial_message)
@@ -9228,7 +6402,7 @@ fn fake_codex_events(claim: &ClaimRunResponse) -> (Vec<AppendRunEventRequest>, S
             AppendRunEventRequest {
                 event_type: "status".into(),
                 role: None,
-                content: Some("initialized fake Codex app-server".into()),
+                content: Some("initialized fake Execution Engine".into()),
                 payload: json!({ "phase": "initialize" }),
                 waiting_tool: None,
             },
@@ -9327,7 +6501,7 @@ mod tests {
             command: "refresh_configuration".into(),
             run_id: None,
             turn_id: None,
-            native_thread_id: Some("thread-7".into()),
+            native_session_id: Some("thread-7".into()),
             native_turn_id: None,
             message: None,
             configuration_revision: Some(revision),
@@ -9353,7 +6527,7 @@ mod tests {
     async fn dynamic_integration_tools_fail_closed_without_atomic_batch_capability() {
         let temp = tempfile::tempdir().unwrap();
         let mut config = test_config();
-        config.codex_driver = "fake".into();
+        config.engine_driver = "fake".into();
         config.work_root = temp.path().to_path_buf();
         let mut claim = test_claim();
         claim.run.integration_session_id = Some(Uuid::new_v4());
@@ -9394,18 +6568,32 @@ mod tests {
             &claim,
             vec![first.clone(), second.clone()],
             "waiting_tool",
-            Some("thread-for-tools"),
+            Some("native-session-for-tools"),
             "/runtime/workdir",
         )
         .unwrap()
         .expect("a waiting turn should produce one finalize batch");
 
         assert_eq!(batch.integration_session_id, integration_session_id);
-        assert_eq!(batch.session_id, "thread-for-tools");
+        assert_eq!(batch.native_session_id, "native-session-for-tools");
         assert_eq!(batch.work_dir_ref, "/runtime/workdir");
         assert_eq!(batch.tool_requests.len(), 2);
         assert_eq!(batch.tool_requests[0].payload, first.payload);
         assert_eq!(batch.tool_requests[1].payload, second.payload);
+    }
+
+    fn test_tool_request_event() -> AppendRunEventRequest {
+        AppendRunEventRequest {
+            event_type: "tool_request".into(),
+            role: Some("assistant".into()),
+            content: Some("tool requested".into()),
+            payload: json!({
+                "tool_request_id": Uuid::new_v4(),
+                "tool_name": "echo",
+                "arguments": { "value": 1 }
+            }),
+            waiting_tool: None,
+        }
     }
 
     #[test]
@@ -9430,7 +6618,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (client, requests, server) = recording_hub_client(3);
         let mut config = test_config();
-        config.codex_driver = "fake".into();
+        config.engine_driver = "fake".into();
         config.work_root = temp.path().to_path_buf();
         let mut claim = test_claim();
         claim.run.integration_session_id = Some(Uuid::new_v4());
@@ -9468,7 +6656,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (client, requests, server) = recording_hub_client_with_failure(3, Some("/complete"));
         let mut config = test_config();
-        config.codex_driver = "fake".into();
+        config.engine_driver = "fake".into();
         config.work_root = temp.path().to_path_buf();
         let mut claim = test_claim();
         claim.run.integration_session_id = Some(Uuid::new_v4());
@@ -9541,7 +6729,7 @@ mod tests {
         };
         let batch = FinalizeToolRequestsRequest {
             integration_session_id: Uuid::new_v4(),
-            session_id: "response-loss-session".into(),
+            native_session_id: "response-loss-native-session".into(),
             work_dir_ref: "/runtime/workdir".into(),
             tool_requests: vec![FinalizeToolRequestEvent {
                 role: Some("assistant".into()),
@@ -9572,7 +6760,8 @@ mod tests {
         let session_id = Uuid::new_v4();
         claim.run.hub_session_id = Some(session_id);
         let first = prepare_run_env(temp.path(), &claim, None).await.unwrap();
-        fs::write(first.codex_home.join("skills/stale.md"), "old")
+        let first_agent_dir = pi_agent_directory(&first.engine_state_root);
+        fs::write(first_agent_dir.join("skills/stale.md"), "old")
             .await
             .unwrap();
 
@@ -9583,7 +6772,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(first.workdir, second.workdir);
-        assert_eq!(first.codex_home, second.codex_home);
+        assert_eq!(first.engine_state_root, second.engine_state_root);
         assert_eq!(
             second.workdir,
             temp.path()
@@ -9592,24 +6781,23 @@ mod tests {
                 .join("workspace")
         );
         assert_eq!(
-            second.codex_home,
+            second.engine_state_root,
             temp.path()
                 .join("sessions")
                 .join(session_id.to_string())
-                .join("codex")
+                .join("engine-state")
         );
         assert!(second.workdir.exists());
-        assert!(second.codex_home.join("config.toml").exists());
-        assert!(second.codex_home.join("skills/stale.md").exists());
+        let second_agent_dir = pi_agent_directory(&second.engine_state_root);
+        assert!(second_agent_dir.join("models.json").exists());
+        assert!(second_agent_dir.join("skills/stale.md").exists());
         assert!(second.workdir.parent().unwrap().join("supervisor").is_dir());
         assert!(second.workdir.parent().unwrap().join("staging").is_dir());
-        assert!(second
-            .codex_home
+        assert!(second_agent_dir
             .join("skills")
             .join(skill_directory_name("repo-review"))
             .join("SKILL.md")
             .exists());
-        assert!(second.codex_home.join("mcp-allowlist.json").exists());
 
         let mut other_session = claim;
         other_session.run.id = Uuid::new_v4();
@@ -9618,12 +6806,12 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(isolated.workdir, second.workdir);
-        assert_ne!(isolated.codex_home, second.codex_home);
+        assert_ne!(isolated.engine_state_root, second.engine_state_root);
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn execution_materialization_skips_valid_state_and_repairs_proxy_or_missing_marker() {
+    async fn pi_materialization_skips_valid_state_and_repairs_proxy_or_missing_marker() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         const MCP_SECRET: &str = "task9-marker-secret";
@@ -9644,27 +6832,22 @@ mod tests {
         let first = prepare_run_env(temp.path(), &claim, Some("http://127.0.0.1:41001/v1"))
             .await
             .unwrap();
-        let config_path = first.codex_home.join("config.toml");
-        let marker_path = first.codex_home.join(".agent-hub-materialization.json");
-        let first_inode = fs::metadata(&config_path).await.unwrap().ino();
+        let agent_dir = pi_agent_directory(&first.engine_state_root);
+        let models_path = agent_dir.join("models.json");
+        let marker_path = agent_dir.join(PI_MATERIALIZATION_MARKER_FILE);
+        let first_inode = fs::metadata(&models_path).await.unwrap().ino();
         assert_eq!(
-            fs::read_to_string(first.codex_home.join("AGENTS.md"))
+            fs::read_to_string(agent_dir.join("AGENTS.md"))
                 .await
                 .unwrap(),
             "Task 9 durable guidance\n"
         );
-        assert!(fs::read_to_string(&config_path)
-            .await
-            .unwrap()
-            .contains(MCP_SECRET));
+        let models = fs::read_to_string(&models_path).await.unwrap();
         let marker = fs::read_to_string(&marker_path).await.unwrap();
-        let sidecar = fs::read_to_string(first.codex_home.join("mcp-allowlist.json"))
-            .await
-            .unwrap();
+        assert!(!models.contains(MCP_SECRET));
         assert!(!marker.contains(MCP_SECRET));
-        assert!(!sidecar.contains(MCP_SECRET));
         assert_eq!(
-            fs::metadata(&config_path)
+            fs::metadata(&models_path)
                 .await
                 .unwrap()
                 .permissions()
@@ -9685,14 +6868,14 @@ mod tests {
         let _ = prepare_run_env(temp.path(), &claim, Some("http://127.0.0.1:41001/v1"))
             .await
             .unwrap();
-        assert_eq!(fs::metadata(&config_path).await.unwrap().ino(), first_inode);
+        assert_eq!(fs::metadata(&models_path).await.unwrap().ino(), first_inode);
 
         let _ = prepare_run_env(temp.path(), &claim, Some("http://127.0.0.1:41002/v1"))
             .await
             .unwrap();
-        let proxy_inode = fs::metadata(&config_path).await.unwrap().ino();
+        let proxy_inode = fs::metadata(&models_path).await.unwrap().ino();
         assert_ne!(proxy_inode, first_inode);
-        assert!(fs::read_to_string(&config_path)
+        assert!(fs::read_to_string(&models_path)
             .await
             .unwrap()
             .contains("41002"));
@@ -9701,12 +6884,12 @@ mod tests {
         let _ = prepare_run_env(temp.path(), &claim, Some("http://127.0.0.1:41002/v1"))
             .await
             .unwrap();
-        assert_ne!(fs::metadata(&config_path).await.unwrap().ino(), proxy_inode);
+        assert_ne!(fs::metadata(&models_path).await.unwrap().ino(), proxy_inode);
         assert!(marker_path.exists());
     }
 
     #[tokio::test]
-    async fn online_refresh_without_bindings_preserves_provider_routes_until_the_next_run() {
+    async fn online_refresh_without_bindings_preserves_pi_provider_routes_until_the_next_run() {
         let temp = tempfile::tempdir().unwrap();
         let runtime_id = Uuid::new_v4();
         let mut first = test_claim();
@@ -9714,7 +6897,7 @@ mod tests {
         first.execution_configuration.instructions = "old guidance".into();
         let reviewer_connection_id = Uuid::from_u128(0x301);
         let reviewer_binding_id = Uuid::from_u128(0x302);
-        first.execution_configuration.codex_subagents = vec![CodexSubagentDefinition {
+        first.execution_configuration.subagents = vec![SubagentDefinition {
             name: "reviewer".into(),
             description: "Review the current change".into(),
             developer_instructions: "Use the old review guidance.".into(),
@@ -9751,10 +6934,11 @@ mod tests {
         let run_env = prepare_run_env(temp.path(), &first, Some("http://127.0.0.1:4567/v1"))
             .await
             .unwrap();
-        let original_config = fs::read_to_string(run_env.codex_home.join("config.toml"))
+        let agent_dir = run_env.engine_state_root.join(PI_AGENT_DIRECTORY);
+        let original_models = fs::read_to_string(agent_dir.join("models.json"))
             .await
             .unwrap()
-            .parse::<toml::Value>()
+            .parse::<Value>()
             .unwrap();
 
         let manager = SessionSupervisorManager::new(temp.path().to_path_buf(), runtime_id, 1);
@@ -9772,11 +6956,9 @@ mod tests {
             "command": "refresh-command",
             "args": ["--new"]
         }]);
-        refreshed.codex_subagents[0].developer_instructions =
-            "Use refreshed review guidance.".into();
-        refreshed.codex_subagents[0].model_selection = None;
-        refreshed.codex_subagents[0].model_settings_override =
-            AgentModelSettingsOverride::default();
+        refreshed.subagents[0].developer_instructions = "Use refreshed review guidance.".into();
+        refreshed.subagents[0].model_selection = None;
+        refreshed.subagents[0].model_settings_override = AgentModelSettingsOverride::default();
         let refreshed_fingerprint = execution_configuration_fingerprint(&refreshed).unwrap();
         let command = RuntimeSessionCommandDto {
             command_id: Uuid::new_v4(),
@@ -9785,7 +6967,7 @@ mod tests {
             command: "refresh_configuration".into(),
             run_id: None,
             turn_id: None,
-            native_thread_id: None,
+            native_session_id: None,
             native_turn_id: None,
             message: None,
             configuration_revision: Some(refreshed.revision),
@@ -9799,42 +6981,22 @@ mod tests {
 
         assert_eq!(applied.outcome, "applied");
         assert!(applied.native_error.is_none());
-        let refreshed_config = fs::read_to_string(run_env.codex_home.join("config.toml"))
+        let refreshed_models = fs::read_to_string(agent_dir.join("models.json"))
             .await
             .unwrap()
-            .parse::<toml::Value>()
+            .parse::<Value>()
             .unwrap();
-        assert_eq!(refreshed_config["model"], original_config["model"]);
+        assert_eq!(refreshed_models, original_models);
         assert_eq!(
-            refreshed_config["model_provider"],
-            original_config["model_provider"]
-        );
-        assert_eq!(
-            refreshed_config["model_providers"],
-            original_config["model_providers"]
-        );
-        assert_eq!(
-            refreshed_config["mcp_servers"]["refresh-mcp"]["command"].as_str(),
-            Some("refresh-command")
-        );
-        assert_eq!(
-            fs::read_to_string(run_env.codex_home.join("AGENTS.md"))
+            fs::read_to_string(agent_dir.join("AGENTS.md"))
                 .await
                 .unwrap(),
             "refreshed non-model guidance\n"
         );
-        let reviewer = fs::read_to_string(run_env.codex_home.join("agents/reviewer.toml"))
-            .await
-            .unwrap();
-        assert!(reviewer.contains("Use refreshed review guidance."));
-        assert!(reviewer.contains("model = \"gpt-review-old\""));
-        assert!(reviewer.contains(&format!(
-            "model_provider = \"{}\"",
-            model_provider_name(reviewer_binding_id)
-        )));
-        assert!(reviewer.contains("model_reasoning_effort = \"ultra\""));
-        let marker: ExecutionMaterializationMarker = serde_json::from_slice(
-            &fs::read(run_env.codex_home.join(MATERIALIZATION_MARKER_FILE))
+        assert!(!agent_dir.join("agents").exists());
+        assert!(!agent_dir.join("mcp-allowlist.json").exists());
+        let marker: PiExecutionMaterializationMarker = serde_json::from_slice(
+            &fs::read(agent_dir.join(PI_MATERIALIZATION_MARKER_FILE))
                 .await
                 .unwrap(),
         )
@@ -9872,35 +7034,29 @@ mod tests {
         let next_env = prepare_run_env(temp.path(), &next, Some("http://127.0.0.1:4567/v1"))
             .await
             .unwrap();
-        let next_config = fs::read_to_string(next_env.codex_home.join("config.toml"))
-            .await
-            .unwrap();
-        assert!(next_config.contains("model = \"gpt-main-next\""));
-        assert!(next_config.contains(&format!(
-            "model_provider = \"{}\"",
-            model_provider_name(next_binding_id)
-        )));
-        assert!(next_config.contains(&format!(
-            "x-agent-hub-model-binding-id = \"{next_binding_id}\""
-        )));
-        assert_ne!(
-            driver_configuration_fingerprint(&first),
-            driver_configuration_fingerprint(&next)
-        );
+        let next_models = fs::read_to_string(
+            next_env
+                .engine_state_root
+                .join(PI_AGENT_DIRECTORY)
+                .join("models.json"),
+        )
+        .await
+        .unwrap();
+        assert!(next_models.contains("gpt-main-next"));
+        assert!(next_models.contains(&next_binding_id.to_string()));
         manager.shutdown();
     }
 
     #[tokio::test]
-    async fn execution_materialization_removes_owned_skills_preserves_unknown_and_isolates_sessions(
-    ) {
+    async fn pi_materialization_removes_owned_skills_preserves_unknown_and_isolates_sessions() {
         let temp = tempfile::tempdir().unwrap();
         let claim = test_claim();
         let first = prepare_run_env(temp.path(), &claim, None).await.unwrap();
-        let removed_skill = first
-            .codex_home
+        let first_agent_dir = pi_agent_directory(&first.engine_state_root);
+        let removed_skill = first_agent_dir
             .join("skills")
             .join(skill_directory_name("repo-review"));
-        let unknown_skill = first.codex_home.join("skills/.system/plugin-owned");
+        let unknown_skill = first_agent_dir.join("skills/.system/plugin-owned");
         fs::create_dir_all(&unknown_skill).await.unwrap();
         fs::write(unknown_skill.join("SKILL.md"), "plugin content")
             .await
@@ -9932,194 +7088,33 @@ mod tests {
         let other = prepare_run_env(temp.path(), &other_session, None)
             .await
             .unwrap();
+        let other_agent_dir = pi_agent_directory(&other.engine_state_root);
         let other_skill_dir = skill_directory_name("other-session");
 
-        assert!(other
-            .codex_home
+        assert!(other_agent_dir
             .join("skills")
             .join(&other_skill_dir)
             .join("SKILL.md")
             .exists());
-        assert!(!first
-            .codex_home
+        assert!(!first_agent_dir
             .join("skills")
             .join(&other_skill_dir)
             .exists());
-        assert!(!other.codex_home.join("skills/.system").exists());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn execution_materialization_refreshes_owned_native_subagents_and_preserves_unknown_files(
-    ) {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = tempfile::tempdir().unwrap();
-        let mut claim = test_claim();
-        let override_connection_id = Uuid::from_u128(0x303);
-        let override_binding_id = Uuid::from_u128(0x304);
-        let override_selection = ModelSelectionDto {
-            connection_id: override_connection_id,
-            model_id: "gpt-review".into(),
-        };
-        claim
-            .execution_configuration
-            .model_bindings
-            .push(RunModelBindingDto {
-                id: override_binding_id,
-                run_id: claim.run.id,
-                binding_key: "reviewer".into(),
-                model_connection_id: override_connection_id,
-                connection_name_snapshot: "Review model".into(),
-                connection_scope_snapshot: ModelConnectionScope::Personal,
-                model_id: "gpt-review".into(),
-                api_type: ModelUpstreamProtocol::OpenaiResponses,
-                model_settings: AgentModelSettings {
-                    reasoning_effort: ReasoningEffort::Ultra,
-                    reasoning_summary: ModelReasoningSummary::Concise,
-                    verbosity: ModelVerbosity::High,
-                    context_window_tokens: Some(128_000),
-                    auto_compact_token_limit: Some(96_000),
-                    reasoning_summary_support: ModelReasoningSummarySupport::Unsupported,
-                    service_tier: Some("flex".into()),
-                    ..AgentModelSettings::default()
-                },
-            });
-        claim.execution_configuration.codex_subagents = vec![
-            CodexSubagentDefinition {
-                name: "researcher".into(),
-                description: "Research the requested topic".into(),
-                developer_instructions: "Use primary sources.".into(),
-                model_selection: None,
-                model_settings_override: AgentModelSettingsOverride::default(),
-                enabled: true,
-                disabled_reason: None,
-            },
-            CodexSubagentDefinition {
-                name: "reviewer".into(),
-                description: "Review the current change".into(),
-                developer_instructions: "Inspect correctness and security.".into(),
-                model_selection: Some(override_selection),
-                model_settings_override: AgentModelSettingsOverride {
-                    reasoning_effort: ModelSettingOverride::Value(ReasoningEffort::Ultra),
-                    ..AgentModelSettingsOverride::default()
-                },
-                enabled: true,
-                disabled_reason: None,
-            },
-            CodexSubagentDefinition {
-                name: "disabled".into(),
-                description: "Disabled role".into(),
-                developer_instructions: "Must not be materialized.".into(),
-                model_selection: None,
-                model_settings_override: AgentModelSettingsOverride::default(),
-                enabled: false,
-                disabled_reason: Some("model_selection_removed".into()),
-            },
-        ];
-        claim.expected_configuration_fingerprint =
-            execution_configuration_fingerprint(&claim.execution_configuration).unwrap();
-
-        let run_env = prepare_run_env(temp.path(), &claim, Some("http://127.0.0.1:4567/v1"))
-            .await
-            .unwrap();
-        let agents_dir = run_env.codex_home.join("agents");
-        let researcher_path = agents_dir.join("researcher.toml");
-        let reviewer_path = agents_dir.join("reviewer.toml");
-        let researcher = fs::read_to_string(&researcher_path).await.unwrap();
-        let reviewer = fs::read_to_string(&reviewer_path).await.unwrap();
-        let researcher = researcher.parse::<toml::Value>().unwrap();
-        let reviewer = reviewer.parse::<toml::Value>().unwrap();
-
-        assert_eq!(researcher["name"].as_str(), Some("researcher"));
-        assert!(researcher.get("model").is_none());
-        assert!(researcher.get("model_provider").is_none());
-        assert!(researcher.get("model_reasoning_effort").is_none());
-        assert_eq!(reviewer["model"].as_str(), Some("gpt-review"));
-        assert_eq!(reviewer["model_reasoning_effort"].as_str(), Some("ultra"));
-        assert_eq!(
-            reviewer["model_reasoning_summary"].as_str(),
-            Some("concise")
-        );
-        assert_eq!(reviewer["model_verbosity"].as_str(), Some("high"));
-        assert_eq!(reviewer["model_context_window"].as_integer(), Some(128_000));
-        assert_eq!(
-            reviewer["model_auto_compact_token_limit"].as_integer(),
-            Some(96_000)
-        );
-        assert_eq!(
-            reviewer["model_supports_reasoning_summaries"].as_bool(),
-            Some(false)
-        );
-        assert_eq!(reviewer["service_tier"].as_str(), Some("flex"));
-        assert_eq!(
-            reviewer["model_provider"].as_str(),
-            Some(model_provider_name(override_binding_id).as_str())
-        );
-        assert!(!agents_dir.join("disabled.toml").exists());
-        assert_eq!(
-            fs::metadata(&reviewer_path)
-                .await
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-
-        fs::write(
-            agents_dir.join("plugin-owned.toml"),
-            "name = \"plugin-owned\"\n",
-        )
-        .await
-        .unwrap();
-        let mut refreshed = claim.clone();
-        refreshed.execution_configuration.revision += 1;
-        refreshed.execution_configuration.codex_subagents = vec![CodexSubagentDefinition {
-            name: "researcher".into(),
-            description: "Research with updated guidance".into(),
-            developer_instructions: "Use primary sources and cite them.".into(),
-            model_selection: None,
-            model_settings_override: AgentModelSettingsOverride {
-                reasoning_effort: ModelSettingOverride::Value(ReasoningEffort::Max),
-                ..AgentModelSettingsOverride::default()
-            },
-            enabled: true,
-            disabled_reason: None,
-        }];
-        let mut researcher_binding = refreshed.execution_configuration.model_bindings[0].clone();
-        researcher_binding.id = Uuid::from_u128(0x305);
-        researcher_binding.binding_key = "researcher".into();
-        researcher_binding.model_settings.reasoning_effort = ReasoningEffort::Max;
-        refreshed.execution_configuration.model_bindings = vec![
-            refreshed.execution_configuration.model_bindings[0].clone(),
-            researcher_binding,
-        ];
-        refreshed.expected_configuration_fingerprint =
-            execution_configuration_fingerprint(&refreshed.execution_configuration).unwrap();
-
-        prepare_run_env(temp.path(), &refreshed, Some("http://127.0.0.1:4567/v1"))
-            .await
-            .unwrap();
-
-        assert!(!reviewer_path.exists());
-        assert!(agents_dir.join("plugin-owned.toml").exists());
-        let researcher = fs::read_to_string(researcher_path).await.unwrap();
-        assert!(researcher.contains("Use primary sources and cite them."));
-        assert!(researcher.contains("model_reasoning_effort = \"max\""));
+        assert!(!other_agent_dir.join("skills/.system").exists());
     }
 
     #[tokio::test]
-    async fn execution_materialization_staging_failure_preserves_previous_state_and_can_retry() {
+    async fn pi_materialization_staging_failure_preserves_previous_state_and_can_retry() {
         let temp = tempfile::tempdir().unwrap();
         let mut original = test_claim();
         original.execution_configuration.instructions = "original guidance".into();
         original.expected_configuration_fingerprint =
             execution_configuration_fingerprint(&original.execution_configuration).unwrap();
         let env = prepare_run_env(temp.path(), &original, None).await.unwrap();
-        let agents_path = env.codex_home.join("AGENTS.md");
-        let marker_path = env.codex_home.join(MATERIALIZATION_MARKER_FILE);
-        let original_agents = fs::read(&agents_path).await.unwrap();
+        let agent_dir = pi_agent_directory(&env.engine_state_root);
+        let guidance_path = agent_dir.join("AGENTS.md");
+        let marker_path = agent_dir.join(PI_MATERIALIZATION_MARKER_FILE);
+        let original_guidance = fs::read(&guidance_path).await.unwrap();
         let original_marker = fs::read(&marker_path).await.unwrap();
 
         let invalid_local_skills = temp.path().join("local-skills-is-a-file");
@@ -10149,20 +7144,21 @@ mod tests {
             .unwrap();
         assert!(
             staging_entries.next_entry().await.unwrap().is_none(),
-            "failed synchronization left an execution configuration staging directory"
+            "failed synchronization left a Pi execution configuration staging directory"
         );
-        assert_eq!(fs::read(&agents_path).await.unwrap(), original_agents);
+        assert_eq!(fs::read(&guidance_path).await.unwrap(), original_guidance);
         assert_eq!(fs::read(&marker_path).await.unwrap(), original_marker);
 
         let retried = prepare_run_env(temp.path(), &updated, None).await.unwrap();
+        let retried_agent_dir = pi_agent_directory(&retried.engine_state_root);
         assert_eq!(
-            fs::read_to_string(retried.codex_home.join("AGENTS.md"))
+            fs::read_to_string(retried_agent_dir.join("AGENTS.md"))
                 .await
                 .unwrap(),
             "updated guidance\n"
         );
-        let marker: ExecutionMaterializationMarker = serde_json::from_slice(
-            &fs::read(retried.codex_home.join(MATERIALIZATION_MARKER_FILE))
+        let marker: PiExecutionMaterializationMarker = serde_json::from_slice(
+            &fs::read(retried_agent_dir.join(PI_MATERIALIZATION_MARKER_FILE))
                 .await
                 .unwrap(),
         )
@@ -10183,7 +7179,7 @@ mod tests {
         let session_id = claim.run.hub_session_id.unwrap();
         let turn_id = claim.run.hub_turn_id.unwrap_or_else(Uuid::new_v4);
         claim.run.hub_turn_id = Some(turn_id);
-        let thread_id = "019bf9b2-7a4d-7000-8000-000000000004";
+        let native_session_id = "019bf9b2-7a4d-7000-8000-000000000004";
         let now = chrono::Utc::now();
         claim.session_context = Some(ClaimSessionContextDto {
             session: HubSessionDto {
@@ -10195,7 +7191,7 @@ mod tests {
                 origin_platform_name: None,
                 origin: HubSessionOriginDto::HubNative,
                 lifecycle_status: "online".into(),
-                native_thread_id: Some(thread_id.into()),
+                native_session_id: Some(native_session_id.into()),
                 active_turn_id: None,
                 history_checkpoint: 0,
                 configuration_fingerprint: None,
@@ -10226,30 +7222,30 @@ mod tests {
         fs::write(paths.workspace.join("result.txt"), "saved workspace\n")
             .await
             .unwrap();
-        fs::create_dir_all(paths.codex.join("sessions"))
+        fs::create_dir_all(paths.engine_state.join("sessions"))
             .await
             .unwrap();
         fs::write(
-            paths.codex.join("sessions/pi-session.jsonl"),
-            format!("{{\"type\":\"session\",\"id\":\"{thread_id}\"}}\n"),
+            paths.engine_state.join("sessions/pi-session.jsonl"),
+            format!("{{\"type\":\"session\",\"id\":\"{native_session_id}\"}}\n"),
         )
         .await
         .unwrap();
         fs::write(
             paths
-                .codex
-                .join(format!("sessions/decoy-{thread_id}.jsonl")),
+                .engine_state
+                .join(format!("sessions/decoy-{native_session_id}.jsonl")),
             "{\"type\":\"session\",\"id\":\"another-session\"}\n",
         )
         .await
         .unwrap();
-        fs::create_dir_all(paths.codex.join(".pi/agent/skills/private"))
+        fs::create_dir_all(paths.engine_state.join(".pi/agent/skills/private"))
             .await
             .unwrap();
-        fs::create_dir_all(paths.codex.join(".pi/agent/extensions"))
+        fs::create_dir_all(paths.engine_state.join(".pi/agent/extensions"))
             .await
             .unwrap();
-        fs::create_dir_all(paths.codex.join(".pi/agent/cache"))
+        fs::create_dir_all(paths.engine_state.join(".pi/agent/cache"))
             .await
             .unwrap();
         for (relative, contents) in [
@@ -10260,7 +7256,7 @@ mod tests {
             (".pi/agent/extensions/provider.ts", "generated extension"),
             (".pi/agent/cache/data", "cache"),
         ] {
-            fs::write(paths.codex.join(relative), contents)
+            fs::write(paths.engine_state.join(relative), contents)
                 .await
                 .unwrap();
         }
@@ -10312,7 +7308,7 @@ mod tests {
                 protocol_capabilities: HashSet::new(),
             },
             work_root: temp.path().to_path_buf(),
-            producing_codex_version: "0.104.0".into(),
+            producing_engine_version: "0.104.0".into(),
         };
 
         assert_eq!(
@@ -10344,14 +7340,17 @@ mod tests {
             "saved workspace\n"
         );
         let recovered =
-            pi_driver::discover_session_file(&restored.join("codex"), thread_id).unwrap();
+            pi_driver::discover_session_file(&restored.join("engine-state"), native_session_id)
+                .unwrap();
         assert_eq!(
             recovered.file_name().unwrap().to_string_lossy(),
             "pi-session.jsonl"
         );
-        assert!(!restored.join("codex/.pi").exists());
+        assert!(!restored.join("engine-state/.pi").exists());
         assert!(!restored
-            .join(format!("codex/sessions/decoy-{thread_id}.jsonl"))
+            .join(format!(
+                "engine-state/sessions/decoy-{native_session_id}.jsonl"
+            ))
             .exists());
         hub.abort();
     }
@@ -10360,34 +7359,34 @@ mod tests {
     async fn restoring_claim_installs_the_current_bundle_and_resumes_its_pi_session() {
         let temp = tempfile::tempdir().unwrap();
         let source_workspace = temp.path().join("source/workspace");
-        let source_codex = temp.path().join("source/codex");
+        let source_engine_state = temp.path().join("source/engine-state");
         fs::create_dir_all(&source_workspace).await.unwrap();
-        fs::create_dir_all(source_codex.join("sessions"))
+        fs::create_dir_all(source_engine_state.join("sessions"))
             .await
             .unwrap();
         fs::write(source_workspace.join("restored.txt"), "from bundle\n")
             .await
             .unwrap();
-        let thread_id = "fake-pi-restored";
+        let native_session_id = "fake-pi-restored";
         fs::write(
-            source_codex.join("sessions/restored.jsonl"),
-            format!("{{\"type\":\"session\",\"id\":\"{thread_id}\"}}\n"),
+            source_engine_state.join("sessions/restored.jsonl"),
+            format!("{{\"type\":\"session\",\"id\":\"{native_session_id}\"}}\n"),
         )
         .await
         .unwrap();
         fs::write(
-            source_codex.join("sessions/other.jsonl"),
+            source_engine_state.join("sessions/other.jsonl"),
             "{\"type\":\"session\",\"id\":\"another-session\"}\n",
         )
         .await
         .unwrap();
-        fs::create_dir_all(source_codex.join(".pi/agent/skills/private"))
+        fs::create_dir_all(source_engine_state.join(".pi/agent/skills/private"))
             .await
             .unwrap();
-        fs::create_dir_all(source_codex.join(".pi/agent/extensions"))
+        fs::create_dir_all(source_engine_state.join(".pi/agent/extensions"))
             .await
             .unwrap();
-        fs::create_dir_all(source_codex.join(".pi/agent/cache"))
+        fs::create_dir_all(source_engine_state.join(".pi/agent/cache"))
             .await
             .unwrap();
         for (relative, contents) in [
@@ -10398,26 +7397,29 @@ mod tests {
             (".pi/agent/extensions/provider.ts", "must not restore"),
             (".pi/agent/cache/data", "must not restore"),
         ] {
-            fs::write(source_codex.join(relative), contents)
+            fs::write(source_engine_state.join(relative), contents)
                 .await
                 .unwrap();
         }
-        fs::write(source_codex.join("session_index.jsonl"), "must not restore")
-            .await
-            .unwrap();
+        fs::write(
+            source_engine_state.join("session_index.jsonl"),
+            "must not restore",
+        )
+        .await
+        .unwrap();
         let session_id = Uuid::new_v4();
         let created_at = chrono::Utc::now();
         let artifact =
             session_bundle::create_session_bundle(&session_bundle::SessionBundleCreateSpec {
                 session_id,
-                native_thread_id: thread_id.into(),
+                native_session_id: native_session_id.into(),
                 history_checkpoint: 8,
                 bundle_generation: 2,
                 ownership_generation: 3,
-                producing_codex_version: "0.103.0".into(),
+                producing_engine_version: "0.103.0".into(),
                 created_at,
                 workspace: source_workspace,
-                codex_home: source_codex,
+                engine_state_root: source_engine_state,
                 archive_path: temp.path().join("source/bundle.tar.zst"),
             })
             .unwrap();
@@ -10464,7 +7466,7 @@ mod tests {
                 origin_platform_name: None,
                 origin: HubSessionOriginDto::HubNative,
                 lifecycle_status: "restoring".into(),
-                native_thread_id: Some(thread_id.into()),
+                native_session_id: Some(native_session_id.into()),
                 active_turn_id: None,
                 history_checkpoint: 8,
                 configuration_fingerprint: None,
@@ -10478,7 +7480,7 @@ mod tests {
                     size_bytes: artifact.size_bytes as i64,
                     history_checkpoint: 8,
                     ownership_generation: 3,
-                    producing_codex_version: "0.103.0".into(),
+                    producing_engine_version: "0.103.0".into(),
                     created_at,
                 }),
                 created_at: now,
@@ -10515,14 +7517,15 @@ mod tests {
             "from bundle\n"
         );
         assert!(!paths.workspace.join("stale.txt").exists());
-        let restored_session = pi_driver::discover_session_file(&paths.codex, thread_id).unwrap();
+        let restored_session =
+            pi_driver::discover_session_file(&paths.engine_state, native_session_id).unwrap();
         assert_eq!(
             restored_session.file_name().unwrap().to_string_lossy(),
             "restored.jsonl"
         );
-        assert!(!paths.codex.join("sessions/other.jsonl").exists());
-        assert!(!paths.codex.join(".pi").exists());
-        assert!(!paths.codex.join("session_index.jsonl").exists());
+        assert!(!paths.engine_state.join("sessions/other.jsonl").exists());
+        assert!(!paths.engine_state.join(".pi").exists());
+        assert!(!paths.engine_state.join("session_index.jsonl").exists());
         let metadata: SessionSupervisorMetadata = serde_json::from_slice(
             &fs::read(paths.supervisor.join(SESSION_SUPERVISOR_METADATA_FILE))
                 .await
@@ -10531,7 +7534,10 @@ mod tests {
         .unwrap();
         assert_eq!(metadata.runtime_id, runtime_id);
         assert_eq!(metadata.ownership_generation, 4);
-        assert_eq!(metadata.native_thread_id.as_deref(), Some(thread_id));
+        assert_eq!(
+            metadata.native_session_id.as_deref(),
+            Some(native_session_id)
+        );
 
         let run_env = prepare_run_env(&config.work_root, &claim, None)
             .await
@@ -10544,10 +7550,10 @@ mod tests {
             Some(&restored_session),
             &pi_driver::pi_tool_allowlist(&claim.agent),
             Duration::from_secs(2),
-            Arc::new(AppServerCancellation::default()),
+            Arc::new(EngineCancellation::default()),
         )
         .unwrap();
-        assert_eq!(process.session_id(), thread_id);
+        assert_eq!(process.native_session_id(), native_session_id);
         assert_eq!(
             process.execute(&claim, None).unwrap().final_status,
             "completed"
@@ -10604,7 +7610,7 @@ mod tests {
                 origin_platform_name: None,
                 origin: HubSessionOriginDto::HubNative,
                 lifecycle_status: "restoring".into(),
-                native_thread_id: Some("native-thread-invalid-bundle".into()),
+                native_session_id: Some("native-thread-invalid-bundle".into()),
                 active_turn_id: None,
                 history_checkpoint: 4,
                 configuration_fingerprint: None,
@@ -10621,7 +7627,7 @@ mod tests {
                     size_bytes: invalid_size as i64,
                     history_checkpoint: 4,
                     ownership_generation: 1,
-                    producing_codex_version: "0.103.0".into(),
+                    producing_engine_version: "0.103.0".into(),
                     created_at: now,
                 }),
                 created_at: now,
@@ -10742,7 +7748,7 @@ mod tests {
         let mut claim = test_claim();
         claim.run.hub_session_id = Some(Uuid::new_v4());
         let mut metadata =
-            session_supervisor_metadata_for_claim(runtime_id, &claim, "test-codex").unwrap();
+            session_supervisor_metadata_for_claim(runtime_id, &claim, "test-engine").unwrap();
         metadata.idle_deadline_unix_ms = Some(10_000);
         persist_session_supervisor_metadata(temp.path(), &metadata)
             .await
@@ -10751,7 +7757,7 @@ mod tests {
             session_id: claim.run.hub_session_id.unwrap(),
             ownership_generation: 1,
             lifecycle_status: "online".into(),
-            native_thread_id: None,
+            native_session_id: None,
             active_run_id: None,
         }];
         let recovery = plan_session_recovery(temp.path(), runtime_id, &snapshots, 1)
@@ -10948,44 +7954,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn version_switch_upgrades_an_idle_intent_without_double_checkpointing() {
-        let temp = tempfile::tempdir().unwrap();
-        let runtime_id = Uuid::new_v4();
-        let manager = SessionSupervisorManager::new_with_idle_timeout(
-            temp.path().to_path_buf(),
-            runtime_id,
-            1,
-            Duration::from_secs(900),
-        );
-        let mut claim = test_claim();
-        claim.run.hub_session_id = Some(Uuid::new_v4());
-        manager.reserve_claim(&claim).unwrap();
-        manager.complete_fake_claim(&claim).await.unwrap();
-        let session_id = claim.run.hub_session_id.unwrap();
-
-        manager
-            .request_checkpoint(session_id, 1, RuntimeCheckpointReason::Idle)
-            .unwrap();
-        manager
-            .request_checkpoint(session_id, 1, RuntimeCheckpointReason::VersionSwitch)
-            .unwrap();
-
-        assert_eq!(
-            manager.take_due_checkpoint_requests().await.unwrap(),
-            vec![RuntimeCheckpointRequest {
-                session_id,
-                ownership_generation: 1,
-                reason: RuntimeCheckpointReason::VersionSwitch,
-            }]
-        );
-        assert!(manager
-            .take_due_checkpoint_requests()
-            .await
-            .unwrap()
-            .is_empty());
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn heartbeat_checkpoint_command_registers_a_drain_intent() {
         let temp = tempfile::tempdir().unwrap();
         let runtime_id = Uuid::new_v4();
@@ -11017,7 +7985,7 @@ mod tests {
                 command: "checkpoint".into(),
                 run_id: None,
                 turn_id: None,
-                native_thread_id: None,
+                native_session_id: None,
                 native_turn_id: None,
                 message: None,
                 configuration_revision: None,
@@ -11341,27 +8309,16 @@ mod tests {
             write_heartbeat_response(&mut successful, false, false, false);
         });
         let client = hub_client_from_stored(&config, runtime_http_client().unwrap(), &stored);
-        let codex_rollout = RuntimeCodexState::new(&config);
 
-        assert!(send_runtime_heartbeat(
-            &config,
-            &client,
-            &mut stored,
-            Some(&manager),
-            &codex_rollout,
-        )
-        .await
-        .is_err());
+        assert!(
+            send_runtime_heartbeat(&config, &client, &mut stored, Some(&manager))
+                .await
+                .is_err()
+        );
         assert_eq!(manager.heartbeat_request().cleaned_sessions, vec![expected]);
-        send_runtime_heartbeat(
-            &config,
-            &client,
-            &mut stored,
-            Some(&manager),
-            &codex_rollout,
-        )
-        .await
-        .unwrap();
+        send_runtime_heartbeat(&config, &client, &mut stored, Some(&manager))
+            .await
+            .unwrap();
         assert!(manager.heartbeat_request().cleaned_sessions.is_empty());
         server.join().unwrap();
     }
@@ -11927,7 +8884,7 @@ mod tests {
         let transport = HubRuntimeCheckpointTransport {
             client,
             work_root: temp.path().to_path_buf(),
-            producing_codex_version: "test-codex".into(),
+            producing_engine_version: "test-engine".into(),
         };
 
         assert_eq!(
@@ -11977,7 +8934,7 @@ mod tests {
         let mut claim = test_claim();
         claim.run.hub_session_id = Some(Uuid::new_v4());
         let mut metadata =
-            session_supervisor_metadata_for_claim(runtime_id, &claim, "test-codex").unwrap();
+            session_supervisor_metadata_for_claim(runtime_id, &claim, "test-engine").unwrap();
         metadata.lifecycle_status = "saving".into();
         metadata.checkpoint_reason = Some(RuntimeCheckpointReason::Drain);
         metadata.checkpoint_retry_unix_ms = Some(10_000);
@@ -11988,7 +8945,7 @@ mod tests {
             session_id: claim.run.hub_session_id.unwrap(),
             ownership_generation: 1,
             lifecycle_status: "saving".into(),
-            native_thread_id: None,
+            native_session_id: None,
             active_run_id: None,
         }];
         let recovery = plan_session_recovery(temp.path(), runtime_id, &snapshots, 1)
@@ -12070,15 +9027,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tampered_owned_skill_marker_cannot_delete_outside_codex_home() {
+    async fn tampered_pi_owned_skill_marker_cannot_delete_outside_engine_state_root() {
         let temp = tempfile::tempdir().unwrap();
         let original = test_claim();
         let env = prepare_run_env(temp.path(), &original, None).await.unwrap();
         let sentinel = env.workdir.join("must-survive.txt");
         fs::write(&sentinel, "workspace state").await.unwrap();
 
-        let marker_path = env.codex_home.join(MATERIALIZATION_MARKER_FILE);
-        let mut marker: ExecutionMaterializationMarker =
+        let agent_dir = pi_agent_directory(&env.engine_state_root);
+        let marker_path = agent_dir.join(PI_MATERIALIZATION_MARKER_FILE);
+        let mut marker: PiExecutionMaterializationMarker =
             serde_json::from_slice(&fs::read(&marker_path).await.unwrap()).unwrap();
         marker.owned_skill_directories = vec!["../../workspace".into()];
         write_private_file(&marker_path, &serde_json::to_vec_pretty(&marker).unwrap()).unwrap();
@@ -12095,207 +9053,12 @@ mod tests {
             fs::read_to_string(&sentinel).await.unwrap(),
             "workspace state"
         );
-        let repaired: ExecutionMaterializationMarker =
+        let repaired: PiExecutionMaterializationMarker =
             serde_json::from_slice(&fs::read(&marker_path).await.unwrap()).unwrap();
         assert_eq!(
             repaired.owned_skill_directories,
             vec![skill_directory_name("repo-review")]
         );
-    }
-
-    #[tokio::test]
-    async fn restart_reconciliation_recovers_only_current_generation_and_keeps_blocked_capacity() {
-        let temp = tempfile::tempdir().unwrap();
-        let runtime_id = Uuid::new_v4();
-        let current_id = Uuid::new_v4();
-        let stale_id = Uuid::new_v4();
-        let foreign_id = Uuid::new_v4();
-        let missing_id = Uuid::new_v4();
-        let orphan_id = Uuid::new_v4();
-        for metadata in [
-            SessionSupervisorMetadata {
-                format_version: 1,
-                session_id: current_id,
-                runtime_id,
-                ownership_generation: 4,
-                lifecycle_status: "online".into(),
-                idle_deadline_unix_ms: None,
-                checkpoint_reason: None,
-                checkpoint_retry_unix_ms: None,
-                hub_checkpoint_attempt_id: None,
-                codex_version: "test-codex".into(),
-                native_thread_id: Some("thread-current".into()),
-            },
-            SessionSupervisorMetadata {
-                format_version: 1,
-                session_id: stale_id,
-                runtime_id,
-                ownership_generation: 2,
-                lifecycle_status: "online".into(),
-                idle_deadline_unix_ms: None,
-                checkpoint_reason: None,
-                checkpoint_retry_unix_ms: None,
-                hub_checkpoint_attempt_id: None,
-                codex_version: "test-codex".into(),
-                native_thread_id: Some("thread-stale".into()),
-            },
-            SessionSupervisorMetadata {
-                format_version: 1,
-                session_id: foreign_id,
-                runtime_id: Uuid::new_v4(),
-                ownership_generation: 1,
-                lifecycle_status: "online".into(),
-                idle_deadline_unix_ms: None,
-                checkpoint_reason: None,
-                checkpoint_retry_unix_ms: None,
-                hub_checkpoint_attempt_id: None,
-                codex_version: "test-codex".into(),
-                native_thread_id: None,
-            },
-            SessionSupervisorMetadata {
-                format_version: 1,
-                session_id: orphan_id,
-                runtime_id,
-                ownership_generation: 1,
-                lifecycle_status: "online".into(),
-                idle_deadline_unix_ms: None,
-                checkpoint_reason: None,
-                checkpoint_retry_unix_ms: None,
-                hub_checkpoint_attempt_id: None,
-                codex_version: "test-codex".into(),
-                native_thread_id: None,
-            },
-        ] {
-            persist_session_supervisor_metadata(temp.path(), &metadata)
-                .await
-                .unwrap();
-        }
-        let snapshots = vec![
-            RuntimeOwnedSessionSnapshotDto {
-                session_id: current_id,
-                ownership_generation: 4,
-                lifecycle_status: "online".into(),
-                native_thread_id: Some("thread-current".into()),
-                active_run_id: None,
-            },
-            RuntimeOwnedSessionSnapshotDto {
-                session_id: stale_id,
-                ownership_generation: 3,
-                lifecycle_status: "online".into(),
-                native_thread_id: Some("thread-current-stale-session".into()),
-                active_run_id: None,
-            },
-            RuntimeOwnedSessionSnapshotDto {
-                session_id: foreign_id,
-                ownership_generation: 1,
-                lifecycle_status: "online".into(),
-                native_thread_id: None,
-                active_run_id: None,
-            },
-            RuntimeOwnedSessionSnapshotDto {
-                session_id: missing_id,
-                ownership_generation: 1,
-                lifecycle_status: "online".into(),
-                native_thread_id: None,
-                active_run_id: None,
-            },
-        ];
-
-        let recovery = plan_session_recovery(temp.path(), runtime_id, &snapshots, 3)
-            .await
-            .unwrap();
-
-        assert_eq!(recovery.records.len(), 4);
-        assert_eq!(recovery.available_new_session_slots(), 0);
-        assert!(matches!(
-            recovery.record(current_id).unwrap().status,
-            LocalSessionRecoveryStatus::Ready(_)
-        ));
-        for blocked in [stale_id, foreign_id, missing_id] {
-            assert!(matches!(
-                recovery.record(blocked).unwrap().status,
-                LocalSessionRecoveryStatus::Blocked(_)
-            ));
-        }
-        let current_metadata = SessionPaths::for_session(temp.path(), current_id)
-            .supervisor
-            .join(SESSION_SUPERVISOR_METADATA_FILE);
-        let encoded = fs::read_to_string(current_metadata).await.unwrap();
-        assert!(encoded.contains("thread-current"));
-        assert!(!encoded.contains("credential"));
-        assert!(!encoded.contains("secret"));
-        assert!(SessionPaths::for_session(temp.path(), stale_id)
-            .root
-            .is_dir());
-        assert!(SessionPaths::for_session(temp.path(), foreign_id)
-            .root
-            .is_dir());
-        assert!(SessionPaths::for_session(temp.path(), orphan_id)
-            .root
-            .is_dir());
-
-        let starts = temp.path().join("recovery-starts");
-        let pid_file = temp.path().join("recovery-pid");
-        let script = temp.path().join("recovery-fake-codex");
-        std::fs::write(
-            &script,
-            format!(
-                r#"#!/bin/sh
-echo start >> {}
-echo $$ > {}
-while IFS= read -r line; do
-  case "$line" in
-    *'"method":"initialize"'*) echo '{{"id":1,"result":{{}}}}' ;;
-  esac
-done
-"#,
-                shell_single_quote(&starts),
-                shell_single_quote(&pid_file),
-            ),
-        )
-        .unwrap();
-        make_executable(&script);
-        let manager =
-            SessionSupervisorManager::recover_cold(temp.path().to_path_buf(), runtime_id, recovery);
-        assert_eq!(
-            manager.ready_owned_sessions(),
-            vec![RuntimeOwnedSessionGenerationDto {
-                session_id: current_id,
-                ownership_generation: 4,
-            }]
-        );
-        assert_eq!(manager.blocked_session_count(), 3);
-        assert!(!starts.exists());
-
-        let mut claim = test_claim();
-        claim.run.hub_session_id = Some(current_id);
-        claim.run.session_ownership_generation = Some(4);
-        let run_env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
-        manager
-            .ensure_app_server(
-                SessionSupervisorMetadata {
-                    format_version: 1,
-                    session_id: current_id,
-                    runtime_id,
-                    ownership_generation: 4,
-                    lifecycle_status: "online".into(),
-                    idle_deadline_unix_ms: None,
-                    checkpoint_reason: None,
-                    checkpoint_retry_unix_ms: None,
-                    hub_checkpoint_attempt_id: None,
-                    codex_version: "test-codex".into(),
-                    native_thread_id: Some("thread-current".into()),
-                },
-                script.display().to_string(),
-                run_env,
-                Duration::from_secs(2),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(std::fs::read_to_string(starts).unwrap().lines().count(), 1);
-        manager.shutdown();
-        assert_process_group_reaped_or_clean_up(&pid_file);
     }
 
     #[tokio::test]
@@ -12311,7 +9074,7 @@ done
                 session_id,
                 ownership_generation: 3,
                 lifecycle_status: "restoring".into(),
-                native_thread_id: None,
+                native_session_id: None,
                 active_run_id: Some(run_id),
             }],
             1,
@@ -12391,7 +9154,7 @@ done
                 session_id,
                 ownership_generation: 3,
                 lifecycle_status: "restoring".into(),
-                native_thread_id: None,
+                native_session_id: None,
                 active_run_id: Some(run_id),
             }],
             1,
@@ -12451,300 +9214,10 @@ done
         hub.abort();
     }
 
-    #[tokio::test]
-    async fn managed_turn_started_event_persists_native_thread_before_hub_upload() {
-        let temp = tempfile::tempdir().unwrap();
-        let script = temp.path().join("managed-turn-started-codex");
-        std::fs::write(
-            &script,
-            r#"#!/bin/sh
-while IFS= read -r line; do
-  case "$line" in
-    *'"method":"initialize"'*) echo '{"id":1,"result":{}}' ;;
-  esac
-done
-"#,
-        )
-        .unwrap();
-        make_executable(&script);
-        let runtime_id = Uuid::new_v4();
-        let mut claim = test_claim();
-        let session_id = Uuid::new_v4();
-        claim.run.hub_session_id = Some(session_id);
-        claim.run.session_ownership_generation = Some(5);
-        let run_env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
-        let manager = SessionSupervisorManager::new(temp.path().to_path_buf(), runtime_id, 1);
-        manager
-            .ensure_app_server(
-                session_supervisor_metadata_for_claim(runtime_id, &claim, "test-codex").unwrap(),
-                script.display().to_string(),
-                run_env,
-                Duration::from_secs(2),
-                None,
-            )
-            .await
-            .unwrap();
-        let event = AppendRunEventRequest {
-            event_type: "turn_started".into(),
-            role: None,
-            content: None,
-            payload: json!({
-                "native_thread_id": "managed-thread",
-                "native_turn_id": "managed-turn"
-            }),
-            waiting_tool: None,
-        };
-
-        persist_managed_native_thread_from_event(&manager, session_id, 5, &event)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            manager.records.lock().unwrap()[&session_id]
-                .snapshot
-                .native_thread_id
-                .as_deref(),
-            Some("managed-thread")
-        );
-        let metadata: SessionSupervisorMetadata = serde_json::from_slice(
-            &std::fs::read(
-                SessionPaths::for_session(temp.path(), session_id)
-                    .supervisor
-                    .join(SESSION_SUPERVISOR_METADATA_FILE),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(metadata.native_thread_id.as_deref(), Some("managed-thread"));
-        manager.shutdown();
-    }
-
-    #[tokio::test]
-    async fn heartbeat_native_thread_mismatch_blocks_session_and_releases_live_resources() {
-        let temp = tempfile::tempdir().unwrap();
-        let pid_file = temp.path().join("thread-mismatch-pid");
-        let script = temp.path().join("thread-mismatch-codex");
-        std::fs::write(
-            &script,
-            format!(
-                r#"#!/bin/sh
-echo $$ > {}
-while IFS= read -r line; do
-  case "$line" in
-    *'"method":"initialize"'*) echo '{{"id":1,"result":{{}}}}' ;;
-  esac
-done
-"#,
-                shell_single_quote(&pid_file),
-            ),
-        )
-        .unwrap();
-        make_executable(&script);
-        let runtime_id = Uuid::new_v4();
-        let session_id = Uuid::new_v4();
-        let manager = SessionSupervisorManager::new(temp.path().to_path_buf(), runtime_id, 1);
-        let client = HubClient {
-            http: reqwest::Client::new(),
-            hub_url: "http://127.0.0.1:1".into(),
-            runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
-            protocol_capabilities: HashSet::new(),
-        };
-        let mut claim = test_claim();
-        claim.run.hub_session_id = Some(session_id);
-        claim.run.session_ownership_generation = Some(5);
-        let proxy = Arc::new(
-            start_model_proxy(
-                &client,
-                claim.run.id,
-                &claim.model_proxy_token,
-                Duration::from_secs(1),
-            )
-            .await
-            .unwrap(),
-        );
-        let proxy_addr: SocketAddr = proxy
-            .base_url
-            .trim_start_matches("http://")
-            .trim_end_matches("/v1")
-            .parse()
-            .unwrap();
-        let run_env = prepare_run_env(temp.path(), &claim, Some(&proxy.base_url))
-            .await
-            .unwrap();
-        manager
-            .ensure_app_server(
-                SessionSupervisorMetadata {
-                    format_version: 1,
-                    session_id,
-                    runtime_id,
-                    ownership_generation: 5,
-                    lifecycle_status: "online".into(),
-                    idle_deadline_unix_ms: None,
-                    checkpoint_reason: None,
-                    checkpoint_retry_unix_ms: None,
-                    hub_checkpoint_attempt_id: None,
-                    codex_version: "test-codex".into(),
-                    native_thread_id: Some("local-thread".into()),
-                },
-                script.display().to_string(),
-                run_env,
-                Duration::from_secs(2),
-                Some(Arc::clone(&proxy)),
-            )
-            .await
-            .unwrap();
-        drop(proxy);
-
-        assert!(manager
-            .reconcile_owned_snapshots(&[RuntimeOwnedSessionSnapshotDto {
-                session_id,
-                ownership_generation: 5,
-                lifecycle_status: "online".into(),
-                native_thread_id: None,
-                active_run_id: None,
-            }])
-            .unwrap()
-            .is_empty());
-        assert_eq!(manager.ready_owned_sessions().len(), 1);
-
-        assert!(manager
-            .reconcile_owned_snapshots(&[RuntimeOwnedSessionSnapshotDto {
-                session_id,
-                ownership_generation: 5,
-                lifecycle_status: "online".into(),
-                native_thread_id: Some("different-hub-thread".into()),
-                active_run_id: None,
-            }])
-            .unwrap()
-            .is_empty());
-
-        assert!(manager.ready_owned_sessions().is_empty());
-        assert_eq!(manager.blocked_session_count(), 1);
-        assert_eq!(manager.available_new_session_slots(), 0);
-        assert!(manager.model_proxy(session_id).is_none());
-        assert_process_group_reaped_or_clean_up(&pid_file);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if tokio::net::TcpStream::connect(proxy_addr).await.is_err() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("native thread mismatch must close the model proxy listener");
-    }
-
-    #[tokio::test]
-    async fn hub_fenced_online_session_stops_app_server_before_workspace_cleanup() {
-        let temp = tempfile::tempdir().unwrap();
-        let pid_file = temp.path().join("deleted-agent-session-pid");
-        let script = temp.path().join("deleted-agent-session-codex");
-        std::fs::write(
-            &script,
-            format!(
-                r#"#!/bin/sh
-echo $$ > {}
-while IFS= read -r line; do
-  case "$line" in
-    *'"method":"initialize"'*) echo '{{"id":1,"result":{{}}}}' ;;
-  esac
-done
-"#,
-                shell_single_quote(&pid_file),
-            ),
-        )
-        .unwrap();
-        make_executable(&script);
-        let runtime_id = Uuid::new_v4();
-        let session_id = Uuid::new_v4();
-        let manager = SessionSupervisorManager::new(temp.path().to_path_buf(), runtime_id, 1);
-        let mut claim = test_claim();
-        claim.run.hub_session_id = Some(session_id);
-        claim.run.session_ownership_generation = Some(3);
-        let run_env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
-        manager
-            .ensure_app_server(
-                SessionSupervisorMetadata {
-                    format_version: 1,
-                    session_id,
-                    runtime_id,
-                    ownership_generation: 3,
-                    lifecycle_status: "online".into(),
-                    idle_deadline_unix_ms: None,
-                    checkpoint_reason: None,
-                    checkpoint_retry_unix_ms: None,
-                    hub_checkpoint_attempt_id: None,
-                    codex_version: "test-codex".into(),
-                    native_thread_id: Some("deleted-agent-thread".into()),
-                },
-                script.display().to_string(),
-                run_env,
-                Duration::from_secs(2),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let cleanup = manager
-            .reconcile_owned_snapshots(&[])
-            .unwrap()
-            .pop()
-            .expect("Hub-fenced online Session must reserve local cleanup");
-
-        assert!(manager.heartbeat_request().owned_sessions.is_empty());
-        assert_process_group_reaped_or_clean_up(&pid_file);
-        assert!(cleanup.path.join("workspace").is_dir());
-        fs::remove_dir_all(&cleanup.path).await.unwrap();
-        manager.complete_released_session_cleanup(&cleanup).unwrap();
-    }
-
-    #[tokio::test]
-    async fn mcp_secrets_are_injected_only_into_private_codex_config() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut claim = test_claim();
-        claim.execution_configuration.mcp_allowlist = json!([
-            {
-                "name": "filesystem",
-                "command": "fs",
-                "args": ["--root", "/workspace"],
-                "secrets": { "API_TOKEN": "super-secret-token" }
-            }
-        ]);
-        claim.agent.mcp_allowlist = claim.execution_configuration.mcp_allowlist.clone();
-        claim.expected_configuration_fingerprint =
-            execution_configuration_fingerprint(&claim.execution_configuration).unwrap();
-
-        let env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
-        let config_toml = fs::read_to_string(env.codex_home.join("config.toml"))
-            .await
-            .unwrap();
-        let allowlist = fs::read_to_string(env.codex_home.join("mcp-allowlist.json"))
-            .await
-            .unwrap();
-
-        assert!(config_toml.contains("[mcp_servers.filesystem]"));
-        assert!(config_toml.contains("API_TOKEN = \"super-secret-token\""));
-        assert!(!allowlist.contains("super-secret-token"));
-        assert!(allowlist.contains(REDACTED_SECRET));
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(env.codex_home.join("config.toml"))
-                .await
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode, 0o600);
-        }
-    }
-
     #[test]
-    fn fake_codex_emits_assistant_message() {
+    fn fake_engine_emits_assistant_message() {
         let claim = test_claim();
-        let (events, status) = fake_codex_events(&claim);
+        let (events, status) = fake_engine_events(&claim);
         assert_eq!(status, "completed");
         assert!(events
             .iter()
@@ -12752,10 +9225,10 @@ done
     }
 
     #[test]
-    fn invalid_codex_driver_is_rejected() {
-        assert!(validate_codex_driver("fake").is_ok());
-        assert!(validate_codex_driver("app-server").is_ok());
-        assert!(validate_codex_driver("typo").is_err());
+    fn invalid_engine_driver_is_rejected() {
+        assert!(validate_engine_driver("fake").is_ok());
+        assert!(validate_engine_driver("pi").is_ok());
+        assert!(validate_engine_driver("typo").is_err());
     }
 
     #[test]
@@ -12849,7 +9322,7 @@ done
             "command": "private-mcp",
             "secrets": { "TOKEN": MCP_SECRET }
         }]);
-        claim.execution_configuration.codex_subagents = vec![CodexSubagentDefinition {
+        claim.execution_configuration.subagents = vec![SubagentDefinition {
             name: "excluded".into(),
             description: "must not be materialized for Pi".into(),
             developer_instructions: "do not run".into(),
@@ -12862,7 +9335,7 @@ done
             execution_configuration_fingerprint(&claim.execution_configuration).unwrap();
         let paths = SessionPaths::for_claim(temp.path(), &claim).unwrap();
         fs::create_dir_all(&paths.workspace).await.unwrap();
-        fs::create_dir_all(&paths.codex).await.unwrap();
+        fs::create_dir_all(&paths.engine_state).await.unwrap();
         fs::create_dir_all(&paths.staging).await.unwrap();
 
         synchronize_pi_execution_configuration(
@@ -12877,7 +9350,7 @@ done
         .await
         .unwrap();
 
-        let agent_dir = paths.codex.join(".pi/agent");
+        let agent_dir = paths.engine_state.join(".pi/agent");
         assert_eq!(
             fs::read_to_string(agent_dir.join("AGENTS.md"))
                 .await
@@ -12943,7 +9416,7 @@ done
         let run_env = prepare_run_env(temp.path(), &claim, Some("http://127.0.0.1:1/v1"))
             .await
             .unwrap();
-        let cancellation = Arc::new(AppServerCancellation::default());
+        let cancellation = Arc::new(EngineCancellation::default());
         let mut process = pi_driver::PersistentPiRpcProcess::start(
             pi_bin.to_str().unwrap(),
             &run_env,
@@ -12954,11 +9427,14 @@ done
         )
         .unwrap();
 
-        assert!(!process.session_id().is_empty());
+        assert!(!process.native_session_id().is_empty());
         assert!(process.session_file().is_file());
         let result = process.execute(&claim, None).unwrap();
         assert_eq!(result.final_status, "completed");
-        assert_eq!(result.session_id.as_deref(), Some(process.session_id()));
+        assert_eq!(
+            result.native_session_id.as_deref(),
+            Some(process.native_session_id())
+        );
         assert_eq!(
             result.native_turn_id.as_deref(),
             Some(claim.run.id.to_string().as_str())
@@ -13054,7 +9530,7 @@ done
             None,
             &pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap(),
             Duration::from_secs(2),
-            Arc::new(AppServerCancellation::default()),
+            Arc::new(EngineCancellation::default()),
         )
         .unwrap();
 
@@ -13122,7 +9598,7 @@ done
         });
 
         let run_env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
-        let agent_dir = run_env.codex_home.join(".pi/agent");
+        let agent_dir = run_env.engine_state_root.join(".pi/agent");
         let catalog_path = agent_dir.join("agent-hub-integration-tools.json");
         let extension_path = agent_dir.join("agent-hub-integration-tools.mjs");
         let catalog: Value =
@@ -13255,7 +9731,7 @@ done
         let run_env = prepare_run_env(temp.path(), &claim, Some("http://127.0.0.1:1/v1"))
             .await
             .unwrap();
-        let cancellation = Arc::new(AppServerCancellation::default());
+        let cancellation = Arc::new(EngineCancellation::default());
         let mut process = pi_driver::PersistentPiRpcProcess::start(
             pi_bin.to_str().unwrap(),
             &run_env,
@@ -13293,7 +9769,7 @@ done
         let run_env = prepare_run_env(temp.path(), &claim, Some("http://127.0.0.1:1/v1"))
             .await
             .unwrap();
-        let cancellation = Arc::new(AppServerCancellation::default());
+        let cancellation = Arc::new(EngineCancellation::default());
         let mut process = pi_driver::PersistentPiRpcProcess::start(
             pi_bin.to_str().unwrap(),
             &run_env,
@@ -13320,13 +9796,13 @@ done
         let run_env = prepare_run_env(temp.path(), &claim, Some("http://127.0.0.1:1/v1"))
             .await
             .unwrap();
-        let cancellation = Arc::new(AppServerCancellation::default());
+        let cancellation = Arc::new(EngineCancellation::default());
         let mut process = pi_driver::PersistentPiRpcProcess::start(
             pi_bin.to_str().unwrap(),
             &run_env,
             None,
             &pi_driver::pi_tool_allowlist(&claim.agent),
-            Duration::from_millis(250),
+            Duration::from_secs(1),
             cancellation,
         )
         .unwrap();
@@ -13347,7 +9823,7 @@ done
         let run_env = prepare_run_env(temp.path(), &claim, Some("http://127.0.0.1:1/v1"))
             .await
             .unwrap();
-        let cancellation = Arc::new(AppServerCancellation::default());
+        let cancellation = Arc::new(EngineCancellation::default());
         let process = pi_driver::PersistentPiRpcProcess::start(
             pi_bin.to_str().unwrap(),
             &run_env,
@@ -13358,7 +9834,7 @@ done
         )
         .unwrap();
         let (command_tx, command_rx) = mpsc::channel();
-        let (event_tx, mut event_rx) = app_server_event_channel();
+        let (event_tx, mut event_rx) = engine_event_channel();
         let driver = std::thread::spawn(move || {
             let mut process = process;
             let mut deferred = VecDeque::new();
@@ -13421,7 +9897,7 @@ done
         )
         .await
         .unwrap();
-        let (event_tx, mut event_rx) = app_server_event_channel();
+        let (event_tx, mut event_rx) = engine_event_channel();
         let first_turn_id = first.run.id.to_string();
         let execution = tokio::spawn({
             let supervisor = Arc::clone(&supervisor);
@@ -13521,7 +9997,7 @@ done
         )
         .await
         .unwrap();
-        let (event_tx, mut event_rx) = app_server_event_channel();
+        let (event_tx, mut event_rx) = engine_event_channel();
         let first_turn_id = first.run.id.to_string();
         let execution = tokio::spawn({
             let supervisor = Arc::clone(&supervisor);
@@ -13561,7 +10037,7 @@ done
         );
 
         let session_file = SessionPaths::for_session(temp.path(), session_id)
-            .codex
+            .engine_state
             .join("sessions/fake-pi-session.jsonl");
         let session_events = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -13627,20 +10103,21 @@ done
             None,
             &pi_driver::pi_tool_allowlist(&first.agent),
             Duration::from_secs(2),
-            Arc::new(AppServerCancellation::default()),
+            Arc::new(EngineCancellation::default()),
         )
         .unwrap();
         assert_eq!(
             first_process.execute(&first, None).unwrap().final_status,
             "completed"
         );
-        let native_session_id = first_process.session_id().to_owned();
+        let native_session_id = first_process.native_session_id().to_owned();
         let first_session_file = first_process.session_file().to_path_buf();
         drop(first_process);
         assert_process_group_reaped_or_clean_up(&first_pid_file);
 
         let recovered_session_file =
-            pi_driver::discover_session_file(&run_env.codex_home, &native_session_id).unwrap();
+            pi_driver::discover_session_file(&run_env.engine_state_root, &native_session_id)
+                .unwrap();
         assert_eq!(recovered_session_file, first_session_file);
 
         let second_pid_file = temp.path().join("pi-cold-second.pid");
@@ -13659,10 +10136,10 @@ done
             Some(&recovered_session_file),
             &pi_driver::pi_tool_allowlist(&second.agent),
             Duration::from_secs(2),
-            Arc::new(AppServerCancellation::default()),
+            Arc::new(EngineCancellation::default()),
         )
         .unwrap();
-        assert_eq!(recovered_process.session_id(), native_session_id);
+        assert_eq!(recovered_process.native_session_id(), native_session_id);
         assert_eq!(recovered_process.session_file(), recovered_session_file);
         assert_eq!(
             recovered_process
@@ -13690,7 +10167,7 @@ done
         let run_env = prepare_run_env(temp.path(), &first, Some("http://127.0.0.1:1/v1"))
             .await
             .unwrap();
-        let cancellation = Arc::new(AppServerCancellation::default());
+        let cancellation = Arc::new(EngineCancellation::default());
         let mut process = pi_driver::PersistentPiRpcProcess::start(
             pi_bin.to_str().unwrap(),
             &run_env,
@@ -13855,7 +10332,7 @@ done
             None,
             &pi_driver::pi_tool_allowlist(&first.agent),
             Duration::from_secs(15),
-            Arc::new(AppServerCancellation::default()),
+            Arc::new(EngineCancellation::default()),
         )
         .unwrap();
 
@@ -13927,215 +10404,6 @@ done
         );
     }
 
-    #[test]
-    fn codex_config_uses_runtime_local_model_proxy_base_url() {
-        let claim = test_claim();
-        let config_toml = render_codex_config(
-            &claim.execution_configuration,
-            Some("http://127.0.0.1:4567/v1"),
-        )
-        .unwrap();
-
-        assert!(config_toml.contains("model_provider = \"agent_hub_"));
-        assert!(config_toml.contains("[model_providers.agent_hub_"));
-        assert!(config_toml.contains("base_url = \"http://127.0.0.1:4567/v1\""));
-        assert!(config_toml.contains("wire_api = \"responses\""));
-    }
-
-    #[test]
-    fn codex_config_materializes_native_multi_provider_models_and_reasoning() {
-        let mut claim = test_claim();
-        let default_binding_id = claim.execution_configuration.model_bindings[0].id;
-        claim.execution_configuration.model_bindings[0].model_settings = AgentModelSettings {
-            reasoning_effort: ReasoningEffort::High,
-            reasoning_summary: ModelReasoningSummary::Detailed,
-            verbosity: ModelVerbosity::Low,
-            context_window_tokens: Some(200_000),
-            auto_compact_token_limit: Some(160_000),
-            reasoning_summary_support: ModelReasoningSummarySupport::Supported,
-            service_tier: Some("priority".into()),
-            request_max_retries: Some(7),
-            stream_max_retries: Some(9),
-            stream_idle_timeout_ms: Some(420_000),
-            request_settings: ModelRequestSettings::OpenaiResponses {},
-        };
-        let override_binding_id = Uuid::from_u128(0x202);
-        let shared_connection_id =
-            claim.execution_configuration.model_bindings[0].model_connection_id;
-        claim
-            .execution_configuration
-            .model_bindings
-            .push(RunModelBindingDto {
-                id: override_binding_id,
-                run_id: claim.run.id,
-                binding_key: "reviewer".into(),
-                model_connection_id: shared_connection_id,
-                connection_name_snapshot: "Main model".into(),
-                connection_scope_snapshot: ModelConnectionScope::Global,
-                model_id: "gpt-main".into(),
-                api_type: ModelUpstreamProtocol::OpenaiResponses,
-                model_settings: AgentModelSettings {
-                    reasoning_effort: ReasoningEffort::Ultra,
-                    reasoning_summary: ModelReasoningSummary::Concise,
-                    verbosity: ModelVerbosity::High,
-                    context_window_tokens: Some(128_000),
-                    auto_compact_token_limit: Some(96_000),
-                    reasoning_summary_support: ModelReasoningSummarySupport::Unsupported,
-                    service_tier: Some("flex".into()),
-                    request_max_retries: Some(2),
-                    stream_max_retries: Some(3),
-                    stream_idle_timeout_ms: Some(300_000),
-                    request_settings: ModelRequestSettings::OpenaiResponses {},
-                },
-            });
-        claim.execution_configuration.codex_subagents = vec![CodexSubagentDefinition {
-            name: "reviewer".into(),
-            description: "Review the current change".into(),
-            developer_instructions: "Inspect correctness and security.".into(),
-            model_selection: None,
-            model_settings_override: AgentModelSettingsOverride {
-                reasoning_effort: ModelSettingOverride::Value(ReasoningEffort::Ultra),
-                ..AgentModelSettingsOverride::default()
-            },
-            enabled: true,
-            disabled_reason: None,
-        }];
-        let default_provider = model_provider_name(default_binding_id);
-        let override_provider = model_provider_name(override_binding_id);
-
-        let rendered = render_codex_config(
-            &claim.execution_configuration,
-            Some("http://127.0.0.1:4567/v1"),
-        )
-        .unwrap();
-        let parsed = rendered.parse::<toml::Value>().unwrap();
-
-        assert_eq!(parsed["model"].as_str(), Some("gpt-main"));
-        assert_eq!(
-            parsed["model_provider"].as_str(),
-            Some(default_provider.as_str())
-        );
-        assert_eq!(parsed["model_reasoning_effort"].as_str(), Some("high"));
-        assert_eq!(parsed["model_reasoning_summary"].as_str(), Some("detailed"));
-        assert_eq!(parsed["model_verbosity"].as_str(), Some("low"));
-        assert_eq!(parsed["model_context_window"].as_integer(), Some(200_000));
-        assert_eq!(
-            parsed["model_auto_compact_token_limit"].as_integer(),
-            Some(160_000)
-        );
-        assert_eq!(
-            parsed["model_supports_reasoning_summaries"].as_bool(),
-            Some(true)
-        );
-        assert_eq!(parsed["service_tier"].as_str(), Some("priority"));
-        assert_eq!(parsed["agents"]["max_threads"].as_integer(), Some(6));
-        assert_eq!(parsed["agents"]["max_depth"].as_integer(), Some(1));
-        for (binding_id, provider) in [
-            (default_binding_id, default_provider),
-            (override_binding_id, override_provider),
-        ] {
-            let provider = &parsed["model_providers"][&provider];
-            assert_eq!(
-                provider["base_url"].as_str(),
-                Some("http://127.0.0.1:4567/v1")
-            );
-            assert_eq!(provider["wire_api"].as_str(), Some("responses"));
-            assert_eq!(
-                provider["http_headers"]["x-agent-hub-model-binding-id"].as_str(),
-                Some(binding_id.to_string().as_str())
-            );
-            assert!(provider["http_headers"]
-                .get("x-agent-hub-model-connection-id")
-                .is_none());
-            assert!(provider.get("env_key").is_none());
-            let expected_transport = if binding_id == default_binding_id {
-                (7, 9, 420_000)
-            } else {
-                (2, 3, 300_000)
-            };
-            assert_eq!(
-                provider["request_max_retries"].as_integer(),
-                Some(expected_transport.0)
-            );
-            assert_eq!(
-                provider["stream_max_retries"].as_integer(),
-                Some(expected_transport.1)
-            );
-            assert_eq!(
-                provider["stream_idle_timeout_ms"].as_integer(),
-                Some(expected_transport.2)
-            );
-        }
-
-        let efforts = [
-            (ReasoningEffort::Default, None),
-            (ReasoningEffort::None, Some("none")),
-            (ReasoningEffort::Minimal, Some("minimal")),
-            (ReasoningEffort::Low, Some("low")),
-            (ReasoningEffort::Medium, Some("medium")),
-            (ReasoningEffort::High, Some("high")),
-            (ReasoningEffort::Xhigh, Some("xhigh")),
-            (ReasoningEffort::Max, Some("max")),
-            (ReasoningEffort::Ultra, Some("ultra")),
-        ];
-        for (effort, expected) in efforts {
-            claim.execution_configuration.model_bindings[0]
-                .model_settings
-                .reasoning_effort = effort;
-            let parsed = render_codex_config(
-                &claim.execution_configuration,
-                Some("http://127.0.0.1:4567/v1"),
-            )
-            .unwrap()
-            .parse::<toml::Value>()
-            .unwrap();
-            assert_eq!(
-                parsed
-                    .get("model_reasoning_effort")
-                    .and_then(toml::Value::as_str),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    #[ignore = "requires the installed Codex CLI"]
-    fn installed_codex_strictly_accepts_detailed_model_configuration() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut claim = test_claim();
-        claim.execution_configuration.model_bindings[0].model_settings = AgentModelSettings {
-            reasoning_effort: ReasoningEffort::High,
-            reasoning_summary: ModelReasoningSummary::Detailed,
-            verbosity: ModelVerbosity::Low,
-            context_window_tokens: Some(200_000),
-            auto_compact_token_limit: Some(160_000),
-            reasoning_summary_support: ModelReasoningSummarySupport::Supported,
-            service_tier: Some("flex".into()),
-            request_max_retries: Some(7),
-            stream_max_retries: Some(9),
-            stream_idle_timeout_ms: Some(420_000),
-            request_settings: ModelRequestSettings::OpenaiResponses {},
-        };
-        let config = render_codex_config(
-            &claim.execution_configuration,
-            Some("http://127.0.0.1:4567/v1"),
-        )
-        .unwrap();
-        stdfs::write(temp.path().join("config.toml"), config).unwrap();
-        let codex_bin = env::var("CODEX_BIN").unwrap_or_else(|_| "codex".into());
-        let output = Command::new(codex_bin)
-            .env("CODEX_HOME", temp.path())
-            .args(["app-server", "--strict-config", "--listen", "stdio://"])
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "Codex rejected generated config: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
     #[tokio::test]
     async fn native_model_materialization_ignores_legacy_provider_url_and_api_key() {
         const PROVIDER_URL: &str = "https://provider-secret.example";
@@ -14155,7 +10423,7 @@ done
         let run_env = prepare_run_env(temp.path(), &claim, Some("http://127.0.0.1:4567/v1"))
             .await
             .unwrap();
-        for entry in WalkDir::new(&run_env.codex_home) {
+        for entry in WalkDir::new(&run_env.engine_state_root) {
             let entry = entry.unwrap();
             if !entry.file_type().is_file() {
                 continue;
@@ -14165,7 +10433,7 @@ done
             assert!(!contents.contains(PROVIDER_URL));
             assert!(!contents.contains(PROVIDER_API_KEY));
         }
-        let (events, _) = fake_codex_events(&claim);
+        let (events, _) = fake_engine_events(&claim);
         let events = serde_json::to_string(&events).unwrap();
         assert!(!events.contains(PROVIDER_URL));
         assert!(!events.contains(PROVIDER_API_KEY));
@@ -14180,7 +10448,9 @@ done
         let request = runtime_register_request(&config);
 
         assert_eq!(request.sandbox_mode, "read-only");
-        assert_eq!(request.codex_version, config.codex_version);
+        assert_eq!(request.engine_version, config.engine_version);
+        assert_eq!(request.capabilities["mcp_allowlist"], false);
+        assert_eq!(request.capabilities["subagents"], false);
         assert_eq!(
             request.capabilities["sandbox"]["configured_mode"],
             "danger-full-access"
@@ -15009,7 +11279,7 @@ Transfer-Encoding: chunked\r\n\
                 1,
                 CompleteRunRequest {
                     status: "completed".into(),
-                    session_id: Some("thread".into()),
+                    native_session_id: Some("native-session".into()),
                     work_dir_ref: Some("workspace".into()),
                 },
             )
@@ -15043,1766 +11313,6 @@ Transfer-Encoding: chunked\r\n\
 
         assert!(forwarded.get("x-first-hop").is_none());
         assert!(forwarded.get("x-second-hop").is_none());
-    }
-
-    #[tokio::test]
-    async fn app_server_process_sends_json_rpc_lifecycle_and_reads_events() {
-        let temp = tempfile::tempdir().unwrap();
-        let transcript = temp.path().join("transcript.jsonl");
-        let script = temp.path().join("fake-codex");
-        let script_contents = format!(
-            r#"#!/bin/sh
-transcript={}
-: > "$transcript"
-while IFS= read -r line; do
-  echo "$line" >> "$transcript"
-  case "$line" in
-    *'"method":"initialize"'*) echo '{{"id":1,"result":{{"serverInfo":{{"name":"fake-codex"}}}}}}' ;;
-    *'"method":"thread/start"'*) echo '{{"id":2,"result":{{"thread":{{"id":"thread-from-result","sessionId":"session-from-thread"}}}}}}' ;;
-    *'"method":"turn/start"'*)
-      echo '{{"method":"item/agentMessage/delta","params":{{"delta":"hello from app server"}}}}'
-      echo '{{"method":"thread/tokenUsage/updated","params":{{"last":{{"input_tokens":1,"output_tokens":2}}}}}}'
-      echo '{{"method":"turn/completed","params":{{"thread":{{"id":"thread-from-result","sessionId":"session-from-complete"}},"turn":{{"status":"completed","items":[{{"type":"agentMessage","text":"hello from app server"}}]}}}}}}'
-      ;;
-  esac
-done
-"#,
-            shell_single_quote(&transcript)
-        );
-        std::fs::write(&script, script_contents).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let mut claim = test_claim();
-        claim.integration_context = Some(IntegrationContextDto {
-            tools: json!([{ "name": "echo", "description": "Echo input", "parameters": { "type": "object" } }]),
-            attachments: json!([]),
-            tool_result: None,
-        });
-        let run_env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
-        let result = run_app_server_process(
-            script.to_str().unwrap(),
-            &run_env.workdir,
-            &run_env.codex_home,
-            &claim,
-            Duration::from_secs(2),
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(result.final_status, "completed");
-        assert_eq!(result.session_id.as_deref(), Some("thread-from-result"));
-        assert_eq!(result.events.len(), 3);
-        assert!(result.events.iter().any(|event| {
-            event.event_type == "message_delta"
-                && event.content.as_deref() == Some("hello from app server")
-        }));
-        let message = result
-            .events
-            .iter()
-            .find(|event| event.event_type == "message")
-            .unwrap();
-        assert_eq!(message.role.as_deref(), Some("assistant"));
-        assert_eq!(message.content.as_deref(), Some("hello from app server"));
-        assert!(result
-            .events
-            .iter()
-            .any(|event| event.event_type == "usage"));
-
-        let methods = std::fs::read_to_string(&transcript)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .map(|value| value["method"].as_str().unwrap().to_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            methods,
-            vec!["initialize", "initialized", "thread/start", "turn/start"]
-        );
-
-        let turn_start = std::fs::read_to_string(&transcript)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .find(|value| value["method"] == "turn/start")
-            .unwrap();
-        assert_eq!(
-            turn_start["params"]["dynamicTools"],
-            claim.integration_context.unwrap().tools
-        );
-    }
-
-    #[tokio::test]
-    async fn app_server_process_streams_events_when_sender_is_available() {
-        let temp = tempfile::tempdir().unwrap();
-        let script = temp.path().join("streaming-fake-codex");
-        let script_contents = r#"#!/bin/sh
-while IFS= read -r line; do
-  case "$line" in
-    *'"method":"initialize"'*) echo '{"id":1,"result":{"serverInfo":{"name":"streaming-fake"}}}' ;;
-    *'"method":"thread/start"'*) echo '{"id":2,"result":{"thread":{"id":"stream-thread","sessionId":"stream-session"}}}' ;;
-    *'"method":"turn/start"'*)
-      echo '{"method":"item/agentMessage/delta","params":{"delta":"streamed"}}'
-      echo '{"method":"thread/tokenUsage/updated","params":{"last":{"input_tokens":1,"output_tokens":1}}}'
-      echo '{"method":"turn/completed","params":{"thread":{"id":"stream-thread","sessionId":"stream-session"},"turn":{"status":"completed","items":[]}}}'
-      ;;
-  esac
-done
-"#;
-        std::fs::write(&script, script_contents).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let claim = test_claim();
-        let run_env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
-        let (event_tx, mut event_rx) = app_server_event_channel();
-        let result = run_app_server_process(
-            script.to_str().unwrap(),
-            &run_env.workdir,
-            &run_env.codex_home,
-            &claim,
-            Duration::from_secs(2),
-            Some(event_tx),
-        )
-        .unwrap();
-
-        assert!(result.events.is_empty());
-        assert_eq!(result.session_id.as_deref(), Some("stream-thread"));
-        let mut streamed = Vec::new();
-        while let Ok(event) = event_rx.try_recv() {
-            streamed.push(event);
-        }
-        assert!(streamed.iter().any(|event| {
-            event.event_type == "message" && event.content.as_deref() == Some("streamed")
-        }));
-        assert!(streamed.iter().any(|event| event.event_type == "usage"));
-    }
-
-    #[test]
-    fn app_server_event_channel_has_a_fixed_capacity() {
-        let (event_tx, _event_rx) = app_server_event_channel();
-
-        assert_eq!(event_tx.max_capacity(), APP_SERVER_EVENT_QUEUE_CAPACITY);
-        assert_eq!(event_tx.capacity(), APP_SERVER_EVENT_QUEUE_CAPACITY);
-    }
-
-    #[test]
-    fn blocked_app_server_event_send_stops_when_the_run_is_cancelled() {
-        let (event_tx, _event_rx) = tokio_mpsc::channel(1);
-        event_tx.try_send(test_tool_request_event()).unwrap();
-        let cancellation = Arc::new(AppServerCancellation::default());
-        let worker_cancellation = Arc::clone(&cancellation);
-        let (done_tx, done_rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let result = send_app_server_event_with_backpressure(
-                &event_tx,
-                test_tool_request_event(),
-                &worker_cancellation,
-            );
-            done_tx.send(result).unwrap();
-        });
-
-        assert!(matches!(
-            done_rx.recv_timeout(Duration::from_millis(50)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ));
-        cancellation.cancel();
-        let result = done_rx
-            .recv_timeout(Duration::from_millis(500))
-            .expect("a cancelled producer must not remain blocked on a full queue");
-        assert!(result.unwrap_err().to_string().contains("cancelled"));
-    }
-
-    #[tokio::test]
-    async fn high_frequency_delta_backpressure_reaps_process_after_slow_hub_failure() {
-        let temp = tempfile::tempdir().unwrap();
-        let pid_file = temp.path().join("burst-codex.pid");
-        let completed_marker = temp.path().join("burst-completed");
-        let script = write_high_frequency_streaming_codex(&temp, &pid_file, &completed_marker);
-        let (client, hub_thread) = slow_failing_hub_client(Duration::from_millis(750));
-        let claim = test_claim();
-        let run_env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
-        let mut config = test_config();
-        config.codex_bin = script.display().to_string();
-        let mut last_heartbeat = Instant::now();
-
-        let error = tokio::time::timeout(
-            Duration::from_secs(3),
-            execute_app_server_with_streaming_with_heartbeat_interval(
-                &config,
-                &client,
-                &claim,
-                &run_env,
-                &mut last_heartbeat,
-                Duration::from_secs(30),
-            ),
-        )
-        .await
-        .expect("slow Hub failure must cancel a backpressured producer in bounded time")
-        .unwrap_err();
-
-        assert!(error.to_string().contains("500"));
-        assert!(
-            !completed_marker.exists(),
-            "the app-server must be backpressured before emitting the entire burst"
-        );
-        assert_process_group_reaped_or_clean_up(&pid_file);
-        hub_thread.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn streamed_event_append_failure_reaps_the_app_server_process_group() {
-        let temp = tempfile::tempdir().unwrap();
-        let pid_file = temp.path().join("event-failure-codex.pid");
-        let script = write_long_running_streaming_codex(&temp, &pid_file);
-        let (client, hub_thread) = failing_hub_client("/events");
-        let claim = test_claim();
-        let run_env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
-        let mut config = test_config();
-        config.codex_bin = script.display().to_string();
-        let mut last_heartbeat = Instant::now();
-
-        let error = execute_app_server_with_streaming_with_heartbeat_interval(
-            &config,
-            &client,
-            &claim,
-            &run_env,
-            &mut last_heartbeat,
-            Duration::from_secs(30),
-        )
-        .await
-        .unwrap_err();
-
-        assert!(error.to_string().contains("500"));
-        assert_process_group_reaped_or_clean_up(&pid_file);
-        hub_thread.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn streamed_heartbeat_failure_reaps_the_app_server_process_group() {
-        let temp = tempfile::tempdir().unwrap();
-        let pid_file = temp.path().join("heartbeat-failure-codex.pid");
-        let script = write_long_running_streaming_codex(&temp, &pid_file);
-        let (client, hub_thread) = failing_hub_client("/heartbeat");
-        let claim = test_claim();
-        let run_env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
-        let mut config = test_config();
-        config.codex_bin = script.display().to_string();
-        let mut last_heartbeat = Instant::now();
-
-        let error = execute_app_server_with_streaming_with_heartbeat_interval(
-            &config,
-            &client,
-            &claim,
-            &run_env,
-            &mut last_heartbeat,
-            Duration::from_millis(50),
-        )
-        .await
-        .unwrap_err();
-
-        assert!(error.to_string().contains("500"));
-        assert_process_group_reaped_or_clean_up(&pid_file);
-        hub_thread.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn app_server_process_does_not_inherit_hub_or_enrollment_secrets() {
-        let temp = tempfile::tempdir().unwrap();
-        let leak_file = temp.path().join("leak.txt");
-        let script = temp.path().join("env-check-codex");
-        let script_contents = format!(
-            r#"#!/bin/sh
-env | grep -E '^(HUB_MODEL_SECRET_KEY|RUNTIME_ENROLLMENT_TOKEN)=' > {} || true
-while IFS= read -r line; do
-  case "$line" in
-    *'"method":"initialize"'*) echo '{{"id":1,"result":{{"serverInfo":{{"name":"env-check"}}}}}}' ;;
-    *'"method":"thread/start"'*) echo '{{"id":2,"result":{{"thread":{{"id":"env-thread","sessionId":"env-session"}}}}}}' ;;
-    *'"method":"turn/start"'*) echo '{{"method":"turn/completed","params":{{"turn":{{"status":"completed","items":[{{"type":"agentMessage","text":"env ok"}}]}}}}}}' ;;
-  esac
-done
-"#,
-            shell_single_quote(&leak_file)
-        );
-        std::fs::write(&script, script_contents).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let claim = test_claim();
-        let run_env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
-        temp_env_var("HUB_MODEL_SECRET_KEY", "hub-model-secret", || {
-            temp_env_var("RUNTIME_ENROLLMENT_TOKEN", "enrollment-secret", || {
-                run_app_server_process(
-                    script.to_str().unwrap(),
-                    &run_env.workdir,
-                    &run_env.codex_home,
-                    &claim,
-                    Duration::from_secs(2),
-                    None,
-                )
-                .unwrap();
-            });
-        });
-
-        assert_eq!(std::fs::read_to_string(leak_file).unwrap_or_default(), "");
-    }
-
-    #[tokio::test]
-    async fn app_server_process_waits_for_initialize_response_before_continuing() {
-        let temp = tempfile::tempdir().unwrap();
-        let transcript = temp.path().join("strict-transcript.jsonl");
-        let script = temp.path().join("strict-fake-codex");
-        let script_contents = format!(
-            r#"#!/usr/bin/env bash
-set -euo pipefail
-transcript={}
-: > "$transcript"
-IFS= read -r line
-echo "$line" >> "$transcript"
-[[ "$line" == *'"method":"initialize"'* ]] || exit 65
-if IFS= read -r -t 0.2 early; then
-  echo "$early" >> "$transcript"
-  echo "request arrived before initialize response" >&2
-  exit 66
-fi
-echo '{{"id":1,"result":{{"serverInfo":{{"name":"strict-fake"}}}}}}'
-while IFS= read -r line; do
-  echo "$line" >> "$transcript"
-  case "$line" in
-    *'"method":"thread/start"'*) echo '{{"id":2,"result":{{"thread":{{"id":"strict-thread","sessionId":"strict-session"}}}}}}' ;;
-    *'"method":"turn/start"'*) echo '{{"method":"turn/completed","params":{{"thread":{{"id":"strict-thread","sessionId":"strict-session"}},"turn":{{"status":"completed","items":[{{"type":"agentMessage","text":"strict done"}}]}}}}}}' ;;
-  esac
-done
-"#,
-            shell_single_quote(&transcript)
-        );
-        std::fs::write(&script, script_contents).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let claim = test_claim();
-        let run_env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
-        let result = run_app_server_process(
-            script.to_str().unwrap(),
-            &run_env.workdir,
-            &run_env.codex_home,
-            &claim,
-            Duration::from_secs(3),
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(result.session_id.as_deref(), Some("strict-thread"));
-        let methods = std::fs::read_to_string(transcript)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .map(|value| value["method"].as_str().unwrap().to_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            methods,
-            vec!["initialize", "initialized", "thread/start", "turn/start"]
-        );
-    }
-
-    #[tokio::test]
-    async fn persistent_app_server_process_initializes_and_starts_thread_once_for_two_session_runs()
-    {
-        let temp = tempfile::tempdir().unwrap();
-        let request_log = temp.path().join("requests.log");
-        let thread_request_log = temp.path().join("thread-requests.log");
-        let pid_file = temp.path().join("pid");
-        let codex_home_file = temp.path().join("codex-home");
-        let script = temp.path().join("persistent-fake-codex");
-        std::fs::write(
-            &script,
-            format!(
-                r#"#!/bin/sh
-echo $$ > {}
-echo "$CODEX_HOME" > {}
-while IFS= read -r line; do
-  case "$line" in
-    *'"method":"initialize"'*) echo initialize >> {}; echo '{{"id":1,"result":{{"serverInfo":{{"name":"persistent"}}}}}}' ;;
-    *'"method":"initialized"'*) echo initialized >> {} ;;
-    *'"method":"thread/start"'*|*'"method":"thread/resume"'*) echo "$line" >> {}; echo thread >> {}; echo '{{"id":2,"result":{{"thread":{{"id":"persistent-thread"}}}}}}' ;;
-    *'"method":"turn/start"'*) echo turn >> {}; echo '{{"method":"item/agentMessage/completed","params":{{"type":"agentMessage","text":"done"}}}}'; echo '{{"method":"turn/completed","params":{{"turn":{{"status":"completed","items":[]}}}}}}' ;;
-  esac
-done
-"#,
-                shell_single_quote(&pid_file),
-                shell_single_quote(&codex_home_file),
-                shell_single_quote(&request_log),
-                shell_single_quote(&request_log),
-                shell_single_quote(&thread_request_log),
-                shell_single_quote(&request_log),
-                shell_single_quote(&request_log),
-            ),
-        )
-        .unwrap();
-        make_executable(&script);
-        let mut first = test_claim();
-        let session_id = Uuid::new_v4();
-        first.run.hub_session_id = Some(session_id);
-        let run_env = prepare_run_env(temp.path(), &first, None).await.unwrap();
-        let cancellation = Arc::new(AppServerCancellation::default());
-        let mut process = PersistentAppServerProcess::start(
-            script.to_str().unwrap(),
-            &run_env,
-            Duration::from_secs(2),
-            Arc::clone(&cancellation),
-        )
-        .unwrap();
-        let child_id = process.child_id();
-
-        let first_result = process.execute(&first, None).unwrap();
-        let mut second = first.clone();
-        second.run.id = Uuid::new_v4();
-        second.run.initial_message = "second".into();
-        let second_result = process.execute(&second, None).unwrap();
-
-        assert_eq!(process.child_id(), child_id);
-        assert_eq!(first_result.final_status, "completed");
-        assert_eq!(second_result.final_status, "completed");
-        assert_eq!(
-            first_result.session_id.as_deref(),
-            Some("persistent-thread")
-        );
-        assert_eq!(second_result.session_id, first_result.session_id);
-        let requests = std::fs::read_to_string(&request_log).unwrap();
-        assert_eq!(
-            requests
-                .lines()
-                .filter(|line| *line == "initialize")
-                .count(),
-            1
-        );
-        assert_eq!(
-            requests
-                .lines()
-                .filter(|line| *line == "initialized")
-                .count(),
-            1
-        );
-        assert_eq!(requests.lines().filter(|line| *line == "thread").count(), 1);
-        assert_eq!(requests.lines().filter(|line| *line == "turn").count(), 2);
-        assert!(std::fs::read_to_string(thread_request_log)
-            .unwrap()
-            .contains(&run_env.workdir.display().to_string()));
-        assert_eq!(
-            std::fs::read_to_string(codex_home_file).unwrap().trim(),
-            run_env.codex_home.display().to_string()
-        );
-        drop(process);
-        assert_process_group_reaped_or_clean_up(&pid_file);
-    }
-
-    #[tokio::test]
-    async fn persistent_app_server_process_correlates_unique_request_ids_to_responses() {
-        let temp = tempfile::tempdir().unwrap();
-        let transcript = temp.path().join("rpc-requests.log");
-        let script = temp.path().join("rpc-id-fake-codex");
-        std::fs::write(
-            &script,
-            format!(
-                r#"#!/bin/sh
-turn_number=0
-while IFS= read -r line; do
-  echo "$line" >> {}
-  request_id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-  case "$line" in
-    *'"method":"initialize"'*) echo "{{\"id\":$request_id,\"result\":{{\"serverInfo\":{{\"name\":\"rpc-id\"}}}}}}" ;;
-    *'"method":"thread/start"'*)
-      unrelated_id=$((request_id + 1000))
-      echo "{{\"id\":$unrelated_id,\"result\":{{\"thread\":{{\"id\":\"unrelated-thread\"}}}}}}"
-      echo "{{\"id\":$request_id,\"result\":{{\"thread\":{{\"id\":\"correlated-thread\"}}}}}}"
-      ;;
-    *'"method":"turn/start"'*)
-      turn_number=$((turn_number + 1))
-      echo "{{\"id\":$request_id,\"result\":{{\"turn\":{{\"id\":\"turn-$turn_number\"}}}}}}"
-      echo "{{\"method\":\"turn/completed\",\"params\":{{\"turn\":{{\"id\":\"turn-$turn_number\",\"status\":\"completed\",\"items\":[{{\"type\":\"agentMessage\",\"text\":\"done\"}}]}}}}}}"
-      ;;
-  esac
-done
-"#,
-                shell_single_quote(&transcript),
-            ),
-        )
-        .unwrap();
-        make_executable(&script);
-
-        let mut first = test_claim();
-        first.run.hub_session_id = Some(Uuid::new_v4());
-        let run_env = prepare_run_env(temp.path(), &first, None).await.unwrap();
-        let mut process = PersistentAppServerProcess::start(
-            script.to_str().unwrap(),
-            &run_env,
-            Duration::from_secs(2),
-            Arc::new(AppServerCancellation::default()),
-        )
-        .unwrap();
-
-        let first_result = process.execute(&first, None).unwrap();
-        let mut second = first.clone();
-        second.run.id = Uuid::new_v4();
-        second.run.initial_message = "second".into();
-        let second_result = process.execute(&second, None).unwrap();
-
-        assert_eq!(
-            first_result.session_id.as_deref(),
-            Some("correlated-thread")
-        );
-        assert_eq!(second_result.session_id, first_result.session_id);
-        let request_ids = std::fs::read_to_string(transcript)
-            .unwrap()
-            .lines()
-            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .filter_map(|request| request.get("id").and_then(serde_json::Value::as_u64))
-            .collect::<Vec<_>>();
-        assert_eq!(request_ids.len(), 4);
-        assert_eq!(request_ids.iter().copied().collect::<HashSet<_>>().len(), 4);
-    }
-
-    #[tokio::test]
-    async fn persistent_app_server_process_does_not_route_stale_turn_notifications_to_the_next_run()
-    {
-        let temp = tempfile::tempdir().unwrap();
-        let script = temp.path().join("stale-turn-fake-codex");
-        std::fs::write(
-            &script,
-            r#"#!/bin/sh
-turn_number=0
-while IFS= read -r line; do
-  request_id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-  case "$line" in
-    *'"method":"initialize"'*) echo "{\"id\":$request_id,\"result\":{}}" ;;
-    *'"method":"thread/start"'*) echo "{\"id\":$request_id,\"result\":{\"thread\":{\"id\":\"stale-thread\"}}}" ;;
-    *'"method":"turn/start"'*)
-      turn_number=$((turn_number + 1))
-      echo "{\"id\":$request_id,\"result\":{\"turn\":{\"id\":\"turn-$turn_number\"}}}"
-      echo "{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"stale-thread\",\"turn\":{\"id\":\"turn-$turn_number\",\"status\":\"completed\",\"items\":[{\"type\":\"agentMessage\",\"text\":\"fresh-$turn_number\"}]}}}"
-      if [ "$turn_number" -eq 1 ]; then
-        echo '{"method":"item/agentMessage/completed","params":{"threadId":"stale-thread","turnId":"turn-1","type":"agentMessage","text":"stale-message"}}'
-        echo '{"method":"thread/tokenUsage/updated","params":{"threadId":"stale-thread","turnId":"turn-1","totalTokens":999}}'
-        echo '{"method":"turn/completed","params":{"threadId":"stale-thread","turn":{"id":"turn-1","status":"completed","items":[]}}}'
-      fi
-      ;;
-  esac
-done
-"#,
-        )
-        .unwrap();
-        make_executable(&script);
-
-        let mut first = test_claim();
-        first.run.hub_session_id = Some(Uuid::new_v4());
-        let run_env = prepare_run_env(temp.path(), &first, None).await.unwrap();
-        let mut process = PersistentAppServerProcess::start(
-            script.to_str().unwrap(),
-            &run_env,
-            Duration::from_secs(2),
-            Arc::new(AppServerCancellation::default()),
-        )
-        .unwrap();
-        process.execute(&first, None).unwrap();
-        let mut second = first.clone();
-        second.run.id = Uuid::new_v4();
-
-        let second = process.execute(&second, None).unwrap();
-
-        let event_text = second
-            .events
-            .iter()
-            .filter_map(|event| event.content.as_deref())
-            .collect::<Vec<_>>();
-        assert_eq!(event_text, vec!["fresh-2"]);
-        assert!(!second.events.iter().any(|event| {
-            event.content.as_deref() == Some("stale-message")
-                || event.payload["turnId"] == "turn-1"
-                || event.payload["turn"]["id"] == "turn-1"
-        }));
-    }
-
-    #[tokio::test]
-    async fn session_supervisor_actor_serializes_runs_and_reaps_process_on_shutdown() {
-        let temp = tempfile::tempdir().unwrap();
-        let pid_file = temp.path().join("actor-pid");
-        let turn_log = temp.path().join("actor-turns.log");
-        let script = temp.path().join("actor-fake-codex");
-        std::fs::write(
-            &script,
-            format!(
-                r#"#!/bin/sh
-echo $$ > {}
-while IFS= read -r line; do
-  case "$line" in
-    *'"method":"initialize"'*) echo '{{"id":1,"result":{{}}}}' ;;
-    *'"method":"thread/start"'*|*'"method":"thread/resume"'*) echo '{{"id":2,"result":{{"thread":{{"id":"actor-thread"}}}}}}' ;;
-    *'"method":"turn/start"'*) echo start >> {}; sleep 0.12; echo done >> {}; echo '{{"method":"turn/completed","params":{{"turn":{{"status":"completed","items":[{{"type":"agentMessage","text":"actor done"}}]}}}}}}' ;;
-  esac
-done
-"#,
-                shell_single_quote(&pid_file),
-                shell_single_quote(&turn_log),
-                shell_single_quote(&turn_log),
-            ),
-        )
-        .unwrap();
-        make_executable(&script);
-        let mut first = test_claim();
-        let session_id = Uuid::new_v4();
-        first.run.hub_session_id = Some(session_id);
-        let run_env = prepare_run_env(temp.path(), &first, None).await.unwrap();
-        let supervisor = SessionSupervisor::start_app_server(
-            session_id,
-            1,
-            script.display().to_string(),
-            run_env,
-            Duration::from_secs(2),
-        )
-        .await
-        .unwrap();
-        let mut second = first.clone();
-        second.run.id = Uuid::new_v4();
-        let started = Instant::now();
-        let first_task = tokio::spawn({
-            let supervisor = Arc::clone(&supervisor);
-            async move { supervisor.execute(first, None).await }
-        });
-        let second_task = tokio::spawn({
-            let supervisor = Arc::clone(&supervisor);
-            async move { supervisor.execute(second, None).await }
-        });
-
-        first_task.await.unwrap().unwrap();
-        second_task.await.unwrap().unwrap();
-        assert!(started.elapsed() >= Duration::from_millis(200));
-        assert_eq!(
-            std::fs::read_to_string(&turn_log)
-                .unwrap()
-                .lines()
-                .collect::<Vec<_>>(),
-            vec!["start", "done", "start", "done"]
-        );
-        supervisor.shutdown();
-        assert_process_group_reaped_or_clean_up(&pid_file);
-        assert!(SessionPaths::for_session(temp.path(), session_id)
-            .root
-            .is_dir());
-    }
-
-    #[tokio::test]
-    async fn session_supervisor_steers_the_expected_active_turn_on_its_existing_connection() {
-        let temp = tempfile::tempdir().unwrap();
-        let ready = temp.path().join("steer-ready");
-        let steer_log = temp.path().join("steer-request.log");
-        let script = temp.path().join("steer-fake-codex");
-        std::fs::write(
-            &script,
-            format!(
-                r#"#!/bin/sh
-while IFS= read -r line; do
-  request_id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-  case "$line" in
-    *'"method":"initialize"'*) echo "{{\"id\":$request_id,\"result\":{{}}}}" ;;
-    *'"method":"thread/start"'*) echo "{{\"id\":$request_id,\"result\":{{\"thread\":{{\"id\":\"steer-thread\"}}}}}}" ;;
-    *'"method":"turn/start"'*)
-      echo "{{\"id\":$request_id,\"result\":{{\"turn\":{{\"id\":\"steer-turn\"}}}}}}"
-      echo "{{\"method\":\"turn/started\",\"params\":{{\"turn\":{{\"id\":\"steer-turn\"}}}}}}"
-      touch {}
-      ;;
-    *'"method":"turn/steer"'*)
-      echo "$line" >> {}
-      echo "{{\"id\":$request_id,\"result\":{{\"turnId\":\"steer-turn\"}}}}"
-      echo "{{\"method\":\"turn/completed\",\"params\":{{\"turn\":{{\"id\":\"steer-turn\",\"status\":\"completed\",\"items\":[{{\"type\":\"agentMessage\",\"text\":\"steered\"}}]}}}}}}"
-      ;;
-  esac
-done
-"#,
-                shell_single_quote(&ready),
-                shell_single_quote(&steer_log),
-            ),
-        )
-        .unwrap();
-        make_executable(&script);
-
-        let mut claim = test_claim();
-        let session_id = Uuid::new_v4();
-        claim.run.hub_session_id = Some(session_id);
-        let run_env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
-        let supervisor = SessionSupervisor::start_app_server(
-            session_id,
-            1,
-            script.display().to_string(),
-            run_env,
-            Duration::from_secs(2),
-        )
-        .await
-        .unwrap();
-        let execution = tokio::spawn({
-            let supervisor = Arc::clone(&supervisor);
-            async move { supervisor.execute(claim, None).await }
-        });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !ready.exists() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-
-        let message_id = Uuid::new_v4();
-        let outcome = supervisor
-            .steer(
-                1,
-                "steer-turn".into(),
-                message_id,
-                vec!["redirect now".into()],
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(outcome, SessionSteerOutcome::Applied);
-        assert_eq!(execution.await.unwrap().unwrap().final_status, "completed");
-        let request: serde_json::Value =
-            serde_json::from_str(std::fs::read_to_string(steer_log).unwrap().trim()).unwrap();
-        assert_eq!(request["params"]["threadId"], "steer-thread");
-        assert_eq!(request["params"]["expectedTurnId"], "steer-turn");
-        assert_eq!(
-            request["params"]["clientUserMessageId"],
-            message_id.to_string()
-        );
-        assert_eq!(request["params"]["input"][0]["text"], "redirect now");
-        supervisor.shutdown();
-    }
-
-    #[tokio::test]
-    async fn active_turn_keeps_its_configuration_and_next_turn_updates_without_restarting() {
-        let temp = tempfile::tempdir().unwrap();
-        let ready = temp.path().join("configuration-turn-ready");
-        let process_pid = temp.path().join("configuration-process.pid");
-        let turn_pid_log = temp.path().join("configuration-turn-pids.log");
-        let guidance_log = temp.path().join("configuration-guidance.log");
-        let request_log = temp.path().join("configuration-requests.log");
-        let script = temp.path().join("configuration-fake-codex");
-        std::fs::write(
-            &script,
-            format!(
-                r#"#!/bin/sh
-echo $$ > {}
-turn_number=0
-while IFS= read -r line; do
-  echo "$line" >> {}
-  request_id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-  case "$line" in
-    *'"method":"initialize"'*) echo "{{\"id\":$request_id,\"result\":{{}}}}" ;;
-    *'"method":"thread/start"'*|*'"method":"thread/resume"'*)
-      echo "{{\"id\":$request_id,\"result\":{{\"thread\":{{\"id\":\"configuration-thread\"}}}}}}"
-      ;;
-    *'"method":"thread/unsubscribe"'*)
-      echo "{{\"id\":$request_id,\"result\":{{}}}}"
-      ;;
-    *'"method":"turn/start"'*)
-      turn_number=$((turn_number + 1))
-      echo $$ >> {}
-      guidance=$(head -n 1 "$CODEX_HOME/AGENTS.md")
-      echo "turn-$turn_number:$guidance" >> {}
-      echo "{{\"id\":$request_id,\"result\":{{\"turn\":{{\"id\":\"configuration-turn-$turn_number\"}}}}}}"
-      echo "{{\"method\":\"turn/started\",\"params\":{{\"turn\":{{\"id\":\"configuration-turn-$turn_number\"}}}}}}"
-      if [ "$turn_number" -eq 1 ]; then
-        touch {}
-      else
-        echo "{{\"method\":\"turn/completed\",\"params\":{{\"turn\":{{\"id\":\"configuration-turn-2\",\"status\":\"completed\",\"items\":[]}}}}}}"
-      fi
-      ;;
-    *'"method":"turn/steer"'*)
-      guidance=$(head -n 1 "$CODEX_HOME/AGENTS.md")
-      echo "steer:$guidance" >> {}
-      echo "{{\"id\":$request_id,\"result\":{{\"turnId\":\"configuration-turn-1\"}}}}"
-      echo '{{"method":"turn/completed","params":{{"turn":{{"id":"configuration-turn-1","status":"completed","items":[]}}}}}}'
-      ;;
-  esac
-done
-"#,
-                shell_single_quote(&process_pid),
-                shell_single_quote(&request_log),
-                shell_single_quote(&turn_pid_log),
-                shell_single_quote(&guidance_log),
-                shell_single_quote(&ready),
-                shell_single_quote(&guidance_log),
-            ),
-        )
-        .unwrap();
-        make_executable(&script);
-
-        let mut first = test_claim();
-        let session_id = Uuid::new_v4();
-        first.run.hub_session_id = Some(session_id);
-        first.execution_configuration.instructions = "old guidance".into();
-        first.expected_configuration_fingerprint =
-            execution_configuration_fingerprint(&first.execution_configuration).unwrap();
-        first.agent.instructions = first.execution_configuration.instructions.clone();
-        let first_binding_id = first.execution_configuration.model_bindings[0].id;
-        let run_env = prepare_run_env(temp.path(), &first, None).await.unwrap();
-        let codex_home = run_env.codex_home.clone();
-        let supervisor = SessionSupervisor::start_app_server(
-            session_id,
-            1,
-            script.display().to_string(),
-            run_env,
-            Duration::from_secs(2),
-        )
-        .await
-        .unwrap();
-
-        let mut updated = first.clone();
-        updated.run.id = Uuid::new_v4();
-        updated.execution_configuration.revision += 1;
-        updated.execution_configuration.instructions = "updated guidance".into();
-        let updated_connection_id = Uuid::from_u128(0x202);
-        let updated_binding_id = Uuid::from_u128(0x203);
-        let updated_selection = ModelSelectionDto {
-            connection_id: updated_connection_id,
-            model_id: "gpt-updated".into(),
-        };
-        let updated_settings = AgentModelSettings {
-            reasoning_effort: ReasoningEffort::Ultra,
-            ..AgentModelSettings::default()
-        };
-        updated.execution_configuration.model_selection = Some(updated_selection.clone());
-        updated.execution_configuration.model_settings = updated_settings.clone();
-        updated.execution_configuration.model_bindings = vec![RunModelBindingDto {
-            id: updated_binding_id,
-            run_id: updated.run.id,
-            binding_key: "main".into(),
-            model_connection_id: updated_connection_id,
-            connection_name_snapshot: "Updated model".into(),
-            connection_scope_snapshot: ModelConnectionScope::Global,
-            model_id: "gpt-updated".into(),
-            api_type: ModelUpstreamProtocol::OpenaiResponses,
-            model_settings: updated_settings.clone(),
-        }];
-        updated.expected_configuration_fingerprint =
-            execution_configuration_fingerprint(&updated.execution_configuration).unwrap();
-        updated.agent.instructions = updated.execution_configuration.instructions.clone();
-        updated.agent.model_selection = Some(updated_selection);
-        updated.agent.model_settings = updated_settings;
-
-        let first_execution = tokio::spawn({
-            let supervisor = Arc::clone(&supervisor);
-            async move { supervisor.execute(first, None).await }
-        });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !ready.exists() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            fs::read_to_string(codex_home.join("AGENTS.md"))
-                .await
-                .unwrap(),
-            "old guidance\n"
-        );
-
-        let refresh_boundary = tokio::spawn({
-            let supervisor = Arc::clone(&supervisor);
-            async move { supervisor.wait_for_configuration_refresh().await }
-        });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(!refresh_boundary.is_finished());
-
-        assert_eq!(
-            supervisor
-                .steer(
-                    1,
-                    "configuration-turn-1".into(),
-                    Uuid::new_v4(),
-                    vec!["keep going".into()],
-                )
-                .await
-                .unwrap(),
-            SessionSteerOutcome::Applied
-        );
-        assert_eq!(
-            first_execution.await.unwrap().unwrap().final_status,
-            "completed"
-        );
-        refresh_boundary.await.unwrap().unwrap();
-
-        let mut online_refresh = updated.execution_configuration.clone();
-        online_refresh.model_selection = None;
-        online_refresh.model_settings = AgentModelSettings::default();
-        online_refresh.model_bindings.clear();
-        let online_refresh_fingerprint =
-            execution_configuration_fingerprint(&online_refresh).unwrap();
-        synchronize_execution_configuration(
-            &SessionPaths::for_session(temp.path(), session_id),
-            &online_refresh,
-            &online_refresh_fingerprint,
-            ModelConfigurationMaterialization::PreserveExisting,
-            None,
-        )
-        .await
-        .unwrap();
-        let preserved_config = fs::read_to_string(codex_home.join("config.toml"))
-            .await
-            .unwrap();
-        assert!(preserved_config.contains(&model_provider_name(first_binding_id)));
-        assert!(!preserved_config.contains(&model_provider_name(updated_binding_id)));
-
-        let _ = prepare_run_env(temp.path(), &updated, None).await.unwrap();
-        assert_eq!(
-            fs::read_to_string(codex_home.join("AGENTS.md"))
-                .await
-                .unwrap(),
-            "updated guidance\n"
-        );
-        assert_eq!(
-            supervisor
-                .execute(updated, None)
-                .await
-                .unwrap()
-                .final_status,
-            "completed"
-        );
-
-        assert_eq!(
-            std::fs::read_to_string(&guidance_log)
-                .unwrap()
-                .lines()
-                .collect::<Vec<_>>(),
-            vec![
-                "turn-1:old guidance",
-                "steer:old guidance",
-                "turn-2:updated guidance",
-            ]
-        );
-        let turn_pids = std::fs::read_to_string(&turn_pid_log)
-            .unwrap()
-            .lines()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        assert_eq!(turn_pids.len(), 2);
-        assert_eq!(turn_pids[0], turn_pids[1]);
-
-        let requests = std::fs::read_to_string(request_log)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            requests
-                .iter()
-                .filter(|request| request["method"] == "initialize")
-                .count(),
-            1
-        );
-        let unsubscribe = requests
-            .iter()
-            .find(|request| request["method"] == "thread/unsubscribe")
-            .expect("configuration refresh must unsubscribe the loaded Thread");
-        assert_eq!(unsubscribe["params"]["threadId"], "configuration-thread");
-        let resumes = requests
-            .iter()
-            .filter(|request| request["method"] == "thread/resume")
-            .collect::<Vec<_>>();
-        assert_eq!(resumes.len(), 1);
-        assert_eq!(resumes[0]["params"]["threadId"], "configuration-thread");
-        assert_eq!(resumes[0]["params"]["model"], "gpt-updated");
-        assert_eq!(
-            resumes[0]["params"]["modelProvider"],
-            model_provider_name(updated_binding_id)
-        );
-        assert_eq!(resumes[0]["params"]["excludeTurns"], true);
-        assert_eq!(resumes[0]["params"]["config"], json!({}));
-        let turns = requests
-            .iter()
-            .filter(|request| request["method"] == "turn/start")
-            .collect::<Vec<_>>();
-        assert_eq!(turns.len(), 2);
-        assert_eq!(turns[1]["params"]["model"], "gpt-updated");
-        assert_eq!(turns[1]["params"]["effort"], "ultra");
-
-        supervisor.shutdown();
-        assert_process_group_reaped_or_clean_up(&process_pid);
-    }
-
-    #[tokio::test]
-    async fn session_supervisor_interrupts_without_rollback_and_waits_for_interrupted_completion() {
-        let temp = tempfile::tempdir().unwrap();
-        let ready = temp.path().join("interrupt-ready");
-        let interrupt_log = temp.path().join("interrupt-request.log");
-        let script = temp.path().join("interrupt-fake-codex");
-        std::fs::write(
-            &script,
-            format!(
-                r#"#!/bin/sh
-turn_number=0
-while IFS= read -r line; do
-  request_id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-  case "$line" in
-    *'"method":"initialize"'*) echo "{{\"id\":$request_id,\"result\":{{}}}}" ;;
-    *'"method":"thread/start"'*) echo "{{\"id\":$request_id,\"result\":{{\"thread\":{{\"id\":\"interrupt-thread\"}}}}}}" ;;
-    *'"method":"turn/start"'*)
-      turn_number=$((turn_number + 1))
-      echo "{{\"id\":$request_id,\"result\":{{\"turn\":{{\"id\":\"interrupt-turn-$turn_number\"}}}}}}"
-      if [ "$turn_number" -eq 1 ]; then
-        echo effect-before-stop > effect.txt
-        echo '{{"method":"item/agentMessage/completed","params":{{"threadId":"interrupt-thread","turnId":"interrupt-turn-1","type":"agentMessage","text":"before stop"}}}}'
-        touch {}
-      else
-        echo '{{"method":"turn/completed","params":{{"threadId":"interrupt-thread","turn":{{"id":"interrupt-turn-2","status":"completed","items":[{{"type":"agentMessage","text":"continued"}}]}}}}}}'
-      fi
-      ;;
-    *'"method":"turn/interrupt"'*)
-      echo "$line" >> {}
-      echo "{{\"id\":$request_id,\"result\":{{}}}}"
-      sleep 0.08
-      echo '{{"method":"turn/completed","params":{{"threadId":"interrupt-thread","turn":{{"id":"interrupt-turn-1","status":"interrupted","items":[]}}}}}}'
-      ;;
-  esac
-done
-"#,
-                shell_single_quote(&ready),
-                shell_single_quote(&interrupt_log),
-            ),
-        )
-        .unwrap();
-        make_executable(&script);
-
-        let mut first = test_claim();
-        let session_id = Uuid::new_v4();
-        first.run.hub_session_id = Some(session_id);
-        let run_env = prepare_run_env(temp.path(), &first, None).await.unwrap();
-        let workspace = run_env.workdir.clone();
-        let supervisor = SessionSupervisor::start_app_server(
-            session_id,
-            1,
-            script.display().to_string(),
-            run_env,
-            Duration::from_secs(2),
-        )
-        .await
-        .unwrap();
-        let mut second = first.clone();
-        second.run.id = Uuid::new_v4();
-        let first_execution = tokio::spawn({
-            let supervisor = Arc::clone(&supervisor);
-            async move { supervisor.execute(first, None).await }
-        });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !ready.exists() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-
-        let started = Instant::now();
-        let outcome = supervisor
-            .interrupt(1, "interrupt-turn-1".into())
-            .await
-            .unwrap();
-
-        assert_eq!(outcome, SessionInterruptOutcome::Interrupted);
-        assert!(started.elapsed() >= Duration::from_millis(70));
-        let first_result = first_execution.await.unwrap().unwrap();
-        assert_eq!(first_result.final_status, "interrupted");
-        assert!(first_result.events.iter().any(|event| {
-            event.event_type == "message" && event.content.as_deref() == Some("before stop")
-        }));
-        assert_eq!(
-            std::fs::read_to_string(workspace.join("effect.txt"))
-                .unwrap()
-                .trim(),
-            "effect-before-stop"
-        );
-        let request: serde_json::Value =
-            serde_json::from_str(std::fs::read_to_string(interrupt_log).unwrap().trim()).unwrap();
-        assert_eq!(request["params"]["threadId"], "interrupt-thread");
-        assert_eq!(request["params"]["turnId"], "interrupt-turn-1");
-
-        let second_result = supervisor.execute(second, None).await.unwrap();
-        assert_eq!(second_result.final_status, "completed");
-        assert_eq!(
-            second_result.native_turn_id.as_deref(),
-            Some("interrupt-turn-2")
-        );
-        supervisor.shutdown();
-    }
-
-    #[tokio::test]
-    async fn session_supervisor_streams_native_turn_binding_before_turn_completion() {
-        let temp = tempfile::tempdir().unwrap();
-        let release = temp.path().join("release-turn");
-        let script = temp.path().join("turn-binding-fake-codex");
-        std::fs::write(
-            &script,
-            format!(
-                r#"#!/bin/sh
-while IFS= read -r line; do
-  request_id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-  case "$line" in
-    *'"method":"initialize"'*) echo "{{\"id\":$request_id,\"result\":{{}}}}" ;;
-    *'"method":"thread/start"'*) echo "{{\"id\":$request_id,\"result\":{{\"thread\":{{\"id\":\"binding-thread\"}}}}}}" ;;
-    *'"method":"turn/start"'*)
-      echo "{{\"id\":$request_id,\"result\":{{\"turn\":{{\"id\":\"binding-turn\"}}}}}}"
-      while [ ! -f {} ]; do sleep 0.01; done
-      echo '{{"method":"turn/completed","params":{{"threadId":"binding-thread","turn":{{"id":"binding-turn","status":"completed","items":[{{"type":"agentMessage","text":"done"}}]}}}}}}'
-      ;;
-  esac
-done
-"#,
-                shell_single_quote(&release),
-            ),
-        )
-        .unwrap();
-        make_executable(&script);
-
-        let mut claim = test_claim();
-        let session_id = Uuid::new_v4();
-        claim.run.hub_session_id = Some(session_id);
-        let run_env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
-        let supervisor = SessionSupervisor::start_app_server(
-            session_id,
-            1,
-            script.display().to_string(),
-            run_env,
-            Duration::from_secs(2),
-        )
-        .await
-        .unwrap();
-        let (event_tx, mut event_rx) = tokio_mpsc::channel(4);
-        let execution = tokio::spawn({
-            let supervisor = Arc::clone(&supervisor);
-            async move { supervisor.execute(claim, Some(event_tx)).await }
-        });
-
-        let event = tokio::time::timeout(Duration::from_millis(300), event_rx.recv())
-            .await
-            .expect("native Turn binding was not streamed before completion")
-            .unwrap();
-        assert_eq!(event.event_type, "turn_started");
-        assert_eq!(event.payload["native_thread_id"], "binding-thread");
-        assert_eq!(event.payload["native_turn_id"], "binding-turn");
-        std::fs::write(release, b"release").unwrap();
-        let result = execution.await.unwrap().unwrap();
-        assert_eq!(result.native_turn_id.as_deref(), Some("binding-turn"));
-        supervisor.shutdown();
-    }
-
-    #[tokio::test]
-    async fn steer_native_outcome_is_not_reapplied_while_hub_ack_retries() {
-        let temp = tempfile::tempdir().unwrap();
-        let ready = temp.path().join("ack-steer-ready");
-        let request_log = temp.path().join("ack-steer-requests");
-        let applied_log = temp.path().join("ack-steer-applied");
-        let script = temp.path().join("ack-steer-fake-codex");
-        std::fs::write(
-            &script,
-            format!(
-                r#"#!/bin/sh
-seen_message_id=''
-steer_count=0
-while IFS= read -r line; do
-  request_id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-  case "$line" in
-    *'"method":"initialize"'*) echo "{{\"id\":$request_id,\"result\":{{}}}}" ;;
-    *'"method":"thread/start"'*) echo "{{\"id\":$request_id,\"result\":{{\"thread\":{{\"id\":\"ack-thread\"}}}}}}" ;;
-    *'"method":"turn/start"'*)
-      echo "{{\"id\":$request_id,\"result\":{{\"turn\":{{\"id\":\"ack-turn\"}}}}}}"
-      touch {}
-      ;;
-    *'"method":"turn/steer"'*)
-      echo "$line" >> {}
-      message_id=$(printf '%s\n' "$line" | sed -n 's/.*"clientUserMessageId":"\([^"]*\)".*/\1/p')
-      if [ "$message_id" != "$seen_message_id" ]; then
-        echo "$message_id" >> {}
-        seen_message_id="$message_id"
-      fi
-      steer_count=$((steer_count + 1))
-      echo "{{\"id\":$request_id,\"result\":{{\"turnId\":\"ack-turn\"}}}}"
-      if [ "$steer_count" -eq 1 ]; then
-        echo '{{"method":"turn/completed","params":{{"threadId":"ack-thread","turn":{{"id":"ack-turn","status":"completed","items":[{{"type":"agentMessage","text":"done"}}]}}}}}}'
-      fi
-      ;;
-  esac
-done
-"#,
-                shell_single_quote(&ready),
-                shell_single_quote(&request_log),
-                shell_single_quote(&applied_log),
-            ),
-        )
-        .unwrap();
-        make_executable(&script);
-
-        let ack_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let ack_release = Arc::new(Notify::new());
-        let app = Router::new().route(
-            "/api/runtime/sessions/{session_id}/commands/{command_id}/complete",
-            post({
-                let ack_attempts = Arc::clone(&ack_attempts);
-                let ack_release = Arc::clone(&ack_release);
-                move || {
-                    let ack_attempts = Arc::clone(&ack_attempts);
-                    let ack_release = Arc::clone(&ack_release);
-                    async move {
-                        if ack_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                            AxumStatusCode::CONFLICT
-                        } else {
-                            ack_release.notified().await;
-                            AxumStatusCode::OK
-                        }
-                    }
-                }
-            }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let hub_addr = listener.local_addr().unwrap();
-        let hub = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = HubClient {
-            http: reqwest::Client::new(),
-            hub_url: format!("http://{hub_addr}"),
-            runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
-            protocol_capabilities: HashSet::new(),
-        };
-        let runtime_id = Uuid::new_v4();
-        let session_id = Uuid::new_v4();
-        let manager = Arc::new(SessionSupervisorManager::new(
-            temp.path().to_path_buf(),
-            runtime_id,
-            1,
-        ));
-        let mut claim = test_claim();
-        claim.run.hub_session_id = Some(session_id);
-        let run_env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
-        manager
-            .ensure_app_server(
-                SessionSupervisorMetadata {
-                    format_version: 1,
-                    session_id,
-                    runtime_id,
-                    ownership_generation: 1,
-                    lifecycle_status: "online".into(),
-                    idle_deadline_unix_ms: None,
-                    checkpoint_reason: None,
-                    checkpoint_retry_unix_ms: None,
-                    hub_checkpoint_attempt_id: None,
-                    codex_version: "test-codex".into(),
-                    native_thread_id: Some("ack-thread".into()),
-                },
-                script.display().to_string(),
-                run_env,
-                Duration::from_secs(2),
-                None,
-            )
-            .await
-            .unwrap();
-        let execution = tokio::spawn({
-            let manager = Arc::clone(&manager);
-            async move { manager.execute(claim, None).await }
-        });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !ready.exists() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-        let message_id = Uuid::new_v4();
-        let command = RuntimeSessionCommandDto {
-            command_id: message_id,
-            session_id,
-            ownership_generation: 1,
-            command: "steer".into(),
-            run_id: Some(Uuid::new_v4()),
-            turn_id: Some(Uuid::new_v4()),
-            native_thread_id: Some("ack-thread".into()),
-            native_turn_id: Some("ack-turn".into()),
-            message: Some(RuntimeSteeringMessageDto {
-                id: message_id,
-                sequence: 1,
-                content: "guide once".into(),
-            }),
-            configuration_revision: None,
-            fingerprint: None,
-            execution_configuration: None,
-        };
-
-        let dispatcher = Arc::new(RuntimeSessionCommandDispatcher::with_retry_delay(
-            Duration::from_millis(10),
-        ));
-        dispatcher.enqueue(&client, &manager, std::slice::from_ref(&command), None);
-        dispatcher.enqueue(&client, &manager, &[command], None);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while ack_attempts.load(Ordering::SeqCst) < 2 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-        assert!(!execution.is_finished());
-        assert!(!manager
-            .ready_owned_sessions()
-            .iter()
-            .any(|owned| owned.session_id == session_id));
-        ack_release.notify_one();
-        tokio::time::timeout(Duration::from_secs(1), execution)
-            .await
-            .expect("Turn completion remained blocked after command ACK succeeded")
-            .unwrap()
-            .unwrap();
-
-        let request_ids = std::fs::read_to_string(request_log)
-            .unwrap()
-            .lines()
-            .map(|line| {
-                serde_json::from_str::<serde_json::Value>(line).unwrap()["params"]
-                    ["clientUserMessageId"]
-                    .as_str()
-                    .unwrap()
-                    .to_owned()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(request_ids, vec![message_id.to_string()]);
-        assert_eq!(
-            std::fs::read_to_string(applied_log)
-                .unwrap()
-                .lines()
-                .collect::<Vec<_>>(),
-            vec![message_id.to_string()]
-        );
-        assert_eq!(ack_attempts.load(Ordering::SeqCst), 2);
-        manager.shutdown();
-        hub.abort();
-    }
-
-    #[tokio::test]
-    async fn blocked_interrupt_does_not_delay_other_sessions_or_repeat_across_heartbeats() {
-        let temp = tempfile::tempdir().unwrap();
-        let interrupt_ready = temp.path().join("parallel-interrupt-ready");
-        let interrupt_release = temp.path().join("parallel-interrupt-release");
-        let interrupt_log = temp.path().join("parallel-interrupt.log");
-        let steer_ready = temp.path().join("parallel-steer-ready");
-        let steer_log = temp.path().join("parallel-steer.log");
-        let interrupt_script = temp.path().join("parallel-interrupt-codex");
-        let steer_script = temp.path().join("parallel-steer-codex");
-        std::fs::write(
-            &interrupt_script,
-            format!(
-                r#"#!/bin/sh
-while IFS= read -r line; do
-  request_id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-  case "$line" in
-    *'"method":"initialize"'*) echo "{{\"id\":$request_id,\"result\":{{}}}}" ;;
-    *'"method":"thread/start"'*) echo "{{\"id\":$request_id,\"result\":{{\"thread\":{{\"id\":\"parallel-interrupt-thread\"}}}}}}" ;;
-    *'"method":"turn/start"'*)
-      echo "{{\"id\":$request_id,\"result\":{{\"turn\":{{\"id\":\"parallel-interrupt-turn\"}}}}}}"
-      touch {}
-      ;;
-    *'"method":"turn/interrupt"'*)
-      echo "$line" >> {}
-      echo "{{\"id\":$request_id,\"result\":{{}}}}"
-      while [ ! -f {} ]; do sleep 0.01; done
-      echo '{{"method":"turn/completed","params":{{"threadId":"parallel-interrupt-thread","turn":{{"id":"parallel-interrupt-turn","status":"interrupted","items":[]}}}}}}'
-      ;;
-  esac
-done
-"#,
-                shell_single_quote(&interrupt_ready),
-                shell_single_quote(&interrupt_log),
-                shell_single_quote(&interrupt_release),
-            ),
-        )
-        .unwrap();
-        std::fs::write(
-            &steer_script,
-            format!(
-                r#"#!/bin/sh
-while IFS= read -r line; do
-  request_id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-  case "$line" in
-    *'"method":"initialize"'*) echo "{{\"id\":$request_id,\"result\":{{}}}}" ;;
-    *'"method":"thread/start"'*) echo "{{\"id\":$request_id,\"result\":{{\"thread\":{{\"id\":\"parallel-steer-thread\"}}}}}}" ;;
-    *'"method":"turn/start"'*)
-      echo "{{\"id\":$request_id,\"result\":{{\"turn\":{{\"id\":\"parallel-steer-turn\"}}}}}}"
-      touch {}
-      ;;
-    *'"method":"turn/steer"'*)
-      echo "$line" >> {}
-      echo "{{\"id\":$request_id,\"result\":{{\"turnId\":\"parallel-steer-turn\"}}}}"
-      echo '{{"method":"turn/completed","params":{{"threadId":"parallel-steer-thread","turn":{{"id":"parallel-steer-turn","status":"completed","items":[]}}}}}}'
-      ;;
-  esac
-done
-"#,
-                shell_single_quote(&steer_ready),
-                shell_single_quote(&steer_log),
-            ),
-        )
-        .unwrap();
-        make_executable(&interrupt_script);
-        make_executable(&steer_script);
-
-        let acked = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let app = Router::new().route(
-            "/api/runtime/sessions/{session_id}/commands/{command_id}/complete",
-            post({
-                let acked = Arc::clone(&acked);
-                move |AxumPath((session_id, command_id)): AxumPath<(Uuid, Uuid)>| {
-                    let acked = Arc::clone(&acked);
-                    async move {
-                        acked.lock().unwrap().push((session_id, command_id));
-                        AxumStatusCode::OK
-                    }
-                }
-            }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let hub_addr = listener.local_addr().unwrap();
-        let hub = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = HubClient {
-            http: reqwest::Client::new(),
-            hub_url: format!("http://{hub_addr}"),
-            runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
-            protocol_capabilities: HashSet::new(),
-        };
-        let runtime_id = Uuid::new_v4();
-        let manager = Arc::new(SessionSupervisorManager::new(
-            temp.path().to_path_buf(),
-            runtime_id,
-            2,
-        ));
-        let interrupt_session_id = Uuid::new_v4();
-        let steer_session_id = Uuid::new_v4();
-        let mut interrupt_claim = test_claim();
-        interrupt_claim.run.hub_session_id = Some(interrupt_session_id);
-        let interrupt_env = prepare_run_env(temp.path(), &interrupt_claim, None)
-            .await
-            .unwrap();
-        manager
-            .ensure_app_server(
-                SessionSupervisorMetadata {
-                    format_version: 1,
-                    session_id: interrupt_session_id,
-                    runtime_id,
-                    ownership_generation: 1,
-                    lifecycle_status: "online".into(),
-                    idle_deadline_unix_ms: None,
-                    checkpoint_reason: None,
-                    checkpoint_retry_unix_ms: None,
-                    hub_checkpoint_attempt_id: None,
-                    codex_version: "test-codex".into(),
-                    native_thread_id: Some("parallel-interrupt-thread".into()),
-                },
-                interrupt_script.display().to_string(),
-                interrupt_env,
-                Duration::from_secs(2),
-                None,
-            )
-            .await
-            .unwrap();
-        let mut steer_claim = test_claim();
-        steer_claim.run.hub_session_id = Some(steer_session_id);
-        let steer_env = prepare_run_env(temp.path(), &steer_claim, None)
-            .await
-            .unwrap();
-        manager
-            .ensure_app_server(
-                SessionSupervisorMetadata {
-                    format_version: 1,
-                    session_id: steer_session_id,
-                    runtime_id,
-                    ownership_generation: 1,
-                    lifecycle_status: "online".into(),
-                    idle_deadline_unix_ms: None,
-                    checkpoint_reason: None,
-                    checkpoint_retry_unix_ms: None,
-                    hub_checkpoint_attempt_id: None,
-                    codex_version: "test-codex".into(),
-                    native_thread_id: Some("parallel-steer-thread".into()),
-                },
-                steer_script.display().to_string(),
-                steer_env,
-                Duration::from_secs(2),
-                None,
-            )
-            .await
-            .unwrap();
-        let interrupt_execution = tokio::spawn({
-            let manager = Arc::clone(&manager);
-            async move { manager.execute(interrupt_claim, None).await }
-        });
-        let steer_execution = tokio::spawn({
-            let manager = Arc::clone(&manager);
-            async move { manager.execute(steer_claim, None).await }
-        });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !(interrupt_ready.exists() && steer_ready.exists()) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-
-        let interrupt_command = RuntimeSessionCommandDto {
-            command_id: Uuid::new_v4(),
-            session_id: interrupt_session_id,
-            ownership_generation: 1,
-            command: "interrupt".into(),
-            run_id: Some(Uuid::new_v4()),
-            turn_id: Some(Uuid::new_v4()),
-            native_thread_id: Some("parallel-interrupt-thread".into()),
-            native_turn_id: Some("parallel-interrupt-turn".into()),
-            message: None,
-            configuration_revision: None,
-            fingerprint: None,
-            execution_configuration: None,
-        };
-        let steer_message_id = Uuid::new_v4();
-        let steer_command = RuntimeSessionCommandDto {
-            command_id: steer_message_id,
-            session_id: steer_session_id,
-            ownership_generation: 1,
-            command: "steer".into(),
-            run_id: Some(Uuid::new_v4()),
-            turn_id: Some(Uuid::new_v4()),
-            native_thread_id: Some("parallel-steer-thread".into()),
-            native_turn_id: Some("parallel-steer-turn".into()),
-            message: Some(RuntimeSteeringMessageDto {
-                id: steer_message_id,
-                sequence: 1,
-                content: "continue independently".into(),
-            }),
-            configuration_revision: None,
-            fingerprint: None,
-            execution_configuration: None,
-        };
-        let dispatcher = Arc::new(RuntimeSessionCommandDispatcher::with_retry_delay(
-            Duration::from_millis(10),
-        ));
-        dispatcher.enqueue(
-            &client,
-            &manager,
-            std::slice::from_ref(&interrupt_command),
-            None,
-        );
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !interrupt_log.exists() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-
-        let enqueued_at = Instant::now();
-        dispatcher.enqueue(
-            &client,
-            &manager,
-            &[interrupt_command.clone(), steer_command],
-            None,
-        );
-        assert!(enqueued_at.elapsed() < Duration::from_millis(50));
-        tokio::time::timeout(Duration::from_millis(300), async {
-            while !steer_log.exists() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("another Session steer was blocked behind an interrupt");
-        dispatcher.enqueue(
-            &client,
-            &manager,
-            std::slice::from_ref(&interrupt_command),
-            None,
-        );
-        assert_eq!(
-            std::fs::read_to_string(&interrupt_log)
-                .unwrap()
-                .lines()
-                .count(),
-            1
-        );
-        assert!(!interrupt_execution.is_finished());
-        tokio::time::timeout(Duration::from_secs(1), steer_execution)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-
-        std::fs::write(&interrupt_release, b"release").unwrap();
-        tokio::time::timeout(Duration::from_secs(1), interrupt_execution)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while acked.lock().unwrap().len() != 2 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-        manager.shutdown();
-        hub.abort();
-    }
-
-    #[tokio::test]
-    async fn session_manager_runs_two_sessions_concurrently_and_blocked_ownership_uses_capacity() {
-        let temp = tempfile::tempdir().unwrap();
-        let release = temp.path().join("release");
-        let make_barrier_codex = |name: &str| {
-            let script = temp.path().join(format!("barrier-codex-{name}"));
-            let pid = temp.path().join(format!("pid-{name}"));
-            let entered = temp.path().join(format!("entered-{name}"));
-            std::fs::write(
-                &script,
-                format!(
-                    r#"#!/bin/sh
-echo $$ > {}
-while IFS= read -r line; do
-  case "$line" in
-    *'"method":"initialize"'*) echo '{{"id":1,"result":{{}}}}' ;;
-    *'"method":"thread/start"'*|*'"method":"thread/resume"'*) echo '{{"id":2,"result":{{"thread":{{"id":"barrier-thread"}}}}}}' ;;
-    *'"method":"turn/start"'*) touch {}; while [ ! -f {} ]; do sleep 0.01; done; echo '{{"method":"turn/completed","params":{{"turn":{{"status":"completed","items":[{{"type":"agentMessage","text":"done"}}]}}}}}}' ;;
-  esac
-done
-"#,
-                    shell_single_quote(&pid),
-                    shell_single_quote(&entered),
-                    shell_single_quote(&release),
-                ),
-            )
-            .unwrap();
-            make_executable(&script);
-            (script, pid, entered)
-        };
-        let (first_bin, first_pid, first_entered) = make_barrier_codex("first");
-        let (second_bin, second_pid, second_entered) = make_barrier_codex("second");
-        let runtime_id = Uuid::new_v4();
-        let manager = Arc::new(SessionSupervisorManager::new(
-            temp.path().to_path_buf(),
-            runtime_id,
-            3,
-        ));
-        let blocked_id = Uuid::new_v4();
-        manager.reserve_blocked(
-            RuntimeOwnedSessionSnapshotDto {
-                session_id: blocked_id,
-                ownership_generation: 8,
-                lifecycle_status: "online".into(),
-                native_thread_id: None,
-                active_run_id: None,
-            },
-            "missing local metadata".into(),
-        );
-
-        let mut first = test_claim();
-        let first_session = Uuid::new_v4();
-        first.run.hub_session_id = Some(first_session);
-        let first_env = prepare_run_env(temp.path(), &first, None).await.unwrap();
-        let first_metadata = SessionSupervisorMetadata {
-            format_version: 1,
-            session_id: first_session,
-            runtime_id,
-            ownership_generation: 1,
-            lifecycle_status: "online".into(),
-            idle_deadline_unix_ms: None,
-            checkpoint_reason: None,
-            checkpoint_retry_unix_ms: None,
-            hub_checkpoint_attempt_id: None,
-            codex_version: "test-codex".into(),
-            native_thread_id: None,
-        };
-        let first_supervisor = manager
-            .ensure_app_server(
-                first_metadata.clone(),
-                first_bin.display().to_string(),
-                first_env.clone(),
-                Duration::from_secs(3),
-                None,
-            )
-            .await
-            .unwrap();
-        let reused = manager
-            .ensure_app_server(
-                first_metadata,
-                "/must-not-spawn".into(),
-                first_env,
-                Duration::from_secs(3),
-                None,
-            )
-            .await
-            .unwrap();
-        assert!(Arc::ptr_eq(&first_supervisor, &reused));
-
-        let mut second = test_claim();
-        let second_session = Uuid::new_v4();
-        second.run.hub_session_id = Some(second_session);
-        let second_env = prepare_run_env(temp.path(), &second, None).await.unwrap();
-        manager
-            .ensure_app_server(
-                SessionSupervisorMetadata {
-                    format_version: 1,
-                    session_id: second_session,
-                    runtime_id,
-                    ownership_generation: 1,
-                    lifecycle_status: "online".into(),
-                    idle_deadline_unix_ms: None,
-                    checkpoint_reason: None,
-                    checkpoint_retry_unix_ms: None,
-                    hub_checkpoint_attempt_id: None,
-                    codex_version: "test-codex".into(),
-                    native_thread_id: None,
-                },
-                second_bin.display().to_string(),
-                second_env,
-                Duration::from_secs(3),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(manager.available_new_session_slots(), 0);
-
-        let first_task = tokio::spawn({
-            let manager = Arc::clone(&manager);
-            async move { manager.execute(first, None).await }
-        });
-        let second_task = tokio::spawn({
-            let manager = Arc::clone(&manager);
-            async move { manager.execute(second, None).await }
-        });
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !(first_entered.exists() && second_entered.exists()) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
-        std::fs::write(&release, "go").unwrap();
-        first_task.await.unwrap().unwrap();
-        second_task.await.unwrap().unwrap();
-
-        manager.shutdown();
-        assert_process_group_reaped_or_clean_up(&first_pid);
-        assert_process_group_reaped_or_clean_up(&second_pid);
-        assert!(SessionPaths::for_session(temp.path(), blocked_id)
-            .root
-            .exists());
     }
 
     #[tokio::test]
@@ -16889,7 +11399,6 @@ done
                         owned_sessions: Vec::new(),
                         cleanup_sessions: Vec::new(),
                         session_commands: Vec::new(),
-                        codex_rollout: RuntimeCodexRolloutCommandDto::default(),
                     })
                 }),
             );
@@ -16905,7 +11414,7 @@ done
         ));
         let mut config = test_config();
         config.work_root = temp.path().to_path_buf();
-        config.codex_bin = pi_bin.display().to_string();
+        config.engine_bin = pi_bin.display().to_string();
         config.hub_url = format!("http://{hub_addr}");
         let client = HubClient {
             http: reqwest::Client::new(),
@@ -16996,7 +11505,7 @@ done
             serde_json::from_slice(&std::fs::read(metadata_path).unwrap()).unwrap();
         let native_session_id = "fake-pi-fake-pi-session";
         assert_eq!(
-            metadata.native_thread_id.as_deref(),
+            metadata.native_session_id.as_deref(),
             Some(native_session_id)
         );
         manager.shutdown();
@@ -17019,7 +11528,7 @@ done
                 session_id,
                 ownership_generation: 1,
                 lifecycle_status: "online".into(),
-                native_thread_id: Some(native_session_id.into()),
+                native_session_id: Some(native_session_id.into()),
                 active_run_id: None,
             }],
             1,
@@ -17111,77 +11620,6 @@ done
     }
 
     #[tokio::test]
-    async fn crashed_session_child_becomes_blocked_without_an_unbounded_restart() {
-        let temp = tempfile::tempdir().unwrap();
-        let starts = temp.path().join("crash-starts");
-        let pid_file = temp.path().join("crash-pid");
-        let script = temp.path().join("crashing-codex");
-        std::fs::write(
-            &script,
-            format!(
-                r#"#!/bin/sh
-echo start >> {}
-echo $$ > {}
-while IFS= read -r line; do
-  case "$line" in
-    *'"method":"initialize"'*) echo '{{"id":1,"result":{{}}}}' ;;
-    *'"method":"thread/start"'*) echo '{{"id":2,"result":{{"thread":{{"id":"crash-thread"}}}}}}' ;;
-    *'"method":"turn/start"'*) exit 71 ;;
-  esac
-done
-"#,
-                shell_single_quote(&starts),
-                shell_single_quote(&pid_file),
-            ),
-        )
-        .unwrap();
-        make_executable(&script);
-        let runtime_id = Uuid::new_v4();
-        let manager = Arc::new(SessionSupervisorManager::new(
-            temp.path().to_path_buf(),
-            runtime_id,
-            1,
-        ));
-        let mut config = test_config();
-        config.work_root = temp.path().to_path_buf();
-        config.codex_bin = script.display().to_string();
-        let client = HubClient {
-            http: reqwest::Client::new(),
-            hub_url: "http://127.0.0.1:1".into(),
-            runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
-            protocol_capabilities: HashSet::new(),
-        };
-        let claim = test_claim();
-        let session_id = claim.run.hub_session_id.unwrap();
-        manager.reserve_claim(&claim).unwrap();
-
-        execute_managed_run(&config, &client, Arc::clone(&manager), claim.clone())
-            .await
-            .expect_err("a crashed app-server must fail its Run");
-
-        {
-            let records = manager.records.lock().unwrap();
-            let record = records.get(&session_id).unwrap();
-            assert!(record.reserved_run_id.is_none());
-            assert!(record.model_proxy.is_none());
-            assert!(matches!(
-                record.status,
-                ManagedSessionStatus::Blocked {
-                    restart_attempts: 1,
-                    ..
-                }
-            ));
-        }
-        assert_eq!(manager.available_new_session_slots(), 0);
-        assert!(manager.ready_owned_sessions().is_empty());
-        let mut follow_up = claim;
-        follow_up.run.id = Uuid::new_v4();
-        assert!(manager.reserve_claim(&follow_up).is_err());
-        assert_eq!(std::fs::read_to_string(&starts).unwrap().lines().count(), 1);
-        assert_process_group_reaped_or_clean_up(&pid_file);
-    }
-
-    #[tokio::test]
     async fn idle_child_exit_is_reconciled_to_blocked_without_waiting_for_another_claim() {
         let temp = tempfile::tempdir().unwrap();
         let starts = temp.path().join("idle-crash-starts");
@@ -17253,7 +11691,6 @@ done
                         owned_sessions: Vec::new(),
                         cleanup_sessions: Vec::new(),
                         session_commands: Vec::new(),
-                        codex_rollout: RuntimeCodexRolloutCommandDto::default(),
                     })
                 }),
             );
@@ -17268,9 +11705,9 @@ done
         ));
         let mut config = test_config();
         config.work_root = temp.path().to_path_buf();
-        config.codex_bin = script.display().to_string();
+        config.engine_bin = script.display().to_string();
         config.hub_url = format!("http://{hub_addr}");
-        config.app_server_timeout = Duration::from_secs(5);
+        config.engine_timeout = Duration::from_secs(5);
         let client = HubClient {
             http: reqwest::Client::new(),
             hub_url: config.hub_url.clone(),
@@ -17329,7 +11766,7 @@ done
         ));
         let mut config = test_config();
         config.work_root = temp.path().to_path_buf();
-        config.codex_bin = temp.path().join("missing-codex").display().to_string();
+        config.engine_bin = temp.path().join("missing-pi").display().to_string();
         let client = HubClient {
             http: reqwest::Client::new(),
             hub_url: "http://127.0.0.1:1".into(),
@@ -17342,7 +11779,7 @@ done
 
         execute_managed_run(&config, &client, Arc::clone(&manager), claim)
             .await
-            .expect_err("missing Codex binary must fail Session startup");
+            .expect_err("missing Pi binary must fail Session startup");
 
         let records = manager.records.lock().unwrap();
         let record = records.get(&session_id).unwrap();
@@ -17432,7 +11869,6 @@ done
                         owned_sessions: Vec::new(),
                         cleanup_sessions: Vec::new(),
                         session_commands: Vec::new(),
-                        codex_rollout: RuntimeCodexRolloutCommandDto::default(),
                     })
                 }),
             );
@@ -17447,9 +11883,9 @@ done
         ));
         let mut config = test_config();
         config.work_root = temp.path().to_path_buf();
-        config.codex_bin = script.display().to_string();
+        config.engine_bin = script.display().to_string();
         config.hub_url = format!("http://{hub_addr}");
-        config.app_server_timeout = Duration::from_secs(3);
+        config.engine_timeout = Duration::from_secs(3);
         let client = HubClient {
             http: reqwest::Client::new(),
             hub_url: config.hub_url.clone(),
@@ -17539,1354 +11975,6 @@ done
     }
 
     #[tokio::test]
-    async fn app_server_process_failure_is_not_converted_to_fake_success() {
-        let temp = tempfile::tempdir().unwrap();
-        let script = temp.path().join("failing-codex");
-        std::fs::write(
-            &script,
-            r#"#!/bin/sh
-echo "app-server failed intentionally" >&2
-exit 70
-"#,
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let claim = test_claim();
-        let run_env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
-        let err = run_app_server_process(
-            script.to_str().unwrap(),
-            &run_env.workdir,
-            &run_env.codex_home,
-            &claim,
-            Duration::from_secs(1),
-            None,
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(err.contains("Codex app-server failed"));
-        assert!(!err.contains("app-server failed intentionally"));
-    }
-
-    #[tokio::test]
-    async fn app_server_failure_and_hub_event_do_not_expose_mcp_secret() {
-        const MCP_SECRET: &str = "mcp-secret-must-not-leak";
-        let temp = tempfile::tempdir().unwrap();
-        let script = temp.path().join("secret-error-codex");
-        std::fs::write(
-            &script,
-            format!(
-                r#"#!/bin/sh
-while IFS= read -r line; do
-  case "$line" in
-    *'"method":"initialize"'*)
-      echo '{}' >&2
-      echo '{{"id":1,"error":{{"message":"{}"}}}}'
-      ;;
-  esac
-done
-"#,
-                MCP_SECRET, MCP_SECRET
-            ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let mut claim = test_claim();
-        claim.execution_configuration.mcp_allowlist = json!([{
-            "name": "secret-server",
-            "command": "secret-server",
-            "secrets": { "API_TOKEN": MCP_SECRET }
-        }]);
-        claim.agent.mcp_allowlist = claim.execution_configuration.mcp_allowlist.clone();
-        claim.expected_configuration_fingerprint =
-            execution_configuration_fingerprint(&claim.execution_configuration).unwrap();
-        let run_env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
-        let error = format!(
-            "{:#}",
-            run_app_server_process(
-                script.to_str().unwrap(),
-                &run_env.workdir,
-                &run_env.codex_home,
-                &claim,
-                Duration::from_secs(2),
-                None,
-            )
-            .unwrap_err()
-        );
-        assert!(!error.contains(MCP_SECRET));
-
-        let (client, hub_requests, hub_thread) = recording_hub_client(2);
-        client.fail_run(claim.run.id, 1).await.unwrap();
-        hub_thread.join().unwrap();
-        let hub_traffic = hub_requests
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|request| String::from_utf8_lossy(request))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(hub_traffic.contains("runtime execution failed"));
-        assert!(!hub_traffic.contains(MCP_SECRET));
-    }
-
-    #[test]
-    fn app_server_item_maps_tool_request_notifications() {
-        let source_id = Uuid::new_v4();
-        let event = app_server_event_from_item(
-            Uuid::from_u128(1),
-            &json!({
-                "type": "toolRequest",
-                "id": source_id,
-                "toolName": "echo",
-                "arguments": { "message": "hello" }
-            }),
-            json!({ "method": "item/completed" }),
-        )
-        .unwrap();
-        assert_eq!(event.event_type, "tool_request");
-        assert_eq!(event.role.as_deref(), Some("assistant"));
-        assert_eq!(event.payload["tool_name"], "echo");
-        assert_eq!(event.payload["arguments"]["message"], "hello");
-        assert!(Uuid::parse_str(event.payload["tool_request_id"].as_str().unwrap()).is_ok());
-        assert_ne!(event.payload["tool_request_id"], source_id.to_string());
-    }
-
-    #[test]
-    fn app_server_items_map_safe_user_visible_activity() {
-        let reasoning = app_server_event_from_item(
-            Uuid::from_u128(1),
-            &json!({
-                "type": "reasoning",
-                "id": "reasoning-1",
-                "summary": ["Checked the deployment state."],
-                "content": ["raw private reasoning"]
-            }),
-            json!({ "method": "item/completed" }),
-        )
-        .unwrap();
-        assert_eq!(reasoning.event_type, "item");
-        assert_eq!(reasoning.payload["item_type"], "reasoning");
-        assert_eq!(reasoning.payload["item_id"], "reasoning-1");
-        assert_eq!(
-            reasoning.payload["summary"][0],
-            "Checked the deployment state."
-        );
-        assert!(reasoning.payload.get("content").is_none());
-
-        let command = app_server_event_from_item(
-            Uuid::from_u128(1),
-            &json!({
-                "type": "commandExecution",
-                "id": "command-1",
-                "command": "cargo test -p agent-hub-runtime",
-                "cwd": "/workspace",
-                "status": "completed",
-                "aggregatedOutput": "test result: ok",
-                "exitCode": 0,
-                "durationMs": 1250
-            }),
-            json!({ "method": "item/completed" }),
-        )
-        .unwrap();
-        assert_eq!(command.event_type, "item");
-        assert_eq!(command.payload["item_type"], "commandExecution");
-        assert_eq!(
-            command.payload["command"],
-            "cargo test -p agent-hub-runtime"
-        );
-        assert_eq!(command.payload["output"], "test result: ok");
-        assert_eq!(command.payload["duration_ms"], 1250);
-
-        let mcp = app_server_event_from_item(
-            Uuid::from_u128(1),
-            &json!({
-                "type": "mcpToolCall",
-                "id": "mcp-1",
-                "server": "issues",
-                "tool": "search",
-                "status": "completed",
-                "arguments": { "token": "must-not-persist" },
-                "result": { "secret": "must-not-persist" }
-            }),
-            json!({ "method": "item/completed" }),
-        )
-        .unwrap();
-        assert_eq!(mcp.event_type, "item");
-        assert_eq!(mcp.payload["item_type"], "mcpToolCall");
-        assert_eq!(mcp.payload["server"], "issues");
-        assert_eq!(mcp.payload["tool"], "search");
-        assert!(mcp.payload.get("arguments").is_none());
-        assert!(mcp.payload.get("result").is_none());
-    }
-
-    #[test]
-    fn app_server_state_streams_started_items_and_command_output() {
-        let mut state = AppServerState::new(Uuid::new_v4());
-        state
-            .handle_value(&json!({
-                "method": "item/started",
-                "params": {
-                    "item": {
-                        "type": "commandExecution",
-                        "id": "command-1",
-                        "command": "cargo test",
-                        "cwd": "/workspace",
-                        "status": "inProgress"
-                    }
-                }
-            }))
-            .unwrap();
-        state
-            .handle_value(&json!({
-                "method": "item/commandExecution/outputDelta",
-                "params": { "itemId": "command-1", "delta": "running tests\n" }
-            }))
-            .unwrap();
-
-        let activity = state
-            .events
-            .iter()
-            .filter(|event| event.event_type == "item")
-            .collect::<Vec<_>>();
-        assert_eq!(activity.len(), 2);
-        assert_eq!(activity[0].payload["phase"], "started");
-        assert_eq!(activity[1].payload["phase"], "output_delta");
-        assert_eq!(activity[1].payload["output"], "running tests\n");
-    }
-
-    #[test]
-    fn streamed_tool_request_is_deferred_until_driver_finishes() {
-        let event = test_tool_request_event();
-        let mut deferred = Vec::new();
-
-        let streamable = defer_tool_request(event.clone(), &mut deferred);
-
-        assert!(streamable.is_none());
-        assert_eq!(deferred.len(), 1);
-        assert_eq!(deferred[0].payload, event.payload);
-    }
-
-    #[test]
-    fn waiting_tool_publication_attaches_resume_metadata() {
-        let mut claim = test_claim();
-        claim.run.integration_session_id = Some(Uuid::new_v4());
-        let published = build_tool_request_batch(
-            &claim,
-            vec![test_tool_request_event()],
-            "waiting_tool",
-            Some("thread-for-tool"),
-            "/runtime/workdir",
-        )
-        .unwrap()
-        .expect("successful waiting turn should publish its tool request");
-
-        assert_eq!(published.session_id, "thread-for-tool");
-        assert_eq!(published.work_dir_ref, "/runtime/workdir");
-        assert_eq!(published.tool_requests.len(), 1);
-    }
-
-    #[test]
-    fn failed_turn_does_not_publish_deferred_tool_request() {
-        let claim = test_claim();
-        let published = build_tool_request_batch(
-            &claim,
-            vec![test_tool_request_event()],
-            "failed",
-            Some("failed-thread"),
-            "/runtime/workdir",
-        )
-        .unwrap();
-
-        assert!(published.is_none());
-    }
-
-    fn test_tool_request_event() -> AppendRunEventRequest {
-        AppendRunEventRequest {
-            event_type: "tool_request".into(),
-            role: Some("assistant".into()),
-            content: Some("tool requested".into()),
-            payload: json!({
-                "tool_request_id": Uuid::new_v4(),
-                "tool_name": "echo",
-                "arguments": { "value": 1 }
-            }),
-            waiting_tool: None,
-        }
-    }
-
-    #[test]
-    fn app_server_tool_request_with_non_uuid_id_gets_hub_uuid() {
-        let event = app_server_event_from_item(
-            Uuid::nil(),
-            &json!({
-                "type": "functionCall",
-                "callId": "codex-call-123",
-                "name": "echo",
-                "arguments": { "message": "hello" }
-            }),
-            json!({ "method": "item/tool/call" }),
-        )
-        .unwrap();
-
-        assert_eq!(event.payload["tool_name"], "echo");
-        assert_ne!(event.payload["tool_request_id"], "codex-call-123");
-        assert!(Uuid::parse_str(event.payload["tool_request_id"].as_str().unwrap()).is_ok());
-    }
-
-    #[test]
-    fn app_server_state_keeps_waiting_tool_after_completed_turn() {
-        let tool_request_id = Uuid::new_v4();
-        let mut state = AppServerState::new(Uuid::new_v4());
-        let tool_request = json!({
-            "type": "toolRequest",
-            "id": tool_request_id,
-            "toolName": "echo",
-            "arguments": { "message": "hello" }
-        });
-
-        state
-            .handle_value(&json!({
-                "method": "item/completed",
-                "params": { "item": tool_request.clone() }
-            }))
-            .unwrap();
-        state
-            .handle_value(&json!({
-                "method": "turn/completed",
-                "params": {
-                    "turn": {
-                        "status": "completed",
-                        "items": [tool_request]
-                    }
-                }
-            }))
-            .unwrap();
-
-        assert_eq!(state.final_status, "waiting_tool");
-        assert!(state.done);
-        assert_eq!(
-            state
-                .events
-                .iter()
-                .filter(|event| event.event_type == "tool_request")
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn app_server_state_deduplicates_repeated_tool_request_items() {
-        let run_id = Uuid::new_v4();
-        let tool_request_id = Uuid::new_v4();
-        let mut state = AppServerState::new(run_id);
-        state.initialized = true;
-        state.thread_id = Some("thread-from-test".into());
-
-        state
-            .handle_value(&json!({
-                "method": "item/completed",
-                "params": {
-                    "item": {
-                        "type": "toolRequest",
-                        "id": tool_request_id,
-                        "toolName": "echo",
-                        "arguments": { "message": "hello" }
-                    }
-                }
-            }))
-            .unwrap();
-        state
-            .handle_value(&json!({
-                "method": "turn/completed",
-                "params": {
-                    "turn": {
-                        "status": "completed",
-                        "items": [{
-                            "type": "toolRequest",
-                            "id": tool_request_id,
-                            "toolName": "echo",
-                            "arguments": { "message": "hello" }
-                        }]
-                    }
-                }
-            }))
-            .unwrap();
-
-        assert_eq!(
-            state
-                .events
-                .iter()
-                .filter(|event| event.event_type == "tool_request")
-                .count(),
-            1
-        );
-        assert_eq!(state.final_status, "waiting_tool");
-    }
-
-    #[test]
-    fn app_server_state_deduplicates_non_uuid_tool_request_source_ids() {
-        let mut state = AppServerState::new(Uuid::new_v4());
-        state.initialized = true;
-        state.thread_id = Some("thread-from-test".into());
-
-        let item = json!({
-            "type": "toolRequest",
-            "id": "codex-call-1",
-            "toolName": "echo",
-            "arguments": { "message": "hello" }
-        });
-        state
-            .handle_value(
-                &json!({ "method": "item/completed", "params": { "item": item.clone() } }),
-            )
-            .unwrap();
-        state
-            .handle_value(&json!({
-                "method": "turn/completed",
-                "params": {
-                    "turn": {
-                        "status": "completed",
-                        "items": [item]
-                    }
-                }
-            }))
-            .unwrap();
-
-        let tool_events = state
-            .events
-            .iter()
-            .filter(|event| event.event_type == "tool_request")
-            .collect::<Vec<_>>();
-        assert_eq!(tool_events.len(), 1);
-        assert_eq!(
-            tool_events[0].payload["source_id"].as_str(),
-            Some("codex-call-1")
-        );
-        assert_eq!(state.final_status, "waiting_tool");
-    }
-
-    #[test]
-    fn app_server_state_failed_turn_overrides_waiting_tool() {
-        let mut state = AppServerState::new(Uuid::new_v4());
-        state
-            .handle_value(&json!({
-                "method": "item/completed",
-                "params": {
-                    "item": {
-                        "type": "toolRequest",
-                        "id": "failed-tool-request",
-                        "toolName": "echo",
-                        "arguments": { "message": "hello" }
-                    }
-                }
-            }))
-            .unwrap();
-        state
-            .handle_value(&json!({
-                "method": "turn/completed",
-                "params": { "turn": { "status": "failed", "items": [] } }
-            }))
-            .unwrap();
-
-        assert_eq!(state.final_status, "failed");
-        assert!(state.done);
-    }
-
-    #[test]
-    fn app_server_state_interrupted_turn_overrides_waiting_tool() {
-        let mut state = AppServerState::new(Uuid::new_v4());
-        state
-            .handle_value(&json!({
-                "method": "turn/completed",
-                "params": {
-                    "turn": {
-                        "status": "interrupted",
-                        "items": [{
-                            "type": "toolRequest",
-                            "id": "interrupted-tool-request",
-                            "toolName": "echo",
-                            "arguments": { "message": "hello" }
-                        }]
-                    }
-                }
-            }))
-            .unwrap();
-
-        assert_eq!(state.final_status, "interrupted");
-        assert!(state.done);
-    }
-
-    #[test]
-    fn app_server_state_does_not_emit_failed_turn_error_details() {
-        const UPSTREAM_SECRET: &str = "failed-turn-secret-must-not-leak";
-
-        for status in ["failed", "interrupted"] {
-            let mut state = AppServerState::new(Uuid::new_v4());
-            state
-                .handle_value(&json!({
-                    "method": "turn/completed",
-                    "params": {
-                        "turn": {
-                            "status": status,
-                            "items": [{
-                                "type": "agentMessage",
-                                "text": "safe assistant output"
-                            }],
-                            "error": { "message": UPSTREAM_SECRET }
-                        }
-                    }
-                }))
-                .unwrap();
-
-            let emitted_payloads = state
-                .events
-                .iter()
-                .map(|event| event.payload.to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(!emitted_payloads.contains(UPSTREAM_SECRET));
-            assert_eq!(state.final_status, status);
-        }
-    }
-
-    #[test]
-    fn app_server_state_rejects_missing_or_non_string_turn_status() {
-        for turn in [
-            json!({ "items": [] }),
-            json!({ "status": null, "items": [] }),
-            json!({ "status": 1, "items": [] }),
-        ] {
-            let mut state = AppServerState::new(Uuid::new_v4());
-            let error = state
-                .handle_value(&json!({
-                    "method": "turn/completed",
-                    "params": { "turn": turn }
-                }))
-                .unwrap_err()
-                .to_string();
-
-            assert!(error.contains("turn status"));
-            assert!(!state.done);
-        }
-    }
-
-    #[test]
-    fn app_server_state_rejects_non_terminal_or_unknown_turn_status() {
-        for status in ["cancelled", "inProgress", "futureStatus"] {
-            let mut state = AppServerState::new(Uuid::new_v4());
-            let error = state
-                .handle_value(&json!({
-                    "method": "turn/completed",
-                    "params": {
-                        "turn": { "status": status, "items": [] }
-                    }
-                }))
-                .unwrap_err()
-                .to_string();
-
-            assert!(error.contains("turn status"));
-            assert!(!error.contains(status));
-            assert!(!state.done);
-        }
-    }
-
-    #[test]
-    fn app_server_state_completes_turn_without_tool_request() {
-        let mut state = AppServerState::new(Uuid::new_v4());
-        state
-            .handle_value(&json!({
-                "method": "turn/completed",
-                "params": { "turn": { "status": "completed", "items": [] } }
-            }))
-            .unwrap();
-
-        assert_eq!(state.final_status, "completed");
-        assert!(state.done);
-    }
-
-    #[tokio::test]
-    async fn app_server_success_without_session_uses_thread_id_for_resume() {
-        let temp = tempfile::tempdir().unwrap();
-        let script = temp.path().join("fake-codex-no-session");
-        let script_contents = r#"#!/bin/sh
-while IFS= read -r line; do
-  case "$line" in
-    *'"method":"initialize"'*) echo '{"id":1,"result":{"serverInfo":{"name":"fake-codex"}}}' ;;
-    *'"method":"thread/start"'*) echo '{"id":2,"result":{"thread":{"id":"thread-without-session"}}}' ;;
-    *'"method":"turn/start"'*)
-      echo '{"method":"turn/completed","params":{"turn":{"status":"completed","items":[{"type":"agentMessage","text":"done without session"}]}}}'
-      ;;
-  esac
-done
-"#;
-        std::fs::write(&script, script_contents).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let claim = test_claim();
-        let run_env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
-        let result = run_app_server_process(
-            script.to_str().unwrap(),
-            &run_env.workdir,
-            &run_env.codex_home,
-            &claim,
-            Duration::from_secs(2),
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(result.session_id.as_deref(), Some("thread-without-session"));
-        assert!(result.events.iter().any(|event| {
-            event.event_type == "message"
-                && event.content.as_deref() == Some("done without session")
-        }));
-    }
-
-    #[test]
-    fn app_server_request_lines_use_real_lifecycle_shape() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut claim = test_claim();
-        claim.execution_configuration.model_bindings[0]
-            .model_settings
-            .reasoning_effort = ReasoningEffort::Ultra;
-        let run_env = RunEnv {
-            workdir: temp.path().join("workdir"),
-            codex_home: temp.path().join("codex-home"),
-        };
-        let requests = app_server_request_lines(&claim, &run_env)
-            .unwrap()
-            .into_iter()
-            .map(|line| serde_json::from_str::<serde_json::Value>(&line).unwrap())
-            .collect::<Vec<_>>();
-
-        assert_eq!(requests[0]["method"], "initialize");
-        assert_eq!(requests[0]["jsonrpc"], "2.0");
-        assert_eq!(requests[1]["method"], "initialized");
-        assert_eq!(requests[1]["jsonrpc"], "2.0");
-        assert_eq!(requests[2]["method"], "thread/start");
-        assert_eq!(requests[2]["jsonrpc"], "2.0");
-        assert_eq!(requests[2]["params"]["approvalPolicy"], "never");
-        assert_eq!(requests[2]["params"]["sandbox"], "workspace-write");
-        assert_eq!(requests[2]["params"]["model"], "gpt-main");
-        assert_eq!(
-            requests[2]["params"]["modelProvider"],
-            model_provider_name(Uuid::from_u128(0x101))
-        );
-        assert_eq!(requests[3]["method"], "turn/start");
-        assert_eq!(requests[3]["jsonrpc"], "2.0");
-        assert_eq!(requests[3]["params"]["input"][0]["type"], "text");
-        assert_eq!(requests[3]["params"]["model"], "gpt-main");
-        assert_eq!(requests[3]["params"]["effort"], "ultra");
-        assert_eq!(
-            requests[3]["params"]["sandboxPolicy"]["type"],
-            "workspaceWrite"
-        );
-        assert_eq!(
-            requests[3]["params"]["sandboxPolicy"]["networkAccess"],
-            true
-        );
-    }
-
-    #[test]
-    fn app_server_fixture_freezes_resume_start_steer_interrupt_protocol() {
-        let temp = tempfile::tempdir().unwrap();
-        let fixture =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../deploy/fake-codex-app-server.sh");
-        let thread_id = "fixture-thread";
-        let turn_id = "fake-app-server-turn-1";
-        let transcript = temp
-            .path()
-            .join(format!("sessions/rollout-{thread_id}.jsonl"));
-        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
-        std::fs::write(&transcript, "{\"existing\":true}\n").unwrap();
-        let requests = [
-            json!({
-                "jsonrpc": "2.0",
-                "id": "initialize-request",
-                "method": "initialize",
-                "params": {
-                    "clientInfo": {
-                        "name": "agent-hub-runtime-test",
-                        "version": env!("CARGO_PKG_VERSION")
-                    }
-                }
-            }),
-            json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }),
-            json!({
-                "jsonrpc": "2.0",
-                "id": "resume-request",
-                "method": "thread/resume",
-                "params": {
-                    "threadId": thread_id,
-                    "cwd": temp.path(),
-                    "approvalPolicy": "never",
-                    "developerInstructions": "test fixture protocol"
-                }
-            }),
-            json!({
-                "jsonrpc": "2.0",
-                "id": "unsubscribe-request",
-                "method": "thread/unsubscribe",
-                "params": { "threadId": thread_id }
-            }),
-            json!({
-                "jsonrpc": "2.0",
-                "id": "refresh-resume-request",
-                "method": "thread/resume",
-                "params": {
-                    "threadId": thread_id,
-                    "cwd": temp.path(),
-                    "approvalPolicy": "never",
-                    "developerInstructions": "refreshed fixture protocol",
-                    "excludeTurns": true,
-                    "config": {}
-                }
-            }),
-            json!({
-                "jsonrpc": "2.0",
-                "id": "start-request",
-                "method": "turn/start",
-                "params": {
-                    "threadId": thread_id,
-                    "source": "fixture:protocol",
-                    "input": [{ "type": "text", "text": "start" }]
-                }
-            }),
-            json!({
-                "jsonrpc": "2.0",
-                "id": "steer-request",
-                "method": "turn/steer",
-                "params": {
-                    "threadId": thread_id,
-                    "expectedTurnId": turn_id,
-                    "input": [{ "type": "text", "text": "steer" }]
-                }
-            }),
-            json!({
-                "jsonrpc": "2.0",
-                "id": "interrupt-request",
-                "method": "turn/interrupt",
-                "params": { "threadId": thread_id, "turnId": turn_id }
-            }),
-        ];
-
-        let mut child = Command::new(&fixture)
-            .arg("app-server")
-            .arg("--listen")
-            .arg("stdio://")
-            .env_clear()
-            .env("PATH", env::var_os("PATH").unwrap_or_default())
-            .env("CODEX_HOME", temp.path())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        {
-            let mut stdin = child.stdin.take().unwrap();
-            for request in &requests {
-                send_app_server_value(&mut stdin, request).unwrap();
-            }
-        }
-        let output = child.wait_with_output().unwrap();
-        assert!(
-            output.status.success(),
-            "fixture failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let messages = String::from_utf8(output.stdout)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .collect::<Vec<_>>();
-        let response = |id: &str| {
-            messages
-                .iter()
-                .find(|message| message.get("id").and_then(|value| value.as_str()) == Some(id))
-                .unwrap_or_else(|| panic!("missing fixture response for {id}"))
-        };
-
-        assert_eq!(
-            response("initialize-request")["result"]["serverInfo"]["name"],
-            "fake-codex"
-        );
-        assert_eq!(
-            response("resume-request")["result"]["thread"]["id"],
-            thread_id
-        );
-        assert_eq!(response("unsubscribe-request")["result"], json!({}));
-        assert_eq!(
-            response("refresh-resume-request")["result"]["thread"]["id"],
-            thread_id
-        );
-        assert_eq!(response("start-request")["result"]["turn"]["id"], turn_id);
-        assert_eq!(response("steer-request")["result"]["turnId"], turn_id);
-        assert_eq!(response("interrupt-request")["result"], json!({}));
-        assert!(messages.iter().any(|message| {
-            message["method"] == "turn/started" && message["params"]["turn"]["id"] == turn_id
-        }));
-        assert!(messages.iter().any(|message| {
-            message["method"] == "turn/completed"
-                && message["params"]["turn"]["id"] == turn_id
-                && message["params"]["turn"]["status"] == "interrupted"
-        }));
-        assert_eq!(
-            std::fs::read_to_string(transcript).unwrap(),
-            "{\"existing\":true}\n"
-        );
-    }
-
-    #[test]
-    fn fake_pi_fixture_uses_pi_jsonl_not_codex_app_server() {
-        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../deploy/fake-pi-rpc.sh");
-        let source = stdfs::read_to_string(&fixture).expect("read fake Pi fixture");
-        assert!(source.contains("--mode rpc"));
-        assert!(source.contains("prompt)"));
-        assert!(source.contains("agent_settled"));
-        assert!(!source.contains("thread/start"));
-        assert!(!source.contains("turn/start"));
-
-        let temp = tempfile::tempdir().unwrap();
-        let session_dir = temp.path().join("sessions");
-        let mut child = Command::new(&fixture)
-            .args(["--mode", "rpc", "--session-dir"])
-            .arg(&session_dir)
-            .env("FAKE_PI_DISABLE_MODEL", "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("start fake Pi fixture");
-        let mut stdin = child.stdin.take().expect("open fake Pi stdin");
-        let stdout = child.stdout.take().expect("open fake Pi stdout");
-        let mut lines = BufReader::new(stdout).lines();
-
-        fn send(stdin: &mut std::process::ChildStdin, value: Value) {
-            serde_json::to_writer(&mut *stdin, &value).unwrap();
-            stdin.write_all(b"\n").unwrap();
-            stdin.flush().unwrap();
-        }
-
-        fn recv(lines: &mut std::io::Lines<BufReader<std::process::ChildStdout>>) -> Value {
-            serde_json::from_str(
-                &lines
-                    .next()
-                    .expect("fixture output")
-                    .expect("read fixture output"),
-            )
-            .expect("fixture JSON")
-        }
-
-        send(&mut stdin, json!({ "id": "state", "type": "get_state" }));
-        let state = recv(&mut lines);
-        assert_eq!(state["type"], "response");
-        assert_eq!(state["command"], "get_state");
-        assert!(state["data"]["sessionFile"].as_str().is_some());
-
-        send(
-            &mut stdin,
-            json!({ "id": "model", "type": "set_model", "provider": "hub", "modelId": "fixture" }),
-        );
-        assert_eq!(recv(&mut lines)["command"], "set_model");
-        send(
-            &mut stdin,
-            json!({ "id": "thinking", "type": "set_thinking_level", "level": "high" }),
-        );
-        assert_eq!(recv(&mut lines)["command"], "set_thinking_level");
-
-        send(
-            &mut stdin,
-            json!({ "id": "prompt", "type": "prompt", "message": "fixture:hold" }),
-        );
-        assert_eq!(recv(&mut lines)["command"], "prompt");
-        assert_eq!(recv(&mut lines)["type"], "agent_start");
-        assert_eq!(recv(&mut lines)["type"], "turn_start");
-        assert_eq!(
-            recv(&mut lines)["assistantMessageEvent"]["type"],
-            "thinking_delta"
-        );
-
-        send(
-            &mut stdin,
-            json!({ "id": "steer", "type": "steer", "message": "fixture:release" }),
-        );
-        assert_eq!(recv(&mut lines)["command"], "steer");
-        assert_eq!(recv(&mut lines)["type"], "queue_update");
-        assert_eq!(recv(&mut lines)["type"], "tool_execution_start");
-        assert_eq!(recv(&mut lines)["type"], "tool_execution_update");
-        assert_eq!(recv(&mut lines)["type"], "tool_execution_end");
-        assert_eq!(
-            recv(&mut lines)["assistantMessageEvent"]["type"],
-            "text_delta"
-        );
-        assert_eq!(recv(&mut lines)["type"], "turn_end");
-        assert_eq!(recv(&mut lines)["type"], "agent_end");
-        assert_eq!(recv(&mut lines)["type"], "agent_settled");
-
-        child.kill().unwrap();
-        child.wait().unwrap();
-    }
-
-    #[test]
-    fn app_server_steer_response_only_falls_back_for_an_ended_expected_turn() {
-        assert_eq!(
-            app_server_steer_response(
-                &json!({ "id": 4, "result": { "turnId": "turn-active" } }),
-                "turn-active",
-            )
-            .unwrap(),
-            SessionSteerOutcome::Applied
-        );
-        assert_eq!(
-            app_server_steer_response(
-                &json!({
-                    "id": 5,
-                    "error": { "code": -32600, "message": "no active turn to steer" }
-                }),
-                "turn-ended",
-            )
-            .unwrap(),
-            SessionSteerOutcome::TurnEnded
-        );
-        assert_eq!(
-            app_server_steer_response(
-                &json!({
-                    "id": 6,
-                    "error": {
-                        "code": -32600,
-                        "message": "expected active turn id `turn-ended` but found `turn-new`"
-                    }
-                }),
-                "turn-ended",
-            )
-            .unwrap(),
-            SessionSteerOutcome::TurnEnded
-        );
-
-        let error = app_server_steer_response(
-            &json!({
-                "id": 7,
-                "error": { "code": -32600, "message": "activeTurnNotSteerable" }
-            }),
-            "turn-active",
-        )
-        .unwrap_err()
-        .to_string();
-        assert_eq!(error, "Codex app-server rejected turn/steer");
-    }
-
-    #[tokio::test]
-    async fn app_server_process_uses_run_model_binding_provider_header() {
-        let model_server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let model_addr = model_server.local_addr().unwrap();
-        let model_thread = std::thread::spawn(move || {
-            let (mut stream, _) = model_server.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(1)))
-                .unwrap();
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 1024];
-            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                let read = stream.read(&mut buffer).unwrap();
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buffer[..read]);
-            }
-            let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
-            assert!(request.starts_with("post /v1/responses "));
-            assert!(request.contains(
-                "x-agent-hub-model-binding-id: 00000000-0000-0000-0000-000000000101\r\n"
-            ));
-            let body = r#"{"output_text":"binding fixture response"}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .unwrap();
-            stream.flush().unwrap();
-        });
-
-        let temp = tempfile::tempdir().unwrap();
-        let script = temp.path().join("binding-fake-codex");
-        std::fs::write(
-            &script,
-            r#"#!/bin/sh
-while IFS= read -r line; do
-  request_id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-  case "$line" in
-    *'"method":"initialize"'*) echo "{\"id\":$request_id,\"result\":{}}" ;;
-    *'"method":"thread/start"'*) echo "{\"id\":$request_id,\"result\":{\"thread\":{\"id\":\"binding-thread\"}}}" ;;
-    *'"method":"turn/start"'*)
-      provider=$(sed -n 's/^model_provider = "\(.*\)"$/\1/p' "$CODEX_HOME/config.toml" | head -n 1)
-      base_url=$(awk -v provider="model_providers.$provider" '/^\[/ { section = substr($0, 2, length($0) - 2); in_provider = section == provider || index(section, provider ".") == 1; next } in_provider && index($0, "base_url = \"") == 1 { value = $0; sub("^[^=]*= \"", "", value); sub("\"$", "", value); print value; exit }' "$CODEX_HOME/config.toml")
-      binding_id=$(awk -v provider="model_providers.$provider" '/^\[/ { section = substr($0, 2, length($0) - 2); in_provider = section == provider || index(section, provider ".") == 1; next } in_provider && index($0, "x-agent-hub-model-binding-id = \"") == 1 { value = $0; sub("^[^=]*= \"", "", value); sub("\"$", "", value); print value; exit }' "$CODEX_HOME/config.toml")
-      curl -fsS -H 'Content-Type: application/json' -H "x-agent-hub-model-binding-id: $binding_id" --data '{"model":"gpt-main","input":"binding"}' "$base_url/responses" >/dev/null
-      echo "{\"id\":$request_id,\"result\":{\"turn\":{\"id\":\"binding-turn\"}}}"
-      echo '{"method":"turn/completed","params":{"threadId":"binding-thread","turn":{"id":"binding-turn","status":"completed","items":[{"type":"agentMessage","text":"binding fixture response"}]}}}'
-      ;;
-  esac
-done
-"#,
-        )
-        .unwrap();
-        make_executable(&script);
-        let claim = test_claim();
-        let run_env = prepare_run_env(
-            temp.path(),
-            &claim,
-            Some(&format!("http://{model_addr}/v1")),
-        )
-        .await
-        .unwrap();
-        let result = run_app_server_process(
-            script.to_str().unwrap(),
-            &run_env.workdir,
-            &run_env.codex_home,
-            &claim,
-            Duration::from_secs(2),
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(result.final_status, "completed");
-        assert_eq!(result.session_id.as_deref(), Some("binding-thread"));
-        assert!(result.events.iter().any(|event| {
-            event.event_type == "message"
-                && event.content.as_deref() == Some("binding fixture response")
-        }));
-        model_thread.join().unwrap();
-    }
-
-    #[test]
-    fn app_server_turn_start_includes_dynamic_tools_for_integration_runs() {
-        let mut claim = test_claim();
-        claim.run.source = "integration:message".into();
-        claim.integration_context = Some(IntegrationContextDto {
-            tools: json!([
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "echo",
-                        "description": "Echo a message",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "message": { "type": "string" }
-                            },
-                            "required": ["message"]
-                        }
-                    }
-                }
-            ]),
-            attachments: json!([]),
-            tool_result: None,
-        });
-
-        let request = app_server_turn_start_request(&claim, "thread-from-test");
-
-        assert_eq!(request["method"], "turn/start");
-        assert_eq!(request["params"]["threadId"], "thread-from-test");
-        assert_eq!(
-            request["params"]["dynamicTools"],
-            claim.integration_context.unwrap().tools
-        );
-    }
-
-    #[test]
-    fn app_server_turn_start_combines_distinct_queued_messages_in_sequence_order() {
-        let mut claim = test_claim();
-        let session_id = claim.run.hub_session_id.unwrap();
-        let turn_id = Uuid::new_v4();
-        claim.run.hub_turn_id = Some(turn_id);
-        let now = chrono::Utc::now();
-        let message = |sequence: i64, content: &str| HubSessionMessageDto {
-            id: Uuid::new_v4(),
-            session_id,
-            sequence,
-            role: "user".into(),
-            message_kind: "message".into(),
-            content: Some(content.into()),
-            payload: json!({}),
-            delivery_mode: "next_turn".into(),
-            delivery_state: "queued".into(),
-            client_message_key: None,
-            expected_native_turn_id: None,
-            turn_id: Some(turn_id),
-            run_id: Some(claim.run.id),
-            accepted_at: now,
-        };
-        claim.session_context = Some(ClaimSessionContextDto {
-            session: HubSessionDto {
-                id: session_id,
-                owner_id: claim.agent.owner_id,
-                agent_id: claim.agent.id,
-                agent_name: claim.agent.name.clone(),
-                agent_deleted_at: None,
-                origin_platform_name: None,
-                origin: HubSessionOriginDto::HubNative,
-                lifecycle_status: "online".into(),
-                native_thread_id: None,
-                active_turn_id: None,
-                history_checkpoint: 2,
-                configuration_fingerprint: None,
-                runtime_owner_id: None,
-                ownership_generation: 1,
-                recovery_error: None,
-                current_bundle: None,
-                created_at: now,
-                updated_at: now,
-            },
-            turn: HubSessionTurnDto {
-                id: turn_id,
-                session_id,
-                native_turn_id: None,
-                status: "pending".into(),
-                configuration_fingerprint: None,
-                ownership_generation: 1,
-                started_at: None,
-                ended_at: None,
-                created_at: now,
-                updated_at: now,
-            },
-            messages: vec![message(2, "second"), message(1, "first")],
-        });
-
-        let request = app_server_turn_start_request(&claim, "thread-from-test");
-        let input = request["params"]["input"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|item| item["text"].as_str().unwrap())
-            .collect::<Vec<_>>();
-
-        assert_eq!(input, vec!["first", "second"]);
-    }
-
-    #[test]
-    fn app_server_turn_start_preserves_exact_tool_result_context() {
-        let mut claim = test_claim();
-        claim.run.source = "integration:tool_result".into();
-        claim.integration_context = Some(IntegrationContextDto {
-            tools: json!([]),
-            attachments: json!([]),
-            tool_result: Some(json!({ "text": "matching tool result" })),
-        });
-
-        let request = app_server_turn_start_request(&claim, "thread-from-test");
-
-        assert_eq!(
-            request["params"]["metadata"]["integration_context"]["tool_result"]["text"],
-            "matching tool result"
-        );
-    }
-
-    #[tokio::test]
-    async fn app_server_process_times_out_and_reaps_child() {
-        let temp = tempfile::tempdir().unwrap();
-        let pid_file = temp.path().join("sleeping-codex.pid");
-        let script = temp.path().join("sleeping-codex");
-        let script_contents = format!(
-            r#"#!/bin/sh
-echo $$ > {}
-while IFS= read -r line; do
-  case "$line" in
-    *'"method":"initialize"'*) while :; do :; done ;;
-  esac
-done
-"#,
-            shell_single_quote(&pid_file)
-        );
-        std::fs::write(&script, script_contents).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let claim = test_claim();
-        let run_env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
-        let err = format!(
-            "{:#}",
-            run_app_server_process(
-                script.to_str().unwrap(),
-                &run_env.workdir,
-                &run_env.codex_home,
-                &claim,
-                Duration::from_millis(200),
-                None,
-            )
-            .unwrap_err()
-        );
-
-        assert!(err.contains("timed out"));
-        #[cfg(unix)]
-        {
-            let pid = std::fs::read_to_string(&pid_file).unwrap();
-            let proc_path = PathBuf::from(format!("/proc/{}", pid.trim()));
-            assert!(!proc_path.exists());
-        }
-    }
-
-    #[tokio::test]
-    async fn app_server_process_reports_bad_json_and_reaps_child() {
-        let temp = tempfile::tempdir().unwrap();
-        let pid_file = temp.path().join("bad-json-codex.pid");
-        let script = temp.path().join("bad-json-codex");
-        let script_contents = format!(
-            r#"#!/bin/sh
-echo $$ > {}
-while IFS= read -r line; do
-  case "$line" in
-    *'"method":"initialize"'*) echo 'not-json'; while :; do :; done ;;
-  esac
-done
-"#,
-            shell_single_quote(&pid_file)
-        );
-        std::fs::write(&script, script_contents).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let claim = test_claim();
-        let run_env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
-        let err = format!(
-            "{:#}",
-            run_app_server_process(
-                script.to_str().unwrap(),
-                &run_env.workdir,
-                &run_env.codex_home,
-                &claim,
-                Duration::from_secs(2),
-                None,
-            )
-            .unwrap_err()
-        );
-
-        assert!(err.contains("parse app-server JSON"));
-        #[cfg(unix)]
-        {
-            let pid = std::fs::read_to_string(&pid_file).unwrap();
-            let proc_path = PathBuf::from(format!("/proc/{}", pid.trim()));
-            assert!(!proc_path.exists());
-        }
-    }
-
-    #[tokio::test]
-    async fn app_server_protocol_error_is_not_success_and_reaps_child() {
-        const UPSTREAM_SECRET: &str = "upstream-error-must-not-leak";
-        let temp = tempfile::tempdir().unwrap();
-        let pid_file = temp.path().join("protocol-error-codex.pid");
-        let script = temp.path().join("protocol-error-codex");
-        let script_contents = format!(
-            r#"#!/bin/sh
-echo $$ > {}
-while IFS= read -r line; do
-  case "$line" in
-    *'"method":"initialize"'*) echo '{{"id":1,"result":{{"serverInfo":{{"name":"fake-codex"}}}}}}' ;;
-    *'"method":"thread/start"'*) echo '{{"id":2,"result":{{"thread":{{"id":"protocol-error-thread"}}}}}}' ;;
-    *'"method":"turn/start"'*)
-      echo '{{"method":"item/completed","params":{{"item":{{"type":"toolRequest","id":"protocol-error-tool","toolName":"echo","arguments":{{}}}}}}}}'
-      echo '{{"method":"turn/completed","params":{{"turn":{{"items":[],"error":{{"message":"{}"}}}}}}}}'
-      while :; do :; done
-      ;;
-  esac
-done
-"#,
-            shell_single_quote(&pid_file),
-            UPSTREAM_SECRET
-        );
-        std::fs::write(&script, script_contents).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let claim = test_claim();
-        let run_env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
-        let error = format!(
-            "{:#}",
-            run_app_server_process(
-                script.to_str().unwrap(),
-                &run_env.workdir,
-                &run_env.codex_home,
-                &claim,
-                Duration::from_secs(2),
-                None,
-            )
-            .unwrap_err()
-        );
-
-        assert!(error.contains("turn status"));
-        assert!(!error.contains(UPSTREAM_SECRET));
-        #[cfg(unix)]
-        {
-            let pid = std::fs::read_to_string(&pid_file).unwrap();
-            let proc_path = PathBuf::from(format!("/proc/{}", pid.trim()));
-            assert!(!proc_path.exists());
-        }
-    }
-
-    #[tokio::test]
-    async fn app_server_process_reports_closed_stdout() {
-        let temp = tempfile::tempdir().unwrap();
-        let script = temp.path().join("closed-stdout-codex");
-        std::fs::write(
-            &script,
-            r#"#!/bin/sh
-exit 0
-"#,
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let claim = test_claim();
-        let run_env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
-        let err = format!(
-            "{:#}",
-            run_app_server_process(
-                script.to_str().unwrap(),
-                &run_env.workdir,
-                &run_env.codex_home,
-                &claim,
-                Duration::from_secs(1),
-                None,
-            )
-            .unwrap_err()
-        );
-
-        assert!(
-            err.contains("stdout closed")
-                || err.contains("exited early")
-                || err.contains("Broken pipe")
-                || err.contains("failed to write"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[tokio::test]
     async fn managed_skill_materializes_with_its_metadata() {
         let temp = tempfile::tempdir().unwrap();
         let mut claim = test_claim();
@@ -18900,7 +11988,7 @@ exit 0
 
         let env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
         let content = fs::read_to_string(
-            env.codex_home
+            pi_agent_directory(&env.engine_state_root)
                 .join("skills")
                 .join(skill_directory_name("repo-review"))
                 .join("SKILL.md"),
@@ -18924,45 +12012,13 @@ exit 0
             execution_configuration_fingerprint(&claim.execution_configuration).unwrap();
 
         let env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
-        let first_dir = env
-            .codex_home
-            .join("skills")
-            .join(skill_directory_name("审查"));
-        let second_dir = env
-            .codex_home
-            .join("skills")
-            .join(skill_directory_name("评审"));
+        let agent_dir = pi_agent_directory(&env.engine_state_root);
+        let first_dir = agent_dir.join("skills").join(skill_directory_name("审查"));
+        let second_dir = agent_dir.join("skills").join(skill_directory_name("评审"));
 
         assert_ne!(first_dir, second_dir);
         assert!(first_dir.join("SKILL.md").exists());
         assert!(second_dir.join("SKILL.md").exists());
-    }
-
-    #[test]
-    fn codex_config_uses_structured_toml_for_control_characters() {
-        let mut claim = test_claim();
-        claim.execution_configuration.mcp_allowlist = json!([{
-            "name": "odd.server\nname",
-            "command": "cmd\n--flag",
-            "args": ["line1\nline2"],
-            "secrets": { "TOKEN.WITH.DOTS": "value\nwith-newline" }
-        }]);
-
-        let rendered = render_codex_config(
-            &claim.execution_configuration,
-            Some("http://127.0.0.1:1234/v1"),
-        )
-        .unwrap();
-        let parsed = rendered.parse::<toml::Value>().unwrap();
-
-        assert_eq!(
-            parsed["mcp_servers"]["odd.server\nname"]["command"].as_str(),
-            Some("cmd\n--flag")
-        );
-        assert_eq!(
-            parsed["mcp_servers"]["odd.server\nname"]["env"]["TOKEN.WITH.DOTS"].as_str(),
-            Some("value\nwith-newline")
-        );
     }
 
     #[test]
@@ -19008,8 +12064,7 @@ exit 0
             .await
             .unwrap();
 
-        assert!(env
-            .codex_home
+        assert!(pi_agent_directory(&env.engine_state_root)
             .join("skills")
             .join(skill_directory_name("directory-fallback"))
             .join("SKILL.md")
@@ -19038,7 +12093,7 @@ exit 0
             .await
             .unwrap();
         let content = fs::read_to_string(
-            env.codex_home
+            pi_agent_directory(&env.engine_state_root)
                 .join("skills")
                 .join(skill_directory_name("repo-review"))
                 .join("SKILL.md"),
@@ -19061,7 +12116,7 @@ exit 0
         let mut claim = test_claim();
         claim.run.hub_session_id = Some(Uuid::new_v4());
         claim.resume = Some(RunResumeDto {
-            thread_id: "thread-parent".into(),
+            native_session_id: "thread-parent".into(),
             work_dir_ref: Some(parent.display().to_string()),
         });
 
@@ -19070,65 +12125,6 @@ exit 0
         assert!(fs::metadata(env.workdir.join("nested/state.txt"))
             .await
             .is_err());
-    }
-
-    #[test]
-    fn resume_uses_thread_resume_json_rpc_method() {
-        let mut claim = test_claim();
-        claim.resume = Some(RunResumeDto {
-            thread_id: "thread-parent".into(),
-            work_dir_ref: None,
-        });
-        let run_env = RunEnv {
-            workdir: PathBuf::from("/tmp/workdir"),
-            codex_home: PathBuf::from("/tmp/codex-home"),
-        };
-
-        let request = app_server_thread_start_request(&claim, &run_env);
-
-        assert_eq!(request["method"], "thread/resume");
-        assert_eq!(request["params"]["threadId"], "thread-parent");
-    }
-
-    #[test]
-    fn configuration_refresh_forces_cold_resume_without_setting_overrides() {
-        let claim = test_claim();
-        let run_env = RunEnv {
-            workdir: PathBuf::from("/tmp/workdir"),
-            codex_home: PathBuf::from("/tmp/codex-home"),
-        };
-
-        let request = app_server_thread_refresh_request(&claim, &run_env, "thread-current");
-
-        assert_eq!(request["method"], "thread/resume");
-        assert_eq!(request["params"]["threadId"], "thread-current");
-        assert_eq!(request["params"]["excludeTurns"], true);
-        assert_eq!(request["params"]["config"], json!({}));
-        assert_eq!(request["params"]["model"], "gpt-main");
-        assert_eq!(
-            request["params"]["modelProvider"],
-            model_provider_name(Uuid::from_u128(0x101))
-        );
-    }
-
-    #[test]
-    fn driver_configuration_fingerprint_changes_with_run_binding_identity() {
-        let first = test_claim();
-        let mut second = first.clone();
-        second.run.id = Uuid::new_v4();
-        second.execution_configuration.model_bindings[0].id = Uuid::new_v4();
-        second.execution_configuration.model_bindings[0].run_id = second.run.id;
-        second.expected_configuration_fingerprint =
-            execution_configuration_fingerprint(&second.execution_configuration).unwrap();
-
-        assert_eq!(
-            first.expected_configuration_fingerprint,
-            second.expected_configuration_fingerprint
-        );
-        assert_ne!(
-            driver_configuration_fingerprint(&first),
-            driver_configuration_fingerprint(&second)
-        );
     }
 
     #[test]
@@ -19147,484 +12143,6 @@ exit 0
             assert_eq!(first, repeated);
             assert_ne!(first, second);
         }
-    }
-
-    #[test]
-    fn runtime_rejects_direct_codex_download_source() {
-        assert_eq!(validate_codex_source("path").unwrap(), "path");
-        let error = validate_codex_source("download").unwrap_err();
-        assert!(error.to_string().contains("Hub"));
-    }
-
-    #[tokio::test]
-    async fn pi_runtime_ignores_legacy_codex_rollout_commands() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let mut config = test_config();
-        assert_eq!(config.codex_driver, "app-server");
-        let original_binary = config.codex_bin.clone();
-        let original_version = config.codex_version.clone();
-        let artifact_requests = Arc::new(AtomicUsize::new(0));
-        let app = Router::new().route(
-            "/api/runtime/codex/artifacts/{version}/{os}/{architecture}",
-            get({
-                let artifact_requests = Arc::clone(&artifact_requests);
-                move || {
-                    let artifact_requests = Arc::clone(&artifact_requests);
-                    async move {
-                        artifact_requests.fetch_add(1, Ordering::SeqCst);
-                        AxumStatusCode::NO_CONTENT
-                    }
-                }
-            }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let hub_addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = HubClient {
-            http: reqwest::Client::new(),
-            hub_url: format!("http://{hub_addr}"),
-            runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
-            protocol_capabilities: HashSet::new(),
-        };
-        let mut rollout = RuntimeCodexState::new(&config);
-
-        apply_runtime_codex_rollout(
-            &mut config,
-            &client,
-            &mut rollout,
-            None,
-            &RuntimeCodexRolloutCommandDto {
-                active_version: Some("0.144.5".into()),
-                target_artifact: Some(CodexVersionArtifactDto {
-                    version: "0.144.5".into(),
-                    os: std::env::consts::OS.into(),
-                    architecture: std::env::consts::ARCH.into(),
-                    artifact_name: "codex.zst".into(),
-                    sha256: "0".repeat(64),
-                    size_bytes: 1,
-                }),
-            },
-        )
-        .await;
-
-        assert_eq!(artifact_requests.load(Ordering::SeqCst), 0);
-        assert_eq!(config.codex_bin, original_binary);
-        assert_eq!(config.codex_version, original_version);
-        assert_eq!(
-            rollout.heartbeat_status(),
-            RuntimeCodexStatusDto {
-                current_version: original_version,
-                candidate_version: None,
-                candidate_status: None,
-                candidate_error: None,
-            }
-        );
-        server.abort();
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn candidate_codex_must_pass_bounded_exact_version_and_app_server_checks() {
-        let temp = tempfile::tempdir().unwrap();
-        let binary = temp.path().join("codex");
-        fs::write(
-            &binary,
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'codex-cli 0.144.5'; exit 0; fi\nif [ \"$1\" = \"app-server\" ] && [ \"$2\" = \"--help\" ]; then exit 0; fi\nexit 9\n",
-        )
-        .await
-        .unwrap();
-        make_executable(&binary);
-
-        verify_codex_compatibility(&binary, "0.144.5", Duration::from_secs(1))
-            .await
-            .unwrap();
-        let error = verify_codex_compatibility(&binary, "0.144.4", Duration::from_secs(1))
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("version mismatch"));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn managed_codex_artifact_is_verified_installed_by_exact_version_and_reused() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let script = b"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'codex-cli 0.144.5'; exit 0; fi\nif [ \"$1\" = \"app-server\" ] && [ \"$2\" = \"--help\" ]; then exit 0; fi\nexit 9\n";
-        let compressed = zstd::stream::encode_all(&script[..], 3).unwrap();
-        let sha256 = Sha256::digest(&compressed)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        let requests = Arc::new(AtomicUsize::new(0));
-        let expected_token = "runtime-artifact-token".to_owned();
-        let app = Router::new().route(
-            "/api/runtime/codex/artifacts/{version}/{os}/{architecture}",
-            get({
-                let requests = Arc::clone(&requests);
-                let compressed = compressed.clone();
-                move |headers: HeaderMap| {
-                    let requests = Arc::clone(&requests);
-                    let compressed = compressed.clone();
-                    let expected_token = expected_token.clone();
-                    async move {
-                        assert_eq!(
-                            headers
-                                .get(axum::http::header::AUTHORIZATION)
-                                .unwrap()
-                                .to_str()
-                                .unwrap(),
-                            format!("Bearer {expected_token}")
-                        );
-                        requests.fetch_add(1, Ordering::SeqCst);
-                        Bytes::from(compressed)
-                    }
-                }
-            }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let hub_url = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = HubClient {
-            http: reqwest::Client::new(),
-            hub_url,
-            runtime_token: Arc::new(std::sync::RwLock::new("runtime-artifact-token".into())),
-            protocol_capabilities: HashSet::new(),
-        };
-        let artifact = CodexVersionArtifactDto {
-            version: "0.144.5".into(),
-            os: std::env::consts::OS.into(),
-            architecture: std::env::consts::ARCH.into(),
-            artifact_name: "codex.zst".into(),
-            sha256,
-            size_bytes: compressed.len() as u64,
-        };
-        let root = tempfile::tempdir().unwrap();
-
-        let installed =
-            install_managed_codex_artifact(root.path(), &client, &artifact, Duration::from_secs(1))
-                .await
-                .unwrap();
-        assert!(installed.ends_with("bin/0.144.5/codex"));
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
-        let reused =
-            install_managed_codex_artifact(root.path(), &client, &artifact, Duration::from_secs(1))
-                .await
-                .unwrap();
-        assert_eq!(reused, installed);
-        assert_eq!(requests.load(Ordering::SeqCst), 1);
-        server.abort();
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn promoted_codex_switches_only_after_old_session_version_checkpoint_is_armed() {
-        let script = b"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'codex-cli 0.144.5'; exit 0; fi\nif [ \"$1\" = \"app-server\" ] && [ \"$2\" = \"--help\" ]; then exit 0; fi\nexit 9\n";
-        let compressed = zstd::stream::encode_all(&script[..], 3).unwrap();
-        let sha256 = format!("{:x}", Sha256::digest(&compressed));
-        let app = Router::new().route(
-            "/api/runtime/codex/artifacts/{version}/{os}/{architecture}",
-            get({
-                let compressed = compressed.clone();
-                move || {
-                    let compressed = compressed.clone();
-                    async move { Bytes::from(compressed) }
-                }
-            }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let hub_url = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = HubClient {
-            http: reqwest::Client::new(),
-            hub_url,
-            runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
-            protocol_capabilities: HashSet::new(),
-        };
-        let root = tempfile::tempdir().unwrap();
-        let runtime_id = Uuid::new_v4();
-        let session_id = Uuid::new_v4();
-        let metadata = SessionSupervisorMetadata {
-            format_version: 1,
-            session_id,
-            runtime_id,
-            ownership_generation: 1,
-            lifecycle_status: "online".into(),
-            idle_deadline_unix_ms: None,
-            checkpoint_reason: None,
-            checkpoint_retry_unix_ms: None,
-            hub_checkpoint_attempt_id: None,
-            codex_version: "0.143.0".into(),
-            native_thread_id: Some("thread-old-version".into()),
-        };
-        persist_session_supervisor_metadata(root.path(), &metadata)
-            .await
-            .unwrap();
-        let snapshots = vec![RuntimeOwnedSessionSnapshotDto {
-            session_id,
-            ownership_generation: 1,
-            lifecycle_status: "online".into(),
-            native_thread_id: Some("thread-old-version".into()),
-            active_run_id: None,
-        }];
-        let recovery = plan_session_recovery(root.path(), runtime_id, &snapshots, 1)
-            .await
-            .unwrap();
-        let manager = SessionSupervisorManager::try_recover_cold_with_idle_timeout(
-            root.path().to_path_buf(),
-            runtime_id,
-            recovery,
-            DEFAULT_SESSION_IDLE_TIMEOUT,
-        )
-        .unwrap();
-        let artifact = CodexVersionArtifactDto {
-            version: "0.144.5".into(),
-            os: std::env::consts::OS.into(),
-            architecture: std::env::consts::ARCH.into(),
-            artifact_name: "codex.zst".into(),
-            sha256,
-            size_bytes: compressed.len() as u64,
-        };
-        let mut config = test_config();
-        config.work_root = root.path().to_path_buf();
-        config.codex_version = "0.143.0".into();
-        config.codex_bin = "/old/codex".into();
-        config.codex_driver = "fake".into();
-        let mut rollout = RuntimeCodexState::new(&config);
-
-        apply_runtime_codex_rollout(
-            &mut config,
-            &client,
-            &mut rollout,
-            Some(&manager),
-            &RuntimeCodexRolloutCommandDto {
-                active_version: Some("0.143.0".into()),
-                target_artifact: Some(artifact),
-            },
-        )
-        .await;
-
-        assert_eq!(config.codex_version, "0.143.0");
-        assert_eq!(
-            rollout.heartbeat_status().candidate_status.as_deref(),
-            Some("ready")
-        );
-        assert!(manager
-            .take_due_checkpoint_requests()
-            .await
-            .unwrap()
-            .is_empty());
-
-        apply_runtime_codex_rollout(
-            &mut config,
-            &client,
-            &mut rollout,
-            Some(&manager),
-            &RuntimeCodexRolloutCommandDto {
-                active_version: Some("0.144.5".into()),
-                target_artifact: None,
-            },
-        )
-        .await;
-
-        assert_eq!(config.codex_version, "0.144.5");
-        assert!(config.codex_bin.ends_with("bin/0.144.5/codex"));
-        assert_eq!(
-            rollout.heartbeat_status(),
-            RuntimeCodexStatusDto {
-                current_version: "0.144.5".into(),
-                candidate_version: None,
-                candidate_status: None,
-                candidate_error: None,
-            }
-        );
-        let persisted: SessionSupervisorMetadata = serde_json::from_slice(
-            &fs::read(
-                SessionPaths::for_session(root.path(), session_id)
-                    .supervisor
-                    .join(SESSION_SUPERVISOR_METADATA_FILE),
-            )
-            .await
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(persisted.codex_version, "0.143.0");
-        assert_eq!(
-            manager.take_due_checkpoint_requests().await.unwrap(),
-            vec![RuntimeCheckpointRequest {
-                session_id,
-                ownership_generation: 1,
-                reason: RuntimeCheckpointReason::VersionSwitch,
-            }]
-        );
-        server.abort();
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn promotion_does_not_interrupt_or_mix_an_in_flight_turn() {
-        let root = tempfile::tempdir().unwrap();
-        let old_binary = root.path().join("old-codex");
-        let entered = root.path().join("old-turn-entered");
-        let release = root.path().join("old-turn-release");
-        let old_pid = root.path().join("old-codex.pid");
-        std::fs::write(
-            &old_binary,
-            format!(
-                r#"#!/bin/sh
-echo $$ > {}
-while IFS= read -r line; do
-  request_id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
-  case "$line" in
-    *'"method":"initialize"'*) echo "{{\"id\":$request_id,\"result\":{{}}}}" ;;
-    *'"method":"thread/start"'*) echo "{{\"id\":$request_id,\"result\":{{\"thread\":{{\"id\":\"old-thread\"}}}}}}" ;;
-    *'"method":"turn/start"'*)
-      echo "{{\"id\":$request_id,\"result\":{{\"turn\":{{\"id\":\"old-turn\"}}}}}}"
-      touch {}
-      while [ ! -f {} ]; do sleep 0.01; done
-      echo '{{"method":"turn/completed","params":{{"threadId":"old-thread","turn":{{"id":"old-turn","status":"completed","items":[{{"type":"agentMessage","text":"old version completed"}}]}}}}}}'
-      ;;
-  esac
-done
-"#,
-                shell_single_quote(&old_pid),
-                shell_single_quote(&entered),
-                shell_single_quote(&release),
-            ),
-        )
-        .unwrap();
-        make_executable(&old_binary);
-
-        let candidate = b"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'codex-cli 0.144.5'; exit 0; fi\nif [ \"$1\" = \"app-server\" ] && [ \"$2\" = \"--help\" ]; then exit 0; fi\nexit 9\n";
-        let compressed = zstd::stream::encode_all(&candidate[..], 3).unwrap();
-        let sha256 = format!("{:x}", Sha256::digest(&compressed));
-        let app = Router::new().route(
-            "/api/runtime/codex/artifacts/{version}/{os}/{architecture}",
-            get({
-                let compressed = compressed.clone();
-                move || {
-                    let compressed = compressed.clone();
-                    async move { Bytes::from(compressed) }
-                }
-            }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = HubClient {
-            http: reqwest::Client::new(),
-            hub_url: format!("http://{}", listener.local_addr().unwrap()),
-            runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
-            protocol_capabilities: HashSet::new(),
-        };
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let runtime_id = Uuid::new_v4();
-        let session_id = Uuid::new_v4();
-        let manager = Arc::new(SessionSupervisorManager::new(
-            root.path().to_path_buf(),
-            runtime_id,
-            1,
-        ));
-        let mut claim = test_claim();
-        claim.run.hub_session_id = Some(session_id);
-        let run_env = prepare_run_env(root.path(), &claim, None).await.unwrap();
-        manager
-            .ensure_app_server(
-                SessionSupervisorMetadata {
-                    format_version: 1,
-                    session_id,
-                    runtime_id,
-                    ownership_generation: 1,
-                    lifecycle_status: "online".into(),
-                    idle_deadline_unix_ms: None,
-                    checkpoint_reason: None,
-                    checkpoint_retry_unix_ms: None,
-                    hub_checkpoint_attempt_id: None,
-                    codex_version: "0.143.0".into(),
-                    native_thread_id: None,
-                },
-                old_binary.display().to_string(),
-                run_env,
-                Duration::from_secs(3),
-                None,
-            )
-            .await
-            .unwrap();
-        let execution = tokio::spawn({
-            let manager = Arc::clone(&manager);
-            async move { manager.execute(claim, None).await }
-        });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !entered.exists() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-        let pid_before = std::fs::read_to_string(&old_pid).unwrap();
-
-        let artifact = CodexVersionArtifactDto {
-            version: "0.144.5".into(),
-            os: std::env::consts::OS.into(),
-            architecture: std::env::consts::ARCH.into(),
-            artifact_name: "codex.zst".into(),
-            sha256,
-            size_bytes: compressed.len() as u64,
-        };
-        let mut config = test_config();
-        config.work_root = root.path().to_path_buf();
-        config.codex_version = "0.143.0".into();
-        config.codex_bin = old_binary.display().to_string();
-        config.codex_driver = "fake".into();
-        let mut rollout = RuntimeCodexState::new(&config);
-        apply_runtime_codex_rollout(
-            &mut config,
-            &client,
-            &mut rollout,
-            Some(&manager),
-            &RuntimeCodexRolloutCommandDto {
-                active_version: Some("0.143.0".into()),
-                target_artifact: Some(artifact),
-            },
-        )
-        .await;
-        apply_runtime_codex_rollout(
-            &mut config,
-            &client,
-            &mut rollout,
-            Some(&manager),
-            &RuntimeCodexRolloutCommandDto {
-                active_version: Some("0.144.5".into()),
-                target_artifact: None,
-            },
-        )
-        .await;
-
-        assert_eq!(config.codex_version, "0.144.5");
-        assert!(!execution.is_finished());
-        assert_eq!(std::fs::read_to_string(&old_pid).unwrap(), pid_before);
-        assert!(manager
-            .take_due_checkpoint_requests()
-            .await
-            .unwrap()
-            .is_empty());
-
-        std::fs::write(&release, b"release").unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(1), execution)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(result.final_status, "completed");
-        assert_eq!(
-            manager.take_due_checkpoint_requests().await.unwrap(),
-            vec![RuntimeCheckpointRequest {
-                session_id,
-                ownership_generation: 1,
-                reason: RuntimeCheckpointReason::VersionSwitch,
-            }]
-        );
-        manager.shutdown();
-        server.abort();
     }
 
     #[tokio::test]
@@ -19692,148 +12210,6 @@ done
         .unwrap();
         make_executable(&script);
         script
-    }
-
-    fn write_long_running_streaming_codex(temp: &tempfile::TempDir, pid_file: &Path) -> PathBuf {
-        let script = temp.path().join("long-running-streaming-codex");
-        let script_contents = format!(
-            r#"#!/bin/sh
-echo $$ > {}
-while IFS= read -r line; do
-  case "$line" in
-    *'"method":"initialize"'*) echo '{{"id":1,"result":{{"serverInfo":{{"name":"long-running"}}}}}}' ;;
-    *'"method":"thread/start"'*) echo '{{"id":2,"result":{{"thread":{{"id":"long-thread","sessionId":"long-session"}}}}}}' ;;
-    *'"method":"turn/start"'*)
-      echo '{{"method":"item/agentMessage/delta","params":{{"delta":"first"}}}}'
-      while :; do sleep 1; done
-      ;;
-  esac
-done
-"#,
-            shell_single_quote(pid_file)
-        );
-        std::fs::write(&script, script_contents).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        script
-    }
-
-    fn write_high_frequency_streaming_codex(
-        temp: &tempfile::TempDir,
-        pid_file: &Path,
-        completed_marker: &Path,
-    ) -> PathBuf {
-        let script = temp.path().join("high-frequency-streaming-codex");
-        let script_contents = format!(
-            r#"#!/bin/sh
-echo $$ > {}
-while IFS= read -r line; do
-  case "$line" in
-    *'"method":"initialize"'*) echo '{{"id":1,"result":{{"serverInfo":{{"name":"burst"}}}}}}' ;;
-    *'"method":"thread/start"'*) echo '{{"id":2,"result":{{"thread":{{"id":"burst-thread","sessionId":"burst-session"}}}}}}' ;;
-    *'"method":"turn/start"'*)
-      i=0
-      while [ "$i" -lt 20000 ]; do
-        echo '{{"method":"item/agentMessage/delta","params":{{"delta":"x"}}}}'
-        i=$((i + 1))
-      done
-      : > {}
-      while :; do sleep 1; done
-      ;;
-  esac
-done
-"#,
-            shell_single_quote(pid_file),
-            shell_single_quote(completed_marker)
-        );
-        std::fs::write(&script, script_contents).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        script
-    }
-
-    fn slow_failing_hub_client(delay: Duration) -> (HubClient, std::thread::JoinHandle<()>) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let thread = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let request = read_http_request(&mut stream);
-            assert!(String::from_utf8_lossy(&request).contains("/events"));
-            std::thread::sleep(delay);
-            stream
-                .write_all(
-                    b"HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-                )
-                .unwrap();
-            stream.flush().unwrap();
-        });
-        (
-            HubClient {
-                http: reqwest::Client::builder()
-                    .connect_timeout(Duration::from_secs(1))
-                    .timeout(Duration::from_secs(2))
-                    .build()
-                    .unwrap(),
-                hub_url: format!("http://{addr}"),
-                runtime_token: Arc::new(std::sync::RwLock::new("test-runtime-token".into())),
-                protocol_capabilities: HashSet::from([ATOMIC_WAITING_TOOL_BATCH_CAPABILITY.into()]),
-            },
-            thread,
-        )
-    }
-
-    fn failing_hub_client(failing_path: &str) -> (HubClient, std::thread::JoinHandle<()>) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let failing_path = failing_path.to_owned();
-        let thread = std::thread::spawn(move || loop {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let request = read_http_request(&mut stream);
-            let request_text = String::from_utf8_lossy(&request);
-            let should_fail = request_text.contains(&failing_path);
-            if should_fail {
-                stream
-                    .write_all(
-                        b"HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-                    )
-                    .unwrap();
-            } else if request_text.contains("/api/runtime/heartbeat") {
-                write_heartbeat_response(&mut stream, false, false, false);
-            } else {
-                stream
-                    .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
-                    .unwrap();
-            }
-            stream.flush().unwrap();
-            if should_fail {
-                return;
-            }
-        });
-        (
-            HubClient {
-                http: reqwest::Client::builder()
-                    .connect_timeout(Duration::from_secs(1))
-                    .timeout(Duration::from_secs(2))
-                    .build()
-                    .unwrap(),
-                hub_url: format!("http://{addr}"),
-                runtime_token: Arc::new(std::sync::RwLock::new("test-runtime-token".into())),
-                protocol_capabilities: HashSet::from([ATOMIC_WAITING_TOOL_BATCH_CAPABILITY.into()]),
-            },
-            thread,
-        )
     }
 
     fn recording_hub_client(
@@ -19945,7 +12321,6 @@ done
             owned_sessions: Vec::new(),
             cleanup_sessions: Vec::new(),
             session_commands: Vec::new(),
-            codex_rollout: RuntimeCodexRolloutCommandDto::default(),
         })
         .unwrap();
         write!(
@@ -19964,15 +12339,18 @@ done
             let pid = std::fs::read_to_string(pid_file).unwrap();
             let pid = pid.trim().parse::<i32>().unwrap();
             for _ in 0..50 {
-                if !process_group_exists(pid) {
+                if !process_group_has_live_members(pid) {
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
+            if !process_group_has_live_members(pid) {
+                return;
+            }
             unsafe {
                 libc::kill(-pid, libc::SIGKILL);
             }
-            panic!("app-server process group {pid} survived runtime cancellation");
+            panic!("Execution Engine process group {pid} survived runtime cancellation");
         }
     }
 
@@ -19984,20 +12362,41 @@ done
         std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
 
-    fn temp_env_var(key: &str, value: &str, action: impl FnOnce()) {
-        let previous = env::var(key).ok();
-        // 测试内临时注入父进程环境，用于验证 Command 显式移除了敏感 runtime env。
-        unsafe {
-            env::set_var(key, value);
+    #[cfg(unix)]
+    fn process_group_has_live_members(process_group_id: i32) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            // A killed descendant can remain a zombie until the container's PID 1 reaps it.
+            process_group_members(process_group_id)
+                .map(|members| {
+                    members
+                        .into_iter()
+                        .any(|(_, state)| !matches!(state, 'Z' | 'X'))
+                })
+                .unwrap_or_else(|_| process_group_exists(process_group_id))
         }
-        action();
-        unsafe {
-            if let Some(previous) = previous {
-                env::set_var(key, previous);
-            } else {
-                env::remove_var(key);
-            }
+        #[cfg(not(target_os = "linux"))]
+        {
+            process_group_exists(process_group_id)
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_group_members(process_group_id: i32) -> std::io::Result<Vec<(i32, char)>> {
+        let members = std::fs::read_dir("/proc")?
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let pid = entry.file_name().to_string_lossy().parse::<i32>().ok()?;
+                let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+                let (_, fields) = stat.rsplit_once(") ")?;
+                let mut fields = fields.split_whitespace();
+                let state = fields.next()?.chars().next()?;
+                fields.next()?;
+                let group_id = fields.next()?.parse::<i32>().ok()?;
+                (group_id == process_group_id).then_some((pid, state))
+            })
+            .collect::<Vec<_>>();
+        Ok(members)
     }
 
     fn test_execution_skill(
@@ -20033,7 +12432,7 @@ done
             instructions: "Be concise".into(),
             model_selection: Some(model_selection.clone()),
             model_settings: model_settings.clone(),
-            codex_subagents: Vec::new(),
+            subagents: Vec::new(),
             model_bindings: vec![RunModelBindingDto {
                 id: model_binding_id,
                 run_id,
@@ -20070,7 +12469,7 @@ done
                 session_ownership_generation: Some(1),
                 status: "running".into(),
                 initial_message: "hello".into(),
-                session_id: None,
+                native_session_id: None,
                 work_dir_ref: None,
                 source: "console".into(),
                 created_at: chrono::Utc::now(),
@@ -20086,7 +12485,7 @@ done
                 runtime_id: None,
                 model_selection: Some(model_selection),
                 model_settings,
-                codex_subagents: Vec::new(),
+                subagents: Vec::new(),
                 model_policy: json!({ "provider": "hub-proxy" }),
                 sandbox_policy: json!({ "mode": "workspace-write", "network_access": true }),
                 managed_skill_ids: Vec::new(),
@@ -20115,11 +12514,10 @@ done
             work_root: PathBuf::from("/tmp/agent-hub-runtime-test"),
             hostname: "test-runtime".into(),
             poll_interval: Duration::from_millis(10),
-            codex_driver: "app-server".into(),
-            codex_source: "path".into(),
-            codex_bin: "codex".into(),
-            codex_version: "test-codex".into(),
-            app_server_timeout: Duration::from_secs(1),
+            engine_driver: "pi".into(),
+            engine_bin: "pi".into(),
+            engine_version: "test-engine".into(),
+            engine_timeout: Duration::from_secs(1),
             model_proxy_idle_timeout: Duration::from_secs(1),
             session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
             max_online_sessions: DEFAULT_MAX_ONLINE_SESSIONS,

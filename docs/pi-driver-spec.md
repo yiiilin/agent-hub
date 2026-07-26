@@ -6,10 +6,12 @@ Pi 是 Agent Hub Runtime 当前的原生执行进程。Hub 仍拥有 Session、R
 Workspace、权限、模型连接、provider key、用量账本和 Bundle 生命周期；Pi
 只在一个在线 Hub Session 内执行一条可恢复的原生会话。
 
-本迭代不实现 MCP 或 Pi/Codex subagent。Hub 的公开 DTO 和数据库中的
-`codex_*` 字段是兼容名称：`codex_version` 保存 Pi artifact 版本，
-`native_thread_id` 保存 Pi native session id，Bundle 的 `codex-thread/`
-子树保存 Pi JSONL recovery data。它们不会被重新解释为 Codex 可执行文件。
+本迭代不实现 MCP 或 Pi Subagent。Hub 的公开 DTO 和数据库使用
+`engine_version` 表示 Runtime Engine 版本，使用 `native_session_id` 表示 Pi
+Native Session ID；Bundle 的 `native-session/` 子树保存 Pi JSONL recovery data。
+Pi Runtime 注册时上报 `mcp_allowlist: false` 和 `subagents: false`；Hub 不会将
+含已启用 MCP 或 Subagent 配置的 Run 领取给该 Runtime，而是以 capability mismatch
+结束该 Run，避免静默忽略配置。
 
 ## 进程和目录
 
@@ -18,7 +20,7 @@ Workspace、权限、模型连接、provider key、用量账本和 Bundle 生命
 ```text
 session-root/
   workspace/                 # Pi cwd，跨 Turn 保留
-  codex/                     # 兼容路径名；Pi 的隔离 HOME
+  engine-state/              # Pi 的隔离 HOME
     .pi/agent/AGENTS.md      # Hub 生成的 Agent 指令
     .pi/agent/models.json    # 只指向 Runtime loopback proxy
     .pi/agent/skills/        # Hub/本地 Skill 快照
@@ -30,8 +32,8 @@ session-root/
 Runtime 用以下形状启动 Pi：
 
 ```text
-HOME=<session-root>/codex
-pi --mode rpc --session-dir <session-root>/codex/sessions [--session <saved-jsonl>]
+HOME=<session-root>/engine-state
+pi --mode rpc --session-dir <session-root>/engine-state/sessions [--session <saved-jsonl>]
 ```
 
 Runtime 明确传递 Workspace cwd、进程组、受限环境变量和工具 allowlist。Pi
@@ -42,7 +44,7 @@ Runtime 明确传递 Workspace cwd、进程组、受限环境变量和工具 all
 
 | Hub 行为 | Pi RPC | Runtime 处理 |
 | --- | --- | --- |
-| 新 Session / Bundle 恢复 | `get_state` | 保存 Pi `sessionId` 和 `sessionFile` |
+| 新 Session / Bundle 恢复 | `get_state` | 保存 Pi Native Session ID 和 `sessionFile` |
 | 设置主模型 | `set_model` | provider 仅是当前 Run binding 的本地代理 |
 | 设置推理强度 | `set_thinking_level` | Pi `max` 可通过 model map 映射到 upstream `ultra` |
 | 空闲用户消息 | `prompt` | Hub 已持久化的有序普通消息合并为一次 prompt |
@@ -73,8 +75,8 @@ Pi `models.json` 为每个 Run 的 `main` binding 创建一个 provider：
 
 ## 工具策略
 
-Pi standalone 没有 Codex `sandboxPolicy` RPC 参数。Runtime 采用保守的
-tool allowlist，不得把旧策略静默放宽：
+Pi standalone 没有统一的 sandbox policy RPC 参数。Runtime 采用保守的
+tool allowlist，不得把 Hub policy 静默放宽：
 
 | Hub sandbox policy | `network_access` | Pi builtin tools |
 | --- | --- | --- |
@@ -85,15 +87,15 @@ tool allowlist，不得把旧策略静默放宽：
 | `danger-full-access` | `true` | 上述工具加 `bash` |
 
 Pi 进程仍运行在 Runtime 的非 root 用户、容器/操作系统隔离和每个 Session
-Workspace 下。此表不承诺 Codex sandbox 的字节级等价；若部署要求比 Runtime
+Workspace 下。此表不承诺其他执行引擎 sandbox 的字节级等价；若部署要求比 Runtime
 容器更强的 host-level shell/network 隔离，必须在 Runtime 节点部署边界提供，
 而不是由 Hub UI 或模型提示词假装实现。
 
 ## Bundle
 
-Bundle 继续只包含 `workspace/`、`manifest.json` 和兼容名称
-`codex-thread/`。最后一个目录只允许 `sessions/` 及一个直接位于其下、首行
-`type=session` 且 `id` 与 manifest native Session id 相同的 Pi recovery JSONL。
+Bundle 只包含 `workspace/`、`manifest.json` 和 `native-session/`。最后一个目录
+只允许 `sessions/` 及一个直接位于其下、首行 `type=session` 且 `id` 与 manifest
+中的 `native_session_id` 相同的 Pi recovery JSONL。
 创建和恢复都不以文件名判断 Session 身份。不得包含：
 
 - `.pi/agent/models.json`、`auth.json`、settings、extensions、Skills 或缓存；
@@ -114,5 +116,5 @@ binding。Pi 是否在新 Turn 使用新增 Skill 内容由其原生资源加载
 - 使用 `FAKE_PI_DISABLE_MODEL=1` 时不发出网络请求，适合纯协议测试；
 - 正常模式从隔离 Pi `models.json` 读取 loopback URL 和 binding header，以
   fake provider 跑完整 Runtime -> Hub gateway 链路；
-- 不接受 JSON-RPC `initialize`、`thread/start` 或 `turn/start`，以防测试把
-  Pi fixture 错当成 Codex app-server。
+- 不接受不属于 Pi standalone RPC 的 JSON-RPC `initialize`、`thread/start` 或
+  `turn/start`，防止 fixture 掩盖 driver 协议错误。

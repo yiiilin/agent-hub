@@ -1,5 +1,8 @@
 # Plan 全面复核与修复 Spec
 
+> Status: historical. 本文件记录早期 Codex runtime 审查与返工验收，当前实现和
+> 术语以现行 `docs/*-spec.md`、ADR-0030 和 Pi Runtime 文档为准。
+
 ## 目标
 
 本轮以仓库根目录 `plan.md` 为验收基线，补齐首轮实现中发现的安全、权限、

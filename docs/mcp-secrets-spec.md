@@ -6,22 +6,22 @@
 2. 管理台以表格显示 MCP entries，通过新建、编辑子表单和带确认的删除操作维护原数组。
 3. MCP entry 可包含 `secrets` 对象；Hub 在控制面 API 和 UI 中返回脱敏值。
 4. 用户保存从 UI 读回的脱敏占位符时不覆盖原 secret，新 secret 只在表单提交中短暂存在。
-5. Runtime 在 Session 专属 `CODEX_HOME` 中使用完整 MCP 配置，secret 只写入权限 `0600` 的 `config.toml`。
-6. `mcp-allowlist.json` 只写脱敏版本，Session Bundle、Workspace、日志、argv 和浏览器快照不得包含 secret。
+5. Pi Runtime V1 不实现 MCP 执行，因此不把 MCP allowlist、命令或 secret 物化到 Session 的 `engine-state/`。
+6. Session Bundle、Workspace、Execution Engine state、日志、argv 和浏览器快照不得包含 MCP secret。
 
 ## 非目标
 
 - 不接入外部 secret manager，不实现字段级权限模型。
-- 不修改现有 MCP 执行协议或 allowlist 存储格式。
+- 不实现 Pi MCP 执行、MCP server 启动或 Runtime-side secret 注入。
 
 ## 验收标准
 
 - Agent 详情中 MCP 以 table 展示，只有点击新建/编辑后才出现子表单。
 - `GET /api/agents/{id}` 和列表不返回 MCP secret 明文；脱敏占位符 round-trip 保留原 secret。
-- Session 配置中 `config.toml` 含必要 secret 且权限为 `0600`；脱敏文件不含明文。
+- Runtime Session 中不存在 `mcp-allowlist.json`，`engine-state/` 和其他 Session 文件均不含 MCP secret 或 Subagent 定义。
 
 ## 测试计划
 
-- Rust：覆盖 MCP secret 脱敏、占位符 merge 和 Runtime config 渲染。
+- Rust：覆盖 MCP secret 脱敏、占位符 merge 和 Pi Runtime 不物化 MCP。
 - TypeScript：前端构建通过。
-- 浏览器：覆盖 MCP 表格新建/编辑/删除、secret 脱敏与运行后文件断言。
+- 浏览器/API QA：覆盖 MCP 表格新建/编辑/删除、secret 脱敏与运行后无落盘断言。

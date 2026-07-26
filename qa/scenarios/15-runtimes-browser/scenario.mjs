@@ -38,7 +38,7 @@ function updateAgentPayload(agent, runtimeId) {
     runtime_id: runtimeId,
     model_selection: agent.model_selection,
     model_settings: agent.model_settings,
-    codex_subagents: agent.codex_subagents,
+    subagents: agent.subagents,
     sandbox_policy: agent.sandbox_policy,
     managed_skill_ids: agent.managed_skill_ids,
     mcp_allowlist: agent.mcp_allowlist
@@ -123,7 +123,7 @@ async function registerRuntimeWithToken(context, template, token, hostname, labe
   const { data } = await client.post('/api/runtime/register', {
     hostname,
     labels: ['qa', 'browser', label],
-    codex_version: template.codex_version,
+    engine_version: template.engine_version,
     capabilities: structuredClone(template.capabilities),
     sandbox_mode: template.sandbox_mode
   }, {
@@ -209,7 +209,7 @@ async function createOwnedSession(admin, context, runtime, agent) {
   });
   assert.equal(begun.ownership_generation, generation);
 
-  const nativeThreadId = uniqueSlug(context, 'qa-runtime-browser-thread');
+  const nativeSessionId = uniqueSlug(context, 'qa-runtime-browser-thread');
   const { data: started } = await runtimePost(runtime, `/api/runtime/runs/${run.id}/events`, {
     ownership_generation: generation,
     payload: {
@@ -217,18 +217,18 @@ async function createOwnedSession(admin, context, runtime, agent) {
       role: null,
       content: null,
       payload: {
-        native_thread_id: nativeThreadId,
+        native_session_id: nativeSessionId,
         native_turn_id: uniqueSlug(context, 'qa-runtime-browser-turn')
       }
     }
   });
-  assert.equal(started.payload.native_thread_id, nativeThreadId);
+  assert.equal(started.payload.native_session_id, nativeSessionId);
 
   const { data: completed } = await runtimePost(runtime, `/api/runtime/runs/${run.id}/complete`, {
     ownership_generation: generation,
     payload: {
       status: 'completed',
-      session_id: nativeThreadId,
+      native_session_id: nativeSessionId,
       work_dir_ref: `/qa/${run.id}`
     }
   });
@@ -367,7 +367,7 @@ export default async function runtimesBrowserScenario(scenarioContext) {
       const reused = await new ApiClient(scenarioContext.baseURL).post('/api/runtime/register', {
         hostname: uniqueSlug(scenarioContext, 'qa-runtime-browser-reused'),
         labels: ['qa', 'browser', 'reused'],
-        codex_version: template.codex_version,
+        engine_version: template.engine_version,
         capabilities: structuredClone(template.capabilities),
         sandbox_mode: template.sandbox_mode
       }, {
@@ -394,7 +394,7 @@ export default async function runtimesBrowserScenario(scenarioContext) {
       await detail.getByRole('heading', { name: primary.hostname }).waitFor();
       const primaryDetailText = await detail.innerText();
       assert.ok(primaryDetailText.includes(primary.id), 'Runtime details must show the registered id');
-      assert.ok(primaryDetailText.includes(template.codex_version), 'Runtime details must show Codex version');
+      assert.ok(primaryDetailText.includes(template.engine_version), 'Runtime details must show engine version');
       assert.ok(primaryDetailText.includes(template.sandbox_mode), 'Runtime details must show sandbox mode');
       assert.equal(
         await detail.getByRole('button', { name: 'Drain runtime' }).isDisabled(),

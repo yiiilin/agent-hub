@@ -11,7 +11,7 @@ object-store checksum upload leave that generation current, then commits the
 next generation. It then releases ownership explicitly and checks that the
 Session is waiting for a Runtime with the committed Bundle and no owner. A
 second temporary Runtime downloads the exact bytes and metadata and resumes the
-existing native Thread rather than creating a replacement. A separate Session
+existing Native Session rather than creating a replacement. A separate Session
 proves that force-deleting its Runtime without a current Bundle exposes
 `recovery_failed`, an error, and read-only behavior through the Session API.
 

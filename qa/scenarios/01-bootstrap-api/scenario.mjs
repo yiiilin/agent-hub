@@ -15,7 +15,8 @@ export default async function bootstrapApiScenario(context) {
   assert.ok(runtimes.some((runtime) => runtime.status === 'online'));
 
   const { data: systemDefault } = await client.get('/api/model-connections/system-default');
-  assert.match(systemDefault.model_connection_id, /^[0-9a-f-]{36}$/);
+  assert.match(systemDefault.selection?.connection_id, /^[0-9a-f-]{36}$/);
+  assert.equal(typeof systemDefault.selection?.model_id, 'string');
 
   assert.equal(
     context.compose.psql("SELECT version || '|' || description || '|' || success FROM _sqlx_migrations ORDER BY version"),
@@ -24,9 +25,5 @@ export default async function bootstrapApiScenario(context) {
   assert.equal(
     context.compose.psql("SELECT password_registration_enabled || '|' || password_login_enabled || '|' || email_verification_required FROM auth_policy WHERE singleton = true"),
     'true|true|false'
-  );
-  assert.equal(
-    context.compose.psql("SELECT status FROM codex_version_rollout WHERE singleton = true"),
-    'idle'
   );
 }

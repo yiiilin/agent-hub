@@ -28,7 +28,7 @@
 - `ApiKeyDto` 包含 nullable `expires_at`而不包含 `revoked_at`；过期 key 返回 401。
 - 续期保留 id、name、prefix、token hash、created/last-used 记录，并拒绝相同或更早日期。
 - 续期和删除仅允许 owner 通过 browser session 或另一把有效 API Key 执行；当前 key 不能操作自身记录。
-- Administration 对 `admin` 和 `super_admin` 可见，并按 protected Super Administrator 边界提供用户、认证、外部平台、Runtime、Codex rollout 和 Model Connection 管理。改密后旧 browser session 失效，API Key 仍然有效。
+- Administration 对 `admin` 和 `super_admin` 可见，并按 protected Super Administrator 边界提供用户、认证、外部平台、Runtime 和 Model Connection 管理。改密后旧 browser session 失效，API Key 仍然有效。
 
 ## 测试计划
 

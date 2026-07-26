@@ -31,12 +31,12 @@ artifact 并执行真实 standalone RPC smoke；不能仅修改版本字符串�
 
 运行时只执行镜像内的 Pi binary，不能让 Runtime 下载 GitHub release，也不能
 把 provider key 写入 Pi 配置。模型请求始终经 Runtime loopback -> Hub model
-gateway；Bundle 只保存 Pi recovery JSONL 和 Workspace。旧 Codex rollout API
-仅为公开契约兼容而保留，不负责分发 Pi artifact。
+gateway；Bundle 只保存 Pi recovery JSONL 和 Workspace。Hub 不提供执行引擎
+rollout API，Pi 随完整 Runtime 镜像发布。
 
 ## 生产 Compose
 
-根目录 `compose.yml` 是默认生产编排。它启动 PostgreSQL、私有 MinIO、Hub 和无状态 Model Gateway；Hub backend 镜像同时包含并直接托管 React/Vite 静态资源，不需要独立 frontend 或 Nginx 容器。生产配置不启用 Mock OIDC、开发用户、开发 Model Connection、fake provider 或 fake Codex。先以 `.env.example` 为清单配置 `.env` 并执行 `chmod 600 .env`；关键值为空时 Compose 会在创建容器前拒绝启动。`.env` 已同时被 Git 和 Docker build context 排除。
+根目录 `compose.yml` 是默认生产编排。它启动 PostgreSQL、私有 MinIO、Hub 和无状态 Model Gateway；Hub backend 镜像同时包含并直接托管 React/Vite 静态资源，不需要独立 frontend 或 Nginx 容器。生产配置不启用 Mock OIDC、开发用户、开发 Model Connection、fake provider 或 fake Pi RPC。先以 `.env.example` 为清单配置 `.env` 并执行 `chmod 600 .env`；关键值为空时 Compose 会在创建容器前拒绝启动。`.env` 已同时被 Git 和 Docker build context 排除。
 
 至少需要设置：
 
@@ -64,8 +64,8 @@ docker compose --profile runtime up -d --build
 ```
 
 Runtime 镜像固定执行 `/opt/agent-hub/pi/pi`，版本由镜像内
-`RUNTIME_CODEX_VERSION=0.81.1` 兼容字段上报，Compose 不接受宿主机同名变量
-覆盖它；不挂载 `CODEX_BIN_PATH`，也不从 Hub 下载执行 artifact。`runtime-data` 包含 Runtime credential、Workspace、在线
+`RUNTIME_ENGINE_VERSION=0.81.1` 上报，Compose 不接受宿主机同名变量覆盖它；
+`ENGINE_BIN` 固定指向镜像内二进制，也不从 Hub 下载执行 artifact。`runtime-data` 包含 Runtime credential、Workspace、在线
 Pi Session state 和暂存文件，不得当作无状态缓存删除。
 
 ## 开发 Compose
@@ -115,19 +115,19 @@ Runtime 被普通或强制删除后，原 Runtime identity 和 credential 永久
 
 ## Runtime 本地数据和 Session Bundle
 
-每个在线 Session 位于 `RUNTIME_WORK_ROOT/sessions/<session-id>/`，包含独立的 `workspace/`、作为隔离 Pi `HOME` 的兼容路径 `codex/`、本地 `supervisor/` 元数据和 `staging/`。`codex/.pi/agent/` 是 Hub 可重建配置，`codex/sessions/` 是 Pi native JSONL。不同 Session 不共享 Workspace、Pi HOME 或 JSONL。
+每个在线 Session 位于 `RUNTIME_WORK_ROOT/sessions/<session-id>/`，包含独立的 `workspace/`、作为隔离 Pi `HOME` 的 `engine-state/`、本地 `supervisor/` 元数据和 `staging/`。`engine-state/.pi/agent/` 是 Hub 可重建配置，`engine-state/sessions/` 是 Pi native JSONL。不同 Session 不共享 Workspace、Pi HOME 或 JSONL。
 
 Session 空闲 15 分钟后，Runtime 默认停止其 Pi RPC 进程并生成一个 `tar.zst` Session Bundle。Bundle 只包含：
 
 | 路径 | 用途 |
 | --- | --- |
 | `workspace/` | Session 的完整工作区，包括隐藏文件和 `.git` |
-| `codex-thread/sessions/<file>.jsonl` | 恢复同一 native Pi Session 的唯一 JSONL |
+| `native-session/sessions/<file>.jsonl` | 恢复同一 Native Session 的唯一 Pi JSONL |
 | `manifest.json` | Hub/Pi Session 标识、Bundle generation、Hub history checkpoint、生成时 Pi 版本，以及内容大小和校验声明 |
 
-Runtime 按 JSONL 第一行的 `type=session` 和 `id=<native_thread_id>` 选择唯一恢复文件，不依赖文件名。恢复只接受兼容目录根、`sessions/` 和一个直接子级 `.jsonl`，并在提交恢复目录前再次验证 header 与 manifest 匹配。Bundle 不包含 `.pi/agent`、Runtime credential、模型密钥、OAuth secret、Agent/Skill/MCP 配置、settings、extensions、日志、缓存、Pi binary 或其他 Session。Agent/Skill/model binding 文件由 Hub 在下一 Turn 前按当前配置重新生成。
+Runtime 按 JSONL 第一行的 `type=session` 和 `id=<native_session_id>` 选择唯一恢复文件，不依赖文件名。恢复只接受 `native-session/`、`native-session/sessions/` 和一个直接子级 `.jsonl`，并在提交恢复目录前再次验证 header 与 manifest 匹配。Bundle 不包含 `.pi/agent`、Runtime credential、模型密钥、OAuth secret、Agent/Skill/MCP 配置、settings、extensions、日志、缓存、Pi binary 或其他 Session。Agent/Skill/model binding 文件由 Hub 在下一 Turn 前按当前配置重新生成。
 
-物理删除 Hub Skill 会请求相关在线 Session 刷新派生配置。空闲 Session 立即处理，活动 Turn 结束或被停止后处理；这只修改 `codex/` 中 Hub-owned 文件，不修改 `workspace/`、Bundle 或 native transcript。
+物理删除 Hub Skill 会请求相关在线 Session 刷新派生配置。空闲 Session 立即处理，活动 Turn 结束或被停止后处理；这只修改 `engine-state/` 中 Hub-owned 文件，不修改 `workspace/`、Bundle 或 native transcript。
 
 Runtime 创建压缩包并计算压缩文件的 SHA-256。Hub 只校验身份、Session ownership generation 和声明的压缩大小，然后流式转发，不解包、不扫描，也不重新计算 checksum。恢复时仍由 Runtime 校验 checksum 后安全解包。
 
@@ -165,11 +165,10 @@ Endpoint 只允许 HTTP/HTTPS，且不能包含 query 或 fragment。HTTPS 是�
 
 S3 credential、bucket 和对象 URL 只存在于 Hub。Runtime 的上传和下载都只连接 Hub，不获得 S3 credential、预签名 URL，也不直接访问对象存储。
 
-## Pi 镜像升级和回滚
+## Runtime Engine 镜像升级和回滚
 
-Pi 版本随完整 Runtime 镜像发布，不由 Hub 的兼容 Codex rollout API 分发。该 API/DTO
-仍可读取和下发旧字段，但 Pi Runtime 不下载 candidate、不切换二进制，也不为它
-安排 version checkpoint。
+Pi 版本随完整 Runtime 镜像发布。Hub 不分发 candidate、不切换 Runtime 二进制，
+也不安排 version checkpoint。
 
 升级前保存当前镜像的不可变 digest 作为上一已知良好版本。先 Drain 待升级 Runtime，
 等全部 Session 完成 Turn、提交 current Bundle 并释放 ownership，再用新 digest 重建

@@ -213,7 +213,7 @@ function updateAgentPayload(agent, overrides = {}) {
     runtime_id: agent.runtime_id,
     model_selection: agent.model_selection,
     model_settings: agent.model_settings,
-    codex_subagents: agent.codex_subagents,
+    subagents: agent.subagents,
     sandbox_policy: agent.sandbox_policy,
     managed_skill_ids: agent.managed_skill_ids,
     mcp_allowlist: agent.mcp_allowlist,
@@ -701,7 +701,7 @@ export default async function integrationsOauthApiScenario(context) {
     assert.equal(completedToolRun.session_id, waitingToolRun.session_id);
     assert.equal(completedToolRun.work_dir_ref, waitingToolRun.work_dir_ref);
     const firstHubSession = (await ownerClient.get(`/api/sessions/${primarySession.hub_session_id}`)).data;
-    assert.equal(typeof firstHubSession.native_thread_id, 'string');
+    assert.equal(typeof firstHubSession.native_session_id, 'string');
 
     const secondContent = context.unique('Continue the same external Session normally');
     const { data: secondAcceptance } = await integrationClient.post(
@@ -720,7 +720,7 @@ export default async function integrationsOauthApiScenario(context) {
     assert.equal(completedSecondRun.session_id, completedToolRun.session_id);
     assert.equal(completedSecondRun.work_dir_ref, completedToolRun.work_dir_ref);
     const continuedHubSession = (await ownerClient.get(`/api/sessions/${primarySession.hub_session_id}`)).data;
-    assert.equal(continuedHubSession.native_thread_id, firstHubSession.native_thread_id);
+    assert.equal(continuedHubSession.native_session_id, firstHubSession.native_session_id);
 
     const { data: integrationMessages } = await integrationClient.get(
       `/api/integrations/sessions/${primarySession.id}/messages`,
@@ -760,7 +760,7 @@ export default async function integrationsOauthApiScenario(context) {
     const { data: registeredIdle } = await runtimeClient.post('/api/runtime/register', {
       hostname: idleHostname,
       labels: ['qa', 'integration-concurrency'],
-      codex_version: runtimeTemplate.codex_version,
+      engine_version: runtimeTemplate.engine_version,
       capabilities: structuredClone(runtimeTemplate.capabilities),
       sandbox_mode: runtimeTemplate.sandbox_mode
     }, { headers: { authorization: `Bearer ${enrollment.token}` } });

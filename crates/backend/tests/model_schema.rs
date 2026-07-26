@@ -238,7 +238,7 @@ async fn model_api_connection_schema_enforces_allowlists_and_complete_selections
     assert!(cross_owner_agent.is_err());
 
     let reserved_binding_key = sqlx::query(
-        "INSERT INTO codex_subagent_definitions
+        "INSERT INTO subagent_definitions
              (id, agent_id, name, description, developer_instructions)
          VALUES ($1, $2, 'MAIN', 'Conflicts with the main binding', '# Invalid')",
     )
@@ -249,7 +249,7 @@ async fn model_api_connection_schema_enforces_allowlists_and_complete_selections
     assert!(reserved_binding_key.is_err());
 
     sqlx::query(
-        "INSERT INTO codex_subagent_definitions
+        "INSERT INTO subagent_definitions
              (id, agent_id, name, description, developer_instructions,
               model_connection_id, model_id, model_settings_override)
          VALUES ($1, $2, 'reviewer', 'Reviews changes', '# Review', $3,

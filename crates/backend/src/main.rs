@@ -51,12 +51,8 @@ use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-mod codex_rollout;
 mod session_bundle_store;
 
-use codex_rollout::{
-    validate_concrete_version, CodexReleaseClient, PreparedCodexArtifact, RuntimePlatform,
-};
 use session_bundle_store::{S3BundleStore, S3BundleStoreConfig};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -81,6 +77,13 @@ const RUNTIME_CAPABILITY_SQL: &str = "
              OR COALESCE((rt.capabilities->>'mcp_allowlist')::boolean, false) = true
            )
            AND (
+             NOT EXISTS (
+               SELECT 1 FROM subagent_definitions subagent
+               WHERE subagent.agent_id = a.id AND subagent.enabled = true
+             )
+             OR COALESCE((rt.capabilities->>'subagents')::boolean, false) = true
+           )
+           AND (
              a.sandbox_policy->>'mode' IS DISTINCT FROM 'workspace-write'
              OR rt.sandbox_mode LIKE 'workspace-write%'
            )
@@ -102,7 +105,7 @@ const ACTIVE_RUNTIME_TOOL_REQUEST_SESSION_SQL: &str = "
     FOR UPDATE";
 const ACTIVE_RUNTIME_TOOL_REQUEST_RUN_SQL: &str = "
     SELECT r.integration_session_id, r.hub_session_id, r.hub_turn_id,
-           r.status, r.session_id, r.work_dir_ref
+           r.status, r.native_session_id, r.work_dir_ref
     FROM runs r
     WHERE r.id = $1
       AND r.runtime_id = $2
@@ -129,7 +132,6 @@ struct AppState {
     model_gateway_auth_token: Arc<Zeroizing<String>>,
     session_bundle_store: Option<Arc<S3BundleStore>>,
     session_bundle_max_bytes: u64,
-    codex_release_client: Arc<CodexReleaseClient>,
     auth_providers: Vec<Arc<dyn AuthProvider>>,
     session_issuer: Arc<dyn SessionIssuer>,
 }
@@ -162,7 +164,7 @@ struct SessionBundleCommitMetadata {
     checksum_sha256: String,
     size_bytes: i64,
     history_checkpoint: i64,
-    producing_codex_version: String,
+    producing_engine_version: String,
     created_at: DateTime<Utc>,
 }
 
@@ -264,7 +266,6 @@ async fn main() -> anyhow::Result<()> {
         .build()?;
     let session_bundle_store = session_bundle_store_from_env()?;
     let session_bundle_max_bytes = session_bundle_max_bytes_from_env()?;
-    let codex_release_client = codex_release_client_from_env()?;
     let state = AppState {
         pool,
         session_cookie_secure: env::var("SESSION_COOKIE_SECURE")
@@ -290,7 +291,6 @@ async fn main() -> anyhow::Result<()> {
         model_gateway_auth_token,
         session_bundle_store,
         session_bundle_max_bytes,
-        codex_release_client,
         auth_providers: vec![
             Arc::new(PasswordAuthProvider),
             Arc::new(BrowserSessionAuthProvider),
@@ -364,18 +364,6 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/admin/auth-policy",
             get(get_auth_policy).patch(update_auth_policy),
-        )
-        .route(
-            "/api/admin/codex-version-rollout",
-            get(get_codex_version_rollout),
-        )
-        .route(
-            "/api/admin/codex-version-rollout/target",
-            put(set_codex_target_version),
-        )
-        .route(
-            "/api/admin/codex-version-rollout/promote",
-            post(promote_codex_target_version),
         )
         .route(
             "/api/admin/external-platforms",
@@ -579,10 +567,6 @@ fn build_router(state: AppState) -> Router {
         )
         .route("/api/runtime/register", post(runtime_register))
         .route("/api/runtime/heartbeat", post(runtime_heartbeat))
-        .route(
-            "/api/runtime/codex/artifacts/{version}/{os}/{architecture}",
-            get(download_runtime_codex_artifact),
-        )
         .route("/api/runtime/runs/claim", post(runtime_claim_run))
         .route(
             "/api/runtime/runs/{run_id}/turn/begin",
@@ -860,9 +844,6 @@ fn openapi_document() -> Value {
                 "post": { "summary": "Create a 30-minute one-time Runtime enrollment token", "responses": { "200": response("RuntimeEnrollmentTokenCreated"), "403": { "$ref": "#/components/responses/Forbidden" } } }
             },
             "/api/admin/runtime-enrollment-tokens/{enrollment_id}/revoke": { "post": { "summary": "Revoke an unused Runtime enrollment token", "parameters": [id("enrollment_id")], "responses": { "200": response("RuntimeEnrollmentToken"), "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
-            "/api/admin/codex-version-rollout": { "get": { "summary": "Get the global Codex version rollout", "responses": { "200": response("CodexVersionRollout"), "403": { "$ref": "#/components/responses/Forbidden" } } } },
-            "/api/admin/codex-version-rollout/target": { "put": { "summary": "Download and distribute one concrete Target Codex Version", "requestBody": body("SetCodexTargetVersionRequest"), "responses": { "200": response("CodexVersionRollout"), "400": { "$ref": "#/components/responses/BadRequest" }, "403": { "$ref": "#/components/responses/Forbidden" }, "409": { "$ref": "#/components/responses/Conflict" }, "502": { "description": "Official Codex release download or integrity verification failed" } } } },
-            "/api/admin/codex-version-rollout/promote": { "post": { "summary": "Promote the ready Target Codex Version globally", "responses": { "200": response("CodexVersionRollout"), "403": { "$ref": "#/components/responses/Forbidden" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/admin/runtimes/{runtime_id}/credential-rotation": { "post": { "summary": "Request Runtime-completed credential rotation", "parameters": [id("runtime_id")], "responses": { "200": response("Runtime"), "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/admin/runtimes/{runtime_id}/drain": { "post": { "summary": "Drain a Runtime after exact hostname confirmation", "parameters": [id("runtime_id")], "requestBody": body("ConfirmRuntimeHostnameRequest"), "responses": { "200": response("RuntimeDrainResponse"), "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/admin/runtimes/{runtime_id}/cancel-drain": { "post": { "summary": "Cancel Runtime drain without reacquiring released Sessions", "parameters": [id("runtime_id")], "responses": { "200": response("RuntimeDrainResponse"), "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
@@ -871,7 +852,6 @@ fn openapi_document() -> Value {
             "/api/admin/runtimes/{runtime_id}/force-delete": { "post": { "summary": "Force delete a Runtime and invalidate owned Session generations", "parameters": [id("runtime_id")], "requestBody": body("ConfirmRuntimeHostnameRequest"), "responses": { "200": response("ForceDeleteRuntimeResponse"), "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/runtime/register": { "post": { "summary": "Consume a one-time enrollment token and create an immutable Runtime identity", "security": [{ "runtimeEnrollmentBearer": [] }], "requestBody": body("RuntimeRegisterRequest"), "responses": { "200": response("RuntimeRegisterResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" } } } },
             "/api/runtime/heartbeat": { "post": { "summary": "Heartbeat and complete staged Runtime credential rotation", "security": [{ "runtimeBearer": [] }], "requestBody": body("RuntimeHeartbeatRequest"), "responses": { "200": response("RuntimeHeartbeatResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
-            "/api/runtime/codex/artifacts/{version}/{os}/{architecture}": { "get": { "summary": "Download the authenticated Runtime's verified Codex artifact", "security": [{ "runtimeBearer": [] }], "parameters": [{ "name": "version", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "os", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "architecture", "in": "path", "required": true, "schema": { "type": "string" } }], "responses": { "200": { "description": "Verified zstd-compressed Codex binary", "content": { "application/zstd": { "schema": { "type": "string", "format": "binary" } } } }, "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/runtime/runs/claim": { "post": { "summary": "Claim one capacity-fenced Run and its exclusive Session ownership generation", "security": [{ "runtimeBearer": [] }], "requestBody": body("RuntimeClaimRunRequest"), "responses": { "200": response("ClaimRunResponse"), "204": no_content(), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" } } } },
             "/api/runtime/model-proxy/v1/responses": { "post": { "summary": "Proxy one run-scoped Responses API request through its selected Model Connection", "security": [{ "modelProxyBearer": [] }], "parameters": [required_header("x-agent-hub-run-id", json!({ "type": "string", "format": "uuid" })), required_header("x-agent-hub-model-binding-id", json!({ "type": "string", "format": "uuid" }))], "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } }, "responses": { "200": { "description": "Responses JSON or SSE from the selected upstream protocol" }, "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" }, "502": { "description": "Model upstream transport failed" }, "504": { "description": "Model upstream timed out" } } } },
             "/api/runtime/runs/{run_id}/turn/begin": { "post": { "summary": "Bind synchronized configuration and begin generation-fenced Turn delivery", "security": [{ "runtimeBearer": [] }], "parameters": [id("run_id")], "requestBody": body("RuntimeBeginTurnRequest"), "responses": { "200": response("BeginRuntimeTurnResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
@@ -891,7 +871,7 @@ fn openapi_document() -> Value {
                         required_header("x-agent-hub-bundle-sha256", json!({ "type": "string", "pattern": "^[0-9a-f]{64}$" })),
                         required_header("x-agent-hub-bundle-size", json!({ "type": "integer", "minimum": 0 })),
                         required_header("x-agent-hub-history-checkpoint", json!({ "type": "integer", "minimum": 0 })),
-                        required_header("x-agent-hub-producing-codex-version", json!({ "type": "string" })),
+                        required_header("x-agent-hub-producing-engine-version", json!({ "type": "string" })),
                         required_header("x-agent-hub-bundle-created-at", json!({ "type": "string", "format": "date-time" }))
                     ],
                     "requestBody": { "required": true, "content": { "application/zstd": { "schema": { "type": "string", "format": "binary" } } } },
@@ -1047,19 +1027,19 @@ fn openapi_schemas() -> Value {
         "ModelTokenUsagePage": { "type": "object", "additionalProperties": false, "required": ["items", "next_cursor"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/ModelTokenUsage" } }, "next_cursor": { "anyOf": [{ "$ref": "#/components/schemas/ModelLedgerCursor" }, { "type": "null" }] } } },
         "ModelCallErrorPage": { "type": "object", "additionalProperties": false, "required": ["items", "next_cursor"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/ModelCallError" } }, "next_cursor": { "anyOf": [{ "$ref": "#/components/schemas/ModelLedgerCursor" }, { "type": "null" }] } } },
         "ReasoningEffort": { "type": "string", "enum": ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] },
-        "CodexSubagentDefinition": { "type": "object", "additionalProperties": false, "required": ["name", "description", "developer_instructions"], "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 64 }, "description": { "type": "string", "minLength": 1, "maxLength": 512 }, "developer_instructions": { "type": "string", "minLength": 1, "maxLength": 100000 }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings_override": { "$ref": "#/components/schemas/AgentModelSettingsOverride" }, "enabled": { "type": "boolean", "default": true }, "disabled_reason": { "type": ["string", "null"] } } },
-        "Agent": { "type": "object", "required": ["id", "owner_id", "name", "instructions", "visibility", "public_to", "runtime_id", "model_selection", "model_settings", "codex_subagents", "model_policy", "sandbox_policy", "managed_skill_ids", "mcp_allowlist", "is_owner", "can_manage", "can_administer", "can_invoke", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": uuid(), "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string", "enum": ["private", "public", "public_to"] }, "public_to": { "type": "array", "items": uuid() }, "runtime_id": { "anyOf": [uuid(), { "type": "null" }] }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "codex_subagents": { "type": "array", "items": { "$ref": "#/components/schemas/CodexSubagentDefinition" } }, "model_policy": {}, "sandbox_policy": {}, "managed_skill_ids": { "type": "array", "items": uuid() }, "mcp_allowlist": {}, "is_owner": { "type": "boolean" }, "can_manage": { "type": "boolean" }, "can_administer": { "type": "boolean" }, "can_invoke": { "type": "boolean" }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
-        "CreateAgentRequest": { "type": "object", "additionalProperties": false, "required": ["name", "instructions", "visibility"], "properties": { "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string" }, "public_to": { "type": "array", "items": uuid() }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "codex_subagents": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/CodexSubagentDefinition" } } } },
-        "UpdateAgentRequest": { "type": "object", "additionalProperties": false, "required": ["name", "instructions", "visibility", "public_to", "runtime_id", "model_selection", "model_settings", "codex_subagents", "sandbox_policy", "managed_skill_ids", "mcp_allowlist"], "properties": { "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string" }, "public_to": { "type": "array", "items": uuid() }, "runtime_id": { "anyOf": [uuid(), { "type": "null" }] }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "codex_subagents": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/CodexSubagentDefinition" } }, "sandbox_policy": { "type": "object" }, "managed_skill_ids": { "type": "array", "items": uuid() }, "mcp_allowlist": {} } },
-        "Run": { "type": "object", "required": ["id", "agent_id", "automation_id", "integration_session_id", "parent_run_id", "runtime_id", "hub_session_id", "hub_message_id", "hub_turn_id", "session_ownership_generation", "status", "initial_message", "session_id", "work_dir_ref", "source", "created_at", "updated_at"], "properties": { "id": uuid(), "agent_id": uuid(), "automation_id": { "anyOf": [uuid(), { "type": "null" }] }, "integration_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "parent_run_id": { "anyOf": [uuid(), { "type": "null" }] }, "runtime_id": { "anyOf": [uuid(), { "type": "null" }] }, "hub_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "hub_message_id": { "anyOf": [uuid(), { "type": "null" }] }, "hub_turn_id": { "anyOf": [uuid(), { "type": "null" }] }, "session_ownership_generation": { "type": ["integer", "null"] }, "status": { "type": "string" }, "initial_message": { "type": "string" }, "session_id": { "type": ["string", "null"] }, "work_dir_ref": { "type": ["string", "null"] }, "source": { "type": "string" }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
+        "SubagentDefinition": { "type": "object", "additionalProperties": false, "required": ["name", "description", "developer_instructions"], "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 64 }, "description": { "type": "string", "minLength": 1, "maxLength": 512 }, "developer_instructions": { "type": "string", "minLength": 1, "maxLength": 100000 }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings_override": { "$ref": "#/components/schemas/AgentModelSettingsOverride" }, "enabled": { "type": "boolean", "default": true }, "disabled_reason": { "type": ["string", "null"] } } },
+        "Agent": { "type": "object", "required": ["id", "owner_id", "name", "instructions", "visibility", "public_to", "runtime_id", "model_selection", "model_settings", "subagents", "model_policy", "sandbox_policy", "managed_skill_ids", "mcp_allowlist", "is_owner", "can_manage", "can_administer", "can_invoke", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": uuid(), "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string", "enum": ["private", "public", "public_to"] }, "public_to": { "type": "array", "items": uuid() }, "runtime_id": { "anyOf": [uuid(), { "type": "null" }] }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "subagents": { "type": "array", "items": { "$ref": "#/components/schemas/SubagentDefinition" } }, "model_policy": {}, "sandbox_policy": {}, "managed_skill_ids": { "type": "array", "items": uuid() }, "mcp_allowlist": {}, "is_owner": { "type": "boolean" }, "can_manage": { "type": "boolean" }, "can_administer": { "type": "boolean" }, "can_invoke": { "type": "boolean" }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
+        "CreateAgentRequest": { "type": "object", "additionalProperties": false, "required": ["name", "instructions", "visibility"], "properties": { "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string" }, "public_to": { "type": "array", "items": uuid() }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "subagents": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/SubagentDefinition" } } } },
+        "UpdateAgentRequest": { "type": "object", "additionalProperties": false, "required": ["name", "instructions", "visibility", "public_to", "runtime_id", "model_selection", "model_settings", "subagents", "sandbox_policy", "managed_skill_ids", "mcp_allowlist"], "properties": { "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string" }, "public_to": { "type": "array", "items": uuid() }, "runtime_id": { "anyOf": [uuid(), { "type": "null" }] }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "subagents": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/SubagentDefinition" } }, "sandbox_policy": { "type": "object" }, "managed_skill_ids": { "type": "array", "items": uuid() }, "mcp_allowlist": {} } },
+        "Run": { "type": "object", "required": ["id", "agent_id", "automation_id", "integration_session_id", "parent_run_id", "runtime_id", "hub_session_id", "hub_message_id", "hub_turn_id", "session_ownership_generation", "status", "initial_message", "native_session_id", "work_dir_ref", "source", "created_at", "updated_at"], "properties": { "id": uuid(), "agent_id": uuid(), "automation_id": { "anyOf": [uuid(), { "type": "null" }] }, "integration_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "parent_run_id": { "anyOf": [uuid(), { "type": "null" }] }, "runtime_id": { "anyOf": [uuid(), { "type": "null" }] }, "hub_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "hub_message_id": { "anyOf": [uuid(), { "type": "null" }] }, "hub_turn_id": { "anyOf": [uuid(), { "type": "null" }] }, "session_ownership_generation": { "type": ["integer", "null"] }, "status": { "type": "string" }, "initial_message": { "type": "string" }, "native_session_id": { "type": ["string", "null"] }, "work_dir_ref": { "type": ["string", "null"] }, "source": { "type": "string" }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
         "RunListResponse": { "type": "object", "required": ["items", "total", "page", "page_size"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/Run" } }, "total": { "type": "integer", "minimum": 0 }, "page": { "type": "integer", "minimum": 1 }, "page_size": { "type": "integer", "minimum": 1, "maximum": 100 } } },
         "CreateRunRequest": { "type": "object", "required": ["message"], "properties": { "message": { "type": "string" }, "hub_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "parent_run_id": { "anyOf": [uuid(), { "type": "null" }] }, "client_message_key": { "type": ["string", "null"] } } },
         "HubSessionOrigin": { "oneOf": [
             { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "type": "string", "const": "hub_native" } } },
             { "type": "object", "additionalProperties": false, "required": ["kind", "platform_id", "tenant_id", "external_identity_id"], "properties": { "kind": { "type": "string", "const": "external" }, "platform_id": uuid(), "tenant_id": { "type": "string" }, "external_identity_id": uuid() } }
         ] },
-        "CurrentSessionBundle": { "type": "object", "required": ["generation", "object_key", "checksum_sha256", "size_bytes", "history_checkpoint", "ownership_generation", "producing_codex_version", "created_at"], "properties": { "generation": { "type": "integer" }, "object_key": { "type": "string" }, "checksum_sha256": { "type": "string" }, "size_bytes": { "type": "integer", "minimum": 0 }, "history_checkpoint": { "type": "integer", "minimum": 0 }, "ownership_generation": { "type": "integer", "minimum": 0 }, "producing_codex_version": { "type": "string" }, "created_at": { "type": "string", "format": "date-time" } } },
-        "HubSession": { "type": "object", "required": ["id", "owner_id", "agent_id", "agent_name", "agent_deleted_at", "origin_platform_name", "origin", "lifecycle_status", "native_thread_id", "active_turn_id", "history_checkpoint", "configuration_fingerprint", "runtime_owner_id", "ownership_generation", "recovery_error", "current_bundle", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": uuid(), "agent_id": uuid(), "agent_name": { "type": "string" }, "agent_deleted_at": { "type": ["string", "null"], "format": "date-time" }, "origin_platform_name": { "type": ["string", "null"] }, "origin": { "$ref": "#/components/schemas/HubSessionOrigin" }, "lifecycle_status": { "type": "string" }, "native_thread_id": { "type": ["string", "null"] }, "active_turn_id": { "anyOf": [uuid(), { "type": "null" }] }, "history_checkpoint": { "type": "integer", "minimum": 0 }, "configuration_fingerprint": { "type": ["string", "null"] }, "runtime_owner_id": { "anyOf": [uuid(), { "type": "null" }] }, "ownership_generation": { "type": "integer", "minimum": 0 }, "recovery_error": { "type": ["string", "null"] }, "current_bundle": { "anyOf": [{ "$ref": "#/components/schemas/CurrentSessionBundle" }, { "type": "null" }] }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
+        "CurrentSessionBundle": { "type": "object", "required": ["generation", "object_key", "checksum_sha256", "size_bytes", "history_checkpoint", "ownership_generation", "producing_engine_version", "created_at"], "properties": { "generation": { "type": "integer" }, "object_key": { "type": "string" }, "checksum_sha256": { "type": "string" }, "size_bytes": { "type": "integer", "minimum": 0 }, "history_checkpoint": { "type": "integer", "minimum": 0 }, "ownership_generation": { "type": "integer", "minimum": 0 }, "producing_engine_version": { "type": "string" }, "created_at": { "type": "string", "format": "date-time" } } },
+        "HubSession": { "type": "object", "required": ["id", "owner_id", "agent_id", "agent_name", "agent_deleted_at", "origin_platform_name", "origin", "lifecycle_status", "native_session_id", "active_turn_id", "history_checkpoint", "configuration_fingerprint", "runtime_owner_id", "ownership_generation", "recovery_error", "current_bundle", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": uuid(), "agent_id": uuid(), "agent_name": { "type": "string" }, "agent_deleted_at": { "type": ["string", "null"], "format": "date-time" }, "origin_platform_name": { "type": ["string", "null"] }, "origin": { "$ref": "#/components/schemas/HubSessionOrigin" }, "lifecycle_status": { "type": "string" }, "native_session_id": { "type": ["string", "null"] }, "active_turn_id": { "anyOf": [uuid(), { "type": "null" }] }, "history_checkpoint": { "type": "integer", "minimum": 0 }, "configuration_fingerprint": { "type": ["string", "null"] }, "runtime_owner_id": { "anyOf": [uuid(), { "type": "null" }] }, "ownership_generation": { "type": "integer", "minimum": 0 }, "recovery_error": { "type": ["string", "null"] }, "current_bundle": { "anyOf": [{ "$ref": "#/components/schemas/CurrentSessionBundle" }, { "type": "null" }] }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
         "HubSessionMessage": { "type": "object", "required": ["id", "session_id", "sequence", "role", "message_kind", "content", "payload", "delivery_mode", "delivery_state", "client_message_key", "expected_native_turn_id", "turn_id", "run_id", "accepted_at"], "properties": { "id": uuid(), "session_id": uuid(), "sequence": { "type": "integer", "minimum": 1 }, "role": { "type": "string" }, "message_kind": { "type": "string" }, "content": { "type": ["string", "null"] }, "payload": {}, "delivery_mode": { "type": "string" }, "delivery_state": { "type": "string" }, "client_message_key": { "type": ["string", "null"] }, "expected_native_turn_id": { "type": ["string", "null"] }, "turn_id": { "anyOf": [uuid(), { "type": "null" }] }, "run_id": { "anyOf": [uuid(), { "type": "null" }] }, "accepted_at": { "type": "string", "format": "date-time" } } },
         "CreateHubSessionMessageRequest": { "type": "object", "required": ["content"], "properties": { "content": { "type": "string" }, "payload": {}, "delivery_mode": { "type": ["string", "null"] }, "client_message_key": { "type": ["string", "null"] }, "parent_run_id": { "anyOf": [uuid(), { "type": "null" }] } } },
         "SessionMessageAcceptance": { "type": "object", "required": ["message", "run"], "properties": { "message": { "$ref": "#/components/schemas/HubSessionMessage" }, "run": { "anyOf": [{ "$ref": "#/components/schemas/Run" }, { "type": "null" }] } } },
@@ -1072,52 +1052,49 @@ fn openapi_schemas() -> Value {
         "CreateAutomationRequest": { "type": "object", "required": ["agent_id", "name", "trigger_type", "prompt", "enabled"], "properties": { "agent_id": uuid(), "name": { "type": "string" }, "trigger_type": { "type": "string" }, "prompt": { "type": "string" }, "schedule": { "type": ["string", "null"] }, "enabled": { "type": "boolean" } } },
         "UpdateAutomationRequest": { "type": "object", "additionalProperties": false, "required": ["name", "trigger_type", "prompt", "schedule", "enabled"], "properties": { "name": { "type": "string" }, "trigger_type": { "type": "string" }, "prompt": { "type": "string" }, "schedule": { "type": ["string", "null"] }, "enabled": { "type": "boolean" } } },
         "TriggerAutomationRequest": { "type": "object", "properties": { "message": { "type": ["string", "null"] } } },
-        "Runtime": { "type": "object", "required": ["id", "hostname", "labels", "codex_version", "capabilities", "sandbox_mode", "status", "last_heartbeat_at", "credential_rotation_requested_at"], "properties": { "id": uuid(), "hostname": { "type": "string" }, "labels": { "type": "array", "items": { "type": "string" } }, "codex_version": { "type": "string" }, "sandbox_mode": { "type": "string" }, "status": { "type": "string" }, "last_heartbeat_at": { "type": "string", "format": "date-time" }, "credential_rotation_requested_at": date(), "capabilities": { "type": "object", "additionalProperties": false, "properties": {
+        "Runtime": { "type": "object", "required": ["id", "hostname", "labels", "engine_version", "capabilities", "sandbox_mode", "status", "last_heartbeat_at", "credential_rotation_requested_at"], "properties": { "id": uuid(), "hostname": { "type": "string" }, "labels": { "type": "array", "items": { "type": "string" } }, "engine_version": { "type": "string" }, "sandbox_mode": { "type": "string" }, "status": { "type": "string" }, "last_heartbeat_at": { "type": "string", "format": "date-time" }, "credential_rotation_requested_at": date(), "capabilities": { "type": "object", "additionalProperties": false, "properties": {
             "driver": { "type": "string" },
-            "codex_source": { "type": "string" },
+            "engine_source": { "type": "string" },
             "model_proxy": { "type": "boolean" },
             "mcp_allowlist": { "type": "boolean" },
-            "thread_resume": { "type": "boolean" },
+            "subagents": { "type": "boolean" },
+            "native_session_resume": { "type": "boolean" },
             "local_skills": { "type": "boolean" },
             "sandbox_downgraded": { "type": "boolean" },
             "sandbox_downgrade_reason": { "type": "string" }
         } } } },
         "RuntimeEnrollmentToken": { "type": "object", "additionalProperties": false, "required": ["id", "created_by", "expires_at", "consumed_at", "consumed_by_runtime_id", "revoked_at", "created_at"], "properties": { "id": uuid(), "created_by": { "anyOf": [uuid(), { "type": "null" }] }, "expires_at": { "type": "string", "format": "date-time" }, "consumed_at": date(), "consumed_by_runtime_id": { "anyOf": [uuid(), { "type": "null" }] }, "revoked_at": date(), "created_at": { "type": "string", "format": "date-time" } } },
         "RuntimeEnrollmentTokenCreated": { "type": "object", "additionalProperties": false, "required": ["enrollment", "token"], "properties": { "enrollment": { "$ref": "#/components/schemas/RuntimeEnrollmentToken" }, "token": { "type": "string", "description": "Shown once; the Hub stores only its SHA-256 hash." } } },
-        "SetCodexTargetVersionRequest": { "type": "object", "additionalProperties": false, "required": ["version"], "properties": { "version": { "type": "string", "minLength": 1, "description": "Concrete Codex CLI release version; mutable latest is rejected." } } },
-        "CodexVersionArtifact": { "type": "object", "additionalProperties": false, "required": ["version", "os", "architecture", "artifact_name", "sha256", "size_bytes"], "properties": { "version": { "type": "string" }, "os": { "type": "string" }, "architecture": { "type": "string" }, "artifact_name": { "type": "string" }, "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "size_bytes": { "type": "integer", "minimum": 1 } } },
-        "RuntimeCodexStatus": { "type": "object", "additionalProperties": false, "required": ["current_version"], "properties": { "current_version": { "type": "string" }, "candidate_version": { "type": ["string", "null"] }, "candidate_status": { "type": ["string", "null"], "enum": ["ready", "failed", null] }, "candidate_error": { "type": ["string", "null"] } } },
-        "RuntimeCodexRolloutCommand": { "type": "object", "additionalProperties": false, "required": ["active_version", "target_artifact"], "properties": { "active_version": { "type": ["string", "null"] }, "target_artifact": { "anyOf": [{ "$ref": "#/components/schemas/CodexVersionArtifact" }, { "type": "null" }] } } },
-        "CodexRuntimeReadiness": { "type": "object", "additionalProperties": false, "required": ["runtime_id", "hostname", "os", "architecture", "current_version", "target_version", "status", "error", "checked_at"], "properties": { "runtime_id": uuid(), "hostname": { "type": "string" }, "os": { "type": "string" }, "architecture": { "type": "string" }, "current_version": { "type": "string" }, "target_version": { "type": ["string", "null"] }, "status": { "type": "string" }, "error": { "type": ["string", "null"] }, "checked_at": date() } },
-        "CodexVersionRollout": { "type": "object", "additionalProperties": false, "required": ["active_version", "target_version", "status", "error", "artifacts", "runtimes", "updated_at"], "properties": { "active_version": { "type": ["string", "null"] }, "target_version": { "type": ["string", "null"] }, "status": { "type": "string", "enum": ["idle", "downloading", "distributing", "ready", "failed", "active"] }, "error": { "type": ["string", "null"] }, "artifacts": { "type": "array", "items": { "$ref": "#/components/schemas/CodexVersionArtifact" } }, "runtimes": { "type": "array", "items": { "$ref": "#/components/schemas/CodexRuntimeReadiness" } }, "updated_at": { "type": "string", "format": "date-time" } } },
-        "RuntimeRegisterRequest": { "type": "object", "required": ["hostname", "labels", "codex_version", "capabilities", "sandbox_mode"], "properties": { "hostname": { "type": "string" }, "labels": { "type": "array", "items": { "type": "string" } }, "codex_version": { "type": "string" }, "capabilities": {}, "sandbox_mode": { "type": "string" } } },
+        "RuntimeRegisterRequest": { "type": "object", "required": ["hostname", "labels", "engine_version", "capabilities", "sandbox_mode"], "properties": { "hostname": { "type": "string" }, "labels": { "type": "array", "items": { "type": "string" } }, "engine_version": { "type": "string" }, "capabilities": {}, "sandbox_mode": { "type": "string" } } },
         "RuntimeRegisterResponse": { "type": "object", "additionalProperties": false, "required": ["runtime_id", "runtime_credential", "protocol_capabilities"], "properties": { "runtime_id": uuid(), "runtime_credential": { "type": "string", "description": "Shown only to the newly enrolled Runtime and never returned by list/admin APIs." }, "protocol_capabilities": { "type": "array", "items": { "type": "string" } } } },
-        "RuntimeOwnedSessionStateRequest": { "type": "object", "additionalProperties": false, "required": ["session_id", "ownership_generation", "lifecycle_status"], "properties": { "session_id": uuid(), "ownership_generation": { "type": "integer", "minimum": 1 }, "lifecycle_status": { "type": "string", "enum": ["restoring", "online", "saving"] }, "checkpoint_reason": { "type": ["string", "null"], "enum": ["idle", "version_switch", "drain", null] } } },
-        "RuntimeOwnedSessionSnapshot": { "type": "object", "additionalProperties": false, "required": ["session_id", "ownership_generation", "lifecycle_status", "native_thread_id"], "properties": { "session_id": uuid(), "ownership_generation": { "type": "integer", "minimum": 1 }, "lifecycle_status": { "type": "string", "enum": ["restoring", "online", "saving"] }, "native_thread_id": { "type": ["string", "null"] }, "active_run_id": { "type": ["string", "null"], "format": "uuid" } } },
+        "RuntimeOwnedSessionStateRequest": { "type": "object", "additionalProperties": false, "required": ["session_id", "ownership_generation", "lifecycle_status"], "properties": { "session_id": uuid(), "ownership_generation": { "type": "integer", "minimum": 1 }, "lifecycle_status": { "type": "string", "enum": ["restoring", "online", "saving"] }, "checkpoint_reason": { "type": ["string", "null"], "enum": ["idle", "drain", null] } } },
+        "RuntimeOwnedSessionSnapshot": { "type": "object", "additionalProperties": false, "required": ["session_id", "ownership_generation", "lifecycle_status", "native_session_id"], "properties": { "session_id": uuid(), "ownership_generation": { "type": "integer", "minimum": 1 }, "lifecycle_status": { "type": "string", "enum": ["restoring", "online", "saving"] }, "native_session_id": { "type": ["string", "null"] }, "active_run_id": { "type": ["string", "null"], "format": "uuid" } } },
         "RuntimeSteeringMessage": { "type": "object", "additionalProperties": false, "required": ["id", "sequence", "content"], "properties": { "id": uuid(), "sequence": { "type": "integer", "minimum": 1 }, "content": { "type": "string" } } },
-        "RuntimeSessionCommand": { "type": "object", "additionalProperties": false, "required": ["command_id", "session_id", "ownership_generation", "command", "run_id", "turn_id", "native_thread_id", "native_turn_id", "message", "configuration_revision", "fingerprint", "execution_configuration"], "properties": { "command_id": uuid(), "session_id": uuid(), "ownership_generation": { "type": "integer", "minimum": 1 }, "command": { "type": "string", "enum": ["checkpoint", "steer", "interrupt", "refresh_configuration"] }, "run_id": { "anyOf": [uuid(), { "type": "null" }] }, "turn_id": { "anyOf": [uuid(), { "type": "null" }] }, "native_thread_id": { "type": ["string", "null"] }, "native_turn_id": { "type": ["string", "null"] }, "message": { "anyOf": [{ "$ref": "#/components/schemas/RuntimeSteeringMessage" }, { "type": "null" }] }, "configuration_revision": { "type": ["integer", "null"], "minimum": 1 }, "fingerprint": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" }, "execution_configuration": { "anyOf": [{ "$ref": "#/components/schemas/AgentExecutionConfiguration" }, { "type": "null" }] } } },
-        "RuntimeHeartbeatRequest": { "type": "object", "additionalProperties": false, "properties": { "pending_credential_hash": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" }, "accepts_session_commands": { "type": "boolean", "default": false }, "owned_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeOwnedSessionStateRequest" } }, "cleaned_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeOwnedSessionGeneration" } }, "codex_status": { "anyOf": [{ "$ref": "#/components/schemas/RuntimeCodexStatus" }, { "type": "null" }] } } },
-        "RuntimeHeartbeatResponse": { "type": "object", "additionalProperties": false, "required": ["rotation_requested", "pending_credential_accepted", "credential_activated", "runtime_status", "owned_sessions", "session_commands", "codex_rollout"], "properties": { "rotation_requested": { "type": "boolean" }, "pending_credential_accepted": { "type": "boolean" }, "credential_activated": { "type": "boolean" }, "runtime_status": { "type": "string" }, "owned_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeOwnedSessionSnapshot" } }, "cleanup_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeOwnedSessionGeneration" } }, "session_commands": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeSessionCommand" } }, "codex_rollout": { "$ref": "#/components/schemas/RuntimeCodexRolloutCommand" } } },
+        "RuntimeSessionCommand": { "type": "object", "additionalProperties": false, "required": ["command_id", "session_id", "ownership_generation", "command", "run_id", "turn_id", "native_session_id", "native_turn_id", "message", "configuration_revision", "fingerprint", "execution_configuration"], "properties": { "command_id": uuid(), "session_id": uuid(), "ownership_generation": { "type": "integer", "minimum": 1 }, "command": { "type": "string", "enum": ["checkpoint", "steer", "interrupt", "refresh_configuration"] }, "run_id": { "anyOf": [uuid(), { "type": "null" }] }, "turn_id": { "anyOf": [uuid(), { "type": "null" }] }, "native_session_id": { "type": ["string", "null"] }, "native_turn_id": { "type": ["string", "null"] }, "message": { "anyOf": [{ "$ref": "#/components/schemas/RuntimeSteeringMessage" }, { "type": "null" }] }, "configuration_revision": { "type": ["integer", "null"], "minimum": 1 }, "fingerprint": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" }, "execution_configuration": { "anyOf": [{ "$ref": "#/components/schemas/AgentExecutionConfiguration" }, { "type": "null" }] } } },
+        "RuntimeHeartbeatRequest": { "type": "object", "additionalProperties": false, "properties": { "pending_credential_hash": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" }, "accepts_session_commands": { "type": "boolean", "default": false }, "owned_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeOwnedSessionStateRequest" } }, "cleaned_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeOwnedSessionGeneration" } } } },
+        "RuntimeHeartbeatResponse": { "type": "object", "additionalProperties": false, "required": ["rotation_requested", "pending_credential_accepted", "credential_activated", "runtime_status", "owned_sessions", "session_commands"], "properties": { "rotation_requested": { "type": "boolean" }, "pending_credential_accepted": { "type": "boolean" }, "credential_activated": { "type": "boolean" }, "runtime_status": { "type": "string" }, "owned_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeOwnedSessionSnapshot" } }, "cleanup_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeOwnedSessionGeneration" } }, "session_commands": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeSessionCommand" } } } },
         "RuntimeOwnedSessionGeneration": { "type": "object", "additionalProperties": false, "required": ["session_id", "ownership_generation"], "properties": { "session_id": uuid(), "ownership_generation": { "type": "integer", "minimum": 1 } } },
         "RuntimeClaimRunRequest": { "type": "object", "additionalProperties": false, "required": ["available_new_session_slots", "ready_owned_sessions"], "properties": { "available_new_session_slots": { "type": "integer", "minimum": 0 }, "ready_owned_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeOwnedSessionGeneration" } } } },
         "BeginRuntimeTurnRequest": { "type": "object", "additionalProperties": false, "required": ["configuration_fingerprint"], "properties": { "configuration_fingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" } } },
         "RuntimeBeginTurnRequest": { "type": "object", "additionalProperties": false, "required": ["ownership_generation", "payload"], "properties": { "ownership_generation": { "type": "integer", "minimum": 1 }, "payload": { "$ref": "#/components/schemas/BeginRuntimeTurnRequest" } } },
         "BeginRuntimeTurnResponse": { "type": "object", "additionalProperties": false, "required": ["session_id", "turn_id", "ownership_generation", "configuration_fingerprint", "messages"], "properties": { "session_id": uuid(), "turn_id": uuid(), "ownership_generation": { "type": "integer", "minimum": 1 }, "configuration_fingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }, "messages": { "type": "array", "items": { "$ref": "#/components/schemas/HubSessionMessage" } } } },
-        "ClaimRunResponse": { "type": "object", "required": ["run", "agent", "execution_configuration", "expected_configuration_fingerprint", "integration_context", "resume", "model_proxy_token", "session_context"], "properties": { "run": { "$ref": "#/components/schemas/Run" }, "agent": { "$ref": "#/components/schemas/Agent" }, "execution_configuration": { "$ref": "#/components/schemas/AgentExecutionConfiguration" }, "expected_configuration_fingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }, "integration_context": {}, "resume": {}, "model_proxy_token": { "type": "string" }, "session_context": {} } },
-        "AgentExecutionConfiguration": { "type": "object", "additionalProperties": false, "required": ["revision", "instructions", "model_selection", "model_settings", "codex_subagents", "model_bindings", "model_policy", "sandbox_policy", "skills", "mcp_allowlist"], "properties": { "revision": { "type": "integer", "minimum": 1 }, "instructions": { "type": "string" }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "codex_subagents": { "type": "array", "items": { "$ref": "#/components/schemas/CodexSubagentDefinition" } }, "model_bindings": { "type": "array", "items": { "$ref": "#/components/schemas/RunModelBinding" } }, "model_policy": {}, "sandbox_policy": {}, "skills": { "type": "array", "items": { "$ref": "#/components/schemas/AgentExecutionSkill" } }, "mcp_allowlist": {} } },
+        "RunResume": { "type": "object", "additionalProperties": false, "required": ["native_session_id", "work_dir_ref"], "properties": { "native_session_id": { "type": "string" }, "work_dir_ref": { "type": ["string", "null"] } } },
+        "ClaimRunResponse": { "type": "object", "required": ["run", "agent", "execution_configuration", "expected_configuration_fingerprint", "integration_context", "resume", "model_proxy_token", "session_context"], "properties": { "run": { "$ref": "#/components/schemas/Run" }, "agent": { "$ref": "#/components/schemas/Agent" }, "execution_configuration": { "$ref": "#/components/schemas/AgentExecutionConfiguration" }, "expected_configuration_fingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }, "integration_context": {}, "resume": { "anyOf": [{ "$ref": "#/components/schemas/RunResume" }, { "type": "null" }] }, "model_proxy_token": { "type": "string" }, "session_context": {} } },
+        "AgentExecutionConfiguration": { "type": "object", "additionalProperties": false, "required": ["revision", "instructions", "model_selection", "model_settings", "subagents", "model_bindings", "model_policy", "sandbox_policy", "skills", "mcp_allowlist"], "properties": { "revision": { "type": "integer", "minimum": 1 }, "instructions": { "type": "string" }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "subagents": { "type": "array", "items": { "$ref": "#/components/schemas/SubagentDefinition" } }, "model_bindings": { "type": "array", "items": { "$ref": "#/components/schemas/RunModelBinding" } }, "model_policy": {}, "sandbox_policy": {}, "skills": { "type": "array", "items": { "$ref": "#/components/schemas/AgentExecutionSkill" } }, "mcp_allowlist": {} } },
         "AgentExecutionSkill": { "type": "object", "additionalProperties": false, "required": ["source", "source_id", "name", "description", "content", "revision", "content_checksum_sha256"], "properties": { "source": { "type": "string", "enum": ["managed"] }, "source_id": { "anyOf": [uuid(), { "type": "null" }] }, "name": { "type": "string" }, "description": { "type": "string" }, "content": { "type": "string" }, "revision": { "type": "integer", "minimum": 1 }, "content_checksum_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" } } },
-        "AppendRunEventRequest": { "type": "object", "required": ["event_type", "role", "content", "payload", "waiting_tool"], "properties": { "event_type": { "type": "string" }, "role": { "type": ["string", "null"] }, "content": { "type": ["string", "null"] }, "payload": {}, "waiting_tool": {} } },
-        "FinalizeToolRequestsRequest": { "type": "object", "required": ["integration_session_id", "session_id", "work_dir_ref", "tool_requests"], "properties": { "integration_session_id": uuid(), "session_id": { "type": "string" }, "work_dir_ref": { "type": "string" }, "tool_requests": { "type": "array", "items": { "type": "object" } } } },
+        "AppendRunEventRequest": { "type": "object", "required": ["event_type", "role", "content", "payload", "waiting_tool"], "properties": { "event_type": { "type": "string" }, "role": { "type": ["string", "null"] }, "content": { "type": ["string", "null"] }, "payload": {}, "waiting_tool": { "anyOf": [{ "$ref": "#/components/schemas/WaitingToolRunTransition" }, { "type": "null" }] } } },
+        "WaitingToolRunTransition": { "type": "object", "required": ["native_session_id", "work_dir_ref"], "properties": { "native_session_id": { "type": "string" }, "work_dir_ref": { "type": "string" } } },
+        "FinalizeToolRequestsRequest": { "type": "object", "required": ["integration_session_id", "native_session_id", "work_dir_ref", "tool_requests"], "properties": { "integration_session_id": uuid(), "native_session_id": { "type": "string" }, "work_dir_ref": { "type": "string" }, "tool_requests": { "type": "array", "items": { "type": "object" } } } },
         "CompleteRuntimeSessionCommandRequest": { "type": "object", "additionalProperties": false, "required": ["command", "outcome", "revision", "fingerprint"], "properties": { "command": { "type": "string", "enum": ["steer", "interrupt", "refresh_configuration"] }, "outcome": { "type": "string", "enum": ["applied", "turn_ended", "failed", "interrupted"] }, "revision": { "type": ["integer", "null"], "minimum": 1 }, "fingerprint": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" } } },
         "CompleteRuntimeSessionCommandResponse": { "type": "object", "additionalProperties": false, "required": ["command_id", "outcome"], "properties": { "command_id": uuid(), "outcome": { "type": "string", "enum": ["applied", "turn_ended", "failed", "interrupted"] } } },
-        "CompleteRunRequest": { "type": "object", "required": ["status", "session_id", "work_dir_ref"], "properties": { "status": { "type": "string", "enum": ["completed", "failed", "waiting_tool", "interrupted"] }, "session_id": { "type": ["string", "null"] }, "work_dir_ref": { "type": ["string", "null"] } } },
+        "CompleteRunRequest": { "type": "object", "required": ["status", "native_session_id", "work_dir_ref"], "properties": { "status": { "type": "string", "enum": ["completed", "failed", "waiting_tool", "interrupted"] }, "native_session_id": { "type": ["string", "null"] }, "work_dir_ref": { "type": ["string", "null"] } } },
         "RuntimeAppendRunEventRequest": { "type": "object", "additionalProperties": false, "required": ["ownership_generation", "payload"], "properties": { "ownership_generation": { "type": "integer", "minimum": 1 }, "payload": { "$ref": "#/components/schemas/AppendRunEventRequest" } } },
         "RuntimeFinalizeToolRequestsRequest": { "type": "object", "additionalProperties": false, "required": ["ownership_generation", "payload"], "properties": { "ownership_generation": { "type": "integer", "minimum": 1 }, "payload": { "$ref": "#/components/schemas/FinalizeToolRequestsRequest" } } },
         "RuntimeCompleteSessionCommandRequest": { "type": "object", "additionalProperties": false, "required": ["ownership_generation", "payload"], "properties": { "ownership_generation": { "type": "integer", "minimum": 1 }, "payload": { "$ref": "#/components/schemas/CompleteRuntimeSessionCommandRequest" } } },
         "RuntimeCompleteRunRequest": { "type": "object", "additionalProperties": false, "required": ["ownership_generation", "payload"], "properties": { "ownership_generation": { "type": "integer", "minimum": 1 }, "payload": { "$ref": "#/components/schemas/CompleteRunRequest" } } },
         "ReleaseRuntimeSessionRequest": { "type": "object", "additionalProperties": false, "required": ["ownership_generation"], "properties": { "ownership_generation": { "type": "integer", "minimum": 1 } } },
-        "BeginRuntimeSessionCheckpointRequest": { "type": "object", "additionalProperties": false, "required": ["ownership_generation", "reason"], "properties": { "ownership_generation": { "type": "integer", "minimum": 1 }, "reason": { "type": "string", "enum": ["idle", "version_switch", "drain"] } } },
-        "RuntimeSessionCheckpointAttempt": { "type": "object", "additionalProperties": false, "required": ["checkpoint_attempt_id", "history_checkpoint", "bundle_generation", "reason"], "properties": { "checkpoint_attempt_id": uuid(), "history_checkpoint": { "type": "integer", "minimum": 0 }, "bundle_generation": { "type": "integer", "minimum": 1 }, "reason": { "type": "string", "enum": ["idle", "version_switch", "drain"] } } },
+        "BeginRuntimeSessionCheckpointRequest": { "type": "object", "additionalProperties": false, "required": ["ownership_generation", "reason"], "properties": { "ownership_generation": { "type": "integer", "minimum": 1 }, "reason": { "type": "string", "enum": ["idle", "drain"] } } },
+        "RuntimeSessionCheckpointAttempt": { "type": "object", "additionalProperties": false, "required": ["checkpoint_attempt_id", "history_checkpoint", "bundle_generation", "reason"], "properties": { "checkpoint_attempt_id": uuid(), "history_checkpoint": { "type": "integer", "minimum": 0 }, "bundle_generation": { "type": "integer", "minimum": 1 }, "reason": { "type": "string", "enum": ["idle", "drain"] } } },
         "RuntimeSessionBundleCommitResponse": { "type": "object", "additionalProperties": false, "required": ["checkpoint_attempt_id", "bundle_generation", "has_queued_work", "ownership_released"], "properties": { "checkpoint_attempt_id": uuid(), "bundle_generation": { "type": "integer", "minimum": 1 }, "has_queued_work": { "type": "boolean" }, "ownership_released": { "type": "boolean" } } },
         "FailRuntimeSessionCheckpointRequest": { "type": "object", "additionalProperties": false, "required": ["ownership_generation", "checkpoint_attempt_id", "error"], "properties": { "ownership_generation": { "type": "integer", "minimum": 1 }, "checkpoint_attempt_id": uuid(), "error": { "type": "string", "minLength": 1 } } },
         "RuntimeSessionCheckpointDisposition": { "type": "object", "additionalProperties": false, "required": ["checkpoint_attempt_id", "disposition", "has_queued_work"], "properties": { "checkpoint_attempt_id": uuid(), "disposition": { "type": "string", "enum": ["resume", "retry"] }, "has_queued_work": { "type": "boolean" } } },
@@ -1808,7 +1785,7 @@ async fn begin_user_erasure(
              current_bundle_checksum_sha256 = NULL, current_bundle_size_bytes = NULL,
              current_bundle_history_checkpoint = NULL,
              current_bundle_ownership_generation = NULL,
-             current_bundle_producing_codex_version = NULL,
+             current_bundle_producing_engine_version = NULL,
              current_bundle_created_at = NULL, current_bundle_runtime_id = NULL,
              current_bundle_checkpoint_attempt_id = NULL,
              saving_history_checkpoint = NULL, saving_ownership_generation = NULL,
@@ -2764,7 +2741,7 @@ async fn update_model_connection(
         .map_err(|_| ApiError::internal("model secret encryption failed"))?;
     let mut tx = state.pool.begin().await?;
     sqlx::query(
-        "LOCK TABLE system_default_model_selection, agents, codex_subagent_definitions
+        "LOCK TABLE system_default_model_selection, agents, subagent_definitions
          IN SHARE ROW EXCLUSIVE MODE",
     )
     .execute(&mut *tx)
@@ -2894,7 +2871,7 @@ async fn bump_agents_for_model_connection_tx(
            AND (
                agent.model_connection_id = $1
                OR EXISTS (
-                   SELECT 1 FROM codex_subagent_definitions AS subagent
+                   SELECT 1 FROM subagent_definitions AS subagent
                    WHERE subagent.agent_id = agent.id
                      AND subagent.model_connection_id = $1
                )
@@ -2946,7 +2923,7 @@ async fn clear_model_selection_references_tx(
              updated_at = CURRENT_TIMESTAMP(3)
          WHERE agent.deleted_at IS NULL
            AND EXISTS (
-               SELECT 1 FROM codex_subagent_definitions AS subagent
+               SELECT 1 FROM subagent_definitions AS subagent
                WHERE subagent.agent_id = agent.id
                  AND subagent.model_connection_id = $1
                  AND ($3 OR subagent.model_id = ANY($2))
@@ -2958,7 +2935,7 @@ async fn clear_model_selection_references_tx(
     .execute(&mut **tx)
     .await?;
     sqlx::query(
-        "UPDATE codex_subagent_definitions
+        "UPDATE subagent_definitions
          SET model_connection_id = NULL, model_id = NULL, enabled = false,
              disabled_reason = $4, updated_at = CURRENT_TIMESTAMP(3)
          WHERE model_connection_id = $1
@@ -2982,7 +2959,7 @@ async fn delete_model_connection_impl(
     let user = require_user(state, headers).await?;
     let mut tx = state.pool.begin().await?;
     sqlx::query(
-        "LOCK TABLE system_default_model_selection, agents, codex_subagent_definitions
+        "LOCK TABLE system_default_model_selection, agents, subagent_definitions
          IN SHARE ROW EXCLUSIVE MODE",
     )
     .execute(&mut *tx)
@@ -3005,7 +2982,7 @@ async fn delete_model_connection_impl(
     .fetch_one(&mut *tx)
     .await?;
     let subagent_references: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM codex_subagent_definitions
+        "SELECT count(*) FROM subagent_definitions
          WHERE model_connection_id = $1",
     )
     .bind(model_connection_id)
@@ -4382,7 +4359,7 @@ async fn create_agent(
     let visibility = normalize_visibility(&req.visibility)?;
     validate_public_visibility_role(visibility, &user.role)?;
     validate_public_to(&state.pool, visibility, &req.public_to, user.id).await?;
-    validate_codex_subagent_definitions(&req.codex_subagents)?;
+    validate_subagent_definitions(&req.subagents)?;
     let model_policy = json!({ "provider": "hub-proxy" });
     let id = Uuid::new_v4();
     let mut tx = state.pool.begin().await?;
@@ -4416,7 +4393,7 @@ async fn create_agent(
         user.id,
         model_selection.as_ref(),
         model_settings,
-        &mut req.codex_subagents,
+        &mut req.subagents,
     )
     .await?;
     let model_connection_id = model_selection
@@ -4445,7 +4422,7 @@ async fn create_agent(
     .bind(model_settings_value)
     .execute(&mut *tx)
     .await?;
-    replace_codex_subagents_tx(&mut tx, id, &req.codex_subagents).await?;
+    replace_subagents_tx(&mut tx, id, &req.subagents).await?;
     tx.commit().await?;
     Ok(Json(load_agent_for_user(&state.pool, id, &user).await?))
 }
@@ -4537,7 +4514,7 @@ async fn update_agent(
     }
     ensure_skills_owned_by_user(&state.pool, &req.managed_skill_ids, existing_agent.owner_id)
         .await?;
-    validate_codex_subagent_definitions(&req.codex_subagents)?;
+    validate_subagent_definitions(&req.subagents)?;
     let execution_configuration_changed =
         agent_execution_configuration_changed(&existing_agent, &req);
 
@@ -4556,7 +4533,7 @@ async fn update_agent(
         existing_agent.owner_id,
         req.model_selection.as_ref(),
         req.model_settings,
-        &mut req.codex_subagents,
+        &mut req.subagents,
     )
     .await?;
     let model_connection_id = req
@@ -4613,7 +4590,7 @@ async fn update_agent(
         .execute(&mut *tx)
         .await?;
     }
-    replace_codex_subagents_tx(&mut tx, agent_id, &req.codex_subagents).await?;
+    replace_subagents_tx(&mut tx, agent_id, &req.subagents).await?;
     tx.commit().await?;
     Ok(Json(
         load_agent_for_user(&state.pool, agent_id, &user).await?,
@@ -4671,7 +4648,7 @@ async fn delete_agent(
             .bind(agent_id)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("DELETE FROM codex_subagent_definitions WHERE agent_id = $1")
+        sqlx::query("DELETE FROM subagent_definitions WHERE agent_id = $1")
             .bind(agent_id)
             .execute(&mut *tx)
             .await?;
@@ -4787,7 +4764,7 @@ async fn delete_agent(
                  current_bundle_checksum_sha256 = NULL, current_bundle_size_bytes = NULL,
                  current_bundle_history_checkpoint = NULL,
                  current_bundle_ownership_generation = NULL,
-                 current_bundle_producing_codex_version = NULL,
+                 current_bundle_producing_engine_version = NULL,
                  current_bundle_created_at = NULL, current_bundle_runtime_id = NULL,
                  current_bundle_checkpoint_attempt_id = NULL,
                  saving_history_checkpoint = NULL, saving_ownership_generation = NULL,
@@ -5365,7 +5342,7 @@ async fn list_agent_runs(
                 runs.parent_run_id, runs.runtime_id, runs.hub_session_id,
                 runs.hub_message_id, runs.hub_turn_id,
                 runs.session_ownership_generation, runs.status, runs.initial_message,
-                runs.session_id, runs.work_dir_ref, runs.source, runs.created_at,
+                runs.native_session_id, runs.work_dir_ref, runs.source, runs.created_at,
                 runs.updated_at
          FROM runs
          JOIN users AS run_owner ON run_owner.id = runs.owner_id
@@ -5518,13 +5495,13 @@ async fn list_hub_sessions(
                  WHERE external_platforms.id = hub_sessions.origin_platform_id)
                     AS origin_platform_name,
                 origin_tenant_id, origin_external_identity_id, lifecycle_status,
-                native_thread_id, active_turn_id, history_checkpoint,
+                native_session_id, active_turn_id, history_checkpoint,
                 configuration_fingerprint, runtime_owner_id, ownership_generation,
                 recovery_error, current_bundle_generation,
                 current_bundle_object_key, current_bundle_checksum_sha256,
                 current_bundle_size_bytes, current_bundle_history_checkpoint,
                 current_bundle_ownership_generation,
-                current_bundle_producing_codex_version,
+                current_bundle_producing_engine_version,
                 current_bundle_created_at, created_at, updated_at
          FROM hub_sessions
          WHERE owner_id = $1
@@ -5552,13 +5529,13 @@ async fn get_hub_session(
                  WHERE external_platforms.id = hub_sessions.origin_platform_id)
                     AS origin_platform_name,
                 origin_tenant_id, origin_external_identity_id, lifecycle_status,
-                native_thread_id, active_turn_id, history_checkpoint,
+                native_session_id, active_turn_id, history_checkpoint,
                 configuration_fingerprint, runtime_owner_id, ownership_generation,
                 recovery_error, current_bundle_generation,
                 current_bundle_object_key, current_bundle_checksum_sha256,
                 current_bundle_size_bytes, current_bundle_history_checkpoint,
                 current_bundle_ownership_generation,
-                current_bundle_producing_codex_version,
+                current_bundle_producing_engine_version,
                 current_bundle_created_at, created_at, updated_at
          FROM hub_sessions
          WHERE id = $1 AND owner_id = $2",
@@ -5750,295 +5727,13 @@ async fn list_runtimes(
 ) -> Result<Json<Vec<RuntimeDto>>, ApiError> {
     require_user(&state, &headers).await?;
     let rows = sqlx::query(
-        "SELECT id, hostname, labels, codex_version, capabilities, sandbox_mode,
+        "SELECT id, hostname, labels, engine_version, capabilities, sandbox_mode,
                 status, last_heartbeat_at, rotation_requested_at
          FROM runtimes ORDER BY last_heartbeat_at DESC",
     )
     .fetch_all(&state.pool)
     .await?;
     Ok(Json(rows.into_iter().map(runtime_from_row).collect()))
-}
-
-async fn get_codex_version_rollout(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<CodexVersionRolloutDto>, ApiError> {
-    require_administrator(&state, &headers).await?;
-    Ok(Json(load_codex_version_rollout(&state.pool).await?))
-}
-
-async fn set_codex_target_version(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(req): Json<SetCodexTargetVersionRequest>,
-) -> Result<Json<CodexVersionRolloutDto>, ApiError> {
-    require_administrator(&state, &headers).await?;
-    let version = req.version.trim().to_owned();
-    validate_concrete_version(&version)
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let platforms = registered_runtime_platforms(&state.pool).await?;
-    if platforms.is_empty() {
-        return Err(ApiError::conflict(
-            "at least one supported Runtime platform must be registered",
-        ));
-    }
-    let attempt_id = Uuid::new_v4();
-    sqlx::query(
-        "UPDATE codex_version_rollout
-         SET target_version = $1, status = 'downloading', error = NULL,
-             attempt_id = $2, updated_at = now()
-         WHERE singleton = true",
-    )
-    .bind(&version)
-    .bind(attempt_id)
-    .execute(&state.pool)
-    .await?;
-
-    let prepared = state
-        .codex_release_client
-        .prepare_release(&version, &platforms)
-        .await;
-    let prepared = match prepared {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            sqlx::query(
-                "UPDATE codex_version_rollout
-                 SET status = 'failed', error = $1, updated_at = now()
-                 WHERE singleton = true AND attempt_id = $2",
-            )
-            .bind(error.to_string())
-            .bind(attempt_id)
-            .execute(&state.pool)
-            .await?;
-            return Err(ApiError::bad_gateway(format!(
-                "prepare Codex release {version}: {error}"
-            )));
-        }
-    };
-    persist_prepared_codex_artifacts(&state.pool, &version, attempt_id, prepared).await?;
-    Ok(Json(load_codex_version_rollout(&state.pool).await?))
-}
-
-async fn promote_codex_target_version(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<CodexVersionRolloutDto>, ApiError> {
-    require_administrator(&state, &headers).await?;
-    let mut tx = state.pool.begin().await?;
-    let rollout = sqlx::query(
-        "SELECT target_version, status FROM codex_version_rollout
-         WHERE singleton = true FOR UPDATE",
-    )
-    .fetch_one(&mut *tx)
-    .await?;
-    let target_version: String = rollout
-        .get::<Option<String>, _>("target_version")
-        .ok_or(ApiError::conflict("no Target Codex Version is prepared"))?;
-    if rollout.get::<String, _>("status") != "ready" {
-        return Err(ApiError::conflict(
-            "every registered Runtime must report ready before promotion",
-        ));
-    }
-    let unready: i64 = sqlx::query_scalar(
-        "SELECT count(*)
-         FROM runtimes
-         LEFT JOIN runtime_codex_readiness AS readiness
-           ON readiness.runtime_id = runtimes.id AND readiness.version = $1
-         WHERE runtimes.credential_revoked_at IS NULL
-           AND runtimes.status <> 'deleted'
-           AND runtimes.codex_version <> $1
-           AND COALESCE(readiness.status, '') <> 'ready'",
-    )
-    .bind(&target_version)
-    .fetch_one(&mut *tx)
-    .await?;
-    if unready != 0 {
-        return Err(ApiError::conflict(
-            "every registered Runtime must report ready before promotion",
-        ));
-    }
-    sqlx::query(
-        "UPDATE codex_version_rollout
-         SET active_version = $1, target_version = NULL, status = 'active',
-             error = NULL, attempt_id = NULL, updated_at = now()
-         WHERE singleton = true",
-    )
-    .bind(&target_version)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(Json(load_codex_version_rollout(&state.pool).await?))
-}
-
-async fn registered_runtime_platforms(pool: &PgPool) -> Result<Vec<RuntimePlatform>, ApiError> {
-    let rows = sqlx::query(
-        "SELECT DISTINCT capabilities #>> '{platform,os}' AS os,
-                         capabilities #>> '{platform,architecture}' AS architecture
-         FROM runtimes
-         WHERE credential_revoked_at IS NULL AND status <> 'deleted'
-         ORDER BY os, architecture",
-    )
-    .fetch_all(pool)
-    .await?;
-    rows.into_iter()
-        .map(|row| {
-            let os: Option<String> = row.get("os");
-            let architecture: Option<String> = row.get("architecture");
-            match (os, architecture) {
-                (Some(os), Some(architecture)) => {
-                    codex_rollout::asset_name_for_platform(&os, &architecture)
-                        .map_err(|error| ApiError::conflict(error.to_string()))?;
-                    Ok(RuntimePlatform { os, architecture })
-                }
-                _ => Err(ApiError::conflict(
-                    "every registered Runtime must report its OS and architecture",
-                )),
-            }
-        })
-        .collect()
-}
-
-async fn persist_prepared_codex_artifacts(
-    pool: &PgPool,
-    version: &str,
-    attempt_id: Uuid,
-    prepared: Vec<PreparedCodexArtifact>,
-) -> Result<(), ApiError> {
-    let mut tx = pool.begin().await?;
-    let current_attempt: Option<Uuid> = sqlx::query_scalar(
-        "SELECT attempt_id FROM codex_version_rollout
-         WHERE singleton = true AND target_version = $1 AND status = 'downloading'
-         FOR UPDATE",
-    )
-    .bind(version)
-    .fetch_optional(&mut *tx)
-    .await?
-    .flatten();
-    if current_attempt != Some(attempt_id) {
-        return Err(ApiError::conflict("Codex target attempt was superseded"));
-    }
-    sqlx::query("DELETE FROM codex_version_artifacts WHERE version = $1")
-        .bind(version)
-        .execute(&mut *tx)
-        .await?;
-    for artifact in prepared {
-        let size_bytes = i64::try_from(artifact.descriptor.size_bytes)
-            .map_err(|_| ApiError::bad_gateway("Codex artifact is too large"))?;
-        sqlx::query(
-            "INSERT INTO codex_version_artifacts
-                 (version, os, architecture, artifact_name, sha256, size_bytes, storage_path)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
-        )
-        .bind(&artifact.descriptor.version)
-        .bind(&artifact.descriptor.os)
-        .bind(&artifact.descriptor.architecture)
-        .bind(&artifact.descriptor.artifact_name)
-        .bind(&artifact.descriptor.sha256)
-        .bind(size_bytes)
-        .bind(artifact.storage_path.to_string_lossy().as_ref())
-        .execute(&mut *tx)
-        .await?;
-    }
-    sqlx::query("DELETE FROM runtime_codex_readiness WHERE version = $1")
-        .bind(version)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query(
-        "UPDATE codex_version_rollout
-         SET status = 'distributing', error = NULL, updated_at = now()
-         WHERE singleton = true AND attempt_id = $1",
-    )
-    .bind(attempt_id)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(())
-}
-
-async fn load_codex_version_rollout(pool: &PgPool) -> Result<CodexVersionRolloutDto, ApiError> {
-    let state = sqlx::query(
-        "SELECT active_version, target_version, status, error, updated_at
-         FROM codex_version_rollout WHERE singleton = true",
-    )
-    .fetch_one(pool)
-    .await?;
-    let active_version: Option<String> = state.get("active_version");
-    let target_version: Option<String> = state.get("target_version");
-    let selected_version = target_version.as_deref().or(active_version.as_deref());
-    let artifacts = if let Some(version) = selected_version {
-        sqlx::query(
-            "SELECT version, os, architecture, artifact_name, sha256, size_bytes
-             FROM codex_version_artifacts
-             WHERE version = $1
-             ORDER BY os, architecture",
-        )
-        .bind(version)
-        .fetch_all(pool)
-        .await?
-        .into_iter()
-        .map(|row| {
-            let size_bytes: i64 = row.get("size_bytes");
-            Ok(CodexVersionArtifactDto {
-                version: row.get("version"),
-                os: row.get("os"),
-                architecture: row.get("architecture"),
-                artifact_name: row.get("artifact_name"),
-                sha256: row.get("sha256"),
-                size_bytes: u64::try_from(size_bytes)
-                    .map_err(|_| ApiError::internal("invalid Codex artifact size"))?,
-            })
-        })
-        .collect::<Result<Vec<_>, ApiError>>()?
-    } else {
-        Vec::new()
-    };
-    let runtime_rows = sqlx::query(
-        "SELECT runtimes.id, runtimes.hostname, runtimes.codex_version,
-                COALESCE(runtimes.capabilities #>> '{platform,os}', 'unknown') AS os,
-                COALESCE(runtimes.capabilities #>> '{platform,architecture}', 'unknown')
-                    AS architecture,
-                readiness.status, readiness.error, readiness.checked_at
-         FROM runtimes
-         LEFT JOIN runtime_codex_readiness AS readiness
-           ON readiness.runtime_id = runtimes.id
-          AND readiness.version = $1
-         ORDER BY runtimes.hostname, runtimes.id",
-    )
-    .bind(selected_version)
-    .fetch_all(pool)
-    .await?;
-    let runtimes = runtime_rows
-        .into_iter()
-        .map(|row| {
-            let current_version: String = row.get("codex_version");
-            let readiness_status: Option<String> = row.get("status");
-            let status = match selected_version {
-                Some(version) if current_version == version => "active".to_owned(),
-                Some(_) => readiness_status.unwrap_or_else(|| "pending".into()),
-                None => "not_requested".into(),
-            };
-            CodexRuntimeReadinessDto {
-                runtime_id: row.get("id"),
-                hostname: row.get("hostname"),
-                os: row.get("os"),
-                architecture: row.get("architecture"),
-                current_version,
-                target_version: selected_version.map(str::to_owned),
-                status,
-                error: row.get("error"),
-                checked_at: row.get("checked_at"),
-            }
-        })
-        .collect();
-    Ok(CodexVersionRolloutDto {
-        active_version,
-        target_version,
-        status: state.get("status"),
-        error: state.get("error"),
-        artifacts,
-        runtimes,
-        updated_at: state.get("updated_at"),
-    })
 }
 
 async fn create_runtime_enrollment_token(
@@ -6126,7 +5821,7 @@ async fn request_runtime_credential_rotation(
         "UPDATE runtimes
          SET rotation_requested_at = COALESCE(rotation_requested_at, now())
          WHERE id = $1 AND credential_revoked_at IS NULL
-         RETURNING id, hostname, labels, codex_version, capabilities, sandbox_mode,
+         RETURNING id, hostname, labels, engine_version, capabilities, sandbox_mode,
                    status, last_heartbeat_at, rotation_requested_at",
     )
     .bind(runtime_id)
@@ -6584,7 +6279,7 @@ async fn load_runtime_drain_response_tx(
     runtime_id: Uuid,
 ) -> Result<RuntimeDrainResponse, ApiError> {
     let runtime = sqlx::query(
-        "SELECT id, hostname, labels, codex_version, capabilities, sandbox_mode,
+        "SELECT id, hostname, labels, engine_version, capabilities, sandbox_mode,
                 status, last_heartbeat_at, rotation_requested_at
          FROM runtimes WHERE id = $1",
     )
@@ -6858,7 +6553,7 @@ async fn list_automation_runs(
     let rows = sqlx::query(
         "SELECT id, agent_id, automation_id, integration_session_id, parent_run_id, runtime_id,
                 hub_session_id, hub_message_id, hub_turn_id, session_ownership_generation,
-                status, initial_message, session_id, work_dir_ref, source, created_at, updated_at
+                status, initial_message, native_session_id, work_dir_ref, source, created_at, updated_at
          FROM runs
          WHERE automation_id = $1
          ORDER BY created_at DESC, id DESC
@@ -7895,7 +7590,7 @@ async fn runtime_register(
     ))?;
     sqlx::query(
         "INSERT INTO runtimes
-             (id, token_hash, hostname, labels, codex_version, capabilities,
+             (id, token_hash, hostname, labels, engine_version, capabilities,
               sandbox_mode, status)
          VALUES ($1, $2, $3, $4, $5, $6, $7, 'online')",
     )
@@ -7903,7 +7598,7 @@ async fn runtime_register(
     .bind(&runtime_credential_hash)
     .bind(req.hostname.trim())
     .bind(req.labels)
-    .bind(req.codex_version)
+    .bind(req.engine_version)
     .bind(req.capabilities)
     .bind(req.sandbox_mode)
     .execute(&mut *tx)
@@ -7936,7 +7631,6 @@ async fn runtime_heartbeat(
         accepts_session_commands,
         owned_sessions,
         cleaned_sessions,
-        codex_status,
     } = req;
     let credential = bearer_token(&headers)
         .filter(|token| !token.trim().is_empty())
@@ -7991,8 +7685,7 @@ async fn runtime_heartbeat(
 
     let mut tx = state.pool.begin().await?;
     let row = sqlx::query(
-        "SELECT id, token_hash, pending_token_hash, rotation_requested_at,
-                codex_version, capabilities
+        "SELECT id, token_hash, pending_token_hash, rotation_requested_at
          FROM runtimes
          WHERE credential_revoked_at IS NULL
            AND (token_hash = $1 OR pending_token_hash = $1)
@@ -8006,8 +7699,6 @@ async fn runtime_heartbeat(
     let current_hash: String = row.get("token_hash");
     let existing_pending_hash: Option<String> = row.get("pending_token_hash");
     let rotation_requested_at: Option<DateTime<Utc>> = row.get("rotation_requested_at");
-    let stored_codex_version: String = row.get("codex_version");
-    let runtime_capabilities: Value = row.get("capabilities");
     let authenticated_pending = existing_pending_hash.as_deref() == Some(&credential_hash);
 
     for cleaned in cleaned_sessions {
@@ -8077,150 +7768,6 @@ async fn runtime_heartbeat(
     .bind(runtime_id)
     .fetch_one(&mut *tx)
     .await?;
-
-    let rollout = sqlx::query(
-        "SELECT active_version, target_version, status
-         FROM codex_version_rollout WHERE singleton = true FOR UPDATE",
-    )
-    .fetch_one(&mut *tx)
-    .await?;
-    let active_version: Option<String> = rollout.get("active_version");
-    let target_version: Option<String> = rollout.get("target_version");
-    let reported_codex_version = codex_status
-        .as_ref()
-        .map(|status| status.current_version.trim())
-        .filter(|version| !version.is_empty())
-        .unwrap_or(stored_codex_version.as_str());
-    if let Some(status) = codex_status.as_ref() {
-        if status.current_version.trim().is_empty() {
-            return Err(ApiError::bad_request(
-                "Runtime Codex current version is required",
-            ));
-        }
-        if status.current_version != stored_codex_version {
-            sqlx::query("UPDATE runtimes SET codex_version = $1 WHERE id = $2")
-                .bind(status.current_version.trim())
-                .bind(runtime_id)
-                .execute(&mut *tx)
-                .await?;
-        }
-        match (
-            target_version.as_deref(),
-            status.candidate_version.as_deref(),
-            status.candidate_status.as_deref(),
-        ) {
-            (Some(target), Some(candidate), Some(readiness @ ("ready" | "failed")))
-                if target == candidate =>
-            {
-                let error = status
-                    .candidate_error
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|error| !error.is_empty());
-                if readiness == "failed" && error.is_none() {
-                    return Err(ApiError::bad_request(
-                        "failed Codex readiness requires an error",
-                    ));
-                }
-                sqlx::query(
-                    "INSERT INTO runtime_codex_readiness
-                         (runtime_id, version, status, error, checked_at)
-                     VALUES ($1, $2, $3, $4, now())
-                     ON CONFLICT (runtime_id, version) DO UPDATE
-                     SET status = EXCLUDED.status, error = EXCLUDED.error, checked_at = now()",
-                )
-                .bind(runtime_id)
-                .bind(target)
-                .bind(readiness)
-                .bind(error)
-                .execute(&mut *tx)
-                .await?;
-            }
-            (None, Some(candidate), Some("ready"))
-                if active_version.as_deref() == Some(candidate) =>
-            {
-                // Promotion may commit between two Runtime heartbeats. The next response
-                // carries the Active Version command that clears this stale readiness.
-            }
-            (Some(_), None, None) | (None, None, None) => {}
-            _ => {
-                return Err(ApiError::conflict(
-                    "Runtime Codex readiness does not match the current Target Version",
-                ));
-            }
-        }
-    }
-    if let Some(target) = target_version.as_deref() {
-        let failed: bool = sqlx::query_scalar(
-            "SELECT EXISTS(
-                 SELECT 1 FROM runtime_codex_readiness
-                 WHERE version = $1 AND status = 'failed'
-             )",
-        )
-        .bind(target)
-        .fetch_one(&mut *tx)
-        .await?;
-        let unready: i64 = sqlx::query_scalar(
-            "SELECT count(*)
-             FROM runtimes
-             LEFT JOIN runtime_codex_readiness AS readiness
-               ON readiness.runtime_id = runtimes.id AND readiness.version = $1
-             WHERE runtimes.credential_revoked_at IS NULL
-               AND runtimes.status <> 'deleted'
-               AND runtimes.codex_version <> $1
-               AND COALESCE(readiness.status, '') <> 'ready'",
-        )
-        .bind(target)
-        .fetch_one(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE codex_version_rollout
-             SET status = $1, error = CASE WHEN $1 = 'failed' THEN
-                     'one or more Runtimes rejected the Target Codex Version' ELSE NULL END,
-                 updated_at = now()
-             WHERE singleton = true AND status IN ('distributing', 'ready', 'failed')",
-        )
-        .bind(if failed {
-            "failed"
-        } else if unready == 0 {
-            "ready"
-        } else {
-            "distributing"
-        })
-        .execute(&mut *tx)
-        .await?;
-    }
-    let artifact_version = target_version.as_deref().or_else(|| {
-        active_version
-            .as_deref()
-            .filter(|active| *active != reported_codex_version)
-    });
-    let target_artifact = if let Some(target) = artifact_version {
-        let runtime_os = runtime_capabilities
-            .pointer("/platform/os")
-            .and_then(Value::as_str)
-            .ok_or(ApiError::conflict("Runtime did not report its OS"))?;
-        let runtime_architecture = runtime_capabilities
-            .pointer("/platform/architecture")
-            .and_then(Value::as_str)
-            .ok_or(ApiError::conflict(
-                "Runtime did not report its architecture",
-            ))?;
-        sqlx::query(
-            "SELECT version, os, architecture, artifact_name, sha256, size_bytes
-             FROM codex_version_artifacts
-             WHERE version = $1 AND os = $2 AND architecture = $3",
-        )
-        .bind(target)
-        .bind(runtime_os)
-        .bind(runtime_architecture)
-        .fetch_optional(&mut *tx)
-        .await?
-        .map(codex_artifact_from_row)
-        .transpose()?
-    } else {
-        None
-    };
 
     for owned in owned_sessions {
         let checkpoint_reason = if owned.lifecycle_status == "saving" {
@@ -8345,7 +7892,7 @@ async fn runtime_heartbeat(
 
     let owned_sessions = sqlx::query(
         "SELECT sessions.id, sessions.ownership_generation,
-                sessions.lifecycle_status, sessions.native_thread_id,
+                sessions.lifecycle_status, sessions.native_session_id,
                 active_runs.id AS active_run_id
          FROM hub_sessions AS sessions
          LEFT JOIN LATERAL (
@@ -8368,7 +7915,7 @@ async fn runtime_heartbeat(
         session_id: row.get("id"),
         ownership_generation: row.get("ownership_generation"),
         lifecycle_status: row.get("lifecycle_status"),
-        native_thread_id: row.get("native_thread_id"),
+        native_session_id: row.get("native_session_id"),
         active_run_id: row.get("active_run_id"),
     })
     .collect();
@@ -8396,7 +7943,7 @@ async fn runtime_heartbeat(
             sqlx::query(
                 "SELECT turns.id AS command_id, sessions.id AS session_id,
                         sessions.ownership_generation, runs.id AS run_id,
-                        turns.id AS turn_id, sessions.native_thread_id,
+                        turns.id AS turn_id, sessions.native_session_id,
                         turns.native_turn_id
                  FROM hub_sessions AS sessions
                  JOIN hub_session_turns AS turns
@@ -8414,7 +7961,7 @@ async fn runtime_heartbeat(
                  WHERE sessions.runtime_owner_id = $1
                    AND turns.interrupt_requested_at IS NOT NULL
                    AND turns.interrupt_acknowledged_at IS NULL
-                   AND sessions.native_thread_id IS NOT NULL
+                   AND sessions.native_session_id IS NOT NULL
                    AND turns.native_turn_id IS NOT NULL
                  ORDER BY sessions.created_at, sessions.id",
             )
@@ -8429,7 +7976,7 @@ async fn runtime_heartbeat(
                 command: "interrupt".into(),
                 run_id: Some(row.get("run_id")),
                 turn_id: Some(row.get("turn_id")),
-                native_thread_id: row.get("native_thread_id"),
+                native_session_id: row.get("native_session_id"),
                 native_turn_id: row.get("native_turn_id"),
                 message: None,
                 configuration_revision: None,
@@ -8464,7 +8011,7 @@ async fn runtime_heartbeat(
                 command: "checkpoint".into(),
                 run_id: None,
                 turn_id: None,
-                native_thread_id: None,
+                native_session_id: None,
                 native_turn_id: None,
                 message: None,
                 configuration_revision: None,
@@ -8496,7 +8043,7 @@ async fn runtime_heartbeat(
             sqlx::query(
                 "SELECT messages.id AS command_id, messages.session_id,
                         sessions.ownership_generation, messages.run_id,
-                        turns.id AS turn_id, sessions.native_thread_id,
+                        turns.id AS turn_id, sessions.native_session_id,
                         turns.native_turn_id, messages.sequence, messages.content
                  FROM hub_session_messages AS messages
                  JOIN hub_sessions AS sessions ON sessions.id = messages.session_id
@@ -8525,7 +8072,7 @@ async fn runtime_heartbeat(
                     command: "steer".into(),
                     run_id: row.get("run_id"),
                     turn_id: Some(row.get("turn_id")),
-                    native_thread_id: row.get("native_thread_id"),
+                    native_session_id: row.get("native_session_id"),
                     native_turn_id: row.get("native_turn_id"),
                     message: Some(RuntimeSteeringMessageDto {
                         id: command_id,
@@ -8541,7 +8088,7 @@ async fn runtime_heartbeat(
     }
     if accepts_session_commands {
         let refresh_rows = sqlx::query(
-            "SELECT id, agent_id, ownership_generation, native_thread_id,
+            "SELECT id, agent_id, ownership_generation, native_session_id,
                     configuration_refresh_revision
              FROM hub_sessions
              WHERE runtime_owner_id = $1
@@ -8569,7 +8116,7 @@ async fn runtime_heartbeat(
                 command: "refresh_configuration".into(),
                 run_id: None,
                 turn_id: None,
-                native_thread_id: row.get("native_thread_id"),
+                native_session_id: row.get("native_session_id"),
                 native_turn_id: None,
                 message: None,
                 configuration_revision: Some(target_revision),
@@ -8588,10 +8135,6 @@ async fn runtime_heartbeat(
         owned_sessions,
         cleanup_sessions,
         session_commands,
-        codex_rollout: RuntimeCodexRolloutCommandDto {
-            active_version,
-            target_artifact,
-        },
     }))
 }
 
@@ -8603,98 +8146,6 @@ fn configuration_command_id(session_id: Uuid, revision: i64) -> Uuid {
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     Uuid::from_bytes(bytes)
-}
-
-fn codex_artifact_from_row(
-    row: sqlx::postgres::PgRow,
-) -> Result<CodexVersionArtifactDto, ApiError> {
-    let size_bytes: i64 = row.get("size_bytes");
-    Ok(CodexVersionArtifactDto {
-        version: row.get("version"),
-        os: row.get("os"),
-        architecture: row.get("architecture"),
-        artifact_name: row.get("artifact_name"),
-        sha256: row.get("sha256"),
-        size_bytes: u64::try_from(size_bytes)
-            .map_err(|_| ApiError::internal("invalid Codex artifact size"))?,
-    })
-}
-
-async fn download_runtime_codex_artifact(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path((version, os, architecture)): Path<(String, String, String)>,
-) -> Result<Response, ApiError> {
-    validate_concrete_version(&version)
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    codex_rollout::asset_name_for_platform(&os, &architecture)
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let runtime_id = require_runtime(&state, &headers).await?;
-    let runtime = sqlx::query(
-        "SELECT capabilities #>> '{platform,os}' AS os,
-                capabilities #>> '{platform,architecture}' AS architecture
-         FROM runtimes WHERE id = $1",
-    )
-    .bind(runtime_id)
-    .fetch_one(&state.pool)
-    .await?;
-    if runtime.get::<Option<String>, _>("os").as_deref() != Some(os.as_str())
-        || runtime.get::<Option<String>, _>("architecture").as_deref()
-            != Some(architecture.as_str())
-    {
-        return Err(ApiError::forbidden(
-            "Runtime may download only its registered platform artifact",
-        ));
-    }
-    let allowed: bool = sqlx::query_scalar(
-        "SELECT active_version = $1 OR target_version = $1
-         FROM codex_version_rollout WHERE singleton = true",
-    )
-    .bind(&version)
-    .fetch_one(&state.pool)
-    .await?;
-    if !allowed {
-        return Err(ApiError::forbidden(
-            "Codex artifact is not the Active or Target Version",
-        ));
-    }
-    let artifact = sqlx::query(
-        "SELECT artifact_name, sha256, size_bytes, storage_path
-         FROM codex_version_artifacts
-         WHERE version = $1 AND os = $2 AND architecture = $3",
-    )
-    .bind(&version)
-    .bind(&os)
-    .bind(&architecture)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or(ApiError::not_found("Codex artifact not found"))?;
-    let storage_path: String = artifact.get("storage_path");
-    let file = tokio::fs::File::open(&storage_path)
-        .await
-        .map_err(|error| ApiError::internal(format!("open Codex artifact: {error}")))?;
-    let size_bytes: i64 = artifact.get("size_bytes");
-    let size_bytes =
-        u64::try_from(size_bytes).map_err(|_| ApiError::internal("invalid Codex artifact size"))?;
-    let metadata = file
-        .metadata()
-        .await
-        .map_err(|error| ApiError::internal(format!("inspect Codex artifact: {error}")))?;
-    if metadata.len() != size_bytes {
-        return Err(ApiError::internal(
-            "stored Codex artifact size does not match verified metadata",
-        ));
-    }
-    let artifact_name: String = artifact.get("artifact_name");
-    let sha256: String = artifact.get("sha256");
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/zstd")
-        .header(header::CONTENT_LENGTH, size_bytes)
-        .header("x-agent-hub-codex-artifact", artifact_name)
-        .header("x-agent-hub-codex-sha256", sha256)
-        .body(Body::from_stream(tokio_util::io::ReaderStream::new(file)))
-        .map_err(|error| ApiError::internal(format!("build Codex artifact response: {error}")))
 }
 
 async fn runtime_release_session(
@@ -8839,8 +8290,7 @@ async fn runtime_release_session(
 fn checkpoint_reason_priority(reason: &str) -> Option<u8> {
     match reason {
         "idle" => Some(0),
-        "version_switch" => Some(1),
-        "drain" => Some(2),
+        "drain" => Some(1),
         _ => None,
     }
 }
@@ -9062,7 +8512,7 @@ async fn runtime_fail_session_checkpoint(
     .bind(saving_history_checkpoint)
     .fetch_one(&mut *tx)
     .await?;
-    let mut reason: String = session.get("saving_reason");
+    let reason: String = session.get("saving_reason");
     if runtime_status == "draining" && reason != "drain" {
         sqlx::query(
             "UPDATE hub_sessions
@@ -9072,14 +8522,12 @@ async fn runtime_fail_session_checkpoint(
         .bind(session_id)
         .execute(&mut *tx)
         .await?;
-        reason = "drain".into();
     }
-    let disposition =
-        if has_queued_work && runtime_status != "draining" && reason != "version_switch" {
-            "resume"
-        } else {
-            "retry"
-        };
+    let disposition = if has_queued_work && runtime_status != "draining" {
+        "resume"
+    } else {
+        "retry"
+    };
     if disposition == "resume" {
         sqlx::query(
             "UPDATE hub_sessions
@@ -9119,7 +8567,7 @@ struct SessionBundleUploadHeaders {
     checksum_sha256: String,
     size_bytes: u64,
     history_checkpoint: i64,
-    producing_codex_version: String,
+    producing_engine_version: String,
     created_at: DateTime<Utc>,
 }
 
@@ -9244,7 +8692,7 @@ async fn runtime_download_session_bundle(
                 current_bundle_generation, current_bundle_object_key,
                 current_bundle_checksum_sha256, current_bundle_size_bytes,
                 current_bundle_history_checkpoint,
-                current_bundle_producing_codex_version, current_bundle_created_at
+                current_bundle_producing_engine_version, current_bundle_created_at
          FROM hub_sessions WHERE id = $1",
     )
     .bind(session_id)
@@ -9306,8 +8754,8 @@ async fn runtime_download_session_bundle(
                 .to_string(),
         ),
         (
-            "x-agent-hub-producing-codex-version",
-            row.get::<String, _>("current_bundle_producing_codex_version"),
+            "x-agent-hub-producing-engine-version",
+            row.get::<String, _>("current_bundle_producing_engine_version"),
         ),
         (
             "x-agent-hub-bundle-created-at",
@@ -9366,10 +8814,11 @@ fn parse_session_bundle_upload_headers(
             "Session Bundle history checkpoint must not be negative",
         ));
     }
-    let producing_codex_version = required_header(headers, "x-agent-hub-producing-codex-version")?;
-    if producing_codex_version.len() > 128 {
+    let producing_engine_version =
+        required_header(headers, "x-agent-hub-producing-engine-version")?;
+    if producing_engine_version.len() > 128 {
         return Err(ApiError::bad_request(
-            "Session Bundle producing Codex version is too long",
+            "Session Bundle producing engine version is too long",
         ));
     }
     let created_at =
@@ -9383,7 +8832,7 @@ fn parse_session_bundle_upload_headers(
         checksum_sha256,
         size_bytes,
         history_checkpoint,
-        producing_codex_version,
+        producing_engine_version,
         created_at,
     })
 }
@@ -9449,7 +8898,7 @@ async fn validate_session_bundle_upload_preflight(
                 current_bundle_runtime_id,
                 current_bundle_checksum_sha256, current_bundle_size_bytes,
                 current_bundle_history_checkpoint, current_bundle_ownership_generation,
-                current_bundle_producing_codex_version, current_bundle_created_at
+                current_bundle_producing_engine_version, current_bundle_created_at
          FROM hub_sessions WHERE id = $1",
     )
     .bind(session_id)
@@ -9477,9 +8926,9 @@ async fn validate_session_bundle_upload_preflight(
             && row.get::<Option<i64>, _>("current_bundle_ownership_generation")
                 == Some(metadata.ownership_generation)
             && row
-                .get::<Option<String>, _>("current_bundle_producing_codex_version")
+                .get::<Option<String>, _>("current_bundle_producing_engine_version")
                 .as_deref()
-                == Some(metadata.producing_codex_version.as_str())
+                == Some(metadata.producing_engine_version.as_str())
             && row
                 .get::<Option<DateTime<Utc>>, _>("current_bundle_created_at")
                 .is_some_and(|created_at| {
@@ -9539,7 +8988,7 @@ async fn commit_and_finalize_session_bundle(
                 current_bundle_runtime_id,
                 current_bundle_checksum_sha256, current_bundle_size_bytes,
                 current_bundle_history_checkpoint, current_bundle_ownership_generation,
-                current_bundle_producing_codex_version, current_bundle_created_at
+                current_bundle_producing_engine_version, current_bundle_created_at
          FROM hub_sessions WHERE id = $1 FOR UPDATE",
     )
     .bind(session_id)
@@ -9567,9 +9016,9 @@ async fn commit_and_finalize_session_bundle(
             && row.get::<Option<i64>, _>("current_bundle_ownership_generation")
                 == Some(metadata.ownership_generation)
             && row
-                .get::<Option<String>, _>("current_bundle_producing_codex_version")
+                .get::<Option<String>, _>("current_bundle_producing_engine_version")
                 .as_deref()
-                == Some(metadata.producing_codex_version.as_str())
+                == Some(metadata.producing_engine_version.as_str())
             && row
                 .get::<Option<DateTime<Utc>>, _>("current_bundle_created_at")
                 .is_some_and(|created_at| {
@@ -9599,7 +9048,7 @@ async fn commit_and_finalize_session_bundle(
         checksum_sha256: metadata.checksum_sha256.clone(),
         size_bytes: metadata.size_bytes as i64,
         history_checkpoint: metadata.history_checkpoint,
-        producing_codex_version: metadata.producing_codex_version.clone(),
+        producing_engine_version: metadata.producing_engine_version.clone(),
         created_at: metadata.created_at,
     };
     let _ = commit_session_bundle_metadata_tx(
@@ -9736,7 +9185,7 @@ async fn commit_session_bundle_metadata_tx(
         || metadata.checkpoint_attempt_id.is_nil()
         || object_key.trim().is_empty()
         || metadata.checksum_sha256.trim().is_empty()
-        || metadata.producing_codex_version.trim().is_empty()
+        || metadata.producing_engine_version.trim().is_empty()
     {
         return Err(ApiError::bad_request("invalid Session Bundle metadata"));
     }
@@ -9748,7 +9197,7 @@ async fn commit_session_bundle_metadata_tx(
                 current_bundle_runtime_id,
                 current_bundle_checksum_sha256, current_bundle_size_bytes,
                 current_bundle_history_checkpoint, current_bundle_ownership_generation,
-                current_bundle_producing_codex_version, current_bundle_created_at
+                current_bundle_producing_engine_version, current_bundle_created_at
          FROM hub_sessions
          WHERE id = $1
          FOR UPDATE",
@@ -9810,9 +9259,9 @@ async fn commit_session_bundle_metadata_tx(
             && session.get::<Option<i64>, _>("current_bundle_ownership_generation")
                 == Some(ownership_generation)
             && session
-                .get::<Option<String>, _>("current_bundle_producing_codex_version")
+                .get::<Option<String>, _>("current_bundle_producing_engine_version")
                 .as_deref()
-                == Some(metadata.producing_codex_version.trim())
+                == Some(metadata.producing_engine_version.trim())
             && session
                 .get::<Option<DateTime<Utc>>, _>("current_bundle_created_at")
                 .is_some_and(|created_at| {
@@ -9845,7 +9294,7 @@ async fn commit_session_bundle_metadata_tx(
              current_bundle_size_bytes = $4,
              current_bundle_history_checkpoint = $5,
              current_bundle_ownership_generation = $6,
-             current_bundle_producing_codex_version = $7,
+             current_bundle_producing_engine_version = $7,
              current_bundle_created_at = $8,
              current_bundle_runtime_id = $10,
              current_bundle_checkpoint_attempt_id = $11,
@@ -9864,7 +9313,7 @@ async fn commit_session_bundle_metadata_tx(
     .bind(metadata.size_bytes)
     .bind(metadata.history_checkpoint)
     .bind(ownership_generation)
-    .bind(metadata.producing_codex_version.trim())
+    .bind(metadata.producing_engine_version.trim())
     .bind(metadata.created_at)
     .bind(session_id)
     .bind(runtime_id)
@@ -9987,7 +9436,7 @@ fn runtime_claim_run_sql() -> String {
         "SELECT r.id, r.agent_id, r.automation_id, r.integration_session_id,
                 r.parent_run_id, r.runtime_id, r.hub_session_id, r.hub_message_id,
                 r.hub_turn_id, r.session_ownership_generation, r.status,
-                r.initial_message, r.session_id, r.work_dir_ref, r.source,
+                r.initial_message, r.native_session_id, r.work_dir_ref, r.source,
                 r.created_at, r.updated_at
          FROM runs r
          JOIN hub_sessions hs ON hs.id = r.hub_session_id
@@ -10008,7 +9457,7 @@ async fn runtime_claim_run(
     let token = bearer_token(&headers).ok_or(ApiError::unauthorized("missing runtime token"))?;
     let mut tx = state.pool.begin().await?;
     let runtime_row = sqlx::query(
-        "SELECT id, status, codex_version FROM runtimes
+        "SELECT id, status FROM runtimes
          WHERE token_hash = $1
            AND credential_revoked_at IS NULL
          FOR UPDATE",
@@ -10019,25 +9468,12 @@ async fn runtime_claim_run(
     let runtime_row = runtime_row.ok_or(ApiError::unauthorized("invalid runtime credential"))?;
     let runtime_id: Uuid = runtime_row.get("id");
     let runtime_status: String = runtime_row.get("status");
-    let runtime_codex_version: String = runtime_row.get("codex_version");
     if runtime_status == "draining" {
         tx.commit().await?;
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
     if runtime_status != "online" {
         return Err(ApiError::unauthorized("runtime is not online"));
-    }
-    let active_codex_version: Option<String> = sqlx::query_scalar(
-        "SELECT active_version FROM codex_version_rollout WHERE singleton = true",
-    )
-    .fetch_one(&mut *tx)
-    .await?;
-    if active_codex_version
-        .as_deref()
-        .is_some_and(|active| active != runtime_codex_version)
-    {
-        tx.commit().await?;
-        return Ok(StatusCode::NO_CONTENT.into_response());
     }
     let mut unique_ready_session_ids = BTreeSet::new();
     for owned_session in &request.ready_owned_sessions {
@@ -10162,7 +9598,7 @@ async fn runtime_claim_run(
          WHERE id = $2
          RETURNING id, agent_id, automation_id, integration_session_id, parent_run_id,
                    runtime_id, hub_session_id, hub_message_id, hub_turn_id,
-                   session_ownership_generation, status, initial_message, session_id,
+                   session_ownership_generation, status, initial_message, native_session_id,
                    work_dir_ref, source, created_at, updated_at",
     )
     .bind(runtime_id)
@@ -10198,7 +9634,7 @@ async fn runtime_claim_run(
         }),
         model_settings: serde_json::from_value(agent_row.get("a_model_settings"))
             .expect("Agent Model Settings are constrained"),
-        codex_subagents: Vec::new(),
+        subagents: Vec::new(),
         model_policy: agent_row.get("a_model_policy"),
         sandbox_policy: agent_row.get("a_sandbox_policy"),
         managed_skill_ids: Vec::new(),
@@ -10210,7 +9646,7 @@ async fn runtime_claim_run(
         created_at: agent_row.get("a_created_at"),
         updated_at: agent_row.get("a_updated_at"),
     };
-    agent.codex_subagents = load_codex_subagents_tx(&mut tx, agent.id).await?;
+    agent.subagents = load_subagents_tx(&mut tx, agent.id).await?;
     let execution_config_revision: i64 = agent_row.get("a_execution_config_revision");
     let skill_rows = sqlx::query(
         "SELECT s.id, s.name, s.description, s.content, s.revision,
@@ -10233,12 +9669,12 @@ async fn runtime_claim_run(
             .map_err(|error| ApiError::internal(error.to_string()))?;
     let run = run_from_row(run_row);
     let session_context = Some(load_claim_session_context_tx(&mut tx, &run).await?);
-    let canonical_thread_id = session_context
+    let canonical_native_session_id = session_context
         .as_ref()
-        .and_then(|context| context.session.native_thread_id.clone());
+        .and_then(|context| context.session.native_session_id.clone());
     let parent_resume = if let Some(parent_run_id) = run.parent_run_id {
         sqlx::query(
-            "SELECT session_id, work_dir_ref
+            "SELECT native_session_id, work_dir_ref
              FROM runs
              WHERE id = $1 AND agent_id = $2",
         )
@@ -10248,20 +9684,20 @@ async fn runtime_claim_run(
         .await?
         .map(|row| {
             (
-                row.get::<Option<String>, _>("session_id"),
+                row.get::<Option<String>, _>("native_session_id"),
                 row.get::<Option<String>, _>("work_dir_ref"),
             )
         })
     } else {
         None
     };
-    let resume = match (canonical_thread_id, parent_resume) {
-        (Some(thread_id), parent) => Some(RunResumeDto {
-            thread_id,
+    let resume = match (canonical_native_session_id, parent_resume) {
+        (Some(native_session_id), parent) => Some(RunResumeDto {
+            native_session_id,
             work_dir_ref: parent.and_then(|(_, work_dir_ref)| work_dir_ref),
         }),
-        (None, Some((Some(thread_id), work_dir_ref))) => Some(RunResumeDto {
-            thread_id,
+        (None, Some((Some(native_session_id), work_dir_ref))) => Some(RunResumeDto {
+            native_session_id,
             work_dir_ref,
         }),
         (None, _) => None,
@@ -10883,7 +10319,7 @@ async fn runtime_complete_run(
         lock_owned_session_for_run_tx(&mut tx, run_id, runtime_id, req.ownership_generation)
             .await?;
     let current = sqlx::query(
-        "SELECT runs.status, runs.session_id, runs.work_dir_ref,
+        "SELECT runs.status, runs.native_session_id, runs.work_dir_ref,
                 runs.hub_session_id, runs.hub_turn_id
          FROM runs
          WHERE runs.id = $1 AND runs.runtime_id = $2
@@ -10899,7 +10335,7 @@ async fn runtime_complete_run(
     .await?
     .ok_or(ApiError::forbidden("runtime does not own an active run"))?;
     let current_status: String = current.get("status");
-    let current_session_id: Option<String> = current.get("session_id");
+    let current_native_session_id: Option<String> = current.get("native_session_id");
     let current_work_dir_ref: Option<String> = current.get("work_dir_ref");
     let hub_session_id: Uuid = current.get("hub_session_id");
     let hub_turn_id: Uuid = current.get("hub_turn_id");
@@ -10911,7 +10347,7 @@ async fn runtime_complete_run(
     if current_status != "running" && !(current_status == "waiting_tool" && status == "interrupted")
     {
         if current_status != status
-            || current_session_id != req.payload.session_id
+            || current_native_session_id != req.payload.native_session_id
             || current_work_dir_ref != req.payload.work_dir_ref
         {
             return Err(ApiError::conflict(
@@ -10944,14 +10380,14 @@ async fn runtime_complete_run(
     }
     let updated = sqlx::query(
         "UPDATE runs
-         SET status = $1, session_id = $2, work_dir_ref = $3, updated_at = now()
+         SET status = $1, native_session_id = $2, work_dir_ref = $3, updated_at = now()
          WHERE id = $4 AND runtime_id = $5
            AND (status = 'running' OR ($1 = 'interrupted' AND status = 'waiting_tool'))
            AND session_ownership_generation = $6
          RETURNING id",
     )
     .bind(status)
-    .bind(req.payload.session_id)
+    .bind(req.payload.native_session_id)
     .bind(req.payload.work_dir_ref)
     .bind(run_id)
     .bind(runtime_id)
@@ -13399,12 +12835,12 @@ async fn insert_run_event_for_active_runtime(
         "runtime does not own the Session generation for this active run",
     ))?;
     if event_type == "turn_started" {
-        let native_thread_id = payload
-            .get("native_thread_id")
+        let native_session_id = payload
+            .get("native_session_id")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty() && value.len() <= 512)
-            .ok_or(ApiError::bad_request("valid native Thread id is required"))?;
+            .ok_or(ApiError::bad_request("valid native Session id is required"))?;
         let native_turn_id = payload
             .get("native_turn_id")
             .and_then(Value::as_str)
@@ -13437,13 +12873,13 @@ async fn insert_run_event_for_active_runtime(
         }
         let session = sqlx::query(
             "UPDATE hub_sessions
-             SET native_thread_id = $1, active_turn_id = $2,
+             SET native_session_id = $1, active_turn_id = $2,
                  lifecycle_status = 'online', updated_at = now()
              WHERE id = $3 AND runtime_owner_id = $4 AND ownership_generation = $5
-               AND (native_thread_id IS NULL OR native_thread_id = $1)
+               AND (native_session_id IS NULL OR native_session_id = $1)
                AND (active_turn_id IS NULL OR active_turn_id = $2)",
         )
-        .bind(native_thread_id)
+        .bind(native_session_id)
         .bind(hub_turn_id)
         .bind(session_id)
         .bind(runtime_id)
@@ -13452,7 +12888,7 @@ async fn insert_run_event_for_active_runtime(
         .await?;
         if session.rows_affected() != 1 {
             return Err(ApiError::conflict(
-                "native Thread or active Turn binding changed before acknowledgement",
+                "native Session or active Turn binding changed before acknowledgement",
             ));
         }
         sqlx::query(
@@ -14209,12 +13645,10 @@ fn validate_skill_payload(name: &str, content: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn validate_codex_subagent_definitions(
-    definitions: &[CodexSubagentDefinition],
-) -> Result<(), ApiError> {
+fn validate_subagent_definitions(definitions: &[SubagentDefinition]) -> Result<(), ApiError> {
     if definitions.len() > 32 {
         return Err(ApiError::bad_request(
-            "an Agent supports at most 32 Codex subagents",
+            "an Agent supports at most 32 Subagents",
         ));
     }
     let mut names = BTreeSet::new();
@@ -14227,16 +13661,14 @@ fn validate_codex_subagent_definitions(
             })
         {
             return Err(ApiError::bad_request(
-                "Codex subagent name must use 1 to 64 letters, digits, hyphens, or underscores",
+                "Subagent name must use 1 to 64 letters, digits, hyphens, or underscores",
             ));
         }
         if !names.insert(name.to_ascii_lowercase()) {
-            return Err(ApiError::bad_request("Codex subagent names must be unique"));
+            return Err(ApiError::bad_request("Subagent names must be unique"));
         }
         if name.eq_ignore_ascii_case("main") {
-            return Err(ApiError::bad_request(
-                "Codex subagent name 'main' is reserved",
-            ));
+            return Err(ApiError::bad_request("Subagent name 'main' is reserved"));
         }
         let description = definition.description.trim();
         if description.is_empty()
@@ -14244,20 +13676,20 @@ fn validate_codex_subagent_definitions(
             || description.chars().any(char::is_control)
         {
             return Err(ApiError::bad_request(
-                "Codex subagent description must be 1 to 512 characters",
+                "Subagent description must be 1 to 512 characters",
             ));
         }
         if definition.developer_instructions.trim().is_empty()
             || definition.developer_instructions.len() > 100_000
         {
             return Err(ApiError::bad_request(
-                "Codex subagent developer instructions are required and must not exceed 100000 bytes",
+                "Subagent developer instructions are required and must not exceed 100000 bytes",
             ));
         }
         if definition.enabled {
             if definition.disabled_reason.is_some() {
                 return Err(ApiError::bad_request(
-                    "enabled Codex subagents cannot have a disabled reason",
+                    "enabled Subagents cannot have a disabled reason",
                 ));
             }
         } else if definition.model_selection.is_some()
@@ -14267,7 +13699,7 @@ fn validate_codex_subagent_definitions(
             )
         {
             return Err(ApiError::bad_request(
-                "disabled Codex subagents must retain the deleted-model reason without an override",
+                "disabled Subagents must retain the deleted-model reason without an override",
             ));
         }
     }
@@ -14377,7 +13809,7 @@ async fn validate_agent_model_configuration_tx(
     owner_id: Uuid,
     model_selection: Option<&ModelSelectionDto>,
     model_settings: AgentModelSettings,
-    subagents: &mut [CodexSubagentDefinition],
+    subagents: &mut [SubagentDefinition],
 ) -> Result<AgentModelSettings, ApiError> {
     let parent_protocol = match model_selection {
         Some(selection) => {
@@ -14410,14 +13842,14 @@ async fn validate_agent_model_configuration_tx(
     Ok(model_settings)
 }
 
-async fn replace_codex_subagents_tx(
+async fn replace_subagents_tx(
     tx: &mut Transaction<'_, Postgres>,
     agent_id: Uuid,
-    definitions: &[CodexSubagentDefinition],
+    definitions: &[SubagentDefinition],
 ) -> Result<(), ApiError> {
     let existing = sqlx::query(
         "SELECT id, lower(btrim(name)) AS normalized_name
-         FROM codex_subagent_definitions
+         FROM subagent_definitions
          WHERE agent_id = $1 FOR UPDATE",
     )
     .bind(agent_id)
@@ -14431,7 +13863,7 @@ async fn replace_codex_subagents_tx(
         )
     })
     .collect::<BTreeMap<_, _>>();
-    sqlx::query("DELETE FROM codex_subagent_definitions WHERE agent_id = $1")
+    sqlx::query("DELETE FROM subagent_definitions WHERE agent_id = $1")
         .bind(agent_id)
         .execute(&mut **tx)
         .await?;
@@ -14441,7 +13873,7 @@ async fn replace_codex_subagents_tx(
             .copied()
             .unwrap_or_else(Uuid::new_v4);
         sqlx::query(
-            "INSERT INTO codex_subagent_definitions
+            "INSERT INTO subagent_definitions
                  (id, agent_id, name, description, developer_instructions,
                   model_connection_id, model_id, model_settings_override,
                   enabled, disabled_reason)
@@ -14476,10 +13908,10 @@ async fn replace_codex_subagents_tx(
     Ok(())
 }
 
-fn codex_subagent_from_row(row: sqlx::postgres::PgRow) -> CodexSubagentDefinition {
+fn subagent_from_row(row: sqlx::postgres::PgRow) -> SubagentDefinition {
     let connection_id: Option<Uuid> = row.get("model_connection_id");
     let model_id: Option<String> = row.get("model_id");
-    CodexSubagentDefinition {
+    SubagentDefinition {
         name: row.get("name"),
         description: row.get("description"),
         developer_instructions: row.get("developer_instructions"),
@@ -14496,47 +13928,47 @@ fn codex_subagent_from_row(row: sqlx::postgres::PgRow) -> CodexSubagentDefinitio
     }
 }
 
-async fn load_codex_subagents(
+async fn load_subagents(
     pool: &PgPool,
     agent_id: Uuid,
-) -> Result<Vec<CodexSubagentDefinition>, ApiError> {
+) -> Result<Vec<SubagentDefinition>, ApiError> {
     let rows = sqlx::query(
         "SELECT name, description, developer_instructions, model_connection_id,
                 model_id, model_settings_override, enabled, disabled_reason
-         FROM codex_subagent_definitions
+         FROM subagent_definitions
          WHERE agent_id = $1
          ORDER BY lower(name), id",
     )
     .bind(agent_id)
     .fetch_all(pool)
     .await?;
-    Ok(rows.into_iter().map(codex_subagent_from_row).collect())
+    Ok(rows.into_iter().map(subagent_from_row).collect())
 }
 
-async fn load_codex_subagents_tx(
+async fn load_subagents_tx(
     tx: &mut Transaction<'_, Postgres>,
     agent_id: Uuid,
-) -> Result<Vec<CodexSubagentDefinition>, ApiError> {
+) -> Result<Vec<SubagentDefinition>, ApiError> {
     let rows = sqlx::query(
         "SELECT name, description, developer_instructions, model_connection_id,
                 model_id, model_settings_override, enabled, disabled_reason
-         FROM codex_subagent_definitions
+         FROM subagent_definitions
          WHERE agent_id = $1
          ORDER BY lower(name), id",
     )
     .bind(agent_id)
     .fetch_all(&mut **tx)
     .await?;
-    Ok(rows.into_iter().map(codex_subagent_from_row).collect())
+    Ok(rows.into_iter().map(subagent_from_row).collect())
 }
 
 async fn hydrate_agent_configuration(pool: &PgPool, agent: &mut AgentDto) -> Result<(), ApiError> {
     agent.managed_skill_ids = load_managed_skill_ids(pool, agent.id).await?;
-    agent.codex_subagents = load_codex_subagents(pool, agent.id).await?;
+    agent.subagents = load_subagents(pool, agent.id).await?;
     Ok(())
 }
 
-fn normalized_codex_subagents(definitions: &[CodexSubagentDefinition]) -> Vec<String> {
+fn normalized_subagents(definitions: &[SubagentDefinition]) -> Vec<String> {
     let mut definitions = definitions
         .iter()
         .map(|definition| {
@@ -14566,8 +13998,7 @@ fn agent_execution_configuration_changed(
     existing.instructions != request.instructions.trim()
         || existing.model_selection != request.model_selection
         || existing.model_settings != request.model_settings
-        || normalized_codex_subagents(&existing.codex_subagents)
-            != normalized_codex_subagents(&request.codex_subagents)
+        || normalized_subagents(&existing.subagents) != normalized_subagents(&request.subagents)
         || existing.model_policy != request.model_policy
         || existing.sandbox_policy != request.sandbox_policy
         || normalized_unordered_entries(&existing.mcp_allowlist)
@@ -14673,7 +14104,7 @@ fn apply_agent_access(mut agent: AgentDto, user: &UserDto) -> AgentDto {
         agent.runtime_id = None;
         agent.model_selection = None;
         agent.model_settings = AgentModelSettings::default();
-        agent.codex_subagents.clear();
+        agent.subagents.clear();
         agent.model_policy = json!({});
         agent.sandbox_policy = json!({});
         agent.managed_skill_ids.clear();
@@ -14780,7 +14211,7 @@ fn build_agent_execution_configuration(
         instructions: agent.instructions.clone(),
         model_selection: agent.model_selection.clone(),
         model_settings: agent.model_settings.clone(),
-        codex_subagents: agent.codex_subagents.clone(),
+        subagents: agent.subagents.clone(),
         model_bindings: Vec::new(),
         model_policy: agent.model_policy.clone(),
         sandbox_policy: agent.sandbox_policy.clone(),
@@ -14807,7 +14238,7 @@ async fn load_agent_execution_configuration_tx(
     .ok_or(ApiError::not_found("agent not found"))?;
     let revision: i64 = row.get("execution_config_revision");
     let mut agent = agent_from_row(row);
-    agent.codex_subagents = load_codex_subagents_tx(tx, agent.id).await?;
+    agent.subagents = load_subagents_tx(tx, agent.id).await?;
     let skill_rows = sqlx::query(
         "SELECT skills.id, skills.name, skills.description, skills.content,
                 skills.revision, skills.content_checksum_sha256
@@ -14826,7 +14257,7 @@ async fn load_agent_execution_configuration_tx(
     // for the online Session; the next claimed Run supplies fresh bindings.
     configuration.model_selection = None;
     configuration.model_settings = AgentModelSettings::default();
-    for subagent in &mut configuration.codex_subagents {
+    for subagent in &mut configuration.subagents {
         subagent.model_selection = None;
         subagent.model_settings_override = AgentModelSettingsOverride::default();
     }
@@ -14920,7 +14351,7 @@ async fn create_run_model_bindings_tx(
         )
         .await?,
     ];
-    for subagent in agent.codex_subagents.iter().filter(|subagent| {
+    for subagent in agent.subagents.iter().filter(|subagent| {
         subagent.enabled
             && (subagent.model_selection.is_some()
                 || subagent.model_settings_override != AgentModelSettingsOverride::default())
@@ -15410,13 +14841,13 @@ async fn load_claim_session_context_tx(
                  WHERE external_platforms.id = hub_sessions.origin_platform_id)
                     AS origin_platform_name,
                 origin_tenant_id, origin_external_identity_id, lifecycle_status,
-                native_thread_id, active_turn_id, history_checkpoint,
+                native_session_id, active_turn_id, history_checkpoint,
                 configuration_fingerprint, runtime_owner_id, ownership_generation,
                 recovery_error, current_bundle_generation,
                 current_bundle_object_key, current_bundle_checksum_sha256,
                 current_bundle_size_bytes, current_bundle_history_checkpoint,
                 current_bundle_ownership_generation,
-                current_bundle_producing_codex_version,
+                current_bundle_producing_engine_version,
                 current_bundle_created_at, created_at, updated_at
          FROM hub_sessions
          WHERE id = $1 AND agent_id = $2",
@@ -15472,13 +14903,13 @@ async fn load_hub_session_tx(
                  WHERE external_platforms.id = hub_sessions.origin_platform_id)
                     AS origin_platform_name,
                 origin_tenant_id, origin_external_identity_id, lifecycle_status,
-                native_thread_id, active_turn_id, history_checkpoint,
+                native_session_id, active_turn_id, history_checkpoint,
                 configuration_fingerprint, runtime_owner_id, ownership_generation,
                 recovery_error, current_bundle_generation,
                 current_bundle_object_key, current_bundle_checksum_sha256,
                 current_bundle_size_bytes, current_bundle_history_checkpoint,
                 current_bundle_ownership_generation,
-                current_bundle_producing_codex_version,
+                current_bundle_producing_engine_version,
                 current_bundle_created_at, created_at, updated_at
          FROM hub_sessions WHERE id = $1",
     )
@@ -15668,7 +15099,7 @@ async fn load_run_public_tx(
     let row = sqlx::query(
         "SELECT id, agent_id, automation_id, integration_session_id, parent_run_id,
                 runtime_id, hub_session_id, hub_message_id, hub_turn_id,
-                session_ownership_generation, status, initial_message, session_id,
+                session_ownership_generation, status, initial_message, native_session_id,
                 work_dir_ref, source, created_at, updated_at
          FROM runs WHERE id = $1",
     )
@@ -15861,7 +15292,7 @@ fn parse_tool_request_batch(
     if request.integration_session_id.is_nil() {
         return Err(ApiError::bad_request("integration session id is required"));
     }
-    if request.session_id.trim().is_empty() || request.work_dir_ref.trim().is_empty() {
+    if request.native_session_id.trim().is_empty() || request.work_dir_ref.trim().is_empty() {
         return Err(ApiError::bad_request(
             "tool request resume metadata is required",
         ));
@@ -16020,10 +15451,10 @@ async fn finalize_tool_request_batch_tx(
         }
     }
     let run_status: String = row.get("status");
-    let run_session_id: Option<String> = row.get("session_id");
+    let run_native_session_id: Option<String> = row.get("native_session_id");
     let run_work_dir_ref: Option<String> = row.get("work_dir_ref");
     if run_status == "waiting_tool" {
-        if run_session_id.as_deref() != Some(request.session_id.as_str())
+        if run_native_session_id.as_deref() != Some(request.native_session_id.as_str())
             || run_work_dir_ref.as_deref() != Some(request.work_dir_ref.as_str())
         {
             return Err(ApiError::conflict(
@@ -16037,10 +15468,10 @@ async fn finalize_tool_request_batch_tx(
 
     let updated = sqlx::query(
         "UPDATE runs
-         SET status = 'waiting_tool', session_id = $1, work_dir_ref = $2, updated_at = now()
+         SET status = 'waiting_tool', native_session_id = $1, work_dir_ref = $2, updated_at = now()
          WHERE id = $3 AND runtime_id = $4 AND status = 'running'",
     )
-    .bind(&request.session_id)
+    .bind(&request.native_session_id)
     .bind(&request.work_dir_ref)
     .bind(run_id)
     .bind(runtime_id)
@@ -16074,7 +15505,7 @@ async fn finalize_tool_request_batch_tx(
         record_integration_tool_request(tx, run_id, integration_session_id, request, expires_at)
             .await?;
     }
-    // Codex has completed the native Turn that produced the tool request. Close
+    // The execution engine completed the native Turn that produced the tool request. Close
     // the corresponding Hub Turn in the same transaction that makes the tool
     // request visible, so an immediately submitted result starts the next Turn.
     let turn_updated = sqlx::query(
@@ -16216,7 +15647,7 @@ async fn load_run_for_user(
         "SELECT r.id, r.agent_id, r.automation_id, r.integration_session_id,
                 r.parent_run_id, r.runtime_id, r.hub_session_id, r.hub_message_id,
                 r.hub_turn_id, r.session_ownership_generation, r.status,
-                r.initial_message, r.session_id, r.work_dir_ref, r.source,
+                r.initial_message, r.native_session_id, r.work_dir_ref, r.source,
                 r.created_at, r.updated_at
          FROM runs r
          JOIN agents a ON a.id = r.agent_id
@@ -16860,32 +16291,6 @@ fn session_bundle_store_from_env() -> anyhow::Result<Option<Arc<S3BundleStore>>>
     Ok(Some(Arc::new(store)))
 }
 
-fn codex_release_client_from_env() -> anyhow::Result<Arc<CodexReleaseClient>> {
-    let api_base = env::var("HUB_CODEX_GITHUB_API_BASE")
-        .unwrap_or_else(|_| "https://api.github.com/repos/openai/codex".into());
-    let artifact_root = env::var("HUB_CODEX_ARTIFACT_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/var/lib/agent-hub/codex-artifacts"));
-    let allow_http = match env::var("HUB_CODEX_GITHUB_ALLOW_HTTP") {
-        Ok(value) if value == "true" => true,
-        Ok(value) if value == "false" => false,
-        Err(env::VarError::NotPresent) => false,
-        Ok(_) => anyhow::bail!("HUB_CODEX_GITHUB_ALLOW_HTTP must be true or false"),
-        Err(error) => return Err(error.into()),
-    };
-    let http = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(300))
-        .read_timeout(Duration::from_secs(120))
-        .build()?;
-    Ok(Arc::new(CodexReleaseClient::new(
-        http,
-        api_base,
-        artifact_root,
-        allow_http,
-    )?))
-}
-
 fn parse_model_proxy_timeout(value: Option<&str>) -> anyhow::Result<Duration> {
     let Some(value) = value else {
         return Ok(DEFAULT_MODEL_PROXY_TIMEOUT);
@@ -17256,7 +16661,7 @@ fn agent_from_row(row: sqlx::postgres::PgRow) -> AgentDto {
             .ok()
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default(),
-        codex_subagents: Vec::new(),
+        subagents: Vec::new(),
         model_policy: row.get("model_policy"),
         sandbox_policy: row.get("sandbox_policy"),
         managed_skill_ids: row.try_get("managed_skill_ids").unwrap_or_default(),
@@ -17290,7 +16695,7 @@ fn runtime_from_row(row: sqlx::postgres::PgRow) -> RuntimeDto {
         id: row.get("id"),
         hostname: row.get("hostname"),
         labels: row.get("labels"),
-        codex_version: row.get("codex_version"),
+        engine_version: row.get("engine_version"),
         capabilities: console_runtime_capabilities(&capabilities),
         sandbox_mode: row.get("sandbox_mode"),
         status: row.get("status"),
@@ -17316,7 +16721,7 @@ fn console_runtime_capabilities(capabilities: &Value) -> Value {
         return json!({});
     };
     let mut visible = serde_json::Map::new();
-    for key in ["driver", "codex_source", "sandbox_downgrade_reason"] {
+    for key in ["driver", "engine_source", "sandbox_downgrade_reason"] {
         if let Some(value @ Value::String(_)) = source.get(key) {
             visible.insert(key.into(), value.clone());
         }
@@ -17324,7 +16729,7 @@ fn console_runtime_capabilities(capabilities: &Value) -> Value {
     for key in [
         "model_proxy",
         "mcp_allowlist",
-        "thread_resume",
+        "native_session_resume",
         "local_skills",
         "sandbox_downgraded",
     ] {
@@ -17428,7 +16833,7 @@ fn run_from_row(row: sqlx::postgres::PgRow) -> RunDto {
         session_ownership_generation: row.get("session_ownership_generation"),
         status: row.get("status"),
         initial_message: row.get("initial_message"),
-        session_id: row.get("session_id"),
+        native_session_id: row.get("native_session_id"),
         work_dir_ref: row.get("work_dir_ref"),
         source: row.get("source"),
         created_at: row.get("created_at"),
@@ -17474,7 +16879,7 @@ fn hub_session_from_row(row: sqlx::postgres::PgRow) -> HubSessionDto {
             size_bytes: row.get("current_bundle_size_bytes"),
             history_checkpoint: row.get("current_bundle_history_checkpoint"),
             ownership_generation: row.get("current_bundle_ownership_generation"),
-            producing_codex_version: row.get("current_bundle_producing_codex_version"),
+            producing_engine_version: row.get("current_bundle_producing_engine_version"),
             created_at: row.get("current_bundle_created_at"),
         });
     HubSessionDto {
@@ -17486,7 +16891,7 @@ fn hub_session_from_row(row: sqlx::postgres::PgRow) -> HubSessionDto {
         origin_platform_name: row.get("origin_platform_name"),
         origin,
         lifecycle_status: row.get("lifecycle_status"),
-        native_thread_id: row.get("native_thread_id"),
+        native_session_id: row.get("native_session_id"),
         active_turn_id: row.get("active_turn_id"),
         history_checkpoint: row.get("history_checkpoint"),
         configuration_fingerprint: row.get("configuration_fingerprint"),
@@ -17984,9 +17389,6 @@ mod tests {
             "/api/admin/users/{user_id}/erase",
             "/api/admin/runtime-enrollment-tokens",
             "/api/admin/runtime-enrollment-tokens/{enrollment_id}/revoke",
-            "/api/admin/codex-version-rollout",
-            "/api/admin/codex-version-rollout/target",
-            "/api/admin/codex-version-rollout/promote",
             "/api/admin/runtimes/{runtime_id}/credential-rotation",
             "/api/admin/runtimes/{runtime_id}/drain",
             "/api/admin/runtimes/{runtime_id}/cancel-drain",
@@ -17996,7 +17398,6 @@ mod tests {
             "/api/runtime/register",
             "/api/runtime/heartbeat",
             "/api/runtime/model-proxy/v1/responses",
-            "/api/runtime/codex/artifacts/{version}/{os}/{architecture}",
             "/api/runtime/runs/claim",
             "/api/runtime/runs/{run_id}/turn/begin",
             "/api/runtime/sessions/{session_id}/commands/{command_id}/complete",
@@ -18194,7 +17595,7 @@ mod tests {
         assert_eq!(
             document["components"]["schemas"]["RuntimeOwnedSessionStateRequest"]["properties"]
                 ["checkpoint_reason"]["enum"],
-            json!(["idle", "version_switch", "drain", null])
+            json!(["idle", "drain", null])
         );
         assert_eq!(
             document["components"]["schemas"]["RuntimeHeartbeatResponse"]["required"],
@@ -18204,29 +17605,8 @@ mod tests {
                 "credential_activated",
                 "runtime_status",
                 "owned_sessions",
-                "session_commands",
-                "codex_rollout"
+                "session_commands"
             ])
-        );
-        assert_eq!(
-            document["paths"]["/api/admin/codex-version-rollout/target"]["put"]["requestBody"]
-                ["content"]["application/json"]["schema"]["$ref"],
-            "#/components/schemas/SetCodexTargetVersionRequest"
-        );
-        assert_eq!(
-            document["paths"]["/api/runtime/codex/artifacts/{version}/{os}/{architecture}"]["get"]
-                ["security"],
-            json!([{ "runtimeBearer": [] }])
-        );
-        assert_eq!(
-            document["components"]["schemas"]["RuntimeHeartbeatRequest"]["properties"]
-                ["codex_status"]["anyOf"][0]["$ref"],
-            "#/components/schemas/RuntimeCodexStatus"
-        );
-        assert_eq!(
-            document["components"]["schemas"]["RuntimeHeartbeatResponse"]["properties"]
-                ["codex_rollout"]["$ref"],
-            "#/components/schemas/RuntimeCodexRolloutCommand"
         );
         assert_eq!(
             document["components"]["schemas"]["RuntimeSessionCommand"]["required"],
@@ -18237,7 +17617,7 @@ mod tests {
                 "command",
                 "run_id",
                 "turn_id",
-                "native_thread_id",
+                "native_session_id",
                 "native_turn_id",
                 "message",
                 "configuration_revision",
@@ -18300,6 +17680,29 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .contains(&json!("interrupted"))
+        );
+        assert!(document["components"]["schemas"]["Run"]["properties"]
+            .get("native_session_id")
+            .is_some());
+        assert!(document["components"]["schemas"]["Run"]["properties"]
+            .get("session_id")
+            .is_none());
+        assert_eq!(
+            document["components"]["schemas"]["CompleteRunRequest"]["required"],
+            json!(["status", "native_session_id", "work_dir_ref"])
+        );
+        assert_eq!(
+            document["components"]["schemas"]["FinalizeToolRequestsRequest"]["required"],
+            json!([
+                "integration_session_id",
+                "native_session_id",
+                "work_dir_ref",
+                "tool_requests"
+            ])
+        );
+        assert_eq!(
+            document["components"]["schemas"]["WaitingToolRunTransition"]["required"],
+            json!(["native_session_id", "work_dir_ref"])
         );
         assert_eq!(
             document["paths"]["/api/runtime/sessions/{session_id}/commands/{command_id}/complete"]
@@ -18509,7 +17912,7 @@ mod tests {
         for property in [
             "model_selection",
             "model_settings",
-            "codex_subagents",
+            "subagents",
             "model_bindings",
         ] {
             assert!(
@@ -18648,7 +18051,7 @@ mod tests {
             session_ownership_generation: None,
             status: "pending".into(),
             initial_message: "go".into(),
-            session_id: None,
+            native_session_id: None,
             work_dir_ref: None,
             source: "integration:message".into(),
             created_at: now,
@@ -19384,7 +18787,7 @@ mod tests {
                 public_to: Vec::new(),
                 model_selection: None,
                 model_settings: Some(AgentModelSettings::default()),
-                codex_subagents: Vec::new(),
+                subagents: Vec::new(),
             }),
         )
         .await
@@ -19398,7 +18801,7 @@ mod tests {
             runtime_id: None,
             model_selection: agent.model_selection.clone(),
             model_settings: agent.model_settings.clone(),
-            codex_subagents: agent.codex_subagents.clone(),
+            subagents: agent.subagents.clone(),
             model_policy: agent.model_policy.clone(),
             sandbox_policy: agent.sandbox_policy.clone(),
             managed_skill_ids: Vec::new(),
@@ -19570,20 +18973,20 @@ mod tests {
         .await
         .unwrap();
 
-        sqlx::query("UPDATE hub_sessions SET native_thread_id = 'thread-native' WHERE id = $1")
+        sqlx::query("UPDATE hub_sessions SET native_session_id = 'thread-native' WHERE id = $1")
             .bind(native_session_id)
             .execute(&pool)
             .await
             .unwrap();
         assert!(sqlx::query(
-            "UPDATE hub_sessions SET native_thread_id = 'thread-other' WHERE id = $1"
+            "UPDATE hub_sessions SET native_session_id = 'thread-other' WHERE id = $1"
         )
         .bind(native_session_id)
         .execute(&pool)
         .await
         .is_err());
         assert!(
-            sqlx::query("UPDATE hub_sessions SET native_thread_id = NULL WHERE id = $1")
+            sqlx::query("UPDATE hub_sessions SET native_session_id = NULL WHERE id = $1")
                 .bind(native_session_id)
                 .execute(&pool)
                 .await
@@ -19672,7 +19075,7 @@ mod tests {
                  current_bundle_size_bytes = 4096,
                  current_bundle_history_checkpoint = 0,
                  current_bundle_ownership_generation = 0,
-                 current_bundle_producing_codex_version = '0.42.0',
+                 current_bundle_producing_engine_version = '0.42.0',
                  current_bundle_created_at = now()
              WHERE id = $1",
         )
@@ -19686,7 +19089,7 @@ mod tests {
         for (id, hostname) in [(runtime_one, "runtime-one"), (runtime_two, "runtime-two")] {
             sqlx::query(
                 "INSERT INTO runtimes
-                     (id, token_hash, hostname, codex_version, sandbox_mode, status)
+                     (id, token_hash, hostname, engine_version, sandbox_mode, status)
                  VALUES ($1, $2, $3, '0.42.0', 'workspace-write', 'online')",
             )
             .bind(id)
@@ -22445,10 +21848,10 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_claim_resumes_session_thread_without_parent_run(pool: PgPool) {
+    async fn runtime_claim_resumes_native_session_without_parent_run(pool: PgPool) {
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
         sqlx::query(
-            "UPDATE hub_sessions SET native_thread_id = 'session-canonical-thread' WHERE id = $1",
+            "UPDATE hub_sessions SET native_session_id = 'session-canonical-thread' WHERE id = $1",
         )
         .bind(fixture.hub_session_id)
         .execute(&fixture.state.pool)
@@ -22460,20 +21863,20 @@ mod tests {
         assert_eq!(claim.run.parent_run_id, None);
         let resume = claim
             .resume
-            .expect("a Session with a native Thread must always resume it");
-        assert_eq!(resume.thread_id, "session-canonical-thread");
+            .expect("a Session with a native Session must always resume it");
+        assert_eq!(resume.native_session_id, "session-canonical-thread");
         assert_eq!(resume.work_dir_ref, None);
     }
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_claim_prefers_session_thread_over_conflicting_parent(pool: PgPool) {
+    async fn runtime_claim_prefers_native_session_over_conflicting_parent(pool: PgPool) {
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
         let parent_run_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO runs
                  (id, agent_id, owner_id, status, initial_message, source,
-                  session_id, work_dir_ref, hub_session_id, hub_turn_id,
+                  native_session_id, work_dir_ref, hub_session_id, hub_turn_id,
                   session_ownership_generation)
              SELECT $1, agent_id, owner_id, 'completed', 'parent', 'console',
                     'stale-parent-thread', 'parent-work-dir', hub_session_id,
@@ -22492,7 +21895,7 @@ mod tests {
             .await
             .unwrap();
         sqlx::query(
-            "UPDATE hub_sessions SET native_thread_id = 'session-canonical-thread' WHERE id = $1",
+            "UPDATE hub_sessions SET native_session_id = 'session-canonical-thread' WHERE id = $1",
         )
         .bind(fixture.hub_session_id)
         .execute(&fixture.state.pool)
@@ -22504,8 +21907,8 @@ mod tests {
         assert_eq!(claim.run.parent_run_id, Some(parent_run_id));
         let resume = claim
             .resume
-            .expect("the canonical Session Thread must override its parent Run");
-        assert_eq!(resume.thread_id, "session-canonical-thread");
+            .expect("the canonical native Session must override its parent Run");
+        assert_eq!(resume.native_session_id, "session-canonical-thread");
         assert_eq!(resume.work_dir_ref.as_deref(), Some("parent-work-dir"));
     }
 
@@ -22517,7 +21920,7 @@ mod tests {
         let second_runtime_token = format!("ahrt_{}", Uuid::new_v4().simple());
         sqlx::query(
             "INSERT INTO runtimes
-                 (id, token_hash, hostname, labels, codex_version, capabilities,
+                 (id, token_hash, hostname, labels, engine_version, capabilities,
                   sandbox_mode, status)
              VALUES ($1, $2, $3, '{}', 'test', '{\"model_proxy\":true}'::jsonb,
                      'workspace-write', 'online')",
@@ -22755,7 +22158,7 @@ mod tests {
         let foreign_runtime_token = format!("ahrt_{}", Uuid::new_v4().simple());
         sqlx::query(
             "INSERT INTO runtimes
-                 (id, token_hash, hostname, labels, codex_version, capabilities,
+                 (id, token_hash, hostname, labels, engine_version, capabilities,
                   sandbox_mode, status)
              VALUES ($1, $2, $3, '{}', 'test', '{\"model_proxy\":true}'::jsonb,
                      'workspace-write', 'online')",
@@ -22863,7 +22266,7 @@ mod tests {
                 1,
                 CompleteRunRequest {
                     status: "completed".into(),
-                    session_id: Some("stale-session".into()),
+                    native_session_id: Some("stale-session".into()),
                     work_dir_ref: Some("stale-workdir".into()),
                 },
             ),
@@ -22891,7 +22294,7 @@ mod tests {
         let fixture = integration_runtime_fixture(pool).await;
         sqlx::query(
             "UPDATE hub_sessions
-             SET native_thread_id = NULL, active_turn_id = NULL
+             SET native_session_id = NULL, active_turn_id = NULL
              WHERE id = $1",
         )
         .bind(fixture.hub_session_id)
@@ -22935,7 +22338,7 @@ mod tests {
                     role: None,
                     content: None,
                     payload: json!({
-                        "native_thread_id": "native-thread-bound",
+                        "native_session_id": "native-thread-bound",
                         "native_turn_id": "native-turn-bound"
                     }),
                     waiting_tool: None,
@@ -22946,7 +22349,7 @@ mod tests {
         .unwrap();
 
         let session: (Option<String>, Option<Uuid>) = sqlx::query_as(
-            "SELECT native_thread_id, active_turn_id FROM hub_sessions WHERE id = $1",
+            "SELECT native_session_id, active_turn_id FROM hub_sessions WHERE id = $1",
         )
         .bind(fixture.hub_session_id)
         .fetch_one(&fixture.state.pool)
@@ -22983,7 +22386,7 @@ mod tests {
         let fixture = integration_runtime_fixture(pool).await;
         sqlx::query(
             "UPDATE hub_sessions
-             SET native_thread_id = NULL, active_turn_id = NULL,
+             SET native_session_id = NULL, active_turn_id = NULL,
                  configuration_fingerprint = NULL
              WHERE id = $1",
         )
@@ -23119,7 +22522,7 @@ mod tests {
         let fixture = integration_runtime_fixture(pool).await;
         sqlx::query(
             "UPDATE hub_sessions
-             SET native_thread_id = NULL, active_turn_id = NULL
+             SET native_session_id = NULL, active_turn_id = NULL
              WHERE id = $1",
         )
         .bind(fixture.hub_session_id)
@@ -23214,7 +22617,7 @@ mod tests {
                     role: None,
                     content: None,
                     payload: json!({
-                        "native_thread_id": "linear-thread",
+                        "native_session_id": "linear-thread",
                         "native_turn_id": "linear-turn"
                     }),
                     waiting_tool: None,
@@ -23294,7 +22697,7 @@ mod tests {
     ) {
         let fixture = integration_runtime_fixture(pool).await;
         sqlx::query(
-            "UPDATE hub_sessions SET native_thread_id = 'fixture-native-thread' WHERE id = $1",
+            "UPDATE hub_sessions SET native_session_id = 'fixture-native-thread' WHERE id = $1",
         )
         .bind(fixture.hub_session_id)
         .execute(&fixture.state.pool)
@@ -23387,7 +22790,7 @@ mod tests {
             "UPDATE hub_sessions
              SET runtime_owner_id = $1, ownership_generation = 1,
                  lifecycle_status = 'online', active_turn_id = $2,
-                 native_thread_id = 'hub-stop-thread'
+                 native_session_id = 'hub-stop-thread'
              WHERE id = $3",
         )
         .bind(fixture.runtime_id)
@@ -23748,7 +23151,7 @@ mod tests {
             "UPDATE hub_sessions
              SET runtime_owner_id = $1, ownership_generation = 1,
                  lifecycle_status = 'online', active_turn_id = $2,
-                 native_thread_id = 'widget-stop-thread'
+                 native_session_id = 'widget-stop-thread'
              WHERE id = $3",
         )
         .bind(fixture.runtime_id)
@@ -23835,7 +23238,7 @@ mod tests {
                 1,
                 CompleteRunRequest {
                     status: "interrupted".into(),
-                    session_id: Some("widget-stop-thread".into()),
+                    native_session_id: Some("widget-stop-thread".into()),
                     work_dir_ref: Some("widget-retained-workspace".into()),
                 },
             ),
@@ -23871,7 +23274,7 @@ mod tests {
         pool: PgPool,
     ) {
         let fixture = integration_runtime_fixture(pool).await;
-        sqlx::query("UPDATE hub_sessions SET native_thread_id = 'interrupt-thread' WHERE id = $1")
+        sqlx::query("UPDATE hub_sessions SET native_session_id = 'interrupt-thread' WHERE id = $1")
             .bind(fixture.hub_session_id)
             .execute(&fixture.state.pool)
             .await
@@ -23929,7 +23332,7 @@ mod tests {
                     command: "interrupt".into(),
                     run_id: Some(fixture.run_id),
                     turn_id: Some(fixture.turn_id),
-                    native_thread_id: Some("interrupt-thread".into()),
+                    native_session_id: Some("interrupt-thread".into()),
                     native_turn_id: Some("fixture-native-turn".into()),
                     message: None,
                     configuration_revision: None,
@@ -23975,7 +23378,7 @@ mod tests {
             "UPDATE hub_sessions
              SET runtime_owner_id = $1, ownership_generation = 1,
                  lifecycle_status = 'online', active_turn_id = $2,
-                 native_thread_id = NULL
+                 native_session_id = NULL
              WHERE id = $3",
         )
         .bind(fixture.runtime_id)
@@ -24065,7 +23468,7 @@ mod tests {
                     role: None,
                     content: None,
                     payload: json!({
-                        "native_thread_id": "late-bound-thread",
+                        "native_session_id": "late-bound-thread",
                         "native_turn_id": "late-bound-turn"
                     }),
                     waiting_tool: None,
@@ -24089,7 +23492,7 @@ mod tests {
             .expect("native binding must make the pending stop deliverable");
         assert_eq!(interrupt.command_id, fixture.turn_id);
         assert_eq!(
-            interrupt.native_thread_id.as_deref(),
+            interrupt.native_session_id.as_deref(),
             Some("late-bound-thread")
         );
         assert_eq!(interrupt.native_turn_id.as_deref(), Some("late-bound-turn"));
@@ -24100,7 +23503,7 @@ mod tests {
     async fn runtime_interrupt_ack_is_generation_fenced_idempotent_and_stops_replay(pool: PgPool) {
         let fixture = integration_runtime_fixture(pool).await;
         sqlx::query(
-            "UPDATE hub_sessions SET native_thread_id = 'interrupt-ack-thread' WHERE id = $1",
+            "UPDATE hub_sessions SET native_session_id = 'interrupt-ack-thread' WHERE id = $1",
         )
         .bind(fixture.hub_session_id)
         .execute(&fixture.state.pool)
@@ -24188,7 +23591,7 @@ mod tests {
     async fn runtime_heartbeat_replays_delivering_steer_before_interrupt(pool: PgPool) {
         let fixture = integration_runtime_fixture(pool).await;
         sqlx::query(
-            "UPDATE hub_sessions SET native_thread_id = 'interrupt-race-thread' WHERE id = $1",
+            "UPDATE hub_sessions SET native_session_id = 'interrupt-race-thread' WHERE id = $1",
         )
         .bind(fixture.hub_session_id)
         .execute(&fixture.state.pool)
@@ -24266,11 +23669,13 @@ mod tests {
         pool: PgPool,
     ) {
         let fixture = integration_runtime_fixture(pool).await;
-        sqlx::query("UPDATE hub_sessions SET native_thread_id = 'completion-thread' WHERE id = $1")
-            .bind(fixture.hub_session_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE hub_sessions SET native_session_id = 'completion-thread' WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
         let delivering = create_integration_message(
             State(fixture.state.clone()),
             bearer_headers(&fixture.integration_token),
@@ -24343,7 +23748,7 @@ mod tests {
                 1,
                 CompleteRunRequest {
                     status: "interrupted".into(),
-                    session_id: Some("completion-thread".into()),
+                    native_session_id: Some("completion-thread".into()),
                     work_dir_ref: Some("retained-workspace".into()),
                 },
             ),
@@ -24475,11 +23880,13 @@ mod tests {
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn natural_completion_remains_authoritative_across_the_stop_race(pool: PgPool) {
         let stop_first = integration_runtime_fixture(pool.clone()).await;
-        sqlx::query("UPDATE hub_sessions SET native_thread_id = 'stop-first-thread' WHERE id = $1")
-            .bind(stop_first.hub_session_id)
-            .execute(&stop_first.state.pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE hub_sessions SET native_session_id = 'stop-first-thread' WHERE id = $1",
+        )
+        .bind(stop_first.hub_session_id)
+        .execute(&stop_first.state.pool)
+        .await
+        .unwrap();
         let _ = stop_integration_run(
             State(stop_first.state.clone()),
             bearer_headers(&stop_first.integration_token),
@@ -24495,7 +23902,7 @@ mod tests {
                 1,
                 CompleteRunRequest {
                     status: "completed".into(),
-                    session_id: Some("stop-first-thread".into()),
+                    native_session_id: Some("stop-first-thread".into()),
                     work_dir_ref: Some("naturally-completed-workspace".into()),
                 },
             ),
@@ -24524,7 +23931,7 @@ mod tests {
                 1,
                 CompleteRunRequest {
                     status: "completed".into(),
-                    session_id: Some("completion-first-thread".into()),
+                    native_session_id: Some("completion-first-thread".into()),
                     work_dir_ref: Some("completion-first-workspace".into()),
                 },
             ),
@@ -24577,7 +23984,6 @@ mod tests {
                 checkpoint_reason: None,
             }],
             cleaned_sessions: Vec::new(),
-            codex_status: None,
         };
 
         let first_delivery = runtime_heartbeat(
@@ -24905,7 +24311,7 @@ mod tests {
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn runtime_heartbeat_preserves_draining_and_fences_owned_state_ack(pool: PgPool) {
         let fixture = integration_runtime_fixture(pool).await;
-        sqlx::query("UPDATE hub_sessions SET native_thread_id = 'thread-current' WHERE id = $1")
+        sqlx::query("UPDATE hub_sessions SET native_session_id = 'thread-current' WHERE id = $1")
             .bind(fixture.hub_session_id)
             .execute(&fixture.state.pool)
             .await
@@ -24940,7 +24346,7 @@ mod tests {
                 session_id: fixture.hub_session_id,
                 ownership_generation: 1,
                 lifecycle_status: "online".into(),
-                native_thread_id: Some("thread-current".into()),
+                native_session_id: Some("thread-current".into()),
                 active_run_id: Some(fixture.run_id),
             }]
         );
@@ -24954,7 +24360,7 @@ mod tests {
                 command: "checkpoint".into(),
                 run_id: None,
                 turn_id: None,
-                native_thread_id: None,
+                native_session_id: None,
                 native_turn_id: None,
                 message: None,
                 configuration_revision: None,
@@ -24976,7 +24382,6 @@ mod tests {
                     checkpoint_reason: Some("drain".into()),
                 }],
                 cleaned_sessions: Vec::new(),
-                codex_status: None,
             }),
         )
         .await
@@ -25245,7 +24650,7 @@ mod tests {
         let other_runtime_token = format!("ahrt_{}", Uuid::new_v4().simple());
         sqlx::query(
             "INSERT INTO runtimes
-                 (id, token_hash, hostname, labels, codex_version, capabilities,
+                 (id, token_hash, hostname, labels, engine_version, capabilities,
                   sandbox_mode, status)
              VALUES ($1, $2, $3, '{}', 'test', '{}'::jsonb,
                      'workspace-write', 'online')",
@@ -25378,9 +24783,6 @@ mod tests {
             .await
             .unwrap();
         let _ = list_external_platforms(State(state.clone()), session_headers(&admin_token))
-            .await
-            .unwrap();
-        let _ = get_codex_version_rollout(State(state.clone()), session_headers(&admin_token))
             .await
             .unwrap();
         let _ = list_runtime_enrollment_tokens(State(state), session_headers(&admin_token))
@@ -25859,300 +25261,6 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn codex_version_rollout_is_super_admin_only_and_rejects_latest(pool: PgPool) {
-        let member_token = create_user_session_with_role(&pool, "member").await;
-        let super_token = create_super_admin_session(&pool).await;
-        let state = Arc::new(test_state_with_browser_session_auth(pool));
-
-        let error = get_codex_version_rollout(State(state.clone()), session_headers(&member_token))
-            .await
-            .unwrap_err();
-        assert_eq!(error.status, StatusCode::FORBIDDEN);
-
-        let error = set_codex_target_version(
-            State(state.clone()),
-            session_headers(&super_token),
-            Json(SetCodexTargetVersionRequest {
-                version: "latest".into(),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
-
-        let rollout = get_codex_version_rollout(State(state), session_headers(&super_token))
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(rollout.active_version, None);
-        assert_eq!(rollout.target_version, None);
-        assert_eq!(rollout.status, "idle");
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn codex_target_downloads_registered_platforms_and_promotes_only_after_readiness(
-        pool: PgPool,
-    ) {
-        #[derive(Clone)]
-        struct ReleaseState {
-            base_url: String,
-        }
-
-        async fn release(State(state): State<ReleaseState>) -> Json<Value> {
-            Json(json!({
-                "tag_name": "rust-v0.144.5",
-                "assets": [
-                    {
-                        "name": "codex-x86_64-unknown-linux-musl.zst",
-                        "browser_download_url": format!("{}/linux", state.base_url),
-                        "digest": "sha256:fca3e6eec7cb0570cd9b04820c19686869610c46a8a37223c9ebae865c8a2e93",
-                        "size": 14
-                    },
-                    {
-                        "name": "codex-aarch64-apple-darwin.zst",
-                        "browser_download_url": format!("{}/macos", state.base_url),
-                        "digest": "sha256:9530d5499d9f9d60d6562a5f5db0399d6c9dfb840552ddce0821b5b723b3a3f0",
-                        "size": 14
-                    }
-                ]
-            }))
-        }
-
-        async fn linux_artifact() -> Bytes {
-            Bytes::from_static(b"linux-artifact")
-        }
-
-        async fn macos_artifact() -> Bytes {
-            Bytes::from_static(b"macos-artifact")
-        }
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let release_app = Router::new()
-            .route("/releases/tags/rust-v0.144.5", get(release))
-            .route("/linux", get(linux_artifact))
-            .route("/macos", get(macos_artifact))
-            .with_state(ReleaseState {
-                base_url: base_url.clone(),
-            });
-        let release_server = tokio::spawn(async move {
-            axum::serve(listener, release_app).await.unwrap();
-        });
-
-        let linux_id = Uuid::new_v4();
-        let macos_id = Uuid::new_v4();
-        let linux_token = format!("runtime-linux-{}", Uuid::new_v4());
-        let macos_token = format!("runtime-macos-{}", Uuid::new_v4());
-        for (runtime_id, token, hostname, platform) in [
-            (
-                linux_id,
-                linux_token.as_str(),
-                "linux-runtime",
-                json!({"platform":{"os":"linux","architecture":"x86_64"}}),
-            ),
-            (
-                macos_id,
-                macos_token.as_str(),
-                "macos-runtime",
-                json!({"platform":{"os":"macos","architecture":"aarch64"}}),
-            ),
-        ] {
-            sqlx::query(
-                "INSERT INTO runtimes
-                     (id, token_hash, hostname, labels, codex_version, capabilities,
-                      sandbox_mode, status)
-                 VALUES ($1, $2, $3, '{}', '0.143.0', $4,
-                         'workspace-write', 'online')",
-            )
-            .bind(runtime_id)
-            .bind(sha256_hex(token))
-            .bind(hostname)
-            .bind(platform)
-            .execute(&pool)
-            .await
-            .unwrap();
-        }
-
-        let super_token = create_super_admin_session(&pool).await;
-        let artifact_root = tempfile::tempdir().unwrap();
-        let mut app_state = test_state_with_browser_session_auth(pool);
-        app_state.codex_release_client = Arc::new(
-            codex_rollout::CodexReleaseClient::new(
-                reqwest::Client::new(),
-                base_url,
-                artifact_root.path().to_path_buf(),
-                true,
-            )
-            .unwrap(),
-        );
-        let state = Arc::new(app_state);
-
-        let target = set_codex_target_version(
-            State(state.clone()),
-            session_headers(&super_token),
-            Json(SetCodexTargetVersionRequest {
-                version: "0.144.5".into(),
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(target.status, "distributing");
-        assert_eq!(target.artifacts.len(), 2);
-
-        let unauthenticated = download_runtime_codex_artifact(
-            State(state.clone()),
-            HeaderMap::new(),
-            Path(("0.144.5".into(), "linux".into(), "x86_64".into())),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(unauthenticated.status, StatusCode::UNAUTHORIZED);
-        let cross_platform = download_runtime_codex_artifact(
-            State(state.clone()),
-            bearer_headers(&linux_token),
-            Path(("0.144.5".into(), "macos".into(), "aarch64".into())),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(cross_platform.status, StatusCode::FORBIDDEN);
-
-        for (token, os, architecture) in [
-            (linux_token.as_str(), "linux", "x86_64"),
-            (macos_token.as_str(), "macos", "aarch64"),
-        ] {
-            let heartbeat = runtime_heartbeat(
-                State(state.clone()),
-                bearer_headers(token),
-                Json(RuntimeHeartbeatRequest {
-                    codex_status: Some(RuntimeCodexStatusDto {
-                        current_version: "0.143.0".into(),
-                        candidate_version: Some("0.144.5".into()),
-                        candidate_status: Some("ready".into()),
-                        candidate_error: None,
-                    }),
-                    ..RuntimeHeartbeatRequest::default()
-                }),
-            )
-            .await
-            .unwrap()
-            .0;
-            let artifact = heartbeat.codex_rollout.target_artifact.unwrap();
-            assert_eq!(
-                (artifact.os.as_str(), artifact.architecture.as_str()),
-                (os, architecture)
-            );
-        }
-
-        let ready = get_codex_version_rollout(State(state.clone()), session_headers(&super_token))
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(ready.status, "ready");
-        assert!(ready
-            .runtimes
-            .iter()
-            .all(|runtime| runtime.status == "ready"));
-
-        let promoted =
-            promote_codex_target_version(State(state.clone()), session_headers(&super_token))
-                .await
-                .unwrap()
-                .0;
-        assert_eq!(promoted.active_version.as_deref(), Some("0.144.5"));
-        assert_eq!(promoted.target_version, None);
-        assert_eq!(promoted.status, "active");
-
-        let catch_up = runtime_heartbeat(
-            State(state.clone()),
-            bearer_headers(&linux_token),
-            Json(RuntimeHeartbeatRequest {
-                codex_status: Some(RuntimeCodexStatusDto {
-                    current_version: "0.143.0".into(),
-                    candidate_version: Some("0.144.5".into()),
-                    candidate_status: Some("ready".into()),
-                    candidate_error: None,
-                }),
-                ..RuntimeHeartbeatRequest::default()
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(
-            catch_up
-                .codex_rollout
-                .target_artifact
-                .as_ref()
-                .map(|artifact| artifact.version.as_str()),
-            Some("0.144.5")
-        );
-        let current = runtime_heartbeat(
-            State(state),
-            bearer_headers(&linux_token),
-            Json(RuntimeHeartbeatRequest {
-                codex_status: Some(RuntimeCodexStatusDto {
-                    current_version: "0.144.5".into(),
-                    candidate_version: None,
-                    candidate_status: None,
-                    candidate_error: None,
-                }),
-                ..RuntimeHeartbeatRequest::default()
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert!(current.codex_rollout.target_artifact.is_none());
-        release_server.abort();
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_claim_waits_until_runtime_reports_active_codex_version(pool: PgPool) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        sqlx::query(
-            "UPDATE codex_version_rollout
-             SET active_version = '0.144.5', status = 'active', updated_at = now()
-             WHERE singleton = true",
-        )
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-
-        let waiting = runtime_claim_run(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            runtime_claim_request(1, Vec::new()),
-        )
-        .await
-        .unwrap()
-        .into_response();
-        assert_eq!(waiting.status(), StatusCode::NO_CONTENT);
-        assert_eq!(
-            runtime_claim_run_state(&fixture.state.pool, fixture.run_id).await,
-            ("pending".into(), None, None)
-        );
-
-        sqlx::query("UPDATE runtimes SET codex_version = '0.144.5' WHERE id = $1")
-            .bind(fixture.runtime_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
-        let claimed = runtime_claim_run(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            runtime_claim_request(1, Vec::new()),
-        )
-        .await
-        .unwrap()
-        .into_response();
-        assert_eq!(claimed.status(), StatusCode::OK);
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn user_erasure_retries_storage_then_purges_owned_graph_and_minimizes_audit(
         pool: PgPool,
     ) {
@@ -26182,7 +25290,7 @@ mod tests {
                 .fetch_one(&fixture.state.pool)
                 .await
                 .unwrap();
-        sqlx::query("UPDATE hub_sessions SET native_thread_id = 'erasure-thread' WHERE id = $1")
+        sqlx::query("UPDATE hub_sessions SET native_session_id = 'erasure-thread' WHERE id = $1")
             .bind(fixture.hub_session_id)
             .execute(&fixture.state.pool)
             .await
@@ -26230,7 +25338,7 @@ mod tests {
                  current_bundle_checksum_sha256 = $3, current_bundle_size_bytes = 12,
                  current_bundle_history_checkpoint = history_checkpoint,
                  current_bundle_ownership_generation = ownership_generation,
-                 current_bundle_producing_codex_version = '0.104.0',
+                 current_bundle_producing_engine_version = '0.104.0',
                  current_bundle_created_at = now(), current_bundle_runtime_id = $4,
                  current_bundle_checkpoint_attempt_id = $5
              WHERE id = $1",
@@ -26459,7 +25567,7 @@ mod tests {
                 1,
                 CompleteRunRequest {
                     status: "completed".into(),
-                    session_id: Some("bundle-upload-thread".into()),
+                    native_session_id: Some("bundle-upload-thread".into()),
                     work_dir_ref: Some("bundle-upload-workdir".into()),
                 },
             ),
@@ -26576,7 +25684,7 @@ mod tests {
         let other_runtime_token = format!("ahrt_{}", Uuid::new_v4().simple());
         sqlx::query(
             "INSERT INTO runtimes
-             (id, token_hash, hostname, labels, codex_version, capabilities, sandbox_mode, status)
+             (id, token_hash, hostname, labels, engine_version, capabilities, sandbox_mode, status)
              VALUES ($1, $2, $3, '{}', 'test', '{}'::jsonb, 'workspace-write',
                      'online')",
         )
@@ -26635,7 +25743,7 @@ mod tests {
                  current_bundle_object_key = $2, current_bundle_checksum_sha256 = $3,
                  current_bundle_size_bytes = $4, current_bundle_history_checkpoint = 3,
                  current_bundle_ownership_generation = 1,
-                 current_bundle_producing_codex_version = '0.104.0',
+                 current_bundle_producing_engine_version = '0.104.0',
                  current_bundle_created_at = $5,
                  current_bundle_checkpoint_attempt_id = $6,
                  current_bundle_runtime_id = $7
@@ -26709,7 +25817,7 @@ mod tests {
         let other_runtime_token = format!("ahrt_{}", Uuid::new_v4().simple());
         sqlx::query(
             "INSERT INTO runtimes
-                 (id, token_hash, hostname, labels, codex_version, capabilities,
+                 (id, token_hash, hostname, labels, engine_version, capabilities,
                   sandbox_mode, status)
              VALUES ($1, $2, $3, '{}', 'test', '{}'::jsonb,
                      'workspace-write', 'online')",
@@ -26775,7 +25883,7 @@ mod tests {
                 1,
                 CompleteRunRequest {
                     status: "completed".into(),
-                    session_id: Some("retained-owner-thread".into()),
+                    native_session_id: Some("retained-owner-thread".into()),
                     work_dir_ref: Some("retained-owner-workdir".into()),
                 },
             ),
@@ -26939,7 +26047,7 @@ mod tests {
         let foreign_runtime_token = format!("ahrt_{}", Uuid::new_v4().simple());
         sqlx::query(
             "INSERT INTO runtimes
-                 (id, token_hash, hostname, labels, codex_version, capabilities,
+                 (id, token_hash, hostname, labels, engine_version, capabilities,
                   sandbox_mode, status)
              VALUES ($1, $2, $3, '{}', 'test', '{}'::jsonb,
                      'workspace-write', 'online')",
@@ -27093,7 +26201,7 @@ mod tests {
                 1,
                 CompleteRunRequest {
                     status: "completed".into(),
-                    session_id: Some("cleanup-order-thread".into()),
+                    native_session_id: Some("cleanup-order-thread".into()),
                     work_dir_ref: Some("cleanup-order-workdir".into()),
                 },
             ),
@@ -27108,7 +26216,7 @@ mod tests {
                  current_bundle_checksum_sha256 = $3, current_bundle_size_bytes = 10,
                  current_bundle_history_checkpoint = history_checkpoint,
                  current_bundle_ownership_generation = 1,
-                 current_bundle_producing_codex_version = '0.103.0',
+                 current_bundle_producing_engine_version = '0.103.0',
                  current_bundle_created_at = now(),
                  current_bundle_checkpoint_attempt_id = $4,
                  current_bundle_runtime_id = $5
@@ -27305,7 +26413,7 @@ mod tests {
                 1,
                 CompleteRunRequest {
                     status: "completed".into(),
-                    session_id: Some("bundle-failure-thread".into()),
+                    native_session_id: Some("bundle-failure-thread".into()),
                     work_dir_ref: Some("bundle-failure-workdir".into()),
                 },
             ),
@@ -27402,7 +26510,7 @@ mod tests {
                 1,
                 CompleteRunRequest {
                     status: "completed".into(),
-                    session_id: Some("frozen-bundle-thread".into()),
+                    native_session_id: Some("frozen-bundle-thread".into()),
                     work_dir_ref: Some("frozen-bundle-workdir".into()),
                 },
             ),
@@ -27462,7 +26570,7 @@ mod tests {
                 checksum_sha256: "frozen-checkpoint".into(),
                 size_bytes: 1024,
                 history_checkpoint: attempt.history_checkpoint,
-                producing_codex_version: "test".into(),
+                producing_engine_version: "test".into(),
                 created_at: Utc::now(),
             },
         )
@@ -27515,7 +26623,7 @@ mod tests {
                 1,
                 CompleteRunRequest {
                     status: "completed".into(),
-                    session_id: Some("attempt-fence-thread".into()),
+                    native_session_id: Some("attempt-fence-thread".into()),
                     work_dir_ref: Some("attempt-fence-workdir".into()),
                 },
             ),
@@ -27548,7 +26656,6 @@ mod tests {
                     checkpoint_reason: None,
                 }],
                 cleaned_sessions: Vec::new(),
-                codex_status: None,
             }),
         )
         .await
@@ -27584,7 +26691,7 @@ mod tests {
                 checksum_sha256: "prior-attempt".into(),
                 size_bytes: 1024,
                 history_checkpoint: prior_attempt.history_checkpoint,
-                producing_codex_version: "test".into(),
+                producing_engine_version: "test".into(),
                 created_at: Utc::now(),
             },
         )
@@ -27600,7 +26707,7 @@ mod tests {
             checksum_sha256: "current-attempt".into(),
             size_bytes: 2048,
             history_checkpoint: current_attempt.history_checkpoint,
-            producing_codex_version: "test".into(),
+            producing_engine_version: "test".into(),
             created_at,
         };
         let mut commit_tx = fixture.state.pool.begin().await.unwrap();
@@ -27643,7 +26750,7 @@ mod tests {
                 checksum_sha256: "changed-metadata".into(),
                 size_bytes: 4096,
                 history_checkpoint: current_attempt.history_checkpoint,
-                producing_codex_version: "test".into(),
+                producing_engine_version: "test".into(),
                 created_at: Utc::now(),
             },
         )
@@ -27668,7 +26775,7 @@ mod tests {
                 1,
                 CompleteRunRequest {
                     status: "completed".into(),
-                    session_id: Some("unreplayable-thread".into()),
+                    native_session_id: Some("unreplayable-thread".into()),
                     work_dir_ref: Some("unreplayable-workdir".into()),
                 },
             ),
@@ -27701,7 +26808,7 @@ mod tests {
                 checksum_sha256: "last-safe".into(),
                 size_bytes: 1024,
                 history_checkpoint: initial_attempt.history_checkpoint,
-                producing_codex_version: "test".into(),
+                producing_engine_version: "test".into(),
                 created_at: Utc::now(),
             },
         )
@@ -27723,7 +26830,6 @@ mod tests {
                     checkpoint_reason: None,
                 }],
                 cleaned_sessions: Vec::new(),
-                codex_status: None,
             }),
         )
         .await
@@ -27740,7 +26846,7 @@ mod tests {
         let delivered_sequence: i64 = sqlx::query_scalar(
             "INSERT INTO hub_session_messages
                  (id, session_id, role, message_kind, content, delivery_mode, delivery_state)
-             VALUES ($1, $2, 'user', 'message', 'already reached Codex',
+             VALUES ($1, $2, 'user', 'message', 'already reached the execution engine',
                      'record_only', 'delivered')
              RETURNING sequence",
         )
@@ -27769,7 +26875,7 @@ mod tests {
                 checksum_sha256: "stale-after-delivery".into(),
                 size_bytes: 2048,
                 history_checkpoint: stale_attempt.history_checkpoint,
-                producing_codex_version: "test".into(),
+                producing_engine_version: "test".into(),
                 created_at: Utc::now(),
             },
         )
@@ -27799,7 +26905,7 @@ mod tests {
                 1,
                 CompleteRunRequest {
                     status: "completed".into(),
-                    session_id: Some("stale-restore-thread".into()),
+                    native_session_id: Some("stale-restore-thread".into()),
                     work_dir_ref: Some("stale-restore-workdir".into()),
                 },
             ),
@@ -27831,7 +26937,7 @@ mod tests {
                 checksum_sha256: "stale-restore".into(),
                 size_bytes: 1024,
                 history_checkpoint: attempt.history_checkpoint,
-                producing_codex_version: "test".into(),
+                producing_engine_version: "test".into(),
                 created_at: Utc::now(),
             },
         )
@@ -27881,7 +26987,7 @@ mod tests {
         let replacement_token = format!("ahrt_{}", Uuid::new_v4().simple());
         sqlx::query(
             "INSERT INTO runtimes
-                 (id, token_hash, hostname, labels, codex_version, capabilities,
+                 (id, token_hash, hostname, labels, engine_version, capabilities,
                   sandbox_mode, status)
              VALUES ($1, $2, 'stale-restore-replacement', '{}', 'test',
                      '{\"model_proxy\":true}'::jsonb, 'workspace-write', 'online')",
@@ -27940,7 +27046,7 @@ mod tests {
                 1,
                 CompleteRunRequest {
                     status: "failed".into(),
-                    session_id: None,
+                    native_session_id: None,
                     work_dir_ref: None,
                 },
             ),
@@ -27996,7 +27102,7 @@ mod tests {
                 1,
                 CompleteRunRequest {
                     status: "completed".into(),
-                    session_id: Some("bundle-thread".into()),
+                    native_session_id: Some("bundle-thread".into()),
                     work_dir_ref: Some("bundle-workdir".into()),
                 },
             ),
@@ -28042,7 +27148,7 @@ mod tests {
                 checksum_sha256: "checkpoint-3".into(),
                 size_bytes: 1024,
                 history_checkpoint: 3,
-                producing_codex_version: "test".into(),
+                producing_engine_version: "test".into(),
                 created_at: Utc::now(),
             },
         )
@@ -28087,7 +27193,7 @@ mod tests {
                 checksum_sha256: "stale".into(),
                 size_bytes: 2048,
                 history_checkpoint: 3,
-                producing_codex_version: "test".into(),
+                producing_engine_version: "test".into(),
                 created_at: Utc::now(),
             },
         )
@@ -28127,7 +27233,7 @@ mod tests {
                 checksum_sha256: "stale-owner".into(),
                 size_bytes: 2048,
                 history_checkpoint: 4,
-                producing_codex_version: "test".into(),
+                producing_engine_version: "test".into(),
                 created_at: Utc::now(),
             },
         )
@@ -28202,7 +27308,7 @@ mod tests {
                 1,
                 CompleteRunRequest {
                     status: "completed".into(),
-                    session_id: Some("checkpoint-thread".into()),
+                    native_session_id: Some("checkpoint-thread".into()),
                     work_dir_ref: Some("checkpoint-workdir".into()),
                 },
             ),
@@ -28370,7 +27476,7 @@ mod tests {
                 1,
                 CompleteRunRequest {
                     status: "completed".into(),
-                    session_id: Some("checkpoint-race-thread".into()),
+                    native_session_id: Some("checkpoint-race-thread".into()),
                     work_dir_ref: Some("checkpoint-race-workdir".into()),
                 },
             ),
@@ -28476,7 +27582,7 @@ mod tests {
                 1,
                 CompleteRunRequest {
                     status: "completed".into(),
-                    session_id: Some("checkpoint-race-thread".into()),
+                    native_session_id: Some("checkpoint-race-thread".into()),
                     work_dir_ref: Some("checkpoint-race-workdir".into()),
                 },
             ),
@@ -28575,9 +27681,7 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn cancelled_drain_checkpoint_resumes_queued_work_but_version_switch_retries(
-        pool: PgPool,
-    ) {
+    async fn cancelled_drain_checkpoint_resumes_queued_work(pool: PgPool) {
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
         let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
         let _ = runtime_complete_run(
@@ -28588,7 +27692,7 @@ mod tests {
                 1,
                 CompleteRunRequest {
                     status: "completed".into(),
-                    session_id: Some("cancel-drain-thread".into()),
+                    native_session_id: Some("cancel-drain-thread".into()),
                     work_dir_ref: Some("cancel-drain-workdir".into()),
                 },
             ),
@@ -28670,52 +27774,6 @@ mod tests {
             .unwrap(),
             "online"
         );
-
-        let version_attempt = runtime_begin_session_checkpoint(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(fixture.hub_session_id),
-            Json(BeginRuntimeSessionCheckpointRequest {
-                ownership_generation: 1,
-                reason: "version_switch".into(),
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        let queued_after_version: i64 = sqlx::query_scalar(
-            "INSERT INTO hub_session_messages
-                 (id, session_id, role, message_kind, content, delivery_mode, delivery_state)
-             VALUES ($1, $2, 'user', 'message', 'wait for version switch',
-                     'next_turn', 'queued')
-             RETURNING sequence",
-        )
-        .bind(Uuid::new_v4())
-        .bind(fixture.hub_session_id)
-        .fetch_one(&fixture.state.pool)
-        .await
-        .unwrap();
-        sqlx::query("UPDATE hub_sessions SET history_checkpoint = $1 WHERE id = $2")
-            .bind(queued_after_version)
-            .bind(fixture.hub_session_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
-        let version_failure = runtime_fail_session_checkpoint(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(fixture.hub_session_id),
-            Json(FailRuntimeSessionCheckpointRequest {
-                ownership_generation: 1,
-                checkpoint_attempt_id: version_attempt.checkpoint_attempt_id,
-                error: "bundle_transport_unavailable".into(),
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(version_failure.disposition, "retry");
-        assert!(version_failure.has_queued_work);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -28736,7 +27794,6 @@ mod tests {
                     checkpoint_reason: None,
                 }],
                 cleaned_sessions: Vec::new(),
-                codex_status: None,
             }),
         )
         .await
@@ -28755,7 +27812,6 @@ mod tests {
                     checkpoint_reason: Some("idle".into()),
                 }],
                 cleaned_sessions: Vec::new(),
-                codex_status: None,
             }),
         )
         .await
@@ -28794,7 +27850,7 @@ mod tests {
                 1,
                 CompleteRunRequest {
                     status: "completed".into(),
-                    session_id: Some("heartbeat-saving-thread".into()),
+                    native_session_id: Some("heartbeat-saving-thread".into()),
                     work_dir_ref: Some("heartbeat-saving-workdir".into()),
                 },
             ),
@@ -28811,7 +27867,6 @@ mod tests {
                 checkpoint_reason: Some("idle".into()),
             }],
             cleaned_sessions: Vec::new(),
-            codex_status: None,
         };
 
         let _ = runtime_heartbeat(
@@ -28864,7 +27919,7 @@ mod tests {
                 1,
                 CompleteRunRequest {
                     status: "completed".into(),
-                    session_id: Some("drain-heartbeat-thread".into()),
+                    native_session_id: Some("drain-heartbeat-thread".into()),
                     work_dir_ref: Some("drain-heartbeat-workdir".into()),
                 },
             ),
@@ -28909,7 +27964,6 @@ mod tests {
                     checkpoint_reason: None,
                 }],
                 cleaned_sessions: Vec::new(),
-                codex_status: None,
             }),
         )
         .await
@@ -29104,7 +28158,7 @@ mod tests {
             Path(fixture.run_id),
             runtime_write(CompleteRunRequest {
                 status: "completed".into(),
-                session_id: Some("drained-thread".into()),
+                native_session_id: Some("drained-thread".into()),
                 work_dir_ref: Some("drained-workdir".into()),
             }),
         )
@@ -29169,7 +28223,7 @@ mod tests {
                 1,
                 CompleteRunRequest {
                     status: "completed".into(),
-                    session_id: Some("existing-drain-thread".into()),
+                    native_session_id: Some("existing-drain-thread".into()),
                     work_dir_ref: Some("existing-drain-workdir".into()),
                 },
             ),
@@ -29197,7 +28251,7 @@ mod tests {
                 1,
                 CompleteRunRequest {
                     status: "completed".into(),
-                    session_id: Some("existing-drain-thread".into()),
+                    native_session_id: Some("existing-drain-thread".into()),
                     work_dir_ref: Some("existing-drain-workdir".into()),
                 },
             ),
@@ -29278,7 +28332,7 @@ mod tests {
             Path(claim.run.id),
             runtime_write(CompleteRunRequest {
                 status: "completed".into(),
-                session_id: Some("delete-thread".into()),
+                native_session_id: Some("delete-thread".into()),
                 work_dir_ref: Some("delete-workdir".into()),
             }),
         )
@@ -29304,7 +28358,7 @@ mod tests {
                 checksum_sha256: "ordinary-delete".into(),
                 size_bytes: 1,
                 history_checkpoint: 3,
-                producing_codex_version: "test".into(),
+                producing_engine_version: "test".into(),
                 created_at: Utc::now(),
             },
         )
@@ -29404,7 +28458,7 @@ mod tests {
                  current_bundle_checksum_sha256 = $2, current_bundle_size_bytes = 1,
                  current_bundle_history_checkpoint = history_checkpoint,
                  current_bundle_ownership_generation = 1,
-                 current_bundle_producing_codex_version = 'test',
+                 current_bundle_producing_engine_version = 'test',
                  current_bundle_created_at = now(),
                  current_bundle_checkpoint_attempt_id = $3,
                  current_bundle_runtime_id = $1
@@ -29654,7 +28708,7 @@ mod tests {
                 checksum_sha256: "force-delete-current".into(),
                 size_bytes: 1,
                 history_checkpoint: 0,
-                producing_codex_version: "test".into(),
+                producing_engine_version: "test".into(),
                 created_at: Utc::now(),
             },
         )
@@ -29719,7 +28773,7 @@ mod tests {
                 checksum_sha256: "force-delete-stale".into(),
                 size_bytes: 1,
                 history_checkpoint: 0,
-                producing_codex_version: "test".into(),
+                producing_engine_version: "test".into(),
                 created_at: Utc::now(),
             },
         )
@@ -29811,7 +28865,7 @@ mod tests {
                 checksum_sha256: "force-delete-delivering".into(),
                 size_bytes: 1,
                 history_checkpoint: 0,
-                producing_codex_version: "test".into(),
+                producing_engine_version: "test".into(),
                 created_at: Utc::now(),
             },
         )
@@ -30171,7 +29225,7 @@ mod tests {
                 1,
                 CompleteRunRequest {
                     status: "completed".into(),
-                    session_id: Some("restore-loss-thread".into()),
+                    native_session_id: Some("restore-loss-thread".into()),
                     work_dir_ref: Some("restore-loss-workdir".into()),
                 },
             ),
@@ -30203,7 +29257,7 @@ mod tests {
                 checksum_sha256: "restore-loss".into(),
                 size_bytes: 1024,
                 history_checkpoint: attempt.history_checkpoint,
-                producing_codex_version: "test".into(),
+                producing_engine_version: "test".into(),
                 created_at: Utc::now(),
             },
         )
@@ -30328,7 +29382,7 @@ mod tests {
         let replacement_token = format!("ahrt_{}", Uuid::new_v4().simple());
         sqlx::query(
             "INSERT INTO runtimes
-                 (id, token_hash, hostname, labels, codex_version, capabilities,
+                 (id, token_hash, hostname, labels, engine_version, capabilities,
                   sandbox_mode, status)
              VALUES ($1, $2, 'restore-loss-replacement', '{}', 'test',
                      '{\"model_proxy\":true}'::jsonb, 'workspace-write', 'online')",
@@ -31664,14 +30718,14 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO runtimes
-             (id, token_hash, hostname, labels, codex_version, capabilities, sandbox_mode,
+             (id, token_hash, hostname, labels, engine_version, capabilities, sandbox_mode,
               status, last_heartbeat_at)
              VALUES ($1, 'unused', 'stale-console-runtime', '{}', 'test', $2,
                      'read-only', 'online', now() - interval '1 minute')",
         )
         .bind(runtime_id)
         .bind(json!({
-            "driver": "app-server",
+            "driver": "pi",
             "model_proxy": true,
             "sandbox_downgraded": true,
             "sandbox_downgrade_reason": "workspace is read-only",
@@ -31690,7 +30744,7 @@ mod tests {
 
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].status, "online");
-        assert_eq!(listed[0].capabilities["driver"], "app-server");
+        assert_eq!(listed[0].capabilities["driver"], "pi");
         assert_eq!(listed[0].capabilities["model_proxy"], true);
         assert!(listed[0].capabilities.get("unknown_secret").is_none());
         assert!(listed[0].capabilities.get("sandbox").is_none());
@@ -32357,9 +31411,12 @@ mod tests {
     }
 
     #[test]
-    fn runtime_capability_sql_requires_model_proxy_and_effective_sandbox() {
+    fn runtime_capability_sql_requires_model_proxy_mcp_subagents_and_effective_sandbox() {
         assert!(RUNTIME_CAPABILITY_SQL.contains(
             "a.model_policy->>'provider' IS DISTINCT FROM 'hub-proxy'\n             OR COALESCE((rt.capabilities->>'model_proxy')::boolean, false) = true"
+        ));
+        assert!(RUNTIME_CAPABILITY_SQL.contains(
+            "subagent.agent_id = a.id AND subagent.enabled = true\n             )\n             OR COALESCE((rt.capabilities->>'subagents')::boolean, false) = true"
         ));
         assert!(RUNTIME_CAPABILITY_SQL.contains(
             "a.sandbox_policy->>'mode' IS DISTINCT FROM 'workspace-write'\n             OR rt.sandbox_mode LIKE 'workspace-write%'"
@@ -32373,9 +31430,9 @@ mod tests {
     }
 
     #[test]
-    fn codex_subagent_main_binding_key_is_reserved_case_insensitively() {
+    fn subagent_main_binding_key_is_reserved_case_insensitively() {
         for name in ["main", "MAIN", " Main "] {
-            let error = validate_codex_subagent_definitions(&[CodexSubagentDefinition {
+            let error = validate_subagent_definitions(&[SubagentDefinition {
                 name: name.into(),
                 description: "Reviews output".into(),
                 developer_instructions: "Review carefully.".into(),
@@ -32392,11 +31449,11 @@ mod tests {
     #[test]
     fn console_runtime_capabilities_only_keep_known_non_sensitive_fields() {
         let capabilities = console_runtime_capabilities(&json!({
-            "driver": "app-server",
-            "codex_source": "bundled",
+            "driver": "pi",
+            "engine_source": "bundled",
             "model_proxy": true,
             "mcp_allowlist": true,
-            "thread_resume": true,
+            "native_session_resume": true,
             "local_skills": false,
             "sandbox_downgraded": true,
             "sandbox_downgrade_reason": "workspace is read-only",
@@ -32407,11 +31464,11 @@ mod tests {
         assert_eq!(
             capabilities,
             json!({
-                "driver": "app-server",
-                "codex_source": "bundled",
+                "driver": "pi",
+                "engine_source": "bundled",
                 "model_proxy": true,
                 "mcp_allowlist": true,
-                "thread_resume": true,
+                "native_session_resume": true,
                 "local_skills": false,
                 "sandbox_downgraded": true,
                 "sandbox_downgrade_reason": "workspace is read-only"
@@ -32424,10 +31481,10 @@ mod tests {
         let properties = schema["properties"].as_object().unwrap();
         for key in [
             "driver",
-            "codex_source",
+            "engine_source",
             "model_proxy",
             "mcp_allowlist",
-            "thread_resume",
+            "native_session_resume",
             "local_skills",
             "sandbox_downgraded",
             "sandbox_downgrade_reason",
@@ -32478,7 +31535,7 @@ mod tests {
     ) {
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
         sqlx::query(
-            "INSERT INTO codex_subagent_definitions
+            "INSERT INTO subagent_definitions
                  (id, agent_id, name, description, developer_instructions,
                   model_settings_override)
              VALUES ($1, $2, 'reviewer', 'Reviews output', 'Review carefully.',
@@ -33345,7 +32402,7 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO codex_subagent_definitions
+            "INSERT INTO subagent_definitions
                  (id, agent_id, name, description, developer_instructions,
                   model_connection_id, model_id, model_settings_override)
              VALUES ($1, $2, 'reviewer', 'Reviews changes', 'Review carefully.',
@@ -33864,7 +32921,7 @@ mod tests {
         };
         let batch = FinalizeToolRequestsRequest {
             integration_session_id: Uuid::new_v4(),
-            session_id: "thread".into(),
+            native_session_id: "thread".into(),
             work_dir_ref: "workdir".into(),
             tool_requests: vec![event.clone(), event],
         };
@@ -34285,7 +33342,7 @@ mod tests {
                 Path(run_id),
                 runtime_write(CompleteRunRequest {
                     status: "waiting_tool".into(),
-                    session_id: Some("integration-test-session".into()),
+                    native_session_id: Some("integration-test-session".into()),
                     work_dir_ref: Some("integration-test-workdir".into()),
                 }),
             )
@@ -34351,7 +33408,7 @@ mod tests {
             Path(fixture.run_id),
             runtime_write(CompleteRunRequest {
                 status: "waiting_tool".into(),
-                session_id: Some("different-session".into()),
+                native_session_id: Some("different-session".into()),
                 work_dir_ref: Some("integration-test-workdir".into()),
             }),
         )
@@ -34443,7 +33500,7 @@ mod tests {
     async fn tool_request_without_waiting_metadata_is_not_published(pool: PgPool) {
         let fixture = integration_runtime_fixture(pool).await;
         let mut batch = tool_request_batch(&fixture, [fixture.tool_request_id]);
-        batch.session_id.clear();
+        batch.native_session_id.clear();
 
         let result = runtime_finalize_tool_requests(
             State(fixture.state.clone()),
@@ -34515,7 +33572,7 @@ mod tests {
             .resume
             .as_ref()
             .expect("tool-result child must resume its parent session");
-        assert_eq!(first_resume.thread_id, "integration-test-session");
+        assert_eq!(first_resume.native_session_id, "integration-test-session");
         assert_eq!(
             first_resume.work_dir_ref.as_deref(),
             Some("integration-test-workdir")
@@ -34526,7 +33583,7 @@ mod tests {
             Path(first_claim.run.id),
             runtime_write(CompleteRunRequest {
                 status: "completed".into(),
-                session_id: Some("first-child-session".into()),
+                native_session_id: Some("first-child-session".into()),
                 work_dir_ref: Some("first-child-workdir".into()),
             }),
         )
@@ -34568,7 +33625,7 @@ mod tests {
             Path(second_claim.run.id),
             runtime_write(CompleteRunRequest {
                 status: "completed".into(),
-                session_id: Some("second-child-session".into()),
+                native_session_id: Some("second-child-session".into()),
                 work_dir_ref: Some("second-child-workdir".into()),
             }),
         )
@@ -35096,11 +34153,13 @@ mod tests {
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn deleting_agent_revokes_delegation_but_keeps_app_and_completed_history(pool: PgPool) {
         let fixture = integration_runtime_fixture(pool).await;
-        sqlx::query("UPDATE hub_sessions SET native_thread_id = 'historical-thread' WHERE id = $1")
-            .bind(fixture.hub_session_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE hub_sessions SET native_session_id = 'historical-thread' WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
         let agent_owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM agents WHERE id = $1")
             .bind(fixture.agent_id)
             .fetch_one(&fixture.state.pool)
@@ -35361,7 +34420,7 @@ mod tests {
         );
         assert_eq!(
             sqlx::query_scalar::<_, String>(
-                "SELECT native_thread_id FROM hub_sessions WHERE id = $1"
+                "SELECT native_session_id FROM hub_sessions WHERE id = $1"
             )
             .bind(fixture.hub_session_id)
             .fetch_one(&fixture.state.pool)
@@ -35588,7 +34647,7 @@ mod tests {
                   current_bundle_checksum_sha256, current_bundle_size_bytes,
                   current_bundle_history_checkpoint,
                   current_bundle_ownership_generation,
-                  current_bundle_producing_codex_version,
+                  current_bundle_producing_engine_version,
                   current_bundle_created_at,
                   current_bundle_checkpoint_attempt_id)
              VALUES ($1, $2, $3, 'hub_native', 'offline', 1, $4,
@@ -35746,7 +34805,6 @@ mod tests {
                     checkpoint_reason: None,
                 }],
                 cleaned_sessions: Vec::new(),
-                codex_status: None,
             }),
         )
         .await
@@ -35947,7 +35005,7 @@ mod tests {
             Path(Uuid::new_v4()),
             runtime_write(CompleteRunRequest {
                 status: "cancelled".into(),
-                session_id: None,
+                native_session_id: None,
                 work_dir_ref: None,
             }),
         )
@@ -35969,7 +35027,7 @@ mod tests {
             Path(fixture.run_id),
             runtime_write(CompleteRunRequest {
                 status: "waiting_tool".into(),
-                session_id: Some("bypass-session".into()),
+                native_session_id: Some("bypass-session".into()),
                 work_dir_ref: Some("bypass-workdir".into()),
             }),
         )
@@ -35998,7 +35056,7 @@ mod tests {
         sqlx::query(
             "UPDATE runs
              SET status = 'running', runtime_id = $1, model_proxy_token_hash = 'original-token',
-                 session_id = 'original-session', work_dir_ref = 'original-workdir'
+                 native_session_id = 'original-session', work_dir_ref = 'original-workdir'
              WHERE id = $2",
         )
         .bind(fixture.runtime_id)
@@ -36015,7 +35073,7 @@ mod tests {
             Path(fixture.run_id),
             runtime_write(CompleteRunRequest {
                 status: "completed".into(),
-                session_id: Some("new-session".into()),
+                native_session_id: Some("new-session".into()),
                 work_dir_ref: Some("new-workdir".into()),
             }),
         )
@@ -36863,7 +35921,7 @@ mod tests {
         let request = RuntimeRegisterRequest {
             hostname: "shared-hostname".into(),
             labels: vec!["test".into()],
-            codex_version: "test".into(),
+            engine_version: "test".into(),
             capabilities: json!({}),
             sandbox_mode: "workspace-write".into(),
         };
@@ -37035,7 +36093,7 @@ mod tests {
         let request = RuntimeRegisterRequest {
             hostname: "revoked-enrollment".into(),
             labels: Vec::new(),
-            codex_version: "test".into(),
+            engine_version: "test".into(),
             capabilities: json!({}),
             sandbox_mode: "workspace-write".into(),
         };
@@ -37097,7 +36155,7 @@ mod tests {
         let request = RuntimeRegisterRequest {
             hostname: "fresh-compose-runtime".into(),
             labels: vec!["development".into()],
-            codex_version: "test".into(),
+            engine_version: "test".into(),
             capabilities: json!({}),
             sandbox_mode: "workspace-write".into(),
         };
@@ -37162,7 +36220,7 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO runtimes
-                 (id, token_hash, hostname, labels, codex_version, capabilities,
+                 (id, token_hash, hostname, labels, engine_version, capabilities,
                   sandbox_mode, status)
              VALUES ($1, $2, 'offline-runtime', '{}', 'test', '{}'::jsonb,
                      'workspace-write', 'offline')",
@@ -37211,7 +36269,7 @@ mod tests {
         );
         sqlx::query(
             "INSERT INTO runtimes
-                 (id, token_hash, hostname, labels, codex_version, capabilities,
+                 (id, token_hash, hostname, labels, engine_version, capabilities,
                   sandbox_mode, status, rotation_requested_at)
              VALUES ($1, $2, 'rotation-test', '{}', 'test', '{}'::jsonb,
                      'workspace-write', 'offline', now())",
@@ -37308,7 +36366,7 @@ mod tests {
         );
         sqlx::query(
             "INSERT INTO runtimes
-                 (id, token_hash, hostname, labels, codex_version, capabilities,
+                 (id, token_hash, hostname, labels, engine_version, capabilities,
                   sandbox_mode, status, credential_revoked_at)
              VALUES ($1, $2, 'revoked-runtime', '{}', 'test', '{}'::jsonb,
                      'workspace-write', 'online', now())",
@@ -37388,7 +36446,7 @@ mod tests {
             runtime_id: None,
             model_selection: None,
             model_settings: AgentModelSettings::default(),
-            codex_subagents: Vec::new(),
+            subagents: Vec::new(),
             model_policy: json!({}),
             sandbox_policy: json!({}),
             managed_skill_ids: Vec::new(),
@@ -37421,7 +36479,7 @@ mod tests {
             runtime_id: None,
             model_selection: None,
             model_settings: AgentModelSettings::default(),
-            codex_subagents: Vec::new(),
+            subagents: Vec::new(),
             model_policy: json!({ "provider": "hub-proxy" }),
             sandbox_policy: json!({ "mode": "workspace-write", "network_access": true }),
             managed_skill_ids: Vec::new(),
@@ -37606,8 +36664,9 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO runtimes
-             (id, token_hash, hostname, labels, codex_version, capabilities, sandbox_mode, status)
-             VALUES ($1, $2, $3, '{}', 'test', '{\"model_proxy\":true}'::jsonb, $4,
+             (id, token_hash, hostname, labels, engine_version, capabilities, sandbox_mode, status)
+             VALUES ($1, $2, $3, '{}', 'test',
+                     '{\"model_proxy\":true,\"subagents\":true}'::jsonb, $4,
                      'online')",
         )
         .bind(runtime_id)
@@ -37898,7 +36957,7 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO runtimes
-             (id, token_hash, hostname, labels, codex_version, capabilities, sandbox_mode, status)
+             (id, token_hash, hostname, labels, engine_version, capabilities, sandbox_mode, status)
              VALUES ($1, $2, $3, '{}', 'test', '{\"model_proxy\":true}'::jsonb,
                      'workspace-write', 'online'),
                     ($4, $5, $6, '{}', 'test', '{\"model_proxy\":true}'::jsonb,
@@ -38191,7 +37250,7 @@ mod tests {
                     reasoning_effort: ReasoningEffort::High,
                     ..AgentModelSettings::default()
                 }),
-                codex_subagents: vec![CodexSubagentDefinition {
+                subagents: vec![SubagentDefinition {
                     name: "researcher".into(),
                     description: "Researches primary sources".into(),
                     developer_instructions: "# Research\n\nCite sources.".into(),
@@ -38213,7 +37272,7 @@ mod tests {
             created.model_settings.reasoning_effort,
             ReasoningEffort::High
         );
-        assert_eq!(created.codex_subagents.len(), 1);
+        assert_eq!(created.subagents.len(), 1);
 
         let options = get_agent_model_connection_options(
             State(state.clone()),
@@ -38239,8 +37298,7 @@ mod tests {
         let mut owner_scoped = update_request_from_agent(&created);
         owner_scoped.model_selection = Some(test_model_selection(&owner_personal));
         owner_scoped.model_settings.reasoning_effort = ReasoningEffort::Ultra;
-        owner_scoped.codex_subagents[0].model_selection =
-            Some(test_model_selection(&owner_personal));
+        owner_scoped.subagents[0].model_selection = Some(test_model_selection(&owner_personal));
         let updated = update_agent(
             State(state.clone()),
             session_headers(&admin_token),
@@ -38259,7 +37317,7 @@ mod tests {
             ReasoningEffort::Ultra
         );
         assert_eq!(
-            updated.codex_subagents[0].model_selection,
+            updated.subagents[0].model_selection,
             Some(test_model_selection(&owner_personal))
         );
 
@@ -38360,7 +37418,7 @@ mod tests {
                     reasoning_effort: ReasoningEffort::Low,
                     ..AgentModelSettings::default()
                 }),
-                codex_subagents: vec![CodexSubagentDefinition {
+                subagents: vec![SubagentDefinition {
                     name: "reviewer".into(),
                     description: "Reviews the result".into(),
                     developer_instructions: "# Review\n\nCheck correctness.".into(),
@@ -38453,12 +37511,12 @@ mod tests {
             refreshed.model_selection,
             Some(test_model_selection(&default_connection))
         );
-        assert!(!refreshed.codex_subagents[0].enabled);
+        assert!(!refreshed.subagents[0].enabled);
         assert_eq!(
-            refreshed.codex_subagents[0].disabled_reason.as_deref(),
+            refreshed.subagents[0].disabled_reason.as_deref(),
             Some("model_connection_deleted")
         );
-        assert_eq!(refreshed.codex_subagents[0].model_selection, None);
+        assert_eq!(refreshed.subagents[0].model_selection, None);
         assert_eq!(
             agent_execution_revision(&pool, agent.id).await,
             revision_before_force + 1
@@ -38570,7 +37628,7 @@ mod tests {
         assert!(deleted.5);
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM codex_subagent_definitions WHERE agent_id = $1",
+                "SELECT count(*) FROM subagent_definitions WHERE agent_id = $1",
             )
             .bind(agent.id)
             .fetch_one(&pool)
@@ -38891,7 +37949,7 @@ mod tests {
                 public_to: Vec::new(),
                 model_selection: Some(selection_a),
                 model_settings: Some(AgentModelSettings::default()),
-                codex_subagents: vec![CodexSubagentDefinition {
+                subagents: vec![SubagentDefinition {
                     name: "reviewer".into(),
                     description: "Reviews output".into(),
                     developer_instructions: "Review carefully.".into(),
@@ -38943,9 +38001,9 @@ mod tests {
             .unwrap()
             .0;
         assert_eq!(after_model_removal.model_selection, None);
-        assert!(after_model_removal.codex_subagents[0].enabled);
+        assert!(after_model_removal.subagents[0].enabled);
         assert_eq!(
-            after_model_removal.codex_subagents[0]
+            after_model_removal.subagents[0]
                 .model_selection
                 .as_ref()
                 .map(|selection| selection.model_id.as_str()),
@@ -38998,12 +38056,10 @@ mod tests {
             .await
             .unwrap()
             .0;
-        assert!(!after_type_change.codex_subagents[0].enabled);
-        assert_eq!(after_type_change.codex_subagents[0].model_selection, None);
+        assert!(!after_type_change.subagents[0].enabled);
+        assert_eq!(after_type_change.subagents[0].model_selection, None);
         assert_eq!(
-            after_type_change.codex_subagents[0]
-                .disabled_reason
-                .as_deref(),
+            after_type_change.subagents[0].disabled_reason.as_deref(),
             Some("model_selection_removed")
         );
     }
@@ -39057,7 +38113,7 @@ mod tests {
         .unwrap();
         let subagent_id = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO codex_subagent_definitions
+            "INSERT INTO subagent_definitions
                  (id, agent_id, name, description, developer_instructions,
                   model_connection_id, model_id)
              VALUES ($1, $2, 'researcher', 'Researches', '# Research', $3, $4)",
@@ -39121,7 +38177,7 @@ mod tests {
         );
         let subagent: (bool, Option<String>, Option<Uuid>) = sqlx::query_as(
             "SELECT enabled, disabled_reason, model_connection_id
-             FROM codex_subagent_definitions WHERE id = $1",
+             FROM subagent_definitions WHERE id = $1",
         )
         .bind(subagent_id)
         .fetch_one(&pool)
@@ -40080,7 +39136,7 @@ mod tests {
             runtime_id: agent.runtime_id,
             model_selection: agent.model_selection.clone(),
             model_settings: agent.model_settings.clone(),
-            codex_subagents: agent.codex_subagents.clone(),
+            subagents: agent.subagents.clone(),
             model_policy: agent.model_policy.clone(),
             sandbox_policy: agent.sandbox_policy.clone(),
             managed_skill_ids: agent.managed_skill_ids.clone(),
@@ -40118,23 +39174,9 @@ mod tests {
             model_gateway_auth_token: Arc::new(Zeroizing::new("test-gateway-token".into())),
             session_bundle_store: None,
             session_bundle_max_bytes: DEFAULT_SESSION_BUNDLE_MAX_BYTES,
-            codex_release_client: test_codex_release_client(),
             auth_providers: Vec::new(),
             session_issuer: Arc::new(BrowserSessionIssuer),
         }
-    }
-
-    fn test_codex_release_client() -> Arc<CodexReleaseClient> {
-        Arc::new(
-            CodexReleaseClient::new(
-                reqwest::Client::new(),
-                "http://127.0.0.1:1".into(),
-                std::env::temp_dir()
-                    .join(format!("agent-hub-test-codex-artifacts-{}", Uuid::new_v4())),
-                true,
-            )
-            .unwrap(),
-        )
     }
 
     fn test_state_with_browser_session_auth(pool: PgPool) -> AppState {
@@ -40222,7 +39264,7 @@ mod tests {
                 "x-agent-hub-history-checkpoint",
                 attempt.history_checkpoint.to_string(),
             ),
-            ("x-agent-hub-producing-codex-version", "0.104.0".into()),
+            ("x-agent-hub-producing-engine-version", "0.104.0".into()),
             ("x-agent-hub-bundle-created-at", created_at.to_rfc3339()),
         ] {
             headers.insert(
@@ -40285,7 +39327,7 @@ mod tests {
                 "arguments": { "query": "test" }
             }),
             waiting_tool: Some(WaitingToolRunTransition {
-                session_id: "integration-test-session".into(),
+                native_session_id: "integration-test-session".into(),
                 work_dir_ref: "integration-test-workdir".into(),
             }),
         }
@@ -40297,7 +39339,7 @@ mod tests {
     ) -> FinalizeToolRequestsRequest {
         FinalizeToolRequestsRequest {
             integration_session_id: fixture.session_id,
-            session_id: "integration-test-session".into(),
+            native_session_id: "integration-test-session".into(),
             work_dir_ref: "integration-test-workdir".into(),
             tool_requests: request_ids
                 .into_iter()
@@ -40543,7 +39585,7 @@ mod tests {
         Option<String>,
     ) {
         sqlx::query_as(
-            "SELECT status, runtime_id, model_proxy_token_hash, session_id, work_dir_ref
+            "SELECT status, runtime_id, model_proxy_token_hash, native_session_id, work_dir_ref
              FROM runs WHERE id = $1",
         )
         .bind(run_id)
@@ -40865,7 +39907,6 @@ mod tests {
             model_gateway_auth_token: Arc::new(Zeroizing::new("test-gateway-token".into())),
             session_bundle_store: None,
             session_bundle_max_bytes: DEFAULT_SESSION_BUNDLE_MAX_BYTES,
-            codex_release_client: test_codex_release_client(),
             auth_providers: Vec::new(),
             session_issuer: Arc::new(BrowserSessionIssuer),
         }

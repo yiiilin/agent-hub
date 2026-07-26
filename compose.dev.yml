@@ -69,9 +69,6 @@ services:
       HUB_BUNDLE_S3_SERVER_SIDE_ENCRYPTION: ${HUB_BUNDLE_S3_SERVER_SIDE_ENCRYPTION:-}
       HUB_BUNDLE_S3_KMS_KEY_ID: ${HUB_BUNDLE_S3_KMS_KEY_ID:-}
       HUB_BUNDLE_S3_ALLOW_HTTP: ${HUB_BUNDLE_S3_ALLOW_HTTP:-true}
-      HUB_CODEX_GITHUB_API_BASE: ${HUB_CODEX_GITHUB_API_BASE:-https://api.github.com/repos/openai/codex}
-      HUB_CODEX_GITHUB_ALLOW_HTTP: ${HUB_CODEX_GITHUB_ALLOW_HTTP:-false}
-      HUB_CODEX_ARTIFACT_ROOT: ${HUB_CODEX_ARTIFACT_ROOT:-/var/lib/agent-hub/codex-artifacts}
       RUST_LOG: ${BACKEND_RUST_LOG:-agent_hub_backend=info,tower_http=info}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/readyz"]
@@ -151,8 +148,9 @@ services:
       RUNTIME_SESSION_IDLE_TIMEOUT_SECS: ${RUNTIME_SESSION_IDLE_TIMEOUT_SECS:-900}
       RUNTIME_MAX_ONLINE_SESSIONS: ${RUNTIME_MAX_ONLINE_SESSIONS:-4}
       RUNTIME_HOSTNAME: ${RUNTIME_HOSTNAME:-compose-runtime-1}
-      RUNTIME_CODEX_DRIVER: app-server
-      RUNTIME_CODEX_SOURCE: path
+      RUNTIME_ENGINE_DRIVER: pi
+      ENGINE_BIN: /opt/agent-hub/pi/pi
+      RUNTIME_ENGINE_VERSION: 0.81.1
       RUNTIME_HEALTH_BIND_ADDR: ${RUNTIME_HEALTH_BIND_ADDR:-0.0.0.0:8081}
       RUST_LOG: ${RUNTIME_RUST_LOG:-agent_hub_runtime=info}
     healthcheck:

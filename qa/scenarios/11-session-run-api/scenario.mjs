@@ -112,8 +112,8 @@ function assertUserMessageHistory(messages, expectedContents) {
 function turnStarted(events, label) {
   const started = events.find((event) => event.event_type === 'turn_started');
   assert.ok(started, `${label} must include turn_started`);
-  assert.equal(typeof started.payload?.native_thread_id, 'string');
-  assert.ok(started.payload.native_thread_id.length > 0);
+  assert.equal(typeof started.payload?.native_session_id, 'string');
+  assert.ok(started.payload.native_session_id.length > 0);
   assert.equal(typeof started.payload?.native_turn_id, 'string');
   assert.ok(started.payload.native_turn_id.length > 0);
   return started;
@@ -160,15 +160,15 @@ export default async function sessionRunApiScenario(context) {
       initialRun.hub_session_id,
       (session) => session.lifecycle_status === 'online'
         && session.active_turn_id === null
-        && typeof session.native_thread_id === 'string'
-        && session.native_thread_id.length > 0,
+        && typeof session.native_session_id === 'string'
+        && session.native_session_id.length > 0,
       'completed Pi Session to expose its native Session id'
     );
     assert.equal(firstSession.owner_id, admin.id);
     assert.equal(firstSession.agent_id, agentId);
     assert.equal(firstSession.agent_name, agentName);
     assert.deepEqual(firstSession.origin, { kind: 'hub_native' });
-    const nativePiSessionId = firstSession.native_thread_id;
+    const nativePiSessionId = firstSession.native_session_id;
 
     const { data: fetchedInitialRun } = await client.get(`/api/runs/${initialRun.id}`);
     assert.equal(fetchedInitialRun.status, 'completed');
@@ -177,7 +177,7 @@ export default async function sessionRunApiScenario(context) {
     const { data: initialEvents } = await client.get(`/api/runs/${initialRun.id}/events`);
     assertStrictlyIncreasing(initialEvents, 'first Pi Run events');
     const firstTurnStarted = turnStarted(initialEvents, 'first Pi Run events');
-    assert.equal(firstTurnStarted.payload.native_thread_id, nativePiSessionId);
+    assert.equal(firstTurnStarted.payload.native_session_id, nativePiSessionId);
     const sseEvents = await readSseThroughTurnStarted(client, context.baseURL, initialRun.id);
     assert.equal(turnStarted(sseEvents, 'first Pi Run SSE').payload.native_turn_id,
       firstTurnStarted.payload.native_turn_id);
@@ -203,13 +203,13 @@ export default async function sessionRunApiScenario(context) {
     const secondSession = await waitForSession(
       client,
       initialRun.hub_session_id,
-      (session) => session.active_turn_id === null && session.native_thread_id === nativePiSessionId,
+      (session) => session.active_turn_id === null && session.native_session_id === nativePiSessionId,
       'second completed Pi Turn to retain the native Session id'
     );
-    assert.equal(secondSession.native_thread_id, nativePiSessionId);
+    assert.equal(secondSession.native_session_id, nativePiSessionId);
     const { data: nextEvents } = await client.get(`/api/runs/${nextAcceptance.run.id}/events`);
     const secondTurnStarted = turnStarted(nextEvents, 'second Pi Run events');
-    assert.equal(secondTurnStarted.payload.native_thread_id, nativePiSessionId);
+    assert.equal(secondTurnStarted.payload.native_session_id, nativePiSessionId);
     assert.notEqual(secondTurnStarted.payload.native_turn_id, firstTurnStarted.payload.native_turn_id);
     const { data: continuedMessages } = await client.get(`/api/sessions/${initialRun.hub_session_id}/messages`);
     const continuedUsers = assertUserMessageHistory(continuedMessages, [initialContent, nextContent]);
@@ -226,12 +226,12 @@ export default async function sessionRunApiScenario(context) {
     const isolatedSession = await waitForSession(
       client,
       isolatedRun.hub_session_id,
-      (session) => session.active_turn_id === null && typeof session.native_thread_id === 'string',
+      (session) => session.active_turn_id === null && typeof session.native_session_id === 'string',
       'isolated Pi Session to complete'
     );
-    assert.notEqual(isolatedSession.native_thread_id, nativePiSessionId);
+    assert.notEqual(isolatedSession.native_session_id, nativePiSessionId);
     const { data: isolatedEvents } = await client.get(`/api/runs/${isolatedRun.id}/events`);
-    assert.notEqual(turnStarted(isolatedEvents, 'isolated Pi Run events').payload.native_thread_id,
+    assert.notEqual(turnStarted(isolatedEvents, 'isolated Pi Run events').payload.native_session_id,
       nativePiSessionId);
 
     const memberClient = new ApiClient(context.baseURL);
@@ -256,14 +256,14 @@ export default async function sessionRunApiScenario(context) {
       (session) => session.lifecycle_status === 'historical' && session.agent_deleted_at !== null,
       'first Pi Session to become historical after Agent deletion'
     );
-    assert.equal(historicalFirst.native_thread_id, nativePiSessionId);
+    assert.equal(historicalFirst.native_session_id, nativePiSessionId);
     const historicalIsolated = await waitForSession(
       client,
       isolatedRun.hub_session_id,
       (session) => session.lifecycle_status === 'historical' && session.agent_deleted_at !== null,
       'isolated Pi Session to become historical after Agent deletion'
     );
-    assert.equal(historicalIsolated.native_thread_id, isolatedSession.native_thread_id);
+    assert.equal(historicalIsolated.native_session_id, isolatedSession.native_session_id);
     await client.post(`/api/sessions/${initialRun.hub_session_id}/messages`, {
       content: 'must not continue after Agent deletion'
     }, { expectedStatus: 404 });

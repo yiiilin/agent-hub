@@ -22,7 +22,7 @@ schema, API, or in-flight Run compatibility.
   per model. One connection can expose multiple model IDs.
 - An Agent Model Selection is one permitted connection ID plus one model ID
   from that connection's allowlist.
-- Agent Model Settings contain invocation behavior. Codex subagents inherit the
+- Agent Model Settings contain invocation behavior. Subagents inherit the
   Agent selection and settings unless they explicitly override them.
 - A System Default Model Selection is a Global connection/model pair copied
   into newly created Agents.

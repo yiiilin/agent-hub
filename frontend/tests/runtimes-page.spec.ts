@@ -12,8 +12,8 @@ function runtime(id: string, hostname: string, status: string, overrides: Record
     id,
     hostname,
     labels: ['linux', `zone:${id}`],
-    codex_version: `codex-${id}`,
-    capabilities: { model_proxy: true, driver: 'app-server' },
+    engine_version: `engine-${id}`,
+    capabilities: { model_proxy: true, driver: 'pi' },
     sandbox_mode: 'workspace-write',
     status,
     last_heartbeat_at: '2026-07-11T08:00:00.000Z',
@@ -64,7 +64,7 @@ async function mockRuntimePage(page: Page, runtimeResponses: Array<ReturnType<ty
 
 test('runtime workspace filters rows and shows the selected runtime details', async ({ page }) => {
   const alpha = runtime('runtime-a', 'alpha-runner', 'online', {
-    capabilities: { model_proxy: true, driver: 'app-server', thread_resume: true, unknown_secret: 'do-not-render' }
+    capabilities: { model_proxy: true, driver: 'pi', engine_source: 'bundled', native_session_resume: true, unknown_secret: 'do-not-render' }
   });
   const beta = runtime('runtime-b', 'beta-runner', 'offline', {
     labels: ['linux', 'degraded'],
@@ -74,7 +74,7 @@ test('runtime workspace filters rows and shows the selected runtime details', as
 
   await page.goto('/runtimes');
   await expect(page.getByRole('heading', { name: 'Runtime Nodes' })).toBeVisible();
-  await expect(page.getByRole('button', { name: /alpha-runner/ })).toContainText('codex-runtime-a');
+  await expect(page.getByRole('button', { name: /alpha-runner/ })).toContainText('engine-runtime-a');
   await expect(page.getByRole('button', { name: /beta-runner/ })).toContainText('offline');
 
   await page.getByRole('radio', { name: /Issues/ }).click();
@@ -95,7 +95,8 @@ test('runtime workspace filters rows and shows the selected runtime details', as
   await page.getByRole('button', { name: /alpha-runner/ }).click();
   await expect(detail.getByRole('link', { name: 'Release operator' })).toHaveAttribute('href', '/agents/agent-a');
   await expect(detail).toContainText('driver');
-  await expect(detail).toContainText('thread_resume');
+  await expect(detail).toContainText('engine_source');
+  await expect(detail).toContainText('native_session_resume');
   await expect(detail).not.toContainText('unknown_secret');
   await expect(detail).not.toContainText('do-not-render');
 });
@@ -255,7 +256,7 @@ test('runtime workspace stacks without horizontal overflow and localizes all con
   await expect(page.getByRole('radio', { name: /全部/ })).toBeVisible();
   const detailRegion = page.getByRole('region', { name: '运行节点详情' });
   await expect(detailRegion).toBeVisible();
-  for (const text of ['标识与状态', '主机名', 'Codex 版本', '最近心跳', '执行环境', '沙箱', '模型代理', '能力', '标签', '绑定的智能体']) {
+  for (const text of ['标识与状态', '主机名', '执行引擎版本', '最近心跳', '执行环境', '沙箱', '模型代理', '能力', '标签', '绑定的智能体']) {
     await expect(detailRegion.getByText(text, { exact: true })).toBeVisible();
   }
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);

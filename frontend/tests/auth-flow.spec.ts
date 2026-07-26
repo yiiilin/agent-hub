@@ -422,7 +422,7 @@ test('Embed JWT exchanges into a widget session through postMessage', async ({ p
   }, { channelId, token: exchangedSession.token });
   await expect(frame.getByRole('button', { name: 'Sending...' })).toBeDisabled();
   releaseWidgetRun();
-  await expect(frame.getByText('Fake Codex completed run')).toBeVisible({ timeout: 30_000 });
+  await expect(frame.getByText('completed run')).toBeVisible({ timeout: 30_000 });
   expect(widgetRunPosts).toBe(1);
   await expect(frame.getByRole('button', { name: 'Send' })).toBeEnabled();
   await expect.poll(() => page.evaluate(() => (window as unknown as { widgetMessages: Record<string, unknown>[] }).widgetMessages.map((message) => message.type))).toContain('agent-hub:run-started');
@@ -436,7 +436,7 @@ test('Embed JWT exchanges into a widget session through postMessage', async ({ p
     (iframe as HTMLIFrameElement).contentWindow?.postMessage({ type: 'agent-hub:session-select', channelId: data.channelId, token: data.token }, '*');
   }, { channelId, token: secondSession.token });
   await expect(frame.getByText(secondAgent.name)).toBeVisible();
-  await expect(frame.getByText('Fake Codex completed run')).toHaveCount(0);
+  await expect(frame.getByText('completed run')).toHaveCount(0);
   await page.request.delete(`/api/agents/${agent.id}`);
   await page.request.delete(`/api/agents/${secondAgent.id}`);
 });

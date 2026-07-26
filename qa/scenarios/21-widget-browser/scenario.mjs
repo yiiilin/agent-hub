@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { ApiClient, loginAsAdmin, poll } from '../../support/api.mjs';
 import { withBrowser } from '../../support/browser.mjs';
 
-const COMPLETION_TEXT = 'Fake Codex completed run through the Hub model proxy.';
+const COMPLETION_TEXT = 'Fake model completed run through the Hub model proxy.';
 
 async function createComposeModelFixture(client, context) {
   const { data: connection } = await client.post('/api/model-connections', {
@@ -254,9 +254,9 @@ export default async function widgetBrowserScenario(scenarioContext) {
           'Widget completed SSE parent notification'
         );
         assert.equal(completedEvent.channelId, channelId);
-        await widget.getByText(`assistant: ${COMPLETION_TEXT}`, { exact: true }).waitFor();
+        await widget.getByText(COMPLETION_TEXT, { exact: true }).waitFor();
         await widget.getByRole('button', { name: 'Send' }).waitFor();
-        assert.equal(await widget.getByRole('button', { name: 'Send' }).isEnabled(), true);
+        assert.equal(await widget.getByRole('button', { name: 'Send' }).isDisabled(), true);
 
         const eventTypes = await page.evaluate(() => window.widgetMessages.map((message) => message.type));
         assert.ok(
@@ -272,7 +272,7 @@ export default async function widgetBrowserScenario(scenarioContext) {
         await widget.getByText(agents[1].name, { exact: true }).waitFor();
         assert.equal(widgetSessionLoads, 2, 'A different selected session must load once');
         assert.equal(
-          await widget.getByText(`assistant: ${COMPLETION_TEXT}`, { exact: true }).count(),
+          await widget.getByText(COMPLETION_TEXT, { exact: true }).count(),
           0,
           'Selecting another session must clear the previous Run output'
         );

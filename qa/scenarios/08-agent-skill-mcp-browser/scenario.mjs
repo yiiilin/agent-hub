@@ -104,7 +104,7 @@ export default async function agentSkillMcpBrowserScenario(scenarioContext) {
     await subagentDialog.getByRole('textbox', { name: 'Developer instructions' }).fill('Review correctness and report blocking findings.');
     await subagentDialog.getByLabel('Reasoning override').selectOption('max');
     await subagentDialog.getByRole('button', { name: 'Save changes' }).click();
-    assert.ok((await createAgentDialog.getByRole('table', { name: 'Codex subagents' }).innerText()).includes('reviewer'));
+    assert.ok((await createAgentDialog.getByRole('table', { name: 'Subagents' }).innerText()).includes('reviewer'));
     await createAgentDialog.getByLabel('Visibility').selectOption('public');
     const createAgentResponsePromise = page.waitForResponse((response) => (
       response.request().method() === 'POST'
@@ -116,14 +116,14 @@ export default async function agentSkillMcpBrowserScenario(scenarioContext) {
     const agent = await createAgentResponse.json();
     assert.equal(agent.visibility, 'public');
     assert.equal(agent.reasoning_effort, 'high');
-    assert.equal(agent.codex_subagents[0].name, 'reviewer');
+    assert.equal(agent.subagents[0].name, 'reviewer');
     await page.waitForURL((url) => url.pathname === `/agents/${agent.id}`);
 
     await page.getByRole('tab', { name: 'Models' }).click();
     const modelsPanel = page.getByRole('tabpanel', { name: 'Models' });
     assert.notEqual(await modelsPanel.getByLabel('Default model connection').inputValue(), '');
     assert.equal(await modelsPanel.getByLabel('Reasoning effort').inputValue(), 'high');
-    assert.ok((await modelsPanel.getByRole('table', { name: 'Codex subagents' }).innerText()).includes('reviewer'));
+    assert.ok((await modelsPanel.getByRole('table', { name: 'Subagents' }).innerText()).includes('reviewer'));
 
     await page.getByRole('tab', { name: 'Skills' }).click();
     const skillsPanel = page.getByRole('tabpanel', { name: 'Skills' });

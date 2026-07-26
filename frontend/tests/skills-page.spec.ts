@@ -31,7 +31,7 @@ const skills = [
 const agents = [{
   id: agentId, name: 'Attached agent', instructions: 'Fixture', visibility: 'private', public_to: [], runtime_id: null,
   owner_id: ownerId, is_owner: true, can_manage: true, can_administer: true, can_invoke: true,
-  model_selection: null, model_settings: automaticModelSettings, codex_subagents: [],
+  model_selection: null, model_settings: automaticModelSettings, subagents: [],
   model_policy: {}, sandbox_policy: {}, managed_skill_ids: [alphaId], mcp_allowlist: [],
   created_at: now, updated_at: now
 }];
@@ -386,7 +386,7 @@ test('skills and managed assignments enforce the real owner boundary', async ({ 
       public_to: [],
       model_selection: null,
       model_settings: automaticModelSettings,
-      codex_subagents: []
+      subagents: []
     } });
     expect(agentResponse.ok()).toBeTruthy();
     const agent = await agentResponse.json() as Agent;
@@ -405,7 +405,7 @@ test('skills and managed assignments enforce the real owner boundary', async ({ 
       runtime_id: agent.runtime_id,
       model_selection: agent.model_selection,
       model_settings: agent.model_settings,
-      codex_subagents: agent.codex_subagents,
+      subagents: agent.subagents,
       sandbox_policy: agent.sandbox_policy,
       managed_skill_ids: [skill.id],
       mcp_allowlist: agent.mcp_allowlist

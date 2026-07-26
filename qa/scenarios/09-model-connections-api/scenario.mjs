@@ -288,7 +288,7 @@ export default async function modelConnectionsApiScenario(context) {
     assert.equal(successfulTest.status_code, 200);
     assert.equal(successfulTest.error_code, null);
     assert.equal(successfulTest.message, null);
-    assert.equal(successfulTest.response_text, 'Fake Codex completed run through the Hub model proxy.');
+    assert.equal(successfulTest.response_text, 'Fake model completed run through the Hub model proxy.');
     assert.equal(Number.isInteger(successfulTest.response_time_ms), true);
     assert.ok(successfulTest.response_time_ms >= 0);
     const failedModelTest = (await administrator.client.post(
@@ -371,7 +371,7 @@ export default async function modelConnectionsApiScenario(context) {
       public_to: [],
       model_selection: null,
       model_settings: modelSettings('openai_responses'),
-      codex_subagents: []
+      subagents: []
     });
     assert.deepEqual(copiedDefaultAgent.model_selection, selection(responseConnection));
 
@@ -394,7 +394,7 @@ export default async function modelConnectionsApiScenario(context) {
       public_to: [],
       model_selection: selection(responseConnection),
       model_settings: responseSettings,
-      codex_subagents: [{
+      subagents: [{
         name: 'inherit_agent',
         description: 'Inherits the Agent model and settings.',
         developer_instructions: 'Use the Agent model configuration.',
@@ -413,9 +413,9 @@ export default async function modelConnectionsApiScenario(context) {
     });
     assert.deepEqual(responseAgent.model_selection, selection(responseConnection));
     assert.deepEqual(responseAgent.model_settings, responseSettings);
-    assert.deepEqual(responseAgent.codex_subagents[0].model_selection, null);
-    assert.deepEqual(responseAgent.codex_subagents[0].model_settings_override, {});
-    assert.deepEqual(responseAgent.codex_subagents[1].model_settings_override, {
+    assert.deepEqual(responseAgent.subagents[0].model_selection, null);
+    assert.deepEqual(responseAgent.subagents[0].model_settings_override, {});
+    assert.deepEqual(responseAgent.subagents[1].model_settings_override, {
       reasoning_effort: 'high',
       request_max_retries: 2
     });
@@ -427,7 +427,7 @@ export default async function modelConnectionsApiScenario(context) {
       public_to: [],
       model_selection: selection(outsiderPersonal),
       model_settings: modelSettings('openai_responses'),
-      codex_subagents: []
+      subagents: []
     }, { expectedStatus: 400 });
 
     const responseRun = await createRun(
@@ -464,7 +464,7 @@ export default async function modelConnectionsApiScenario(context) {
       public_to: [],
       model_selection: selection(chatConnection),
       model_settings: chatSettings,
-      codex_subagents: []
+      subagents: []
     });
     await createRun(owner.client, chatAgent.id, 'Verify the Chat conversion path.');
 
@@ -484,7 +484,7 @@ export default async function modelConnectionsApiScenario(context) {
       public_to: [],
       model_selection: selection(anthropicConnection),
       model_settings: anthropicSettings,
-      codex_subagents: []
+      subagents: []
     });
     await createRun(owner.client, anthropicAgent.id, 'Verify the Anthropic conversion path.');
 
@@ -549,7 +549,7 @@ export default async function modelConnectionsApiScenario(context) {
     assert.deepEqual(forceUpdated.allowed_model_ids, [ERROR_MODEL_ID]);
     const { data: unconfiguredAgent } = await owner.client.get(`/api/agents/${responseAgent.id}`);
     assert.equal(unconfiguredAgent.model_selection, null);
-    const disabledReviewer = unconfiguredAgent.codex_subagents.find((item) => item.name === 'reviewer');
+    const disabledReviewer = unconfiguredAgent.subagents.find((item) => item.name === 'reviewer');
     assert.equal(disabledReviewer.enabled, false);
     assert.equal(disabledReviewer.disabled_reason, 'model_selection_removed');
     assert.equal(disabledReviewer.model_selection, null);

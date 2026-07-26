@@ -129,7 +129,7 @@ export function RuntimesPage({ user }: { user: User }) {
     return runtimes.filter((runtime) => {
       const matchesFilter = filter === 'all'
         || (filter === 'online' ? runtime.status === 'online' : runtime.status !== 'online');
-      const haystack = [runtime.hostname, runtime.status, runtime.codex_version, ...runtime.labels].join(' ').toLocaleLowerCase(locale);
+      const haystack = [runtime.hostname, runtime.status, runtime.engine_version, ...runtime.labels].join(' ').toLocaleLowerCase(locale);
       return matchesFilter && (!query || haystack.includes(query));
     });
   }, [filter, locale, runtimes, search]);
@@ -138,7 +138,7 @@ export function RuntimesPage({ user }: { user: User }) {
     .sort((left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime()), [enrollmentClock, enrollments]);
   const selectedRuntime = runtimes.find((runtime) => runtime.id === selectedId) ?? null;
   const boundAgents = agents.filter((agent) => agent.runtime_id === selectedRuntime?.id);
-  const visibleCapabilities = ['driver', 'codex_source', 'model_proxy', 'mcp_allowlist', 'thread_resume', 'local_skills']
+  const visibleCapabilities = ['driver', 'engine_source', 'model_proxy', 'mcp_allowlist', 'native_session_resume', 'local_skills']
     .flatMap((key) => selectedRuntime && key in selectedRuntime.capabilities
       ? [[key, selectedRuntime.capabilities[key]] as const]
       : []);
@@ -373,7 +373,7 @@ export function RuntimesPage({ user }: { user: User }) {
                 onClick={() => selectRuntime(runtime.id)}
               >
                 <span className="runtime-row-heading"><strong>{runtime.hostname}</strong><span className={`status ${runtime.status}`}>{localizedStatus(runtime.status, t)}</span></span>
-                <span className="runtime-row-meta"><span>{t('lastHeartbeat')}: {new Date(runtime.last_heartbeat_at).toLocaleString(locale)}</span><span>{runtime.codex_version}</span></span>
+                <span className="runtime-row-meta"><span>{t('lastHeartbeat')}: {new Date(runtime.last_heartbeat_at).toLocaleString(locale)}</span><span>{runtime.engine_version}</span></span>
               </button>
             ))}
           </div>
@@ -394,7 +394,7 @@ export function RuntimesPage({ user }: { user: User }) {
                   <h3>{t('runtimeStatus')}</h3>
                   <dl className="runtime-properties">
                     <div><dt>{t('hostname')}</dt><dd>{selectedRuntime.hostname}</dd></div>
-                    <div><dt>{t('codexVersion')}</dt><dd>{selectedRuntime.codex_version}</dd></div>
+                    <div><dt>{t('engineVersion')}</dt><dd>{selectedRuntime.engine_version}</dd></div>
                     <div><dt>{t('lastHeartbeat')}</dt><dd>{new Date(selectedRuntime.last_heartbeat_at).toLocaleString(locale)}</dd></div>
                   </dl>
                 </section>

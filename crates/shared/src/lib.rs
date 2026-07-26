@@ -132,7 +132,7 @@ pub struct CurrentSessionBundleDto {
     pub size_bytes: i64,
     pub history_checkpoint: i64,
     pub ownership_generation: i64,
-    pub producing_codex_version: String,
+    pub producing_engine_version: String,
     pub created_at: DateTime<Utc>,
 }
 
@@ -147,7 +147,7 @@ pub struct HubSessionDto {
     pub origin_platform_name: Option<String>,
     pub origin: HubSessionOriginDto,
     pub lifecycle_status: String,
-    pub native_thread_id: Option<String>,
+    pub native_session_id: Option<String>,
     pub active_turn_id: Option<Uuid>,
     pub history_checkpoint: i64,
     pub configuration_fingerprint: Option<String>,
@@ -729,7 +729,7 @@ pub enum ReasoningEffort {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct CodexSubagentDefinition {
+pub struct SubagentDefinition {
     pub name: String,
     pub description: String,
     pub developer_instructions: String,
@@ -764,7 +764,7 @@ pub struct AgentDto {
     #[serde(default)]
     pub model_settings: AgentModelSettings,
     #[serde(default)]
-    pub codex_subagents: Vec<CodexSubagentDefinition>,
+    pub subagents: Vec<SubagentDefinition>,
     pub model_policy: Value,
     pub sandbox_policy: Value,
     pub managed_skill_ids: Vec<Uuid>,
@@ -807,7 +807,7 @@ pub struct AgentExecutionConfigurationDto {
     #[serde(default)]
     pub model_settings: AgentModelSettings,
     #[serde(default)]
-    pub codex_subagents: Vec<CodexSubagentDefinition>,
+    pub subagents: Vec<SubagentDefinition>,
     #[serde(default)]
     pub model_bindings: Vec<RunModelBindingDto>,
     pub model_policy: Value,
@@ -905,20 +905,20 @@ pub fn execution_configuration_fingerprint(
         .collect::<Vec<_>>();
 
     let mut subagent_names = BTreeSet::new();
-    let mut codex_subagents = configuration.codex_subagents.clone();
-    for subagent in &codex_subagents {
+    let mut subagents = configuration.subagents.clone();
+    for subagent in &subagents {
         let normalized_name = subagent.name.trim().to_lowercase();
         if normalized_name.is_empty()
             || subagent.description.trim().is_empty()
             || subagent.developer_instructions.trim().is_empty()
         {
             return Err(ExecutionConfigurationError(
-                "Codex Subagent name, description, and developer instructions are required",
+                "Subagent name, description, and developer instructions are required",
             ));
         }
         if !subagent_names.insert(normalized_name.clone()) {
             return Err(ExecutionConfigurationError(
-                "Codex Subagent names must be unique ignoring case",
+                "Subagent names must be unique ignoring case",
             ));
         }
         match (subagent.enabled, subagent.disabled_reason.as_deref()) {
@@ -926,7 +926,7 @@ pub fn execution_configuration_fingerprint(
             (false, Some(reason)) if !reason.trim().is_empty() => {}
             _ => {
                 return Err(ExecutionConfigurationError(
-                    "Codex Subagent enabled and disabled reason shape is invalid",
+                    "Subagent enabled and disabled reason shape is invalid",
                 ));
             }
         }
@@ -936,11 +936,11 @@ pub fn execution_configuration_fingerprint(
             && !binding_keys.contains(&normalized_name)
         {
             return Err(ExecutionConfigurationError(
-                "Codex Subagent override must have a matching Run Model Binding",
+                "Subagent override must have a matching Run Model Binding",
             ));
         }
     }
-    codex_subagents.sort_by_key(|subagent| subagent.name.trim().to_lowercase());
+    subagents.sort_by_key(|subagent| subagent.name.trim().to_lowercase());
 
     let mut names = BTreeSet::new();
     let mut skills = configuration.skills.clone();
@@ -996,7 +996,7 @@ pub fn execution_configuration_fingerprint(
         "instructions": configuration.instructions,
         "model_selection": configuration.model_selection,
         "model_settings": configuration.model_settings,
-        "codex_subagents": codex_subagents,
+        "subagents": subagents,
         "model_bindings": model_binding_metadata,
         "model_policy": configuration.model_policy,
         "sandbox_policy": configuration.sandbox_policy,
@@ -1085,70 +1085,12 @@ pub struct RuntimeDto {
     pub id: Uuid,
     pub hostname: String,
     pub labels: Vec<String>,
-    pub codex_version: String,
+    pub engine_version: String,
     pub capabilities: Value,
     pub sandbox_mode: String,
     pub status: String,
     pub last_heartbeat_at: DateTime<Utc>,
     pub credential_rotation_requested_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct SetCodexTargetVersionRequest {
-    pub version: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CodexVersionArtifactDto {
-    pub version: String,
-    pub os: String,
-    pub architecture: String,
-    pub artifact_name: String,
-    pub sha256: String,
-    pub size_bytes: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeCodexStatusDto {
-    pub current_version: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub candidate_version: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub candidate_status: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub candidate_error: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RuntimeCodexRolloutCommandDto {
-    pub active_version: Option<String>,
-    pub target_artifact: Option<CodexVersionArtifactDto>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CodexRuntimeReadinessDto {
-    pub runtime_id: Uuid,
-    pub hostname: String,
-    pub os: String,
-    pub architecture: String,
-    pub current_version: String,
-    pub target_version: Option<String>,
-    pub status: String,
-    pub error: Option<String>,
-    pub checked_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CodexVersionRolloutDto {
-    pub active_version: Option<String>,
-    pub target_version: Option<String>,
-    pub status: String,
-    pub error: Option<String>,
-    pub artifacts: Vec<CodexVersionArtifactDto>,
-    pub runtimes: Vec<CodexRuntimeReadinessDto>,
-    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1186,7 +1128,7 @@ pub struct RunDto {
     pub session_ownership_generation: Option<i64>,
     pub status: String,
     pub initial_message: String,
-    pub session_id: Option<String>,
+    pub native_session_id: Option<String>,
     pub work_dir_ref: Option<String>,
     pub source: String,
     pub created_at: DateTime<Utc>,
@@ -1203,7 +1145,7 @@ pub struct RunListResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunResumeDto {
-    pub thread_id: String,
+    pub native_session_id: String,
     pub work_dir_ref: Option<String>,
 }
 
@@ -1431,7 +1373,7 @@ pub struct CreateAgentRequest {
     #[serde(default)]
     pub model_settings: Option<AgentModelSettings>,
     #[serde(default)]
-    pub codex_subagents: Vec<CodexSubagentDefinition>,
+    pub subagents: Vec<SubagentDefinition>,
 }
 
 fn legacy_hub_proxy_model_policy() -> Value {
@@ -1452,7 +1394,7 @@ pub struct UpdateAgentRequest {
     #[serde(default)]
     pub model_settings: AgentModelSettings,
     #[serde(default)]
-    pub codex_subagents: Vec<CodexSubagentDefinition>,
+    pub subagents: Vec<SubagentDefinition>,
     #[doc(hidden)]
     #[serde(skip, default = "legacy_hub_proxy_model_policy")]
     pub model_policy: Value,
@@ -1593,7 +1535,7 @@ pub struct ExchangeEmbedJwtRequest {
 pub struct RuntimeRegisterRequest {
     pub hostname: String,
     pub labels: Vec<String>,
-    pub codex_version: String,
+    pub engine_version: String,
     pub capabilities: Value,
     pub sandbox_mode: String,
 }
@@ -1617,8 +1559,6 @@ pub struct RuntimeHeartbeatRequest {
     pub owned_sessions: Vec<RuntimeOwnedSessionStateRequest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cleaned_sessions: Vec<RuntimeOwnedSessionGenerationDto>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub codex_status: Option<RuntimeCodexStatusDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1642,8 +1582,6 @@ pub struct RuntimeHeartbeatResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cleanup_sessions: Vec<RuntimeOwnedSessionGenerationDto>,
     pub session_commands: Vec<RuntimeSessionCommandDto>,
-    #[serde(default)]
-    pub codex_rollout: RuntimeCodexRolloutCommandDto,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1651,7 +1589,7 @@ pub struct RuntimeOwnedSessionSnapshotDto {
     pub session_id: Uuid,
     pub ownership_generation: i64,
     pub lifecycle_status: String,
-    pub native_thread_id: Option<String>,
+    pub native_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_run_id: Option<Uuid>,
 }
@@ -1678,7 +1616,7 @@ pub struct RuntimeSessionCommandDto {
     pub command: String,
     pub run_id: Option<Uuid>,
     pub turn_id: Option<Uuid>,
-    pub native_thread_id: Option<String>,
+    pub native_session_id: Option<String>,
     pub native_turn_id: Option<String>,
     pub message: Option<RuntimeSteeringMessageDto>,
     pub configuration_revision: Option<i64>,
@@ -1840,7 +1778,7 @@ pub struct AppendRunEventRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WaitingToolRunTransition {
-    pub session_id: String,
+    pub native_session_id: String,
     pub work_dir_ref: String,
 }
 
@@ -1854,7 +1792,7 @@ pub struct FinalizeToolRequestEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FinalizeToolRequestsRequest {
     pub integration_session_id: Uuid,
-    pub session_id: String,
+    pub native_session_id: String,
     pub work_dir_ref: String,
     pub tool_requests: Vec<FinalizeToolRequestEvent>,
 }
@@ -1862,7 +1800,7 @@ pub struct FinalizeToolRequestsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompleteRunRequest {
     pub status: String,
-    pub session_id: Option<String>,
+    pub native_session_id: Option<String>,
     pub work_dir_ref: Option<String>,
 }
 
@@ -1880,7 +1818,7 @@ mod tests {
             id: Uuid::from_u128(1),
             hostname: "runtime-1".into(),
             labels: vec!["linux".into()],
-            codex_version: "0.1.0".into(),
+            engine_version: "0.1.0".into(),
             capabilities: json!({ "model_proxy": true }),
             sandbox_mode: "workspace-write".into(),
             status: "online".into(),
@@ -1894,7 +1832,7 @@ mod tests {
         let register = RuntimeRegisterRequest {
             hostname: "runtime-1".into(),
             labels: vec!["linux".into()],
-            codex_version: "0.1.0".into(),
+            engine_version: "0.1.0".into(),
             capabilities: json!({ "model_proxy": true }),
             sandbox_mode: "workspace-write".into(),
         };
@@ -2476,7 +2414,7 @@ mod tests {
             instructions: "Use the current managed Skills".into(),
             model_selection: None,
             model_settings: AgentModelSettings::default(),
-            codex_subagents: Vec::new(),
+            subagents: Vec::new(),
             model_bindings: Vec::new(),
             model_policy: json!({ "model": "gpt-test" }),
             sandbox_policy: json!({ "mode": "workspace-write" }),
@@ -2499,7 +2437,7 @@ mod tests {
             command: "refresh_configuration".into(),
             run_id: None,
             turn_id: None,
-            native_thread_id: Some("thread-12".into()),
+            native_session_id: Some("thread-12".into()),
             native_turn_id: None,
             message: None,
             configuration_revision: Some(configuration.revision),
@@ -2552,7 +2490,7 @@ mod tests {
                 external_identity_id: Uuid::from_u128(7),
             },
             lifecycle_status: "offline".into(),
-            native_thread_id: Some("thread-1".into()),
+            native_session_id: Some("thread-1".into()),
             active_turn_id: None,
             history_checkpoint: 12,
             configuration_fingerprint: Some("sha256:config".into()),
@@ -2566,7 +2504,7 @@ mod tests {
                 size_bytes: 4096,
                 history_checkpoint: 12,
                 ownership_generation: 3,
-                producing_codex_version: "0.42.0".into(),
+                producing_engine_version: "0.42.0".into(),
                 created_at: now,
             }),
             created_at: now,
@@ -2588,7 +2526,7 @@ mod tests {
             "agent_deleted_at": null,
             "origin": { "kind": "hub_native" },
             "lifecycle_status": "waiting_for_runtime",
-            "native_thread_id": null,
+            "native_session_id": null,
             "active_turn_id": null,
             "history_checkpoint": 0,
             "configuration_fingerprint": null,
@@ -2693,13 +2631,15 @@ mod tests {
             ownership_generation: 7,
             payload: CompleteRunRequest {
                 status: "completed".into(),
-                session_id: Some("thread-1".into()),
+                native_session_id: Some("thread-1".into()),
                 work_dir_ref: Some("session-11".into()),
             },
         };
         let value = serde_json::to_value(write).unwrap();
         assert_eq!(value["ownership_generation"], 7);
         assert_eq!(value["payload"]["status"], "completed");
+        assert_eq!(value["payload"]["native_session_id"], "thread-1");
+        assert!(value["payload"].get("session_id").is_none());
 
         let heartbeat = RuntimeHeartbeatResponse {
             rotation_requested: false,
@@ -2710,7 +2650,7 @@ mod tests {
                 session_id,
                 ownership_generation: 7,
                 lifecycle_status: "online".into(),
-                native_thread_id: Some("thread-11".into()),
+                native_session_id: Some("thread-11".into()),
                 active_run_id: Some(Uuid::from_u128(13)),
             }],
             cleanup_sessions: Vec::new(),
@@ -2721,19 +2661,18 @@ mod tests {
                 command: "checkpoint".into(),
                 run_id: None,
                 turn_id: None,
-                native_thread_id: None,
+                native_session_id: None,
                 native_turn_id: None,
                 message: None,
                 configuration_revision: None,
                 fingerprint: None,
                 execution_configuration: None,
             }],
-            codex_rollout: RuntimeCodexRolloutCommandDto::default(),
         };
         let value = serde_json::to_value(heartbeat).unwrap();
         assert_eq!(value["runtime_status"], "draining");
         assert_eq!(value["owned_sessions"][0]["ownership_generation"], 7);
-        assert_eq!(value["owned_sessions"][0]["native_thread_id"], "thread-11");
+        assert_eq!(value["owned_sessions"][0]["native_session_id"], "thread-11");
         assert_eq!(
             value["owned_sessions"][0]["active_run_id"],
             Uuid::from_u128(13).to_string()
@@ -2758,16 +2697,12 @@ mod tests {
                 session_id,
                 ownership_generation: 7,
                 lifecycle_status: "saving".into(),
-                checkpoint_reason: Some("version_switch".into()),
+                checkpoint_reason: Some("idle".into()),
             }],
             cleaned_sessions: Vec::new(),
-            codex_status: None,
         };
         let value = serde_json::to_value(saving).unwrap();
-        assert_eq!(
-            value["owned_sessions"][0]["checkpoint_reason"],
-            "version_switch"
-        );
+        assert_eq!(value["owned_sessions"][0]["checkpoint_reason"], "idle");
         assert_eq!(
             serde_json::to_value(BeginRuntimeSessionCheckpointRequest {
                 ownership_generation: 7,
@@ -2925,95 +2860,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_version_rollout_contract_carries_exact_artifact_and_runtime_status() {
-        let artifact = CodexVersionArtifactDto {
-            version: "0.144.5".into(),
-            os: "linux".into(),
-            architecture: "x86_64".into(),
-            artifact_name: "codex-x86_64-unknown-linux-musl.zst".into(),
-            sha256: "a".repeat(64),
-            size_bytes: 42,
-        };
-        let request: RuntimeHeartbeatRequest = serde_json::from_value(json!({
-            "codex_status": {
-                "current_version": "0.143.0",
-                "candidate_version": "0.144.5",
-                "candidate_status": "ready",
-                "candidate_error": null
-            }
-        }))
-        .unwrap();
-        assert_eq!(
-            request.codex_status.unwrap().candidate_status.as_deref(),
-            Some("ready")
-        );
-
-        let command = RuntimeCodexRolloutCommandDto {
-            active_version: Some("0.143.0".into()),
-            target_artifact: Some(artifact.clone()),
-        };
-        assert_eq!(
-            serde_json::to_value(&command).unwrap()["target_artifact"],
-            serde_json::to_value(artifact).unwrap()
-        );
-        let heartbeat: RuntimeHeartbeatResponse = serde_json::from_value(json!({
-            "rotation_requested": false,
-            "pending_credential_accepted": false,
-            "credential_activated": false,
-            "runtime_status": "online",
-            "owned_sessions": [],
-            "session_commands": [],
-            "codex_rollout": command
-        }))
-        .unwrap();
-        assert_eq!(
-            heartbeat
-                .codex_rollout
-                .target_artifact
-                .unwrap()
-                .architecture,
-            "x86_64"
-        );
-
-        let target: SetCodexTargetVersionRequest = serde_json::from_value(json!({
-            "version": "0.144.5"
-        }))
-        .unwrap();
-        assert_eq!(target.version, "0.144.5");
-
-        let now = Utc::now();
-        let rollout = CodexVersionRolloutDto {
-            active_version: Some("0.143.0".into()),
-            target_version: Some("0.144.5".into()),
-            status: "ready".into(),
-            error: None,
-            artifacts: vec![CodexVersionArtifactDto {
-                version: "0.144.5".into(),
-                os: "linux".into(),
-                architecture: "x86_64".into(),
-                artifact_name: "codex-x86_64-unknown-linux-musl.zst".into(),
-                sha256: "a".repeat(64),
-                size_bytes: 42,
-            }],
-            runtimes: vec![CodexRuntimeReadinessDto {
-                runtime_id: Uuid::nil(),
-                hostname: "runtime-1".into(),
-                os: "linux".into(),
-                architecture: "x86_64".into(),
-                current_version: "0.143.0".into(),
-                target_version: Some("0.144.5".into()),
-                status: "ready".into(),
-                error: None,
-                checked_at: Some(now),
-            }],
-            updated_at: now,
-        };
-        let serialized = serde_json::to_value(rollout).unwrap();
-        assert_eq!(serialized["status"], "ready");
-        assert_eq!(serialized["runtimes"][0]["current_version"], "0.143.0");
-    }
-
-    #[test]
     fn execution_configuration_fingerprint_uses_effective_run_bindings() {
         let connection_id = Uuid::from_u128(20);
         let run_id = Uuid::from_u128(21);
@@ -3050,7 +2896,7 @@ mod tests {
             instructions: "Use the configured model".into(),
             model_selection: Some(selection),
             model_settings: main_settings,
-            codex_subagents: vec![CodexSubagentDefinition {
+            subagents: vec![SubagentDefinition {
                 name: "reviewer".into(),
                 description: "Reviews changes".into(),
                 developer_instructions: "# Review".into(),
@@ -3104,7 +2950,7 @@ mod tests {
             instructions: String::new(),
             model_selection: None,
             model_settings: AgentModelSettings::default(),
-            codex_subagents: Vec::new(),
+            subagents: Vec::new(),
             model_bindings: Vec::new(),
             model_policy: json!({}),
             sandbox_policy: json!({}),

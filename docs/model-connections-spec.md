@@ -6,7 +6,7 @@
 
 1. Model API Connection 是可复用的 provider 访问配置，只保存显示名称、Global/Personal 作用域、服务根地址、加密 API Key、单一 API Type、Allowed Model ID 列表、启停状态和时间戳。
 2. Allowed Model ID 是连接内精确匹配的 provider `model` 字符串，不是独立 Model 实体。一个连接可以开放多个 Model ID，不为每个 Model ID 复制地址和密钥。
-3. Agent Model Selection 是一个 `connection_id + model_id`；Agent Model Settings 保存 Codex 行为和协议专属请求设置。连接不保存调用参数。
+3. Agent Model Selection 是一个 `connection_id + model_id`；Agent Model Settings 保存 Execution Engine 行为和协议专属请求设置。连接不保存调用参数。
 4. API Type 只允许 `openai_responses`、`openai_chat_completions` 和 `anthropic_messages`。Runtime 始终使用 Responses；Hub 经内部 Model Gateway 透明转发或转换。
 5. V1 直接使用本文件定义的最终 schema 和 API。开发、测试环境重建数据库，不回填旧连接字段，不保留旧 Run，不接受 connection-ID proxy header，也不提供旧 DTO alias。
 
@@ -62,24 +62,24 @@ Base URL 不包含 `/v1`，可以包含业务路径。Global 和 Personal URL �
 - 连接必须符合 Agent owner 的 Global/Personal scope，Model ID 必须在当前 allowlist 中。
 - System Default Model Selection 只能引用 enabled Global 连接及其一个 Allowed Model ID。创建 Agent 时复制 pair；以后修改默认值不改变已有 Agent。
 - 没有 selection 的 Agent 仍可保存和查看，但属于 model-unconfigured，不能启动新 Turn。
-- Codex Subagent Definition 不提交 selection 时继承 Agent pair；显式提交时必须是另一个完整、可授权 pair。
+- Subagent Definition 不提交 selection 时继承 Agent pair；显式提交时必须是另一个完整、可授权 pair。
 
 ## Agent Model Settings
 
-根 Agent 保存一个完整 `model_settings` 对象。枚举的 `default` 和数值/字符串的 `null` 表示保持 Codex/provider 自动行为：
+根 Agent 保存一个完整 `model_settings` 对象。枚举的 `default` 和数值/字符串的 `null` 表示保持 Execution Engine/provider 自动行为：
 
-| 字段 | 自动值 | Codex 原生配置 | 约束 |
+| 字段 | 自动值 | 执行边界 | 约束 |
 | --- | --- | --- | --- |
-| `reasoning_effort` | `default` | `model_reasoning_effort` | `default`、`none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`ultra` |
-| `reasoning_summary` | `default` | `model_reasoning_summary` | `default`、`auto`、`concise`、`detailed`、`none` |
-| `verbosity` | `default` | `model_verbosity` | `default`、`low`、`medium`、`high` |
-| `context_window_tokens` | `null` | `model_context_window` | 正整数 |
-| `auto_compact_token_limit` | `null` | `model_auto_compact_token_limit` | 正整数，不大于 context window |
-| `reasoning_summary_support` | `auto` | `model_supports_reasoning_summaries` | `auto`、`supported`、`unsupported` |
-| `service_tier` | `null` | `service_tier` | trim 后 1 到 64 字符 |
-| `request_max_retries` | `null` | provider `request_max_retries` | `0..100` |
-| `stream_max_retries` | `null` | provider `stream_max_retries` | `0..100` |
-| `stream_idle_timeout_ms` | `null` | provider `stream_idle_timeout_ms` | 正整数毫秒 |
+| `reasoning_effort` | `default` | Engine/Gateway reasoning | `default`、`none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`ultra` |
+| `reasoning_summary` | `default` | Run binding/provider | `default`、`auto`、`concise`、`detailed`、`none` |
+| `verbosity` | `default` | Run binding/provider | `default`、`low`、`medium`、`high` |
+| `context_window_tokens` | `null` | Engine context window | 正整数 |
+| `auto_compact_token_limit` | `null` | Run binding | 正整数，不大于 context window |
+| `reasoning_summary_support` | `auto` | Run binding/provider capability | `auto`、`supported`、`unsupported` |
+| `service_tier` | `null` | provider request | trim 后 1 到 64 字符 |
+| `request_max_retries` | `null` | Engine provider client | `0..100` |
+| `stream_max_retries` | `null` | Engine provider client | `0..100` |
+| `stream_idle_timeout_ms` | `null` | Engine provider client | 正整数毫秒 |
 
 `request_settings` 是与有效 API Type 一致的 tagged object：
 
@@ -92,9 +92,9 @@ Base URL 不包含 `/v1`，可以包含业务路径。Global 和 Personal URL �
 Subagent 使用 `model_settings_override`：
 
 - 字段缺失表示继承 Agent；枚举可以显式提交 `default`，nullable 数值/字符串可以显式提交 `null`，从而覆盖 Agent 并恢复自动行为。
-- 有具体值时覆盖 Agent。有效优先级逐字段为：Subagent override、Agent value、Codex/provider 自动行为。
+- 有具体值时覆盖 Agent。有效优先级逐字段为：Subagent override、Agent value、Execution Engine/provider 自动行为。
 - 未显式选择另一 pair 时，请求设置按字段继承且协议相同。显式选择不同 API Type 时，缺失的 `request_settings` 使用新 API Type 的全自动对象，不能继承不兼容协议字段。
-- Runtime 只把 Codex 原生字段写入受控 TOML；协议专属 request settings 只进入 Hub 到 Gateway 的 envelope。
+- Runtime 只把当前 driver 支持的执行字段写入受控 Pi 配置；协议专属 request settings 只进入 Hub 到 Gateway 的 envelope。
 
 ## 引用、删除和生效边界
 
@@ -124,7 +124,7 @@ Subagent 使用 `model_settings_override`：
 ```
 
 1. Runtime claim 只包含 binding snapshots，不含 provider endpoint、Key 或 connection-level secret。
-2. Runtime 为每个 binding 渲染受控 Codex provider，并通过 loopback proxy 发送 Run ID、binding ID 和 run-scoped token。
+2. Runtime 为主 binding 渲染受控 Pi provider，并通过 loopback proxy 发送 Run ID、binding ID 和 run-scoped token。
 3. Hub 只接受 binding ID。它必须属于认证的 active Run，且 request `model` 等于 binding Model ID。
 4. Hub 验证 Runtime、Run、Agent scope、binding snapshot 和 live connection enabled state；每次请求读取一次 live endpoint/ciphertext 并解密 Key。
 5. Hub 使用 binding 的 API Type 和 effective request settings 调用 Gateway。两个 Agent 即使共享 connection/model，也由不同 binding ID 保留各自设置。

@@ -53,6 +53,85 @@ test('priority helper only accepts a prioritized or runtime-owned target run', (
   expect(() => validatePrioritizeResult(runId, `30000000-0000-4000-8000-000000000001|running|20000000-0000-4000-8000-000000000001|t|f`)).toThrow(/unexpected target/);
 });
 
+test('widget remains usable when randomUUID is unavailable on non-secure HTTP', async ({ page }) => {
+  const pageErrors: string[] = [];
+  page.on('pageerror', (error) => pageErrors.push(error.message));
+  await page.addInitScript(() => {
+    Object.defineProperty(globalThis.crypto, 'randomUUID', {
+      configurable: true,
+      value: undefined
+    });
+  });
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === '/api/widget/session') {
+      return route.fulfill({ json: {
+        id: 'agent-id',
+        name: 'Non-secure HTTP Widget Agent',
+        instructions: 'Exercise Widget channel ID fallback behavior.'
+      } });
+    }
+    return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });
+  });
+
+  await page.goto('/widget#token=widget-token');
+  await expect(page).toHaveURL(/\/widget$/);
+  await expect(page.getByText('Non-secure HTTP Widget Agent')).toBeVisible();
+  await expect(page.getByRole('textbox', { name: 'Message' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Send' })).toBeDisabled();
+  expect(pageErrors).toEqual([]);
+});
+
+test('widget matches the platform chat interaction and event presentation', async ({ page }) => {
+  const runId = '70000000-0000-0000-0000-000000000000';
+  let runRequests = 0;
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === '/api/widget/session') return route.fulfill({ json: { id: 'agent-id', name: 'Chat Widget Agent', instructions: '' } });
+    if (path === '/api/widget/runs' && request.method() === 'POST') {
+      runRequests += 1;
+      return route.fulfill({ json: {
+        id: runId, agent_id: 'agent-id', automation_id: null, integration_session_id: null,
+        parent_run_id: null, runtime_id: null, status: 'running', initial_message: 'Hello agent',
+        native_session_id: null, work_dir_ref: null, source: 'widget', created_at: new Date().toISOString(), updated_at: new Date().toISOString()
+      } });
+    }
+    if (path === `/api/runs/${runId}/events/stream`) {
+      const events = [
+        { seq: 1, run_id: runId, event_type: 'item', role: null, content: null, payload: { item_id: 'reasoning-1', item_type: 'reasoning', phase: 'completed', summary: ['Checked the request.'], duration_ms: 800 }, created_at: '2026-07-24T10:00:01.000Z' },
+        { seq: 2, run_id: runId, event_type: 'message', role: 'assistant', content: 'Hello from the agent.', payload: {}, created_at: '2026-07-24T10:00:02.000Z' },
+        { seq: 3, run_id: runId, event_type: 'status', role: null, content: 'completed', payload: { status: 'completed' }, created_at: '2026-07-24T10:00:03.000Z' }
+      ];
+      return route.fulfill({
+        contentType: 'text/event-stream',
+        body: events.map((event) => `event: run_event\ndata: ${JSON.stringify(event)}\n\n`).join('')
+      });
+    }
+    return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });
+  });
+
+  await page.goto('/widget#token=widget-token');
+  const composer = page.getByRole('textbox', { name: 'Message' });
+  await expect(page.locator('.widget.session-chat')).toBeVisible();
+  await composer.fill('First line');
+  await composer.press('Shift+Enter');
+  await expect(composer).toHaveValue('First line\n');
+  expect(runRequests).toBe(0);
+  await composer.fill('Hello agent');
+  await composer.press('Enter');
+  await expect(page.locator('.session-bubble.role-user')).toContainText('Hello agent');
+  await expect(page.getByText('Hello from the agent.', { exact: true })).toBeVisible();
+  await expect(page.getByText('assistant: Hello from the agent.', { exact: true })).toHaveCount(0);
+  const activity = page.locator('.session-activity-events');
+  await expect(activity).toContainText(/Worked for/);
+  await activity.locator('summary').click();
+  await expect(activity).toContainText('Checked the request.');
+  await expect(composer).toHaveValue('');
+  await expect(page.getByRole('button', { name: 'Send' })).toBeDisabled();
+  expect(runRequests).toBe(1);
+});
+
 test('widget serializes rapid submissions and exposes pending UI', async ({ page }) => {
   const runId = '70000000-0000-0000-0000-000000000001';
   let runRequests = 0;
@@ -77,14 +156,17 @@ test('widget serializes rapid submissions and exposes pending UI', async ({ page
     (form as HTMLFormElement).requestSubmit();
   });
   await expect.poll(() => runRequests).toBe(1);
+  await expect(page.locator('.session-bubble.role-user')).toContainText('Submit once');
+  await expect(page.getByRole('status', { name: 'Thinking...' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Sending...' })).toBeDisabled();
   if (!heldRoute.current) throw new Error('Widget run route was not captured');
   await heldRoute.current.fulfill({ json: {
     id: runId, agent_id: 'agent-id', automation_id: null, integration_session_id: null,
     parent_run_id: null, runtime_id: null, status: 'pending', initial_message: 'Submit once',
-    session_id: null, work_dir_ref: null, source: 'widget', created_at: new Date().toISOString(), updated_at: new Date().toISOString()
+    native_session_id: null, work_dir_ref: null, source: 'widget', created_at: new Date().toISOString(), updated_at: new Date().toISOString()
   } });
-  await expect(page.getByRole('button', { name: 'Send' })).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'Send' })).toBeDisabled();
+  await expect(page.getByRole('textbox', { name: 'Message' })).toHaveValue('');
   expect(runRequests).toBe(1);
 });
 
@@ -101,7 +183,7 @@ test('widget stream ignores malformed SSE JSON and keeps later events', async ({
     if (path === '/api/widget/runs' && request.method() === 'POST') return route.fulfill({ json: {
       id: runId, agent_id: 'agent-id', automation_id: null, integration_session_id: null,
       parent_run_id: null, runtime_id: null, status: 'running', initial_message: 'Malformed stream',
-      session_id: null, work_dir_ref: null, source: 'widget', created_at: new Date().toISOString(), updated_at: new Date().toISOString()
+      native_session_id: null, work_dir_ref: null, source: 'widget', created_at: new Date().toISOString(), updated_at: new Date().toISOString()
     } });
     if (path === `/api/runs/${runId}/events/stream`) return route.fulfill({
       contentType: 'text/event-stream',
@@ -111,8 +193,9 @@ test('widget stream ignores malformed SSE JSON and keeps later events', async ({
   });
   await page.goto('/widget#token=widget-token');
   await expect(page.getByText('Malformed Widget Agent')).toBeVisible();
+  await page.getByRole('textbox', { name: 'Message' }).fill('Malformed stream');
   await page.getByRole('button', { name: 'Send' }).click();
-  await expect(page.getByText('assistant: Valid widget event')).toBeVisible();
+  await expect(page.getByText('Valid widget event', { exact: true })).toBeVisible();
   expect(pageErrors).toEqual([]);
   expect(consoleErrors).toEqual([]);
 });
@@ -121,17 +204,17 @@ function modelProxyConfigProbe(workDirRef: string) {
   const runRoot = dirname(workDirRef);
   const script = `
 set -eu
-config="${runRoot}/codex/config.toml"
-test -f "$config"
-provider_section=no
-responses_wire=no
+models="${runRoot}/engine-state/.pi/agent/models.json"
+test -f "$models"
+provider=no
+responses_api=no
 loopback_base_url=no
 zero_port=no
-grep -F '[model_providers.agent_hub_' "$config" >/dev/null && provider_section=yes
-grep -F 'wire_api = "responses"' "$config" >/dev/null && responses_wire=yes
-grep -E 'base_url = "http://127\\.0\\.0\\.1:[0-9]+/v1"' "$config" >/dev/null && loopback_base_url=yes
-grep -F 'base_url = "http://127.0.0.1:0/v1"' "$config" >/dev/null && zero_port=yes
-printf '{"providerSection":"%s","responsesWire":"%s","loopbackBaseUrl":"%s","zeroPort":"%s"}' "$provider_section" "$responses_wire" "$loopback_base_url" "$zero_port"
+grep -F '"agent-hub-' "$models" >/dev/null && provider=yes
+grep -F '"api": "openai-responses"' "$models" >/dev/null && responses_api=yes
+grep -E '"baseUrl": "http://127\\.0\\.0\\.1:[0-9]+/v1"' "$models" >/dev/null && loopback_base_url=yes
+grep -F '"baseUrl": "http://127.0.0.1:0/v1"' "$models" >/dev/null && zero_port=yes
+printf '{"provider":"%s","responsesApi":"%s","loopbackBaseUrl":"%s","zeroPort":"%s"}' "$provider" "$responses_api" "$loopback_base_url" "$zero_port"
 `;
   return JSON.parse(execFileSync('docker', [
     ...composeArgs(),
@@ -578,7 +661,7 @@ async function cleanupResources(
   if (errors.length > 0) throw new AggregateError(errors, description);
 }
 
-const consoleRunTestTitle = 'console, widget, and automations run through the app-server Codex driver';
+const consoleRunTestTitle = 'console, widget, and automations run through the Pi execution engine';
 let consoleRunCleanupIds: { agentIds: string[]; skillId: string | null } | null = null;
 
 test.afterEach(async ({ request: cleanupApi }, testInfo) => {
@@ -651,7 +734,7 @@ test('runtime page shows the effective sandbox and deterministic downgrade reaso
       data: {
         hostname,
         labels: ['playwright', 'sandbox-downgrade'],
-        codex_version: 'sandbox-evidence-e2e',
+        engine_version: 'sandbox-evidence-e2e',
         capabilities: {
           model_proxy: true,
           sandbox_downgraded: true,
@@ -701,7 +784,7 @@ test('runtime rotates its persisted credential without re-registering and resume
     expect(runtimesResponse.ok()).toBeTruthy();
     const runtimes = await runtimesResponse.json() as Array<{
       capabilities: Record<string, unknown>;
-      codex_version: string;
+      engine_version: string;
       hostname: string;
       id: string;
       labels: string[];
@@ -784,7 +867,7 @@ test(consoleRunTestTitle, async ({ page, context, baseURL }) => {
   const managedAgentResponse = await createAgentThroughUi(
     page,
     agentName,
-    'Respond from fake Codex for browser validation.'
+    'Respond through the test execution engine for browser validation.'
   );
   expect(managedAgentResponse.ok()).toBeTruthy();
   const managedAgent = await managedAgentResponse.json() as { id: string };
@@ -796,7 +879,7 @@ test(consoleRunTestTitle, async ({ page, context, baseURL }) => {
   await page.getByRole('tab', { name: 'Instructions' }).click();
   const instructionsPanel = page.getByRole('tabpanel', { name: 'Instructions' });
   await instructionsPanel.getByLabel('Name', { exact: true }).fill(managedAgentName);
-  await instructionsPanel.getByRole('textbox', { name: 'Instructions' }).fill('Respond from fake Codex with managed Agent configuration.');
+  await instructionsPanel.getByRole('textbox', { name: 'Instructions' }).fill('Respond through the test execution engine with managed Agent configuration.');
   await instructionsPanel.getByRole('button', { name: 'Save agent' }).click();
 
   await page.getByRole('tab', { name: 'Access' }).click();
@@ -837,7 +920,7 @@ test(consoleRunTestTitle, async ({ page, context, baseURL }) => {
   const targetRun = await targetRunResponse.json() as { id: string; hub_session_id: string | null };
   expect(targetRun.hub_session_id).toBeTruthy();
   prioritizePendingRunForRuntimeClaim(targetRun.id);
-  await expect(sessionDetail.getByText('Fake Codex completed run')).toBeVisible({ timeout: 30_000 });
+  await expect(sessionDetail.getByText('completed run')).toBeVisible({ timeout: 30_000 });
   await expect.poll(async () => {
     const response = await page.request.get(`/api/runs/${targetRun.id}`);
     if (!response.ok()) return null;
@@ -849,8 +932,8 @@ test(consoleRunTestTitle, async ({ page, context, baseURL }) => {
   expect(firstRun?.work_dir_ref).toBeTruthy();
   if (!firstRun.work_dir_ref) throw new Error('first Run work directory is missing');
   expect(modelProxyConfigProbe(firstRun.work_dir_ref)).toEqual({
-    providerSection: 'yes',
-    responsesWire: 'yes',
+    provider: 'yes',
+    responsesApi: 'yes',
     loopbackBaseUrl: 'yes',
     zeroPort: 'no'
   });
@@ -859,9 +942,9 @@ test(consoleRunTestTitle, async ({ page, context, baseURL }) => {
   if (!sessionId) throw new Error('first Run Session id is missing');
   const firstSessionResponse = await page.request.get(`/api/sessions/${sessionId}`);
   expect(firstSessionResponse.ok()).toBeTruthy();
-  const firstSession = await firstSessionResponse.json() as { native_thread_id: string | null };
-  expect(firstSession.native_thread_id).toBeTruthy();
-  await sessionDetail.getByRole('textbox', { name: 'Message' }).fill('Resume the selected Codex thread from Playwright');
+  const firstSession = await firstSessionResponse.json() as { native_session_id: string | null };
+  expect(firstSession.native_session_id).toBeTruthy();
+  await sessionDetail.getByRole('textbox', { name: 'Message' }).fill('Resume the selected execution engine session from Playwright');
   const resumeRunResponsePromise = page.waitForResponse((response) => response.request().method() === 'POST'
     && new URL(response.url()).pathname === `/api/sessions/${sessionId}/messages`);
   await sessionDetail.getByRole('button', { name: 'Send' }).click();
@@ -869,7 +952,7 @@ test(consoleRunTestTitle, async ({ page, context, baseURL }) => {
   expect(resumeRunResponse.ok()).toBeTruthy();
   const acceptedMessage = await resumeRunResponse.json() as { run: { id: string } };
   prioritizePendingRunForRuntimeClaim(acceptedMessage.run.id);
-  await expect(sessionDetail.getByText('Resume the selected Codex thread from Playwright', { exact: true })).toBeVisible();
+  await expect(sessionDetail.getByText('Resume the selected execution engine session from Playwright', { exact: true })).toBeVisible();
   await expect.poll(async () => {
     const response = await page.request.get(`/api/runs/${acceptedMessage.run.id}`);
     if (!response.ok()) return null;
@@ -881,8 +964,8 @@ test(consoleRunTestTitle, async ({ page, context, baseURL }) => {
   expect(resumedRun.hub_session_id).toBe(sessionId);
   const continuedSessionResponse = await page.request.get(`/api/sessions/${sessionId}`);
   expect(continuedSessionResponse.ok()).toBeTruthy();
-  const continuedSession = await continuedSessionResponse.json() as { native_thread_id: string | null };
-  expect(continuedSession.native_thread_id).toBe(firstSession.native_thread_id);
+  const continuedSession = await continuedSessionResponse.json() as { native_session_id: string | null };
+  expect(continuedSession.native_session_id).toBe(firstSession.native_session_id);
 
   const widgetSessionResponse = await page.request.post('/api/embed/sessions', {
     data: { agent_id: createdManagedAgentId }
@@ -896,11 +979,12 @@ test(consoleRunTestTitle, async ({ page, context, baseURL }) => {
   await expect(widget.getByText(managedAgentName)).toBeVisible();
   const widgetRunResponsePromise = widget.waitForResponse((response) => response.request().method() === 'POST'
     && new URL(response.url()).pathname === '/api/widget/runs');
+  await widget.getByRole('textbox', { name: 'Message' }).fill('Run through the Widget');
   await widget.getByRole('button', { name: 'Send' }).click();
   const widgetRunResponse = await widgetRunResponsePromise;
   expect(widgetRunResponse.ok()).toBeTruthy();
   prioritizePendingRunForRuntimeClaim((await widgetRunResponse.json() as { id: string }).id);
-  await expect(widget.getByText('Fake Codex completed run')).toBeVisible({ timeout: 30_000 });
+  await expect(widget.getByText('completed run')).toBeVisible({ timeout: 30_000 });
 
   await widget.close();
   widget = null;
@@ -911,7 +995,7 @@ test(consoleRunTestTitle, async ({ page, context, baseURL }) => {
   const automationAgentResponse = await createAgentThroughUi(
     page,
     automationAgentName,
-    'Run Automation fixtures through the app-server Codex driver.'
+    'Run Automation fixtures through the Pi execution engine.'
   );
   expect(automationAgentResponse.ok()).toBeTruthy();
   const createdAutomationAgentId = (await automationAgentResponse.json() as { id: string }).id;
@@ -956,7 +1040,7 @@ test(consoleRunTestTitle, async ({ page, context, baseURL }) => {
   await expect(manualHistoryRow).toContainText('Automation run from Playwright');
   await manualHistoryRow.click();
   const manualRunEvents = page.getByRole('region', { name: 'Run events' });
-  await expect(manualRunEvents).toContainText('Fake Codex completed run');
+  await expect(manualRunEvents).toContainText('completed run');
   await expect(manualRunEvents.locator('.status.completed')).toBeVisible();
   const manualAutomationId = (await (await page.request.get('/api/automations')).json() as Array<{ id: string; name: string }>).find((automation) => automation.name === automationName)?.id;
   expect(manualRun.automation_id).toBe(manualAutomationId);
@@ -1023,7 +1107,7 @@ test(consoleRunTestTitle, async ({ page, context, baseURL }) => {
   const scheduledAgentResponse = await createAgentThroughUi(
     page,
     scheduledAgentName,
-    'Run scheduled Automation fixtures through the app-server Codex driver.'
+    'Run scheduled Automation fixtures through the Pi execution engine.'
   );
   expect(scheduledAgentResponse.ok()).toBeTruthy();
   const createdScheduledAgentId = (await scheduledAgentResponse.json() as { id: string }).id;
@@ -1084,13 +1168,13 @@ test(consoleRunTestTitle, async ({ page, context, baseURL }) => {
   await expect(intervalRunRow).toContainText('completed');
   await expect(intervalRunRow).toContainText('Scheduled automation');
   await intervalRunRow.click();
-  await expect(page.getByText('Fake Codex completed run')).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByText('completed run')).toBeVisible({ timeout: 30_000 });
   const cronRunRow = page.locator(`[data-run-id="${cronRunId}"]`);
   await expect(cronRunRow).toContainText(cronRunMessage);
   await expect(cronRunRow).toContainText('completed');
   await expect(cronRunRow).toContainText('Scheduled automation');
   await cronRunRow.click();
-  await expect(page.getByText('Fake Codex completed run')).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByText('completed run')).toBeVisible({ timeout: 30_000 });
 
   await page.goto('/runtimes');
   const composeRuntimeRow = page.getByRole('button', { name: /compose-runtime-1 online/ });
@@ -1098,7 +1182,7 @@ test(consoleRunTestTitle, async ({ page, context, baseURL }) => {
   await composeRuntimeRow.click();
   const runtimeDetail = page.getByRole('region', { name: 'Runtime details' });
   await expect(runtimeDetail.getByText('online').first()).toBeVisible();
-  await expect(runtimeDetail.getByText('driver:app-server').first()).toBeVisible();
+  await expect(runtimeDetail.getByText('driver:pi').first()).toBeVisible();
   await expect(runtimeDetail.getByText('unmanaged').first()).toBeVisible();
   await expect(runtimeDetail.locator('dt', { hasText: /^Model proxy$/ }).locator('..').locator('dd')).toHaveText('Enabled');
 
@@ -1357,7 +1441,7 @@ test('archiving an agent wins against a registered runtime claim and fails the p
       data: {
         hostname: `batch1-claim-archive-${nonce}`,
         labels: ['playwright', 'batch1'],
-        codex_version: 'batch1-e2e',
+        engine_version: 'batch1-e2e',
         capabilities: { model_proxy: true, mcp_allowlist: false },
         sandbox_mode: 'workspace-write'
       }

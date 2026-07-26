@@ -1,8 +1,8 @@
 # Agent Hub QA Scenarios
 
 This directory contains unattended end-to-end scenarios that use an isolated
-Docker Compose environment. The environment uses fake Codex, a fake Responses
-provider, and Mock OIDC; it does not call a real AI service.
+Docker Compose environment. The environment uses a fake Pi RPC process, a fake
+model provider, and Mock OIDC; it does not call a real AI service.
 
 ## Coverage contract
 

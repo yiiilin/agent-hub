@@ -1,7 +1,6 @@
 import {
   Eye,
   KeyRound,
-  PackageCheck,
   Pencil,
   Plus,
   Save,
@@ -10,13 +9,12 @@ import {
   UserX,
   Users
 } from 'lucide-react';
-import { FormEvent, KeyboardEvent, useEffect, useRef, useState } from 'react';
+import { FormEvent, KeyboardEvent, useEffect, useState } from 'react';
 import {
   api,
   type AdminUserDetail,
   type AuthenticationChannel,
   type AuthPolicy,
-  type CodexVersionRollout,
   type ExternalPlatform,
   type User,
   type UserErasure
@@ -31,15 +29,9 @@ const emptyPolicy: AuthPolicy = {
   email_verification_required: false
 };
 
-type AdministrationTab = 'authentication' | 'platforms' | 'users' | 'codex';
+type AdministrationTab = 'authentication' | 'platforms' | 'users';
 type PlatformDialogState = { mode: 'create' } | { mode: 'edit'; platform: ExternalPlatform };
 type UserDialogState = { kind: 'details' | 'password' | 'erase'; detail: AdminUserDetail };
-
-const CODEX_ROLLOUT_POLL_INTERVAL_MS = 2_000;
-
-function isCodexRolloutPending(status: string) {
-  return status === 'downloading' || status === 'distributing';
-}
 
 function Feedback({ error, notice }: { error: boolean; notice: string }) {
   const { t } = useI18n();
@@ -492,151 +484,13 @@ function UsersTab({ currentUser }: { currentUser: User }) {
   </div>;
 }
 
-function CodexVersionTab() {
-  const { t } = useI18n();
-  const [rollout, setRollout] = useState<CodexVersionRollout | null>(null);
-  const [targetVersion, setTargetVersion] = useState('');
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [actionError, setActionError] = useState(false);
-  const [notice, setNotice] = useState('');
-  const [pollStartGeneration, setPollStartGeneration] = useState(0);
-  const rolloutGeneration = useRef(0);
-  const pollController = useRef<AbortController | null>(null);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    api.codexVersionRollout(controller.signal)
-      .then((response) => {
-        setRollout(response);
-        setLoadError(false);
-      })
-      .catch(() => { if (!controller.signal.aborted) setLoadError(true); })
-      .finally(() => { if (!controller.signal.aborted) setLoading(false); });
-    return () => {
-      rolloutGeneration.current += 1;
-      pollController.current?.abort();
-      controller.abort();
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!rollout || !isCodexRolloutPending(rollout.status)) return;
-    const generation = rolloutGeneration.current;
-    let active = true;
-    let timer: number | undefined;
-
-    const poll = async () => {
-      if (!active || generation !== rolloutGeneration.current) return;
-      const controller = new AbortController();
-      pollController.current = controller;
-      try {
-        const response = await api.codexVersionRollout(controller.signal);
-        if (!active || controller.signal.aborted || generation !== rolloutGeneration.current) return;
-        setActionError(false);
-        setRollout(response);
-        if (isCodexRolloutPending(response.status)) {
-          timer = window.setTimeout(poll, CODEX_ROLLOUT_POLL_INTERVAL_MS);
-        }
-      } catch {
-        if (active && !controller.signal.aborted && generation === rolloutGeneration.current) {
-          setActionError(true);
-          timer = window.setTimeout(poll, CODEX_ROLLOUT_POLL_INTERVAL_MS);
-        }
-      } finally {
-        if (pollController.current === controller) pollController.current = null;
-      }
-    };
-
-    timer = window.setTimeout(poll, CODEX_ROLLOUT_POLL_INTERVAL_MS);
-    return () => {
-      active = false;
-      if (timer !== undefined) window.clearTimeout(timer);
-      pollController.current?.abort();
-    };
-  }, [pollStartGeneration, rollout?.status, rollout?.target_version]);
-
-  async function prepareVersion(event: FormEvent) {
-    event.preventDefault();
-    const version = targetVersion.trim();
-    if (busy || !version) return;
-    setBusy(true);
-    setActionError(false);
-    setNotice('');
-    const generation = rolloutGeneration.current + 1;
-    rolloutGeneration.current = generation;
-    pollController.current?.abort();
-    try {
-      const response = await api.setCodexTargetVersion(version);
-      if (generation !== rolloutGeneration.current) return;
-      setRollout(response);
-      setTargetVersion('');
-      setNotice(t('codexVersionPrepared'));
-    } catch {
-      if (generation === rolloutGeneration.current) setActionError(true);
-    } finally {
-      if (generation === rolloutGeneration.current) {
-        setPollStartGeneration(generation);
-        setBusy(false);
-      }
-    }
-  }
-
-  async function promoteVersion() {
-    if (busy) return;
-    setBusy(true);
-    setActionError(false);
-    setNotice('');
-    const generation = rolloutGeneration.current + 1;
-    rolloutGeneration.current = generation;
-    pollController.current?.abort();
-    try {
-      const response = await api.promoteCodexTargetVersion();
-      if (generation !== rolloutGeneration.current) return;
-      setRollout(response);
-      setNotice(t('codexVersionPromoted'));
-    } catch {
-      if (generation === rolloutGeneration.current) setActionError(true);
-    } finally {
-      if (generation === rolloutGeneration.current) {
-        setPollStartGeneration(generation);
-        setBusy(false);
-      }
-    }
-  }
-
-  if (loading) return <div className="panel state-panel" role="status">{t('loadingAdministration')}</div>;
-  if (loadError) return <div className="panel state-panel" role="alert"><p>{t('administrationLoadFailed')}</p></div>;
-
-  return <div className="administration-tab-content">
-    <Feedback error={actionError} notice={notice} />
-    <section className="admin-section administration-codex" aria-labelledby="codex-rollout-title">
-      <header><PackageCheck size={18} /><div><h2 id="codex-rollout-title">{t('codexRollout')}</h2><p>{t('codexRolloutHelp')}</p></div></header>
-      {rollout && <dl className="admin-summary">
-        <div><dt>{t('activeVersion')}</dt><dd>{rollout.active_version ?? t('none')}</dd></div>
-        <div><dt>{t('targetVersion')}</dt><dd>{rollout.target_version ?? t('none')}</dd></div>
-        <div><dt>{t('status')}</dt><dd><span className={`status ${rollout.status}`}>{rollout.status}</span></dd></div>
-      </dl>}
-      {rollout?.error && <p className="error">{rollout.error}</p>}
-      <form className="admin-inline-form" onSubmit={prepareVersion}>
-        <label>{t('targetCodexVersion')}<input value={targetVersion} onChange={(event) => setTargetVersion(event.target.value)} /></label>
-        <button className="secondary" disabled={busy || !targetVersion.trim()}><PackageCheck size={15} /> {busy ? t('saving') : t('prepareVersion')}</button>
-      </form>
-      {rollout?.target_version && rollout.status === 'ready' && <button type="button" className="primary admin-save" disabled={busy} onClick={promoteVersion}>{t('promoteReadyVersion')}</button>}
-      {rollout && rollout.runtimes.length > 0 && <div className="rollout-runtime-list"><strong>{t('runtimeReadiness')}</strong>{rollout.runtimes.map((runtime) => <div key={runtime.runtime_id}><span><b>{runtime.hostname}</b><small>{runtime.os}/{runtime.architecture}</small></span><code>{runtime.current_version}</code><span className={`status ${runtime.status}`}>{runtime.status}</span></div>)}</div>}
-    </section>
-  </div>;
-}
-
 export function AdministrationPage({ currentUser }: { currentUser: User }) {
   const { t } = useI18n();
   const [activeTab, setActiveTab] = useState<AdministrationTab>('authentication');
   const tabs = [
     { id: 'authentication' as const, label: t('authentication'), icon: ShieldCheck },
     { id: 'platforms' as const, label: t('externalPlatforms'), icon: Settings },
-    { id: 'users' as const, label: t('userManagement'), icon: Users },
-    { id: 'codex' as const, label: t('codexVersion'), icon: PackageCheck }
+    { id: 'users' as const, label: t('userManagement'), icon: Users }
   ];
 
   function handleTabKeyDown(event: KeyboardEvent<HTMLButtonElement>, index: number) {
@@ -676,7 +530,6 @@ export function AdministrationPage({ currentUser }: { currentUser: User }) {
       {activeTab === 'authentication' && <AuthenticationTab />}
       {activeTab === 'platforms' && <ExternalPlatformsTab />}
       {activeTab === 'users' && <UsersTab currentUser={currentUser} />}
-      {activeTab === 'codex' && <CodexVersionTab />}
     </div>
   </div>;
 }

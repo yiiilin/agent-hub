@@ -178,12 +178,12 @@ BEGIN
                 MESSAGE = 'Hub Session ownership generation cannot decrease';
         END IF;
 
-        IF OLD.native_thread_id IS NOT NULL
-            AND NEW.native_thread_id IS DISTINCT FROM OLD.native_thread_id
+        IF OLD.native_session_id IS NOT NULL
+            AND NEW.native_session_id IS DISTINCT FROM OLD.native_session_id
         THEN
             RAISE EXCEPTION USING
                 ERRCODE = '23514',
-                MESSAGE = 'native Thread binding cannot be cleared or replaced';
+                MESSAGE = 'native Session binding cannot be cleared or replaced';
         END IF;
 
         IF NEW.history_checkpoint < OLD.history_checkpoint THEN
@@ -759,7 +759,7 @@ BEGIN
     IF NEW.api_type IS DISTINCT FROM OLD.api_type AND (
         EXISTS (SELECT 1 FROM agents WHERE model_connection_id = OLD.id)
         OR EXISTS (
-            SELECT 1 FROM codex_subagent_definitions
+            SELECT 1 FROM subagent_definitions
             WHERE model_connection_id = OLD.id
         )
         OR EXISTS (
@@ -776,7 +776,7 @@ BEGIN
         WHERE model_connection_id = OLD.id
           AND NOT (model_id = ANY(NEW.allowed_model_ids))
     ) OR EXISTS (
-        SELECT 1 FROM codex_subagent_definitions
+        SELECT 1 FROM subagent_definitions
         WHERE model_connection_id = OLD.id
           AND NOT (model_id = ANY(NEW.allowed_model_ids))
     ) OR EXISTS (
@@ -884,7 +884,7 @@ CREATE TABLE public.automations (
     updated_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
-CREATE TABLE public.codex_subagent_definitions (
+CREATE TABLE public.subagent_definitions (
     id uuid NOT NULL,
     agent_id uuid NOT NULL,
     name text NOT NULL,
@@ -897,39 +897,14 @@ CREATE TABLE public.codex_subagent_definitions (
     disabled_reason text,
     created_at timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
     updated_at timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
-    CONSTRAINT codex_subagent_description_nonempty CHECK ((btrim(description) <> ''::text)),
-    CONSTRAINT codex_subagent_disabled_shape_check CHECK ((((enabled = true) AND (disabled_reason IS NULL)) OR ((enabled = false) AND (disabled_reason IS NOT NULL) AND (btrim(disabled_reason) <> ''::text)))),
-    CONSTRAINT codex_subagent_instructions_nonempty CHECK ((btrim(developer_instructions) <> ''::text)),
-    CONSTRAINT codex_subagent_model_selection_shape_check CHECK (((model_connection_id IS NULL) = (model_id IS NULL))),
-    CONSTRAINT codex_subagent_model_settings_override_check CHECK (public.validate_agent_model_settings_override(model_settings_override)),
-    CONSTRAINT codex_subagent_name_nonempty CHECK ((btrim(name) <> ''::text)),
-    CONSTRAINT codex_subagent_name_not_reserved CHECK ((lower(btrim(name)) <> 'main'::text)),
-    CONSTRAINT codex_subagent_model_id_nonempty CHECK ((model_id IS NULL OR btrim(model_id) <> ''::text))
-);
-
-CREATE TABLE public.codex_version_artifacts (
-    version text NOT NULL,
-    os text NOT NULL,
-    architecture text NOT NULL,
-    artifact_name text NOT NULL,
-    sha256 text NOT NULL,
-    size_bytes bigint NOT NULL,
-    storage_path text NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT codex_version_artifacts_sha256_check CHECK ((sha256 ~ '^[0-9a-f]{64}$'::text)),
-    CONSTRAINT codex_version_artifacts_size_bytes_check CHECK ((size_bytes >= 0))
-);
-
-CREATE TABLE public.codex_version_rollout (
-    singleton boolean DEFAULT true NOT NULL,
-    active_version text,
-    target_version text,
-    status text DEFAULT 'idle'::text NOT NULL,
-    error text,
-    attempt_id uuid,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT codex_version_rollout_singleton_check CHECK (singleton),
-    CONSTRAINT codex_version_rollout_status_check CHECK ((status = ANY (ARRAY['idle'::text, 'downloading'::text, 'distributing'::text, 'ready'::text, 'failed'::text, 'active'::text])))
+    CONSTRAINT subagent_description_nonempty CHECK ((btrim(description) <> ''::text)),
+    CONSTRAINT subagent_disabled_shape_check CHECK ((((enabled = true) AND (disabled_reason IS NULL)) OR ((enabled = false) AND (disabled_reason IS NOT NULL) AND (btrim(disabled_reason) <> ''::text)))),
+    CONSTRAINT subagent_instructions_nonempty CHECK ((btrim(developer_instructions) <> ''::text)),
+    CONSTRAINT subagent_model_selection_shape_check CHECK (((model_connection_id IS NULL) = (model_id IS NULL))),
+    CONSTRAINT subagent_model_settings_override_check CHECK (public.validate_agent_model_settings_override(model_settings_override)),
+    CONSTRAINT subagent_name_nonempty CHECK ((btrim(name) <> ''::text)),
+    CONSTRAINT subagent_name_not_reserved CHECK ((lower(btrim(name)) <> 'main'::text)),
+    CONSTRAINT subagent_model_id_nonempty CHECK ((model_id IS NULL OR btrim(model_id) <> ''::text))
 );
 
 CREATE TABLE public.embed_jwt_replays (
@@ -1026,7 +1001,7 @@ CREATE TABLE public.hub_sessions (
     origin_tenant_id text,
     origin_external_identity_id uuid,
     lifecycle_status text NOT NULL,
-    native_thread_id text,
+    native_session_id text,
     active_turn_id uuid,
     history_checkpoint bigint DEFAULT 0 NOT NULL,
     configuration_fingerprint text,
@@ -1039,7 +1014,7 @@ CREATE TABLE public.hub_sessions (
     current_bundle_size_bytes bigint,
     current_bundle_history_checkpoint bigint,
     current_bundle_ownership_generation bigint,
-    current_bundle_producing_codex_version text,
+    current_bundle_producing_engine_version text,
     current_bundle_created_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
@@ -1057,7 +1032,7 @@ CREATE TABLE public.hub_sessions (
     configuration_applied_revision bigint DEFAULT 0 NOT NULL,
     CONSTRAINT hub_sessions_check CHECK ((((origin_kind = 'hub_native'::text) AND (origin_platform_id IS NULL) AND (origin_tenant_id IS NULL) AND (origin_external_identity_id IS NULL)) OR ((origin_kind = 'external'::text) AND (origin_platform_id IS NOT NULL) AND (origin_tenant_id IS NOT NULL) AND (btrim(origin_tenant_id) <> ''::text) AND (origin_external_identity_id IS NOT NULL)))),
     CONSTRAINT hub_sessions_check1 CHECK (((runtime_owner_id IS NULL) OR (ownership_generation > 0))),
-    CONSTRAINT hub_sessions_check2 CHECK ((((current_bundle_generation IS NULL) AND (current_bundle_object_key IS NULL) AND (current_bundle_checksum_sha256 IS NULL) AND (current_bundle_size_bytes IS NULL) AND (current_bundle_history_checkpoint IS NULL) AND (current_bundle_ownership_generation IS NULL) AND (current_bundle_producing_codex_version IS NULL) AND (current_bundle_created_at IS NULL)) OR ((current_bundle_generation IS NOT NULL) AND (current_bundle_object_key IS NOT NULL) AND (btrim(current_bundle_object_key) <> ''::text) AND (current_bundle_checksum_sha256 IS NOT NULL) AND (btrim(current_bundle_checksum_sha256) <> ''::text) AND (current_bundle_size_bytes IS NOT NULL) AND (current_bundle_history_checkpoint IS NOT NULL) AND (current_bundle_ownership_generation IS NOT NULL) AND (current_bundle_producing_codex_version IS NOT NULL) AND (btrim(current_bundle_producing_codex_version) <> ''::text) AND (current_bundle_created_at IS NOT NULL)))),
+    CONSTRAINT hub_sessions_check2 CHECK ((((current_bundle_generation IS NULL) AND (current_bundle_object_key IS NULL) AND (current_bundle_checksum_sha256 IS NULL) AND (current_bundle_size_bytes IS NULL) AND (current_bundle_history_checkpoint IS NULL) AND (current_bundle_ownership_generation IS NULL) AND (current_bundle_producing_engine_version IS NULL) AND (current_bundle_created_at IS NULL)) OR ((current_bundle_generation IS NOT NULL) AND (current_bundle_object_key IS NOT NULL) AND (btrim(current_bundle_object_key) <> ''::text) AND (current_bundle_checksum_sha256 IS NOT NULL) AND (btrim(current_bundle_checksum_sha256) <> ''::text) AND (current_bundle_size_bytes IS NOT NULL) AND (current_bundle_history_checkpoint IS NOT NULL) AND (current_bundle_ownership_generation IS NOT NULL) AND (current_bundle_producing_engine_version IS NOT NULL) AND (btrim(current_bundle_producing_engine_version) <> ''::text) AND (current_bundle_created_at IS NOT NULL)))),
     CONSTRAINT hub_sessions_configuration_applied_revision_nonnegative CHECK ((configuration_applied_revision >= 0)),
     CONSTRAINT hub_sessions_configuration_refresh_revision_nonnegative CHECK ((configuration_refresh_revision >= 0)),
     CONSTRAINT hub_sessions_configuration_revision_order CHECK ((configuration_applied_revision <= configuration_refresh_revision)),
@@ -1069,7 +1044,7 @@ CREATE TABLE public.hub_sessions (
     CONSTRAINT hub_sessions_last_checkpoint_result_shape CHECK ((((last_checkpoint_attempt_id IS NULL) AND (last_checkpoint_ownership_generation IS NULL) AND (last_checkpoint_disposition IS NULL) AND (last_checkpoint_has_queued_work IS NULL)) OR ((last_checkpoint_attempt_id IS NOT NULL) AND (last_checkpoint_ownership_generation IS NOT NULL) AND (last_checkpoint_ownership_generation > 0) AND (last_checkpoint_disposition = ANY (ARRAY['resume'::text, 'retry'::text])) AND (last_checkpoint_has_queued_work IS NOT NULL)))),
     CONSTRAINT hub_sessions_lifecycle_status_check CHECK ((lifecycle_status = ANY (ARRAY['waiting_for_runtime'::text, 'restoring'::text, 'online'::text, 'saving'::text, 'offline'::text, 'recovery_failed'::text, 'historical'::text]))),
     CONSTRAINT hub_sessions_ownership_generation_check CHECK ((ownership_generation >= 0)),
-    CONSTRAINT hub_sessions_saving_checkpoint_shape CHECK ((((lifecycle_status = 'saving'::text) AND (saving_history_checkpoint IS NOT NULL) AND (saving_history_checkpoint >= 0) AND (saving_ownership_generation IS NOT NULL) AND (saving_ownership_generation > 0) AND (saving_reason = ANY (ARRAY['idle'::text, 'version_switch'::text, 'drain'::text])) AND (saving_checkpoint_attempt_id IS NOT NULL)) OR ((lifecycle_status <> 'saving'::text) AND (saving_history_checkpoint IS NULL) AND (saving_ownership_generation IS NULL) AND (saving_reason IS NULL) AND (saving_checkpoint_attempt_id IS NULL))))
+    CONSTRAINT hub_sessions_saving_checkpoint_shape CHECK ((((lifecycle_status = 'saving'::text) AND (saving_history_checkpoint IS NOT NULL) AND (saving_history_checkpoint >= 0) AND (saving_ownership_generation IS NOT NULL) AND (saving_ownership_generation > 0) AND (saving_reason = ANY (ARRAY['idle'::text, 'drain'::text])) AND (saving_checkpoint_attempt_id IS NOT NULL)) OR ((lifecycle_status <> 'saving'::text) AND (saving_history_checkpoint IS NULL) AND (saving_ownership_generation IS NULL) AND (saving_reason IS NULL) AND (saving_checkpoint_attempt_id IS NULL))))
 );
 
 CREATE TABLE public.integration_app_agents (
@@ -1326,7 +1301,7 @@ CREATE TABLE public.runs (
     runtime_id uuid,
     status text NOT NULL,
     initial_message text NOT NULL,
-    session_id text,
+    native_session_id text,
     work_dir_ref text,
     source text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
@@ -1346,15 +1321,6 @@ CREATE TABLE public.runs (
     CONSTRAINT runs_model_subject_shape_check CHECK (((model_subject_type <> 'integration_app'::text) OR (model_subject_user_id IS NULL))),
     CONSTRAINT runs_model_subject_type_check CHECK ((model_subject_type = ANY (ARRAY['user'::text, 'integration_app'::text, 'system'::text]))),
     CONSTRAINT runs_session_ownership_generation_nonnegative CHECK (((session_ownership_generation IS NULL) OR (session_ownership_generation >= 0)))
-);
-
-CREATE TABLE public.runtime_codex_readiness (
-    runtime_id uuid NOT NULL,
-    version text NOT NULL,
-    status text NOT NULL,
-    error text,
-    checked_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT runtime_codex_readiness_status_check CHECK ((status = ANY (ARRAY['ready'::text, 'failed'::text])))
 );
 
 CREATE TABLE public.runtime_enrollment_tokens (
@@ -1385,7 +1351,7 @@ CREATE TABLE public.runtimes (
     token_hash text NOT NULL,
     hostname text NOT NULL,
     labels text[] DEFAULT '{}'::text[] NOT NULL,
-    codex_version text NOT NULL,
+    engine_version text NOT NULL,
     capabilities jsonb DEFAULT '{}'::jsonb NOT NULL,
     sandbox_mode text NOT NULL,
     status text NOT NULL,
@@ -1520,14 +1486,8 @@ ALTER TABLE ONLY public.automations
 ALTER TABLE ONLY public.automations
     ADD CONSTRAINT automations_webhook_token_key UNIQUE (webhook_token_hash);
 
-ALTER TABLE ONLY public.codex_subagent_definitions
-    ADD CONSTRAINT codex_subagent_definitions_pkey PRIMARY KEY (id);
-
-ALTER TABLE ONLY public.codex_version_artifacts
-    ADD CONSTRAINT codex_version_artifacts_pkey PRIMARY KEY (version, os, architecture);
-
-ALTER TABLE ONLY public.codex_version_rollout
-    ADD CONSTRAINT codex_version_rollout_pkey PRIMARY KEY (singleton);
+ALTER TABLE ONLY public.subagent_definitions
+    ADD CONSTRAINT subagent_definitions_pkey PRIMARY KEY (id);
 
 ALTER TABLE ONLY public.embed_jwt_replays
     ADD CONSTRAINT embed_jwt_replays_pkey PRIMARY KEY (jti);
@@ -1646,9 +1606,6 @@ ALTER TABLE ONLY public.runs
 ALTER TABLE ONLY public.runs
     ADD CONSTRAINT runs_pkey PRIMARY KEY (id);
 
-ALTER TABLE ONLY public.runtime_codex_readiness
-    ADD CONSTRAINT runtime_codex_readiness_pkey PRIMARY KEY (runtime_id, version);
-
 ALTER TABLE ONLY public.runtime_enrollment_tokens
     ADD CONSTRAINT runtime_enrollment_tokens_pkey PRIMARY KEY (id);
 
@@ -1705,11 +1662,9 @@ CREATE INDEX automations_agent_created_idx ON public.automations USING btree (ag
 
 CREATE INDEX automations_owner_created_idx ON public.automations USING btree (owner_id, created_at DESC);
 
-CREATE UNIQUE INDEX codex_subagent_agent_name_key ON public.codex_subagent_definitions USING btree (agent_id, lower(btrim(name)));
+CREATE UNIQUE INDEX subagent_agent_name_key ON public.subagent_definitions USING btree (agent_id, lower(btrim(name)));
 
-CREATE INDEX codex_subagent_model_connection_idx ON public.codex_subagent_definitions USING btree (model_connection_id) WHERE (model_connection_id IS NOT NULL);
-
-CREATE INDEX codex_version_artifacts_version_idx ON public.codex_version_artifacts USING btree (version, os, architecture);
+CREATE INDEX subagent_model_connection_idx ON public.subagent_definitions USING btree (model_connection_id) WHERE (model_connection_id IS NOT NULL);
 
 CREATE INDEX embed_sessions_oauth_app_idx ON public.embed_sessions USING btree (oauth_app_id) WHERE (oauth_app_id IS NOT NULL);
 
@@ -1725,7 +1680,7 @@ CREATE INDEX hub_sessions_agent_updated_idx ON public.hub_sessions USING btree (
 
 CREATE UNIQUE INDEX hub_sessions_current_bundle_object_key ON public.hub_sessions USING btree (current_bundle_object_key) WHERE (current_bundle_object_key IS NOT NULL);
 
-CREATE UNIQUE INDEX hub_sessions_native_thread_key ON public.hub_sessions USING btree (native_thread_id) WHERE (native_thread_id IS NOT NULL);
+CREATE UNIQUE INDEX hub_sessions_native_session_key ON public.hub_sessions USING btree (native_session_id) WHERE (native_session_id IS NOT NULL);
 
 CREATE INDEX hub_sessions_owner_updated_idx ON public.hub_sessions USING btree (owner_id, updated_at DESC, id DESC);
 
@@ -1779,8 +1734,6 @@ CREATE INDEX runs_status_created_idx ON public.runs USING btree (status, created
 
 CREATE INDEX runs_widget_session_idx ON public.runs USING btree (widget_session_id, created_at);
 
-CREATE INDEX runtime_codex_readiness_version_idx ON public.runtime_codex_readiness USING btree (version, status, runtime_id);
-
 CREATE INDEX runtime_enrollment_tokens_created_at_idx ON public.runtime_enrollment_tokens USING btree (created_at DESC);
 
 CREATE INDEX runtime_session_cleanup_obligations_erasure_idx ON public.runtime_session_cleanup_obligations USING btree (erasure_user_id, created_at) WHERE (erasure_user_id IS NOT NULL);
@@ -1801,7 +1754,7 @@ CREATE TRIGGER agents_model_selection_validate BEFORE INSERT OR UPDATE OF owner_
 
 CREATE TRIGGER agents_protect_super_admin_model_accounting BEFORE DELETE ON public.agents FOR EACH ROW EXECUTE FUNCTION public.protect_super_admin_model_accounting_before_agent_delete();
 
-CREATE TRIGGER codex_subagent_model_selection_validate BEFORE INSERT OR UPDATE OF agent_id, model_connection_id, model_id, model_settings_override ON public.codex_subagent_definitions FOR EACH ROW EXECUTE FUNCTION public.validate_subagent_model_selection();
+CREATE TRIGGER subagent_model_selection_validate BEFORE INSERT OR UPDATE OF agent_id, model_connection_id, model_id, model_settings_override ON public.subagent_definitions FOR EACH ROW EXECUTE FUNCTION public.validate_subagent_model_selection();
 
 CREATE TRIGGER hub_session_messages_assign_sequence BEFORE INSERT ON public.hub_session_messages FOR EACH ROW EXECUTE FUNCTION public.assign_hub_session_message_sequence();
 
@@ -1862,11 +1815,11 @@ ALTER TABLE ONLY public.automations
 ALTER TABLE ONLY public.automations
     ADD CONSTRAINT automations_owner_id_fkey FOREIGN KEY (owner_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.codex_subagent_definitions
-    ADD CONSTRAINT codex_subagent_definitions_agent_id_fkey FOREIGN KEY (agent_id) REFERENCES public.agents(id) ON DELETE CASCADE;
+ALTER TABLE ONLY public.subagent_definitions
+    ADD CONSTRAINT subagent_definitions_agent_id_fkey FOREIGN KEY (agent_id) REFERENCES public.agents(id) ON DELETE CASCADE;
 
-ALTER TABLE ONLY public.codex_subagent_definitions
-    ADD CONSTRAINT codex_subagent_definitions_model_connection_id_fkey FOREIGN KEY (model_connection_id) REFERENCES public.model_connections(id) ON DELETE RESTRICT;
+ALTER TABLE ONLY public.subagent_definitions
+    ADD CONSTRAINT subagent_definitions_model_connection_id_fkey FOREIGN KEY (model_connection_id) REFERENCES public.model_connections(id) ON DELETE RESTRICT;
 
 ALTER TABLE ONLY public.embed_sessions
     ADD CONSTRAINT embed_sessions_agent_id_fkey FOREIGN KEY (agent_id) REFERENCES public.agents(id) ON DELETE CASCADE;
@@ -2075,9 +2028,6 @@ ALTER TABLE ONLY public.runs
 ALTER TABLE ONLY public.runs
     ADD CONSTRAINT runs_widget_session_id_fkey FOREIGN KEY (widget_session_id) REFERENCES public.embed_sessions(id) ON DELETE SET NULL;
 
-ALTER TABLE ONLY public.runtime_codex_readiness
-    ADD CONSTRAINT runtime_codex_readiness_runtime_id_fkey FOREIGN KEY (runtime_id) REFERENCES public.runtimes(id) ON DELETE CASCADE;
-
 ALTER TABLE ONLY public.runtime_enrollment_tokens
     ADD CONSTRAINT runtime_enrollment_tokens_consumed_by_runtime_id_fkey FOREIGN KEY (consumed_by_runtime_id) REFERENCES public.runtimes(id) ON DELETE SET NULL;
 
@@ -2113,6 +2063,3 @@ INSERT INTO public.auth_policy
     (singleton, password_registration_enabled, password_login_enabled,
      email_verification_required)
 VALUES (true, true, true, false);
-
-INSERT INTO public.codex_version_rollout (singleton)
-VALUES (true);

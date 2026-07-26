@@ -11,7 +11,7 @@
 7. `client_credentials` token 代表应用，可为多个外部用户创建和继续 Session；每个 Session 仍固定保存自己的 platform、tenant 和 External Identity origin。
 8. 每个 Integration Session 固定归属其 Integration App 和 Agent。应用级 token 可管理该应用为多个外部身份创建的 Session；用户级 token 只能管理自己的 Session。
 9. 解除 Agent 关联、应用管理者失去 `can_invoke`、用户失去 Agent 权限或 Agent 被删除时，已签发 token 对该 Agent 立即失效。
-10. Integration 消息、Steering Message、tool request/result、SSE 和 native Thread 延续仍遵守通用 Session 顺序与 Turn 边界。
+10. Integration 消息、Steering Message、tool request/result、SSE 和 Native Session 延续仍遵守通用 Session 顺序与 Turn 边界。
 11. Integration App 中每个已关联 Agent 单独生成短期 Widget 地址，不存在跨 Agent 的通用嵌入凭据。
 
 ## 非目标
@@ -20,7 +20,7 @@
 - 不将 Application Token 接入 `require_user()`，不允许应用凭据访问控制面 API。
 - 不允许跨 Integration App、External Platform 或未委托 Agent 访问 Session。
 - 本轮不提供 Integration App 删除，只提供新建、编辑和 client secret 轮换。
-- 不把 tool result 建模为新 Codex Thread，不合并或覆盖原消息历史。
+- 不把 tool result 建模为新 Native Session，不合并或覆盖原消息历史。
 
 ## 验收标准
 
@@ -29,7 +29,7 @@
 - 用户级 token 可按 profile scopes 读取 `userinfo`；应用级 token 不得伪造 Hub 用户资料。
 - 应用级 token 可为两个外部用户分别创建 Session，两个 Session 的 origin 互不混同。
 - Bearer token 访问 `/api/auth/me` 或 `/api/agents` 被拒绝。
-- 发送需要工具的消息后出现 `tool_request`；提交 result 后在同一 Session/Thread 中得到结果。
+- 发送需要工具的消息后出现 `tool_request`；提交 result 后在同一 Hub Session 和 Native Session 中得到结果。
 - 解除关联或权限收回后，旧 token 的新请求和存量 SSE 都不再获得该 Agent 数据。
 
 ## 测试计划

@@ -2,16 +2,15 @@
 
 ## 目的与边界
 
-本文件集中定义 Hub Session、Runtime ownership、native execution session、Session Bundle 和版本切换的执行契约。ADR-0001 至 ADR-0021 与本文件优先于仍以 Hub Run 描述执行历史的早期文档。
+本文件集中定义 Hub Session、Runtime ownership、Native Session、Session Bundle 和 Runtime Engine 版本切换的执行契约。ADR-0001 至 ADR-0021 与本文件优先于仍以 Hub Run 描述执行历史的早期文档。
 
 ## Pi 执行实现
 
-当前 Runtime 使用 Pi standalone RPC，不再启动 Codex app-server。Hub 的
-公开 DTO、数据库字段和旧 Bundle 顶层名称暂保持兼容：`codex_version` 表示
-Pi artifact 版本，`native_thread_id` 表示 Pi session id，`codex-thread/`
-保存 Pi recovery JSONL。精确 Pi 进程、RPC、模型代理、工具和 Bundle 约束见
-[`pi-driver-spec.md`](pi-driver-spec.md)；该文件在 Pi 相关实现细节上优先于本
-文档中的旧 Codex 术语。
+当前 Runtime 使用 Pi standalone RPC。Hub 的公开 DTO 和数据库使用
+`engine_version` 表示 Runtime Engine 版本，使用 `native_session_id` 表示 Pi
+Native Session ID；Bundle 的 `native-session/` 保存 Pi recovery JSONL。精确 Pi
+进程、RPC、模型代理、工具和 Bundle 约束见
+[`pi-driver-spec.md`](pi-driver-spec.md)。
 
 ```text
 Hub User 1 --- many Hub Sessions
@@ -21,7 +20,7 @@ Hub Session 1 --- 1 Workspace
             1 --- 1 native Pi Session
             1 --- many ordered Messages
             1 --- many Hub Runs (scheduling/audit)
-            1 --- 0..1 active Pi Turn
+            1 --- 0..1 active Native Turn
 ```
 
 - Hub-native Session 的 external origin 全部为空。
@@ -58,7 +57,7 @@ Hub Session 1 --- 1 Workspace
 waiting_for_runtime -> restoring -> online
 offline             -> restoring -> online
 online(active)      -> online(idle)              # Turn terminal
-online(idle)        -> saving                     # 15 min idle, drain, or version switch
+online(idle)        -> saving                     # 15 min idle, drain, or engine image switch
 saving              -> offline                    # Bundle committed and ownership released
 saving              -> online                     # queued work reuses retained local files
 restoring|saving    -> recovery_failed            # only the specified unrecoverable cases
@@ -98,7 +97,7 @@ restoring|saving    -> recovery_failed            # only the specified unrecover
 ```text
 session-root/
   workspace/        # 用户可见、跨 Turn 延续的工作区
-  codex/            # 兼容路径名；Session 专属 Pi HOME
+  engine-state/     # Session 专属 Pi HOME
     .pi/agent/       # Hub 可重建 instructions、models 和 Skills
     sessions/        # Pi native Session JSONL
   supervisor/       # owner/generation、进程和恢复所需的本地元数据
@@ -118,12 +117,12 @@ Bundle 是 streaming `tar.zst`，顶层必须且只能包含：
 ```text
 workspace/       # 完整 Workspace，包含隐藏文件和 .git，不按 .gitignore 过滤
 manifest.json    # 格式/Hub Session/Pi Session/history checkpoint/generations/version/size/checksum
-codex-thread/    # 兼容名称；只含 sessions/<one Pi JSONL>
+native-session/  # 只含 sessions/<one Pi JSONL>
 ```
 
 - 打包前停止 Pi RPC 进程，确保 JSONL 已落盘。
 - 创建端解析每个直接位于 Pi `sessions/` 下的 `.jsonl` 首行，只选择 `type=session` 且 `id` 等于 manifest native Session id 的唯一文件；文件名不参与身份判断。
-- 恢复端只接受 `codex-thread/`、`codex-thread/sessions/` 和一个直接子级 `.jsonl`，并在提交目录前验证该 JSONL header 与 manifest 匹配。
+- 恢复端只接受 `native-session/`、`native-session/sessions/` 和一个直接子级 `.jsonl`，并在提交目录前验证该 JSONL header 与 manifest 匹配。
 - 排除 `.pi/agent`、Hub 认证、model proxy token、Runtime Credential、logs、caches、settings、extensions、Skills、Pi binary、其他 Session JSONL 和可由 Hub 重建的配置。
 - 普通文件、目录和不会逃逸归档根的安全 symlink 可进入 Bundle；拒绝 device、socket、FIFO、路径穿越和逃逸链接。
 - Runtime 流式计算压缩 Bundle checksum、压缩大小和内容声明；恢复 Runtime 在解包前验证。Hub 不 unpack、scan、hash 或完整缓冲 Bundle。
@@ -139,17 +138,17 @@ codex-thread/    # 兼容名称；只含 sessions/<one Pi JSONL>
 - S3-compatible endpoint 可配置 HTTP 或 HTTPS；server-side encryption 是可选部署配置。
 - Pi 在执行任务时的网络访问不属于 Runtime 系统流量，受 Runtime 工具 allowlist、非 root 容器和部署网络边界约束。
 
-## Pi artifact 版本切换
+## Runtime Engine 版本切换
 
-- Pi 版本固定在 Runtime image 中，并以兼容字段 `codex_version` 上报。不可变版本、源码 commit、build patch、Bun baseline 和 model-data snapshot 必须一起验证。
-- Hub 保留旧 rollout DTO/API，但 Pi Runtime 对 candidate/active 命令保持 inert：不下载 artifact、不切换当前 binary、不安排 version checkpoint。
+- Pi 版本固定在 Runtime image 中，并以 `engine_version` 上报。不可变版本、源码 commit、build patch、Bun baseline 和 model-data snapshot 必须一起验证。
+- Hub 不提供 Runtime Engine rollout API，Runtime 不下载或切换执行二进制。
 - 升级或回滚以完整 Runtime image 为单位。先 Drain 并等 Session current Bundle 提交、ownership 释放，再替换镜像；active Turn 不被混用版本。
 - 新镜像恢复时重新物化当前配置并 resume Bundle 中同一 Pi Session id。无法 resume 时保留原 Bundle 和只读 Hub 历史，Session 进入 `recovery_failed`，不得创建替代 native Session。
 
 ## 验收测试边界
 
 - 数据库：origin 完整性、消息顺序、Session/Agent 不可变绑定、ownership generation fencing 和 current Bundle 原子切换。
-- Runtime：目录隔离、一个 Pi Session 多 Turn、steer/interrupt race、进程重启恢复、idle/drain/version 时序、Skill refresh 空闲/活动/过期命令和安全 tar.zst。
+- Runtime：目录隔离、一个 Native Session 多 Turn、steer/interrupt race、进程重启恢复、idle/drain/version 时序、Skill refresh 空闲/活动/过期命令和安全 tar.zst。
 - Hub streaming：认证、generation、size limit、backpressure、中断传输和 S3-compatible HTTP/HTTPS 配置。
 - 版本：固定 submodule/model-data/patch checksum、baseline standalone 构建、最终镜像无 Node/npm/Bun，以及整镜像 rollback 流程。
 - 浏览器：desktop 与 390px 下的会话列表和来源筛选、Agent 选择新建对话、SSE 实时回复、可读 Pi 活动折叠、多 Turn 历史恢复、Historical Session 只读、立即引导、显式停止和 Runtime drain/delete。

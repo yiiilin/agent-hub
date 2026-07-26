@@ -35,7 +35,7 @@ async function runtimeJson(client, credential, path, body, expectedStatus = 200)
   });
 }
 
-async function registerRuntime(admin, context, codexVersion, prefix) {
+async function registerRuntime(admin, context, engineVersion, prefix) {
   const hostname = uniqueSlug(context, prefix);
   const { data: enrollment } = await admin.post('/api/admin/runtime-enrollment-tokens', {});
   assertUuid(enrollment.enrollment.id, 'Runtime enrollment id');
@@ -46,13 +46,13 @@ async function registerRuntime(admin, context, codexVersion, prefix) {
   const { data: registered } = await client.post('/api/runtime/register', {
     hostname,
     labels: ['qa', 'bundle-recovery'],
-    codex_version: codexVersion,
+    engine_version: engineVersion,
     capabilities: {
       driver: 'qa-http',
       platform: { os: 'linux', architecture: 'x86_64' },
       model_proxy: true,
       mcp_allowlist: true,
-      thread_resume: true
+      native_session_resume: true
     },
     sandbox_mode: 'workspace-write'
   }, {
@@ -94,7 +94,7 @@ async function bindAgentToRuntime(admin, agent, runtimeId) {
       runtime_id: runtimeId,
       model_selection: agent.model_selection,
       model_settings: agent.model_settings,
-      codex_subagents: agent.codex_subagents,
+      subagents: agent.subagents,
       sandbox_policy: agent.sandbox_policy,
       managed_skill_ids: agent.managed_skill_ids,
       mcp_allowlist: agent.mcp_allowlist
@@ -121,7 +121,7 @@ async function claimRun(runtime, expectedRunId) {
   return { claim, generation };
 }
 
-async function beginAndCompleteTurn(runtime, claim, generation, nativeThreadId, nativeTurnId) {
+async function beginAndCompleteTurn(runtime, claim, generation, nativeSessionId, nativeTurnId) {
   const runId = claim.run.id;
   const { data: begun } = await runtimeJson(
     runtime.client,
@@ -147,14 +147,14 @@ async function beginAndCompleteTurn(runtime, claim, generation, nativeThreadId, 
         role: null,
         content: null,
         payload: {
-          native_thread_id: nativeThreadId,
+          native_session_id: nativeSessionId,
           native_turn_id: nativeTurnId
         }
       }
     }
   );
   assert.equal(started.event_type, 'turn_started');
-  assert.equal(started.payload.native_thread_id, nativeThreadId);
+  assert.equal(started.payload.native_session_id, nativeSessionId);
   assert.equal(started.payload.native_turn_id, nativeTurnId);
 
   const { data: completed } = await runtimeJson(
@@ -165,13 +165,13 @@ async function beginAndCompleteTurn(runtime, claim, generation, nativeThreadId, 
       ownership_generation: generation,
       payload: {
         status: 'completed',
-        session_id: nativeThreadId,
+        native_session_id: nativeSessionId,
         work_dir_ref: `/qa/${runId}`
       }
     }
   );
   assert.equal(completed.status, 'completed');
-  assert.equal(completed.session_id, nativeThreadId);
+  assert.equal(completed.native_session_id, nativeSessionId);
   return completed;
 }
 
@@ -219,7 +219,7 @@ async function beginCheckpoint(runtime, sessionId, generation, reason = 'idle') 
   return data;
 }
 
-function bundleMetadata(attempt, ownershipGeneration, producingCodexVersion, createdAt) {
+function bundleMetadata(attempt, ownershipGeneration, producingEngineVersion, createdAt) {
   return {
     ownershipGeneration,
     checkpointAttemptId: attempt.checkpoint_attempt_id,
@@ -227,7 +227,7 @@ function bundleMetadata(attempt, ownershipGeneration, producingCodexVersion, cre
     checksum: BUNDLE_SHA256,
     size: BUNDLE_BYTES.length,
     historyCheckpoint: attempt.history_checkpoint,
-    producingCodexVersion,
+    producingEngineVersion,
     createdAt
   };
 }
@@ -242,7 +242,7 @@ function bundleUploadHeaders(credential, metadata, overrides = {}) {
     'x-agent-hub-bundle-sha256': metadata.checksum,
     'x-agent-hub-bundle-size': String(metadata.size),
     'x-agent-hub-history-checkpoint': String(metadata.historyCheckpoint),
-    'x-agent-hub-producing-codex-version': metadata.producingCodexVersion,
+    'x-agent-hub-producing-engine-version': metadata.producingEngineVersion,
     'x-agent-hub-bundle-created-at': metadata.createdAt,
     ...overrides
   });
@@ -314,11 +314,9 @@ export default async function bundleRecoveryApiScenario(context) {
   const { data: initialRuntimes } = await admin.get('/api/runtimes');
   const composeRuntimeIds = new Set(initialRuntimes.map((runtime) => runtime.id));
   assert.ok(initialRuntimes.some((runtime) => runtime.status === 'online'));
-  const { data: rollout } = await admin.get('/api/admin/codex-version-rollout');
-  const codexVersion = rollout.active_version
-    ?? initialRuntimes.find((runtime) => runtime.status === 'online')?.codex_version;
-  assert.equal(typeof codexVersion, 'string');
-  assert.ok(codexVersion.length > 0);
+  const engineVersion = initialRuntimes.find((runtime) => runtime.status === 'online')?.engine_version;
+  assert.equal(typeof engineVersion, 'string');
+  assert.ok(engineVersion.length > 0);
 
   const runtimes = [];
   const agentIds = [];
@@ -329,7 +327,7 @@ export default async function bundleRecoveryApiScenario(context) {
     const firstRuntime = await registerRuntime(
       admin,
       context,
-      codexVersion,
+      engineVersion,
       'qa-bundle-runtime-one'
     );
     runtimes.push(firstRuntime);
@@ -341,7 +339,7 @@ export default async function bundleRecoveryApiScenario(context) {
     );
     agentIds.push(bundleAgent.id);
 
-    const firstThreadId = uniqueSlug(context, 'qa-native-thread');
+    const firstNativeSessionId = uniqueSlug(context, 'qa-native-thread');
     const { data: firstRun } = await admin.post(`/api/agents/${bundleAgent.id}/runs`, {
       message: context.unique('QA initial Bundle Turn'),
       hub_session_id: null,
@@ -356,13 +354,13 @@ export default async function bundleRecoveryApiScenario(context) {
       firstRuntime,
       firstOwnership.claim,
       firstOwnership.generation,
-      firstThreadId,
+      firstNativeSessionId,
       uniqueSlug(context, 'qa-native-turn-one')
     );
 
     const { data: onlineSession } = await admin.get(`/api/sessions/${sessionId}`);
     assert.equal(onlineSession.lifecycle_status, 'online');
-    assert.equal(onlineSession.native_thread_id, firstThreadId);
+    assert.equal(onlineSession.native_session_id, firstNativeSessionId);
     assert.equal(onlineSession.active_turn_id, null);
     assert.equal(onlineSession.runtime_owner_id, firstRuntime.id);
     assert.equal(onlineSession.ownership_generation, firstOwnership.generation);
@@ -408,7 +406,7 @@ export default async function bundleRecoveryApiScenario(context) {
     const firstMetadata = bundleMetadata(
       firstAttempt,
       firstOwnership.generation,
-      codexVersion,
+      engineVersion,
       firstCreatedAt
     );
     const firstCommit = await uploadBundle(context, firstRuntime, sessionId, firstMetadata);
@@ -431,7 +429,7 @@ export default async function bundleRecoveryApiScenario(context) {
     assert.equal(firstPointer.size_bytes, BUNDLE_BYTES.length);
     assert.equal(firstPointer.history_checkpoint, firstAttempt.history_checkpoint);
     assert.equal(firstPointer.ownership_generation, firstOwnership.generation);
-    assert.equal(firstPointer.producing_codex_version, codexVersion);
+    assert.equal(firstPointer.producing_engine_version, engineVersion);
     assert.ok(Date.parse(firstPointer.created_at) >= firstAttemptStartedAt);
     assert.ok(Date.parse(firstPointer.created_at) <= firstCommitFinishedAt);
     assert.equal(Date.parse(firstPointer.created_at), Date.parse(firstCreatedAt));
@@ -442,7 +440,7 @@ export default async function bundleRecoveryApiScenario(context) {
     assert.deepEqual(firstReplay, firstCommit, 'identical attempt replay must be idempotent');
     await uploadBundle(context, firstRuntime, sessionId, {
       ...firstMetadata,
-      producingCodexVersion: `${codexVersion}-conflict`
+      producingEngineVersion: `${engineVersion}-conflict`
     }, { expectedStatus: 409 });
     assertCurrentBundle(
       (await admin.get(`/api/sessions/${sessionId}`)).data,
@@ -464,7 +462,7 @@ export default async function bundleRecoveryApiScenario(context) {
     const secondMetadata = bundleMetadata(
       secondAttempt,
       firstOwnership.generation,
-      codexVersion,
+      engineVersion,
       secondCreatedAt
     );
 
@@ -538,7 +536,7 @@ export default async function bundleRecoveryApiScenario(context) {
     assert.equal(secondPointer.size_bytes, BUNDLE_BYTES.length);
     assert.equal(secondPointer.history_checkpoint, secondAttempt.history_checkpoint);
     assert.equal(secondPointer.ownership_generation, firstOwnership.generation);
-    assert.equal(secondPointer.producing_codex_version, codexVersion);
+    assert.equal(secondPointer.producing_engine_version, engineVersion);
     assert.ok(Date.parse(secondPointer.created_at) >= secondAttemptStartedAt);
     assert.ok(Date.parse(secondPointer.created_at) <= secondCommitFinishedAt);
     assert.equal(Date.parse(secondPointer.created_at), Date.parse(secondCreatedAt));
@@ -570,7 +568,7 @@ export default async function bundleRecoveryApiScenario(context) {
     const secondRuntime = await registerRuntime(
       admin,
       context,
-      codexVersion,
+      engineVersion,
       'qa-bundle-runtime-two'
     );
     runtimes.push(secondRuntime);
@@ -579,8 +577,8 @@ export default async function bundleRecoveryApiScenario(context) {
 
     const restoredOwnership = await claimRun(secondRuntime, queued.run.id);
     assert.equal(restoredOwnership.generation, firstOwnership.generation + 1);
-    assert.equal(restoredOwnership.claim.resume.thread_id, firstThreadId);
-    assert.equal(restoredOwnership.claim.session_context.session.native_thread_id, firstThreadId);
+    assert.equal(restoredOwnership.claim.resume.native_session_id, firstNativeSessionId);
+    assert.equal(restoredOwnership.claim.session_context.session.native_session_id, firstNativeSessionId);
     assert.deepEqual(restoredOwnership.claim.session_context.session.current_bundle, secondPointer);
 
     const downloaded = await downloadBundle(
@@ -602,8 +600,8 @@ export default async function bundleRecoveryApiScenario(context) {
       String(secondMetadata.historyCheckpoint)
     );
     assert.equal(
-      downloaded.response.headers.get('x-agent-hub-producing-codex-version'),
-      codexVersion
+      downloaded.response.headers.get('x-agent-hub-producing-engine-version'),
+      engineVersion
     );
     assert.equal(
       Date.parse(downloaded.response.headers.get('x-agent-hub-bundle-created-at')),
@@ -614,12 +612,12 @@ export default async function bundleRecoveryApiScenario(context) {
       secondRuntime,
       restoredOwnership.claim,
       restoredOwnership.generation,
-      firstThreadId,
+      firstNativeSessionId,
       uniqueSlug(context, 'qa-native-turn-two')
     );
     const { data: restoredSession } = await admin.get(`/api/sessions/${sessionId}`);
     assert.equal(restoredSession.lifecycle_status, 'online');
-    assert.equal(restoredSession.native_thread_id, firstThreadId);
+    assert.equal(restoredSession.native_session_id, firstNativeSessionId);
     assert.equal(restoredSession.ownership_generation, restoredOwnership.generation);
     assert.equal(restoredSession.runtime_owner_id, secondRuntime.id);
     assert.deepEqual(restoredSession.current_bundle, secondPointer);
@@ -638,7 +636,7 @@ export default async function bundleRecoveryApiScenario(context) {
       bundleMetadata(
         cleanupAttempt,
         restoredOwnership.generation,
-        codexVersion,
+        engineVersion,
         new Date().toISOString()
       )
     );
@@ -653,7 +651,7 @@ export default async function bundleRecoveryApiScenario(context) {
       'QA Unrecoverable Session Agent'
     );
     agentIds.push(unrecoverableAgent.id);
-    const unrecoverableThreadId = uniqueSlug(context, 'qa-unrecoverable-thread');
+    const unrecoverableNativeSessionId = uniqueSlug(context, 'qa-unrecoverable-thread');
     const { data: unrecoverableRun } = await admin.post(
       `/api/agents/${unrecoverableAgent.id}/runs`,
       {
@@ -668,7 +666,7 @@ export default async function bundleRecoveryApiScenario(context) {
       secondRuntime,
       unrecoverableOwnership.claim,
       unrecoverableOwnership.generation,
-      unrecoverableThreadId,
+      unrecoverableNativeSessionId,
       uniqueSlug(context, 'qa-unrecoverable-turn')
     );
     const { data: noBundleSession } = await admin.get(`/api/sessions/${unrecoverableSessionId}`);
@@ -754,7 +752,7 @@ export default async function bundleRecoveryApiScenario(context) {
       unrecoverableOwnership.generation + 1
     );
     assert.equal(recoveryFailed.current_bundle, null);
-    assert.equal(recoveryFailed.native_thread_id, unrecoverableThreadId);
+    assert.equal(recoveryFailed.native_session_id, unrecoverableNativeSessionId);
     const rejectedMessage = await admin.post(`/api/sessions/${unrecoverableSessionId}/messages`, {
       content: context.unique('QA rejected recovery-failed continuation'),
       client_message_key: context.unique('qa-recovery-failed-message')

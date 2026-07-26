@@ -20,7 +20,7 @@ function session(id: string, agentName: string, lifecycleStatus: string, overrid
     origin_platform_name: null,
     origin: { kind: 'hub_native' },
     lifecycle_status: lifecycleStatus,
-    native_thread_id: `thread-${id}`,
+    native_session_id: `session-${id}`,
     active_turn_id: null,
     history_checkpoint: 2,
     configuration_fingerprint: null,
@@ -61,10 +61,10 @@ async function routeMe(page: Page, user = superAdmin) {
 test('Session history exposes queued work, explicit stop, recovery failure, and Historical Session read-only state', async ({ page }) => {
   const active = session('active', 'Release agent', 'online', { active_turn_id: 'turn-active' });
   const saving = session('saving', 'Checkpoint agent', 'saving');
-  const failed = session('failed', 'Recovery agent', 'recovery_failed', { recovery_error: 'native thread could not resume' });
+  const failed = session('failed', 'Recovery agent', 'recovery_failed', { recovery_error: 'native session could not resume' });
   const historical = session('historical', 'Deleted agent', 'historical', {
     agent_deleted_at: '2026-07-15T09:30:00.000Z',
-    native_thread_id: null,
+    native_session_id: null,
     runtime_owner_id: null
   });
   const sessions = [active, saving, failed, historical];
@@ -113,7 +113,7 @@ test('Session history exposes queued work, explicit stop, recovery failure, and 
 
   await agentFilter.selectOption(failed.agent_id);
   await page.getByRole('button', { name: /Recovery agent/ }).click();
-  await expect(detail).toContainText('native thread could not resume');
+  await expect(detail).toContainText('native session could not resume');
   await expect(detail.getByRole('textbox', { name: 'Message' })).toHaveCount(0);
 
   await agentFilter.selectOption(historical.agent_id);
@@ -159,11 +159,6 @@ async function mockAdministration(page: Page, user = superAdmin) {
   };
   let platforms = [{ id: 'platform-1', key: 'github', name: 'GitHub' }];
   let channels = [{ id: 'channel-1', platform_id: 'platform-1', key: 'oauth', name: 'OAuth', enabled: true, trusted_email: true }];
-  let rollout = {
-    active_version: '0.30.0' as string | null, target_version: null as string | null, status: 'active', error: null, artifacts: [],
-    runtimes: [{ runtime_id: 'runtime-a', hostname: 'alpha', os: 'linux', architecture: 'x86_64', current_version: '0.30.0', target_version: null as string | null, status: 'active', error: null, checked_at: null }],
-    updated_at: '2026-07-15T09:00:00.000Z'
-  };
   const users = [
     { user: superAdmin, email_verified: true, has_password: true, created_at: '2026-07-10T08:00:00.000Z' },
     { user: { id: 'user-2', username: 'alice', email: 'alice@example.com', display_name: 'Alice', role: 'member' }, email_verified: true, has_password: false, created_at: '2026-07-11T08:00:00.000Z' }
@@ -212,21 +207,10 @@ async function mockAdministration(page: Page, user = superAdmin) {
     erasures.unshift(result);
     return route.fulfill({ status: 202, json: result });
   });
-  await page.route('**/api/admin/codex-version-rollout', (route) => route.fulfill({ json: rollout }));
-  await page.route('**/api/admin/codex-version-rollout/target', async (route) => {
-    const body = await record(route, 'target') as { version: string };
-    rollout = { ...rollout, target_version: body.version, status: 'ready', runtimes: rollout.runtimes.map((runtime) => ({ ...runtime, target_version: body.version, status: 'ready' })) };
-    return route.fulfill({ json: rollout });
-  });
-  await page.route('**/api/admin/codex-version-rollout/promote', async (route) => {
-    await record(route, 'promote');
-    rollout = { ...rollout, active_version: rollout.target_version, target_version: null, status: 'active' };
-    return route.fulfill({ json: rollout });
-  });
   return bodies;
 }
 
-test('Super Administrator manages identity policy, trusted channels, user erasure, and exact Codex rollout', async ({ page }) => {
+test('Super Administrator manages identity policy, trusted channels, and user erasure', async ({ page }) => {
   const bodies = await mockAdministration(page);
   await page.goto('/administration');
   await expect(page.getByRole('heading', { name: 'Administration', exact: true, level: 1 })).toBeVisible();
@@ -258,15 +242,6 @@ test('Super Administrator manages identity policy, trusted channels, user erasur
   await deleteUserDialog.getByRole('button', { name: 'Delete user' }).click();
   expect(bodies.erasure).toEqual([{ username: 'alice' }]);
   await expect(page.getByText('completed', { exact: true })).toBeVisible();
-
-  await page.getByRole('tab', { name: 'Codex version' }).click();
-  await page.getByLabel('Target Codex version').fill('0.31.0');
-  await page.getByRole('button', { name: 'Prepare version' }).click();
-  await expect(page.getByText('0.31.0', { exact: true })).toBeVisible();
-  await page.getByRole('button', { name: 'Promote ready version' }).click();
-  await expect(page.getByText('0.31.0', { exact: true })).toBeVisible();
-  expect(bodies.target).toEqual([{ version: '0.31.0' }]);
-  expect(bodies.promote).toHaveLength(1);
 });
 
 test('Administration navigation is Super Administrator-only', async ({ page }) => {
@@ -299,8 +274,6 @@ test('Administration remains operable in Chinese at 390px without browser or net
   await expect(page.getByRole('table', { name: '外部平台' })).toBeVisible();
   await page.getByRole('tab', { name: '用户管理' }).click();
   await expect(page.getByRole('heading', { name: '用户管理', exact: true, level: 2 })).toBeVisible();
-  await page.getByRole('tab', { name: 'Codex 版本' }).click();
-  await expect(page.getByRole('heading', { name: 'Codex 版本发布', exact: true, level: 2 })).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
   expect(pageErrors).toEqual([]);
   expect(consoleErrors).toEqual([]);

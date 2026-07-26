@@ -22,11 +22,10 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc as tokio_mpsc;
 
 use super::{
-    model_binding, pi_model_provider_name, pi_thinking_level,
-    send_app_server_event_with_backpressure, stable_tool_request_uuid,
-    terminate_child_process_tree, AppServerCancellation, AppServerRunResult,
+    model_binding, pi_model_provider_name, pi_thinking_level, send_engine_event_with_backpressure,
+    stable_tool_request_uuid, terminate_child_process_tree, EngineCancellation, EngineRunResult,
     PendingInterruptResponse, PendingSteerResponse, RunEnv, SessionInterruptOutcome,
-    SessionSteerOutcome, SessionSupervisorCommand, APP_SERVER_EVENT_QUEUE_CAPACITY,
+    SessionSteerOutcome, SessionSupervisorCommand, ENGINE_EVENT_QUEUE_CAPACITY,
 };
 
 const PI_SESSION_DIRECTORY: &str = "sessions";
@@ -67,15 +66,15 @@ export default function registerAgentHubIntegrationTools(pi) {
 "#;
 
 fn pi_agent_directory(run_env: &RunEnv) -> PathBuf {
-    run_env.codex_home.join(PI_AGENT_DIRECTORY)
+    run_env.engine_state_root.join(PI_AGENT_DIRECTORY)
 }
 
 fn pi_home_directory(run_env: &RunEnv) -> PathBuf {
-    run_env.codex_home.join(PI_HOME_DIRECTORY)
+    run_env.engine_state_root.join(PI_HOME_DIRECTORY)
 }
 
 fn pi_temp_directory(run_env: &RunEnv) -> PathBuf {
-    run_env.codex_home.join(PI_TEMP_DIRECTORY)
+    run_env.engine_state_root.join(PI_TEMP_DIRECTORY)
 }
 
 fn pi_integration_extension_path(run_env: &RunEnv) -> PathBuf {
@@ -680,14 +679,14 @@ fn add_landlock_current_process_maps_rule(ruleset_fd: RawFd) -> std::io::Result<
 pub(super) struct PersistentPiRpcProcess {
     session_dir: PathBuf,
     session_file: PathBuf,
-    session_id: String,
+    native_session_id: String,
     next_request_id: u64,
     child: Option<std::process::Child>,
     stdin: Option<std::process::ChildStdin>,
     line_rx: Option<mpsc::Receiver<anyhow::Result<String>>>,
     stdout_reader: Option<std::thread::JoinHandle<()>>,
     stderr_reader: Option<std::thread::JoinHandle<Result<usize, std::io::Error>>>,
-    cancellation: Arc<AppServerCancellation>,
+    cancellation: Arc<EngineCancellation>,
     timeout: Duration,
 }
 
@@ -698,10 +697,10 @@ impl PersistentPiRpcProcess {
         saved_session: Option<&Path>,
         tools: &[String],
         timeout: Duration,
-        cancellation: Arc<AppServerCancellation>,
+        cancellation: Arc<EngineCancellation>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(!tools.is_empty(), "Pi tool allowlist must not be empty");
-        let session_dir = run_env.codex_home.join(PI_SESSION_DIRECTORY);
+        let session_dir = run_env.engine_state_root.join(PI_SESSION_DIRECTORY);
         let agent_dir = pi_agent_directory(run_env);
         let pi_home = pi_home_directory(run_env);
         let pi_temp = pi_temp_directory(run_env);
@@ -791,7 +790,7 @@ impl PersistentPiRpcProcess {
         let stdout = child.stdout.take().context("open Pi RPC stdout")?;
         let mut stderr = child.stderr.take().context("open Pi RPC stderr")?;
         let (line_tx, line_rx) =
-            mpsc::sync_channel::<anyhow::Result<String>>(APP_SERVER_EVENT_QUEUE_CAPACITY);
+            mpsc::sync_channel::<anyhow::Result<String>>(ENGINE_EVENT_QUEUE_CAPACITY);
         let stdout_reader = std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {
                 if line_tx
@@ -817,7 +816,7 @@ impl PersistentPiRpcProcess {
         let mut process = Self {
             session_dir,
             session_file: PathBuf::new(),
-            session_id: String::new(),
+            native_session_id: String::new(),
             next_request_id: 1,
             child: Some(child),
             stdin: Some(stdin),
@@ -840,8 +839,8 @@ impl PersistentPiRpcProcess {
     }
 
     #[cfg(test)]
-    pub(super) fn session_id(&self) -> &str {
-        &self.session_id
+    pub(super) fn native_session_id(&self) -> &str {
+        &self.native_session_id
     }
 
     pub(super) fn ensure_running(&mut self) -> anyhow::Result<()> {
@@ -863,7 +862,7 @@ impl PersistentPiRpcProcess {
             .get("data")
             .and_then(Value::as_object)
             .context("Pi get_state response is missing data")?;
-        let session_id = state
+        let native_session_id = state
             .get("sessionId")
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
@@ -881,7 +880,7 @@ impl PersistentPiRpcProcess {
                 "Pi opened a different Session file than requested"
             );
         }
-        self.session_id = session_id.to_owned();
+        self.native_session_id = native_session_id.to_owned();
         self.session_file = session_file;
         Ok(())
     }
@@ -891,7 +890,7 @@ impl PersistentPiRpcProcess {
         &mut self,
         claim: &ClaimRunResponse,
         event_tx: Option<tokio_mpsc::Sender<AppendRunEventRequest>>,
-    ) -> anyhow::Result<AppServerRunResult> {
+    ) -> anyhow::Result<EngineRunResult> {
         let result = self.execute_inner(claim, &event_tx, None, None);
         if result.is_err() {
             self.shutdown();
@@ -905,7 +904,7 @@ impl PersistentPiRpcProcess {
         event_tx: Option<tokio_mpsc::Sender<AppendRunEventRequest>>,
         command_rx: &mpsc::Receiver<SessionSupervisorCommand>,
         deferred_commands: &mut VecDeque<SessionSupervisorCommand>,
-    ) -> anyhow::Result<AppServerRunResult> {
+    ) -> anyhow::Result<EngineRunResult> {
         let result =
             self.execute_inner(claim, &event_tx, Some(command_rx), Some(deferred_commands));
         if result.is_err() {
@@ -920,12 +919,12 @@ impl PersistentPiRpcProcess {
         event_tx: &Option<tokio_mpsc::Sender<AppendRunEventRequest>>,
         command_rx: Option<&mpsc::Receiver<SessionSupervisorCommand>>,
         mut deferred_commands: Option<&mut VecDeque<SessionSupervisorCommand>>,
-    ) -> anyhow::Result<AppServerRunResult> {
+    ) -> anyhow::Result<EngineRunResult> {
         self.ensure_running()?;
         let started_at = Instant::now();
         let mut state = PiRunState::new(
             claim.run.id,
-            self.session_id.clone(),
+            self.native_session_id.clone(),
             integration_tool_names(claim.integration_context.as_ref())?
                 .into_iter()
                 .collect(),
@@ -946,7 +945,6 @@ impl PersistentPiRpcProcess {
                     match command_rx.try_recv() {
                         Ok(SessionSupervisorCommand::Steer {
                             expected_turn_id,
-                            client_user_message_id: _,
                             input,
                             response,
                         }) => {
@@ -963,10 +961,7 @@ impl PersistentPiRpcProcess {
                             }))?;
                             pending.insert(
                                 request_id,
-                                PendingPiRequest::Steer(PendingSteerResponse {
-                                    expected_turn_id,
-                                    response,
-                                }),
+                                PendingPiRequest::Steer(PendingSteerResponse { response }),
                             );
                         }
                         Ok(SessionSupervisorCommand::Interrupt {
@@ -1229,7 +1224,7 @@ enum PendingPiRequest {
 
 struct PiRunState {
     run_id: uuid::Uuid,
-    session_id: String,
+    native_session_id: String,
     native_turn_id: String,
     events: Vec<AppendRunEventRequest>,
     streamed_events: usize,
@@ -1257,12 +1252,12 @@ struct PiRunState {
 impl PiRunState {
     fn new(
         run_id: uuid::Uuid,
-        session_id: String,
+        native_session_id: String,
         integration_tool_names: HashSet<String>,
     ) -> Self {
         Self {
             run_id,
-            session_id,
+            native_session_id,
             native_turn_id: run_id.to_string(),
             events: Vec::new(),
             streamed_events: 0,
@@ -1472,7 +1467,7 @@ impl PiRunState {
             role: None,
             content: None,
             payload: json!({
-                "native_thread_id": self.session_id,
+                "native_session_id": self.native_session_id,
                 "native_turn_id": self.native_turn_id
             }),
             waiting_tool: None,
@@ -1719,23 +1714,23 @@ impl PiRunState {
     fn flush_events(
         &mut self,
         event_tx: &Option<tokio_mpsc::Sender<AppendRunEventRequest>>,
-        cancellation: &AppServerCancellation,
+        cancellation: &EngineCancellation,
     ) -> anyhow::Result<()> {
         let Some(event_tx) = event_tx else {
             return Ok(());
         };
         for event in self.events.drain(..) {
-            send_app_server_event_with_backpressure(event_tx, event, cancellation)?;
+            send_engine_event_with_backpressure(event_tx, event, cancellation)?;
             self.streamed_events += 1;
         }
         Ok(())
     }
 
-    fn finish(self) -> AppServerRunResult {
-        AppServerRunResult {
+    fn finish(self) -> EngineRunResult {
+        EngineRunResult {
             events: self.events,
             final_status: self.final_status,
-            session_id: Some(self.session_id),
+            native_session_id: Some(self.native_session_id),
             native_turn_id: Some(self.native_turn_id),
         }
     }
@@ -1778,10 +1773,10 @@ pub(super) fn pi_tool_allowlist_for_claim(claim: &ClaimRunResponse) -> anyhow::R
 
 pub(super) fn discover_session_file(
     pi_home: &Path,
-    expected_session_id: &str,
+    expected_native_session_id: &str,
 ) -> anyhow::Result<PathBuf> {
     anyhow::ensure!(
-        !expected_session_id.trim().is_empty(),
+        !expected_native_session_id.trim().is_empty(),
         "Pi Session id must not be empty"
     );
     let session_dir = pi_home.join(PI_SESSION_DIRECTORY);
@@ -1803,7 +1798,7 @@ pub(super) fn discover_session_file(
             .context("Pi Session candidate is empty")?;
         let header: Value = serde_json::from_str(&first_line).context("parse Pi Session header")?;
         if header.get("type").and_then(Value::as_str) != Some("session")
-            || header.get("id").and_then(Value::as_str) != Some(expected_session_id)
+            || header.get("id").and_then(Value::as_str) != Some(expected_native_session_id)
         {
             continue;
         }
@@ -2094,10 +2089,10 @@ mod tests {
         let session_root = root.join(name);
         let run_env = RunEnv {
             workdir: session_root.join("workspace"),
-            codex_home: session_root.join("codex"),
+            engine_state_root: session_root.join("engine-state"),
         };
         let agent_dir = pi_agent_directory(&run_env);
-        let session_dir = run_env.codex_home.join(PI_SESSION_DIRECTORY);
+        let session_dir = run_env.engine_state_root.join(PI_SESSION_DIRECTORY);
         let pi_home = pi_home_directory(&run_env);
         let pi_temp = pi_temp_directory(&run_env);
         for path in [
@@ -2167,13 +2162,16 @@ mod tests {
     }
 
     #[test]
-    fn landlock_blocks_legacy_and_sibling_session_reads_but_keeps_own_pi_state_writable() {
+    fn landlock_blocks_unmanaged_and_sibling_session_reads_but_keeps_own_pi_state_writable() {
         let temp = tempfile::tempdir().unwrap();
         let fixture = isolated_run_env(temp.path(), "first");
         let own_workspace_file = fixture.run_env.workdir.join("allowed.txt");
-        let own_legacy_config = fixture.run_env.codex_home.join("config.toml");
+        let unmanaged_state = fixture
+            .run_env
+            .engine_state_root
+            .join("unmanaged-state.json");
         std::fs::write(&own_workspace_file, "own-workspace\n").unwrap();
-        std::fs::write(&own_legacy_config, "MCP_SECRET=legacy-secret\n").unwrap();
+        std::fs::write(&unmanaged_state, "ENGINE_SECRET=unmanaged-secret\n").unwrap();
 
         let sibling = isolated_run_env(temp.path(), "second");
         let sibling_workspace_file = sibling.run_env.workdir.join("secret.txt");
@@ -2204,7 +2202,7 @@ if /bin/sh -c ': > "$1"' sh "$8"; then exit 14; fi
                 &agent_state,
                 &session_state,
                 &temp_state,
-                &own_legacy_config,
+                &unmanaged_state,
                 &sibling_workspace_file,
                 &sibling_models_file,
                 &denied_workspace_write,

@@ -93,7 +93,7 @@ export type AgentModelSettingsOverride = Partial<{
   request_settings: ModelRequestSettings | null;
 }>;
 
-export type CodexSubagentDefinition = {
+export type SubagentDefinition = {
   name: string;
   description: string;
   developer_instructions: string;
@@ -112,7 +112,7 @@ export type Agent = {
   runtime_id: string | null;
   model_selection: ModelSelection | null;
   model_settings: AgentModelSettings;
-  codex_subagents: CodexSubagentDefinition[];
+  subagents: SubagentDefinition[];
   owner_id: string;
   is_owner: boolean;
   can_manage: boolean;
@@ -144,7 +144,7 @@ export type Runtime = {
   id: string;
   hostname: string;
   labels: string[];
-  codex_version: string;
+  engine_version: string;
   capabilities: Record<string, unknown>;
   sandbox_mode: string;
   status: string;
@@ -180,7 +180,7 @@ export type Run = {
   session_ownership_generation: number | null;
   status: string;
   initial_message: string;
-  session_id: string | null;
+  native_session_id: string | null;
   work_dir_ref: string | null;
   source: string;
   created_at: string;
@@ -203,7 +203,7 @@ export type CurrentSessionBundle = {
   size_bytes: number;
   history_checkpoint: number;
   ownership_generation: number;
-  producing_codex_version: string;
+  producing_engine_version: string;
   created_at: string;
 };
 
@@ -216,7 +216,7 @@ export type HubSession = {
   origin_platform_name: string | null;
   origin: HubSessionOrigin;
   lifecycle_status: string;
-  native_thread_id: string | null;
+  native_session_id: string | null;
   active_turn_id: string | null;
   history_checkpoint: number;
   configuration_fingerprint: string | null;
@@ -316,37 +316,6 @@ export type UserErasure = {
   status: string;
   requested_at: string;
   completed_at: string | null;
-};
-
-export type CodexVersionArtifact = {
-  version: string;
-  os: string;
-  architecture: string;
-  artifact_name: string;
-  sha256: string;
-  size_bytes: number;
-};
-
-export type CodexRuntimeReadiness = {
-  runtime_id: string;
-  hostname: string;
-  os: string;
-  architecture: string;
-  current_version: string;
-  target_version: string | null;
-  status: string;
-  error: string | null;
-  checked_at: string | null;
-};
-
-export type CodexVersionRollout = {
-  active_version: string | null;
-  target_version: string | null;
-  status: string;
-  error: string | null;
-  artifacts: CodexVersionArtifact[];
-  runtimes: CodexRuntimeReadiness[];
-  updated_at: string;
 };
 
 export type RunListResponse = {
@@ -449,7 +418,7 @@ export type CreateConfiguredAgentRequest = {
   public_to: string[];
   model_selection: ModelSelection | null;
   model_settings: AgentModelSettings;
-  codex_subagents: CodexSubagentDefinition[];
+  subagents: SubagentDefinition[];
 };
 
 export type UpdateModelConnectionRequest = Pick<
@@ -833,19 +802,6 @@ export const api = {
       body: JSON.stringify({ username }),
       signal
     }),
-  codexVersionRollout: (signal?: AbortSignal) =>
-    request<CodexVersionRollout>('/api/admin/codex-version-rollout', { signal }),
-  setCodexTargetVersion: (version: string, signal?: AbortSignal) =>
-    request<CodexVersionRollout>('/api/admin/codex-version-rollout/target', {
-      method: 'PUT',
-      body: JSON.stringify({ version }),
-      signal
-    }),
-  promoteCodexTargetVersion: (signal?: AbortSignal) =>
-    request<CodexVersionRollout>('/api/admin/codex-version-rollout/promote', {
-      method: 'POST',
-      signal
-    }),
   logout: () => request<void>('/api/auth/logout', { method: 'POST' }),
   apiKeys: (page = 1, pageSize = 20, signal?: AbortSignal) =>
     request<ApiKeyListResponse>(`/api/auth/api-keys?page=${page}&page_size=${pageSize}`, { signal }),
@@ -953,7 +909,7 @@ export const api = {
         runtime_id: agent.runtime_id,
         model_selection: agent.model_selection,
         model_settings: agent.model_settings,
-        codex_subagents: agent.codex_subagents,
+        subagents: agent.subagents,
         sandbox_policy: agent.sandbox_policy,
         managed_skill_ids: agent.managed_skill_ids,
         mcp_allowlist: agent.mcp_allowlist

@@ -83,7 +83,7 @@ function runFixture(id: string, automationId: string, message: string) {
     session_ownership_generation: null,
     status: 'completed',
     initial_message: message,
-    session_id: null,
+    native_session_id: null,
     work_dir_ref: null,
     source: 'automation:manual',
     created_at: '2026-07-17T09:00:00.000Z',

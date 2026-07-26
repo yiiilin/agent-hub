@@ -48,7 +48,7 @@ function updatePayload(agent, overrides = {}) {
     runtime_id: agent.runtime_id,
     model_selection: agent.model_selection,
     model_settings: agent.model_settings,
-    codex_subagents: agent.codex_subagents,
+    subagents: agent.subagents,
     sandbox_policy: agent.sandbox_policy,
     managed_skill_ids: agent.managed_skill_ids,
     mcp_allowlist: agent.mcp_allowlist,
@@ -68,39 +68,36 @@ function runtimeProbe(context, workDirRef) {
   const script = String.raw`
 set -eu
 root="$1"
-config="$root/codex/config.toml"
-allowlist="$root/codex/mcp-allowlist.json"
-test -f "$config"
-test -f "$allowlist"
-mode="$(stat -c '%a' "$config")"
-config_secret=no
-allowlist_secret=no
-allowlist_redacted=no
+agent_dir="$root/engine-state/.pi/agent"
+models="$agent_dir/models.json"
+test -f "$models"
+test -f "$agent_dir/AGENTS.md"
+mode="$(stat -c '%a' "$models")"
+models_secret=no
+mcp_file=no
 skill_v1=no
 skill_v2=no
 subagent=no
 instructions=no
 outside_leaks=0
-grep -F 'qa-mcp-secret-' "$config" >/dev/null && config_secret=yes || true
-grep -F 'qa-mcp-secret-' "$allowlist" >/dev/null && allowlist_secret=yes || true
-grep -F '********' "$allowlist" >/dev/null && allowlist_redacted=yes || true
-grep -R -F 'QA managed Skill content v1' "$root/codex/skills" >/dev/null 2>&1 && skill_v1=yes || true
-grep -R -F 'QA managed Skill content v2' "$root/codex/skills" >/dev/null 2>&1 && skill_v2=yes || true
-grep -R -F 'Review the QA change for correctness.' "$root/codex/agents" >/dev/null 2>&1 && subagent=yes || true
-grep -F '# QA Agent Instructions' "$root/codex/AGENTS.md" >/dev/null && instructions=yes || true
-outside_leaks="$(find "$root" -type f ! -path "$config" -exec grep -Il -F 'qa-mcp-secret-' {} + 2>/dev/null | wc -l | tr -d ' ')"
-printf '%s|%s|%s|%s|%s|%s|%s|%s|%s' "$mode" "$config_secret" "$allowlist_secret" "$allowlist_redacted" "$skill_v1" "$skill_v2" "$subagent" "$instructions" "$outside_leaks"
+grep -F 'qa-mcp-secret-' "$models" >/dev/null && models_secret=yes || true
+test "$(find "$root/engine-state" -type f -name 'mcp-allowlist.json' | wc -l | tr -d ' ')" = 0 || mcp_file=yes
+grep -R -F 'QA managed Skill content v1' "$agent_dir/skills" >/dev/null 2>&1 && skill_v1=yes || true
+grep -R -F 'QA managed Skill content v2' "$agent_dir/skills" >/dev/null 2>&1 && skill_v2=yes || true
+grep -R -F 'Review the QA change for correctness.' "$root/engine-state" >/dev/null 2>&1 && subagent=yes || true
+grep -F '# QA Agent Instructions' "$agent_dir/AGENTS.md" >/dev/null && instructions=yes || true
+outside_leaks="$(find "$root" -type f -exec grep -Il -F 'qa-mcp-secret-' {} + 2>/dev/null | wc -l | tr -d ' ')"
+printf '%s|%s|%s|%s|%s|%s|%s|%s' "$mode" "$models_secret" "$mcp_file" "$skill_v1" "$skill_v2" "$subagent" "$instructions" "$outside_leaks"
 `;
   const output = context.compose.run([
     'exec', '-T', 'runtime', 'sh', '-lc', script, 'qa-probe', runRoot
   ]).stdout.trim();
-  const [mode, configSecret, allowlistSecret, allowlistRedacted, skillV1, skillV2, subagent, instructions, outsideLeaks] = output.split('|');
+  const [mode, modelsSecret, mcpFile, skillV1, skillV2, subagent, instructions, outsideLeaks] = output.split('|');
   return {
     runRoot,
     mode,
-    configSecret,
-    allowlistSecret,
-    allowlistRedacted,
+    modelsSecret,
+    mcpFile,
     skillV1,
     skillV2,
     subagent,
@@ -222,7 +219,7 @@ export default async function agentSkillMcpApiScenario(context) {
       public_to: [outsider.user.id],
       model_selection: defaultSelection,
       model_settings: { reasoning_effort: 'high' },
-      codex_subagents: [{
+      subagents: [{
         name: 'reviewer',
         description: 'Reviews the current QA change.',
         developer_instructions: 'Review the QA change for correctness.',
@@ -235,7 +232,7 @@ export default async function agentSkillMcpApiScenario(context) {
     assert.deepEqual(configuredAgent.public_to, [outsider.user.id]);
     assert.deepEqual(configuredAgent.model_selection, defaultSelection);
     assert.equal(configuredAgent.model_settings.reasoning_effort, 'high');
-    assert.equal(configuredAgent.codex_subagents[0].name, 'reviewer');
+    assert.equal(configuredAgent.subagents[0].name, 'reviewer');
     const { data: configuredOptions } = await target.client.get(`/api/agents/${configuredAgent.id}/model-options`);
     assert.equal(configuredOptions.items.some((item) => (
       item.connection_id === defaultSelection.connection_id
@@ -280,33 +277,92 @@ export default async function agentSkillMcpApiScenario(context) {
     assert.deepEqual(placeholderRoundTrip.mcp_allowlist[0].args, ['--mode', 'read-only', '--verbose']);
     assert.equal(JSON.stringify(placeholderRoundTrip).includes(mcpSecret), false, 'Placeholder round-trip must stay redacted');
 
+    const { data: mcpOnly } = await updateAgent(target.client, placeholderRoundTrip, {
+      subagents: []
+    });
+    const mcpOnlyMessage = context.unique('QA Pi rejects unsupported MCP execution');
+    const { data: mcpOnlyRun } = await target.client.post(`/api/agents/${mcpOnly.id}/runs`, {
+      message: mcpOnlyMessage,
+      hub_session_id: null,
+      parent_run_id: null
+    });
+    const mcpOnlyRejected = await waitForRunStatus(
+      target.client,
+      mcpOnly.id,
+      mcpOnlyRun.id,
+      'failed',
+      15_000
+    );
+    assert.equal(mcpOnlyRejected.native_session_id, null);
+    const { data: mcpOnlyEvents } = await target.client.get(`/api/runs/${mcpOnlyRun.id}/events`);
+    assert.equal(
+      mcpOnlyEvents.some((event) => event.event_type === 'status'
+        && event.payload?.reason === 'runtime capability mismatch'),
+      true,
+      'Pi must reject MCP execution until the Runtime advertises support'
+    );
+    assert.equal(JSON.stringify(mcpOnlyEvents).includes(mcpSecret), false,
+      'Rejected Run events must not expose MCP plaintext');
+
+    const { data: subagentOnly } = await updateAgent(target.client, mcpOnly, {
+      mcp_allowlist: [],
+      subagents: configuredAgent.subagents
+    });
+    const subagentOnlyMessage = context.unique('QA Pi rejects unsupported Subagent execution');
+    const { data: subagentOnlyRun } = await target.client.post(`/api/agents/${subagentOnly.id}/runs`, {
+      message: subagentOnlyMessage,
+      hub_session_id: null,
+      parent_run_id: null
+    });
+    const subagentOnlyRejected = await waitForRunStatus(
+      target.client,
+      subagentOnly.id,
+      subagentOnlyRun.id,
+      'failed',
+      15_000
+    );
+    assert.equal(subagentOnlyRejected.native_session_id, null);
+    const { data: subagentOnlyEvents } = await target.client.get(`/api/runs/${subagentOnlyRun.id}/events`);
+    assert.equal(
+      subagentOnlyEvents.some((event) => event.event_type === 'status'
+        && event.payload?.reason === 'runtime capability mismatch'),
+      true,
+      'Pi must reject enabled Subagent execution until the Runtime advertises support'
+    );
+
+    const { data: runnable } = await updateAgent(target.client, subagentOnly, {
+      instructions: '# QA Agent Instructions\n\nUse the managed Skill.',
+      subagents: [],
+      mcp_allowlist: []
+    });
+    assert.deepEqual(runnable.subagents, []);
+    assert.deepEqual(runnable.mcp_allowlist, []);
+
     const firstMessage = context.unique('QA first materialized Turn');
-    const { data: firstRun } = await target.client.post(`/api/agents/${configured.id}/runs`, {
+    const { data: firstRun } = await target.client.post(`/api/agents/${runnable.id}/runs`, {
       message: firstMessage,
       hub_session_id: null,
       parent_run_id: null
     });
-    const firstCompleted = await waitForRunStatus(target.client, configured.id, firstRun.id, 'completed', 60_000);
+    const firstCompleted = await waitForRunStatus(target.client, runnable.id, firstRun.id, 'completed', 60_000);
     assert.match(firstCompleted.work_dir_ref, /^\//);
     assert.match(firstCompleted.hub_session_id, UUID_PATTERN);
 
     const firstProbe = runtimeProbe(context, firstCompleted.work_dir_ref);
     assert.deepEqual({
       mode: firstProbe.mode,
-      configSecret: firstProbe.configSecret,
-      allowlistSecret: firstProbe.allowlistSecret,
-      allowlistRedacted: firstProbe.allowlistRedacted,
+      modelsSecret: firstProbe.modelsSecret,
+      mcpFile: firstProbe.mcpFile,
       skillV1: firstProbe.skillV1,
       subagent: firstProbe.subagent,
       instructions: firstProbe.instructions,
       outsideLeaks: firstProbe.outsideLeaks
     }, {
       mode: '600',
-      configSecret: 'yes',
-      allowlistSecret: 'no',
-      allowlistRedacted: 'yes',
+      modelsSecret: 'no',
+      mcpFile: 'no',
       skillV1: 'yes',
-      subagent: 'yes',
+      subagent: 'no',
       instructions: 'yes',
       outsideLeaks: '0'
     });
@@ -326,12 +382,12 @@ export default async function agentSkillMcpApiScenario(context) {
     assert.notEqual(skillV2.content_checksum_sha256, skillV1.content_checksum_sha256);
 
     const secondMessage = context.unique('QA refreshed materialized Turn');
-    const { data: secondRun } = await target.client.post(`/api/agents/${configured.id}/runs`, {
+    const { data: secondRun } = await target.client.post(`/api/agents/${runnable.id}/runs`, {
       message: secondMessage,
       hub_session_id: firstCompleted.hub_session_id,
       parent_run_id: firstRun.id
     });
-    const secondCompleted = await waitForRunStatus(target.client, configured.id, secondRun.id, 'completed', 60_000);
+    const secondCompleted = await waitForRunStatus(target.client, runnable.id, secondRun.id, 'completed', 60_000);
     assert.equal(secondCompleted.hub_session_id, firstCompleted.hub_session_id);
     assert.equal(dirname(secondCompleted.work_dir_ref), firstProbe.runRoot);
     const secondProbe = runtimeProbe(context, secondCompleted.work_dir_ref);
@@ -340,13 +396,13 @@ export default async function agentSkillMcpApiScenario(context) {
     assert.equal(secondProbe.outsideLeaks, '0');
 
     await target.client.delete(`/api/skills/${skillV1.id}`, { expectedStatus: 204 });
-    const { data: unboundAgent } = await target.client.get(`/api/agents/${configured.id}`);
+    const { data: unboundAgent } = await target.client.get(`/api/agents/${runnable.id}`);
     assert.deepEqual(unboundAgent.managed_skill_ids, [], 'Deleting a Skill must remove Agent bindings');
 
     const { data: messagesBeforeDelete } = await target.client.get(`/api/sessions/${firstCompleted.hub_session_id}/messages`);
     assert.equal(messagesBeforeDelete.some((message) => message.content === firstMessage), true);
     assert.equal(messagesBeforeDelete.some((message) => message.content === secondMessage), true);
-    await target.client.delete(`/api/agents/${configured.id}`, { expectedStatus: 204 });
+    await target.client.delete(`/api/agents/${runnable.id}`, { expectedStatus: 204 });
 
     const { data: historical } = await target.client.get(`/api/sessions/${firstCompleted.hub_session_id}`);
     assert.equal(historical.lifecycle_status, 'historical');
@@ -362,7 +418,7 @@ export default async function agentSkillMcpApiScenario(context) {
       client_message_key: context.unique('historical-reject'),
       parent_run_id: secondRun.id
     }, { expectedStatus: 404 });
-    await target.client.post(`/api/agents/${configured.id}/runs`, {
+    await target.client.post(`/api/agents/${runnable.id}/runs`, {
       message: 'Deleted Agents must not run.',
       hub_session_id: historical.id,
       parent_run_id: secondRun.id

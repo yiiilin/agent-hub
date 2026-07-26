@@ -1,6 +1,6 @@
 # Automation browser workflows
 
-Uses the real console, backend, PostgreSQL, scheduler, Runtime, fake Codex, and
+Uses the real console, backend, PostgreSQL, scheduler, Runtime, fake Pi RPC, and
 fake Responses provider. The scenario creates and edits Automations through the
 UI, exercises Markdown source and rich-text modes, proves the Agent binding is
 immutable, and validates the shared row structure for manual, webhook,

@@ -12,7 +12,7 @@ type RuntimeFixture = {
   id: string;
   hostname: string;
   labels: string[];
-  codex_version: string;
+  engine_version: string;
   capabilities: Record<string, unknown>;
   sandbox_mode: string;
   status: string;
@@ -35,8 +35,8 @@ function runtime(id: string, hostname: string, status = 'online'): RuntimeFixtur
     id,
     hostname,
     labels: ['linux'],
-    codex_version: `codex-${id}`,
-    capabilities: { model_proxy: true, driver: 'app-server' },
+    engine_version: `engine-${id}`,
+    capabilities: { model_proxy: true, driver: 'pi' },
     sandbox_mode: 'workspace-write',
     status,
     last_heartbeat_at: '2026-07-17T08:00:00.000Z',

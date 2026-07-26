@@ -31,7 +31,7 @@ FROM runtime-base
 COPY --from=builder /app/target/release/agent-hub-runtime /usr/local/bin/agent-hub-runtime
 COPY --from=pi-builder --chown=root:root /opt/pi-runtime /opt/agent-hub/pi
 RUN chmod -R a-w /opt/agent-hub/pi
-ENV CODEX_BIN=/opt/agent-hub/pi/pi
-ENV RUNTIME_CODEX_VERSION=0.81.1
+ENV ENGINE_BIN=/opt/agent-hub/pi/pi
+ENV RUNTIME_ENGINE_VERSION=0.81.1
 USER 10001:10001
 CMD ["agent-hub-runtime"]

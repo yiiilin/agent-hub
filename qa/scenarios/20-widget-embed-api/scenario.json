@@ -2,5 +2,5 @@
   "name": "Widget embed exchange, scoped Session, SSE, stop, and isolation",
   "type": "api",
   "timeout_ms": 240000,
-  "covers": ["WGT-001", "WGT-002", "WGT-003"]
+  "covers": ["SES-004", "SES-005", "WGT-001", "WGT-002", "WGT-003"]
 }

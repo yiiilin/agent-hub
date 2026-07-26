@@ -27,7 +27,7 @@ const terminalRunStatuses = new Set(['completed', 'failed', 'cancelled', 'interr
 
 type ActivityKind = 'reasoning' | 'command' | 'file' | 'tool' | 'search' | 'plan' | 'image' | 'subagent' | 'compaction' | 'review' | 'wait';
 
-type ActivityEntry = {
+export type ActivityEntry = {
   id: string;
   runId: string;
   itemId: string | null;
@@ -97,7 +97,7 @@ function formatActivityDuration(activities: ActivityEntry[], locale: string) {
   return `${minuteLabel} ${secondLabel}`;
 }
 
-function mergeRunEvents(current: RunEvent[], incoming: RunEvent[]) {
+export function mergeRunEvents(current: RunEvent[], incoming: RunEvent[]) {
   const merged = new Map(current.map((event) => [`${event.run_id}:${event.seq}`, event]));
   for (const event of incoming) merged.set(`${event.run_id}:${event.seq}`, event);
   return [...merged.values()].sort((left, right) => (
@@ -224,7 +224,7 @@ function mergeActivity(current: ActivityEntry, incoming: ActivityEntry): Activit
   };
 }
 
-function projectActivities(events: RunEvent[]) {
+export function projectActivities(events: RunEvent[]) {
   const activities = new Map<string, ActivityEntry>();
   for (const event of events) {
     const activity = activityFromEvent(event);
@@ -240,7 +240,7 @@ function projectActivities(events: RunEvent[]) {
   ));
 }
 
-function resizeComposer(textarea: HTMLTextAreaElement | null) {
+export function resizeComposer(textarea: HTMLTextAreaElement | null) {
   if (!textarea) return;
   const style = window.getComputedStyle(textarea);
   const lineHeight = Number.parseFloat(style.lineHeight);
@@ -265,6 +265,52 @@ function ActivityIcon({ kind }: { kind: ActivityKind }) {
   if (kind === 'image') return <ImageIcon size={15} />;
   if (kind === 'subagent') return <Users size={15} />;
   return <Minimize2 size={15} />;
+}
+
+export function ChatActivityGroup({ activities }: { activities: ActivityEntry[] }) {
+  const { locale, t } = useI18n();
+  return <details className="session-activity-events"><summary><span>{t('agentActivityDuration').replace('{duration}', formatActivityDuration(activities, locale))}</span><ChevronRight className="session-activity-chevron" size={16} aria-hidden="true" /></summary><div>{activities.map((activity) => <div className="session-activity-row" key={activity.id}><span className="session-activity-icon" aria-hidden="true"><ActivityIcon kind={activity.kind} /></span><div className="session-activity-content"><strong>{t(activityKeys[activity.kind])}</strong>{activity.summary && (activity.kind === 'command' ? <code>{activity.summary}</code> : <span className="session-activity-summary">{activity.summary}</span>)}{activity.output && <div className="session-activity-output"><span>{t('activityOutput')}</span><pre>{activity.output}</pre></div>}</div></div>)}</div></details>;
+}
+
+export function ChatMessageBubble({
+  agentName,
+  content,
+  guidance,
+  role,
+  state,
+  stateLabel
+}: {
+  agentName: string | null;
+  content: string;
+  guidance?: string;
+  role: string;
+  state?: string;
+  stateLabel?: string;
+}) {
+  const { t } = useI18n();
+  return <article className={`session-bubble role-${role}`}>
+    {role !== 'user' && <span className="session-message-avatar" aria-hidden="true"><Bot size={17} /></span>}
+    <div className="session-message-body">
+      <header>{role !== 'user' && <strong>{role === 'assistant' ? agentName ?? t('assistant') : role}</strong>}{state && state !== 'delivered' && <span className={`message-state ${state}`}>{stateLabel}</span>}</header>
+      <div className="session-message-text">{content}</div>
+      {guidance && <small>{guidance}</small>}
+    </div>
+  </article>;
+}
+
+export function ChatThinkingBubble() {
+  const { t } = useI18n();
+  return <article className="session-bubble role-assistant session-thinking">
+    <span className="session-message-avatar" aria-hidden="true"><Bot size={17} /></span>
+    <div className="session-message-body">
+      <div className="session-thinking-indicator" role="status" aria-label={t('agentThinking')}>
+        <span className="session-thinking-label">{t('agentThinking')}</span>
+        <span className="session-thinking-dot" aria-hidden="true" />
+        <span className="session-thinking-dot" aria-hidden="true" />
+        <span className="session-thinking-dot" aria-hidden="true" />
+      </div>
+    </div>
+  </article>;
 }
 
 function eventRefreshesSession(event: RunEvent) {
@@ -756,26 +802,17 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
               {!conversationDraft && !messagesLoading && messagesError && <div className="operation-state error" role="alert">{t('messagesLoadFailed')}</div>}
               {!conversationDraft && !messagesLoading && !messagesError && timelineItems.length === 0 && <div className="operation-state">{t('noMessages')}</div>}
               {!conversationDraft && timelineItems.map((entry) => entry.kind === 'activity-group'
-                ? <details className="session-activity-events" key={entry.id}><summary><span>{t('agentActivityDuration').replace('{duration}', formatActivityDuration(entry.activities, locale))}</span><ChevronRight className="session-activity-chevron" size={16} aria-hidden="true" /></summary><div>{entry.activities.map((activity) => <div className="session-activity-row" key={activity.id}><span className="session-activity-icon" aria-hidden="true"><ActivityIcon kind={activity.kind} /></span><div className="session-activity-content"><strong>{t(activityKeys[activity.kind])}</strong>{activity.summary && (activity.kind === 'command' ? <code>{activity.summary}</code> : <span className="session-activity-summary">{activity.summary}</span>)}{activity.output && <div className="session-activity-output"><span>{t('activityOutput')}</span><pre>{activity.output}</pre></div>}</div></div>)}</div></details>
-                : <article className={`session-bubble role-${entry.role}`} key={entry.id}>
-                  {entry.role !== 'user' && <span className="session-message-avatar" aria-hidden="true"><Bot size={17} /></span>}
-                  <div className="session-message-body">
-                    <header>{entry.role !== 'user' && <strong>{entry.role === 'assistant' ? conversationAgentName : entry.role}</strong>}{entry.kind === 'message' && entry.state && entry.state !== 'delivered' && <span className={`message-state ${entry.state}`}>{deliveryLabel(entry.state)}</span>}</header>
-                    <div className="session-message-text">{entry.content}</div>
-                    {entry.kind === 'message' && entry.mode === 'steer' && <small>{t('guidingCurrentTurn')}</small>}
-                  </div>
-                </article>)}
-              {!conversationDraft && showThinking && <article className="session-bubble role-assistant session-thinking">
-                <span className="session-message-avatar" aria-hidden="true"><Bot size={17} /></span>
-                <div className="session-message-body">
-                  <div className="session-thinking-indicator" role="status" aria-label={t('agentThinking')}>
-                    <span className="session-thinking-label">{t('agentThinking')}</span>
-                    <span className="session-thinking-dot" aria-hidden="true" />
-                    <span className="session-thinking-dot" aria-hidden="true" />
-                    <span className="session-thinking-dot" aria-hidden="true" />
-                  </div>
-                </div>
-              </article>}
+                ? <ChatActivityGroup activities={entry.activities} key={entry.id} />
+                : <ChatMessageBubble
+                  agentName={conversationAgentName}
+                  content={entry.content}
+                  guidance={entry.kind === 'message' && entry.mode === 'steer' ? t('guidingCurrentTurn') : undefined}
+                  key={entry.id}
+                  role={entry.role}
+                  state={entry.kind === 'message' ? entry.state : undefined}
+                  stateLabel={entry.kind === 'message' && entry.state ? deliveryLabel(entry.state) : undefined}
+                />)}
+              {!conversationDraft && showThinking && <ChatThinkingBubble />}
             </div>
           </div>
           {canMutate && <form className="session-composer session-chat-composer" onSubmit={submitMessage}>

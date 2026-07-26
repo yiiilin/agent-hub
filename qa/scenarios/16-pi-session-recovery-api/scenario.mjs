@@ -29,7 +29,7 @@ function updateAgentPayload(agent, overrides = {}) {
     runtime_id: agent.runtime_id,
     model_selection: agent.model_selection,
     model_settings: agent.model_settings,
-    codex_subagents: agent.codex_subagents,
+    subagents: agent.subagents,
     sandbox_policy: agent.sandbox_policy,
     managed_skill_ids: agent.managed_skill_ids,
     mcp_allowlist: agent.mcp_allowlist,
@@ -62,9 +62,9 @@ function sessionPaths(sessionId) {
   const root = `${RUNTIME_SESSION_ROOT}/${sessionId}`;
   return {
     root,
-    agent: `${root}/codex/.pi/agent`,
-    agentsFile: `${root}/codex/.pi/agent/AGENTS.md`,
-    modelsFile: `${root}/codex/.pi/agent/models.json`
+    agent: `${root}/engine-state/.pi/agent`,
+    agentsFile: `${root}/engine-state/.pi/agent/AGENTS.md`,
+    modelsFile: `${root}/engine-state/.pi/agent/models.json`
   };
 }
 
@@ -144,11 +144,11 @@ export default async function piSessionRecoveryScenario(context) {
       client,
       sessionId,
       (session) => session.lifecycle_status === 'online'
-        && typeof session.native_thread_id === 'string'
-        && session.native_thread_id.length > 0,
+        && typeof session.native_session_id === 'string'
+        && session.native_session_id.length > 0,
       'first Pi Turn to expose its native Session id'
     );
-    const nativePiSessionId = activeFirstSession.native_thread_id;
+    const nativePiSessionId = activeFirstSession.native_session_id;
     const firstOwnershipGeneration = activeFirstSession.ownership_generation;
     const paths = sessionPaths(sessionId);
     const bundleSentinel = context.unique('pi-bundle-config-sentinel');
@@ -169,8 +169,8 @@ export default async function piSessionRecoveryScenario(context) {
         && session.current_bundle?.generation >= 1,
       'idle Pi Session to commit a Bundle and release ownership'
     );
-    assert.equal(savedSession.native_thread_id, nativePiSessionId);
-    assert.equal(savedSession.current_bundle.producing_codex_version, composeRuntime.codex_version);
+    assert.equal(savedSession.native_session_id, nativePiSessionId);
+    assert.equal(savedSession.current_bundle.producing_engine_version, composeRuntime.engine_version);
 
     await poll(
       () => runtimeExec(context.compose, ['test', '!', '-e', paths.root], { allowFailure: true }).status,
@@ -200,7 +200,7 @@ export default async function piSessionRecoveryScenario(context) {
       client,
       sessionId,
       (session) => session.lifecycle_status === 'online'
-        && session.native_thread_id === nativePiSessionId,
+        && session.native_session_id === nativePiSessionId,
       'second Pi Turn to restore the native Session id from its Bundle'
     );
     assert.ok(activeRecoveredSession.ownership_generation > firstOwnershipGeneration);
@@ -229,7 +229,7 @@ export default async function piSessionRecoveryScenario(context) {
     const completedSession = await waitForSession(
       client,
       sessionId,
-      (session) => session.active_turn_id === null && session.native_thread_id === nativePiSessionId,
+      (session) => session.active_turn_id === null && session.native_session_id === nativePiSessionId,
       'recovered Pi Session to complete its second Turn'
     );
 

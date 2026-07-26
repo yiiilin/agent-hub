@@ -1,9 +1,0 @@
-{
-  "name": "Destructive-last exact Codex rollout and in-flight continuity",
-  "type": "api",
-  "timeout_ms": 420000,
-  "covers": [
-    "ROL-001",
-    "ROL-002"
-  ]
-}

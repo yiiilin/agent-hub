@@ -6,7 +6,7 @@ import {
   ApiError,
   type AgentModelSettings,
   type AgentModelSettingsOverride,
-  type CodexSubagentDefinition,
+  type SubagentDefinition,
   type ModelConnectionOption,
   type ModelConnectionOptions,
   type ModelReasoningSummary,
@@ -328,11 +328,11 @@ function SubagentModelSettingsFields({
 
 type SubagentDialogState = {
   index: number | null;
-  draft: CodexSubagentDefinition;
+  draft: SubagentDefinition;
   error: string;
 };
 
-function emptySubagent(): CodexSubagentDefinition {
+function emptySubagent(): SubagentDefinition {
   return {
     name: '',
     description: '',
@@ -342,7 +342,7 @@ function emptySubagent(): CodexSubagentDefinition {
   };
 }
 
-function editableSubagent(definition?: CodexSubagentDefinition): CodexSubagentDefinition {
+function editableSubagent(definition?: SubagentDefinition): SubagentDefinition {
   return definition ? {
     ...definition,
     enabled: true,
@@ -358,7 +358,7 @@ function SubagentTable({
   onEdit,
   onDelete
 }: {
-  definitions: CodexSubagentDefinition[];
+  definitions: SubagentDefinition[];
   modelOptions: ModelConnectionOption[];
   canManage: boolean;
   disabled: boolean;
@@ -367,7 +367,7 @@ function SubagentTable({
 }) {
   const { t } = useI18n();
   return <div className="agents-table-wrap agent-subagent-table-wrap">
-    <table className="agents-table agent-subagent-table" aria-label={t('codexSubagents')}>
+    <table className="agents-table agent-subagent-table" aria-label={t('subagents')}>
       <thead><tr><th>{t('subagentName')}</th><th>{t('subagentDescription')}</th><th>{t('subagentModelOverride')}</th><th>{t('subagentReasoningOverride')}</th><th>{t('status')}</th>{canManage && <th className="agent-subagent-actions-column">{t('actions')}</th>}</tr></thead>
       <tbody>{definitions.map((definition, index) => <tr key={`${definition.name}-${index}`}>
         <td><strong>{definition.name}</strong></td>
@@ -375,8 +375,8 @@ function SubagentTable({
         <td>{modelName(definition.model_selection, modelOptions, t('inheritAgentModel'))}</td>
         <td>{Object.keys(definition.model_settings_override).length ? t('subagentOverrideCount').replace('{count}', String(Object.keys(definition.model_settings_override).length)) : t('inheritAllAgentSettings')}</td>
         <td>{definition.enabled === false ? <span title={definition.disabled_reason ?? undefined}>{t('disabled')}</span> : t('enabled')}</td>
-        {canManage && <td className="agent-subagent-actions-column"><div className="button-row agent-subagent-actions"><button type="button" className="icon-button" disabled={disabled} aria-label={`${t('editCodexSubagent')}: ${definition.name}`} title={`${t('editCodexSubagent')}: ${definition.name}`} onClick={() => onEdit(index)}><Pencil size={16} /></button><button type="button" className="icon-button" disabled={disabled} aria-label={`${t('delete')} ${definition.name}`} title={`${t('delete')} ${definition.name}`} onClick={() => onDelete(index)}><Trash2 size={16} /></button></div></td>}
-      </tr>)}{definitions.length === 0 && <tr><td colSpan={canManage ? 6 : 5}><div className="compact-empty">{t('noCodexSubagents')}</div></td></tr>}</tbody>
+        {canManage && <td className="agent-subagent-actions-column"><div className="button-row agent-subagent-actions"><button type="button" className="icon-button" disabled={disabled} aria-label={`${t('editSubagent')}: ${definition.name}`} title={`${t('editSubagent')}: ${definition.name}`} onClick={() => onEdit(index)}><Pencil size={16} /></button><button type="button" className="icon-button" disabled={disabled} aria-label={`${t('delete')} ${definition.name}`} title={`${t('delete')} ${definition.name}`} onClick={() => onDelete(index)}><Trash2 size={16} /></button></div></td>}
+      </tr>)}{definitions.length === 0 && <tr><td colSpan={canManage ? 6 : 5}><div className="compact-empty">{t('noSubagents')}</div></td></tr>}</tbody>
     </table>
   </div>;
 }
@@ -394,14 +394,14 @@ function SubagentDialog({
   onClose
 }: {
   dialog: SubagentDialogState;
-  definitions: CodexSubagentDefinition[];
+  definitions: SubagentDefinition[];
   modelOptions: ModelConnectionOption[];
   parentSelection: ModelSelection | null;
   parentSettings: AgentModelSettings;
   formId: string;
   busy: boolean;
   onChange: (dialog: SubagentDialogState) => void;
-  onCommit: (index: number | null, definition: CodexSubagentDefinition) => void;
+  onCommit: (index: number | null, definition: SubagentDefinition) => void;
   onClose: () => void;
 }) {
   const { t } = useI18n();
@@ -411,7 +411,7 @@ function SubagentDialog({
   const effectiveApiType = selectedOption(effectiveSelection, modelOptions)?.api_type ?? parentApiType;
   const protocolChanged = Boolean(dialog.draft.model_selection && effectiveApiType !== parentApiType);
 
-  function update(update: Partial<CodexSubagentDefinition>) {
+  function update(update: Partial<SubagentDefinition>) {
     onChange({ ...dialog, draft: { ...dialog.draft, ...update }, error: '' });
   }
 
@@ -438,7 +438,7 @@ function SubagentDialog({
   }
 
   return <FormDialog
-    title={dialog.index === null ? t('addCodexSubagent') : `${t('editCodexSubagent')}: ${dialog.draft.name}`}
+    title={dialog.index === null ? t('addSubagent') : `${t('editSubagent')}: ${dialog.draft.name}`}
     busy={busy}
     onClose={onClose}
     initialFocusRef={nameRef}
@@ -602,7 +602,7 @@ function CreateAgentModal({ currentUser, navigate, onClose }: { currentUser: Use
   const [modelsError, setModelsError] = useState(false);
   const [modelSelection, setModelSelection] = useState<ModelSelection | null>(null);
   const [modelSettings, setModelSettings] = useState<AgentModelSettings>(automaticAgentModelSettings);
-  const [codexSubagents, setCodexSubagents] = useState<CodexSubagentDefinition[]>([]);
+  const [subagents, setSubagents] = useState<SubagentDefinition[]>([]);
   const [subagentDialog, setSubagentDialog] = useState<SubagentDialogState | null>(null);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState(false);
@@ -681,7 +681,7 @@ function CreateAgentModal({ currentUser, navigate, onClose }: { currentUser: Use
         public_to: visibility === 'public_to' ? publicTo : [],
         model_selection: modelSelection,
         model_settings: modelSettings,
-        codex_subagents: codexSubagents
+        subagents: subagents
       }, controller.signal);
       if (controller.signal.aborted || !mountedRef.current) return;
       navigate(`/agents/${agent.id}`);
@@ -696,22 +696,22 @@ function CreateAgentModal({ currentUser, navigate, onClose }: { currentUser: Use
   }
 
   function openSubagent(index: number | null) {
-    const definition = index === null ? undefined : codexSubagents[index];
+    const definition = index === null ? undefined : subagents[index];
     if (index !== null && !definition) return;
     setSubagentDialog({ index, draft: editableSubagent(definition), error: '' });
   }
 
-  function commitSubagent(index: number | null, definition: CodexSubagentDefinition) {
-    setCodexSubagents((current) => index === null
+  function commitSubagent(index: number | null, definition: SubagentDefinition) {
+    setSubagents((current) => index === null
       ? [...current, definition]
       : current.map((candidate, candidateIndex) => candidateIndex === index ? definition : candidate));
     setSubagentDialog(null);
   }
 
   function deleteSubagent(index: number) {
-    const definition = codexSubagents[index];
-    if (!definition || !window.confirm(t('confirmDeleteCodexSubagent').replace('{name}', definition.name))) return;
-    setCodexSubagents((current) => current.filter((_, candidateIndex) => candidateIndex !== index));
+    const definition = subagents[index];
+    if (!definition || !window.confirm(t('confirmDeleteSubagent').replace('{name}', definition.name))) return;
+    setSubagents((current) => current.filter((_, candidateIndex) => candidateIndex !== index));
   }
 
   return <><FormDialog
@@ -736,8 +736,8 @@ function CreateAgentModal({ currentUser, navigate, onClose }: { currentUser: Use
               return <option key={value} value={value} disabled={option.status === 'disabled' && value !== selectionValue(modelSelection)}>{modelOptionLabel(option, t)}</option>;
             })}</select></label><AgentModelSettingsFields settings={modelSettings} apiType={selectedOption(modelSelection, modelOptions.items)?.api_type ?? 'openai_responses'} disabled={pending} onChange={setModelSettings} /></>}
         <section className="agent-subagent-section">
-          <div className="agent-subagent-heading"><span className="field-label">{t('codexSubagents')}</span><button type="button" className="secondary" disabled={pending || modelsLoading || modelsError || codexSubagents.length >= 32} onClick={() => openSubagent(null)}><Plus size={16} /> {t('addCodexSubagent')}</button></div>
-          <SubagentTable definitions={codexSubagents} modelOptions={modelOptions.items} canManage disabled={pending} onEdit={openSubagent} onDelete={deleteSubagent} />
+          <div className="agent-subagent-heading"><span className="field-label">{t('subagents')}</span><button type="button" className="secondary" disabled={pending || modelsLoading || modelsError || subagents.length >= 32} onClick={() => openSubagent(null)}><Plus size={16} /> {t('addSubagent')}</button></div>
+          <SubagentTable definitions={subagents} modelOptions={modelOptions.items} canManage disabled={pending} onEdit={openSubagent} onDelete={deleteSubagent} />
         </section>
         <label>{t('visibility')}<select value={visibility} onChange={(event) => { setVisibility(event.target.value); if (event.target.value !== 'public_to') setPublicTo([]); }}><option value="private">{t('private')}</option><option value="public_to">{t('specificUsers')}</option>{canCreatePublic && <option value="public">{t('public')}</option>}</select></label>
         {visibility === 'public_to' && <fieldset className="agent-user-picker" disabled={pending || usersLoading}><legend>{t('agentPublicTo')}</legend>
@@ -745,7 +745,7 @@ function CreateAgentModal({ currentUser, navigate, onClose }: { currentUser: Use
         {error && <div className="error" role="alert">{t('agentCreateFailed')}</div>}
       </form>
   </FormDialog>
-  {subagentDialog && <SubagentDialog dialog={subagentDialog} definitions={codexSubagents} modelOptions={modelOptions.items} parentSelection={modelSelection} parentSettings={modelSettings} formId="create-agent-subagent-form" busy={pending} onChange={setSubagentDialog} onCommit={commitSubagent} onClose={() => setSubagentDialog(null)} />}
+  {subagentDialog && <SubagentDialog dialog={subagentDialog} definitions={subagents} modelOptions={modelOptions.items} parentSelection={modelSelection} parentSettings={modelSettings} formId="create-agent-subagent-form" busy={pending} onChange={setSubagentDialog} onCommit={commitSubagent} onClose={() => setSubagentDialog(null)} />}
   </>;
 }
 
@@ -843,14 +843,14 @@ function sameIds(left: string[], right: string[]) {
 type AgentModelDraft = {
   modelSelection: ModelSelection | null;
   modelSettings: AgentModelSettings;
-  codexSubagents: CodexSubagentDefinition[];
+  subagents: SubagentDefinition[];
 };
 
 function agentModelDraft(agent: Agent): AgentModelDraft {
   return {
     modelSelection: agent.model_selection,
     modelSettings: agent.model_settings,
-    codexSubagents: agent.codex_subagents
+    subagents: agent.subagents
   };
 }
 
@@ -892,8 +892,8 @@ export function AgentPage({
   const [instructionBase, setInstructionBase] = useState({ name: '', instructions: '' });
   const [managedSkillDraft, setManagedSkillDraft] = useState<string[]>([]);
   const [managedSkillBase, setManagedSkillBase] = useState<string[]>([]);
-  const [modelDraft, setModelDraft] = useState<AgentModelDraft>({ modelSelection: null, modelSettings: automaticAgentModelSettings, codexSubagents: [] });
-  const [modelBase, setModelBase] = useState<AgentModelDraft>({ modelSelection: null, modelSettings: automaticAgentModelSettings, codexSubagents: [] });
+  const [modelDraft, setModelDraft] = useState<AgentModelDraft>({ modelSelection: null, modelSettings: automaticAgentModelSettings, subagents: [] });
+  const [modelBase, setModelBase] = useState<AgentModelDraft>({ modelSelection: null, modelSettings: automaticAgentModelSettings, subagents: [] });
   const [accessDraft, setAccessDraft] = useState({ visibility: 'private', publicTo: [] as string[], runtimeId: null as string | null });
   const [accessBase, setAccessBase] = useState({ visibility: 'private', publicTo: [] as string[], runtimeId: null as string | null });
 
@@ -913,8 +913,8 @@ export function AgentPage({
   const mcpDirty = Boolean(mcpDialog && !sameMcpDraft(mcpDialog.draft, mcpDialog.base));
   const modelDirty = !sameAgentModelDraft(modelDraft, modelBase);
   const subagentDialogDirty = Boolean(subagentDialog && !sameAgentModelDraft(
-    { ...modelDraft, codexSubagents: [subagentDialog.draft] },
-    { ...modelDraft, codexSubagents: [editableSubagent(subagentDialog.index === null ? undefined : modelDraft.codexSubagents[subagentDialog.index])] }
+    { ...modelDraft, subagents: [subagentDialog.draft] },
+    { ...modelDraft, subagents: [editableSubagent(subagentDialog.index === null ? undefined : modelDraft.subagents[subagentDialog.index])] }
   ));
   const accessDirty = accessDraft.visibility !== accessBase.visibility
     || !sameIds(accessDraft.publicTo, accessBase.publicTo)
@@ -1070,7 +1070,7 @@ export function AgentPage({
         ...next,
         model_selection: modelDraft.modelSelection,
         model_settings: modelDraft.modelSettings,
-        codex_subagents: modelDraft.codexSubagents
+        subagents: modelDraft.subagents
       };
       if (tab === 'skills') next = { ...next, managed_skill_ids: managedSkillDraft };
       if (tab === 'access') next = {
@@ -1112,26 +1112,26 @@ export function AgentPage({
 
   function openSubagentDialog(index: number | null) {
     if (!agent?.can_manage) return;
-    const definition = index === null ? undefined : modelDraft.codexSubagents[index];
+    const definition = index === null ? undefined : modelDraft.subagents[index];
     if (index !== null && !definition) return;
     setSubagentDialog({ index, draft: editableSubagent(definition), error: '' });
   }
 
-  function commitSubagent(index: number | null, definition: CodexSubagentDefinition) {
+  function commitSubagent(index: number | null, definition: SubagentDefinition) {
     setModelDraft((current) => ({
       ...current,
-      codexSubagents: index === null
-        ? [...current.codexSubagents, definition]
-        : current.codexSubagents.map((candidate, candidateIndex) => candidateIndex === index ? definition : candidate)
+      subagents: index === null
+        ? [...current.subagents, definition]
+        : current.subagents.map((candidate, candidateIndex) => candidateIndex === index ? definition : candidate)
     }));
     setSubagentDialog(null);
   }
 
   function deleteSubagentDefinition(index: number) {
     if (!agent?.can_manage || configPendingRef.current) return;
-    const definition = modelDraft.codexSubagents[index];
-    if (!definition || !window.confirm(t('confirmDeleteCodexSubagent').replace('{name}', definition.name))) return;
-    setModelDraft((current) => ({ ...current, codexSubagents: current.codexSubagents.filter((_, candidateIndex) => candidateIndex !== index) }));
+    const definition = modelDraft.subagents[index];
+    if (!definition || !window.confirm(t('confirmDeleteSubagent').replace('{name}', definition.name))) return;
+    setModelDraft((current) => ({ ...current, subagents: current.subagents.filter((_, candidateIndex) => candidateIndex !== index) }));
   }
 
   function openSkillsDialog() {
@@ -1272,7 +1272,7 @@ export function AgentPage({
       <aside className="agent-inspector" role="complementary" aria-label={t('agentInspector')}>
         <section className="agent-identity"><Bot size={28} /><div><strong>{agent.name}</strong><span>{agent.instructions}</span></div></section>
         <section><h2>{t('agentInspectorRuntime')}</h2><dl><div><dt>{t('agentAvailability')}</dt><dd>{availabilityLabel(availability, t)}</dd></div><div><dt>{t('runtime')}</dt><dd>{runtime?.hostname ?? availabilityLabel(availability, t)}</dd></div></dl></section>
-        <section><h2>{t('agentInspectorModel')}</h2><dl><div><dt>{t('agentModelSelection')}</dt><dd>{modelName(agent.model_selection, modelOptions.items, t('modelNotConfigured'))}</dd></div><div><dt>{t('reasoningEffort')}</dt><dd>{agent.model_settings.reasoning_effort}</dd></div><div><dt>{t('codexSubagents')}</dt><dd>{agent.codex_subagents.length}</dd></div></dl></section>
+        <section><h2>{t('agentInspectorModel')}</h2><dl><div><dt>{t('agentModelSelection')}</dt><dd>{modelName(agent.model_selection, modelOptions.items, t('modelNotConfigured'))}</dd></div><div><dt>{t('reasoningEffort')}</dt><dd>{agent.model_settings.reasoning_effort}</dd></div><div><dt>{t('subagents')}</dt><dd>{agent.subagents.length}</dd></div></dl></section>
         <section><h2>{t('agentInspectorAccess')}</h2><dl><div><dt>{t('visibility')}</dt><dd>{visibilityLabel(agent.visibility, t)}</dd></div>{agent.visibility === 'public_to' && <div><dt>{t('agentPublicTo')}</dt><dd>{agent.public_to.length}</dd></div>}</dl></section>
         <section><h2>{t('managedSkills')}</h2><div className="agent-skill-chips">{managedSkills.map((skill) => <span key={skill.id}>{skill.name}</span>)}{managedSkills.length === 0 && <span>{t('none')}</span>}</div></section>
         <section><h2>{t('details')}</h2><dl><div><dt>{t('created')}</dt><dd>{new Date(agent.created_at).toLocaleString(locale)}</dd></div><div><dt>{t('updated')}</dt><dd>{new Date(agent.updated_at).toLocaleString(locale)}</dd></div></dl></section>
@@ -1294,9 +1294,9 @@ export function AgentPage({
                 return <option key={value} value={value} disabled={option.status === 'disabled' && value !== selectionValue(modelDraft.modelSelection)}>{modelOptionLabel(option, t)}</option>;
               })}</select></label>
               <AgentModelSettingsFields settings={modelDraft.modelSettings} apiType={selectedOption(modelDraft.modelSelection, modelOptions.items)?.api_type ?? 'openai_responses'} disabled={configPending} onChange={(modelSettings) => setModelDraft((current) => ({ ...current, modelSettings }))} />
-              <section className="agent-subagent-section"><div className="agent-subagent-heading"><span className="field-label">{t('codexSubagents')}</span><button type="button" className="secondary" disabled={configPending || modelDraft.codexSubagents.length >= 32} onClick={() => openSubagentDialog(null)}><Plus size={16} /> {t('addCodexSubagent')}</button></div><SubagentTable definitions={modelDraft.codexSubagents} modelOptions={modelOptions.items} canManage disabled={configPending} onEdit={openSubagentDialog} onDelete={deleteSubagentDefinition} /></section>
+              <section className="agent-subagent-section"><div className="agent-subagent-heading"><span className="field-label">{t('subagents')}</span><button type="button" className="secondary" disabled={configPending || modelDraft.subagents.length >= 32} onClick={() => openSubagentDialog(null)}><Plus size={16} /> {t('addSubagent')}</button></div><SubagentTable definitions={modelDraft.subagents} modelOptions={modelOptions.items} canManage disabled={configPending} onEdit={openSubagentDialog} onDelete={deleteSubagentDefinition} /></section>
               <button className="primary" disabled={configPending || !modelDirty}><Save size={16} /> {configPending ? t('saving') : t('saveAgent')}</button>
-            </form> : <div className="stack agent-readonly"><dl className="agent-model-summary"><div><dt>{t('agentModelSelection')}</dt><dd>{modelName(agent.model_selection, modelOptions.items, t('modelNotConfigured'))}</dd></div><div><dt>{t('reasoningEffort')}</dt><dd>{agent.model_settings.reasoning_effort}</dd></div></dl><SubagentTable definitions={agent.codex_subagents} modelOptions={modelOptions.items} canManage={false} disabled onEdit={() => undefined} onDelete={() => undefined} /></div>}
+            </form> : <div className="stack agent-readonly"><dl className="agent-model-summary"><div><dt>{t('agentModelSelection')}</dt><dd>{modelName(agent.model_selection, modelOptions.items, t('modelNotConfigured'))}</dd></div><div><dt>{t('reasoningEffort')}</dt><dd>{agent.model_settings.reasoning_effort}</dd></div></dl><SubagentTable definitions={agent.subagents} modelOptions={modelOptions.items} canManage={false} disabled onEdit={() => undefined} onDelete={() => undefined} /></div>}
           </section>
           <section id="agent-panel-skills" role="tabpanel" aria-labelledby="agent-tab-skills" aria-label={t('tabSkills')} hidden={activeTab !== 'skills'}>
             {agent.can_manage && <div className="button-row agent-panel-actions"><button type="button" className="secondary" disabled={configPending} onClick={openSkillsDialog}><Pencil size={16} /> {t('editManagedSkills')}</button></div>}
@@ -1358,6 +1358,6 @@ export function AgentPage({
       {mcpDialog.error && <div className="error" role="alert">{mcpDialog.error}</div>}
     </form>
   </FormDialog>}
-  {subagentDialog && <SubagentDialog dialog={subagentDialog} definitions={modelDraft.codexSubagents} modelOptions={modelOptions.items} parentSelection={modelDraft.modelSelection} parentSettings={modelDraft.modelSettings} formId="agent-subagent-form" busy={configPending} onChange={setSubagentDialog} onCommit={commitSubagent} onClose={() => setSubagentDialog(null)} />}
+  {subagentDialog && <SubagentDialog dialog={subagentDialog} definitions={modelDraft.subagents} modelOptions={modelOptions.items} parentSelection={modelDraft.modelSelection} parentSettings={modelDraft.modelSettings} formId="agent-subagent-form" busy={configPending} onChange={setSubagentDialog} onCommit={commitSubagent} onClose={() => setSubagentDialog(null)} />}
   </>;
 }

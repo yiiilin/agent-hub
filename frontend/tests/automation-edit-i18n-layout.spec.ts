@@ -39,7 +39,7 @@ async function createOwnedAgentFixture(page: import('@playwright/test').Page, la
     public_to: [],
     model_selection: { connection_id: model.id, model_id: 'hub-proxy-smoke' },
     model_settings: automaticModelSettings,
-    codex_subagents: []
+    subagents: []
   } });
   expect(agentResponse.ok()).toBeTruthy();
   return {
@@ -106,7 +106,7 @@ function automationRun(id: string, automationId: string, status: string, message
     runtime_id: null,
     status,
     initial_message: message,
-    session_id: null,
+    native_session_id: null,
     work_dir_ref: null,
     source,
     created_at: created,

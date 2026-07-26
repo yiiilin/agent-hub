@@ -5,12 +5,12 @@
 V1 保留以下可浏览器验证的产品链路；其执行和存储边界已由 ADR-0012 及 `docs/session-runtime-spec.md` 更新为 Session 级：
 
 1. 用户登录并获取 Hub 登录会话。
-2. 创建 Agent，保存 Markdown instructions、visibility、owner、managed Skills、MCP、Runtime 约束、Agent Model Selection/Settings 和 Codex Subagent Definitions；sandbox policy 仍参与执行但不在管理台展示。
+2. 创建 Agent，保存 Markdown instructions、visibility、owner、managed Skills、MCP、Runtime 约束、Agent Model Selection/Settings 和 Subagent Definitions；sandbox policy 仍参与执行但不在管理台展示。
 3. Runtime 通过管理员签发的一次性 Enrollment Token 建立身份，之后使用自己的可撤销 Runtime Credential heartbeat。
 4. 用户选择 Agent 后进入当前浏览器保留的 Conversation Draft；首条消息原子创建 Hub Session、Message 和 Run，后续消息继续该 Session，且每条消息独立持久化。
-5. Runtime 获得 Session 的排他 ownership generation，在该 Session 独立的 `workspace/` 和 Codex 目录中继续同一个 native Codex Thread。
+5. Runtime 获得 Session 的排他 ownership generation，在该 Session 独立的 `workspace/` 和 `engine-state/` 中继续同一个 Native Session。
 6. Hub 保存消息、Run 和 native Item 映射事件，并通过 SSE 推送给管理台和 widget。
-7. 管理台以 Session 为登录后默认页和第一导航，使用对话主视图展示消息、SSE 回复、按时间线折叠的 Codex 可读活动与历史状态；Hub 内部状态、用量和 delta 事件不直接展示。
+7. 管理台以 Session 为登录后默认页和第一导航，使用对话主视图展示消息、SSE 回复、按时间线折叠的执行活动与历史状态；Hub 内部状态、用量和 delta 事件不直接展示。
 8. Widget iframe 使用 embed token 访问其来源范围内的 Session，也支持宿主通过 `postMessage` 选择 Session 和提交消息。
 9. Session 离线时由 Runtime 生成最小 `tar.zst` Bundle，经 Hub 流式写入对象存储；恢复也只经过 Hub。
 10. Integration App 统一 OAuth、外部 Session API 和 Widget，可委托多个 Agent，并通过应用级或用户级 Application Token 使用显式 Agent scopes。
@@ -21,7 +21,7 @@ V1 保留以下可浏览器验证的产品链路；其执行和存储边界已�
 
 - 既有 console、widget、integration 和 automation 用户链路继续可用；迁移只把它们接到统一 Session 生命周期。
 - Hub-native Session 不伪造外部来源；外部 Session 固定绑定创建它的 External Platform、Tenant 和 Identity。
-- Run 仍是调度、重试和审计记录，但不拥有 Workspace、Codex 目录、Thread 或 app-server 进程。
+- Run 仍是调度、重试和审计记录，但不拥有 Workspace、Execution Engine state、Native Session 或引擎进程。
 - Runtime 池属于管理员接入的可信基础设施；用户执行数据仍以 owner、Agent 权限、Session 隔离、MCP allowlist 和 sandbox 共同约束。
 
 ## 验收标准
@@ -38,9 +38,9 @@ V1 保留以下可浏览器验证的产品链路；其执行和存储边界已�
 - External Session 在 Hub 管理台可查看完整消息和活动历史，但不能发送消息、立即引导或停止 Turn；对应 Hub console API 同样拒绝写操作，匹配来源的外部集成接口不受影响。
 - 会话输入框使用 `Enter` 发送、`Shift+Enter` 换行，并在 2 到 5 行间自动增高；重进多 Turn Session 后仍展示所有 Run 的回答。
 - `/runtimes` 能看到 Runtime 身份、状态、labels 和 heartbeat 时间。
-- widget 能创建或选择受其 origin 约束的 Session，发送消息并看到 fake Codex 回复。
+- widget 能创建或选择受其 origin 约束的 Session，发送消息并看到 fake provider 回复。
 - 宿主页面能通过 `postMessage` 提交 widget 消息，并收到 Run started 和 Run event 通知。
-- 同一 Session 的后续消息复用其 Workspace 和 Codex Thread；不同 Session 的文件和 Codex 状态隔离。
+- 同一 Session 的后续消息复用其 Workspace 和 Native Session；不同 Session 的 Workspace 和 Execution Engine state 隔离。
 - 后端、Runtime、前端构建与测试命令通过。
 
 ## 测试计划
@@ -49,6 +49,6 @@ V1 保留以下可浏览器验证的产品链路；其执行和存储边界已�
 - 每个 OpenAPI operation、管理台页面和关键 Widget/Runtime 协议都必须映射到稳定 Feature ID；场景通过 manifest 的 `covers` 声明自己直接验证的行为。
 - 每个核心功能域至少保留一条真实 Compose API 或 Browser QA 链路；并发、持久化约束和协议状态机可继续由 Rust 测试承担，不在浏览器重复所有分支。
 - 后端：覆盖凭据脱敏、Session/origin 授权、消息顺序、Run 关联和数据库迁移。
-- Runtime：覆盖 Session 目录隔离、native Thread 多 Turn 继续、ownership fencing 和 fake app-server 事件。
+- Runtime：覆盖 Session 目录隔离、Native Session 多 Turn 继续、ownership fencing 和 fake Pi RPC 事件。
 - Frontend：TypeScript 构建校验。
 - 浏览器：覆盖登录、Session-first 导航、Agent/Session 创建、继续对话、Integration App、Markdown 编辑、Skill/API Key/Runtime/Administration 管理和 Widget 消息，同时验证 desktop 与 390px。

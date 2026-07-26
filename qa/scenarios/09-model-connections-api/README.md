@@ -3,7 +3,7 @@
 Type: `api`
 
 This scenario runs against an isolated Compose environment with the real Hub,
-PostgreSQL, Runtime, stateless Model Gateway, fake Codex app-server, and fake
+PostgreSQL, Runtime, stateless Model Gateway, fake Pi RPC process, and fake
 Responses/Chat Completions/Anthropic provider.
 
 It proves that a Connection owns only its URL, encrypted key, API Type, scope,

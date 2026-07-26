@@ -5,7 +5,7 @@
 本文件只定义传输边界；Model API Connection、Agent Model Selection/Settings、权限、密钥、用量和 UI 的权威契约见 `docs/model-connections-spec.md`。
 
 1. Runtime 为每个在线 Session 保持一个 loopback proxy，并在当前 Run 切换时原子更新 run-scoped model proxy token。
-2. Codex 原生 provider 和自定义子 Agent provider 都请求 loopback proxy；Runtime 添加 Run ID、Run Model Binding ID 和 Hub token 后转发到 `POST /api/runtime/model-proxy/v1/responses`。不接受 Model API Connection ID 代替 binding ID。
+2. Pi provider 请求 loopback proxy；Runtime 添加 Run ID、Run Model Binding ID 和 Hub token 后转发到 `POST /api/runtime/model-proxy/v1/responses`。不接受 Model API Connection ID 代替 binding ID。
 3. Hub 验证 active Run/Runtime、binding 对 Run 的归属、Agent connection scope、live connection enabled state，以及请求 Model ID 与 binding snapshot 完全相同；每次请求从 PostgreSQL 读取一次 live endpoint/ciphertext 并解密 API Key。
 4. Hub 使用 binding snapshot 固定的 API Type 和有效 request settings，把服务根地址、API Key、query、安全 headers 和原始 Responses body 封装为一次性 envelope，使用内部 Bearer Token 调用 Model Gateway。Gateway 不查询 Agent Hub 数据库，也不持久化 envelope。
 5. Gateway 根据协议透明转发或转换请求，并返回 Responses JSON/SSE。Hub 旁路解析 terminal response：存在有效 `usage` 时写入 immutable usage ledger；失败或协议错误写入 sanitized error ledger。解析不能延迟首个下游 chunk。
@@ -23,11 +23,11 @@
 
 ## Binding 配置与请求边界
 
-- Agent Model Settings 中的 Codex 原生字段（reasoning、summary、verbosity、context、compaction、service tier 和 provider retry/idle）在 Run 开始时解析并写入受控 Codex TOML；它们不进入 Hub 到 Gateway 的请求级 envelope。
+- Agent Model Settings 在 Run 开始时解析；Pi driver 支持的 reasoning、context 和 output limit 写入 Session 专属 `models.json` 或 Turn 设置，其余 Execution Engine 行为字段保留在不可变 binding 中。它们不作为协议专属覆盖进入 Hub 到 Gateway 的请求级 envelope。
 - Run binding 的 effective `request_settings` 进入 envelope，且 tagged `protocol` 必须与 binding API Type 相同。Responses 没有覆盖字段；Chat 可覆盖 `temperature`、`top_p`、`max_completion_tokens`；Anthropic 可覆盖 `temperature` 或 `top_p` 以及 `max_tokens`。
-- Codex 根据原生配置产生的 Responses 请求体仍按既有链路传输。Hub 只验证请求中的 Model ID，OpenAI Responses fast path 保持原始 body bytes；Chat 和 Anthropic 路径在验证可表示性后转换，并只合并非 `null` 的协议专属覆盖。
+- Pi 产生的 Responses 请求体按既有链路传输。Hub 只验证请求中的 Model ID，OpenAI Responses fast path 保持原始 body bytes；Chat 和 Anthropic 路径在验证可表示性后转换，并只合并非 `null` 的协议专属覆盖。
 - 转换无法无损表达的 Responses 字段、历史项、工具或采样冲突必须在上游调用前以 `unsupported_protocol_feature` 返回；Gateway 不静默丢弃字段。跨协议历史只接受严格白名单中的 message、function call/result、reasoning、refusal 与其可移植内容字段；例如 item `id`、`status`、`phase`、未知 item 字段和 `output_text.annotations`/`logprobs` 一律拒绝。除 binding `request_settings` 外，Hub 和 Gateway 不向请求体注入采样、输出限制、`tool_choice` 或 `parallel_tool_calls`。
-- `request_max_retries`、`stream_max_retries` 和 `stream_idle_timeout_ms` 属于该 binding 的 Codex provider 客户端行为。Gateway 继续不重试、不 fallback；一次到达 Gateway 的请求只产生一次上游调用。
+- `request_max_retries`、`stream_max_retries` 和 `stream_idle_timeout_ms` 属于该 binding 的 Execution Engine provider 客户端行为。Gateway 继续不重试、不 fallback；一次到达 Gateway 的请求只产生一次上游调用。
 
 ## Run Binding 授权边界
 
@@ -67,4 +67,4 @@
 - API Key 只由 Hub 到 Gateway 的请求级 envelope 和 Gateway 到所选 provider 的认证 header 主动发送；Runtime 配置、Run event、usage/error、Gateway/Hub 生成的错误、日志和 response headers 不包含 secret。provider body 适用上述信任边界。
 - completed without usage 作为协议错误；任意 terminal status 带 usage 时仍记录该 usage，错误状态同时记录 Model Call Error。
 - Run Model Binding、Model Token Usage 和 Model Call Error 都保存请求生效时的三种协议与有效请求参数，后续修改 live connection 或 Agent settings 不改写历史。
-- Agent Model Settings 的 Codex 字段只改变 Runtime 生成的 Codex 配置；OpenAI Responses 透明转发测试必须证明 Gateway 不因这些参数或空的 Responses request settings 改写 body 或增加 retry。
+- Agent Model Settings 的 driver 字段只改变 Runtime 生成的 Pi 配置或 Turn 设置；OpenAI Responses 透明转发测试必须证明 Gateway 不因这些参数或空的 Responses request settings 改写 body 或增加 retry。

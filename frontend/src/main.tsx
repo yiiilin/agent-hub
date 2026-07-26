@@ -1,4 +1,4 @@
-import { Activity, BookOpen, Bot, BrainCircuit, Check, CirclePause, Clock, Copy, ExternalLink, KeyRound, Languages, LogOut, Monitor, Plug, Plus, RotateCcw, Save, Search, Send, Settings, ShieldAlert, Sparkles, Trash2, Workflow, X } from 'lucide-react';
+import { Activity, ArrowUp, BookOpen, Bot, BrainCircuit, Check, CirclePause, Clock, Copy, ExternalLink, KeyRound, Languages, LogOut, Monitor, Plug, Plus, RotateCcw, Save, Search, Send, Settings, ShieldAlert, Sparkles, Trash2, Workflow, X } from 'lucide-react';
 import React, { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Agent, api, ApiError, ApiKey, ApiKeyValidity, Automation, HubSession, Run, RunEvent, Runtime, RuntimeEnrollmentToken, User, WidgetAgent } from './api/client';
@@ -7,7 +7,7 @@ import type { TranslationKey } from './i18n';
 import { FormDialog } from './components/form-dialog';
 import { MarkdownEditor } from './components/markdown-editor';
 import { SkillDetailPage, SkillsPage } from './skills';
-import { SessionsPage } from './sessions';
+import { ChatActivityGroup, ChatMessageBubble, ChatThinkingBubble, mergeRunEvents, projectActivities, resizeComposer, SessionsPage, type ActivityEntry } from './sessions';
 import { AdministrationPage } from './administration';
 import { AgentPage as AgentDetailPage, AgentsPage } from './agents';
 import { IntegrationAppsPage } from './integrations';
@@ -771,14 +771,14 @@ function RuntimesPage({ user }: { user: User }) {
     return runtimes.filter((runtime) => {
       const matchesFilter = filter === 'all'
         || (filter === 'online' ? runtime.status === 'online' : runtime.status !== 'online');
-      const haystack = [runtime.hostname, runtime.status, runtime.codex_version, ...runtime.labels].join(' ').toLocaleLowerCase(locale);
+      const haystack = [runtime.hostname, runtime.status, runtime.engine_version, ...runtime.labels].join(' ').toLocaleLowerCase(locale);
       return matchesFilter && (!query || haystack.includes(query));
     });
   }, [filter, locale, runtimes, search]);
   const selectedRuntime = runtimes.find((runtime) => runtime.id === selectedId) ?? null;
   const boundAgents = agents.filter((agent) => agent.runtime_id === selectedRuntime?.id);
 
-  const visibleCapabilities = ['driver', 'codex_source', 'model_proxy', 'mcp_allowlist', 'thread_resume', 'local_skills']
+  const visibleCapabilities = ['driver', 'engine_source', 'model_proxy', 'mcp_allowlist', 'native_session_resume', 'local_skills']
     .flatMap((key) => selectedRuntime && key in selectedRuntime.capabilities ? [[key, selectedRuntime.capabilities[key]] as const] : []);
 
   function capabilityValue(value: unknown) {
@@ -966,7 +966,7 @@ function RuntimesPage({ user }: { user: User }) {
                 onClick={() => setSelectedId(runtime.id)}
               >
                 <span className="runtime-row-heading"><strong>{runtime.hostname}</strong><span className={`status ${runtime.status}`}>{localizedStatus(runtime.status, t)}</span></span>
-                <span className="runtime-row-meta"><span>{t('lastHeartbeat')}: {new Date(runtime.last_heartbeat_at).toLocaleString(locale)}</span><span>{runtime.codex_version}</span></span>
+                <span className="runtime-row-meta"><span>{t('lastHeartbeat')}: {new Date(runtime.last_heartbeat_at).toLocaleString(locale)}</span><span>{runtime.engine_version}</span></span>
               </button>
             ))}
           </div>
@@ -987,7 +987,7 @@ function RuntimesPage({ user }: { user: User }) {
                   <h3>{t('runtimeStatus')}</h3>
                   <dl className="runtime-properties">
                     <div><dt>{t('hostname')}</dt><dd>{selectedRuntime.hostname}</dd></div>
-                    <div><dt>{t('codexVersion')}</dt><dd>{selectedRuntime.codex_version}</dd></div>
+                    <div><dt>{t('engineVersion')}</dt><dd>{selectedRuntime.engine_version}</dd></div>
                     <div><dt>{t('lastHeartbeat')}</dt><dd>{new Date(selectedRuntime.last_heartbeat_at).toLocaleString(locale)}</dd></div>
                   </dl>
                 </section>
@@ -1319,16 +1319,42 @@ function AutomationsPage() {
   );
 }
 
+function widgetChannelId() {
+  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  // randomUUID is secure-context-only, while development Widgets may use LAN HTTP.
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+type WidgetExchange = {
+  message: string;
+  run: Run;
+};
+
+type WidgetTimelineMessage = { kind: 'message'; id: string; content: string; occurredAt: number; sequence: number };
+type WidgetTimelineEntry = WidgetTimelineMessage
+  | { kind: 'activity'; activity: ActivityEntry; occurredAt: number; sequence: number };
+type WidgetTimelineItem = WidgetTimelineMessage
+  | { kind: 'activity-group'; id: string; activities: ActivityEntry[] };
+
+const widgetTerminalStatuses = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
+
 function WidgetApp({ token }: { token?: string }) {
   const { language, setLanguage, t } = useI18n();
   const [sessionToken, setSessionToken] = useState(token ?? '');
   const [agent, setAgent] = useState<WidgetAgent | null>(null);
-  const [message, setMessage] = useState(() => t('defaultWidgetMessage'));
-  const [run, setRun] = useState<Run | null>(null);
+  const [message, setMessage] = useState('');
+  const [exchanges, setExchanges] = useState<WidgetExchange[]>([]);
+  const [pendingMessage, setPendingMessage] = useState<string | null>(null);
   const [error, setError] = useState('');
   const [hostOrigin, setHostOrigin] = useState<string | null>(null);
-  const [channelId] = useState(() => crypto.randomUUID());
+  const [channelId] = useState(widgetChannelId);
   const widgetRef = useRef<HTMLDivElement>(null);
+  const chatScrollRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   const sessionTokenRef = useRef(token ?? '');
   const sessionGeneration = useRef(0);
   const runGeneration = useRef(0);
@@ -1351,8 +1377,17 @@ function WidgetApp({ token }: { token?: string }) {
     sessionTokenRef.current = nextToken;
     setSessionToken(nextToken);
     setAgent(null);
-    setRun(null);
+    setExchanges([]);
+    setPendingMessage(null);
+    setMessage('');
     setError('');
+  }, []);
+
+  const scrollChatToBottom = useCallback(() => {
+    requestAnimationFrame(() => {
+      const scroll = chatScrollRef.current;
+      if (scroll) scroll.scrollTop = scroll.scrollHeight;
+    });
   }, []);
 
   const exchangeEmbedJwt = useCallback(async (jwt: string) => {
@@ -1374,17 +1409,20 @@ function WidgetApp({ token }: { token?: string }) {
 
   const startWidgetRun = useCallback(async (content: string) => {
     const token = sessionTokenRef.current;
-    if (!token || runPendingRef.current) return;
+    if (!token || !content.trim() || runPendingRef.current) return;
     runPendingRef.current = true;
     setRunPending(true);
+    setPendingMessage(content);
     const generation = sessionGeneration.current;
     const requestGeneration = ++runGeneration.current;
     setError('');
     try {
       const createdRun = await api.createWidgetRun(token, content);
       if (generation !== sessionGeneration.current || requestGeneration !== runGeneration.current) return;
-      setRun(createdRun);
+      setExchanges((current) => [...current, { message: content, run: createdRun }]);
+      setMessage((current) => current === content ? '' : current);
       postWidgetMessage('agent-hub:run-started', { runId: createdRun.id });
+      scrollChatToBottom();
     } catch (err) {
       if (generation !== sessionGeneration.current || requestGeneration !== runGeneration.current) return;
       setError(t('genericError'));
@@ -1392,13 +1430,15 @@ function WidgetApp({ token }: { token?: string }) {
       if (generation === sessionGeneration.current && requestGeneration === runGeneration.current) {
         runPendingRef.current = false;
         setRunPending(false);
+        setPendingMessage(null);
       }
     }
-  }, [postWidgetMessage]);
+  }, [postWidgetMessage, scrollChatToBottom]);
 
   const reportWidgetRunEvent = useCallback((event: RunEvent) => {
     postWidgetMessage('agent-hub:run-event', { runId: event.run_id, event });
-  }, [postWidgetMessage]);
+    scrollChatToBottom();
+  }, [postWidgetMessage, scrollChatToBottom]);
 
   useEffect(() => {
     if (!hostOrigin && window.parent !== window) {
@@ -1435,7 +1475,6 @@ function WidgetApp({ token }: { token?: string }) {
       }
       if (event.data.type === 'agent-hub:message-submit') {
         const content = typeof event.data.message === 'string' ? event.data.message : message;
-        setMessage(content);
         await startWidgetRun(content);
       }
     };
@@ -1451,6 +1490,10 @@ function WidgetApp({ token }: { token?: string }) {
       .catch(() => { if (!cancelled) setError(t('genericError')); });
     return () => { cancelled = true; };
   }, [sessionToken, t]);
+
+  useEffect(() => {
+    resizeComposer(composerRef.current);
+  }, [message]);
 
   useEffect(() => {
     if (!hostOrigin || !widgetRef.current) return;
@@ -1475,26 +1518,44 @@ function WidgetApp({ token }: { token?: string }) {
   }
 
   return (
-    <div className="widget" ref={widgetRef}>
-      <header><span className="widget-title"><Bot size={18} /> <strong>{agent?.name ?? t('agentWidget')}</strong></span><select className="widget-language" aria-label={t('language')} value={language} onChange={(event) => setLanguage(event.target.value as 'en' | 'zh-CN')}><option value="en">English</option><option value="zh-CN">简体中文</option></select></header>
-      <form className="widget-form" onSubmit={submit}>
-        <textarea disabled={runPending} value={message} onChange={(event) => setMessage(event.target.value)} />
-        <button className="primary" disabled={!sessionToken || runPending}><Send size={16} /> {runPending ? t('sending') : t('send')}</button>
+    <div className="widget session-chat" ref={widgetRef}>
+      <header className="session-detail-header session-chat-header widget-header">
+        <div className="session-chat-title"><span className="widget-agent-icon" aria-hidden="true"><Bot size={17} /></span><div><h2>{agent?.name ?? t('agentWidget')}</h2><span>{t('hubNative')}</span></div></div>
+        <label className="widget-language-control"><Languages size={15} aria-hidden="true" /><span className="sr-only">{t('language')}</span><select className="widget-language" aria-label={t('language')} value={language} onChange={(event) => setLanguage(event.target.value as 'en' | 'zh-CN')}><option value="en">English</option><option value="zh-CN">简体中文</option></select></label>
+      </header>
+      <div className="session-chat-scroll" ref={chatScrollRef}>
+        {error && <div className="session-banner error" role="alert">{error}</div>}
+        <div className="session-transcript widget-transcript" aria-live="polite">
+          {exchanges.map((exchange) => <React.Fragment key={exchange.run.id}>
+            <ChatMessageBubble agentName={agent?.name ?? null} content={exchange.message} role="user" />
+            <WidgetRunConsole run={exchange.run} token={sessionToken} agentName={agent?.name ?? null} onEvent={reportWidgetRunEvent} />
+          </React.Fragment>)}
+          {pendingMessage && <>
+            <ChatMessageBubble agentName={agent?.name ?? null} content={pendingMessage} role="user" />
+            <ChatThinkingBubble />
+          </>}
+        </div>
+      </div>
+      <form className="session-composer session-chat-composer widget-composer" onSubmit={submit}>
+        <label><span className="sr-only">{t('message')}</span><textarea ref={composerRef} rows={2} aria-label={t('message')} value={message} onChange={(event) => setMessage(event.target.value)} onInput={(event) => resizeComposer(event.currentTarget)} onKeyDown={(event) => {
+          if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return;
+          event.preventDefault();
+          event.currentTarget.form?.requestSubmit();
+        }} placeholder={t('messagePlaceholder')} /></label>
+        <div><span className="session-composer-actions"><button type="submit" className="icon-button session-send-button" aria-label={runPending ? t('sending') : t('send')} title={t('send')} disabled={!sessionToken || runPending || !message.trim()}><ArrowUp size={18} /></button></span></div>
       </form>
-      {error && <div className="error">{error}</div>}
-      {run && <WidgetRunConsole key={`${run.id}:${sessionToken}`} run={run} token={sessionToken} onEvent={reportWidgetRunEvent} />}
     </div>
   );
 }
 
-function WidgetRunConsole({ run, token, onEvent }: { run: Run; token: string; onEvent: (event: RunEvent) => void }) {
+function WidgetRunConsole({ run, token, agentName, onEvent }: { run: Run; token: string; agentName: string | null; onEvent: (event: RunEvent) => void }) {
   const [events, setEvents] = useState<RunEvent[]>([]);
 
   useEffect(() => {
     setEvents([]);
     const controller = new AbortController();
     api.streamWidgetRunEvents(run.id, token, controller.signal, (parsed) => {
-      setEvents((current) => current.some((item) => item.seq === parsed.seq) ? current : [...current, parsed]);
+      setEvents((current) => mergeRunEvents(current, [parsed]));
       onEvent(parsed);
     }).catch((err) => {
       if (!controller.signal.aborted) console.error(err);
@@ -1502,9 +1563,56 @@ function WidgetRunConsole({ run, token, onEvent }: { run: Run; token: string; on
     return () => controller.abort();
   }, [onEvent, run.id, token]);
 
-  const assistantComplete = events.some((event) => event.event_type === 'message' && event.role === 'assistant');
-  const visibleEvents = assistantComplete ? events.filter((event) => event.event_type !== 'message_delta') : events;
-  return <div className="console compact">{visibleEvents.map((event) => event.content && <p key={event.seq}>{event.role ? `${event.role}: ` : ''}{event.content}</p>)}</div>;
+  const timeline = useMemo<WidgetTimelineItem[]>(() => {
+    const entries: WidgetTimelineEntry[] = projectActivities(events).map((activity) => ({
+      kind: 'activity',
+      activity,
+      occurredAt: activity.occurredAt,
+      sequence: activity.sequence
+    }));
+    const completeMessages = events.filter((event) => event.event_type === 'message' && event.role === 'assistant' && event.content);
+    if (completeMessages.length > 0) {
+      for (const event of completeMessages) entries.push({
+        kind: 'message',
+        id: `widget-message-${event.seq}`,
+        content: event.content!,
+        occurredAt: Date.parse(event.created_at) || 0,
+        sequence: event.seq
+      });
+    } else {
+      const deltas = events.filter((event) => event.event_type === 'message_delta' && event.role === 'assistant' && event.content);
+      if (deltas.length > 0) entries.push({
+        kind: 'message',
+        id: 'widget-message-live',
+        content: deltas.map((event) => event.content).join(''),
+        occurredAt: Date.parse(deltas[0].created_at) || 0,
+        sequence: deltas[0].seq
+      });
+    }
+    entries.sort((left, right) => left.occurredAt - right.occurredAt || left.sequence - right.sequence);
+    return entries.reduce<WidgetTimelineItem[]>((items, entry) => {
+      if (entry.kind === 'message') {
+        items.push(entry);
+        return items;
+      }
+      const previous = items.at(-1);
+      if (previous?.kind === 'activity-group') previous.activities.push(entry.activity);
+      else items.push({ kind: 'activity-group', id: `widget-activity-${entry.activity.id}`, activities: [entry.activity] });
+      return items;
+    }, []);
+  }, [events]);
+  const terminal = events.some((event) => {
+    if (event.event_type !== 'status') return false;
+    const status = event.content ?? (typeof event.payload.status === 'string' ? event.payload.status : null);
+    return status !== null && widgetTerminalStatuses.has(status);
+  });
+  const hasAssistantMessage = timeline.some((entry) => entry.kind === 'message');
+
+  return <>{timeline.map((entry) => entry.kind === 'activity-group'
+    ? <ChatActivityGroup activities={entry.activities} key={entry.id} />
+    : <ChatMessageBubble agentName={agentName} content={entry.content} key={entry.id} role="assistant" />)}
+    {!terminal && !hasAssistantMessage && <ChatThinkingBubble />}
+  </>;
 }
 
 createRoot(document.getElementById('root')!).render(<I18nProvider><App /></I18nProvider>);

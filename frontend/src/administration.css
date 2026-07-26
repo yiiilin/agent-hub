@@ -70,8 +70,7 @@
   padding-top: 4px;
 }
 
-.administration-page .administration-policy,
-.administration-page .administration-codex {
+.administration-page .administration-policy {
   max-width: 820px;
 }
 
@@ -419,14 +418,10 @@
     border-bottom: 0;
   }
 
-  .administration-page .admin-summary,
-  .administration-page .admin-inline-form,
-  .administration-page .rollout-runtime-list > div,
   .administration-page .erasure-history > div {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .administration-page .admin-inline-form button,
   .administration-page .admin-save {
     width: 100%;
   }

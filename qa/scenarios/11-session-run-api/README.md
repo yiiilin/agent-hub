@@ -9,4 +9,4 @@ Session id while an independent Session receives a different id.
 The scenario also checks that a second ordinary user cannot read the owner's
 Sessions, and Agent deletion preserves historical Session identities while
 rejecting new messages. It does not depend on synthetic held Turns, fixed model
-text, or an app-server-specific native Turn fixture.
+text, or a driver-specific native Turn fixture.

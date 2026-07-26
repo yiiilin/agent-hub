@@ -7,7 +7,7 @@ HTTP fixture. It temporarily shortens the Runtime idle timeout, completes a Pi
 Turn, observes the committed Bundle and deleted local Session root, then
 restarts the Runtime and completes a second Turn in the same Pi Session.
 
-The smoke asserts that the compatibility `native_thread_id` remains the same Pi
+The smoke asserts that the compatibility `native_session_id` remains the same Pi
 Session id across recovery. Before checkpointing it writes a unique sentinel
 into generated Pi configuration, then updates the Agent instructions while the
 Session is offline. After recovery, the sentinel is absent, the new instructions

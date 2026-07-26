@@ -18,7 +18,6 @@ serde_yaml_ng.workspace = true
 sha2.workspace = true
 tar.workspace = true
 tempfile.workspace = true
-toml.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true

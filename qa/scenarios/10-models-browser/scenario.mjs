@@ -599,7 +599,7 @@ export default async function modelsBrowserScenario(scenarioContext) {
         createAgentDialog,
         `${reviewSelection.connection_id}\n${reviewSelection.model_id}`
       );
-      const draftSubagents = createAgentDialog.getByRole('table', { name: 'Codex subagents' });
+      const draftSubagents = createAgentDialog.getByRole('table', { name: 'Subagents' });
       assert.ok((await draftSubagents.innerText()).includes('inheritor'));
       assert.ok((await draftSubagents.innerText()).includes('reviewer'));
 
@@ -615,11 +615,11 @@ export default async function modelsBrowserScenario(scenarioContext) {
       memberAgentId = createdAgent.id;
       assert.deepEqual(createdAgent.model_selection, personalSelection);
       assert.deepEqual(createdAgent.model_settings, DETAILED_MODEL_SETTINGS);
-      const inherited = createdAgent.codex_subagents.find((item) => item.name === 'inheritor');
+      const inherited = createdAgent.subagents.find((item) => item.name === 'inheritor');
       assert.ok(inherited, 'Created Agent must retain the inheriting subagent');
       assert.deepEqual(inherited.model_selection, null);
       assert.deepEqual(inherited.model_settings_override, {});
-      const overridden = createdAgent.codex_subagents.find((item) => item.name === 'reviewer');
+      const overridden = createdAgent.subagents.find((item) => item.name === 'reviewer');
       assert.ok(overridden, 'Created Agent must retain the overriding subagent');
       assert.deepEqual(overridden.model_selection, reviewSelection);
       assert.deepEqual(overridden.model_settings_override, {
@@ -635,7 +635,7 @@ export default async function modelsBrowserScenario(scenarioContext) {
         personalSelectionValue
       );
       await assertDetailedModelSettings(memberModelsPanel);
-      const savedSubagents = memberModelsPanel.getByRole('table', { name: 'Codex subagents' });
+      const savedSubagents = memberModelsPanel.getByRole('table', { name: 'Subagents' });
       const inheritedRow = savedSubagents.getByRole('row').filter({ hasText: 'inheritor' });
       assert.ok((await inheritedRow.innerText()).includes('Inherit Agent model'));
       assert.ok((await inheritedRow.innerText()).includes('Inherits all Agent settings'));
@@ -803,7 +803,7 @@ export default async function modelsBrowserScenario(scenarioContext) {
           public_to: [],
           model_selection: null,
           model_settings: AUTOMATIC_RESPONSES_SETTINGS,
-          codex_subagents: [{
+          subagents: [{
             name: 'global-reviewer',
             description: 'Keeps the second allowed model selected.',
             developer_instructions: 'Review using the second Global model.',
@@ -857,11 +857,11 @@ export default async function modelsBrowserScenario(scenarioContext) {
       );
       assert.equal(afterForceUpdate.model_selection, null);
       assert.deepEqual(
-        afterForceUpdate.codex_subagents[0].model_selection,
+        afterForceUpdate.subagents[0].model_selection,
         selection(globalConnection, REVIEW_MODEL_ID)
       );
-      assert.equal(afterForceUpdate.codex_subagents[0].enabled ?? true, true);
-      assert.equal(afterForceUpdate.codex_subagents[0].disabled_reason ?? null, null);
+      assert.equal(afterForceUpdate.subagents[0].enabled ?? true, true);
+      assert.equal(afterForceUpdate.subagents[0].disabled_reason ?? null, null);
       assert.deepEqual(
         await responseJson(
           await request.get('/api/model-connections/system-default'),
@@ -875,7 +875,7 @@ export default async function modelsBrowserScenario(scenarioContext) {
       let adminModelsPanel = page.getByRole('tabpanel', { name: 'Models' });
       const adminModelSelect = adminModelsPanel.getByLabel('Model API Connection and model');
       assert.equal(await adminModelSelect.inputValue(), '');
-      let globalSubagentRow = adminModelsPanel.getByRole('table', { name: 'Codex subagents' })
+      let globalSubagentRow = adminModelsPanel.getByRole('table', { name: 'Subagents' })
         .getByRole('row').filter({ hasText: 'global-reviewer' });
       assert.ok((await globalSubagentRow.innerText()).includes(REVIEW_MODEL_ID));
       assert.ok((await globalSubagentRow.innerText()).includes('Enabled'));
@@ -933,9 +933,9 @@ export default async function modelsBrowserScenario(scenarioContext) {
         'Agent after force delete'
       );
       assert.equal(afterForceDelete.model_selection, null);
-      assert.equal(afterForceDelete.codex_subagents[0].model_selection, null);
-      assert.equal(afterForceDelete.codex_subagents[0].enabled, false);
-      assert.equal(afterForceDelete.codex_subagents[0].disabled_reason, 'model_connection_deleted');
+      assert.equal(afterForceDelete.subagents[0].model_selection, null);
+      assert.equal(afterForceDelete.subagents[0].enabled, false);
+      assert.equal(afterForceDelete.subagents[0].disabled_reason, 'model_connection_deleted');
       await page.goto(`/agents/${copiedAgent.id}`, { waitUntil: 'domcontentloaded' });
       await page.getByRole('tab', { name: 'Models' }).click();
       adminModelsPanel = page.getByRole('tabpanel', { name: 'Models' });
@@ -943,7 +943,7 @@ export default async function modelsBrowserScenario(scenarioContext) {
         await adminModelsPanel.getByLabel('Model API Connection and model').inputValue(),
         ''
       );
-      globalSubagentRow = adminModelsPanel.getByRole('table', { name: 'Codex subagents' })
+      globalSubagentRow = adminModelsPanel.getByRole('table', { name: 'Subagents' })
         .getByRole('row').filter({ hasText: 'global-reviewer' });
       assert.ok((await globalSubagentRow.innerText()).includes('Disabled'));
       await page.setViewportSize({ width: 390, height: 844 });

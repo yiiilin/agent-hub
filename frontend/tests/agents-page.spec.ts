@@ -21,7 +21,7 @@ type AgentFixture = {
     stream_idle_timeout_ms: number | null;
     request_settings: { protocol: 'openai_responses' } | { protocol: 'openai_chat_completions'; temperature: number | null; top_p: number | null; max_completion_tokens: number | null } | { protocol: 'anthropic_messages'; temperature: number | null; top_p: number | null; max_tokens: number | null };
   };
-  codex_subagents: Array<{
+  subagents: Array<{
     name: string;
     description: string;
     developer_instructions: string;
@@ -56,7 +56,7 @@ const runtimes = [
     id: '20000000-0000-0000-0000-000000000001',
     hostname: 'alpha-runtime',
     labels: [],
-    codex_version: 'test',
+    engine_version: 'test',
     capabilities: {},
     sandbox_mode: 'workspace-write',
     status: 'online',
@@ -66,7 +66,7 @@ const runtimes = [
     id: '20000000-0000-0000-0000-000000000002',
     hostname: 'zulu-runtime',
     labels: [],
-    codex_version: 'test',
+    engine_version: 'test',
     capabilities: {},
     sandbox_mode: 'workspace-write',
     status: 'offline',
@@ -99,7 +99,7 @@ function agentFixture(overrides: Partial<AgentFixture> & Pick<AgentFixture, 'id'
     runtime_id: null,
     model_selection: null,
     model_settings: automaticModelSettings,
-    codex_subagents: [],
+    subagents: [],
     owner_id: currentUser.id,
     is_owner: true,
     can_manage: true,
@@ -312,7 +312,7 @@ test('create Agent modal traps focus, restores its opener, redacts errors, and s
   await subagentDialog.getByLabel('Reasoning effort Setting source').selectOption('override');
   await subagentDialog.locator('label').filter({ hasText: 'Reasoning effort' }).locator('select').nth(1).selectOption('max');
   await subagentDialog.getByRole('button', { name: 'Save changes' }).click();
-  await expect(dialog.getByRole('table', { name: 'Codex subagents' })).toContainText('reviewer');
+  await expect(dialog.getByRole('table', { name: 'Subagents' })).toContainText('reviewer');
   await dialog.getByLabel('Visibility').selectOption('public_to');
   await expect(dialog.getByRole('checkbox')).toHaveCount(2);
   await expect(dialog.getByText(currentUser.email)).toHaveCount(0);
@@ -336,7 +336,7 @@ test('create Agent modal traps focus, restores its opener, redacts errors, and s
   expect(createBodies[1]).toMatchObject({
     model_selection: { connection_id: globalModelId, model_id: 'gpt-global' },
     model_settings: expect.objectContaining({ reasoning_effort: 'high' }),
-    codex_subagents: [{
+    subagents: [{
       name: 'reviewer',
       description: 'Reviews the current change.',
       developer_instructions: 'Review the diff and report blocking findings.',
@@ -485,12 +485,12 @@ test('agent detail uses the six-tab IA and stacks the inspector first on mobile'
   expect(positions.overflow).toBeLessThanOrEqual(0);
 });
 
-test('models panel edits the Agent default, reasoning, and Codex subagent definitions', async ({ page }) => {
+test('models panel edits the Agent default, reasoning, and Subagent definitions', async ({ page }) => {
   const agent = ownerDetail({
     id: '50000000-0000-0000-0000-000000000055',
     model_selection: { connection_id: globalModelId, model_id: 'gpt-global' },
     model_settings: { ...automaticModelSettings, reasoning_effort: 'medium' },
-    codex_subagents: [{
+    subagents: [{
       name: 'reviewer',
       description: 'Reviews the current change.',
       developer_instructions: 'Review the diff.',
@@ -515,7 +515,7 @@ test('models panel edits the Agent default, reasoning, and Codex subagent defini
   await expect(panel.getByLabel('Reasoning effort').locator('option')).toHaveText([
     'default', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'
   ]);
-  await expect(panel.getByRole('table', { name: 'Codex subagents' })).toContainText('reviewer');
+  await expect(panel.getByRole('table', { name: 'Subagents' })).toContainText('reviewer');
 
   await panel.getByRole('button', { name: 'Edit subagent: reviewer' }).click();
   const dialog = page.getByRole('dialog', { name: 'Edit subagent: reviewer' });
@@ -532,7 +532,7 @@ test('models panel edits the Agent default, reasoning, and Codex subagent defini
   expect(patches[0]).toMatchObject({
     model_selection: { connection_id: personalModelId, model_id: 'gpt-personal' },
     model_settings: expect.objectContaining({ reasoning_effort: 'max' }),
-    codex_subagents: [{
+    subagents: [{
       name: 'reviewer',
       developer_instructions: 'Review the diff and identify release blockers.',
       model_selection: { connection_id: personalModelId, model_id: 'gpt-personal' },
@@ -804,7 +804,7 @@ test('agent activity is read-only run history', async ({ page }) => {
   const historicalRun = {
     id: '60000000-0000-0000-0000-000000000042', agent_id: agent.id, automation_id: null,
     integration_session_id: null, parent_run_id: null, runtime_id: null, status: 'completed',
-    initial_message: 'Historical run from a previous conversation', session_id: 'session-history',
+    initial_message: 'Historical run from a previous conversation', native_session_id: 'session-history',
     work_dir_ref: null, source: 'console', created_at: agent.created_at, updated_at: agent.updated_at
   };
   await installDetailApi(page, { agent, runs: [historicalRun] });
@@ -859,7 +859,7 @@ test('agent tabs keep real instructions, access, and read-only activity history'
   const historicalRun = {
     id: '60000000-0000-0000-0000-000000000043', agent_id: agent.id, automation_id: null,
     integration_session_id: null, parent_run_id: null, runtime_id: null, status: 'completed',
-    initial_message: 'Existing activity history', session_id: 'history-session', work_dir_ref: null,
+    initial_message: 'Existing activity history', native_session_id: 'history-session', work_dir_ref: null,
     source: 'console', created_at: agent.created_at, updated_at: agent.updated_at
   };
   await installDetailApi(page, {
@@ -971,7 +971,7 @@ test('agent pages localize and stay overflow-free at 1280, 1440, and 390 pixels'
   const localizedRun = {
     id: '60000000-0000-0000-0000-000000000051', agent_id: agent.id, automation_id: null,
     integration_session_id: null, parent_run_id: null, runtime_id: runtimes[0].id, status: 'completed',
-    initial_message: 'Localized run', session_id: null, work_dir_ref: null, source: 'integration:tool_result',
+    initial_message: 'Localized run', native_session_id: null, work_dir_ref: null, source: 'integration:tool_result',
     created_at: agent.created_at, updated_at: agent.updated_at
   };
   const pageErrors: string[] = [];

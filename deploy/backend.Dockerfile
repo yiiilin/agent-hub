@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 agenthub \
     && useradd --system --uid 10001 --gid agenthub --no-create-home agenthub \
-    && mkdir -p /var/lib/agent-hub/codex-artifacts \
+    && mkdir -p /var/lib/agent-hub \
     && chown -R agenthub:agenthub /var/lib/agent-hub
 COPY --from=backend-builder /app/target/release/agent-hub-backend /usr/local/bin/agent-hub-backend
 COPY --from=frontend-builder /app/dist /app/frontend/dist
