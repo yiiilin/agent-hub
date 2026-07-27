@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     env, fs as stdfs,
     io::Write,
     net::SocketAddr,
@@ -2890,6 +2890,7 @@ enum ManagedSessionStatus {
         metadata: SessionSupervisorMetadata,
         supervisor: Arc<SessionSupervisor>,
         busy: bool,
+        tool_allowlist: BTreeSet<String>,
     },
     Blocked {
         reason: String,
@@ -3445,6 +3446,7 @@ impl SessionSupervisorManager {
                         metadata,
                         supervisor,
                         busy: false,
+                        ..
                     } if metadata.lifecycle_status == "online" => {
                         (metadata.clone(), Some(Arc::clone(supervisor)))
                     }
@@ -4140,7 +4142,8 @@ impl SessionSupervisorManager {
         let session_id = metadata.session_id;
         let ownership_generation = metadata.ownership_generation;
         let native_session_id = metadata.native_session_id.clone();
-        self.ensure_session_supervisor(metadata, model_proxy, move || async move {
+        let launch_tools = tools.clone();
+        self.ensure_session_supervisor(metadata, model_proxy, tools, move || async move {
             let saved_session = native_session_id
                 .as_deref()
                 .map(|session_id| {
@@ -4153,7 +4156,7 @@ impl SessionSupervisorManager {
                 pi_bin,
                 run_env,
                 saved_session,
-                tools,
+                launch_tools,
                 timeout,
             )
             .await
@@ -4165,6 +4168,7 @@ impl SessionSupervisorManager {
         &self,
         metadata: SessionSupervisorMetadata,
         model_proxy: Option<Arc<LocalModelProxy>>,
+        tools: Vec<String>,
         start: F,
     ) -> anyhow::Result<Arc<SessionSupervisor>>
     where
@@ -4183,14 +4187,8 @@ impl SessionSupervisorManager {
             metadata.ownership_generation > 0,
             "ownership generation must be positive"
         );
-        let snapshot = RuntimeOwnedSessionSnapshotDto {
-            session_id: metadata.session_id,
-            ownership_generation: metadata.ownership_generation,
-            lifecycle_status: metadata.lifecycle_status.clone(),
-            native_session_id: metadata.native_session_id.clone(),
-            active_run_id: None,
-        };
-        {
+        let tool_allowlist = tools.into_iter().collect::<BTreeSet<_>>();
+        let supervisor_to_stop = {
             let mut records = self.records.lock().unwrap();
             if let Some(record) = records.get_mut(&metadata.session_id) {
                 anyhow::ensure!(
@@ -4198,8 +4196,34 @@ impl SessionSupervisorManager {
                     "Session manager has a different ownership generation"
                 );
                 match &record.status {
-                    ManagedSessionStatus::Ready { supervisor, .. } => {
-                        return Ok(Arc::clone(supervisor));
+                    ManagedSessionStatus::Ready {
+                        metadata: current_metadata,
+                        supervisor,
+                        busy,
+                        tool_allowlist: current_tool_allowlist,
+                    } => {
+                        if *current_tool_allowlist == tool_allowlist {
+                            return Ok(Arc::clone(supervisor));
+                        }
+                        anyhow::ensure!(
+                            !*busy,
+                            "Pi tool policy cannot change during an active Turn"
+                        );
+                        if let Some(current_native_session_id) =
+                            current_metadata.native_session_id.as_ref()
+                        {
+                            anyhow::ensure!(
+                                metadata.native_session_id.as_ref()
+                                    == Some(current_native_session_id),
+                                "Pi tool policy restart Native Session is missing or does not match"
+                            );
+                        }
+                        if let Some(model_proxy) = model_proxy.as_ref() {
+                            record.model_proxy = Some(Arc::clone(model_proxy));
+                        }
+                        let supervisor = Arc::clone(supervisor);
+                        record.status = ManagedSessionStatus::Starting;
+                        Some(supervisor)
                     }
                     ManagedSessionStatus::Cold {
                         metadata: recovered,
@@ -4213,6 +4237,7 @@ impl SessionSupervisorManager {
                             record.model_proxy = Some(Arc::clone(model_proxy));
                         }
                         record.status = ManagedSessionStatus::Starting;
+                        None
                     }
                     ManagedSessionStatus::Starting => {
                         anyhow::bail!("Session supervisor is already starting")
@@ -4226,6 +4251,13 @@ impl SessionSupervisorManager {
                     records.len() < self.max_online_sessions,
                     "Runtime Session capacity is full"
                 );
+                let snapshot = RuntimeOwnedSessionSnapshotDto {
+                    session_id: metadata.session_id,
+                    ownership_generation: metadata.ownership_generation,
+                    lifecycle_status: metadata.lifecycle_status.clone(),
+                    native_session_id: metadata.native_session_id.clone(),
+                    active_run_id: None,
+                };
                 records.insert(
                     metadata.session_id,
                     ManagedSessionRecord {
@@ -4235,7 +4267,11 @@ impl SessionSupervisorManager {
                         model_proxy: model_proxy.as_ref().map(Arc::clone),
                     },
                 );
+                None
             }
+        };
+        if let Some(supervisor) = supervisor_to_stop {
+            supervisor.shutdown();
         }
 
         if let Err(error) = persist_session_supervisor_metadata(&self.work_root, &metadata).await {
@@ -4265,6 +4301,7 @@ impl SessionSupervisorManager {
             metadata,
             supervisor: Arc::clone(&supervisor),
             busy: false,
+            tool_allowlist,
         };
         Ok(supervisor)
     }
@@ -4653,6 +4690,7 @@ impl SessionSupervisorManager {
                     metadata,
                     supervisor,
                     busy,
+                    ..
                 } => {
                     anyhow::ensure!(
                         metadata.native_session_id.as_deref() == Some(native_session_id),
@@ -4774,6 +4812,7 @@ impl SessionSupervisorManager {
                     metadata,
                     supervisor,
                     busy,
+                    ..
                 } => {
                     anyhow::ensure!(
                         metadata.native_session_id.as_deref() == Some(native_session_id),
@@ -5110,6 +5149,7 @@ impl SessionSupervisorManager {
                         metadata,
                         supervisor,
                         busy: false,
+                        ..
                     } if metadata.ownership_generation == record.snapshot.ownership_generation
                         && metadata.lifecycle_status == "online"
                         && metadata.checkpoint_reason.is_none()
@@ -6536,6 +6576,7 @@ mod tests {
             tools: json!([{ "name": "echo" }]),
             attachments: json!([]),
             tool_result: None,
+            external_user: None,
         });
         let client = HubClient {
             http: reqwest::Client::new(),
@@ -6628,6 +6669,7 @@ mod tests {
             tools: json!([{ "name": "echo" }]),
             attachments: json!([]),
             tool_result: None,
+            external_user: None,
         });
         let run_id = claim.run.id;
 
@@ -6666,6 +6708,7 @@ mod tests {
             tools: json!([{ "name": "echo" }]),
             attachments: json!([]),
             tool_result: None,
+            external_user: None,
         });
 
         let error = execute_run(&config, &client, claim).await.unwrap_err();
@@ -9520,6 +9563,7 @@ mod tests {
                 "url": null
             }]),
             tool_result: None,
+            external_user: None,
         });
         let run_env = prepare_run_env(temp.path(), &claim, Some("http://127.0.0.1:1/v1"))
             .await
@@ -9595,6 +9639,7 @@ mod tests {
             }]),
             attachments: json!([]),
             tool_result: None,
+            external_user: None,
         });
 
         let run_env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
@@ -9697,6 +9742,14 @@ mod tests {
                 "text": "tool result with \"quotes\"",
                 "nested": { "values": [1, true, null, { "line": "first\nsecond" }] }
             })),
+            external_user: Some(ExternalUserContextDto {
+                external_user_id: "external-42".into(),
+                tenant_id: "tenant-7".into(),
+                username: Some("ada".into()),
+                display_name: Some("Ada Lovelace".into()),
+                email: Some("ada@example.com".into()),
+                attributes: json!({ "plan": "pro" }),
+            }),
         });
 
         let prompt = pi_driver::pi_prompt_text(&claim).unwrap();
@@ -9718,6 +9771,19 @@ mod tests {
                 .tool_result
                 .clone()
                 .unwrap()
+        );
+        assert_eq!(
+            envelope["external_user"],
+            serde_json::to_value(
+                claim
+                    .integration_context
+                    .as_ref()
+                    .unwrap()
+                    .external_user
+                    .as_ref()
+                    .unwrap()
+            )
+            .unwrap()
         );
     }
 
@@ -11316,6 +11382,82 @@ Transfer-Encoding: chunked\r\n\
     }
 
     #[tokio::test]
+    async fn session_manager_restarts_pi_for_changed_tools_and_resumes_native_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("pi-tool-policy.pid");
+        let launch_log = temp.path().join("pi-tool-policy-launches.log");
+        let pi_bin = write_tool_recording_fake_pi_wrapper(&temp, &pid_file, &launch_log);
+        let runtime_id = Uuid::new_v4();
+        let manager = SessionSupervisorManager::new(temp.path().to_path_buf(), runtime_id, 1);
+
+        let mut first = test_claim();
+        first.run.runtime_id = Some(runtime_id);
+        let session_id = first.run.hub_session_id.unwrap();
+        let first_metadata =
+            session_supervisor_metadata_for_claim(runtime_id, &first, "test-engine").unwrap();
+        let first_run_env = prepare_run_env(temp.path(), &first, None).await.unwrap();
+        let first_tools = pi_driver::pi_tool_allowlist_for_claim(&first).unwrap();
+        let first_supervisor = manager
+            .ensure_pi(
+                first_metadata.clone(),
+                pi_bin.display().to_string(),
+                first_run_env,
+                first_tools,
+                Duration::from_secs(2),
+                None,
+            )
+            .await
+            .unwrap();
+        let first_result = first_supervisor.execute(first.clone(), None).await.unwrap();
+        let native_session_id = first_result.native_session_id.unwrap();
+        manager
+            .update_native_session_id(session_id, 1, Some(&native_session_id))
+            .await
+            .unwrap();
+
+        let mut second = first;
+        second.run.id = Uuid::new_v4();
+        second.execution_configuration.model_bindings[0].id = Uuid::new_v4();
+        second.execution_configuration.model_bindings[0].run_id = second.run.id;
+        second.agent.sandbox_policy = json!({ "mode": "read-only", "network_access": false });
+        second.agent.tool_allowlist = vec!["read".into(), "grep".into()];
+        second.execution_configuration.sandbox_policy = second.agent.sandbox_policy.clone();
+        second.execution_configuration.tool_allowlist = second.agent.tool_allowlist.clone();
+        second.expected_configuration_fingerprint =
+            execution_configuration_fingerprint(&second.execution_configuration).unwrap();
+        let second_run_env = prepare_run_env(temp.path(), &second, None).await.unwrap();
+        let second_tools = pi_driver::pi_tool_allowlist_for_claim(&second).unwrap();
+        let mut second_metadata = first_metadata;
+        second_metadata.native_session_id = Some(native_session_id.clone());
+        let second_supervisor = manager
+            .ensure_pi(
+                second_metadata,
+                pi_bin.display().to_string(),
+                second_run_env,
+                second_tools,
+                Duration::from_secs(2),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(!Arc::ptr_eq(&first_supervisor, &second_supervisor));
+        let second_result = second_supervisor.execute(second, None).await.unwrap();
+        assert_eq!(
+            second_result.native_session_id.as_deref(),
+            Some(native_session_id.as_str())
+        );
+        let launches = std::fs::read_to_string(&launch_log).unwrap();
+        let launches = launches.lines().collect::<Vec<_>>();
+        assert_eq!(launches.len(), 2);
+        assert!(launches[0].contains("--tools read,grep,find,ls,edit,write,bash"));
+        assert!(launches[1].contains("--tools read,grep"));
+
+        manager.shutdown();
+        assert_process_group_reaped_or_clean_up(&pid_file);
+    }
+
+    #[tokio::test]
     async fn managed_session_waits_for_turn_ack_and_reuses_proxy_while_switching_run_auth() {
         let temp = tempfile::tempdir().unwrap();
         let pid_file = temp.path().join("managed-pi.pid");
@@ -12212,6 +12354,37 @@ done
         script
     }
 
+    fn write_tool_recording_fake_pi_wrapper(
+        temp: &tempfile::TempDir,
+        pid_file: &Path,
+        launch_log: &Path,
+    ) -> PathBuf {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/fake-pi-rpc.sh")
+            .canonicalize()
+            .unwrap();
+        let fixture_source = std::fs::read_to_string(&fixture).unwrap();
+        let fixture_body = fixture_source
+            .split_once('\n')
+            .map(|(_, body)| body)
+            .unwrap_or(fixture_source.as_str());
+        let script = temp
+            .path()
+            .join(format!("fake-pi-tools-{}", Uuid::new_v4().simple()));
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho $$ > {}\nprintf '%s\\n' \"$*\" >> {}\nexport FAKE_PI_DISABLE_MODEL=1\n{}",
+                shell_single_quote(pid_file),
+                shell_single_quote(launch_log),
+                fixture_body
+            ),
+        )
+        .unwrap();
+        make_executable(&script);
+        script
+    }
+
     fn recording_hub_client(
         expected_requests: usize,
     ) -> (HubClient, RecordedHubRequests, std::thread::JoinHandle<()>) {
@@ -12452,6 +12625,7 @@ done
                 "Check the diff.",
             )],
             mcp_allowlist: json!([{ "name": "filesystem", "command": "fs" }]),
+            tool_allowlist: default_agent_tool_allowlist(),
         };
         let expected_configuration_fingerprint =
             execution_configuration_fingerprint(&execution_configuration).unwrap();
@@ -12490,6 +12664,7 @@ done
                 sandbox_policy: json!({ "mode": "workspace-write", "network_access": true }),
                 managed_skill_ids: Vec::new(),
                 mcp_allowlist: json!([{ "name": "filesystem", "command": "fs" }]),
+                tool_allowlist: default_agent_tool_allowlist(),
                 is_owner: false,
                 can_manage: false,
                 can_administer: false,

@@ -1,7 +1,7 @@
-import { Activity, ArrowUp, BookOpen, Bot, BrainCircuit, Check, CirclePause, Clock, Copy, ExternalLink, KeyRound, Languages, LogOut, Monitor, Plug, Plus, RotateCcw, Save, Search, Send, Settings, ShieldAlert, Sparkles, Trash2, Workflow, X } from 'lucide-react';
+import { Activity, ArrowUp, BookOpen, Bot, BrainCircuit, Check, CirclePause, Clock, Copy, ExternalLink, History, KeyRound, Languages, LogOut, Monitor, Plug, Plus, RotateCcw, Save, Search, Send, Settings, ShieldAlert, Sparkles, Trash2, Workflow, X } from 'lucide-react';
 import React, { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Agent, api, ApiError, ApiKey, ApiKeyValidity, Automation, HubSession, Run, RunEvent, Runtime, RuntimeEnrollmentToken, User, WidgetAgent } from './api/client';
+import { Agent, api, ApiError, ApiKey, ApiKeyValidity, Automation, HubSession, HubSessionMessage, Run, RunEvent, Runtime, RuntimeEnrollmentToken, User, WidgetAgent, WidgetHistorySession } from './api/client';
 import { I18nProvider, useI18n } from './i18n';
 import type { TranslationKey } from './i18n';
 import { FormDialog } from './components/form-dialog';
@@ -17,14 +17,15 @@ import { ModelsPage } from './models';
 import { clearConversationDrafts } from './session-drafts';
 import './styles.css';
 
-type Route = { name: 'login' } | { name: 'agents' } | { name: 'agent'; agentId: string } | { name: 'sessions' } | { name: 'integrations' } | { name: 'skills' } | { name: 'skill'; skillId: string } | { name: 'models' } | { name: 'apiKeys' } | { name: 'docs' } | { name: 'automations' } | { name: 'runtimes' } | { name: 'administration' } | { name: 'widget'; token?: string } | { name: 'notFound' };
+type Route = { name: 'login' } | { name: 'agents' } | { name: 'agent'; agentId: string } | { name: 'sessions' } | { name: 'integrations' } | { name: 'skills' } | { name: 'skill'; skillId: string } | { name: 'models' } | { name: 'apiKeys' } | { name: 'docs' } | { name: 'automations' } | { name: 'runtimes' } | { name: 'administration' } | { name: 'widget'; token?: string; appClientId?: string } | { name: 'notFound' };
 
 function parseRoute(): Route {
   const path = window.location.pathname;
   if (path.startsWith('/widget')) {
     const token = new URLSearchParams(window.location.hash.slice(1)).get('token') ?? undefined;
     if (token) window.history.replaceState(null, '', '/widget');
-    return { name: 'widget', token };
+    const appClientId = token ? undefined : new URLSearchParams(window.location.search).get('app') || undefined;
+    return { name: 'widget', token, appClientId };
   }
   if (path.startsWith('/agents/')) {
     return { name: 'agent', agentId: path.split('/')[2] };
@@ -97,7 +98,7 @@ function App() {
     api.me().then(setUser).catch(() => setUser(null)).finally(() => setLoading(false));
   }, [route.name]);
 
-  if (route.name === 'widget') return <WidgetApp token={route.token} />;
+  if (route.name === 'widget') return <WidgetApp token={route.token} appClientId={route.appClientId} />;
   if (loading) return <Shell user={user}><div className="panel">{t('loading')}</div></Shell>;
   if (!user || route.name === 'login') return <LoginPage onLogin={setUser} />;
 
@@ -105,7 +106,7 @@ function App() {
     <Shell user={user}>
       {route.name === 'agents' && <AgentsPage currentUser={user} navigate={navigate} />}
       {route.name === 'sessions' && <SessionsPage currentUserId={user.id} />}
-      {route.name === 'integrations' && <IntegrationAppsPage />}
+      {route.name === 'integrations' && <IntegrationAppsPage currentUser={user} />}
       {/* agentId 变化时重建详情页，避免旧 Agent 的表单、运行列表和 controls 在新路由加载期间残留。 */}
       {route.name === 'agent' && <AgentDetailPage key={route.agentId} agentId={route.agentId} currentUser={user} navigate={navigate} setNavigationBlocker={setNavigationBlocker} RunConsole={RunConsole} />}
       {route.name === 'skills' && <SkillsPage navigate={navigate} />}
@@ -1330,9 +1331,74 @@ function widgetChannelId() {
 }
 
 type WidgetExchange = {
+  id: string;
   message: string;
-  run: Run;
+  runId: string | null;
+  initialEvents: RunEvent[];
+  displayRun: boolean;
 };
+
+type WidgetSessionTarget = {
+  integrationSessionId: string | null;
+  hubSessionId: string;
+};
+
+type StoredWidgetState = {
+  token: string;
+  expiresAt?: string;
+  historyEnabled: boolean;
+  target: WidgetSessionTarget | null;
+  draft: string;
+  draftClientMessageKey: string | null;
+  visitorKey?: string;
+};
+
+const widgetStateStorageKey = 'agent-hub-widget-state-v1';
+
+function publicWidgetStateStorageKey(clientId: string) {
+  return `agent-hub-public-widget-state-v1:${clientId}`;
+}
+
+function sameWidgetSessionTarget(left: WidgetSessionTarget | null, right: WidgetSessionTarget | null) {
+  return left === right || (left !== null && right !== null
+    && left.integrationSessionId === right.integrationSessionId
+    && left.hubSessionId === right.hubSessionId);
+}
+
+function loadStoredWidgetState(storageKey: string): StoredWidgetState | null {
+  try {
+    const parsed = JSON.parse(sessionStorage.getItem(storageKey) ?? 'null') as Record<string, unknown> | null;
+    if (!parsed || typeof parsed.token !== 'string' || !parsed.token) return null;
+    const candidate = parsed.target;
+    const target = candidate && typeof candidate === 'object'
+      && (typeof (candidate as Record<string, unknown>).integrationSessionId === 'string' || (candidate as Record<string, unknown>).integrationSessionId === null)
+      && typeof (candidate as Record<string, unknown>).hubSessionId === 'string'
+      ? {
+          integrationSessionId: (candidate as { integrationSessionId: string | null }).integrationSessionId,
+          hubSessionId: (candidate as { hubSessionId: string }).hubSessionId
+        }
+      : null;
+    return {
+      token: parsed.token,
+      expiresAt: typeof parsed.expiresAt === 'string' ? parsed.expiresAt : undefined,
+      historyEnabled: parsed.historyEnabled === true,
+      target,
+      draft: typeof parsed.draft === 'string' ? parsed.draft : '',
+      draftClientMessageKey: typeof parsed.draftClientMessageKey === 'string' ? parsed.draftClientMessageKey : null,
+      visitorKey: typeof parsed.visitorKey === 'string' && parsed.visitorKey ? parsed.visitorKey : undefined
+    };
+  } catch {
+    return null;
+  }
+}
+
+function storeWidgetState(storageKey: string, state: StoredWidgetState) {
+  try {
+    sessionStorage.setItem(storageKey, JSON.stringify(state));
+  } catch {
+    // The Widget remains usable when storage is unavailable or quota-limited.
+  }
+}
 
 type WidgetTimelineMessage = { kind: 'message'; id: string; content: string; occurredAt: number; sequence: number };
 type WidgetTimelineEntry = WidgetTimelineMessage
@@ -1342,22 +1408,60 @@ type WidgetTimelineItem = WidgetTimelineMessage
 
 const widgetTerminalStatuses = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
 
-function WidgetApp({ token }: { token?: string }) {
+function WidgetApp({ token, appClientId }: { token?: string; appClientId?: string }) {
   const { language, setLanguage, t } = useI18n();
-  const [sessionToken, setSessionToken] = useState(token ?? '');
+  const publicWidget = Boolean(appClientId && !token);
+  const storageKey = publicWidget && appClientId ? publicWidgetStateStorageKey(appClientId) : widgetStateStorageKey;
+  const [bootstrap] = useState(() => {
+    const stored = loadStoredWidgetState(storageKey);
+    const restoresStoredState = publicWidget || !token || stored?.token === token;
+    return {
+      sessionToken: publicWidget ? stored?.token ?? '' : token ?? stored?.token ?? '',
+      expiresAt: restoresStoredState ? stored?.expiresAt : undefined,
+      historyEnabled: publicWidget ? false : restoresStoredState ? stored?.historyEnabled ?? false : false,
+      target: restoresStoredState ? stored?.target ?? null : null,
+      draft: restoresStoredState ? stored?.draft ?? '' : '',
+      draftClientMessageKey: restoresStoredState ? stored?.draftClientMessageKey ?? null : null,
+      visitorKey: publicWidget ? stored?.visitorKey ?? widgetChannelId() : undefined
+    };
+  });
+  const [sessionToken, setSessionToken] = useState(bootstrap.sessionToken);
+  const [credentialExpiresAt, setCredentialExpiresAt] = useState<string | undefined>(bootstrap.expiresAt);
+  const [historyEnabled, setHistoryEnabled] = useState(bootstrap.historyEnabled);
+  const [selectedSession, setSelectedSession] = useState<WidgetSessionTarget | null>(bootstrap.target);
   const [agent, setAgent] = useState<WidgetAgent | null>(null);
-  const [message, setMessage] = useState('');
+  const [message, setMessage] = useState(bootstrap.draft);
+  const [draftClientMessageKey, setDraftClientMessageKey] = useState<string | null>(bootstrap.draftClientMessageKey);
   const [exchanges, setExchanges] = useState<WidgetExchange[]>([]);
   const [pendingMessage, setPendingMessage] = useState<string | null>(null);
   const [error, setError] = useState('');
   const [hostOrigin, setHostOrigin] = useState<string | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [historySessions, setHistorySessions] = useState<WidgetHistorySession[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState('');
+  const [transcriptLoading, setTranscriptLoading] = useState(false);
+  const [credentialEpoch, setCredentialEpoch] = useState(0);
+  const [publicAccessReady, setPublicAccessReady] = useState(!publicWidget);
   const [channelId] = useState(widgetChannelId);
   const widgetRef = useRef<HTMLDivElement>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
-  const sessionTokenRef = useRef(token ?? '');
-  const sessionGeneration = useRef(0);
-  const runGeneration = useRef(0);
+  const sessionTokenRef = useRef(bootstrap.sessionToken);
+  const selectedSessionRef = useRef<WidgetSessionTarget | null>(bootstrap.target);
+  const messageRef = useRef(bootstrap.draft);
+  const draftClientMessageKeyRef = useRef<string | null>(bootstrap.draftClientMessageKey);
+  const credentialSelectionGeneration = useRef(0);
+  const logicalSessionGeneration = useRef(0);
+  const exchangeRequestGeneration = useRef(0);
+  const equivalentTokensRef = useRef(new Set(bootstrap.sessionToken ? [bootstrap.sessionToken] : []));
+  const renewalInFlightRef = useRef(false);
+  const renewalPromiseRef = useRef<Promise<unknown> | null>(null);
+  const publicAccessInFlightRef = useRef<Promise<unknown> | null>(null);
+  const pendingSubmissionRef = useRef<string | null>(null);
+  const historyEnabledRef = useRef(bootstrap.historyEnabled);
+  const visitorKeyRef = useRef(bootstrap.visitorKey);
+  const publicAccessReadyRef = useRef(!publicWidget);
   const runPendingRef = useRef(false);
   const hostOriginRef = useRef<string | null>(null);
   const [runPending, setRunPending] = useState(false);
@@ -1368,21 +1472,6 @@ function WidgetApp({ token }: { token?: string }) {
     window.parent.postMessage({ type, channelId, ...payload }, origin);
   }, [channelId]);
 
-  const selectSession = useCallback((nextToken: string) => {
-    if (nextToken === sessionTokenRef.current) return;
-    sessionGeneration.current += 1;
-    runGeneration.current += 1;
-    runPendingRef.current = false;
-    setRunPending(false);
-    sessionTokenRef.current = nextToken;
-    setSessionToken(nextToken);
-    setAgent(null);
-    setExchanges([]);
-    setPendingMessage(null);
-    setMessage('');
-    setError('');
-  }, []);
-
   const scrollChatToBottom = useCallback(() => {
     requestAnimationFrame(() => {
       const scroll = chatScrollRef.current;
@@ -1390,50 +1479,255 @@ function WidgetApp({ token }: { token?: string }) {
     });
   }, []);
 
+  const updateDraft = useCallback((nextMessage: string) => {
+    if (nextMessage !== messageRef.current) {
+      draftClientMessageKeyRef.current = null;
+      setDraftClientMessageKey(null);
+    }
+    messageRef.current = nextMessage;
+    setMessage(nextMessage);
+  }, []);
+
+  const clearDraft = useCallback(() => {
+    messageRef.current = '';
+    draftClientMessageKeyRef.current = null;
+    setMessage('');
+    setDraftClientMessageKey(null);
+  }, []);
+
+  const updateSelectedSession = useCallback((nextTarget: WidgetSessionTarget | null) => {
+    selectedSessionRef.current = nextTarget;
+    setSelectedSession(nextTarget);
+  }, []);
+
+  const rotateCredential = useCallback((expectedToken: string, nextToken: string, expiresAt?: string) => {
+    if (!nextToken || sessionTokenRef.current !== expectedToken) return;
+    const tokens = new Set(equivalentTokensRef.current);
+    tokens.add(expectedToken);
+    tokens.add(nextToken);
+    equivalentTokensRef.current = tokens;
+    sessionTokenRef.current = nextToken;
+    setSessionToken(nextToken);
+    if (expiresAt) setCredentialExpiresAt(expiresAt);
+    setError('');
+  }, []);
+
+  const requestPublicWidgetAccess = useCallback(async () => {
+    if (!publicWidget || !appClientId || !visitorKeyRef.current) return;
+    if (publicAccessInFlightRef.current) return publicAccessInFlightRef.current;
+    const expectedToken = sessionTokenRef.current;
+    const operation = api.publicWidgetAccess(appClientId, visitorKeyRef.current)
+      .then((access) => {
+        if (sessionTokenRef.current !== expectedToken) return;
+        const expiresAt = Number.isFinite(access.expires_in) && access.expires_in > 0
+          ? new Date(Date.now() + access.expires_in * 1_000).toISOString()
+          : undefined;
+        rotateCredential(expectedToken, access.access_token, expiresAt);
+        publicAccessReadyRef.current = true;
+        setPublicAccessReady(true);
+        setAgent(access.agent);
+        historyEnabledRef.current = false;
+        setHistoryEnabled(false);
+        setHistoryOpen(false);
+        setHistorySessions([]);
+        if (!selectedSessionRef.current && access.hub_session_id) {
+          updateSelectedSession({ integrationSessionId: null, hubSessionId: access.hub_session_id });
+        }
+      })
+      .catch(() => { if (sessionTokenRef.current === expectedToken) setError(t('genericError')); })
+      .finally(() => {
+        if (publicAccessInFlightRef.current === operation) publicAccessInFlightRef.current = null;
+      });
+    publicAccessInFlightRef.current = operation;
+    return operation;
+  }, [appClientId, publicWidget, rotateCredential, t, updateSelectedSession]);
+
+  const selectCredential = useCallback((nextToken: string) => {
+    if (!nextToken || equivalentTokensRef.current.has(nextToken)) return false;
+    credentialSelectionGeneration.current += 1;
+    logicalSessionGeneration.current += 1;
+    equivalentTokensRef.current = new Set([nextToken]);
+    sessionTokenRef.current = nextToken;
+    historyEnabledRef.current = false;
+    setSessionToken(nextToken);
+    setCredentialExpiresAt(undefined);
+    setHistoryEnabled(false);
+    setAgent(null);
+    setHistoryOpen(false);
+    setHistorySessions([]);
+    setHistoryError('');
+    setTranscriptLoading(false);
+    updateSelectedSession(null);
+    setExchanges([]);
+    setPendingMessage(null);
+    clearDraft();
+    setError('');
+    setCredentialEpoch((current) => current + 1);
+    return true;
+  }, [clearDraft, updateSelectedSession]);
+
   const exchangeEmbedJwt = useCallback(async (jwt: string) => {
-    // 先使已有 session 和 in-flight run 失效，较晚返回的 exchange 不能覆盖新选择。
-    selectSession('');
-    const generation = sessionGeneration.current;
+    const requestGeneration = ++exchangeRequestGeneration.current;
+    const selectionGeneration = credentialSelectionGeneration.current;
     try {
       const response = await api.exchangeEmbedJwt(jwt);
-      if (generation !== sessionGeneration.current) return false;
-      selectSession(response.token);
+      if (requestGeneration !== exchangeRequestGeneration.current
+        || selectionGeneration !== credentialSelectionGeneration.current) return false;
+      selectCredential(response.token);
       return true;
-    } catch (err) {
-      if (generation === sessionGeneration.current) {
+    } catch {
+      if (requestGeneration === exchangeRequestGeneration.current
+        && selectionGeneration === credentialSelectionGeneration.current) {
         setError(t('genericError'));
       }
       return false;
     }
-  }, [selectSession]);
+  }, [selectCredential, t]);
+
+  const loadWidgetTranscript = useCallback(async (
+    accessToken: string,
+    target: WidgetSessionTarget,
+    expectedLogicalGeneration: number
+  ) => {
+    setTranscriptLoading(true);
+    try {
+      const [messages, events] = await Promise.all([
+        api.widgetSessionMessages(accessToken, target.integrationSessionId ?? target.hubSessionId),
+        api.widgetSessionEvents(accessToken, target.integrationSessionId ?? target.hubSessionId)
+      ]);
+      if (expectedLogicalGeneration !== logicalSessionGeneration.current
+        || !sameWidgetSessionTarget(target, selectedSessionRef.current)) return;
+      const eventsByRun = new Map<string, RunEvent[]>();
+      for (const event of events) {
+        const current = eventsByRun.get(event.run_id) ?? [];
+        current.push(event);
+        eventsByRun.set(event.run_id, current);
+      }
+      const userMessages = messages.filter((item) => item.role === 'user' && item.content !== null);
+      const finalMessageIndexForRun = new Map<string, number>();
+      userMessages.forEach((item, index) => {
+        if (item.run_id) finalMessageIndexForRun.set(item.run_id, index);
+      });
+      setExchanges(userMessages.map((item, index) => ({
+        id: item.id,
+        message: item.content ?? '',
+        runId: item.run_id,
+        initialEvents: item.run_id ? mergeRunEvents([], eventsByRun.get(item.run_id) ?? []) : [],
+        displayRun: item.run_id !== null && finalMessageIndexForRun.get(item.run_id) === index
+      })));
+      scrollChatToBottom();
+    } catch {
+      if (expectedLogicalGeneration === logicalSessionGeneration.current
+        && sameWidgetSessionTarget(target, selectedSessionRef.current)) {
+        setError(t('genericError'));
+      }
+    } finally {
+      if (expectedLogicalGeneration === logicalSessionGeneration.current
+        && sameWidgetSessionTarget(target, selectedSessionRef.current)) {
+        setTranscriptLoading(false);
+      }
+    }
+  }, [scrollChatToBottom, t]);
+
+  const refreshWidgetHistory = useCallback(async (accessToken: string, expectedCredentialGeneration: number) => {
+    setHistoryLoading(true);
+    setHistoryError('');
+    try {
+      const sessions = await api.widgetSessions(accessToken);
+      if (expectedCredentialGeneration === credentialSelectionGeneration.current) {
+        setHistorySessions(sessions);
+      }
+    } catch {
+      if (expectedCredentialGeneration === credentialSelectionGeneration.current) {
+        setHistoryError(t('widgetHistoryLoadFailed'));
+      }
+    } finally {
+      if (expectedCredentialGeneration === credentialSelectionGeneration.current) {
+        setHistoryLoading(false);
+      }
+    }
+  }, [t]);
+
+  const selectLogicalSession = useCallback((nextTarget: WidgetSessionTarget | null) => {
+    if (sameWidgetSessionTarget(nextTarget, selectedSessionRef.current)) {
+      setHistoryOpen(false);
+      return;
+    }
+    logicalSessionGeneration.current += 1;
+    const generation = logicalSessionGeneration.current;
+    updateSelectedSession(nextTarget);
+    setExchanges([]);
+    setPendingMessage(null);
+    setTranscriptLoading(nextTarget !== null);
+    clearDraft();
+    setError('');
+    setHistoryOpen(false);
+    if (nextTarget && sessionTokenRef.current.startsWith('ahw_')) {
+      void loadWidgetTranscript(sessionTokenRef.current, nextTarget, generation);
+    }
+  }, [clearDraft, loadWidgetTranscript, updateSelectedSession]);
 
   const startWidgetRun = useCallback(async (content: string) => {
-    const token = sessionTokenRef.current;
-    if (!token || !content.trim() || runPendingRef.current) return;
+    if (!sessionTokenRef.current || !content.trim() || runPendingRef.current || (publicWidget && !publicAccessReadyRef.current)) return;
     runPendingRef.current = true;
     setRunPending(true);
     setPendingMessage(content);
-    const generation = sessionGeneration.current;
-    const requestGeneration = ++runGeneration.current;
+    const logicalGeneration = logicalSessionGeneration.current;
+    const requestTarget = selectedSessionRef.current;
+    const submissionId = widgetChannelId();
+    pendingSubmissionRef.current = submissionId;
+    let clientMessageKey = widgetChannelId();
+    if (messageRef.current === content) {
+      clientMessageKey = draftClientMessageKeyRef.current ?? clientMessageKey;
+      draftClientMessageKeyRef.current = clientMessageKey;
+      setDraftClientMessageKey(clientMessageKey);
+    }
     setError('');
     try {
-      const createdRun = await api.createWidgetRun(token, content);
-      if (generation !== sessionGeneration.current || requestGeneration !== runGeneration.current) return;
-      setExchanges((current) => [...current, { message: content, run: createdRun }]);
-      setMessage((current) => current === content ? '' : current);
+      const pendingRenewal = renewalPromiseRef.current;
+      if (pendingRenewal) await pendingRenewal.catch(() => undefined);
+      if (logicalGeneration !== logicalSessionGeneration.current) return;
+      const accessToken = sessionTokenRef.current;
+      const createdRun = await api.createWidgetRun(accessToken, content, {
+        ...(requestTarget ? {
+          integration_session_id: requestTarget.integrationSessionId,
+          hub_session_id: requestTarget.hubSessionId
+        } : {}),
+        client_message_key: clientMessageKey
+      });
       postWidgetMessage('agent-hub:run-started', { runId: createdRun.id });
+      if (logicalGeneration !== logicalSessionGeneration.current) return;
+      if (createdRun.hub_session_id) {
+        updateSelectedSession({
+          integrationSessionId: createdRun.integration_session_id,
+          hubSessionId: createdRun.hub_session_id
+        });
+      }
+      setExchanges((current) => current.some((exchange) => exchange.runId === createdRun.id)
+        ? current
+        : [...current, {
+            id: `widget-run-${createdRun.id}`,
+            message: content,
+            runId: createdRun.id,
+            initialEvents: [],
+            displayRun: true
+          }]);
+      if (messageRef.current === content) clearDraft();
+      if (historyEnabledRef.current) {
+        void refreshWidgetHistory(sessionTokenRef.current, credentialSelectionGeneration.current);
+      }
       scrollChatToBottom();
-    } catch (err) {
-      if (generation !== sessionGeneration.current || requestGeneration !== runGeneration.current) return;
-      setError(t('genericError'));
+    } catch {
+      if (logicalGeneration === logicalSessionGeneration.current) setError(t('genericError'));
     } finally {
-      if (generation === sessionGeneration.current && requestGeneration === runGeneration.current) {
+      if (pendingSubmissionRef.current === submissionId) {
+        pendingSubmissionRef.current = null;
         runPendingRef.current = false;
         setRunPending(false);
-        setPendingMessage(null);
+        if (logicalGeneration === logicalSessionGeneration.current) setPendingMessage(null);
       }
     }
-  }, [postWidgetMessage, scrollChatToBottom]);
+  }, [clearDraft, postWidgetMessage, publicWidget, refreshWidgetHistory, scrollChatToBottom, t, updateSelectedSession]);
 
   const reportWidgetRunEvent = useCallback((event: RunEvent) => {
     postWidgetMessage('agent-hub:run-event', { runId: event.run_id, event });
@@ -1454,11 +1748,11 @@ function WidgetApp({ token }: { token?: string }) {
         setHostOrigin(event.origin);
         let sessionReady = false;
         if (typeof event.data.token === 'string') {
-          selectSession(event.data.token);
+          selectCredential(event.data.token);
           sessionReady = true;
         }
         if (typeof event.data.jwt === 'string') {
-          sessionReady = await exchangeEmbedJwt(event.data.jwt);
+          sessionReady = (await exchangeEmbedJwt(event.data.jwt)) || sessionReady;
         }
         window.parent.postMessage(
           { type: 'agent-hub:ready', channelId, protocolVersion: 1, bound: true, sessionReady },
@@ -1471,29 +1765,135 @@ function WidgetApp({ token }: { token?: string }) {
         await exchangeEmbedJwt(event.data.jwt);
       }
       if (event.data.type === 'agent-hub:session-select' && typeof event.data.token === 'string') {
-        selectSession(event.data.token);
+        selectCredential(event.data.token);
       }
       if (event.data.type === 'agent-hub:message-submit') {
-        const content = typeof event.data.message === 'string' ? event.data.message : message;
+        const content = typeof event.data.message === 'string' ? event.data.message : messageRef.current;
         await startWidgetRun(content);
       }
     };
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
-  }, [channelId, exchangeEmbedJwt, message, selectSession, startWidgetRun]);
+  }, [channelId, exchangeEmbedJwt, selectCredential, startWidgetRun]);
+
+  useEffect(() => {
+    if (!publicWidget) return;
+    const restoredTarget = selectedSessionRef.current;
+    void requestPublicWidgetAccess()?.then(() => {
+      if (restoredTarget && sameWidgetSessionTarget(restoredTarget, selectedSessionRef.current)) {
+        void loadWidgetTranscript(sessionTokenRef.current, restoredTarget, logicalSessionGeneration.current);
+      }
+    });
+  }, [loadWidgetTranscript, publicWidget, requestPublicWidgetAccess]);
+
+  useEffect(() => {
+    if (publicWidget) return;
+    const accessToken = sessionTokenRef.current;
+    if (!accessToken) return;
+    let cancelled = false;
+    const expectedCredentialGeneration = credentialSelectionGeneration.current;
+    api.widgetAgent(accessToken)
+      .then((loaded) => {
+        if (cancelled || expectedCredentialGeneration !== credentialSelectionGeneration.current) return;
+        setAgent(loaded);
+        const externalCredential = accessToken.startsWith('ahw_');
+        const nextHistoryEnabled = loaded.history_enabled === true;
+        historyEnabledRef.current = nextHistoryEnabled;
+        setCredentialExpiresAt(loaded.expires_at);
+        setHistoryEnabled(nextHistoryEnabled);
+        if (nextHistoryEnabled) {
+          void refreshWidgetHistory(sessionTokenRef.current, expectedCredentialGeneration);
+        } else {
+          setHistorySessions([]);
+          setHistoryOpen(false);
+        }
+        const restoredTarget = selectedSessionRef.current;
+        if (externalCredential && restoredTarget) {
+          void loadWidgetTranscript(sessionTokenRef.current, restoredTarget, logicalSessionGeneration.current);
+        }
+      })
+      .catch(() => { if (!cancelled && expectedCredentialGeneration === credentialSelectionGeneration.current) setError(t('genericError')); });
+    return () => { cancelled = true; };
+  }, [credentialEpoch, loadWidgetTranscript, publicWidget, refreshWidgetHistory, t]);
 
   useEffect(() => {
     if (!sessionToken) return;
+    storeWidgetState(storageKey, {
+      token: sessionToken,
+      expiresAt: credentialExpiresAt,
+      historyEnabled,
+      target: selectedSession,
+      draft: message,
+      draftClientMessageKey,
+      visitorKey: bootstrap.visitorKey
+    });
+  }, [bootstrap.visitorKey, credentialExpiresAt, draftClientMessageKey, historyEnabled, message, selectedSession, sessionToken, storageKey]);
+
+  useEffect(() => {
+    if (!publicWidget || !credentialExpiresAt) return;
+    const expiresAt = Date.parse(credentialExpiresAt);
+    if (!Number.isFinite(expiresAt)) return;
     let cancelled = false;
-    api.widgetAgent(sessionToken)
-      .then((loaded) => { if (!cancelled) setAgent(loaded); })
-      .catch(() => { if (!cancelled) setError(t('genericError')); });
-    return () => { cancelled = true; };
-  }, [sessionToken, t]);
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const schedule = (delay: number) => { timer = setTimeout(() => { void refresh(); }, delay); };
+    const refresh = async () => {
+      if (cancelled) return;
+      if (runPendingRef.current) {
+        schedule(1_000);
+        return;
+      }
+      await requestPublicWidgetAccess();
+    };
+    schedule(Math.max(0, expiresAt - Date.now() - 60_000));
+    return () => { cancelled = true; if (timer) clearTimeout(timer); };
+  }, [credentialExpiresAt, publicWidget, requestPublicWidgetAccess]);
+
+  useEffect(() => {
+    if (publicWidget || !sessionToken.startsWith('ahw_') || !credentialExpiresAt) return;
+    const expiresAt = Date.parse(credentialExpiresAt);
+    if (!Number.isFinite(expiresAt)) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const schedule = (delay: number) => {
+      timer = setTimeout(() => { void renew(); }, delay);
+    };
+    const renew = async () => {
+      if (cancelled || sessionTokenRef.current !== sessionToken) return;
+      if (runPendingRef.current) {
+        schedule(1_000);
+        return;
+      }
+      if (renewalInFlightRef.current) {
+        schedule(1_000);
+        return;
+      }
+      renewalInFlightRef.current = true;
+      const operation = api.renewWidgetSession(sessionToken);
+      renewalPromiseRef.current = operation;
+      try {
+        const renewed = await operation;
+        if (!cancelled) rotateCredential(sessionToken, renewed.token, renewed.expires_at);
+      } catch {
+        if (!cancelled && sessionTokenRef.current === sessionToken) {
+          setError(t('genericError'));
+          schedule(10_000);
+        }
+      } finally {
+        if (renewalPromiseRef.current === operation) renewalPromiseRef.current = null;
+        renewalInFlightRef.current = false;
+      }
+    };
+    schedule(Math.max(0, expiresAt - Date.now() - 60_000));
+    return () => { cancelled = true; if (timer) clearTimeout(timer); };
+  }, [credentialExpiresAt, publicWidget, rotateCredential, sessionToken, t]);
 
   useEffect(() => {
     resizeComposer(composerRef.current);
   }, [message]);
+
+  useEffect(() => {
+    scrollChatToBottom();
+  }, [exchanges, pendingMessage, scrollChatToBottom]);
 
   useEffect(() => {
     if (!hostOrigin || !widgetRef.current) return;
@@ -1521,14 +1921,31 @@ function WidgetApp({ token }: { token?: string }) {
     <div className="widget session-chat" ref={widgetRef}>
       <header className="session-detail-header session-chat-header widget-header">
         <div className="session-chat-title"><span className="widget-agent-icon" aria-hidden="true"><Bot size={17} /></span><div><h2>{agent?.name ?? t('agentWidget')}</h2><span>{t('hubNative')}</span></div></div>
-        <label className="widget-language-control"><Languages size={15} aria-hidden="true" /><span className="sr-only">{t('language')}</span><select className="widget-language" aria-label={t('language')} value={language} onChange={(event) => setLanguage(event.target.value as 'en' | 'zh-CN')}><option value="en">English</option><option value="zh-CN">简体中文</option></select></label>
+        <div className="widget-header-actions">
+          {historyEnabled && <button type="button" className="icon-button widget-history-toggle" aria-label={t('widgetHistory')} title={t('widgetHistory')} onClick={() => setHistoryOpen((open) => !open)}><History size={17} /></button>}
+          <label className="widget-language-control"><Languages size={15} aria-hidden="true" /><span className="sr-only">{t('language')}</span><select className="widget-language" aria-label={t('language')} value={language} onChange={(event) => setLanguage(event.target.value as 'en' | 'zh-CN')}><option value="en">English</option><option value="zh-CN">简体中文</option></select></label>
+        </div>
       </header>
+      {historyOpen && <aside className="widget-history" role="dialog" aria-label={t('widgetHistory')}>
+        <header><strong>{t('widgetHistory')}</strong><button type="button" className="icon-button" aria-label={t('widgetCloseHistory')} title={t('widgetCloseHistory')} onClick={() => setHistoryOpen(false)}><X size={16} /></button></header>
+        <button type="button" className="secondary widget-history-new" onClick={() => selectLogicalSession(null)}><Plus size={15} /> {t('newConversation')}</button>
+        {historyLoading && <div className="widget-history-state">{t('loadingMessages')}</div>}
+        {historyError && <div className="widget-history-state error">{historyError} <button type="button" className="text-button" onClick={() => void refreshWidgetHistory(sessionTokenRef.current, credentialSelectionGeneration.current)}>{t('retry')}</button></div>}
+        {!historyLoading && !historyError && historySessions.length === 0 && <div className="widget-history-state">{t('widgetNoHistory')}</div>}
+        {!historyLoading && !historyError && historySessions.length > 0 && <div className="widget-history-list">{historySessions.map((item) => {
+          const itemTarget = { integrationSessionId: item.id, hubSessionId: item.hub_session_id };
+          return <button type="button" key={item.id} className={`widget-history-item ${sameWidgetSessionTarget(itemTarget, selectedSession) ? 'selected' : ''}`} onClick={() => selectLogicalSession(itemTarget)}>
+            <span>{item.preview || t('newConversation')}</span><time>{new Date(item.updated_at).toLocaleString(language)}</time>
+          </button>;
+        })}</div>}
+      </aside>}
       <div className="session-chat-scroll" ref={chatScrollRef}>
         {error && <div className="session-banner error" role="alert">{error}</div>}
         <div className="session-transcript widget-transcript" aria-live="polite">
-          {exchanges.map((exchange) => <React.Fragment key={exchange.run.id}>
+          {transcriptLoading && exchanges.length === 0 && <div className="widget-transcript-state">{t('loadingMessages')}</div>}
+          {exchanges.map((exchange) => <React.Fragment key={exchange.id}>
             <ChatMessageBubble agentName={agent?.name ?? null} content={exchange.message} role="user" />
-            <WidgetRunConsole run={exchange.run} token={sessionToken} agentName={agent?.name ?? null} onEvent={reportWidgetRunEvent} />
+            {exchange.displayRun && exchange.runId && <WidgetRunConsole runId={exchange.runId} token={sessionToken} initialEvents={exchange.initialEvents} agentName={agent?.name ?? null} onEvent={reportWidgetRunEvent} />}
           </React.Fragment>)}
           {pendingMessage && <>
             <ChatMessageBubble agentName={agent?.name ?? null} content={pendingMessage} role="user" />
@@ -1537,31 +1954,39 @@ function WidgetApp({ token }: { token?: string }) {
         </div>
       </div>
       <form className="session-composer session-chat-composer widget-composer" onSubmit={submit}>
-        <label><span className="sr-only">{t('message')}</span><textarea ref={composerRef} rows={2} aria-label={t('message')} value={message} onChange={(event) => setMessage(event.target.value)} onInput={(event) => resizeComposer(event.currentTarget)} onKeyDown={(event) => {
+        <label><span className="sr-only">{t('message')}</span><textarea ref={composerRef} rows={2} aria-label={t('message')} value={message} onChange={(event) => updateDraft(event.target.value)} onInput={(event) => resizeComposer(event.currentTarget)} onKeyDown={(event) => {
           if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return;
           event.preventDefault();
           event.currentTarget.form?.requestSubmit();
         }} placeholder={t('messagePlaceholder')} /></label>
-        <div><span className="session-composer-actions"><button type="submit" className="icon-button session-send-button" aria-label={runPending ? t('sending') : t('send')} title={t('send')} disabled={!sessionToken || runPending || !message.trim()}><ArrowUp size={18} /></button></span></div>
+        <div><span className="session-composer-actions"><button type="submit" className="icon-button session-send-button" aria-label={runPending ? t('sending') : t('send')} title={t('send')} disabled={!sessionToken || runPending || !message.trim() || !publicAccessReady}><ArrowUp size={18} /></button></span></div>
       </form>
     </div>
   );
 }
 
-function WidgetRunConsole({ run, token, agentName, onEvent }: { run: Run; token: string; agentName: string | null; onEvent: (event: RunEvent) => void }) {
-  const [events, setEvents] = useState<RunEvent[]>([]);
+function WidgetRunConsole({ runId, token, initialEvents, agentName, onEvent }: { runId: string; token: string; initialEvents: RunEvent[]; agentName: string | null; onEvent: (event: RunEvent) => void }) {
+  const [events, setEvents] = useState<RunEvent[]>(() => mergeRunEvents([], initialEvents));
 
   useEffect(() => {
-    setEvents([]);
+    setEvents(mergeRunEvents([], initialEvents));
+  }, [runId]);
+
+  useEffect(() => {
     const controller = new AbortController();
-    api.streamWidgetRunEvents(run.id, token, controller.signal, (parsed) => {
+    const abortForPageExit = () => controller.abort();
+    window.addEventListener('pagehide', abortForPageExit, { once: true });
+    api.streamWidgetRunEvents(runId, token, controller.signal, (parsed) => {
       setEvents((current) => mergeRunEvents(current, [parsed]));
       onEvent(parsed);
     }).catch((err) => {
       if (!controller.signal.aborted) console.error(err);
     });
-    return () => controller.abort();
-  }, [onEvent, run.id, token]);
+    return () => {
+      window.removeEventListener('pagehide', abortForPageExit);
+      controller.abort();
+    };
+  }, [onEvent, runId, token]);
 
   const timeline = useMemo<WidgetTimelineItem[]>(() => {
     const entries: WidgetTimelineEntry[] = projectActivities(events).map((activity) => ({

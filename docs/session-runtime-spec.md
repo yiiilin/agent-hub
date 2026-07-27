@@ -24,6 +24,7 @@ Hub Session 1 --- 1 Workspace
 ```
 
 - Hub-native Session 的 external origin 全部为空。
+- Public Widget Session 使用独立的 `public_widget` origin，external origin 字段全部为空；它不创建 Integration Session，也不进入 Widget 历史发现。
 - External Session 的 External Platform、Tenant 和 Identity 全部固定且不可部分为空。
 - Hub 管理台可查看当前用户拥有的全部 Session 历史，但只允许在 Hub-native Session 中发送消息、立即引导和停止 Turn。External Session 在管理台始终只读；与其完整 origin 匹配的外部 token 仍可通过外部集成接口继续对话。
 - Session 创建后不能更换 owner 或 Agent。
@@ -107,7 +108,8 @@ session-root/
 - 不同 Session 不共享可写 Workspace、Pi HOME、生成配置或 native JSONL。
 - Agent instructions、Skills 和 Model Connection references 由 Hub 数据重新生成，只在 Turn 之间按当前 fingerprint 写入；活动 Turn 保持稳定文件集，真实 provider key 永不进入 Session 目录。本迭代不物化 MCP 或子 Agent。
 - Skill 物理删除后，Hub 为受影响在线 Session 发出 generation-fenced `refresh_configuration`，携带当前完整配置与 fingerprint。空闲 Session 立即原子 materialize；活动 Turn 只记住命令，到终态后处理并回执。
-- 过期 refresh 回执不得清除更新的待刷新状态；下一 heartbeat 继续下发最新 fingerprint。刷新不重启 Pi，不写 Workspace。
+- 过期 refresh 回执不得清除更新的待刷新状态；下一 heartbeat 继续下发最新 fingerprint。刷新只物化 Hub 管理的配置文件，不写 Workspace。
+- 刷新本身不打断或立即重启 Pi；如果下一 Turn 的有效 Pi 工具集合与在线进程启动时不同，Runtime 在 Turn 开始前停止空闲进程，并从同一 JSONL 恢复同一个 Native Session。工具集合未变化时继续复用在线进程。
 - Runtime 进程重启后从持久化目录发现仍由自己拥有的在线 Session；不得仅因 Runtime 进程退出就丢弃目录。
 
 ## Session Bundle

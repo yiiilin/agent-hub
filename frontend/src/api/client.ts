@@ -122,11 +122,64 @@ export type Agent = {
   sandbox_policy: Record<string, unknown>;
   managed_skill_ids: string[];
   mcp_allowlist: unknown[];
+  tool_allowlist: string[];
   created_at: string;
   updated_at: string;
 };
 
 export type WidgetAgent = Pick<Agent, 'id' | 'name' | 'instructions'>;
+
+// Legacy embed credentials return only the Agent fields. External Widget
+// credentials add expiry and history capability without changing that shape.
+export type WidgetSession = WidgetAgent & {
+  expires_at?: string;
+  history_enabled?: boolean;
+};
+
+export type WidgetCredential = {
+  token: string;
+  expires_at?: string;
+};
+
+export type PublicWidgetApp = {
+  id?: string;
+  client_id: string;
+  name?: string;
+};
+
+export type PublicWidgetAccess = {
+  access_token: string;
+  expires_in: number;
+  widget_session_id: string;
+  hub_session_id?: string | null;
+  agent: WidgetAgent;
+  app?: PublicWidgetApp;
+};
+
+type PublicWidgetAccessResponse = {
+  access_token?: string;
+  token?: string;
+  expires_in?: number;
+  expires_at?: string;
+  widget_session_id: string;
+  hub_session_id?: string | null;
+  agent: WidgetAgent;
+  app?: PublicWidgetApp;
+};
+
+export type WidgetHistorySession = {
+  id: string;
+  hub_session_id: string;
+  created_at: string;
+  updated_at: string;
+  preview: string | null;
+};
+
+export type WidgetRunTarget = {
+  integration_session_id?: string | null;
+  hub_session_id?: string;
+  client_message_key?: string;
+};
 
 export type Skill = {
   id: string;
@@ -419,6 +472,7 @@ export type CreateConfiguredAgentRequest = {
   model_selection: ModelSelection | null;
   model_settings: AgentModelSettings;
   subagents: SubagentDefinition[];
+  tool_allowlist: string[];
 };
 
 export type UpdateModelConnectionRequest = Pick<
@@ -546,6 +600,10 @@ export type IntegrationApp = {
   authentication_channel_id: string;
   redirect_uris: string[];
   agent_ids: string[];
+  widget_history_enabled: boolean;
+  login_required: boolean;
+  allowed_origins: string[];
+  tool_allowlist: string[] | null;
   created_at: string;
   updated_at: string;
 };
@@ -556,11 +614,15 @@ export type CreateIntegrationAppRequest = {
   authentication_channel_id: string;
   redirect_uris: string[];
   agent_ids: string[];
+  widget_history_enabled: boolean;
+  login_required: boolean;
+  allowed_origins: string[];
+  tool_allowlist: string[] | null;
 };
 
 export type UpdateIntegrationAppRequest = Pick<
   CreateIntegrationAppRequest,
-  'name' | 'redirect_uris' | 'agent_ids'
+  'name' | 'redirect_uris' | 'agent_ids' | 'widget_history_enabled' | 'login_required' | 'allowed_origins' | 'tool_allowlist'
 >;
 
 export type IntegrationAppSecretResponse = {
@@ -670,7 +732,16 @@ async function streamRunEventsWithHeaders(
   signal: AbortSignal,
   onEvent: (event: RunEvent) => void
 ) {
-  const response = await fetch(`/api/runs/${runId}/events/stream`, {
+  return streamEventsWithHeaders(`/api/runs/${runId}/events/stream`, headers, signal, onEvent);
+}
+
+async function streamEventsWithHeaders(
+  path: string,
+  headers: HeadersInit,
+  signal: AbortSignal,
+  onEvent: (event: RunEvent) => void
+) {
+  const response = await fetch(path, {
     credentials: 'include',
     headers,
     signal
@@ -717,6 +788,20 @@ async function streamWidgetRunEvents(
 ) {
   return streamRunEventsWithHeaders(
     runId,
+    { 'X-Agent-Hub-Embed-Token': token },
+    signal,
+    onEvent
+  );
+}
+
+async function streamWidgetSessionEvents(
+  sessionId: string,
+  token: string,
+  signal: AbortSignal,
+  onEvent: (event: RunEvent) => void
+) {
+  return streamEventsWithHeaders(
+    `/api/widget/sessions/${encodeURIComponent(sessionId)}/events/stream`,
     { 'X-Agent-Hub-Embed-Token': token },
     signal,
     onEvent
@@ -912,7 +997,8 @@ export const api = {
         subagents: agent.subagents,
         sandbox_policy: agent.sandbox_policy,
         managed_skill_ids: agent.managed_skill_ids,
-        mcp_allowlist: agent.mcp_allowlist
+        mcp_allowlist: agent.mcp_allowlist,
+        tool_allowlist: agent.tool_allowlist
       }),
       signal
     }),
@@ -1086,15 +1172,51 @@ export const api = {
     body: JSON.stringify(integrationSession),
     signal
   }),
-  widgetAgent: (token: string) => request<WidgetAgent>('/api/widget/session', {
+  publicWidgetAccess: async (clientId: string, visitorKey: string, signal?: AbortSignal) => {
+    const response = await request<PublicWidgetAccessResponse>('/api/widget/public/access', {
+      method: 'POST',
+      body: JSON.stringify({ client_id: clientId, visitor_key: visitorKey }),
+      signal
+    });
+    const accessToken = response.access_token ?? response.token;
+    if (!accessToken) throw new ApiError(500, 'request_failed');
+    const expiresIn = response.expires_in ?? Math.max(0, (Date.parse(response.expires_at ?? '') - Date.now()) / 1_000);
+    if (!Number.isFinite(expiresIn)) throw new ApiError(500, 'request_failed');
+    return { ...response, access_token: accessToken, expires_in: expiresIn };
+  },
+  widgetAgent: (token: string, signal?: AbortSignal) => request<WidgetSession>('/api/widget/session', {
+    signal,
     headers: { 'X-Agent-Hub-Embed-Token': token }
   }),
-  createWidgetRun: (token: string, message: string) =>
+  renewWidgetSession: (token: string, signal?: AbortSignal) =>
+    request<WidgetCredential>('/api/widget/session/renew', {
+      method: 'POST',
+      signal,
+      headers: { 'X-Agent-Hub-Embed-Token': token },
+      body: JSON.stringify({})
+    }),
+  widgetSessions: (token: string, signal?: AbortSignal) =>
+    request<WidgetHistorySession[]>('/api/widget/sessions', {
+      signal,
+      headers: { 'X-Agent-Hub-Embed-Token': token }
+    }),
+  widgetSessionMessages: (token: string, sessionId: string, signal?: AbortSignal) =>
+    request<HubSessionMessage[]>(`/api/widget/sessions/${encodeURIComponent(sessionId)}/messages`, {
+      signal,
+      headers: { 'X-Agent-Hub-Embed-Token': token }
+    }),
+  widgetSessionEvents: (token: string, sessionId: string, signal?: AbortSignal) =>
+    request<RunEvent[]>(`/api/widget/sessions/${encodeURIComponent(sessionId)}/events`, {
+      signal,
+      headers: { 'X-Agent-Hub-Embed-Token': token }
+    }),
+  createWidgetRun: (token: string, message: string, target: WidgetRunTarget = {}) =>
     request<Run>('/api/widget/runs', {
       method: 'POST',
       headers: { 'X-Agent-Hub-Embed-Token': token },
-      body: JSON.stringify({ message, parent_run_id: null })
+      body: JSON.stringify({ message, parent_run_id: null, ...target })
     }),
   streamRunEvents,
-  streamWidgetRunEvents
+  streamWidgetRunEvents,
+  streamWidgetSessionEvents
 };

@@ -117,6 +117,7 @@ pub struct UpdateAuthenticationChannelRequest {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HubSessionOriginDto {
     HubNative,
+    PublicWidget,
     External {
         platform_id: Uuid,
         tenant_id: String,
@@ -769,6 +770,8 @@ pub struct AgentDto {
     pub sandbox_policy: Value,
     pub managed_skill_ids: Vec<Uuid>,
     pub mcp_allowlist: Value,
+    #[serde(default = "default_agent_tool_allowlist")]
+    pub tool_allowlist: Vec<String>,
     pub owner_id: Uuid,
     pub is_owner: bool,
     pub can_manage: bool,
@@ -783,6 +786,77 @@ pub struct WidgetAgentDto {
     pub id: Uuid,
     pub name: String,
     pub instructions: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WidgetUserProfileDto {
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub attributes: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalUserContextDto {
+    pub external_user_id: String,
+    pub tenant_id: String,
+    pub username: Option<String>,
+    pub display_name: Option<String>,
+    pub email: Option<String>,
+    pub attributes: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WidgetSessionDto {
+    #[serde(flatten)]
+    pub agent: WidgetAgentDto,
+    pub expires_at: DateTime<Utc>,
+    pub history_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WidgetAccessResponse {
+    pub token: String,
+    pub expires_at: DateTime<Utc>,
+    pub agent: WidgetAgentDto,
+    pub history_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreatePublicWidgetAccessRequest {
+    pub client_id: String,
+    pub visitor_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicWidgetAccessResponse {
+    pub token: String,
+    pub expires_at: DateTime<Utc>,
+    pub widget_session_id: Uuid,
+    pub hub_session_id: Option<Uuid>,
+    pub agent: WidgetAgentDto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WidgetTokenResponse {
+    pub token: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WidgetHistorySessionDto {
+    pub id: Uuid,
+    pub hub_session_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub preview: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -814,6 +888,8 @@ pub struct AgentExecutionConfigurationDto {
     pub sandbox_policy: Value,
     pub skills: Vec<AgentExecutionSkillDto>,
     pub mcp_allowlist: Value,
+    #[serde(default = "default_agent_tool_allowlist")]
+    pub tool_allowlist: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -991,6 +1067,7 @@ pub fn execution_configuration_fingerprint(
         })
         .collect::<Vec<_>>();
     let mcp_allowlist = normalized_redacted_mcp(&configuration.mcp_allowlist)?;
+    let tool_allowlist = normalized_agent_tool_allowlist(&configuration.tool_allowlist)?;
     let value = json!({
         "revision": configuration.revision,
         "instructions": configuration.instructions,
@@ -1002,11 +1079,40 @@ pub fn execution_configuration_fingerprint(
         "sandbox_policy": configuration.sandbox_policy,
         "skills": skill_metadata,
         "mcp_allowlist": mcp_allowlist,
+        "tool_allowlist": tool_allowlist,
     });
     Ok(format!(
         "sha256:{}",
         sha256_hex(canonical_json(&value).as_bytes())
     ))
+}
+
+fn normalized_agent_tool_allowlist(
+    tools: &[String],
+) -> Result<Vec<String>, ExecutionConfigurationError> {
+    if tools.is_empty() {
+        return Err(ExecutionConfigurationError(
+            "Agent tool allowlist must not be empty",
+        ));
+    }
+    let requested = tools
+        .iter()
+        .map(|tool| tool.trim())
+        .collect::<BTreeSet<_>>();
+    if requested.len() != tools.len()
+        || requested
+            .iter()
+            .any(|tool| !AGENT_TOOL_NAMES.contains(tool))
+    {
+        return Err(ExecutionConfigurationError(
+            "Agent tool allowlist is invalid",
+        ));
+    }
+    Ok(AGENT_TOOL_NAMES
+        .iter()
+        .filter(|tool| requested.contains(**tool))
+        .map(|tool| (*tool).to_owned())
+        .collect())
 }
 
 fn normalized_redacted_mcp(value: &Value) -> Result<Value, ExecutionConfigurationError> {
@@ -1204,6 +1310,13 @@ pub struct IntegrationAppDto {
     pub authentication_channel_id: Uuid,
     pub redirect_uris: Value,
     pub agent_ids: Vec<Uuid>,
+    pub widget_history_enabled: bool,
+    #[serde(default = "default_true")]
+    pub login_required: bool,
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    #[serde(default)]
+    pub tool_allowlist: Option<Vec<String>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1242,6 +1355,8 @@ pub struct IntegrationContextDto {
     pub tools: Value,
     pub attachments: Value,
     pub tool_result: Option<Value>,
+    #[serde(default)]
+    pub external_user: Option<ExternalUserContextDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1311,6 +1426,14 @@ pub struct CreateIntegrationAppRequest {
     pub authentication_channel_id: Uuid,
     pub redirect_uris: Value,
     pub agent_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub widget_history_enabled: bool,
+    #[serde(default = "default_true")]
+    pub login_required: bool,
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    #[serde(default)]
+    pub tool_allowlist: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1319,6 +1442,14 @@ pub struct UpdateIntegrationAppRequest {
     pub name: String,
     pub redirect_uris: Value,
     pub agent_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub widget_history_enabled: bool,
+    #[serde(default = "default_true")]
+    pub login_required: bool,
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    #[serde(default)]
+    pub tool_allowlist: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1374,6 +1505,8 @@ pub struct CreateAgentRequest {
     pub model_settings: Option<AgentModelSettings>,
     #[serde(default)]
     pub subagents: Vec<SubagentDefinition>,
+    #[serde(default = "default_agent_tool_allowlist")]
+    pub tool_allowlist: Vec<String>,
 }
 
 fn legacy_hub_proxy_model_policy() -> Value {
@@ -1401,6 +1534,28 @@ pub struct UpdateAgentRequest {
     pub sandbox_policy: Value,
     pub managed_skill_ids: Vec<Uuid>,
     pub mcp_allowlist: Value,
+    #[serde(default = "default_agent_tool_allowlist")]
+    pub tool_allowlist: Vec<String>,
+}
+
+pub const AGENT_TOOL_NAMES: &[&str] = &[
+    "read",
+    "grep",
+    "find",
+    "ls",
+    "edit",
+    "write",
+    "bash",
+    "integration",
+];
+
+pub const PUBLIC_WIDGET_TOOL_NAMES: &[&str] = &["read", "grep", "find", "ls"];
+
+pub fn default_agent_tool_allowlist() -> Vec<String> {
+    AGENT_TOOL_NAMES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1447,6 +1602,43 @@ pub struct CreateIntegrationSessionRequest {
     pub tenant_id: Option<String>,
     pub tools: Value,
     pub metadata: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateWidgetAccessRequest {
+    pub agent_id: Uuid,
+    pub external_user_id: String,
+    pub tenant_id: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub attributes: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RenewWidgetSessionRequest {
+    #[serde(default)]
+    pub profile: Option<WidgetUserProfileDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateWidgetRunRequest {
+    pub message: String,
+    #[serde(default)]
+    pub integration_session_id: Option<Uuid>,
+    #[serde(default)]
+    pub hub_session_id: Option<Uuid>,
+    #[serde(default)]
+    pub parent_run_id: Option<Uuid>,
+    #[serde(default)]
+    pub client_message_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2322,6 +2514,10 @@ mod tests {
             authentication_channel_id: Uuid::from_u128(5),
             redirect_uris: json!(["https://example.test/callback"]),
             agent_ids: vec![Uuid::from_u128(6), Uuid::from_u128(7)],
+            widget_history_enabled: false,
+            login_required: true,
+            allowed_origins: Vec::new(),
+            tool_allowlist: None,
             created_at: now,
             updated_at: now,
         };
@@ -2428,6 +2624,7 @@ mod tests {
                 content_checksum_sha256: sha256_hex(content.as_bytes()),
             }],
             mcp_allowlist: json!([]),
+            tool_allowlist: default_agent_tool_allowlist(),
         };
         let fingerprint = execution_configuration_fingerprint(&configuration).unwrap();
         let command = RuntimeSessionCommandDto {
@@ -2916,6 +3113,7 @@ mod tests {
                 "name": "repo",
                 "secrets": { "TOKEN": "first-secret" }
             }]),
+            tool_allowlist: default_agent_tool_allowlist(),
         };
 
         let fingerprint = execution_configuration_fingerprint(&configuration).unwrap();
@@ -2964,6 +3162,7 @@ mod tests {
                 content_checksum_sha256: sha256_hex(content.as_bytes()),
             }],
             mcp_allowlist: json!([]),
+            tool_allowlist: default_agent_tool_allowlist(),
         };
 
         assert!(execution_configuration_fingerprint(&configuration).is_err());

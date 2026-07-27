@@ -1,8 +1,20 @@
 import assert from 'node:assert/strict';
+import { Buffer } from 'node:buffer';
 import { ApiClient, loginAsAdmin, poll } from '../../support/api.mjs';
 import { withBrowser } from '../../support/browser.mjs';
 
 const COMPLETION_TEXT = 'Fake model completed run through the Hub model proxy.';
+
+function uniqueSlug(context, prefix) {
+  return context.unique(prefix)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
+function basicAuthorization(clientId, clientSecret) {
+  return `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}`;
+}
 
 async function createComposeModelFixture(client, context) {
   const { data: connection } = await client.post('/api/model-connections', {
@@ -74,15 +86,52 @@ export default async function widgetBrowserScenario(scenarioContext) {
       agents.push(agent);
     }
 
+    const { data: integrationOptions } = await adminClient.get('/api/integration-app-options');
+    const trustedChannel = integrationOptions.authentication_channels.find((channel) => (
+      channel.enabled && channel.trusted_email
+    ));
+    assert.ok(trustedChannel, 'A trusted Authentication Channel must be available');
+    const externalPlatform = integrationOptions.external_platforms.find((platform) => (
+      platform.id === trustedChannel.platform_id
+    ));
+    assert.ok(externalPlatform, 'The trusted Authentication Channel must belong to a platform');
+    const { data: appSecret } = await adminClient.post('/api/integration-apps', {
+      name: scenarioContext.unique('QA Widget browser app'),
+      external_platform_id: externalPlatform.id,
+      authentication_channel_id: trustedChannel.id,
+      redirect_uris: [new URL('/qa-widget-browser/callback', scenarioContext.baseURL).href],
+      agent_ids: agents.map((agent) => agent.id),
+      widget_history_enabled: true
+    });
+    const integrationApp = appSecret.integration_app;
+    const externalUserId = uniqueSlug(scenarioContext, 'qa-widget-browser-user');
+    const externalTenantId = uniqueSlug(scenarioContext, 'qa-widget-browser-tenant');
     const sessions = [];
     for (const agent of agents) {
-      const { data } = await adminClient.post('/api/embed/sessions', { agent_id: agent.id });
-      assert.equal(typeof data.token, 'string', 'Embed session must return an opaque token');
-      assert.ok(data.token.length > 0, 'Embed session token must not be empty');
+      const { data } = await adminClient.post('/api/widget/access', {
+        agent_id: agent.id,
+        external_user_id: externalUserId,
+        tenant_id: externalTenantId,
+        username: externalUserId,
+        display_name: 'QA Widget Browser User',
+        email: `${externalUserId}@example.com`,
+        attributes: { scenario: 'widget-browser' }
+      }, {
+        headers: {
+          authorization: basicAuthorization(integrationApp.client_id, appSecret.client_secret)
+        }
+      });
+      assert.equal(typeof data.token, 'string', 'Widget access must return an opaque token');
+      assert.equal(data.token.startsWith('ahw_'), true, 'Widget access must use the external prefix');
+      assert.equal(data.history_enabled, true);
       sessions.push(data);
     }
 
-    await withBrowser(scenarioContext, {}, async ({ page, context, browserErrors }) => {
+    await withBrowser(scenarioContext, {
+      allowedHttpErrors: [
+        { method: 'POST', pathname: '/api/embed/exchange', status: 401, times: 1 }
+      ]
+    }, async ({ page, context, browserErrors }) => {
       await page.goto('/widget', { waitUntil: 'domcontentloaded' });
       await page.setContent(`
         <!doctype html>
@@ -119,7 +168,7 @@ export default async function widgetBrowserScenario(scenarioContext) {
       assert.equal(initialReady.protocolVersion, 1);
       assert.equal(typeof initialReady.channelId, 'string');
       assert.ok(initialReady.channelId.length > 0, 'Widget ready message must include a channel nonce');
-      const channelId = initialReady.channelId;
+      let channelId = initialReady.channelId;
 
       let widgetSessionLoads = 0;
       page.on('request', (request) => {
@@ -153,7 +202,7 @@ export default async function widgetBrowserScenario(scenarioContext) {
         assert.equal(boundReady.channelId, channelId);
         assert.equal(boundReady.protocolVersion, 1);
         assert.equal(boundReady.sessionReady, true);
-        await widget.getByText(agents[0].name, { exact: true }).waitFor();
+        await widget.getByRole('heading', { name: agents[0].name }).waitFor();
         assert.equal(widgetSessionLoads, 1, 'Selected Widget session must load exactly once');
 
         const resize = await waitForHostMessage(
@@ -183,6 +232,8 @@ export default async function widgetBrowserScenario(scenarioContext) {
 
         const firstMessage = scenarioContext.unique('Widget parent submission');
         const duplicateMessage = scenarioContext.unique('Widget duplicate submission');
+        const preservedDraft = scenarioContext.unique('Widget draft survives failed exchange');
+        await widget.getByRole('textbox', { name: 'Message' }).fill(preservedDraft);
         const runResponsePromise = page.waitForResponse((response) => (
           response.request().method() === 'POST'
           && new URL(response.url()).pathname === '/api/widget/runs'
@@ -198,6 +249,24 @@ export default async function widgetBrowserScenario(scenarioContext) {
         });
         await widget.getByRole('button', { name: 'Sending...' }).waitFor();
         assert.equal(await widget.getByRole('button', { name: 'Sending...' }).isDisabled(), true);
+
+        const failedExchangeResponse = page.waitForResponse((response) => (
+          response.request().method() === 'POST'
+          && new URL(response.url()).pathname === '/api/embed/exchange'
+        ));
+        await postToWidget(iframe, {
+          type: 'agent-hub:embed-jwt',
+          channelId,
+          jwt: 'not-a-valid-embed-jwt'
+        });
+        assert.equal((await failedExchangeResponse).status(), 401);
+        assert.equal(
+          await widget.getByRole('textbox', { name: 'Message' }).inputValue(),
+          preservedDraft,
+          'Failed JWT exchange must preserve the draft'
+        );
+        assert.equal(await widget.getByRole('button', { name: 'Sending...' }).isDisabled(), true);
+        assert.equal(runRequests, 1, 'Failed JWT exchange must preserve the pending Run lock');
 
         await postToWidget(iframe, {
           type: 'agent-hub:session-select',
@@ -256,7 +325,7 @@ export default async function widgetBrowserScenario(scenarioContext) {
         assert.equal(completedEvent.channelId, channelId);
         await widget.getByText(COMPLETION_TEXT, { exact: true }).waitFor();
         await widget.getByRole('button', { name: 'Send' }).waitFor();
-        assert.equal(await widget.getByRole('button', { name: 'Send' }).isDisabled(), true);
+        assert.equal(await widget.getByRole('button', { name: 'Send' }).isEnabled(), true);
 
         const eventTypes = await page.evaluate(() => window.widgetMessages.map((message) => message.type));
         assert.ok(
@@ -264,13 +333,59 @@ export default async function widgetBrowserScenario(scenarioContext) {
           'run-started must precede streamed run-event notifications'
         );
 
+        await widget.getByRole('button', { name: 'History' }).click();
+        await widget.getByRole('button', { name: new RegExp(firstMessage) }).waitFor();
+        await widget.getByRole('button', { name: 'Close history' }).click();
+        await poll(async () => iframe.evaluate((element) => {
+          const stored = element.contentWindow?.sessionStorage.getItem('agent-hub-widget-state-v1');
+          return stored ? JSON.parse(stored) : null;
+        }), (stored) => (
+          stored?.draft === preservedDraft
+          && stored?.target?.integrationSessionId === createdRun.integration_session_id
+          && stored?.target?.hubSessionId === createdRun.hub_session_id
+        ), {
+          timeoutMs: 10_000,
+          description: 'Widget draft and exact Session ids to reach sessionStorage'
+        });
+
+        await page.evaluate(() => { window.widgetMessages = []; });
+        await iframe.evaluate((element) => element.contentWindow?.location.reload());
+        await widget.getByRole('heading', { name: agents[0].name }).waitFor();
+        await widget.getByText(COMPLETION_TEXT, { exact: true }).waitFor();
+        assert.equal(
+          await widget.getByRole('textbox', { name: 'Message' }).inputValue(),
+          preservedDraft,
+          'Reload must restore the current Widget draft'
+        );
+        await widget.getByRole('button', { name: 'History' }).waitFor();
+        const reloadedReady = await waitForHostMessage(
+          page,
+          (message) => message.type === 'agent-hub:ready' && message.bound !== true,
+          'reloaded Widget initial ready message'
+        );
+        channelId = reloadedReady.channelId;
+        await postToWidget(iframe, {
+          type: 'agent-hub:init',
+          channelId,
+          token: sessions[0].token
+        });
+        await waitForHostMessage(
+          page,
+          (message) => message.type === 'agent-hub:ready'
+            && message.bound === true
+            && message.channelId === channelId,
+          'reloaded Widget origin-bound ready message'
+        );
+        assert.equal(widgetSessionLoads, 2, 'Reload must restore the same credential without extra selection');
+
         await postToWidget(iframe, {
           type: 'agent-hub:session-select',
           channelId,
           token: sessions[1].token
         });
-        await widget.getByText(agents[1].name, { exact: true }).waitFor();
-        assert.equal(widgetSessionLoads, 2, 'A different selected session must load once');
+        await widget.getByRole('heading', { name: agents[1].name }).waitFor();
+        assert.equal(widgetSessionLoads, 3, 'A different selected credential must load once');
+        assert.equal(await widget.getByRole('textbox', { name: 'Message' }).inputValue(), '');
         assert.equal(
           await widget.getByText(COMPLETION_TEXT, { exact: true }).count(),
           0,

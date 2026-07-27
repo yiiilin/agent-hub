@@ -68,6 +68,18 @@ _Avoid_: Agent, External Platform, Authentication Channel
 A short-lived credential issued to an Integration App. It represents either the application itself or one authenticated Hub User, and its authority is limited by its Agent Scopes and the application's current Agent delegations.
 _Avoid_: API Key, browser Session, Runtime Credential
 
+**Widget Access Credential**:
+A 15-minute opaque `ahw_` credential that an Integration App backend obtains for one delegated Agent and one trusted External Identity. Renewal rotates only its token while preserving the stable credential record; it does not itself create or identify a conversation Session.
+_Avoid_: Integration App client secret, Application Token, Widget Session ID, permanent embed token
+
+**External User Context**:
+The trusted external profile snapshot attached to one Widget Run by Hub after Integration App authentication. It carries the External Tenant and external user ID plus optional username, display name, email, and attributes to the Execution Engine; browser input alone cannot change it.
+_Avoid_: Hub User profile, untrusted prompt text, live mutable identity record
+
+**Widget History**:
+The optional per-Integration-App discovery of Sessions constrained by Integration App, Agent, External Platform, External Tenant, External Identity, and external user ID. Disabling it removes list discovery but does not invalidate an exact Session ID already held by the current Widget page.
+_Avoid_: Cross-application history, Hub console Session list, permanent browser archive
+
 **Agent Scope**:
 An OAuth permission named `agent:<uuid>` that authorizes an Application Token to use one currently delegated Agent. It never changes a Session's immutable Agent binding or Session Origin.
 _Avoid_: Agent visibility, Application ownership, Session Origin

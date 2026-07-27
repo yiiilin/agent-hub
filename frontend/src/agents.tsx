@@ -23,6 +23,7 @@ import {
 } from './api/client';
 import { FormDialog } from './components/form-dialog';
 import { MarkdownEditor } from './components/markdown-editor';
+import { builtInTools, normalizeToolAllowlist, ToolAllowlistPicker } from './components/tool-allowlist';
 import { useI18n } from './i18n';
 
 type Navigate = (path: string, force?: boolean) => void;
@@ -603,6 +604,7 @@ function CreateAgentModal({ currentUser, navigate, onClose }: { currentUser: Use
   const [modelSelection, setModelSelection] = useState<ModelSelection | null>(null);
   const [modelSettings, setModelSettings] = useState<AgentModelSettings>(automaticAgentModelSettings);
   const [subagents, setSubagents] = useState<SubagentDefinition[]>([]);
+  const [toolAllowlist, setToolAllowlist] = useState<string[]>([...builtInTools]);
   const [subagentDialog, setSubagentDialog] = useState<SubagentDialogState | null>(null);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState(false);
@@ -681,7 +683,8 @@ function CreateAgentModal({ currentUser, navigate, onClose }: { currentUser: Use
         public_to: visibility === 'public_to' ? publicTo : [],
         model_selection: modelSelection,
         model_settings: modelSettings,
-        subagents: subagents
+        subagents: subagents,
+        tool_allowlist: toolAllowlist
       }, controller.signal);
       if (controller.signal.aborted || !mountedRef.current) return;
       navigate(`/agents/${agent.id}`);
@@ -739,6 +742,7 @@ function CreateAgentModal({ currentUser, navigate, onClose }: { currentUser: Use
           <div className="agent-subagent-heading"><span className="field-label">{t('subagents')}</span><button type="button" className="secondary" disabled={pending || modelsLoading || modelsError || subagents.length >= 32} onClick={() => openSubagent(null)}><Plus size={16} /> {t('addSubagent')}</button></div>
           <SubagentTable definitions={subagents} modelOptions={modelOptions.items} canManage disabled={pending} onEdit={openSubagent} onDelete={deleteSubagent} />
         </section>
+        <ToolAllowlistPicker value={toolAllowlist} onChange={setToolAllowlist} disabled={pending} legend={t('toolAllowlist')} />
         <label>{t('visibility')}<select value={visibility} onChange={(event) => { setVisibility(event.target.value); if (event.target.value !== 'public_to') setPublicTo([]); }}><option value="private">{t('private')}</option><option value="public_to">{t('specificUsers')}</option>{canCreatePublic && <option value="public">{t('public')}</option>}</select></label>
         {visibility === 'public_to' && <fieldset className="agent-user-picker" disabled={pending || usersLoading}><legend>{t('agentPublicTo')}</legend>
           {usersLoading ? <span>{t('loadingUsers')}</span> : usersError ? <div role="alert"><span>{t('usersLoadFailed')}</span><button type="button" className="text-button" onClick={loadUsers}>{t('retry')}</button></div> : users.map((user) => <label className="check-row" key={user.id}><input type="checkbox" checked={publicTo.includes(user.id)} onChange={(event) => setPublicTo((current) => event.target.checked ? [...current, user.id] : current.filter((id) => id !== user.id))} /> {user.display_name} ({user.email ?? user.username})</label>)}</fieldset>}
@@ -894,8 +898,8 @@ export function AgentPage({
   const [managedSkillBase, setManagedSkillBase] = useState<string[]>([]);
   const [modelDraft, setModelDraft] = useState<AgentModelDraft>({ modelSelection: null, modelSettings: automaticAgentModelSettings, subagents: [] });
   const [modelBase, setModelBase] = useState<AgentModelDraft>({ modelSelection: null, modelSettings: automaticAgentModelSettings, subagents: [] });
-  const [accessDraft, setAccessDraft] = useState({ visibility: 'private', publicTo: [] as string[], runtimeId: null as string | null });
-  const [accessBase, setAccessBase] = useState({ visibility: 'private', publicTo: [] as string[], runtimeId: null as string | null });
+  const [accessDraft, setAccessDraft] = useState({ visibility: 'private', publicTo: [] as string[], runtimeId: null as string | null, toolAllowlist: [...builtInTools] as string[] });
+  const [accessBase, setAccessBase] = useState({ visibility: 'private', publicTo: [] as string[], runtimeId: null as string | null, toolAllowlist: [...builtInTools] as string[] });
 
   const mounted = useRef(true);
   const loadGeneration = useRef(0);
@@ -918,7 +922,8 @@ export function AgentPage({
   ));
   const accessDirty = accessDraft.visibility !== accessBase.visibility
     || !sameIds(accessDraft.publicTo, accessBase.publicTo)
-    || accessDraft.runtimeId !== accessBase.runtimeId;
+    || accessDraft.runtimeId !== accessBase.runtimeId
+    || !sameIds(accessDraft.toolAllowlist, accessBase.toolAllowlist);
   const dirty = instructionDirty || skillsDirty || mcpDirty || modelDirty || subagentDialogDirty || accessDirty;
 
   const applyLoadedAgent = useCallback((loaded: Agent) => {
@@ -934,7 +939,8 @@ export function AgentPage({
     const access = {
       visibility: loaded.visibility,
       publicTo: loaded.public_to,
-      runtimeId: loaded.runtime_id
+      runtimeId: loaded.runtime_id,
+      toolAllowlist: normalizeToolAllowlist(loaded.tool_allowlist)
     };
     setAccessDraft(access);
     setAccessBase(access);
@@ -1077,7 +1083,8 @@ export function AgentPage({
         ...next,
         visibility: accessDraft.visibility,
         public_to: accessDraft.visibility === 'public_to' ? accessDraft.publicTo : [],
-        runtime_id: accessDraft.runtimeId
+        runtime_id: accessDraft.runtimeId,
+        tool_allowlist: accessDraft.toolAllowlist
       };
       const updated = await api.updateAgent(agentId, next, operation.controller.signal);
       if (operation.controller.signal.aborted || !mounted.current || operation.generation !== mutationGeneration.current) return;
@@ -1099,7 +1106,7 @@ export function AgentPage({
         setSubagentDialog(null);
       }
       if (tab === 'access') {
-        const saved = { visibility: updated.visibility, publicTo: updated.public_to, runtimeId: updated.runtime_id };
+        const saved = { visibility: updated.visibility, publicTo: updated.public_to, runtimeId: updated.runtime_id, toolAllowlist: normalizeToolAllowlist(updated.tool_allowlist) };
         setAccessDraft(saved);
         setAccessBase(saved);
       }
@@ -1317,7 +1324,7 @@ export function AgentPage({
               </table>
             </div>
           </section>
-          <section id="agent-panel-access" role="tabpanel" aria-labelledby="agent-tab-access" aria-label={t('tabAccess')} hidden={activeTab !== 'access'}>{agent.can_manage ? <form className="stack" onSubmit={(event) => saveAgentTab(event, 'access')}><label>{t('visibility')}<select disabled={configPending} value={accessDraft.visibility} onChange={(event) => setAccessDraft((current) => ({ ...current, visibility: event.target.value, publicTo: event.target.value === 'public_to' ? current.publicTo : [] }))}><option value="private">{t('private')}</option><option value="public_to">{t('specificUsers')}</option>{(canSetPublic || accessDraft.visibility === 'public') && <option value="public">{t('public')}</option>}</select></label>{accessDraft.visibility === 'public_to' && <fieldset className="agent-user-picker" disabled={configPending}><legend>{t('agentPublicTo')}</legend>{users.filter((user) => user.id !== agent.owner_id).map((user) => <label className="check-row" key={user.id}><input type="checkbox" checked={accessDraft.publicTo.includes(user.id)} onChange={(event) => setAccessDraft((current) => ({ ...current, publicTo: event.target.checked ? [...current.publicTo, user.id] : current.publicTo.filter((id) => id !== user.id) }))} /> {user.display_name} ({user.email ?? user.username})</label>)}</fieldset>}<label>{t('runtime')}<select disabled={configPending} value={accessDraft.runtimeId ?? ''} onChange={(event) => setAccessDraft((current) => ({ ...current, runtimeId: event.target.value || null }))}><option value="">{t('automatic')}</option>{runtimes.map((item) => <option key={item.id} value={item.id}>{item.hostname} · {runtimeStatusLabel(item.status, t)}</option>)}</select></label><button className="primary" disabled={configPending || !accessDirty}><Save size={16} /> {configPending ? t('saving') : t('saveAgent')}</button></form> : <div className="agent-readonly">{visibilityLabel(agent.visibility, t)}</div>}</section>
+          <section id="agent-panel-access" role="tabpanel" aria-labelledby="agent-tab-access" aria-label={t('tabAccess')} hidden={activeTab !== 'access'}>{agent.can_manage ? <form className="stack" onSubmit={(event) => saveAgentTab(event, 'access')}><label>{t('visibility')}<select disabled={configPending} value={accessDraft.visibility} onChange={(event) => setAccessDraft((current) => ({ ...current, visibility: event.target.value, publicTo: event.target.value === 'public_to' ? current.publicTo : [] }))}><option value="private">{t('private')}</option><option value="public_to">{t('specificUsers')}</option>{(canSetPublic || accessDraft.visibility === 'public') && <option value="public">{t('public')}</option>}</select></label>{accessDraft.visibility === 'public_to' && <fieldset className="agent-user-picker" disabled={configPending}><legend>{t('agentPublicTo')}</legend>{users.filter((user) => user.id !== agent.owner_id).map((user) => <label className="check-row" key={user.id}><input type="checkbox" checked={accessDraft.publicTo.includes(user.id)} onChange={(event) => setAccessDraft((current) => ({ ...current, publicTo: event.target.checked ? [...current.publicTo, user.id] : current.publicTo.filter((id) => id !== user.id) }))} /> {user.display_name} ({user.email ?? user.username})</label>)}</fieldset>}<label>{t('runtime')}<select disabled={configPending} value={accessDraft.runtimeId ?? ''} onChange={(event) => setAccessDraft((current) => ({ ...current, runtimeId: event.target.value || null }))}><option value="">{t('automatic')}</option>{runtimes.map((item) => <option key={item.id} value={item.id}>{item.hostname} · {runtimeStatusLabel(item.status, t)}</option>)}</select></label><ToolAllowlistPicker value={accessDraft.toolAllowlist} onChange={(toolAllowlist) => setAccessDraft((current) => ({ ...current, toolAllowlist }))} disabled={configPending} legend={t('toolAllowlist')} /><button className="primary" disabled={configPending || !accessDirty}><Save size={16} /> {configPending ? t('saving') : t('saveAgent')}</button></form> : <div className="agent-readonly">{visibilityLabel(agent.visibility, t)}</div>}</section>
         </div>
         {error && <div className="error agent-detail-error" role="alert">{error}</div>}
       </section>

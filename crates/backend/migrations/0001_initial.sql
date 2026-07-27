@@ -808,6 +808,7 @@ CREATE TABLE public.agents (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     runtime_id uuid,
     mcp_allowlist jsonb DEFAULT '[]'::jsonb NOT NULL,
+    tool_allowlist jsonb DEFAULT '["read", "grep", "find", "ls", "edit", "write", "bash", "integration"]'::jsonb NOT NULL,
     sandbox_policy jsonb DEFAULT '{"mode": "workspace-write", "network_access": true}'::jsonb NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     public_to uuid[] DEFAULT '{}'::uuid[] NOT NULL,
@@ -828,6 +829,7 @@ CREATE TABLE public.agents (
         "request_settings":{"protocol":"openai_responses"}
     }'::jsonb NOT NULL,
     CONSTRAINT agents_execution_config_revision_positive CHECK ((execution_config_revision > 0)),
+    CONSTRAINT agents_tool_allowlist_array CHECK ((jsonb_typeof(tool_allowlist) = 'array'::text)),
     CONSTRAINT agents_model_selection_shape_check CHECK (((model_connection_id IS NULL) = (model_id IS NULL))),
     CONSTRAINT agents_model_settings_check CHECK (public.validate_agent_model_settings(model_settings)),
     CONSTRAINT agents_visibility_check CHECK ((visibility = ANY (ARRAY['private'::text, 'public_to'::text, 'public'::text])))
@@ -921,8 +923,15 @@ CREATE TABLE public.embed_sessions (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     last_run_id uuid,
     id uuid DEFAULT gen_random_uuid() NOT NULL,
-    hub_session_id uuid NOT NULL,
-    oauth_app_id uuid
+    hub_session_id uuid,
+    oauth_app_id uuid,
+    external_tenant_id text,
+    external_user_id text,
+    external_identity_id uuid,
+    profile_snapshot jsonb DEFAULT '{}'::jsonb NOT NULL,
+    anonymous boolean DEFAULT false NOT NULL,
+    anonymous_key_hash text,
+    CONSTRAINT embed_sessions_anonymous_shape CHECK ((((anonymous = false) AND (anonymous_key_hash IS NULL)) OR ((anonymous = true) AND (oauth_app_id IS NOT NULL) AND (anonymous_key_hash IS NOT NULL) AND (anonymous_key_hash ~ '^[0-9a-f]{64}$'::text) AND (external_tenant_id IS NULL) AND (external_user_id IS NULL) AND (external_identity_id IS NULL))))
 );
 
 CREATE TABLE public.external_identities (
@@ -933,6 +942,8 @@ CREATE TABLE public.external_identities (
     authentication_channel_id uuid NOT NULL,
     last_email text,
     last_username text,
+    last_display_name text,
+    attributes jsonb DEFAULT '{}'::jsonb NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     tenant_id text DEFAULT 'default'::text NOT NULL,
@@ -1030,7 +1041,7 @@ CREATE TABLE public.hub_sessions (
     current_bundle_runtime_id uuid,
     configuration_refresh_revision bigint DEFAULT 0 NOT NULL,
     configuration_applied_revision bigint DEFAULT 0 NOT NULL,
-    CONSTRAINT hub_sessions_check CHECK ((((origin_kind = 'hub_native'::text) AND (origin_platform_id IS NULL) AND (origin_tenant_id IS NULL) AND (origin_external_identity_id IS NULL)) OR ((origin_kind = 'external'::text) AND (origin_platform_id IS NOT NULL) AND (origin_tenant_id IS NOT NULL) AND (btrim(origin_tenant_id) <> ''::text) AND (origin_external_identity_id IS NOT NULL)))),
+    CONSTRAINT hub_sessions_check CHECK ((((origin_kind = ANY (ARRAY['hub_native'::text, 'public_widget'::text])) AND (origin_platform_id IS NULL) AND (origin_tenant_id IS NULL) AND (origin_external_identity_id IS NULL)) OR ((origin_kind = 'external'::text) AND (origin_platform_id IS NOT NULL) AND (origin_tenant_id IS NOT NULL) AND (btrim(origin_tenant_id) <> ''::text) AND (origin_external_identity_id IS NOT NULL)))),
     CONSTRAINT hub_sessions_check1 CHECK (((runtime_owner_id IS NULL) OR (ownership_generation > 0))),
     CONSTRAINT hub_sessions_check2 CHECK ((((current_bundle_generation IS NULL) AND (current_bundle_object_key IS NULL) AND (current_bundle_checksum_sha256 IS NULL) AND (current_bundle_size_bytes IS NULL) AND (current_bundle_history_checkpoint IS NULL) AND (current_bundle_ownership_generation IS NULL) AND (current_bundle_producing_engine_version IS NULL) AND (current_bundle_created_at IS NULL)) OR ((current_bundle_generation IS NOT NULL) AND (current_bundle_object_key IS NOT NULL) AND (btrim(current_bundle_object_key) <> ''::text) AND (current_bundle_checksum_sha256 IS NOT NULL) AND (btrim(current_bundle_checksum_sha256) <> ''::text) AND (current_bundle_size_bytes IS NOT NULL) AND (current_bundle_history_checkpoint IS NOT NULL) AND (current_bundle_ownership_generation IS NOT NULL) AND (current_bundle_producing_engine_version IS NOT NULL) AND (btrim(current_bundle_producing_engine_version) <> ''::text) AND (current_bundle_created_at IS NOT NULL)))),
     CONSTRAINT hub_sessions_configuration_applied_revision_nonnegative CHECK ((configuration_applied_revision >= 0)),
@@ -1228,7 +1239,14 @@ CREATE TABLE public.oauth_apps (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     external_platform_id uuid NOT NULL,
     authentication_channel_id uuid NOT NULL,
-    deleted_at timestamp with time zone
+    widget_history_enabled boolean DEFAULT false NOT NULL,
+    deleted_at timestamp with time zone,
+    login_required boolean DEFAULT true NOT NULL,
+    allowed_origins jsonb DEFAULT '[]'::jsonb NOT NULL,
+    tool_allowlist jsonb,
+    CONSTRAINT oauth_apps_allowed_origins_array CHECK ((jsonb_typeof(allowed_origins) = 'array'::text)),
+    CONSTRAINT oauth_apps_public_widget_shape CHECK (((login_required = true) OR (widget_history_enabled = false))),
+    CONSTRAINT oauth_apps_tool_allowlist_array CHECK (((tool_allowlist IS NULL) OR (jsonb_typeof(tool_allowlist) = 'array'::text)))
 );
 
 CREATE TABLE public.oauth_authorization_codes (
@@ -1318,6 +1336,7 @@ CREATE TABLE public.runs (
     model_subject_type text DEFAULT 'user'::text NOT NULL,
     model_subject_user_id uuid,
     model_source_integration_app_id uuid,
+    external_user_context jsonb,
     CONSTRAINT runs_model_subject_shape_check CHECK (((model_subject_type <> 'integration_app'::text) OR (model_subject_user_id IS NULL))),
     CONSTRAINT runs_model_subject_type_check CHECK ((model_subject_type = ANY (ARRAY['user'::text, 'integration_app'::text, 'system'::text]))),
     CONSTRAINT runs_session_ownership_generation_nonnegative CHECK (((session_ownership_generation IS NULL) OR (session_ownership_generation >= 0)))
@@ -1668,6 +1687,10 @@ CREATE INDEX subagent_model_connection_idx ON public.subagent_definitions USING 
 
 CREATE INDEX embed_sessions_oauth_app_idx ON public.embed_sessions USING btree (oauth_app_id) WHERE (oauth_app_id IS NOT NULL);
 
+CREATE UNIQUE INDEX embed_sessions_anonymous_visitor_key_idx ON public.embed_sessions USING btree (oauth_app_id, anonymous_key_hash) WHERE (anonymous = true);
+
+CREATE INDEX embed_sessions_widget_scope_idx ON public.embed_sessions USING btree (oauth_app_id, agent_id, external_tenant_id, external_identity_id) WHERE (external_identity_id IS NOT NULL);
+
 CREATE INDEX hub_session_messages_delivery_idx ON public.hub_session_messages USING btree (session_id, delivery_state, sequence);
 
 CREATE UNIQUE INDEX hub_session_messages_session_client_key_idx ON public.hub_session_messages USING btree (session_id, client_message_key) WHERE (client_message_key IS NOT NULL);
@@ -1832,6 +1855,9 @@ ALTER TABLE ONLY public.embed_sessions
 
 ALTER TABLE ONLY public.embed_sessions
     ADD CONSTRAINT embed_sessions_oauth_app_id_fkey FOREIGN KEY (oauth_app_id) REFERENCES public.oauth_apps(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.embed_sessions
+    ADD CONSTRAINT embed_sessions_external_identity_id_fkey FOREIGN KEY (external_identity_id) REFERENCES public.external_identities(id) ON DELETE CASCADE;
 
 ALTER TABLE ONLY public.embed_sessions
     ADD CONSTRAINT embed_sessions_owner_id_fkey FOREIGN KEY (owner_id) REFERENCES public.users(id) ON DELETE CASCADE;

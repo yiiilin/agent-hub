@@ -313,8 +313,9 @@ test('create Agent modal traps focus, restores its opener, redacts errors, and s
   await subagentDialog.locator('label').filter({ hasText: 'Reasoning effort' }).locator('select').nth(1).selectOption('max');
   await subagentDialog.getByRole('button', { name: 'Save changes' }).click();
   await expect(dialog.getByRole('table', { name: 'Subagents' })).toContainText('reviewer');
+  await dialog.getByRole('checkbox', { name: 'bash' }).uncheck();
   await dialog.getByLabel('Visibility').selectOption('public_to');
-  await expect(dialog.getByRole('checkbox')).toHaveCount(2);
+  await expect(dialog.getByRole('checkbox')).toHaveCount(10);
   await expect(dialog.getByText(currentUser.email)).toHaveCount(0);
   await dialog.getByRole('checkbox', { name: new RegExp(userA.email) }).check();
 
@@ -342,7 +343,8 @@ test('create Agent modal traps focus, restores its opener, redacts errors, and s
       developer_instructions: 'Review the diff and report blocking findings.',
       model_selection: { connection_id: personalModelId, model_id: 'gpt-personal' },
       model_settings_override: { reasoning_effort: 'max' }
-    }]
+    }],
+    tool_allowlist: ['read', 'grep', 'find', 'ls', 'edit', 'write', 'integration']
   });
 });
 

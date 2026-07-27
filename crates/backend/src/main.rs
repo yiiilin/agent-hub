@@ -33,7 +33,10 @@ use axum::{
     routing::{any, delete, get, post, put},
     Json, Router,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Timelike, Utc};
 use futures_util::{Stream, StreamExt};
 use hmac::{Hmac, Mac};
@@ -155,6 +158,7 @@ struct AcceptSessionMessage {
     model_subject_type: String,
     model_subject_user_id: Option<Uuid>,
     model_source_integration_app_id: Option<Uuid>,
+    external_user_context: Option<ExternalUserContextDto>,
 }
 
 #[allow(dead_code)] // Task 11 calls this only after Hub-managed object upload succeeds.
@@ -534,7 +538,26 @@ fn build_router(state: AppState) -> Router {
         .route("/api/automations/webhook", post(trigger_automation_webhook))
         .route("/api/embed/sessions", post(create_embed_session))
         .route("/api/embed/exchange", post(exchange_embed_jwt))
+        .route("/api/widget/access", post(create_widget_access))
+        .route(
+            "/api/widget/public/access",
+            post(create_public_widget_access),
+        )
         .route("/api/widget/session", get(get_widget_session))
+        .route("/api/widget/session/renew", post(renew_widget_session))
+        .route("/api/widget/sessions", get(list_widget_sessions))
+        .route(
+            "/api/widget/sessions/{session_id}/messages",
+            get(list_widget_session_messages),
+        )
+        .route(
+            "/api/widget/sessions/{session_id}/events",
+            get(list_widget_session_events),
+        )
+        .route(
+            "/api/widget/sessions/{session_id}/events/stream",
+            get(stream_widget_session_events),
+        )
         .route("/api/widget/runs", post(create_widget_run))
         .route("/api/widget/runs/{run_id}/stop", post(stop_widget_run))
         .route(
@@ -607,7 +630,8 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/runtime/model-proxy/v1/{*path}",
             post(runtime_model_proxy),
-        );
+        )
+        .route("/widget", get(widget_page));
 
     with_frontend(router, PathBuf::from(DEFAULT_FRONTEND_DIST_DIR))
         .layer(cors)
@@ -627,6 +651,38 @@ where
             ServeDir::new(&frontend_dist_dir)
                 .fallback(ServeFile::new(frontend_dist_dir.join("index.html"))),
         )
+}
+
+#[derive(Debug, Deserialize)]
+struct WidgetPageQuery {
+    app: Option<String>,
+}
+
+async fn widget_page(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<WidgetPageQuery>,
+) -> Result<Response, ApiError> {
+    let contents =
+        tokio::fs::read_to_string(PathBuf::from(DEFAULT_FRONTEND_DIST_DIR).join("index.html"))
+            .await
+            .map_err(|_| ApiError::not_found("Widget frontend is unavailable"))?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    if let Some(client_id) = query.app {
+        let app = load_public_widget_app_by_client_id(&state.pool, &client_id).await?;
+        let frame_ancestors = if app.allowed_origins.is_empty() {
+            "'none'".to_owned()
+        } else {
+            app.allowed_origins.join(" ")
+        };
+        let csp = HeaderValue::from_str(&format!("frame-ancestors {frame_ancestors}"))
+            .map_err(|_| ApiError::internal("public Widget CSP could not be encoded"))?;
+        headers.insert(HeaderName::from_static("content-security-policy"), csp);
+    }
+    Ok((headers, contents).into_response())
 }
 
 async fn api_not_found() -> StatusCode {
@@ -889,7 +945,14 @@ fn openapi_document() -> Value {
             "/api/runtime/runs/{run_id}/complete": { "post": { "summary": "Complete a generation-fenced Runtime Run", "security": [{ "runtimeBearer": [] }], "parameters": [id("run_id")], "requestBody": body("RuntimeCompleteRunRequest"), "responses": { "200": response("Run"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/embed/sessions": { "post": { "summary": "Create widget embed session", "requestBody": body("CreateEmbedSessionRequest"), "responses": { "200": response("TokenResponse"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/embed/exchange": { "post": { "summary": "Exchange embed JWT", "security": [], "requestBody": body("EmbedExchangeRequest"), "responses": { "200": response("TokenResponse"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
-            "/api/widget/session": { "get": { "summary": "Get widget session agent", "security": [{ "embedToken": [] }], "responses": { "200": response("WidgetAgent"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
+            "/api/widget/access": { "post": { "summary": "Issue a short-lived Widget credential for one trusted external user", "security": [{ "integrationClientBasic": [] }], "requestBody": body("CreateWidgetAccessRequest"), "responses": { "200": response("WidgetAccessResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" } } } },
+            "/api/widget/public/access": { "post": { "summary": "Issue or renew an anonymous public Widget credential", "security": [], "requestBody": body("CreatePublicWidgetAccessRequest"), "responses": { "200": response("PublicWidgetAccessResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
+            "/api/widget/session": { "get": { "summary": "Get Widget credential metadata and Agent", "security": [{ "embedToken": [] }], "responses": { "200": response("WidgetSession"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
+            "/api/widget/session/renew": { "post": { "summary": "Rotate one external Widget credential in place", "security": [{ "embedToken": [] }], "requestBody": body("RenewWidgetSessionRequest"), "responses": { "200": response("WidgetTokenResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" } } } },
+            "/api/widget/sessions": { "get": { "summary": "List history enabled Sessions in the exact external Widget scope", "security": [{ "embedToken": [] }], "responses": { "200": list_response("WidgetHistorySession"), "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" } } } },
+            "/api/widget/sessions/{session_id}/messages": { "get": { "summary": "List one exact external Widget Session's messages", "security": [{ "embedToken": [] }], "parameters": [id("session_id")], "responses": { "200": list_response("HubSessionMessage"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
+            "/api/widget/sessions/{session_id}/events": { "get": { "summary": "List one exact external Widget Session's Run events", "security": [{ "embedToken": [] }], "parameters": [id("session_id")], "responses": { "200": list_response("RunEvent"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
+            "/api/widget/sessions/{session_id}/events/stream": { "get": { "summary": "Stream one exact external Widget Session's Run events", "security": [{ "embedToken": [] }], "parameters": [id("session_id")], "responses": { "200": { "description": "Server-sent event stream", "content": { "text/event-stream": { "schema": { "type": "string" } } } }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/widget/runs": { "post": { "summary": "Create widget run", "security": [{ "embedToken": [] }], "requestBody": body("CreateWidgetRunRequest"), "responses": { "200": response("Run"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" } } } },
             "/api/widget/runs/{run_id}/stop": { "post": { "summary": "Stop the active Turn associated with this widget token", "security": [{ "embedToken": [] }], "parameters": [id("run_id")], "responses": { "200": response("Run"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/oauth/authorize": { "get": { "summary": "Authorize Integration App for an existing external identity", "security": [{ "sessionCookie": [] }], "parameters": [{ "name": "client_id", "in": "query", "required": true, "schema": { "type": "string" } }, { "name": "redirect_uri", "in": "query", "required": true, "schema": { "type": "string", "format": "uri" } }, { "name": "state", "in": "query", "required": false, "schema": { "type": "string" } }, { "name": "scope", "in": "query", "required": false, "schema": { "type": "string" } }, { "name": "external_user_id", "in": "query", "required": true, "schema": { "type": "string" } }, { "name": "tenant_id", "in": "query", "required": true, "schema": { "type": "string" } }], "responses": { "303": { "description": "Redirect with authorization code" }, "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" } } } },
@@ -914,6 +977,7 @@ fn openapi_document() -> Value {
                 "runtimeEnrollmentBearer": { "type": "http", "scheme": "bearer", "bearerFormat": "One-time Runtime enrollment token (ahre_)" },
                 "runtimeBearer": { "type": "http", "scheme": "bearer", "bearerFormat": "Per-Runtime credential (ahrc_)" },
                 "modelProxyBearer": { "type": "http", "scheme": "bearer", "bearerFormat": "Run-scoped model proxy token (ahr_)" },
+                "integrationClientBasic": { "type": "http", "scheme": "basic", "description": "Integration App client_id and client_secret." },
                 "sessionCookie": { "type": "apiKey", "in": "cookie", "name": "agent_hub_session", "description": "HttpOnly browser session cookie issued by password or OIDC login." },
                 "embedToken": { "type": "apiKey", "in": "header", "name": "X-Agent-Hub-Embed-Token" },
                 "webhookToken": { "type": "apiKey", "in": "header", "name": "X-Agent-Hub-Webhook-Token" }
@@ -1027,15 +1091,17 @@ fn openapi_schemas() -> Value {
         "ModelTokenUsagePage": { "type": "object", "additionalProperties": false, "required": ["items", "next_cursor"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/ModelTokenUsage" } }, "next_cursor": { "anyOf": [{ "$ref": "#/components/schemas/ModelLedgerCursor" }, { "type": "null" }] } } },
         "ModelCallErrorPage": { "type": "object", "additionalProperties": false, "required": ["items", "next_cursor"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/ModelCallError" } }, "next_cursor": { "anyOf": [{ "$ref": "#/components/schemas/ModelLedgerCursor" }, { "type": "null" }] } } },
         "ReasoningEffort": { "type": "string", "enum": ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] },
+        "AgentToolName": { "type": "string", "enum": ["read", "grep", "find", "ls", "edit", "write", "bash", "integration"] },
         "SubagentDefinition": { "type": "object", "additionalProperties": false, "required": ["name", "description", "developer_instructions"], "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 64 }, "description": { "type": "string", "minLength": 1, "maxLength": 512 }, "developer_instructions": { "type": "string", "minLength": 1, "maxLength": 100000 }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings_override": { "$ref": "#/components/schemas/AgentModelSettingsOverride" }, "enabled": { "type": "boolean", "default": true }, "disabled_reason": { "type": ["string", "null"] } } },
-        "Agent": { "type": "object", "required": ["id", "owner_id", "name", "instructions", "visibility", "public_to", "runtime_id", "model_selection", "model_settings", "subagents", "model_policy", "sandbox_policy", "managed_skill_ids", "mcp_allowlist", "is_owner", "can_manage", "can_administer", "can_invoke", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": uuid(), "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string", "enum": ["private", "public", "public_to"] }, "public_to": { "type": "array", "items": uuid() }, "runtime_id": { "anyOf": [uuid(), { "type": "null" }] }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "subagents": { "type": "array", "items": { "$ref": "#/components/schemas/SubagentDefinition" } }, "model_policy": {}, "sandbox_policy": {}, "managed_skill_ids": { "type": "array", "items": uuid() }, "mcp_allowlist": {}, "is_owner": { "type": "boolean" }, "can_manage": { "type": "boolean" }, "can_administer": { "type": "boolean" }, "can_invoke": { "type": "boolean" }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
-        "CreateAgentRequest": { "type": "object", "additionalProperties": false, "required": ["name", "instructions", "visibility"], "properties": { "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string" }, "public_to": { "type": "array", "items": uuid() }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "subagents": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/SubagentDefinition" } } } },
-        "UpdateAgentRequest": { "type": "object", "additionalProperties": false, "required": ["name", "instructions", "visibility", "public_to", "runtime_id", "model_selection", "model_settings", "subagents", "sandbox_policy", "managed_skill_ids", "mcp_allowlist"], "properties": { "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string" }, "public_to": { "type": "array", "items": uuid() }, "runtime_id": { "anyOf": [uuid(), { "type": "null" }] }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "subagents": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/SubagentDefinition" } }, "sandbox_policy": { "type": "object" }, "managed_skill_ids": { "type": "array", "items": uuid() }, "mcp_allowlist": {} } },
+        "Agent": { "type": "object", "required": ["id", "owner_id", "name", "instructions", "visibility", "public_to", "runtime_id", "model_selection", "model_settings", "subagents", "model_policy", "sandbox_policy", "managed_skill_ids", "mcp_allowlist", "tool_allowlist", "is_owner", "can_manage", "can_administer", "can_invoke", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": uuid(), "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string", "enum": ["private", "public", "public_to"] }, "public_to": { "type": "array", "items": uuid() }, "runtime_id": { "anyOf": [uuid(), { "type": "null" }] }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "subagents": { "type": "array", "items": { "$ref": "#/components/schemas/SubagentDefinition" } }, "model_policy": {}, "sandbox_policy": {}, "managed_skill_ids": { "type": "array", "items": uuid() }, "mcp_allowlist": {}, "tool_allowlist": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/components/schemas/AgentToolName" } }, "is_owner": { "type": "boolean" }, "can_manage": { "type": "boolean" }, "can_administer": { "type": "boolean" }, "can_invoke": { "type": "boolean" }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
+        "CreateAgentRequest": { "type": "object", "additionalProperties": false, "required": ["name", "instructions", "visibility"], "properties": { "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string" }, "public_to": { "type": "array", "items": uuid() }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "subagents": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/SubagentDefinition" } }, "tool_allowlist": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/components/schemas/AgentToolName" }, "default": ["read", "grep", "find", "ls", "edit", "write", "bash", "integration"] } } },
+        "UpdateAgentRequest": { "type": "object", "additionalProperties": false, "required": ["name", "instructions", "visibility", "public_to", "runtime_id", "model_selection", "model_settings", "subagents", "sandbox_policy", "managed_skill_ids", "mcp_allowlist"], "properties": { "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string" }, "public_to": { "type": "array", "items": uuid() }, "runtime_id": { "anyOf": [uuid(), { "type": "null" }] }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "subagents": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/SubagentDefinition" } }, "sandbox_policy": { "type": "object" }, "managed_skill_ids": { "type": "array", "items": uuid() }, "mcp_allowlist": {}, "tool_allowlist": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/components/schemas/AgentToolName" }, "default": ["read", "grep", "find", "ls", "edit", "write", "bash", "integration"] } } },
         "Run": { "type": "object", "required": ["id", "agent_id", "automation_id", "integration_session_id", "parent_run_id", "runtime_id", "hub_session_id", "hub_message_id", "hub_turn_id", "session_ownership_generation", "status", "initial_message", "native_session_id", "work_dir_ref", "source", "created_at", "updated_at"], "properties": { "id": uuid(), "agent_id": uuid(), "automation_id": { "anyOf": [uuid(), { "type": "null" }] }, "integration_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "parent_run_id": { "anyOf": [uuid(), { "type": "null" }] }, "runtime_id": { "anyOf": [uuid(), { "type": "null" }] }, "hub_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "hub_message_id": { "anyOf": [uuid(), { "type": "null" }] }, "hub_turn_id": { "anyOf": [uuid(), { "type": "null" }] }, "session_ownership_generation": { "type": ["integer", "null"] }, "status": { "type": "string" }, "initial_message": { "type": "string" }, "native_session_id": { "type": ["string", "null"] }, "work_dir_ref": { "type": ["string", "null"] }, "source": { "type": "string" }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
         "RunListResponse": { "type": "object", "required": ["items", "total", "page", "page_size"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/Run" } }, "total": { "type": "integer", "minimum": 0 }, "page": { "type": "integer", "minimum": 1 }, "page_size": { "type": "integer", "minimum": 1, "maximum": 100 } } },
         "CreateRunRequest": { "type": "object", "required": ["message"], "properties": { "message": { "type": "string" }, "hub_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "parent_run_id": { "anyOf": [uuid(), { "type": "null" }] }, "client_message_key": { "type": ["string", "null"] } } },
         "HubSessionOrigin": { "oneOf": [
             { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "type": "string", "const": "hub_native" } } },
+            { "type": "object", "additionalProperties": false, "required": ["kind"], "properties": { "kind": { "type": "string", "const": "public_widget" } } },
             { "type": "object", "additionalProperties": false, "required": ["kind", "platform_id", "tenant_id", "external_identity_id"], "properties": { "kind": { "type": "string", "const": "external" }, "platform_id": uuid(), "tenant_id": { "type": "string" }, "external_identity_id": uuid() } }
         ] },
         "CurrentSessionBundle": { "type": "object", "required": ["generation", "object_key", "checksum_sha256", "size_bytes", "history_checkpoint", "ownership_generation", "producing_engine_version", "created_at"], "properties": { "generation": { "type": "integer" }, "object_key": { "type": "string" }, "checksum_sha256": { "type": "string" }, "size_bytes": { "type": "integer", "minimum": 0 }, "history_checkpoint": { "type": "integer", "minimum": 0 }, "ownership_generation": { "type": "integer", "minimum": 0 }, "producing_engine_version": { "type": "string" }, "created_at": { "type": "string", "format": "date-time" } } },
@@ -1080,7 +1146,7 @@ fn openapi_schemas() -> Value {
         "BeginRuntimeTurnResponse": { "type": "object", "additionalProperties": false, "required": ["session_id", "turn_id", "ownership_generation", "configuration_fingerprint", "messages"], "properties": { "session_id": uuid(), "turn_id": uuid(), "ownership_generation": { "type": "integer", "minimum": 1 }, "configuration_fingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }, "messages": { "type": "array", "items": { "$ref": "#/components/schemas/HubSessionMessage" } } } },
         "RunResume": { "type": "object", "additionalProperties": false, "required": ["native_session_id", "work_dir_ref"], "properties": { "native_session_id": { "type": "string" }, "work_dir_ref": { "type": ["string", "null"] } } },
         "ClaimRunResponse": { "type": "object", "required": ["run", "agent", "execution_configuration", "expected_configuration_fingerprint", "integration_context", "resume", "model_proxy_token", "session_context"], "properties": { "run": { "$ref": "#/components/schemas/Run" }, "agent": { "$ref": "#/components/schemas/Agent" }, "execution_configuration": { "$ref": "#/components/schemas/AgentExecutionConfiguration" }, "expected_configuration_fingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }, "integration_context": {}, "resume": { "anyOf": [{ "$ref": "#/components/schemas/RunResume" }, { "type": "null" }] }, "model_proxy_token": { "type": "string" }, "session_context": {} } },
-        "AgentExecutionConfiguration": { "type": "object", "additionalProperties": false, "required": ["revision", "instructions", "model_selection", "model_settings", "subagents", "model_bindings", "model_policy", "sandbox_policy", "skills", "mcp_allowlist"], "properties": { "revision": { "type": "integer", "minimum": 1 }, "instructions": { "type": "string" }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "subagents": { "type": "array", "items": { "$ref": "#/components/schemas/SubagentDefinition" } }, "model_bindings": { "type": "array", "items": { "$ref": "#/components/schemas/RunModelBinding" } }, "model_policy": {}, "sandbox_policy": {}, "skills": { "type": "array", "items": { "$ref": "#/components/schemas/AgentExecutionSkill" } }, "mcp_allowlist": {} } },
+        "AgentExecutionConfiguration": { "type": "object", "additionalProperties": false, "required": ["revision", "instructions", "model_selection", "model_settings", "subagents", "model_bindings", "model_policy", "sandbox_policy", "skills", "mcp_allowlist", "tool_allowlist"], "properties": { "revision": { "type": "integer", "minimum": 1 }, "instructions": { "type": "string" }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "subagents": { "type": "array", "items": { "$ref": "#/components/schemas/SubagentDefinition" } }, "model_bindings": { "type": "array", "items": { "$ref": "#/components/schemas/RunModelBinding" } }, "model_policy": {}, "sandbox_policy": {}, "skills": { "type": "array", "items": { "$ref": "#/components/schemas/AgentExecutionSkill" } }, "mcp_allowlist": {}, "tool_allowlist": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/components/schemas/AgentToolName" } } } },
         "AgentExecutionSkill": { "type": "object", "additionalProperties": false, "required": ["source", "source_id", "name", "description", "content", "revision", "content_checksum_sha256"], "properties": { "source": { "type": "string", "enum": ["managed"] }, "source_id": { "anyOf": [uuid(), { "type": "null" }] }, "name": { "type": "string" }, "description": { "type": "string" }, "content": { "type": "string" }, "revision": { "type": "integer", "minimum": 1 }, "content_checksum_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" } } },
         "AppendRunEventRequest": { "type": "object", "required": ["event_type", "role", "content", "payload", "waiting_tool"], "properties": { "event_type": { "type": "string" }, "role": { "type": ["string", "null"] }, "content": { "type": ["string", "null"] }, "payload": {}, "waiting_tool": { "anyOf": [{ "$ref": "#/components/schemas/WaitingToolRunTransition" }, { "type": "null" }] } } },
         "WaitingToolRunTransition": { "type": "object", "required": ["native_session_id", "work_dir_ref"], "properties": { "native_session_id": { "type": "string" }, "work_dir_ref": { "type": "string" } } },
@@ -1107,11 +1173,20 @@ fn openapi_schemas() -> Value {
         "EmbedExchangeRequest": { "type": "object", "required": ["jwt"], "properties": { "jwt": { "type": "string" } } },
         "TokenResponse": { "type": "object", "required": ["token"], "properties": { "token": { "type": "string" } } },
         "WidgetAgent": { "type": "object", "required": ["id", "name", "instructions"], "properties": { "id": uuid(), "name": { "type": "string" }, "instructions": { "type": "string" } } },
-        "CreateWidgetRunRequest": { "type": "object", "required": ["message"], "properties": { "message": { "type": "string" }, "hub_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "parent_run_id": { "anyOf": [uuid(), { "type": "null" }] }, "client_message_key": { "type": ["string", "null"] } } },
-        "IntegrationApp": { "type": "object", "additionalProperties": false, "required": ["id", "owner_id", "name", "client_id", "external_platform_id", "authentication_channel_id", "redirect_uris", "agent_ids", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": uuid(), "name": { "type": "string" }, "client_id": { "type": "string" }, "external_platform_id": uuid(), "authentication_channel_id": uuid(), "redirect_uris": { "type": "array", "items": { "type": "string", "format": "uri" } }, "agent_ids": { "type": "array", "items": uuid() }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
+        "WidgetUserProfile": { "type": "object", "additionalProperties": false, "properties": { "username": { "type": ["string", "null"] }, "display_name": { "type": ["string", "null"] }, "email": { "type": ["string", "null"], "format": "email" }, "attributes": { "type": "object", "additionalProperties": true, "default": {} } } },
+        "CreateWidgetAccessRequest": { "type": "object", "additionalProperties": false, "required": ["agent_id", "external_user_id", "tenant_id"], "properties": { "agent_id": uuid(), "external_user_id": { "type": "string" }, "tenant_id": { "type": "string" }, "username": { "type": ["string", "null"] }, "display_name": { "type": ["string", "null"] }, "email": { "type": ["string", "null"], "format": "email" }, "attributes": { "type": "object", "additionalProperties": true, "default": {} } } },
+        "WidgetSession": { "type": "object", "required": ["id", "name", "instructions"], "properties": { "id": uuid(), "name": { "type": "string" }, "instructions": { "type": "string" }, "expires_at": { "type": "string", "format": "date-time" }, "history_enabled": { "type": "boolean" } } },
+        "WidgetAccessResponse": { "type": "object", "additionalProperties": false, "required": ["token", "expires_at", "agent", "history_enabled"], "properties": { "token": { "type": "string" }, "expires_at": { "type": "string", "format": "date-time" }, "agent": { "$ref": "#/components/schemas/WidgetAgent" }, "history_enabled": { "type": "boolean" } } },
+        "CreatePublicWidgetAccessRequest": { "type": "object", "additionalProperties": false, "required": ["client_id", "visitor_key"], "properties": { "client_id": { "type": "string", "minLength": 1 }, "visitor_key": { "type": "string", "minLength": 16, "maxLength": 512 } } },
+        "PublicWidgetAccessResponse": { "type": "object", "additionalProperties": false, "required": ["token", "expires_at", "widget_session_id", "hub_session_id", "agent"], "properties": { "token": { "type": "string" }, "expires_at": { "type": "string", "format": "date-time" }, "widget_session_id": uuid(), "hub_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "agent": { "$ref": "#/components/schemas/WidgetAgent" } } },
+        "RenewWidgetSessionRequest": { "type": "object", "additionalProperties": false, "properties": { "profile": { "anyOf": [{ "$ref": "#/components/schemas/WidgetUserProfile" }, { "type": "null" }] } } },
+        "WidgetTokenResponse": { "type": "object", "additionalProperties": false, "required": ["token", "expires_at"], "properties": { "token": { "type": "string" }, "expires_at": { "type": "string", "format": "date-time" } } },
+        "WidgetHistorySession": { "type": "object", "additionalProperties": false, "required": ["id", "hub_session_id", "created_at", "updated_at", "preview"], "properties": { "id": uuid(), "hub_session_id": uuid(), "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" }, "preview": { "type": ["string", "null"] } } },
+        "CreateWidgetRunRequest": { "type": "object", "additionalProperties": false, "required": ["message"], "properties": { "message": { "type": "string" }, "integration_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "hub_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "parent_run_id": { "anyOf": [uuid(), { "type": "null" }] }, "client_message_key": { "type": ["string", "null"] } } },
+        "IntegrationApp": { "type": "object", "additionalProperties": false, "required": ["id", "owner_id", "name", "client_id", "external_platform_id", "authentication_channel_id", "redirect_uris", "agent_ids", "widget_history_enabled", "login_required", "allowed_origins", "tool_allowlist", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": uuid(), "name": { "type": "string" }, "client_id": { "type": "string" }, "external_platform_id": uuid(), "authentication_channel_id": uuid(), "redirect_uris": { "type": "array", "items": { "type": "string", "format": "uri" } }, "agent_ids": { "type": "array", "items": uuid() }, "widget_history_enabled": { "type": "boolean" }, "login_required": { "type": "boolean", "default": true }, "allowed_origins": { "type": "array", "items": { "type": "string", "format": "uri" } }, "tool_allowlist": { "anyOf": [{ "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/components/schemas/AgentToolName" } }, { "type": "null" }] }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
         "IntegrationAppSecretResponse": { "type": "object", "additionalProperties": false, "required": ["integration_app", "client_secret"], "properties": { "integration_app": { "$ref": "#/components/schemas/IntegrationApp" }, "client_secret": { "type": "string", "description": "Shown only in this create or rotate response." } } },
-        "CreateIntegrationAppRequest": { "type": "object", "additionalProperties": false, "required": ["name", "external_platform_id", "authentication_channel_id", "redirect_uris", "agent_ids"], "properties": { "name": { "type": "string" }, "external_platform_id": uuid(), "authentication_channel_id": uuid(), "redirect_uris": { "type": "array", "items": { "type": "string", "format": "uri" } }, "agent_ids": { "type": "array", "maxItems": 100, "uniqueItems": true, "items": uuid() } } },
-        "UpdateIntegrationAppRequest": { "type": "object", "additionalProperties": false, "required": ["name", "redirect_uris", "agent_ids"], "properties": { "name": { "type": "string" }, "redirect_uris": { "type": "array", "items": { "type": "string", "format": "uri" } }, "agent_ids": { "type": "array", "maxItems": 100, "uniqueItems": true, "items": uuid() } } },
+        "CreateIntegrationAppRequest": { "type": "object", "additionalProperties": false, "required": ["name", "external_platform_id", "authentication_channel_id", "redirect_uris", "agent_ids"], "properties": { "name": { "type": "string" }, "external_platform_id": uuid(), "authentication_channel_id": uuid(), "redirect_uris": { "type": "array", "items": { "type": "string", "format": "uri" } }, "agent_ids": { "type": "array", "maxItems": 100, "uniqueItems": true, "items": uuid() }, "widget_history_enabled": { "type": "boolean", "default": false }, "login_required": { "type": "boolean", "default": true }, "allowed_origins": { "type": "array", "items": { "type": "string", "format": "uri" }, "default": [] }, "tool_allowlist": { "anyOf": [{ "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/components/schemas/AgentToolName" } }, { "type": "null" }], "default": null } } },
+        "UpdateIntegrationAppRequest": { "type": "object", "additionalProperties": false, "required": ["name", "redirect_uris", "agent_ids"], "properties": { "name": { "type": "string" }, "redirect_uris": { "type": "array", "items": { "type": "string", "format": "uri" } }, "agent_ids": { "type": "array", "maxItems": 100, "uniqueItems": true, "items": uuid() }, "widget_history_enabled": { "type": "boolean", "default": false }, "login_required": { "type": "boolean", "default": true }, "allowed_origins": { "type": "array", "items": { "type": "string", "format": "uri" }, "default": [] }, "tool_allowlist": { "anyOf": [{ "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/components/schemas/AgentToolName" } }, { "type": "null" }], "default": null } } },
         "OAuthTokenRequest": { "oneOf": [
             { "type": "object", "additionalProperties": false, "required": ["grant_type", "client_id", "client_secret", "code", "redirect_uri"], "properties": { "grant_type": { "type": "string", "const": "authorization_code" }, "client_id": { "type": "string" }, "client_secret": { "type": "string" }, "code": { "type": "string" }, "redirect_uri": { "type": "string", "format": "uri" }, "scope": { "type": "string" } } },
             { "type": "object", "additionalProperties": false, "required": ["grant_type", "client_id", "client_secret", "scope"], "properties": { "grant_type": { "type": "string", "const": "client_credentials" }, "client_id": { "type": "string" }, "client_secret": { "type": "string" }, "scope": { "type": "string" } } }
@@ -4321,7 +4396,7 @@ async fn list_agents(
     let rows = sqlx::query(
         "SELECT a.id, a.owner_id, a.name, a.instructions, a.visibility, a.public_to,
                 a.runtime_id, a.model_connection_id, a.model_id, a.model_settings,
-                a.model_policy, a.sandbox_policy, a.mcp_allowlist,
+                a.model_policy, a.sandbox_policy, a.mcp_allowlist, a.tool_allowlist,
                 a.created_at, a.updated_at
          FROM agents AS a
          JOIN users AS owner ON owner.id = a.owner_id
@@ -4360,6 +4435,7 @@ async fn create_agent(
     validate_public_visibility_role(visibility, &user.role)?;
     validate_public_to(&state.pool, visibility, &req.public_to, user.id).await?;
     validate_subagent_definitions(&req.subagents)?;
+    let tool_allowlist = normalize_agent_tool_allowlist(&req.tool_allowlist)?;
     let model_policy = json!({ "provider": "hub-proxy" });
     let id = Uuid::new_v4();
     let mut tx = state.pool.begin().await?;
@@ -4407,8 +4483,8 @@ async fn create_agent(
     sqlx::query(
         "INSERT INTO agents
              (id, owner_id, name, instructions, visibility, public_to, model_policy,
-              model_connection_id, model_id, model_settings)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+              model_connection_id, model_id, model_settings, tool_allowlist)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(id)
     .bind(user.id)
@@ -4420,6 +4496,10 @@ async fn create_agent(
     .bind(model_connection_id)
     .bind(model_id)
     .bind(model_settings_value)
+    .bind(
+        serde_json::to_value(tool_allowlist)
+            .map_err(|_| ApiError::internal("Agent tool policy could not be encoded"))?,
+    )
     .execute(&mut *tx)
     .await?;
     replace_subagents_tx(&mut tx, id, &req.subagents).await?;
@@ -4508,6 +4588,7 @@ async fn update_agent(
     let user = require_user(&state, &headers).await?;
     let existing_agent = load_agent_manageable_by_user(&state.pool, agent_id, &user).await?;
     req.mcp_allowlist = merge_mcp_secrets(&existing_agent.mcp_allowlist, &req.mcp_allowlist);
+    req.tool_allowlist = normalize_agent_tool_allowlist(&req.tool_allowlist)?;
     validate_agent_payload(&req)?;
     if let Some(runtime_id) = req.runtime_id {
         ensure_runtime_online(&state.pool, runtime_id).await?;
@@ -4551,10 +4632,11 @@ async fn update_agent(
          SET name = $1, instructions = $2, visibility = $3, public_to = $4, runtime_id = $5,
              model_connection_id = $6, model_id = $7, model_settings = $8,
              model_policy = $9, sandbox_policy = $10, mcp_allowlist = $11,
+             tool_allowlist = $12,
              execution_config_revision = execution_config_revision
-                 + CASE WHEN $12 THEN 1 ELSE 0 END,
+                 + CASE WHEN $13 THEN 1 ELSE 0 END,
              updated_at = now()
-         WHERE id = $13 AND deleted_at IS NULL
+         WHERE id = $14 AND deleted_at IS NULL
          ",
     )
     .bind(req.name.trim())
@@ -4568,12 +4650,34 @@ async fn update_agent(
     .bind(req.model_policy)
     .bind(req.sandbox_policy)
     .bind(req.mcp_allowlist)
+    .bind(
+        serde_json::to_value(&req.tool_allowlist)
+            .map_err(|_| ApiError::internal("Agent tool policy could not be encoded"))?,
+    )
     .bind(execution_configuration_changed)
     .bind(agent_id)
     .execute(&mut *tx)
     .await?;
     if updated.rows_affected() == 0 {
         return Err(ApiError::not_found("agent not found"));
+    }
+    if execution_configuration_changed {
+        sqlx::query(
+            "UPDATE hub_sessions AS sessions
+             SET configuration_refresh_revision = GREATEST(
+                     sessions.configuration_refresh_revision,
+                     agents.execution_config_revision
+                 ),
+                 updated_at = now()
+             FROM agents
+             WHERE sessions.agent_id = agents.id
+               AND agents.id = $1
+               AND sessions.runtime_owner_id IS NOT NULL
+               AND sessions.lifecycle_status IN ('restoring', 'online')",
+        )
+        .bind(agent_id)
+        .execute(&mut *tx)
+        .await?;
     }
     sqlx::query("DELETE FROM agent_skills WHERE agent_id = $1")
         .bind(agent_id)
@@ -4936,6 +5040,20 @@ async fn create_integration_app(
 ) -> Result<Json<IntegrationAppSecretResponse>, ApiError> {
     let user = require_user(&state, &headers).await?;
     validate_integration_app_payload(&req.name, &req.redirect_uris, &req.agent_ids)?;
+    let allowed_origins = normalize_allowed_origins(&req.allowed_origins)?;
+    let tool_allowlist = req
+        .tool_allowlist
+        .as_deref()
+        .map(normalize_agent_tool_allowlist)
+        .transpose()?;
+    validate_public_widget_settings(
+        req.login_required,
+        req.widget_history_enabled,
+        &allowed_origins,
+        tool_allowlist.as_deref(),
+        &req.agent_ids,
+        &user.role,
+    )?;
     let client_id = format!("ahc_{}", Uuid::new_v4().simple());
     let client_secret = format!("ahs_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let app_id = Uuid::new_v4();
@@ -4947,11 +5065,14 @@ async fn create_integration_app(
     )
     .await?;
     validate_integration_app_agents_tx(&mut tx, &user, &req.agent_ids).await?;
+    validate_integration_app_tool_allowlist_tx(&mut tx, &req.agent_ids, tool_allowlist.as_deref())
+        .await?;
     sqlx::query(
         "INSERT INTO oauth_apps
-             (id, agent_id, owner_id, name, client_id, client_secret_hash,
-              redirect_uris, external_platform_id, authentication_channel_id)
-         VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8)",
+              (id, agent_id, owner_id, name, client_id, client_secret_hash,
+              redirect_uris, external_platform_id, authentication_channel_id,
+              widget_history_enabled, login_required, allowed_origins, tool_allowlist)
+         VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(app_id)
     .bind(user.id)
@@ -4961,6 +5082,19 @@ async fn create_integration_app(
     .bind(&req.redirect_uris)
     .bind(req.external_platform_id)
     .bind(req.authentication_channel_id)
+    .bind(req.widget_history_enabled)
+    .bind(req.login_required)
+    .bind(
+        serde_json::to_value(&allowed_origins)
+            .map_err(|_| ApiError::internal("Widget origins could not be encoded"))?,
+    )
+    .bind(
+        tool_allowlist
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|_| ApiError::internal("App tool policy could not be encoded"))?,
+    )
     .execute(&mut *tx)
     .await?;
     replace_integration_app_agents_tx(&mut tx, app_id, &req.agent_ids).await?;
@@ -4979,6 +5113,20 @@ async fn update_integration_app(
 ) -> Result<Json<IntegrationAppDto>, ApiError> {
     let user = require_user(&state, &headers).await?;
     validate_integration_app_payload(&req.name, &req.redirect_uris, &req.agent_ids)?;
+    let allowed_origins = normalize_allowed_origins(&req.allowed_origins)?;
+    let tool_allowlist = req
+        .tool_allowlist
+        .as_deref()
+        .map(normalize_agent_tool_allowlist)
+        .transpose()?;
+    validate_public_widget_settings(
+        req.login_required,
+        req.widget_history_enabled,
+        &allowed_origins,
+        tool_allowlist.as_deref(),
+        &req.agent_ids,
+        &user.role,
+    )?;
     let mut tx = state.pool.begin().await?;
     let exists = sqlx::query_scalar::<_, Uuid>(
         "SELECT id FROM oauth_apps
@@ -4993,13 +5141,30 @@ async fn update_integration_app(
         return Err(ApiError::not_found("integration app not found"));
     }
     validate_integration_app_agents_tx(&mut tx, &user, &req.agent_ids).await?;
+    validate_integration_app_tool_allowlist_tx(&mut tx, &req.agent_ids, tool_allowlist.as_deref())
+        .await?;
     sqlx::query(
         "UPDATE oauth_apps
-         SET name = $1, redirect_uris = $2, updated_at = now()
-         WHERE id = $3 AND owner_id = $4",
+         SET name = $1, redirect_uris = $2, widget_history_enabled = $3,
+             login_required = $4, allowed_origins = $5, tool_allowlist = $6,
+             updated_at = now()
+         WHERE id = $7 AND owner_id = $8",
     )
     .bind(req.name.trim())
     .bind(req.redirect_uris)
+    .bind(req.widget_history_enabled)
+    .bind(req.login_required)
+    .bind(
+        serde_json::to_value(&allowed_origins)
+            .map_err(|_| ApiError::internal("Widget origins could not be encoded"))?,
+    )
+    .bind(
+        tool_allowlist
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|_| ApiError::internal("App tool policy could not be encoded"))?,
+    )
     .bind(app_id)
     .bind(user.id)
     .execute(&mut *tx)
@@ -5470,6 +5635,7 @@ async fn create_run(
             model_subject_type: "user".into(),
             model_subject_user_id: Some(user.id),
             model_source_integration_app_id: None,
+            external_user_context: None,
         },
     )
     .await?;
@@ -5625,6 +5791,7 @@ async fn create_hub_session_message(
             model_subject_type: "user".into(),
             model_subject_user_id: Some(user.id),
             model_source_integration_app_id: None,
+            external_user_context: None,
         },
     )
     .await?;
@@ -6825,133 +6992,717 @@ async fn exchange_embed_jwt(
     Ok(Json(CreateEmbedSessionResponse { token }))
 }
 
+async fn create_widget_access(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<CreateWidgetAccessRequest>,
+) -> Result<Json<WidgetAccessResponse>, ApiError> {
+    let (client_id, client_secret) = widget_client_credentials(&headers)?;
+    let app = load_oauth_app_by_client_id(&state.pool, &client_id).await?;
+    if !constant_time_eq(
+        app.client_secret_hash.as_bytes(),
+        sha256_hex(&client_secret).as_bytes(),
+    ) {
+        return Err(ApiError::unauthorized("invalid oauth client"));
+    }
+    let tenant_id = require_origin_tenant(Some(&req.tenant_id))?;
+    let external_user_id = normalize_external_user_id(&req.external_user_id)?;
+    let profile = normalize_widget_user_profile(WidgetUserProfileDto {
+        username: req.username,
+        display_name: req.display_name,
+        email: req.email,
+        attributes: req.attributes,
+    })?;
+    let mut tx = state.pool.begin().await?;
+    require_integration_authentication_channel_tx(
+        &mut tx,
+        app.external_platform_id,
+        app.authentication_channel_id,
+    )
+    .await?;
+    validate_oauth_agent_scopes_tx(&mut tx, &app, &[format!("agent:{}", req.agent_id)], None)
+        .await?;
+    let agent_owner_id: Uuid = sqlx::query_scalar(
+        "SELECT agent.owner_id
+         FROM integration_app_agents AS delegated
+         JOIN agents AS agent ON agent.id = delegated.agent_id
+         WHERE delegated.app_id = $1 AND delegated.agent_id = $2
+           AND agent.deleted_at IS NULL
+         FOR UPDATE OF agent",
+    )
+    .bind(app.id)
+    .bind(req.agent_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::forbidden(
+        "oauth agent scope is not currently delegated",
+    ))?;
+    lock_active_integration_agent_tx(&mut tx, req.agent_id, agent_owner_id).await?;
+    let resolved = resolve_external_identity_tx(
+        &mut tx,
+        app.external_platform_id,
+        app.authentication_channel_id,
+        &tenant_id,
+        &external_user_id,
+        profile.email.as_deref(),
+        profile.username.as_deref(),
+    )
+    .await?;
+    update_external_identity_widget_profile_tx(&mut tx, resolved.identity_id, &profile).await?;
+    let external_user = ExternalUserContextDto {
+        external_user_id,
+        tenant_id,
+        username: profile.username,
+        display_name: profile.display_name,
+        email: profile.email,
+        attributes: profile.attributes,
+    };
+    let token = format!("ahw_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let expires_at = Utc::now() + ChronoDuration::minutes(15);
+    insert_widget_access_session_tx(
+        &mut tx,
+        app.id,
+        req.agent_id,
+        resolved.user.id,
+        resolved.identity_id,
+        &external_user,
+        &token,
+        expires_at,
+    )
+    .await?;
+    let agent = sqlx::query(
+        "SELECT id, name, instructions FROM agents WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(req.agent_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Json(WidgetAccessResponse {
+        token,
+        expires_at,
+        agent: WidgetAgentDto {
+            id: agent.get("id"),
+            name: agent.get("name"),
+            instructions: agent.get("instructions"),
+        },
+        history_enabled: app.widget_history_enabled,
+    }))
+}
+
+async fn create_public_widget_access(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreatePublicWidgetAccessRequest>,
+) -> Result<Json<PublicWidgetAccessResponse>, ApiError> {
+    let app = load_public_widget_app_by_client_id(&state.pool, &req.client_id).await?;
+    let anonymous_key_hash = visitor_key_hash(&req.visitor_key)?;
+    let mut tx = state.pool.begin().await?;
+    let agent = sqlx::query(
+        "SELECT agent.id, agent.owner_id, agent.name, agent.instructions
+         FROM integration_app_agents AS delegated
+         JOIN agents AS agent ON agent.id = delegated.agent_id
+         WHERE delegated.app_id = $1 AND agent.deleted_at IS NULL
+         ORDER BY agent.id
+         LIMIT 1",
+    )
+    .bind(app.id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::not_found("public Widget Agent not found"))?;
+    let agent_id: Uuid = agent.get("id");
+    let owner_id: Uuid = agent.get("owner_id");
+    lock_active_integration_agent_tx(&mut tx, agent_id, owner_id).await?;
+    let token = format!("ahp_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let expires_at = Utc::now() + ChronoDuration::minutes(15);
+    let (widget_session_id, hub_session_id): (Uuid, Option<Uuid>) = sqlx::query_as(
+        "INSERT INTO embed_sessions
+             (token_hash, agent_id, owner_id, oauth_app_id, expires_at,
+              anonymous, anonymous_key_hash)
+         VALUES ($1, $2, $3, $4, $5, true, $6)
+         ON CONFLICT (oauth_app_id, anonymous_key_hash) WHERE anonymous
+         DO UPDATE SET token_hash = EXCLUDED.token_hash,
+                       expires_at = EXCLUDED.expires_at,
+                       agent_id = EXCLUDED.agent_id,
+                       owner_id = EXCLUDED.owner_id,
+                       hub_session_id = CASE
+                           WHEN embed_sessions.agent_id = EXCLUDED.agent_id
+                            AND embed_sessions.owner_id = EXCLUDED.owner_id
+                           THEN embed_sessions.hub_session_id
+                           ELSE NULL
+                       END,
+                       last_run_id = CASE
+                           WHEN embed_sessions.agent_id = EXCLUDED.agent_id
+                            AND embed_sessions.owner_id = EXCLUDED.owner_id
+                           THEN embed_sessions.last_run_id
+                           ELSE NULL
+                       END
+         RETURNING id, hub_session_id",
+    )
+    .bind(sha256_hex(&token))
+    .bind(agent_id)
+    .bind(owner_id)
+    .bind(app.id)
+    .bind(expires_at)
+    .bind(anonymous_key_hash)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Json(PublicWidgetAccessResponse {
+        token,
+        expires_at,
+        widget_session_id,
+        hub_session_id,
+        agent: WidgetAgentDto {
+            id: agent_id,
+            name: agent.get("name"),
+            instructions: agent.get("instructions"),
+        },
+    }))
+}
+
 async fn get_widget_session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-) -> Result<Json<WidgetAgentDto>, ApiError> {
+) -> Result<Response, ApiError> {
     let token = embed_token_from_headers(&headers)
         .ok_or(ApiError::unauthorized("missing embed session"))?;
-    let (_, _, agent_id, owner_id) = load_embed_session(&state.pool, &token).await?;
-    let agent = load_agent_owned_by_user(&state.pool, agent_id, owner_id).await?;
-    Ok(Json(widget_agent_from_agent(agent)))
+    let mut tx = state.pool.begin().await?;
+    let credential = load_widget_credential_tx(&mut tx, &token).await?;
+    let agent = sqlx::query(
+        "SELECT id, name, instructions FROM agents WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(credential.agent_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let agent = WidgetAgentDto {
+        id: agent.get("id"),
+        name: agent.get("name"),
+        instructions: agent.get("instructions"),
+    };
+    tx.commit().await?;
+    if credential.is_external() {
+        return Ok(Json(WidgetSessionDto {
+            agent,
+            expires_at: credential.expires_at,
+            history_enabled: credential.history_enabled,
+        })
+        .into_response());
+    }
+    Ok(Json(agent).into_response())
+}
+
+async fn renew_widget_session(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<RenewWidgetSessionRequest>,
+) -> Result<Json<WidgetTokenResponse>, ApiError> {
+    let token = embed_token_from_headers(&headers)
+        .filter(|token| token.starts_with("ahw_"))
+        .ok_or(ApiError::unauthorized("invalid Widget credential"))?;
+    let mut tx = state.pool.begin().await?;
+    let credential = lock_widget_credential_tx(&mut tx, &token).await?;
+    if !credential.is_external() {
+        return Err(ApiError::unauthorized("invalid Widget credential"));
+    }
+    if let Some(profile) = req.profile {
+        let (client_id, client_secret) = widget_client_credentials(&headers)?;
+        let app = load_oauth_app_by_client_id(&state.pool, &client_id).await?;
+        if Some(app.id) != credential.oauth_app_id
+            || !constant_time_eq(
+                app.client_secret_hash.as_bytes(),
+                sha256_hex(&client_secret).as_bytes(),
+            )
+        {
+            return Err(ApiError::unauthorized("invalid oauth client"));
+        }
+        let profile = normalize_widget_user_profile(profile)?;
+        let external_identity_id = credential
+            .external_identity_id
+            .ok_or(ApiError::internal("external Widget identity is missing"))?;
+        update_external_identity_widget_profile_tx(&mut tx, external_identity_id, &profile).await?;
+        let external_user = ExternalUserContextDto {
+            external_user_id: credential
+                .external_user_id
+                .clone()
+                .ok_or(ApiError::internal("external Widget user is missing"))?,
+            tenant_id: credential
+                .external_tenant_id
+                .clone()
+                .ok_or(ApiError::internal("external Widget tenant is missing"))?,
+            username: profile.username,
+            display_name: profile.display_name,
+            email: profile.email,
+            attributes: profile.attributes,
+        };
+        let profile_snapshot = serde_json::to_value(external_user)
+            .map_err(|_| ApiError::internal("external user profile could not be encoded"))?;
+        sqlx::query("UPDATE embed_sessions SET profile_snapshot = $1 WHERE id = $2")
+            .bind(profile_snapshot)
+            .bind(credential.id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    let renewed_token = format!("ahw_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let expires_at = Utc::now() + ChronoDuration::minutes(15);
+    sqlx::query(
+        "UPDATE embed_sessions
+         SET token_hash = $1, expires_at = $2
+         WHERE id = $3 AND token_hash = $4",
+    )
+    .bind(sha256_hex(&renewed_token))
+    .bind(expires_at)
+    .bind(credential.id)
+    .bind(sha256_hex(&token))
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Json(WidgetTokenResponse {
+        token: renewed_token,
+        expires_at,
+    }))
+}
+
+async fn list_widget_sessions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<WidgetHistorySessionDto>>, ApiError> {
+    let token = embed_token_from_headers(&headers)
+        .ok_or(ApiError::unauthorized("missing embed session"))?;
+    let mut tx = state.pool.begin().await?;
+    let credential = load_widget_credential_tx(&mut tx, &token).await?;
+    if !credential.history_enabled {
+        return Err(ApiError::forbidden("Widget history is disabled"));
+    }
+    let (
+        oauth_app_id,
+        external_platform_id,
+        external_tenant_id,
+        external_user_id,
+        external_identity_id,
+    ) = credential.external_scope()?;
+    let rows = sqlx::query(
+        "SELECT integration.id, hub.id AS hub_session_id, hub.created_at,
+                GREATEST(
+                    hub.updated_at,
+                    COALESCE(
+                        (SELECT max(message.accepted_at)
+                         FROM hub_session_messages AS message
+                         WHERE message.session_id = hub.id),
+                        hub.updated_at
+                    )
+                ) AS updated_at,
+                (SELECT message.content
+                 FROM hub_session_messages AS message
+                 WHERE message.session_id = hub.id AND message.role = 'user'
+                   AND message.content IS NOT NULL
+                 ORDER BY message.sequence LIMIT 1) AS preview
+         FROM integration_sessions AS integration
+         JOIN hub_sessions AS hub
+           ON hub.id = integration.hub_session_id
+          AND hub.owner_id = integration.owner_id
+          AND hub.agent_id = integration.agent_id
+         WHERE integration.oauth_app_id = $1
+           AND integration.agent_id = $2
+           AND integration.owner_id = $3
+           AND integration.external_user_id = $4
+           AND hub.origin_kind = 'external'
+           AND hub.origin_platform_id = $5
+           AND hub.origin_tenant_id = $6
+           AND hub.origin_external_identity_id = $7
+         ORDER BY updated_at DESC, integration.id DESC
+         LIMIT 100",
+    )
+    .bind(oauth_app_id)
+    .bind(credential.agent_id)
+    .bind(credential.owner_id)
+    .bind(external_user_id)
+    .bind(external_platform_id)
+    .bind(external_tenant_id)
+    .bind(external_identity_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| WidgetHistorySessionDto {
+                id: row.get("id"),
+                hub_session_id: row.get("hub_session_id"),
+                created_at: row.get("created_at"),
+                updated_at: row.get("updated_at"),
+                preview: row.get("preview"),
+            })
+            .collect(),
+    ))
+}
+
+async fn list_widget_session_messages(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(session_id): Path<Uuid>,
+) -> Result<Json<Vec<HubSessionMessageDto>>, ApiError> {
+    let token = embed_token_from_headers(&headers)
+        .ok_or(ApiError::unauthorized("missing embed session"))?;
+    let mut tx = state.pool.begin().await?;
+    let credential = load_widget_credential_tx(&mut tx, &token).await?;
+    let (integration_session_id, hub_session_id) = widget_session_locator(&credential, session_id);
+    let scoped = load_widget_scoped_session_tx(
+        &mut tx,
+        &credential,
+        integration_session_id,
+        hub_session_id,
+        false,
+    )
+    .await?;
+    let rows = sqlx::query(
+        "SELECT id, session_id, sequence, role, message_kind, content, payload,
+                delivery_mode, delivery_state, client_message_key,
+                expected_native_turn_id, turn_id, run_id, accepted_at
+         FROM hub_session_messages
+         WHERE session_id = $1 ORDER BY sequence",
+    )
+    .bind(scoped.hub_session_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Json(rows.into_iter().map(hub_message_from_row).collect()))
+}
+
+async fn list_widget_session_events(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(session_id): Path<Uuid>,
+    Query(query): Query<EventStreamQuery>,
+) -> Result<Json<Vec<RunEventDto>>, ApiError> {
+    let after = widget_event_cursor(query.after)?;
+    let token = embed_token_from_headers(&headers)
+        .ok_or(ApiError::unauthorized("missing embed session"))?;
+    let mut tx = state.pool.begin().await?;
+    let credential = load_widget_credential_tx(&mut tx, &token).await?;
+    let (integration_session_id, hub_session_id) = widget_session_locator(&credential, session_id);
+    let scoped = load_widget_scoped_session_tx(
+        &mut tx,
+        &credential,
+        integration_session_id,
+        hub_session_id,
+        false,
+    )
+    .await?;
+    let events = load_widget_session_events_after_tx(&mut tx, &scoped, after).await?;
+    tx.commit().await?;
+    Ok(Json(events))
+}
+
+async fn stream_widget_session_events(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(session_id): Path<Uuid>,
+    Query(query): Query<EventStreamQuery>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let mut last_seq = widget_event_cursor(query.after)?;
+    authorize_widget_session(&state, &headers, session_id).await?;
+    let stream_state = state.clone();
+    let stream_headers = headers.clone();
+    let event_stream = stream! {
+        loop {
+            let token = match embed_token_from_headers(&stream_headers) {
+                Some(token) => token,
+                None => {
+                    yield Ok(Event::default().event("error").data("missing embed session"));
+                    break;
+                }
+            };
+            let mut tx = match stream_state.pool.begin().await {
+                Ok(tx) => tx,
+                Err(_) => {
+                    yield Ok(Event::default().event("error").data("Widget history is unavailable"));
+                    break;
+                }
+            };
+            let loaded = async {
+                let credential = load_widget_credential_tx(&mut tx, &token).await?;
+                let (integration_session_id, hub_session_id) =
+                    widget_session_locator(&credential, session_id);
+                let scoped = load_widget_scoped_session_tx(
+                    &mut tx,
+                    &credential,
+                    integration_session_id,
+                    hub_session_id,
+                    false,
+                )
+                .await?;
+                let events = load_widget_session_events_after_tx(&mut tx, &scoped, last_seq).await?;
+                tx.commit().await?;
+                Ok::<_, ApiError>(events)
+            }.await;
+            match loaded {
+                Ok(events) => {
+                    for event in events {
+                        last_seq = event.seq;
+                        let payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
+                        yield Ok(Event::default().event("run_event").id(event.seq.to_string()).data(payload));
+                    }
+                }
+                Err(err) => {
+                    yield Ok(Event::default().event("error").data(err.message));
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(700)).await;
+        }
+    };
+    Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
+}
+
+fn widget_event_cursor(after: Option<i64>) -> Result<i64, ApiError> {
+    let after = after.unwrap_or(0);
+    if after < 0 {
+        return Err(ApiError::bad_request("event cursor must be nonnegative"));
+    }
+    Ok(after)
 }
 
 async fn create_widget_run(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(req): Json<CreateRunRequest>,
+    Json(req): Json<CreateWidgetRunRequest>,
 ) -> Result<Json<RunDto>, ApiError> {
     let token = embed_token_from_headers(&headers)
         .ok_or(ApiError::unauthorized("missing embed session"))?;
     let mut tx = state.pool.begin().await?;
-    // 与删除保持 Agent -> embed session 的固定锁顺序，避免并发删除死锁。
-    let session_preview = sqlx::query(
-        "SELECT embed.agent_id, embed.owner_id, embed.hub_session_id
-         FROM embed_sessions AS embed
-         JOIN agents AS agent ON agent.id = embed.agent_id AND agent.deleted_at IS NULL
-         WHERE embed.token_hash = $1 AND embed.expires_at > now()
-           AND (
-               embed.oauth_app_id IS NULL
-               OR EXISTS (
-                   SELECT 1
-                   FROM oauth_apps AS app
-                   JOIN users AS app_owner
-                     ON app_owner.id = app.owner_id
-                    AND app_owner.deletion_requested_at IS NULL
-                   JOIN authentication_channels AS channel
-                     ON channel.id = app.authentication_channel_id
-                    AND channel.platform_id = app.external_platform_id
-                    AND channel.enabled = true AND channel.trusted_email = true
-                   JOIN integration_app_agents AS delegated
-                     ON delegated.app_id = app.id AND delegated.agent_id = agent.id
-                   WHERE app.id = embed.oauth_app_id
-                     AND app.deleted_at IS NULL AND app.client_secret_hash IS NOT NULL
-                     AND (agent.owner_id = app.owner_id OR agent.visibility = 'public'
-                          OR (agent.visibility = 'public_to'
-                              AND app.owner_id = ANY(agent.public_to)))
-               )
-           )",
-    )
-    .bind(sha256_hex(&token))
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or(ApiError::unauthorized("invalid embed session"))?;
-    ensure_agent_can_start_run_tx(
-        &mut tx,
-        session_preview.get("agent_id"),
-        session_preview.get("owner_id"),
-    )
-    .await?;
-    let session = sqlx::query(
-        "SELECT embed.id, embed.agent_id, embed.owner_id, embed.hub_session_id,
-                embed.oauth_app_id
-         FROM embed_sessions AS embed
-         JOIN agents AS agent ON agent.id = embed.agent_id AND agent.deleted_at IS NULL
-         WHERE embed.token_hash = $1 AND embed.expires_at > now()
-           AND (
-               embed.oauth_app_id IS NULL
-               OR EXISTS (
-                   SELECT 1
-                   FROM oauth_apps AS app
-                   JOIN users AS app_owner
-                     ON app_owner.id = app.owner_id
-                    AND app_owner.deletion_requested_at IS NULL
-                   JOIN authentication_channels AS channel
-                     ON channel.id = app.authentication_channel_id
-                    AND channel.platform_id = app.external_platform_id
-                    AND channel.enabled = true AND channel.trusted_email = true
-                   JOIN integration_app_agents AS delegated
-                     ON delegated.app_id = app.id AND delegated.agent_id = agent.id
-                   WHERE app.id = embed.oauth_app_id
-                     AND app.deleted_at IS NULL AND app.client_secret_hash IS NOT NULL
-                     AND (agent.owner_id = app.owner_id OR agent.visibility = 'public'
-                          OR (agent.visibility = 'public_to'
-                              AND app.owner_id = ANY(agent.public_to)))
-               )
-           )
-         FOR UPDATE OF embed",
-    )
-    .bind(sha256_hex(&token))
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or(ApiError::unauthorized("invalid embed session"))?;
-    let agent_id: Uuid = session.get("agent_id");
-    let owner_id: Uuid = session.get("owner_id");
-    let source_integration_app_id: Option<Uuid> = session.get("oauth_app_id");
-    let widget_session_id: Uuid = session.get("id");
-    let hub_session_id: Uuid = session.get("hub_session_id");
-    if req
-        .hub_session_id
-        .is_some_and(|requested| requested != hub_session_id)
+    let credential = lock_widget_credential_tx(&mut tx, &token).await?;
+    ensure_agent_has_configured_model_tx(&mut tx, credential.agent_id).await?;
+    let client_message_key = normalize_client_message_key(req.client_message_key.as_deref())?;
+
+    let (hub_session_id, integration_session_id, external_user_context) = if credential
+        .is_anonymous()
     {
-        return Err(ApiError::bad_request(
-            "embed token is bound to another session",
-        ));
-    }
+        if req.integration_session_id.is_some() {
+            return Err(ApiError::bad_request(
+                "public Widget does not use Integration Sessions",
+            ));
+        }
+        let retried_hub_session_id = if let Some(client_message_key) = client_message_key.as_deref()
+        {
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT runs.hub_session_id
+                 FROM runs
+                 JOIN hub_session_messages AS message
+                   ON message.session_id = runs.hub_session_id
+                  AND message.run_id = runs.id
+                 WHERE runs.widget_session_id = $1
+                   AND runs.source = 'widget'
+                   AND message.client_message_key = $2
+                 ORDER BY message.accepted_at, message.id
+                 LIMIT 1",
+            )
+            .bind(credential.id)
+            .bind(client_message_key)
+            .fetch_optional(&mut *tx)
+            .await?
+        } else {
+            None
+        };
+        let hub_session_id = if let Some(hub_session_id) = retried_hub_session_id {
+            hub_session_id
+        } else if let Some(hub_session_id) = credential.hub_session_id {
+            if req
+                .hub_session_id
+                .is_some_and(|requested| requested != hub_session_id)
+            {
+                return Err(ApiError::bad_request(
+                    "public Widget credential is bound to another session",
+                ));
+            }
+            hub_session_id
+        } else {
+            if req.hub_session_id.is_some() {
+                return Err(ApiError::bad_request(
+                    "public Widget has not started this session",
+                ));
+            }
+            let hub_session_id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO hub_sessions
+                     (id, owner_id, agent_id, origin_kind, lifecycle_status)
+                 VALUES ($1, $2, $3, 'public_widget', 'waiting_for_runtime')",
+            )
+            .bind(hub_session_id)
+            .bind(credential.owner_id)
+            .bind(credential.agent_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE embed_sessions
+                 SET hub_session_id = $1
+                 WHERE id = $2 AND hub_session_id IS NULL",
+            )
+            .bind(hub_session_id)
+            .bind(credential.id)
+            .execute(&mut *tx)
+            .await?;
+            hub_session_id
+        };
+        (hub_session_id, None, None)
+    } else if credential.is_external() {
+        let oauth_app_id = credential
+            .oauth_app_id
+            .ok_or(ApiError::internal("external Widget app is missing"))?;
+        let external_platform_id = credential
+            .external_platform_id
+            .ok_or(ApiError::internal("external Widget platform is missing"))?;
+        let external_tenant_id = credential
+            .external_tenant_id
+            .as_deref()
+            .ok_or(ApiError::internal("external Widget tenant is missing"))?;
+        let external_user_id = credential
+            .external_user_id
+            .as_deref()
+            .ok_or(ApiError::internal("external Widget user is missing"))?;
+        let external_identity_id = credential
+            .external_identity_id
+            .ok_or(ApiError::internal("external Widget identity is missing"))?;
+        let external_user =
+            serde_json::from_value::<ExternalUserContextDto>(credential.profile_snapshot.clone())
+                .map_err(|_| ApiError::internal("external Widget profile is invalid"))?;
+
+        let (selected_hub_session_id, selected_integration_session_id) =
+            if req.integration_session_id.is_some() || req.hub_session_id.is_some() {
+                let selected = load_widget_scoped_session_tx(
+                    &mut tx,
+                    &credential,
+                    req.integration_session_id,
+                    req.hub_session_id,
+                    true,
+                )
+                .await?;
+                (
+                    selected.hub_session_id,
+                    selected
+                        .integration_session_id
+                        .expect("external Widget Session has an Integration Session"),
+                )
+            } else {
+                let retried_session =
+                    if let Some(client_message_key) = client_message_key.as_deref() {
+                        sqlx::query_as::<_, (Uuid, Uuid)>(
+                            "SELECT integration.id, integration.hub_session_id
+                         FROM runs
+                         JOIN hub_session_messages AS message
+                           ON message.session_id = runs.hub_session_id
+                          AND message.run_id = runs.id
+                         JOIN integration_sessions AS integration
+                           ON integration.id = runs.integration_session_id
+                          AND integration.hub_session_id = runs.hub_session_id
+                         WHERE runs.widget_session_id = $1
+                           AND runs.source = 'widget'
+                           AND message.client_message_key = $2
+                         ORDER BY message.accepted_at, message.id
+                         LIMIT 1",
+                        )
+                        .bind(credential.id)
+                        .bind(client_message_key)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                    } else {
+                        None
+                    };
+                if let Some((integration_session_id, hub_session_id)) = retried_session {
+                    let selected = load_widget_scoped_session_tx(
+                        &mut tx,
+                        &credential,
+                        Some(integration_session_id),
+                        Some(hub_session_id),
+                        true,
+                    )
+                    .await?;
+                    (
+                        selected.hub_session_id,
+                        selected
+                            .integration_session_id
+                            .expect("external Widget Session has an Integration Session"),
+                    )
+                } else {
+                    let hub_session_id = Uuid::new_v4();
+                    sqlx::query(
+                        "INSERT INTO hub_sessions
+                             (id, owner_id, agent_id, origin_kind, origin_platform_id,
+                              origin_tenant_id, origin_external_identity_id, lifecycle_status)
+                         VALUES ($1, $2, $3, 'external', $4, $5, $6,
+                                 'waiting_for_runtime')",
+                    )
+                    .bind(hub_session_id)
+                    .bind(credential.owner_id)
+                    .bind(credential.agent_id)
+                    .bind(external_platform_id)
+                    .bind(external_tenant_id)
+                    .bind(external_identity_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    let integration_session_id = Uuid::new_v4();
+                    sqlx::query(
+                        "INSERT INTO integration_sessions
+                             (id, oauth_app_id, agent_id, owner_id, external_user_id,
+                              tool_definitions, metadata, hub_session_id)
+                         VALUES ($1, $2, $3, $4, $5, '[]'::jsonb, '{}'::jsonb, $6)",
+                    )
+                    .bind(integration_session_id)
+                    .bind(oauth_app_id)
+                    .bind(credential.agent_id)
+                    .bind(credential.owner_id)
+                    .bind(external_user_id)
+                    .bind(hub_session_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    (hub_session_id, integration_session_id)
+                }
+            };
+        (
+            selected_hub_session_id,
+            Some(selected_integration_session_id),
+            Some(external_user),
+        )
+    } else {
+        let hub_session_id = credential
+            .hub_session_id
+            .ok_or(ApiError::unauthorized("invalid embed session"))?;
+        if req.integration_session_id.is_some()
+            || req
+                .hub_session_id
+                .is_some_and(|requested| requested != hub_session_id)
+        {
+            return Err(ApiError::bad_request(
+                "embed token is bound to another session",
+            ));
+        }
+        (hub_session_id, None, None)
+    };
     let accepted = accept_session_message_tx(
         &mut tx,
         AcceptSessionMessage {
             session_id: hub_session_id,
-            agent_id,
-            owner_id,
+            agent_id: credential.agent_id,
+            owner_id: credential.owner_id,
             content: req.message,
             payload: json!({}),
             role: "user".into(),
             message_kind: "message".into(),
             requested_delivery_mode: "next_turn".into(),
-            client_message_key: req.client_message_key,
+            client_message_key,
             source: "widget".into(),
             automation_id: None,
-            integration_session_id: None,
+            integration_session_id,
             parent_run_id: req.parent_run_id,
             continuation_turn_id: None,
-            model_subject_type: if source_integration_app_id.is_some() {
+            model_subject_type: if credential.oauth_app_id.is_some() {
                 "integration_app".into()
             } else {
                 "user".into()
             },
-            model_subject_user_id: source_integration_app_id.is_none().then_some(owner_id),
-            model_source_integration_app_id: source_integration_app_id,
+            model_subject_user_id: credential
+                .oauth_app_id
+                .is_none()
+                .then_some(credential.owner_id),
+            model_source_integration_app_id: credential.oauth_app_id,
+            external_user_context,
         },
     )
     .await?;
@@ -6959,13 +7710,13 @@ async fn create_widget_run(
         .run
         .ok_or(ApiError::internal("widget message did not schedule a run"))?;
     sqlx::query("UPDATE runs SET widget_session_id = $1 WHERE id = $2")
-        .bind(widget_session_id)
+        .bind(credential.id)
         .bind(run.id)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("UPDATE embed_sessions SET last_run_id = $1 WHERE token_hash = $2")
+    sqlx::query("UPDATE embed_sessions SET last_run_id = $1 WHERE id = $2")
         .bind(run.id)
-        .bind(sha256_hex(&token))
+        .bind(credential.id)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -6980,61 +7731,19 @@ async fn stop_widget_run(
     let token = embed_token_from_headers(&headers)
         .ok_or(ApiError::unauthorized("missing embed session"))?;
     let mut tx = state.pool.begin().await?;
-    let session = sqlx::query(
-        "SELECT embed.id, embed.hub_session_id
-         FROM embed_sessions AS embed
-         JOIN agents AS agent
-           ON agent.id = embed.agent_id AND agent.deleted_at IS NULL
-         JOIN hub_sessions AS hub
-           ON hub.id = embed.hub_session_id
-          AND hub.owner_id = embed.owner_id
-          AND hub.agent_id = embed.agent_id
-          AND hub.origin_kind = 'hub_native'
-         WHERE embed.token_hash = $1 AND embed.expires_at > now()
-           AND (
-               embed.oauth_app_id IS NULL
-               OR EXISTS (
-                   SELECT 1
-                   FROM oauth_apps AS app
-                   JOIN users AS app_owner
-                     ON app_owner.id = app.owner_id
-                    AND app_owner.deletion_requested_at IS NULL
-                   JOIN authentication_channels AS channel
-                     ON channel.id = app.authentication_channel_id
-                    AND channel.platform_id = app.external_platform_id
-                    AND channel.enabled = true AND channel.trusted_email = true
-                   JOIN integration_app_agents AS delegated
-                     ON delegated.app_id = app.id AND delegated.agent_id = agent.id
-                   WHERE app.id = embed.oauth_app_id
-                     AND app.deleted_at IS NULL AND app.client_secret_hash IS NOT NULL
-                     AND (agent.owner_id = app.owner_id OR agent.visibility = 'public'
-                          OR (agent.visibility = 'public_to'
-                              AND app.owner_id = ANY(agent.public_to)))
-               )
-           )
-         FOR UPDATE OF embed",
-    )
-    .bind(sha256_hex(&token))
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or(ApiError::unauthorized("invalid embed session"))?;
-    let widget_session_id: Uuid = session.get("id");
-    let hub_session_id: Uuid = session.get("hub_session_id");
-    let scoped_run: bool = sqlx::query_scalar(
-        "SELECT EXISTS (
-             SELECT 1 FROM runs
-             WHERE id = $1 AND hub_session_id = $2
-               AND widget_session_id = $3
-         )",
+    let credential = lock_widget_credential_tx(&mut tx, &token).await?;
+    let hub_session_id: Uuid = sqlx::query_scalar(
+        "SELECT hub_session_id FROM runs
+         WHERE id = $1 AND agent_id = $2 AND owner_id = $3
+           AND widget_session_id = $4",
     )
     .bind(run_id)
-    .bind(hub_session_id)
-    .bind(widget_session_id)
-    .fetch_one(&mut *tx)
-    .await?;
-    if !scoped_run {
-        return Err(ApiError::not_found("run not found"));
-    }
+    .bind(credential.agent_id)
+    .bind(credential.owner_id)
+    .bind(credential.id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::not_found("run not found"))?;
     let run = request_run_interrupt_tx(&mut tx, run_id, hub_session_id).await?;
     tx.commit().await?;
     Ok(Json(run))
@@ -7230,6 +7939,7 @@ async fn create_integration_message(
             model_subject_type: model_attribution.subject_type.into(),
             model_subject_user_id: model_attribution.subject_user_id,
             model_source_integration_app_id: model_attribution.source_integration_app_id,
+            external_user_context: None,
         },
     )
     .await?;
@@ -7502,6 +8212,15 @@ async fn submit_integration_tool_result(
         tool_request.tool_name,
         compact_json(&req.result)
     );
+    let external_user_context = sqlx::query_scalar::<_, Option<Value>>(
+        "SELECT external_user_context FROM runs WHERE id = $1",
+    )
+    .bind(tool_request.run_id)
+    .fetch_one(&mut *tx)
+    .await?
+    .map(serde_json::from_value::<ExternalUserContextDto>)
+    .transpose()
+    .map_err(|_| ApiError::internal("Run external user context is invalid"))?;
     let model_attribution = integration_run_model_attribution(&principal);
     let accepted = accept_session_message_tx(
         &mut tx,
@@ -7526,6 +8245,7 @@ async fn submit_integration_tool_result(
             model_subject_type: model_attribution.subject_type.into(),
             model_subject_user_id: model_attribution.subject_user_id,
             model_source_integration_app_id: model_attribution.source_integration_app_id,
+            external_user_context,
         },
     )
     .await?;
@@ -8102,8 +8822,14 @@ async fn runtime_heartbeat(
         for row in refresh_rows {
             let session_id: Uuid = row.get("id");
             let target_revision: i64 = row.get("configuration_refresh_revision");
-            let execution_configuration =
+            let mut execution_configuration =
                 load_agent_execution_configuration_tx(&mut tx, row.get("agent_id")).await?;
+            apply_session_tool_policy_to_configuration_tx(
+                &mut tx,
+                session_id,
+                &mut execution_configuration,
+            )
+            .await?;
             if execution_configuration.revision != target_revision {
                 continue;
             }
@@ -9411,6 +10137,7 @@ fn runtime_claim_agent_sql() -> String {
                 a.model_connection_id AS a_model_connection_id,
                 a.model_id AS a_model_id, a.model_settings AS a_model_settings,
                 a.sandbox_policy AS a_sandbox_policy, a.mcp_allowlist AS a_mcp_allowlist,
+                a.tool_allowlist AS a_tool_allowlist,
                 a.execution_config_revision AS a_execution_config_revision,
                 a.created_at AS a_created_at, a.updated_at AS a_updated_at
          FROM agents a
@@ -9639,6 +10366,8 @@ async fn runtime_claim_run(
         sandbox_policy: agent_row.get("a_sandbox_policy"),
         managed_skill_ids: Vec::new(),
         mcp_allowlist: agent_row.get("a_mcp_allowlist"),
+        tool_allowlist: serde_json::from_value(agent_row.get("a_tool_allowlist"))
+            .expect("Agent tool policy is constrained"),
         is_owner: false,
         can_manage: false,
         can_administer: false,
@@ -9647,6 +10376,7 @@ async fn runtime_claim_run(
         updated_at: agent_row.get("a_updated_at"),
     };
     agent.subagents = load_subagents_tx(&mut tx, agent.id).await?;
+    apply_session_tool_policy_to_agent_tx(&mut tx, hub_session_id, &mut agent).await?;
     let execution_config_revision: i64 = agent_row.get("a_execution_config_revision");
     let skill_rows = sqlx::query(
         "SELECT s.id, s.name, s.description, s.content, s.revision,
@@ -9702,7 +10432,16 @@ async fn runtime_claim_run(
         }),
         (None, _) => None,
     };
-    let integration_context = load_integration_context_for_run(&mut tx, &run).await?;
+    let mut integration_context = load_integration_context_for_run(&mut tx, &run).await?;
+    if !agent
+        .tool_allowlist
+        .iter()
+        .any(|tool| tool == "integration")
+    {
+        if let Some(context) = &mut integration_context {
+            context.tools = json!([]);
+        }
+    }
     tx.commit().await?;
 
     Ok(Json(ClaimRunResponse {
@@ -9952,7 +10691,9 @@ async fn runtime_complete_session_command(
             .fetch_optional(&mut *tx)
             .await?
             .ok_or(ApiError::not_found("agent not found"))?;
-        let configuration = load_agent_execution_configuration_tx(&mut tx, agent_id).await?;
+        let mut configuration = load_agent_execution_configuration_tx(&mut tx, agent_id).await?;
+        apply_session_tool_policy_to_configuration_tx(&mut tx, session_id, &mut configuration)
+            .await?;
         let current_fingerprint = execution_configuration_fingerprint(&configuration)
             .map_err(|error| ApiError::internal(error.to_string()))?;
         let target_revision: i64 = sqlx::query_scalar(
@@ -10157,14 +10898,14 @@ async fn runtime_complete_session_command(
                           model_subject_type, model_subject_user_id,
                           model_source_integration_app_id,
                           automation_id, integration_session_id, parent_run_id,
-                          widget_session_id,
+                          widget_session_id, external_user_context,
                           hub_session_id, hub_message_id, hub_turn_id,
                           session_ownership_generation)
                      SELECT $1, agent_id, owner_id, 'pending', $2, source,
                             model_subject_type, model_subject_user_id,
                             model_source_integration_app_id,
                             automation_id, integration_session_id, id,
-                            widget_session_id,
+                            widget_session_id, external_user_context,
                             hub_session_id, $3, $4, $5
                      FROM runs WHERE id = $6 AND hub_session_id = $7",
                 )
@@ -10194,6 +10935,10 @@ async fn runtime_complete_session_command(
                      integration_session_id = COALESCE(
                          next.integration_session_id,
                          previous.integration_session_id
+                     ),
+                     external_user_context = COALESCE(
+                         next.external_user_context,
+                         previous.external_user_context
                      ),
                      updated_at = now()
                  FROM runs AS previous
@@ -11535,6 +12280,40 @@ async fn insert_embed_session_tx(
     Ok(embed_session_id)
 }
 
+async fn insert_widget_access_session_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    oauth_app_id: Uuid,
+    agent_id: Uuid,
+    owner_id: Uuid,
+    external_identity_id: Uuid,
+    external_user: &ExternalUserContextDto,
+    token: &str,
+    expires_at: DateTime<Utc>,
+) -> Result<Uuid, ApiError> {
+    let profile_snapshot = serde_json::to_value(external_user)
+        .map_err(|_| ApiError::internal("external user profile could not be encoded"))?;
+    sqlx::query_scalar(
+        "INSERT INTO embed_sessions
+             (token_hash, agent_id, owner_id, oauth_app_id, expires_at,
+              external_tenant_id, external_user_id, external_identity_id,
+              profile_snapshot)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         RETURNING id",
+    )
+    .bind(sha256_hex(token))
+    .bind(agent_id)
+    .bind(owner_id)
+    .bind(oauth_app_id)
+    .bind(expires_at)
+    .bind(&external_user.tenant_id)
+    .bind(&external_user.external_user_id)
+    .bind(external_identity_id)
+    .bind(profile_snapshot)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(Into::into)
+}
+
 fn normalize_client_message_key(value: Option<&str>) -> Result<Option<String>, ApiError> {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
@@ -11572,6 +12351,135 @@ fn normalize_external_user_id(value: &str) -> Result<String, ApiError> {
         return Err(ApiError::bad_request("valid external user id is required"));
     }
     Ok(value.to_owned())
+}
+
+fn widget_client_credentials(headers: &HeaderMap) -> Result<(String, String), ApiError> {
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Basic "))
+        .ok_or(ApiError::unauthorized("invalid oauth client"))?;
+    let decoded = STANDARD
+        .decode(authorization)
+        .map_err(|_| ApiError::unauthorized("invalid oauth client"))?;
+    let credentials = std::str::from_utf8(&decoded)
+        .map_err(|_| ApiError::unauthorized("invalid oauth client"))?;
+    let (client_id, client_secret) = credentials
+        .split_once(':')
+        .ok_or(ApiError::unauthorized("invalid oauth client"))?;
+    if client_id.trim().is_empty()
+        || client_id.len() > 256
+        || client_id.chars().any(char::is_control)
+        || client_secret.is_empty()
+        || client_secret.len() > 1024
+    {
+        return Err(ApiError::unauthorized("invalid oauth client"));
+    }
+    Ok((client_id.to_owned(), client_secret.to_owned()))
+}
+
+fn normalize_widget_user_profile(
+    mut profile: WidgetUserProfileDto,
+) -> Result<WidgetUserProfileDto, ApiError> {
+    profile.username = validate_external_username(profile.username.as_deref())?;
+    profile.display_name =
+        normalize_widget_profile_text(profile.display_name.as_deref(), "display name")?;
+    profile.email = profile.email.as_deref().map(normalize_email).transpose()?;
+    profile.attributes = normalize_widget_attributes(profile.attributes)?;
+    Ok(profile)
+}
+
+fn normalize_widget_profile_text(
+    value: Option<&str>,
+    field: &str,
+) -> Result<Option<String>, ApiError> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if value.chars().count() > 256 || value.chars().any(char::is_control) {
+        return Err(ApiError::bad_request(format!(
+            "valid external {field} is required"
+        )));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+fn normalize_widget_attributes(value: Value) -> Result<Value, ApiError> {
+    let value = if value.is_null() { json!({}) } else { value };
+    if !value.is_object() {
+        return Err(ApiError::bad_request(
+            "external user attributes must be a JSON object",
+        ));
+    }
+    if serde_json::to_vec(&value)
+        .map_err(|_| ApiError::bad_request("external user attributes are invalid"))?
+        .len()
+        > 8 * 1024
+    {
+        return Err(ApiError::bad_request(
+            "external user attributes are too large",
+        ));
+    }
+    let mut values = 0;
+    validate_widget_attribute_value(&value, 0, &mut values)?;
+    Ok(value)
+}
+
+fn validate_widget_attribute_value(
+    value: &Value,
+    depth: usize,
+    value_count: &mut usize,
+) -> Result<(), ApiError> {
+    if depth > 4 {
+        return Err(ApiError::bad_request(
+            "external user attributes are nested too deeply",
+        ));
+    }
+    *value_count += 1;
+    if *value_count > 128 {
+        return Err(ApiError::bad_request(
+            "external user attributes contain too many values",
+        ));
+    }
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => Ok(()),
+        Value::String(value) => {
+            if value.chars().count() > 1024 || value.chars().any(char::is_control) {
+                return Err(ApiError::bad_request(
+                    "external user attribute text is invalid",
+                ));
+            }
+            Ok(())
+        }
+        Value::Array(items) => {
+            if items.len() > 32 {
+                return Err(ApiError::bad_request(
+                    "external user attributes contain too many values",
+                ));
+            }
+            for value in items {
+                validate_widget_attribute_value(value, depth + 1, value_count)?;
+            }
+            Ok(())
+        }
+        Value::Object(attributes) => {
+            if attributes.len() > 32 {
+                return Err(ApiError::bad_request(
+                    "external user attributes contain too many values",
+                ));
+            }
+            for (key, value) in attributes {
+                if key.is_empty() || key.chars().count() > 128 || key.chars().any(char::is_control)
+                {
+                    return Err(ApiError::bad_request(
+                        "external user attribute key is invalid",
+                    ));
+                }
+                validate_widget_attribute_value(value, depth + 1, value_count)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 async fn accept_session_message_tx(
@@ -11971,14 +12879,14 @@ async fn move_queued_steers_to_next_turn_tx(
                   model_subject_type, model_subject_user_id,
                   model_source_integration_app_id,
                   automation_id, integration_session_id, parent_run_id,
-                  widget_session_id,
+                  widget_session_id, external_user_context,
                   hub_session_id, hub_message_id, hub_turn_id,
                   session_ownership_generation)
              SELECT $1, agent_id, owner_id, 'pending', $2, source,
                     model_subject_type, model_subject_user_id,
                     model_source_integration_app_id,
                     automation_id, integration_session_id, id,
-                    widget_session_id,
+                    widget_session_id, external_user_context,
                     hub_session_id, $3, $4, $5
              FROM runs WHERE id = $6 AND hub_session_id = $7",
         )
@@ -12005,6 +12913,10 @@ async fn move_queued_steers_to_next_turn_tx(
              integration_session_id = COALESCE(
                  next.integration_session_id,
                  previous.integration_session_id
+             ),
+             external_user_context = COALESCE(
+                 next.external_user_context,
+                 previous.external_user_context
              ),
              updated_at = now()
          FROM runs AS previous
@@ -12083,20 +12995,27 @@ async fn insert_session_run_tx(
     parent_run_id: Option<Uuid>,
 ) -> Result<Uuid, ApiError> {
     let run_id = Uuid::new_v4();
+    let external_user_context = request
+        .external_user_context
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|_| ApiError::internal("external user context could not be encoded"))?;
     let inserted = sqlx::query(
         "INSERT INTO runs
              (id, agent_id, owner_id, status, initial_message, source,
               model_subject_type, model_subject_user_id,
               model_source_integration_app_id, automation_id,
               integration_session_id, parent_run_id,
-              hub_session_id, hub_turn_id, session_ownership_generation)
+              hub_session_id, hub_turn_id, session_ownership_generation,
+              external_user_context)
          SELECT $1, sessions.agent_id, sessions.owner_id, 'pending', $2, $3,
                 $4, $5, $6, $7, $8, $9, sessions.id, $10,
-                sessions.ownership_generation
+                sessions.ownership_generation, $11
          FROM hub_sessions AS sessions
-         WHERE sessions.id = $11
-           AND sessions.owner_id = $12
-           AND sessions.agent_id = $13",
+         WHERE sessions.id = $12
+           AND sessions.owner_id = $13
+           AND sessions.agent_id = $14",
     )
     .bind(run_id)
     .bind(request.content.trim())
@@ -12108,6 +13027,7 @@ async fn insert_session_run_tx(
     .bind(request.integration_session_id)
     .bind(parent_run_id)
     .bind(turn_id)
+    .bind(external_user_context)
     .bind(request.session_id)
     .bind(request.owner_id)
     .bind(request.agent_id)
@@ -12220,6 +13140,7 @@ async fn insert_run_for_agent_tx(
             model_subject_type: "user".into(),
             model_subject_user_id: Some(owner_id),
             model_source_integration_app_id: None,
+            external_user_context: None,
         },
     )
     .await?;
@@ -12333,6 +13254,7 @@ fn validate_agent_payload(req: &UpdateAgentRequest) -> Result<(), ApiError> {
     if req.name.trim().is_empty() {
         return Err(ApiError::bad_request("agent name is required"));
     }
+    normalize_agent_tool_allowlist(&req.tool_allowlist)?;
     let Some(model_policy) = req.model_policy.as_object() else {
         return Err(ApiError::bad_request("model policy must be a JSON object"));
     };
@@ -13166,6 +14088,73 @@ struct OAuthAppRecord {
     redirect_uris: Value,
     external_platform_id: Uuid,
     authentication_channel_id: Uuid,
+    widget_history_enabled: bool,
+    login_required: bool,
+    allowed_origins: Vec<String>,
+    tool_allowlist: Option<Vec<String>>,
+}
+
+#[derive(Debug)]
+struct WidgetCredential {
+    id: Uuid,
+    agent_id: Uuid,
+    agent_owner_id: Uuid,
+    owner_id: Uuid,
+    hub_session_id: Option<Uuid>,
+    oauth_app_id: Option<Uuid>,
+    external_platform_id: Option<Uuid>,
+    external_tenant_id: Option<String>,
+    external_user_id: Option<String>,
+    external_identity_id: Option<Uuid>,
+    profile_snapshot: Value,
+    expires_at: DateTime<Utc>,
+    history_enabled: bool,
+    anonymous: bool,
+}
+
+impl WidgetCredential {
+    fn is_anonymous(&self) -> bool {
+        self.anonymous
+    }
+
+    fn is_external(&self) -> bool {
+        !self.anonymous && self.oauth_app_id.is_some() && self.external_identity_id.is_some()
+    }
+
+    fn external_scope(&self) -> Result<(Uuid, Uuid, &str, &str, Uuid), ApiError> {
+        Ok((
+            self.oauth_app_id
+                .ok_or(ApiError::unauthorized("invalid external Widget credential"))?,
+            self.external_platform_id
+                .ok_or(ApiError::unauthorized("invalid external Widget credential"))?,
+            self.external_tenant_id
+                .as_deref()
+                .ok_or(ApiError::unauthorized("invalid external Widget credential"))?,
+            self.external_user_id
+                .as_deref()
+                .ok_or(ApiError::unauthorized("invalid external Widget credential"))?,
+            self.external_identity_id
+                .ok_or(ApiError::unauthorized("invalid external Widget credential"))?,
+        ))
+    }
+}
+
+fn widget_session_locator(
+    credential: &WidgetCredential,
+    session_id: Uuid,
+) -> (Option<Uuid>, Option<Uuid>) {
+    if credential.is_external() {
+        (Some(session_id), None)
+    } else {
+        (None, Some(session_id))
+    }
+}
+
+#[derive(Debug)]
+struct WidgetScopedSession {
+    integration_session_id: Option<Uuid>,
+    hub_session_id: Uuid,
+    widget_session_id: Uuid,
 }
 
 #[derive(Debug)]
@@ -13552,7 +14541,7 @@ async fn load_agent_for_user(
     let row = sqlx::query(
         "SELECT a.id, a.owner_id, a.name, a.instructions, a.visibility, a.public_to,
                 a.runtime_id, a.model_connection_id, a.model_id, a.model_settings,
-                a.model_policy, a.sandbox_policy, a.mcp_allowlist,
+                a.model_policy, a.sandbox_policy, a.mcp_allowlist, a.tool_allowlist,
                 a.created_at, a.updated_at
          FROM agents AS a
          JOIN users AS owner ON owner.id = a.owner_id
@@ -13583,7 +14572,7 @@ async fn load_agent_owned_by_user(
     let row = sqlx::query(
         "SELECT id, owner_id, name, instructions, visibility, public_to, runtime_id,
                 model_connection_id, model_id, model_settings,
-                model_policy, sandbox_policy, mcp_allowlist, created_at, updated_at
+                model_policy, sandbox_policy, mcp_allowlist, tool_allowlist, created_at, updated_at
          FROM agents
          WHERE id = $1 AND owner_id = $2 AND deleted_at IS NULL",
     )
@@ -13605,7 +14594,7 @@ async fn load_agent_manageable_by_user(
     let row = sqlx::query(
         "SELECT a.id, a.owner_id, a.name, a.instructions, a.visibility, a.public_to,
                 a.runtime_id, a.model_connection_id, a.model_id, a.model_settings,
-                a.model_policy, a.sandbox_policy, a.mcp_allowlist,
+                a.model_policy, a.sandbox_policy, a.mcp_allowlist, a.tool_allowlist,
                 a.created_at, a.updated_at
          FROM agents AS a
          JOIN users AS owner ON owner.id = a.owner_id
@@ -14003,6 +14992,7 @@ fn agent_execution_configuration_changed(
         || existing.sandbox_policy != request.sandbox_policy
         || normalized_unordered_entries(&existing.mcp_allowlist)
             != normalized_unordered_entries(&request.mcp_allowlist)
+        || existing.tool_allowlist != request.tool_allowlist
         || existing_skill_ids != requested_skill_ids
 }
 
@@ -14084,6 +15074,7 @@ fn is_admin_role(role: &str) -> bool {
     matches!(role, "admin" | "super_admin")
 }
 
+#[cfg(test)]
 fn widget_agent_from_agent(agent: AgentDto) -> WidgetAgentDto {
     // iframe widget 只需要展示和发起消息，不暴露控制面的私有配置。
     WidgetAgentDto {
@@ -14217,7 +15208,113 @@ fn build_agent_execution_configuration(
         sandbox_policy: agent.sandbox_policy.clone(),
         skills: skills.into_values().collect(),
         mcp_allowlist: agent.mcp_allowlist.clone(),
+        tool_allowlist: agent.tool_allowlist.clone(),
     })
+}
+
+#[derive(Debug)]
+struct SessionToolPolicy {
+    public_widget: bool,
+    app_tool_allowlist: Option<Vec<String>>,
+}
+
+async fn load_session_tool_policy_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: Uuid,
+) -> Result<SessionToolPolicy, ApiError> {
+    let row = sqlx::query(
+        "SELECT hub.origin_kind,
+                COALESCE(
+                    (
+                        SELECT app.tool_allowlist
+                        FROM integration_sessions AS integration
+                        JOIN oauth_apps AS app ON app.id = integration.oauth_app_id
+                        WHERE integration.hub_session_id = hub.id
+                          AND app.deleted_at IS NULL
+                        ORDER BY integration.created_at DESC
+                        LIMIT 1
+                    ),
+                    (
+                        SELECT app.tool_allowlist
+                        FROM embed_sessions AS embed
+                        JOIN oauth_apps AS app ON app.id = embed.oauth_app_id
+                        WHERE embed.hub_session_id = hub.id
+                          AND app.deleted_at IS NULL
+                        LIMIT 1
+                    )
+                ) AS app_tool_allowlist
+         FROM hub_sessions AS hub
+         WHERE hub.id = $1",
+    )
+    .bind(session_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ApiError::not_found("Hub Session not found"))?;
+    let origin_kind: String = row.get("origin_kind");
+    let app_tool_allowlist = row
+        .get::<Option<Value>, _>("app_tool_allowlist")
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| ApiError::internal("stored App tool policy is invalid"))?;
+    Ok(SessionToolPolicy {
+        public_widget: origin_kind == "public_widget",
+        app_tool_allowlist,
+    })
+}
+
+fn apply_session_tool_policy(
+    tools: &mut Vec<String>,
+    sandbox_policy: &mut Value,
+    mcp_allowlist: &mut Value,
+    policy: &SessionToolPolicy,
+) -> Result<(), ApiError> {
+    let mut effective = normalize_agent_tool_allowlist(tools)?;
+    if let Some(app_tool_allowlist) = policy.app_tool_allowlist.as_deref() {
+        effective.retain(|tool| app_tool_allowlist.iter().any(|allowed| allowed == tool));
+    }
+    if policy.public_widget {
+        effective.retain(|tool| PUBLIC_WIDGET_TOOL_NAMES.contains(&tool.as_str()));
+        if effective.is_empty() {
+            return Err(ApiError::conflict(
+                "public Widget Agent must enable at least one read-only file tool",
+            ));
+        }
+        *sandbox_policy = json!({ "mode": "read-only", "network_access": false });
+        *mcp_allowlist = json!([]);
+    }
+    if effective.is_empty() {
+        return Err(ApiError::conflict("effective Agent tool policy is empty"));
+    }
+    *tools = effective;
+    Ok(())
+}
+
+async fn apply_session_tool_policy_to_agent_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: Uuid,
+    agent: &mut AgentDto,
+) -> Result<(), ApiError> {
+    let policy = load_session_tool_policy_tx(tx, session_id).await?;
+    apply_session_tool_policy(
+        &mut agent.tool_allowlist,
+        &mut agent.sandbox_policy,
+        &mut agent.mcp_allowlist,
+        &policy,
+    )
+}
+
+async fn apply_session_tool_policy_to_configuration_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: Uuid,
+    configuration: &mut AgentExecutionConfigurationDto,
+) -> Result<(), ApiError> {
+    let policy = load_session_tool_policy_tx(tx, session_id).await?;
+    apply_session_tool_policy(
+        &mut configuration.tool_allowlist,
+        &mut configuration.sandbox_policy,
+        &mut configuration.mcp_allowlist,
+        &policy,
+    )
 }
 
 async fn load_agent_execution_configuration_tx(
@@ -14227,7 +15324,7 @@ async fn load_agent_execution_configuration_tx(
     let row = sqlx::query(
         "SELECT id, owner_id, name, instructions, visibility, public_to, runtime_id,
                 model_connection_id, model_id, model_settings,
-                model_policy, sandbox_policy, mcp_allowlist, execution_config_revision,
+                model_policy, sandbox_policy, mcp_allowlist, tool_allowlist, execution_config_revision,
                 created_at, updated_at
          FROM agents
          WHERE id = $1 AND deleted_at IS NULL",
@@ -14406,6 +15503,139 @@ fn validate_integration_app_payload(
         return Err(ApiError::bad_request(
             "integration app agent ids must contain at most 100 unique values",
         ));
+    }
+    Ok(())
+}
+
+fn normalize_agent_tool_allowlist(value: &[String]) -> Result<Vec<String>, ApiError> {
+    let requested = value
+        .iter()
+        .map(|name| name.trim())
+        .collect::<BTreeSet<_>>();
+    if requested.is_empty() {
+        return Err(ApiError::bad_request(
+            "at least one Agent tool must be enabled",
+        ));
+    }
+    if requested.len() != value.len()
+        || requested
+            .iter()
+            .any(|name| !AGENT_TOOL_NAMES.contains(name))
+    {
+        return Err(ApiError::bad_request("unsupported or duplicate Agent tool"));
+    }
+    Ok(AGENT_TOOL_NAMES
+        .iter()
+        .filter(|name| requested.contains(**name))
+        .map(|name| (*name).to_owned())
+        .collect())
+}
+
+fn normalize_allowed_origins(value: &[String]) -> Result<Vec<String>, ApiError> {
+    let mut origins = BTreeSet::new();
+    for raw in value {
+        let raw = raw.trim();
+        if raw.is_empty() || raw.contains('*') {
+            return Err(ApiError::bad_request(
+                "Widget origin must be an exact HTTP(S) Origin",
+            ));
+        }
+        let url = Url::parse(raw).map_err(|_| ApiError::bad_request("Widget origin is invalid"))?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(ApiError::bad_request(
+                "Widget origin must be an exact HTTP(S) Origin without a path",
+            ));
+        }
+        origins.insert(url.origin().ascii_serialization());
+    }
+    Ok(origins.into_iter().collect())
+}
+
+fn validate_public_widget_settings(
+    login_required: bool,
+    widget_history_enabled: bool,
+    allowed_origins: &[String],
+    tool_allowlist: Option<&[String]>,
+    agent_ids: &[Uuid],
+    role: &str,
+) -> Result<(), ApiError> {
+    if login_required {
+        return Ok(());
+    }
+    if !is_admin_role(role) {
+        return Err(ApiError::forbidden(
+            "administrator permission is required for public Widgets",
+        ));
+    }
+    if allowed_origins.is_empty() {
+        return Err(ApiError::bad_request(
+            "public Widget requires at least one allowed Origin",
+        ));
+    }
+    if widget_history_enabled {
+        return Err(ApiError::bad_request("public Widget cannot enable history"));
+    }
+    if agent_ids.len() != 1 {
+        return Err(ApiError::bad_request(
+            "public Widget requires exactly one Agent",
+        ));
+    }
+    if tool_allowlist.is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| !PUBLIC_WIDGET_TOOL_NAMES.contains(&tool.as_str()))
+    }) {
+        return Err(ApiError::bad_request(
+            "public Widget only permits read-only file tools",
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_integration_app_tool_allowlist_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    agent_ids: &[Uuid],
+    tool_allowlist: Option<&[String]>,
+) -> Result<(), ApiError> {
+    let Some(tool_allowlist) = tool_allowlist else {
+        return Ok(());
+    };
+    if agent_ids.is_empty() {
+        return Err(ApiError::bad_request(
+            "App tool selection requires at least one Agent",
+        ));
+    }
+    let rows = sqlx::query(
+        "SELECT id, tool_allowlist FROM agents
+         WHERE id = ANY($1) AND deleted_at IS NULL
+         FOR SHARE",
+    )
+    .bind(agent_ids)
+    .fetch_all(&mut **tx)
+    .await?;
+    if rows.len() != agent_ids.len() {
+        return Err(ApiError::not_found("agent not found"));
+    }
+    for row in rows {
+        let allowed = normalize_agent_tool_allowlist(
+            &serde_json::from_value::<Vec<String>>(row.get("tool_allowlist"))
+                .map_err(|_| ApiError::internal("stored Agent tool policy is invalid"))?,
+        )?;
+        if tool_allowlist
+            .iter()
+            .any(|tool| !allowed.iter().any(|allowed_tool| allowed_tool == tool))
+        {
+            return Err(ApiError::bad_request(
+                "App tools can only further restrict its Agents",
+            ));
+        }
     }
     Ok(())
 }
@@ -14777,7 +16007,9 @@ async fn load_integration_app(
 ) -> Result<IntegrationAppDto, ApiError> {
     let row = sqlx::query(
         "SELECT id, owner_id, name, client_id, external_platform_id,
-                authentication_channel_id, redirect_uris, created_at, updated_at
+                authentication_channel_id, redirect_uris, widget_history_enabled,
+                login_required, allowed_origins, tool_allowlist,
+                created_at, updated_at
          FROM oauth_apps
          WHERE id = $1 AND owner_id = $2 AND deleted_at IS NULL",
     )
@@ -14802,7 +16034,8 @@ async fn load_oauth_app_by_client_id(
 ) -> Result<OAuthAppRecord, ApiError> {
     let row = sqlx::query(
         "SELECT id, owner_id, client_secret_hash, redirect_uris,
-                external_platform_id, authentication_channel_id
+                external_platform_id, authentication_channel_id, widget_history_enabled,
+                login_required, allowed_origins, tool_allowlist
          FROM oauth_apps
          WHERE client_id = $1 AND deleted_at IS NULL
            AND client_secret_hash IS NOT NULL",
@@ -14818,7 +16051,61 @@ async fn load_oauth_app_by_client_id(
         redirect_uris: row.get("redirect_uris"),
         external_platform_id: row.get("external_platform_id"),
         authentication_channel_id: row.get("authentication_channel_id"),
+        widget_history_enabled: row.get("widget_history_enabled"),
+        login_required: row.get("login_required"),
+        allowed_origins: serde_json::from_value(row.get("allowed_origins"))
+            .map_err(|_| ApiError::internal("stored Widget origins are invalid"))?,
+        tool_allowlist: row
+            .get::<Option<Value>, _>("tool_allowlist")
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|_| ApiError::internal("stored App tool policy is invalid"))?,
     })
+}
+
+async fn load_public_widget_app_by_client_id(
+    pool: &PgPool,
+    client_id: &str,
+) -> Result<OAuthAppRecord, ApiError> {
+    let app = load_oauth_app_by_client_id(pool, client_id).await?;
+    if app.login_required {
+        return Err(ApiError::not_found("public Widget application not found"));
+    }
+    if app.allowed_origins.is_empty() {
+        return Err(ApiError::conflict("public Widget has no allowed Origins"));
+    }
+    if app.tool_allowlist.as_ref().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| !PUBLIC_WIDGET_TOOL_NAMES.contains(&tool.as_str()))
+    }) {
+        return Err(ApiError::conflict("public Widget tool policy is invalid"));
+    }
+    let agent_count: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+         FROM integration_app_agents AS delegated
+         JOIN agents AS agent ON agent.id = delegated.agent_id
+         WHERE delegated.app_id = $1 AND agent.deleted_at IS NULL",
+    )
+    .bind(app.id)
+    .fetch_one(pool)
+    .await?;
+    if agent_count != 1 {
+        return Err(ApiError::conflict(
+            "public Widget must delegate exactly one active Agent",
+        ));
+    }
+    Ok(app)
+}
+
+fn visitor_key_hash(visitor_key: &str) -> Result<String, ApiError> {
+    let visitor_key = visitor_key.trim();
+    if !(16..=512).contains(&visitor_key.len()) || visitor_key.chars().any(char::is_control) {
+        return Err(ApiError::bad_request(
+            "public Widget visitor key is invalid",
+        ));
+    }
+    Ok(sha256_hex(visitor_key))
 }
 
 async fn load_claim_session_context_tx(
@@ -14927,10 +16214,22 @@ async fn load_integration_context_for_run(
     let Some(session_id) = run.integration_session_id else {
         return Ok(None);
     };
-    let session = sqlx::query("SELECT tool_definitions FROM integration_sessions WHERE id = $1")
-        .bind(session_id)
-        .fetch_one(&mut **tx)
-        .await?;
+    let session = sqlx::query(
+        "SELECT integration.tool_definitions, runs.external_user_context
+         FROM integration_sessions AS integration
+         JOIN runs ON runs.id = $2
+          AND runs.integration_session_id = integration.id
+         WHERE integration.id = $1",
+    )
+    .bind(session_id)
+    .bind(run.id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let external_user = session
+        .get::<Option<Value>, _>("external_user_context")
+        .map(serde_json::from_value::<ExternalUserContextDto>)
+        .transpose()
+        .map_err(|_| ApiError::internal("Run external user context is invalid"))?;
     let attachment_rows = sqlx::query(
         "SELECT kind, name, content_type, size_bytes, text, url
          FROM integration_attachments WHERE run_id = $1 ORDER BY created_at ASC",
@@ -14974,6 +16273,7 @@ async fn load_integration_context_for_run(
         tools: session.get("tool_definitions"),
         attachments: Value::Array(attachments),
         tool_result,
+        external_user,
     }))
 }
 
@@ -15705,21 +17005,20 @@ async fn authorize_run_stream(
     run_id: Uuid,
 ) -> Result<(), ApiError> {
     if let Some(token) = embed_token_from_headers(headers) {
-        let (widget_session_id, hub_session_id, agent_id, owner_id) =
-            load_embed_session(&state.pool, &token).await?;
+        let mut tx = state.pool.begin().await?;
+        let credential = load_widget_credential_tx(&mut tx, &token).await?;
         let row: Option<(Uuid,)> = sqlx::query_as(
             "SELECT id FROM runs
              WHERE id = $1 AND agent_id = $2 AND owner_id = $3
-               AND source = 'widget' AND widget_session_id = $4
-               AND hub_session_id = $5",
+               AND source = 'widget' AND widget_session_id = $4",
         )
         .bind(run_id)
-        .bind(agent_id)
-        .bind(owner_id)
-        .bind(widget_session_id)
-        .bind(hub_session_id)
-        .fetch_optional(&state.pool)
+        .bind(credential.agent_id)
+        .bind(credential.owner_id)
+        .bind(credential.id)
+        .fetch_optional(&mut *tx)
         .await?;
+        tx.commit().await?;
         return row
             .map(|_| ())
             .ok_or(ApiError::forbidden("embed session cannot access run"));
@@ -15729,52 +17028,288 @@ async fn authorize_run_stream(
     Ok(())
 }
 
-async fn load_embed_session(
-    pool: &PgPool,
+async fn load_widget_credential_tx(
+    tx: &mut Transaction<'_, Postgres>,
     token: &str,
-) -> Result<(Uuid, Uuid, Uuid, Uuid), ApiError> {
+) -> Result<WidgetCredential, ApiError> {
     let row = sqlx::query(
-        "SELECT embed.id, embed.hub_session_id, embed.agent_id, embed.owner_id
+        "SELECT embed.id, embed.agent_id, agent.owner_id AS agent_owner_id,
+                embed.owner_id, embed.hub_session_id, embed.oauth_app_id,
+                app.external_platform_id, embed.external_tenant_id,
+                embed.external_user_id, embed.external_identity_id,
+                embed.profile_snapshot, embed.expires_at,
+                COALESCE(app.widget_history_enabled, false) AS history_enabled,
+                embed.anonymous
          FROM embed_sessions AS embed
          JOIN agents AS agent ON agent.id = embed.agent_id AND agent.deleted_at IS NULL
          JOIN users AS session_owner
            ON session_owner.id = embed.owner_id
           AND session_owner.deletion_requested_at IS NULL
+         LEFT JOIN oauth_apps AS app ON app.id = embed.oauth_app_id
          WHERE embed.token_hash = $1 AND embed.expires_at > now()
            AND (
                embed.oauth_app_id IS NULL
-               OR EXISTS (
-                   SELECT 1
-                   FROM oauth_apps AS app
-                   JOIN users AS app_owner
-                     ON app_owner.id = app.owner_id
-                    AND app_owner.deletion_requested_at IS NULL
-                   JOIN authentication_channels AS channel
-                     ON channel.id = app.authentication_channel_id
-                    AND channel.platform_id = app.external_platform_id
-                    AND channel.enabled = true AND channel.trusted_email = true
-                   JOIN integration_app_agents AS delegated
-                     ON delegated.app_id = app.id AND delegated.agent_id = agent.id
-                   WHERE app.id = embed.oauth_app_id
-                     AND app.deleted_at IS NULL AND app.client_secret_hash IS NOT NULL
-                     AND (agent.owner_id = app.owner_id OR agent.visibility = 'public'
-                          OR (agent.visibility = 'public_to'
-                              AND app.owner_id = ANY(agent.public_to)))
+               OR (
+                   app.deleted_at IS NULL AND app.client_secret_hash IS NOT NULL
+                   AND EXISTS (
+                       SELECT 1 FROM users AS app_owner
+                       WHERE app_owner.id = app.owner_id
+                         AND app_owner.deletion_requested_at IS NULL
+                   )
+                   AND (embed.anonymous = false OR app.login_required = false)
+                   AND EXISTS (
+                       SELECT 1 FROM authentication_channels AS channel
+                       WHERE channel.id = app.authentication_channel_id
+                         AND channel.platform_id = app.external_platform_id
+                         AND channel.enabled = true AND channel.trusted_email = true
+                   )
+                   AND EXISTS (
+                       SELECT 1 FROM integration_app_agents AS delegated
+                       WHERE delegated.app_id = app.id AND delegated.agent_id = agent.id
+                         AND (agent.owner_id = app.owner_id OR agent.visibility = 'public'
+                              OR (agent.visibility = 'public_to'
+                                  AND app.owner_id = ANY(agent.public_to)))
+                   )
+                   AND (
+                       embed.external_identity_id IS NULL
+                       OR EXISTS (
+                           SELECT 1 FROM external_identities AS identity
+                           WHERE identity.id = embed.external_identity_id
+                             AND identity.user_id = embed.owner_id
+                             AND identity.platform_id = app.external_platform_id
+                             AND identity.tenant_id = embed.external_tenant_id
+                             AND identity.external_user_id = embed.external_user_id
+                       )
+                   )
                )
-           )",
+           )
+         ",
     )
     .bind(sha256_hex(token))
-    .fetch_optional(pool)
+    .fetch_optional(&mut **tx)
     .await?;
-    row.map(|row| {
-        (
-            row.get("id"),
-            row.get("hub_session_id"),
-            row.get("agent_id"),
-            row.get("owner_id"),
-        )
+    row.map(widget_credential_from_row)
+        .ok_or(ApiError::unauthorized("invalid embed session"))
+}
+
+async fn load_widget_scoped_session_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    credential: &WidgetCredential,
+    integration_session_id: Option<Uuid>,
+    hub_session_id: Option<Uuid>,
+    lock: bool,
+) -> Result<WidgetScopedSession, ApiError> {
+    if integration_session_id.is_none() && hub_session_id.is_none() {
+        return Err(ApiError::bad_request("Widget Session id is required"));
+    }
+    if credential.is_anonymous() {
+        if integration_session_id.is_some() {
+            return Err(ApiError::bad_request(
+                "public Widget does not use Integration Sessions",
+            ));
+        }
+        let requested_hub_session_id = hub_session_id.ok_or(ApiError::bad_request(
+            "public Widget Session id is required",
+        ))?;
+        let lock_clause = if lock { " FOR UPDATE" } else { "" };
+        let statement = format!(
+            "SELECT id FROM hub_sessions
+             WHERE id = $1 AND id = $2 AND agent_id = $3 AND owner_id = $4
+               AND origin_kind = 'public_widget'{lock_clause}"
+        );
+        let row = sqlx::query(&statement)
+            .bind(requested_hub_session_id)
+            .bind(credential.hub_session_id)
+            .bind(credential.agent_id)
+            .bind(credential.owner_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or(ApiError::not_found("Widget Session not found"))?;
+        return Ok(WidgetScopedSession {
+            integration_session_id: None,
+            hub_session_id: row.get("id"),
+            widget_session_id: credential.id,
+        });
+    }
+    if !credential.is_external() {
+        if integration_session_id.is_some()
+            || hub_session_id != credential.hub_session_id
+            || credential.hub_session_id.is_none()
+        {
+            return Err(ApiError::not_found("Widget Session not found"));
+        }
+        return Ok(WidgetScopedSession {
+            integration_session_id: None,
+            hub_session_id: credential.hub_session_id.expect("checked above"),
+            widget_session_id: credential.id,
+        });
+    }
+    let (
+        oauth_app_id,
+        external_platform_id,
+        external_tenant_id,
+        external_user_id,
+        external_identity_id,
+    ) = credential.external_scope()?;
+    let lock_clause = if lock {
+        " FOR UPDATE OF integration"
+    } else {
+        ""
+    };
+    let statement = format!(
+        "SELECT integration.id, integration.hub_session_id
+         FROM integration_sessions AS integration
+         JOIN hub_sessions AS hub
+           ON hub.id = integration.hub_session_id
+          AND hub.owner_id = integration.owner_id
+          AND hub.agent_id = integration.agent_id
+         WHERE integration.oauth_app_id = $1
+           AND integration.agent_id = $2
+           AND integration.owner_id = $3
+           AND integration.external_user_id = $4
+           AND hub.origin_kind = 'external'
+           AND hub.origin_platform_id = $5
+           AND hub.origin_tenant_id = $6
+           AND hub.origin_external_identity_id = $7
+           AND ($8::uuid IS NULL OR integration.id = $8)
+           AND ($9::uuid IS NULL OR hub.id = $9){lock_clause}"
+    );
+    let row = sqlx::query(&statement)
+        .bind(oauth_app_id)
+        .bind(credential.agent_id)
+        .bind(credential.owner_id)
+        .bind(external_user_id)
+        .bind(external_platform_id)
+        .bind(external_tenant_id)
+        .bind(external_identity_id)
+        .bind(integration_session_id)
+        .bind(hub_session_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(ApiError::not_found("Widget Session not found"))?;
+    Ok(WidgetScopedSession {
+        integration_session_id: Some(row.get("id")),
+        hub_session_id: row.get("hub_session_id"),
+        widget_session_id: credential.id,
     })
-    .ok_or(ApiError::unauthorized("invalid embed session"))
+}
+
+async fn authorize_widget_session(
+    state: &AppState,
+    headers: &HeaderMap,
+    session_id: Uuid,
+) -> Result<(), ApiError> {
+    let token =
+        embed_token_from_headers(headers).ok_or(ApiError::unauthorized("missing embed session"))?;
+    let mut tx = state.pool.begin().await?;
+    let credential = load_widget_credential_tx(&mut tx, &token).await?;
+    let (integration_session_id, hub_session_id) = widget_session_locator(&credential, session_id);
+    load_widget_scoped_session_tx(
+        &mut tx,
+        &credential,
+        integration_session_id,
+        hub_session_id,
+        false,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn load_widget_session_events_after_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session: &WidgetScopedSession,
+    after: i64,
+) -> Result<Vec<RunEventDto>, ApiError> {
+    let rows = if let Some(integration_session_id) = session.integration_session_id {
+        sqlx::query(
+            "SELECT event.seq, event.event_id, event.run_id, event.event_type,
+                    event.role, event.content, event.payload, event.created_at
+             FROM run_events AS event
+             JOIN runs ON runs.id = event.run_id
+             WHERE runs.integration_session_id = $1
+               AND runs.hub_session_id = $2
+               AND event.seq > $3
+             ORDER BY event.seq ASC",
+        )
+        .bind(integration_session_id)
+        .bind(session.hub_session_id)
+        .bind(after)
+        .fetch_all(&mut **tx)
+        .await?
+    } else {
+        sqlx::query(
+            "SELECT event.seq, event.event_id, event.run_id, event.event_type,
+                    event.role, event.content, event.payload, event.created_at
+             FROM run_events AS event
+             JOIN runs ON runs.id = event.run_id
+             WHERE runs.widget_session_id = $1
+               AND runs.hub_session_id = $2
+               AND event.seq > $3
+             ORDER BY event.seq ASC",
+        )
+        .bind(session.widget_session_id)
+        .bind(session.hub_session_id)
+        .bind(after)
+        .fetch_all(&mut **tx)
+        .await?
+    };
+    Ok(rows.into_iter().map(event_from_row).collect())
+}
+
+async fn lock_widget_credential_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    token: &str,
+) -> Result<WidgetCredential, ApiError> {
+    // Keep the shared Agent -> Widget credential lock order used by deletion paths.
+    let preview = sqlx::query(
+        "SELECT embed.agent_id, agent.owner_id AS agent_owner_id
+         FROM embed_sessions AS embed
+         JOIN agents AS agent ON agent.id = embed.agent_id AND agent.deleted_at IS NULL
+         WHERE embed.token_hash = $1 AND embed.expires_at > now()",
+    )
+    .bind(sha256_hex(token))
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ApiError::unauthorized("invalid embed session"))?;
+    let agent_id: Uuid = preview.get("agent_id");
+    let agent_owner_id: Uuid = preview.get("agent_owner_id");
+    lock_active_integration_agent_tx(tx, agent_id, agent_owner_id).await?;
+    sqlx::query(
+        "SELECT id FROM embed_sessions
+         WHERE token_hash = $1 AND expires_at > now()
+         FOR UPDATE",
+    )
+    .bind(sha256_hex(token))
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ApiError::unauthorized("invalid embed session"))?;
+    let credential = load_widget_credential_tx(tx, token).await?;
+    if credential.agent_id != agent_id || credential.agent_owner_id != agent_owner_id {
+        return Err(ApiError::internal(
+            "Widget credential Agent changed while locking",
+        ));
+    }
+    Ok(credential)
+}
+
+fn widget_credential_from_row(row: sqlx::postgres::PgRow) -> WidgetCredential {
+    WidgetCredential {
+        id: row.get("id"),
+        agent_id: row.get("agent_id"),
+        agent_owner_id: row.get("agent_owner_id"),
+        owner_id: row.get("owner_id"),
+        hub_session_id: row.get("hub_session_id"),
+        oauth_app_id: row.get("oauth_app_id"),
+        external_platform_id: row.get("external_platform_id"),
+        external_tenant_id: row.get("external_tenant_id"),
+        external_user_id: row.get("external_user_id"),
+        external_identity_id: row.get("external_identity_id"),
+        profile_snapshot: row.get("profile_snapshot"),
+        expires_at: row.get("expires_at"),
+        history_enabled: row.get("history_enabled"),
+        anonymous: row.get("anonymous"),
+    }
 }
 
 async fn load_auth_policy(pool: &PgPool) -> Result<AuthPolicyDto, ApiError> {
@@ -16027,6 +17562,32 @@ async fn resolve_external_identity_tx(
     .execute(&mut **tx)
     .await?;
     Ok(ResolvedExternalIdentity { user, identity_id })
+}
+
+async fn update_external_identity_widget_profile_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    identity_id: Uuid,
+    profile: &WidgetUserProfileDto,
+) -> Result<(), ApiError> {
+    let updated = sqlx::query(
+        "UPDATE external_identities
+         SET last_email = COALESCE($1, last_email),
+             last_username = COALESCE($2, last_username),
+             last_display_name = COALESCE($3, last_display_name),
+             attributes = $4, updated_at = now()
+         WHERE id = $5",
+    )
+    .bind(profile.email.as_deref())
+    .bind(profile.username.as_deref())
+    .bind(profile.display_name.as_deref())
+    .bind(&profile.attributes)
+    .bind(identity_id)
+    .execute(&mut **tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(ApiError::unauthorized("external identity is unavailable"));
+    }
+    Ok(())
 }
 
 async fn create_hub_user(
@@ -16666,6 +18227,11 @@ fn agent_from_row(row: sqlx::postgres::PgRow) -> AgentDto {
         sandbox_policy: row.get("sandbox_policy"),
         managed_skill_ids: row.try_get("managed_skill_ids").unwrap_or_default(),
         mcp_allowlist: row.get("mcp_allowlist"),
+        tool_allowlist: row
+            .try_get::<Value, _>("tool_allowlist")
+            .ok()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_else(default_agent_tool_allowlist),
         is_owner: false,
         can_manage: false,
         can_administer: false,
@@ -16783,6 +18349,15 @@ fn integration_app_from_row(row: sqlx::postgres::PgRow, agent_ids: Vec<Uuid>) ->
         authentication_channel_id: row.get("authentication_channel_id"),
         redirect_uris: row.get("redirect_uris"),
         agent_ids,
+        widget_history_enabled: row.get("widget_history_enabled"),
+        login_required: row.get("login_required"),
+        allowed_origins: serde_json::from_value(row.get("allowed_origins"))
+            .expect("Integration App origins are constrained"),
+        tool_allowlist: row
+            .get::<Option<Value>, _>("tool_allowlist")
+            .map(serde_json::from_value)
+            .transpose()
+            .expect("Integration App tool policy is constrained"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
@@ -16863,6 +18438,7 @@ fn hub_message_from_row(row: sqlx::postgres::PgRow) -> HubSessionMessageDto {
 fn hub_session_from_row(row: sqlx::postgres::PgRow) -> HubSessionDto {
     let origin = match row.get::<String, _>("origin_kind").as_str() {
         "hub_native" => HubSessionOriginDto::HubNative,
+        "public_widget" => HubSessionOriginDto::PublicWidget,
         "external" => HubSessionOriginDto::External {
             platform_id: row.get("origin_platform_id"),
             tenant_id: row.get("origin_tenant_id"),
@@ -17100,6 +18676,96 @@ mod tests {
                 .decode(&envelope.body_base64)
                 .unwrap(),
         )
+    }
+
+    #[test]
+    fn public_widget_tool_policy_is_read_only_and_app_scoped() {
+        let mut tools = default_agent_tool_allowlist();
+        let mut sandbox_policy = json!({ "mode": "workspace-write", "network_access": true });
+        let mut mcp_allowlist = json!([{ "name": "private-filesystem" }]);
+        apply_session_tool_policy(
+            &mut tools,
+            &mut sandbox_policy,
+            &mut mcp_allowlist,
+            &SessionToolPolicy {
+                public_widget: true,
+                app_tool_allowlist: Some(vec!["read".into(), "grep".into()]),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(tools, ["read", "grep"]);
+        assert_eq!(
+            sandbox_policy,
+            json!({ "mode": "read-only", "network_access": false })
+        );
+        assert_eq!(mcp_allowlist, json!([]));
+    }
+
+    #[test]
+    fn public_widget_configuration_and_tool_allowlists_fail_closed() {
+        assert_eq!(
+            normalize_agent_tool_allowlist(&["grep".into(), "read".into()]).unwrap(),
+            ["read", "grep"]
+        );
+        for invalid in [
+            Vec::<String>::new(),
+            vec!["read".into(), "read".into()],
+            vec!["unknown".into()],
+        ] {
+            assert_eq!(
+                normalize_agent_tool_allowlist(&invalid).unwrap_err().status,
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        let agent_id = Uuid::new_v4();
+        assert!(validate_public_widget_settings(
+            false,
+            false,
+            &["https://docs.example.test".into()],
+            Some(&["read".into(), "grep".into()]),
+            &[agent_id],
+            "admin",
+        )
+        .is_ok());
+        for error in [
+            validate_public_widget_settings(
+                false,
+                false,
+                &["https://docs.example.test".into()],
+                None,
+                &[agent_id],
+                "member",
+            ),
+            validate_public_widget_settings(false, false, &[], None, &[agent_id], "admin"),
+            validate_public_widget_settings(
+                false,
+                true,
+                &["https://docs.example.test".into()],
+                None,
+                &[agent_id],
+                "admin",
+            ),
+            validate_public_widget_settings(
+                false,
+                false,
+                &["https://docs.example.test".into()],
+                None,
+                &[agent_id, Uuid::new_v4()],
+                "admin",
+            ),
+            validate_public_widget_settings(
+                false,
+                false,
+                &["https://docs.example.test".into()],
+                Some(&["bash".into()]),
+                &[agent_id],
+                "admin",
+            ),
+        ] {
+            assert!(error.is_err());
+        }
     }
 
     #[tokio::test]
@@ -17348,6 +19014,7 @@ mod tests {
             "runtimeEnrollmentBearer",
             "runtimeBearer",
             "modelProxyBearer",
+            "integrationClientBasic",
         ] {
             assert!(
                 document["components"]["securitySchemes"]
@@ -17382,6 +19049,14 @@ mod tests {
             "/api/sessions/{session_id}/messages",
             "/api/runs/{run_id}/stop",
             "/api/runs/{run_id}/events/stream",
+            "/api/widget/access",
+            "/api/widget/public/access",
+            "/api/widget/session",
+            "/api/widget/session/renew",
+            "/api/widget/sessions",
+            "/api/widget/sessions/{session_id}/messages",
+            "/api/widget/sessions/{session_id}/events",
+            "/api/widget/sessions/{session_id}/events/stream",
             "/api/widget/runs/{run_id}/stop",
             "/api/integrations/sessions/{session_id}/runs/{run_id}/stop",
             "/api/integrations/tool-requests/{tool_request_id}/result",
@@ -17514,6 +19189,15 @@ mod tests {
         assert!(execution_configuration["properties"]
             .get("default_model_connection_id")
             .is_none());
+        assert_eq!(
+            execution_configuration["properties"]["tool_allowlist"]["items"]["$ref"],
+            "#/components/schemas/AgentToolName"
+        );
+        assert_eq!(
+            document["components"]["schemas"]["Agent"]["properties"]["tool_allowlist"]["items"]
+                ["$ref"],
+            "#/components/schemas/AgentToolName"
+        );
         let proxy_parameters = document["paths"]["/api/runtime/model-proxy/v1/responses"]["post"]
             ["parameters"]
             .as_array()
@@ -17714,6 +19398,39 @@ mod tests {
             json!([{ "embedToken": [] }])
         );
         assert_eq!(
+            document["paths"]["/api/widget/access"]["post"]["security"],
+            json!([{ "integrationClientBasic": [] }])
+        );
+        assert_eq!(
+            document["paths"]["/api/widget/public/access"]["post"]["security"],
+            json!([])
+        );
+        assert_eq!(
+            document["paths"]["/api/widget/public/access"]["post"]["requestBody"]["content"]
+                ["application/json"]["schema"]["$ref"],
+            "#/components/schemas/CreatePublicWidgetAccessRequest"
+        );
+        assert_eq!(
+            document["paths"]["/api/widget/public/access"]["post"]["responses"]["200"]["content"]
+                ["application/json"]["schema"]["$ref"],
+            "#/components/schemas/PublicWidgetAccessResponse"
+        );
+        assert!(
+            document["components"]["schemas"]["PublicWidgetAccessResponse"]["properties"]
+                .get("hub_session_id")
+                .is_some()
+        );
+        assert_eq!(
+            document["paths"]["/api/widget/session/renew"]["post"]["responses"]["200"]["content"]
+                ["application/json"]["schema"]["$ref"],
+            "#/components/schemas/WidgetTokenResponse"
+        );
+        assert!(
+            document["components"]["schemas"]["CreateWidgetRunRequest"]["properties"]
+                .get("integration_session_id")
+                .is_some()
+        );
+        assert_eq!(
             document["paths"]["/api/integrations/sessions/{session_id}/runs/{run_id}/stop"]["post"]
                 ["security"],
             json!([{ "integrationBearer": [] }])
@@ -17771,11 +19488,19 @@ mod tests {
                 ["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/SessionMessageAcceptance"
         );
-        assert!(
-            !document["components"]["schemas"]["HubSessionOrigin"]["oneOf"][1]["required"]
-                .as_array()
-                .is_some_and(|required| required.contains(&json!("platform_name")))
-        );
+        let session_origins = document["components"]["schemas"]["HubSessionOrigin"]["oneOf"]
+            .as_array()
+            .unwrap();
+        assert!(session_origins
+            .iter()
+            .any(|origin| { origin["properties"]["kind"]["const"] == "public_widget" }));
+        let external_origin = session_origins
+            .iter()
+            .find(|origin| origin["properties"]["kind"]["const"] == "external")
+            .unwrap();
+        assert!(!external_origin["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&json!("platform_name"))));
         assert!(document["components"]["schemas"]["HubSession"]["required"]
             .as_array()
             .is_some_and(|required| required.contains(&json!("origin_platform_name"))));
@@ -17914,6 +19639,7 @@ mod tests {
             "model_settings",
             "subagents",
             "model_bindings",
+            "tool_allowlist",
         ] {
             assert!(
                 execution_configuration["properties"]
@@ -18097,7 +19823,13 @@ mod tests {
                 "Run schema is missing {field}"
             );
         }
-        for field in ["external_platform_id", "authentication_channel_id"] {
+        for field in [
+            "external_platform_id",
+            "authentication_channel_id",
+            "login_required",
+            "allowed_origins",
+            "tool_allowlist",
+        ] {
             assert!(
                 document["components"]["schemas"]["IntegrationApp"]["properties"]
                     .get(field)
@@ -18788,6 +20520,7 @@ mod tests {
                 model_selection: None,
                 model_settings: Some(AgentModelSettings::default()),
                 subagents: Vec::new(),
+                tool_allowlist: default_agent_tool_allowlist(),
             }),
         )
         .await
@@ -18810,6 +20543,7 @@ mod tests {
                 "command": "gh-mcp",
                 "secrets": { "TOKEN": secret }
             }]),
+            tool_allowlist: default_agent_tool_allowlist(),
         };
 
         let _ = update_agent(
@@ -18886,6 +20620,7 @@ mod tests {
                 model_subject_type: "user".into(),
                 model_subject_user_id: Some(owner_id),
                 model_source_integration_app_id: None,
+                external_user_context: None,
             },
         )
         .await?;
@@ -19554,6 +21289,10 @@ mod tests {
                 authentication_channel_id: channel_id,
                 redirect_uris: json!(["https://client.example.com/callback"]),
                 agent_ids: agent_ids.to_vec(),
+                widget_history_enabled: false,
+                login_required: true,
+                allowed_origins: Vec::new(),
+                tool_allowlist: None,
             }),
         )
         .await
@@ -19578,12 +21317,17 @@ mod tests {
                 name: "Updated App".into(),
                 redirect_uris: json!(["https://client.example.com/new-callback"]),
                 agent_ids: vec![agent_ids[1]],
+                widget_history_enabled: true,
+                login_required: true,
+                allowed_origins: Vec::new(),
+                tool_allowlist: None,
             }),
         )
         .await
         .unwrap()
         .0;
         assert_eq!(updated.agent_ids, vec![agent_ids[1]]);
+        assert!(updated.widget_history_enabled);
 
         let rotated = rotate_integration_app_secret(
             State(state.clone()),
@@ -19716,6 +21460,10 @@ mod tests {
                 authentication_channel_id: channel_id,
                 redirect_uris: json!(["https://widget.example.com/callback"]),
                 agent_ids: vec![delegated_agent_id],
+                widget_history_enabled: false,
+                login_required: true,
+                allowed_origins: Vec::new(),
+                tool_allowlist: Some(vec!["read".into(), "grep".into()]),
             }),
         )
         .await
@@ -19749,8 +21497,8 @@ mod tests {
         .0
         .token;
         assert!(widget_token.starts_with("ahe_"));
-        let persisted: (Option<Uuid>, Uuid, Uuid, DateTime<Utc>) = sqlx::query_as(
-            "SELECT oauth_app_id, agent_id, owner_id, expires_at
+        let persisted: (Option<Uuid>, Uuid, Uuid, DateTime<Utc>, Uuid) = sqlx::query_as(
+            "SELECT oauth_app_id, agent_id, owner_id, expires_at, hub_session_id
              FROM embed_sessions WHERE token_hash = $1",
         )
         .bind(sha256_hex(&widget_token))
@@ -19762,15 +21510,34 @@ mod tests {
         assert_eq!(persisted.2, agent_owner.id);
         assert!(persisted.3 >= issued_at + ChronoDuration::minutes(59));
         assert!(persisted.3 <= Utc::now() + ChronoDuration::minutes(61));
+        let mut configuration_tx = pool.begin().await.unwrap();
+        let mut configuration =
+            load_agent_execution_configuration_tx(&mut configuration_tx, delegated_agent_id)
+                .await
+                .unwrap();
+        apply_session_tool_policy_to_configuration_tx(
+            &mut configuration_tx,
+            persisted.4,
+            &mut configuration,
+        )
+        .await
+        .unwrap();
+        configuration_tx.rollback().await.unwrap();
+        assert_eq!(configuration.tool_allowlist, vec!["read", "grep"]);
         let mut widget_headers = HeaderMap::new();
         widget_headers.insert(
             HeaderName::from_static("x-agent-hub-embed-token"),
             HeaderValue::from_str(&widget_token).unwrap(),
         );
-        let widget = get_widget_session(State(state.clone()), widget_headers.clone())
+        let widget_response = get_widget_session(State(state.clone()), widget_headers.clone())
             .await
-            .unwrap()
-            .0;
+            .unwrap();
+        let widget: WidgetAgentDto = serde_json::from_slice(
+            &axum::body::to_bytes(widget_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(widget.id, delegated_agent_id);
         sqlx::query("DELETE FROM integration_app_agents WHERE app_id = $1 AND agent_id = $2")
             .bind(app.id)
@@ -19897,6 +21664,1187 @@ mod tests {
             .unwrap(),
             0
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn integration_app_client_credentials_issue_scoped_widget_access_without_creating_a_session(
+        pool: PgPool,
+    ) {
+        let owner = create_hub_user(
+            &pool,
+            Some("widget-access-owner@example.com"),
+            None,
+            Some("password-hash"),
+            true,
+        )
+        .await
+        .unwrap();
+        let agent_id = Uuid::new_v4();
+        let platform_id = Uuid::new_v4();
+        let channel_id = Uuid::new_v4();
+        let app_id = Uuid::new_v4();
+        let client_id = format!("widget-access-{}", Uuid::new_v4().simple());
+        let client_secret = "widget-access-client-secret";
+        sqlx::query(
+            "INSERT INTO agents (id, owner_id, name, instructions, visibility)
+             VALUES ($1, $2, 'Widget Access Agent', 'test', 'private')",
+        )
+        .bind(agent_id)
+        .bind(owner.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO external_platforms (id, key, name)
+             VALUES ($1, $2, 'Widget Access Platform')",
+        )
+        .bind(platform_id)
+        .bind(format!("widget-access-{}", Uuid::new_v4().simple()))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO authentication_channels
+                 (id, platform_id, key, name, enabled, trusted_email, created_by)
+             VALUES ($1, $2, 'widget', 'Widget', true, true, $3)",
+        )
+        .bind(channel_id)
+        .bind(platform_id)
+        .bind(owner.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO oauth_apps
+                 (id, owner_id, name, client_id, client_secret_hash, redirect_uris,
+                  external_platform_id, authentication_channel_id, widget_history_enabled)
+             VALUES ($1, $2, 'Widget Access App', $3, $4, '[]'::jsonb, $5, $6, false)",
+        )
+        .bind(app_id)
+        .bind(owner.id)
+        .bind(&client_id)
+        .bind(sha256_hex(client_secret))
+        .bind(platform_id)
+        .bind(channel_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO integration_app_agents (app_id, agent_id) VALUES ($1, $2)")
+            .bind(app_id)
+            .bind(agent_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let app = build_router(test_state_with_pool(pool.clone()));
+        let basic = base64::engine::general_purpose::STANDARD
+            .encode(format!("{client_id}:{client_secret}"));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/widget/access")
+                    .header(header::AUTHORIZATION, format!("Basic {basic}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "agent_id": agent_id,
+                            "tenant_id": "tenant-acme",
+                            "external_user_id": "external-user-42",
+                            "username": "external-user",
+                            "display_name": "External User",
+                            "email": "external-user@example.com",
+                            "attributes": { "plan": "pro", "locale": "zh-CN" }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let issued: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let token = issued["token"].as_str().unwrap();
+        assert!(token.starts_with("ahw_"));
+        assert_eq!(issued["agent"]["id"], json!(agent_id));
+        assert_eq!(issued["history_enabled"], false);
+        assert!(issued["expires_at"].as_str().is_some());
+
+        let stored = sqlx::query(
+            "SELECT oauth_app_id, agent_id, owner_id, hub_session_id,
+                    external_tenant_id, external_user_id, external_identity_id,
+                    profile_snapshot
+             FROM embed_sessions WHERE token_hash = $1",
+        )
+        .bind(sha256_hex(token))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored.get::<Option<Uuid>, _>("oauth_app_id"), Some(app_id));
+        assert_eq!(stored.get::<Uuid, _>("agent_id"), agent_id);
+        assert!(stored.get::<Option<Uuid>, _>("hub_session_id").is_none());
+        assert_eq!(stored.get::<String, _>("external_tenant_id"), "tenant-acme");
+        assert_eq!(
+            stored.get::<String, _>("external_user_id"),
+            "external-user-42"
+        );
+        assert_eq!(
+            stored.get::<Value, _>("profile_snapshot")["display_name"],
+            "External User"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM hub_sessions")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        let identity = sqlx::query(
+            "SELECT last_email, last_username, last_display_name, attributes
+             FROM external_identities
+             WHERE id = $1",
+        )
+        .bind(stored.get::<Uuid, _>("external_identity_id"))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            identity.get::<Option<String>, _>("last_email").as_deref(),
+            Some("external-user@example.com")
+        );
+        assert_eq!(
+            identity
+                .get::<Option<String>, _>("last_username")
+                .as_deref(),
+            Some("external-user")
+        );
+        assert_eq!(
+            identity
+                .get::<Option<String>, _>("last_display_name")
+                .as_deref(),
+            Some("External User")
+        );
+        assert_eq!(identity.get::<Value, _>("attributes")["plan"], "pro");
+    }
+
+    struct WidgetExternalTestFixture {
+        state: Arc<AppState>,
+        router: Router,
+        app_id: Uuid,
+        agent_id: Uuid,
+        platform_id: Uuid,
+        client_id: String,
+        client_secret: String,
+    }
+
+    async fn widget_external_test_fixture(
+        pool: PgPool,
+        history_enabled: bool,
+    ) -> WidgetExternalTestFixture {
+        let owner = create_hub_user(
+            &pool,
+            Some(&format!(
+                "widget-fixture-{}@example.com",
+                Uuid::new_v4().simple()
+            )),
+            None,
+            Some("password-hash"),
+            true,
+        )
+        .await
+        .unwrap();
+        let model_connection_id = Uuid::new_v4();
+        let model_id = format!("widget-model-{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO model_connections
+                 (id, scope, name, base_url, api_type, allowed_model_ids,
+                  api_key_ciphertext, api_key_nonce, created_by)
+             VALUES ($1, 'global', 'Widget Test Model', 'https://models.example.test',
+                     'openai_responses', $2, $3, $4, $5)",
+        )
+        .bind(model_connection_id)
+        .bind(vec![model_id.clone()])
+        .bind(vec![1_u8; 17])
+        .bind(vec![2_u8; 12])
+        .bind(owner.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let agent_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO agents
+                 (id, owner_id, name, instructions, visibility,
+                  model_connection_id, model_id)
+             VALUES ($1, $2, 'Widget External Agent', 'test', 'private', $3, $4)",
+        )
+        .bind(agent_id)
+        .bind(owner.id)
+        .bind(model_connection_id)
+        .bind(&model_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let platform_id = Uuid::new_v4();
+        let channel_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO external_platforms (id, key, name)
+             VALUES ($1, $2, 'Widget Fixture Platform')",
+        )
+        .bind(platform_id)
+        .bind(format!("widget-fixture-{}", Uuid::new_v4().simple()))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO authentication_channels
+                 (id, platform_id, key, name, enabled, trusted_email, created_by)
+             VALUES ($1, $2, 'widget', 'Widget', true, true, $3)",
+        )
+        .bind(channel_id)
+        .bind(platform_id)
+        .bind(owner.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let app_id = Uuid::new_v4();
+        let client_id = format!("widget-fixture-{}", Uuid::new_v4().simple());
+        let client_secret = format!("widget-secret-{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO oauth_apps
+                 (id, owner_id, name, client_id, client_secret_hash, redirect_uris,
+                  external_platform_id, authentication_channel_id, widget_history_enabled)
+             VALUES ($1, $2, 'Widget Fixture App', $3, $4, '[]'::jsonb, $5, $6, $7)",
+        )
+        .bind(app_id)
+        .bind(owner.id)
+        .bind(&client_id)
+        .bind(sha256_hex(&client_secret))
+        .bind(platform_id)
+        .bind(channel_id)
+        .bind(history_enabled)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO integration_app_agents (app_id, agent_id) VALUES ($1, $2)")
+            .bind(app_id)
+            .bind(agent_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let state = Arc::new(test_state_with_pool(pool));
+        let router = build_router((*state).clone());
+        WidgetExternalTestFixture {
+            state,
+            router,
+            app_id,
+            agent_id,
+            platform_id,
+            client_id,
+            client_secret,
+        }
+    }
+
+    async fn issue_widget_external_access(
+        fixture: &WidgetExternalTestFixture,
+        tenant_id: &str,
+        external_user_id: &str,
+        display_name: &str,
+    ) -> WidgetAccessResponse {
+        issue_widget_external_access_for(
+            fixture,
+            &fixture.client_id,
+            &fixture.client_secret,
+            fixture.agent_id,
+            tenant_id,
+            external_user_id,
+            display_name,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn issue_widget_external_access_for(
+        fixture: &WidgetExternalTestFixture,
+        client_id: &str,
+        client_secret: &str,
+        agent_id: Uuid,
+        tenant_id: &str,
+        external_user_id: &str,
+        display_name: &str,
+    ) -> WidgetAccessResponse {
+        let basic = STANDARD.encode(format!("{client_id}:{client_secret}"));
+        let response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/widget/access")
+                    .header(header::AUTHORIZATION, format!("Basic {basic}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "agent_id": agent_id,
+                            "tenant_id": tenant_id,
+                            "external_user_id": external_user_id,
+                            "username": format!("{external_user_id}-name"),
+                            "display_name": display_name,
+                            "email": format!("{external_user_id}@example.com"),
+                            "attributes": { "fixture_version": display_name }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn issue_public_widget_access(
+        fixture: &WidgetExternalTestFixture,
+        visitor_key: &str,
+    ) -> PublicWidgetAccessResponse {
+        let response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/widget/public/access")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "client_id": fixture.client_id,
+                            "visitor_key": visitor_key
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn create_widget_external_run(
+        fixture: &WidgetExternalTestFixture,
+        token: &str,
+        message: &str,
+    ) -> RunDto {
+        let response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/widget/runs")
+                    .header("x-agent-hub-embed-token", token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "message": message,
+                            "client_message_key": format!("test-{}", Uuid::new_v4())
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn public_widget_access_rotates_visitor_credential_and_restores_its_session(
+        pool: PgPool,
+    ) {
+        let fixture = widget_external_test_fixture(pool, false).await;
+        sqlx::query(
+            "UPDATE oauth_apps
+             SET login_required = false,
+                 allowed_origins = '[\"https://docs.example.test\"]'::jsonb,
+                 tool_allowlist = '[\"read\",\"grep\"]'::jsonb
+             WHERE id = $1",
+        )
+        .bind(fixture.app_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        let visitor_key = format!("public-visitor-{}", Uuid::new_v4().simple());
+        let first = issue_public_widget_access(&fixture, &visitor_key).await;
+        assert!(first.token.starts_with("ahp_"));
+        assert_eq!(first.agent.id, fixture.agent_id);
+        assert!(first.hub_session_id.is_none());
+
+        let rotated = issue_public_widget_access(&fixture, &visitor_key).await;
+        assert_eq!(rotated.widget_session_id, first.widget_session_id);
+        assert!(rotated.hub_session_id.is_none());
+        assert_ne!(rotated.token, first.token);
+
+        let replaced_token = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/widget/session")
+                    .header("x-agent-hub-embed-token", &first.token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replaced_token.status(), StatusCode::UNAUTHORIZED);
+
+        let run_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/widget/runs")
+                    .header("x-agent-hub-embed-token", &rotated.token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"message":"public widget hello","client_message_key":"public-first"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(run_response.status(), StatusCode::OK);
+        let run: RunDto = serde_json::from_slice(
+            &axum::body::to_bytes(run_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let hub_session_id = run.hub_session_id.unwrap();
+        assert!(run.integration_session_id.is_none());
+
+        let refreshed = issue_public_widget_access(&fixture, &visitor_key).await;
+        assert_eq!(refreshed.widget_session_id, first.widget_session_id);
+        assert_eq!(refreshed.hub_session_id, Some(hub_session_id));
+        assert_ne!(refreshed.token, rotated.token);
+
+        let retry_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/widget/runs")
+                    .header("x-agent-hub-embed-token", &refreshed.token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"message":"public widget hello","client_message_key":"public-first"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry_response.status(), StatusCode::OK);
+        let retried_run: RunDto = serde_json::from_slice(
+            &axum::body::to_bytes(retry_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(retried_run.id, run.id);
+
+        let history_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/widget/sessions")
+                    .header("x-agent-hub-embed-token", &refreshed.token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(history_response.status(), StatusCode::FORBIDDEN);
+
+        let transcript_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/widget/sessions/{hub_session_id}/messages"))
+                    .header("x-agent-hub-embed-token", &refreshed.token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(transcript_response.status(), StatusCode::OK);
+        let messages: Vec<HubSessionMessageDto> = serde_json::from_slice(
+            &axum::body::to_bytes(transcript_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content.as_deref(), Some("public widget hello"));
+
+        let mut tx = fixture.state.pool.begin().await.unwrap();
+        let session = load_hub_session_tx(&mut tx, hub_session_id).await.unwrap();
+        tx.rollback().await.unwrap();
+        assert!(matches!(session.origin, HubSessionOriginDto::PublicWidget));
+        assert_eq!(session.origin_platform_name, None);
+        assert_eq!(
+            sqlx::query_as::<_, (Option<Uuid>, Option<Uuid>, bool)>(
+                "SELECT hub_session_id, last_run_id, anonymous
+                 FROM embed_sessions WHERE id = $1",
+            )
+            .bind(first.widget_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            (Some(hub_session_id), Some(run.id), true)
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM runs WHERE widget_session_id = $1",)
+                .bind(first.widget_session_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let other_visitor = issue_public_widget_access(
+            &fixture,
+            &format!("other-public-visitor-{}", Uuid::new_v4().simple()),
+        )
+        .await;
+        assert_ne!(other_visitor.widget_session_id, first.widget_session_id);
+        assert!(other_visitor.hub_session_id.is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn first_external_widget_message_creates_the_scoped_session_and_runtime_user_context(
+        pool: PgPool,
+    ) {
+        let fixture = widget_external_test_fixture(pool, false).await;
+        let issued = issue_widget_external_access(
+            &fixture,
+            "tenant-runtime",
+            "runtime-user",
+            "Runtime User",
+        )
+        .await;
+        let response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/widget/runs")
+                    .header("x-agent-hub-embed-token", &issued.token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"message":"first external widget message","client_message_key":"widget-first"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let run: RunDto = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let retry_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/widget/runs")
+                    .header("x-agent-hub-embed-token", &issued.token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"message":"first external widget message","client_message_key":"widget-first"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry_response.status(), StatusCode::OK);
+        let retried_run: RunDto = serde_json::from_slice(
+            &axum::body::to_bytes(retry_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(retried_run.id, run.id);
+        assert_eq!(
+            retried_run.integration_session_id,
+            run.integration_session_id
+        );
+        assert_eq!(retried_run.hub_session_id, run.hub_session_id);
+        let integration_session_id = run.integration_session_id.unwrap();
+        let hub_session_id = run.hub_session_id.unwrap();
+        let scoped = sqlx::query(
+            "SELECT integration.oauth_app_id, integration.agent_id, integration.owner_id,
+                    integration.external_user_id, integration.hub_session_id,
+                    hub.origin_kind, hub.origin_platform_id, hub.origin_tenant_id,
+                    hub.origin_external_identity_id
+             FROM integration_sessions AS integration
+             JOIN hub_sessions AS hub ON hub.id = integration.hub_session_id
+             WHERE integration.id = $1",
+        )
+        .bind(integration_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(scoped.get::<Uuid, _>("oauth_app_id"), fixture.app_id);
+        assert_eq!(scoped.get::<Uuid, _>("agent_id"), fixture.agent_id);
+        assert_eq!(scoped.get::<Uuid, _>("hub_session_id"), hub_session_id);
+        assert_eq!(scoped.get::<String, _>("external_user_id"), "runtime-user");
+        assert_eq!(scoped.get::<String, _>("origin_kind"), "external");
+        assert_eq!(
+            scoped.get::<Option<Uuid>, _>("origin_platform_id"),
+            Some(fixture.platform_id)
+        );
+        assert_eq!(
+            scoped
+                .get::<Option<String>, _>("origin_tenant_id")
+                .as_deref(),
+            Some("tenant-runtime")
+        );
+        let run_context: Value =
+            sqlx::query_scalar("SELECT external_user_context FROM runs WHERE id = $1")
+                .bind(run.id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(run_context["display_name"], "Runtime User");
+        assert_eq!(run_context["attributes"]["fixture_version"], "Runtime User");
+        let mut tx = fixture.state.pool.begin().await.unwrap();
+        let context = load_integration_context_for_run(&mut tx, &run)
+            .await
+            .unwrap()
+            .unwrap();
+        tx.rollback().await.unwrap();
+        let external_user = context.external_user.unwrap();
+        assert_eq!(external_user.external_user_id, "runtime-user");
+        assert_eq!(external_user.tenant_id, "tenant-runtime");
+        assert_eq!(external_user.display_name.as_deref(), Some("Runtime User"));
+        for (table, expected) in [
+            ("hub_sessions", 1_i64),
+            ("integration_sessions", 1_i64),
+            ("runs", 1_i64),
+            ("hub_session_messages", 1_i64),
+        ] {
+            let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+            assert_eq!(count, expected, "unexpected {table} rows after retry");
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn widget_renewal_rotates_the_same_credential_and_continues_its_selected_session(
+        pool: PgPool,
+    ) {
+        let fixture = widget_external_test_fixture(pool, true).await;
+        let issued =
+            issue_widget_external_access(&fixture, "tenant-renew", "renew-user", "Renew User")
+                .await;
+        let credential_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM embed_sessions WHERE token_hash = $1")
+                .bind(sha256_hex(&issued.token))
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        let first_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/widget/runs")
+                    .header("x-agent-hub-embed-token", &issued.token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"message":"before renewal","client_message_key":"renew-first"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_response.status(), StatusCode::OK);
+        let first_run: RunDto = serde_json::from_slice(
+            &axum::body::to_bytes(first_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        let renew_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/widget/session/renew")
+                    .header("x-agent-hub-embed-token", &issued.token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(renew_response.status(), StatusCode::OK);
+        let renewed: WidgetTokenResponse = serde_json::from_slice(
+            &axum::body::to_bytes(renew_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(renewed.token.starts_with("ahw_"));
+        assert_ne!(renewed.token, issued.token);
+        assert!(renewed.expires_at > issued.expires_at);
+        let renewed_credential_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM embed_sessions WHERE token_hash = $1")
+                .bind(sha256_hex(&renewed.token))
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(renewed_credential_id, credential_id);
+
+        let expired_token_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/widget/session")
+                    .header("x-agent-hub-embed-token", &issued.token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(expired_token_response.status(), StatusCode::UNAUTHORIZED);
+        let session_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/widget/session")
+                    .header("x-agent-hub-embed-token", &renewed.token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session_response.status(), StatusCode::OK);
+        let session: WidgetSessionDto = serde_json::from_slice(
+            &axum::body::to_bytes(session_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(session.agent.id, fixture.agent_id);
+        assert!(session.history_enabled);
+
+        let continue_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/widget/runs")
+                    .header("x-agent-hub-embed-token", &renewed.token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "message": "after renewal",
+                            "integration_session_id": first_run.integration_session_id,
+                            "hub_session_id": first_run.hub_session_id,
+                            "client_message_key": "renew-second"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(continue_response.status(), StatusCode::OK);
+        let continued: RunDto = serde_json::from_slice(
+            &axum::body::to_bytes(continue_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(continued.hub_session_id, first_run.hub_session_id);
+        assert_eq!(
+            continued.integration_session_id,
+            first_run.integration_session_id
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn widget_profile_refresh_requires_app_credentials_and_updates_future_runs(pool: PgPool) {
+        let fixture = widget_external_test_fixture(pool, false).await;
+        let issued = issue_widget_external_access(
+            &fixture,
+            "tenant-profile",
+            "profile-user",
+            "Profile Before",
+        )
+        .await;
+        let profile_body = serde_json::to_vec(&json!({
+            "profile": {
+                "username": "profile-user",
+                "display_name": "Profile After",
+                "email": "profile-user@example.com",
+                "attributes": { "revision": 2 }
+            }
+        }))
+        .unwrap();
+        let untrusted_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/widget/session/renew")
+                    .header("x-agent-hub-embed-token", &issued.token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(profile_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(untrusted_response.status(), StatusCode::UNAUTHORIZED);
+
+        let basic = STANDARD.encode(format!("{}:{}", fixture.client_id, fixture.client_secret));
+        let trusted_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/widget/session/renew")
+                    .header("x-agent-hub-embed-token", &issued.token)
+                    .header(header::AUTHORIZATION, format!("Basic {basic}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(profile_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(trusted_response.status(), StatusCode::OK);
+        let renewed: WidgetTokenResponse = serde_json::from_slice(
+            &axum::body::to_bytes(trusted_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let run_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/widget/runs")
+                    .header("x-agent-hub-embed-token", &renewed.token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"message":"use refreshed profile"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(run_response.status(), StatusCode::OK);
+        let run: RunDto = serde_json::from_slice(
+            &axum::body::to_bytes(run_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let context: Value =
+            sqlx::query_scalar("SELECT external_user_context FROM runs WHERE id = $1")
+                .bind(run.id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(context["display_name"], "Profile After");
+        assert_eq!(context["attributes"]["revision"], 2);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn widget_history_is_configurable_and_isolated_by_full_external_scope(pool: PgPool) {
+        let fixture = widget_external_test_fixture(pool, true).await;
+        let primary = issue_widget_external_access(
+            &fixture,
+            "tenant-history",
+            "history-user",
+            "History User",
+        )
+        .await;
+        let primary_run =
+            create_widget_external_run(&fixture, &primary.token, "primary history message").await;
+        let primary_session_id = primary_run.integration_session_id.unwrap();
+
+        let other_user = issue_widget_external_access(
+            &fixture,
+            "tenant-history",
+            "other-history-user",
+            "Other History User",
+        )
+        .await;
+        create_widget_external_run(&fixture, &other_user.token, "other user message").await;
+        let other_tenant = issue_widget_external_access(
+            &fixture,
+            "other-history-tenant",
+            "history-user",
+            "History User",
+        )
+        .await;
+        create_widget_external_run(&fixture, &other_tenant.token, "other tenant message").await;
+
+        let other_app_id = Uuid::new_v4();
+        let other_client_id = format!("widget-history-app-{}", Uuid::new_v4().simple());
+        let other_client_secret = "widget-history-other-app-secret";
+        sqlx::query(
+            "INSERT INTO oauth_apps
+                 (id, owner_id, name, client_id, client_secret_hash, redirect_uris,
+                  external_platform_id, authentication_channel_id,
+                  widget_history_enabled)
+             SELECT $1, owner_id, 'Other History App', $2, $3, redirect_uris,
+                    external_platform_id, authentication_channel_id, true
+             FROM oauth_apps WHERE id = $4",
+        )
+        .bind(other_app_id)
+        .bind(&other_client_id)
+        .bind(sha256_hex(other_client_secret))
+        .bind(fixture.app_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO integration_app_agents (app_id, agent_id) VALUES ($1, $2)")
+            .bind(other_app_id)
+            .bind(fixture.agent_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        let other_app = issue_widget_external_access_for(
+            &fixture,
+            &other_client_id,
+            other_client_secret,
+            fixture.agent_id,
+            "tenant-history",
+            "history-user",
+            "History User",
+        )
+        .await;
+        create_widget_external_run(&fixture, &other_app.token, "other app message").await;
+
+        let other_agent_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO agents
+                 (id, owner_id, name, instructions, visibility, model_policy,
+                  runtime_id, mcp_allowlist, sandbox_policy, public_to,
+                  model_connection_id, model_id, model_settings)
+             SELECT $1, owner_id, 'Other History Agent', instructions, visibility,
+                    model_policy, runtime_id, mcp_allowlist, sandbox_policy, public_to,
+                    model_connection_id, model_id, model_settings
+             FROM agents WHERE id = $2",
+        )
+        .bind(other_agent_id)
+        .bind(fixture.agent_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO integration_app_agents (app_id, agent_id) VALUES ($1, $2)")
+            .bind(fixture.app_id)
+            .bind(other_agent_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        let other_agent = issue_widget_external_access_for(
+            &fixture,
+            &fixture.client_id,
+            &fixture.client_secret,
+            other_agent_id,
+            "tenant-history",
+            "history-user",
+            "History User",
+        )
+        .await;
+        create_widget_external_run(&fixture, &other_agent.token, "other agent message").await;
+
+        let list_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/widget/sessions")
+                    .header("x-agent-hub-embed-token", &primary.token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let history: Vec<WidgetHistorySessionDto> = serde_json::from_slice(
+            &axum::body::to_bytes(list_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id, primary_session_id);
+        assert_eq!(
+            history[0].hub_session_id,
+            primary_run.hub_session_id.unwrap()
+        );
+        assert_eq!(
+            history[0].preview.as_deref(),
+            Some("primary history message")
+        );
+
+        let messages_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/api/widget/sessions/{primary_session_id}/messages"
+                    ))
+                    .header("x-agent-hub-embed-token", &primary.token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(messages_response.status(), StatusCode::OK);
+        let messages: Vec<HubSessionMessageDto> = serde_json::from_slice(
+            &axum::body::to_bytes(messages_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].content.as_deref(),
+            Some("primary history message")
+        );
+
+        let events_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/widget/sessions/{primary_session_id}/events"))
+                    .header("x-agent-hub-embed-token", &primary.token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(events_response.status(), StatusCode::OK);
+        let events: Vec<RunEventDto> = serde_json::from_slice(
+            &axum::body::to_bytes(events_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!events.is_empty());
+        assert!(events.iter().all(|event| event.run_id == primary_run.id));
+
+        for foreign_token in [
+            &other_user.token,
+            &other_tenant.token,
+            &other_app.token,
+            &other_agent.token,
+        ] {
+            let response = fixture
+                .router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!(
+                            "/api/widget/sessions/{primary_session_id}/messages"
+                        ))
+                        .header("x-agent-hub-embed-token", foreign_token)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        sqlx::query("UPDATE oauth_apps SET widget_history_enabled = false WHERE id = $1")
+            .bind(fixture.app_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        let disabled_list = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/widget/sessions")
+                    .header("x-agent-hub-embed-token", &primary.token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(disabled_list.status(), StatusCode::FORBIDDEN);
+        let exact_session_after_disable = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/api/widget/sessions/{primary_session_id}/messages"
+                    ))
+                    .header("x-agent-hub-embed-token", &primary.token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact_session_after_disable.status(), StatusCode::OK);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -23189,8 +26137,9 @@ mod tests {
         let steered = create_widget_run(
             State(fixture.state.clone()),
             widget_headers,
-            Json(CreateRunRequest {
+            Json(CreateWidgetRunRequest {
                 message: "widget joins the active console Turn".into(),
+                integration_session_id: None,
                 hub_session_id: Some(fixture.hub_session_id),
                 parent_run_id: None,
                 client_message_key: Some("widget-active-turn".into()),
@@ -27539,6 +30488,7 @@ mod tests {
                 model_subject_type: "user".into(),
                 model_subject_user_id: Some(owner_id),
                 model_source_integration_app_id: None,
+                external_user_context: None,
             },
         )
         .await
@@ -34591,8 +37541,9 @@ mod tests {
         let widget_error = create_widget_run(
             State(state),
             widget_headers,
-            Json(CreateRunRequest {
+            Json(CreateWidgetRunRequest {
                 message: "must not continue".into(),
+                integration_session_id: None,
                 hub_session_id: None,
                 parent_run_id: None,
                 client_message_key: None,
@@ -36451,6 +39402,7 @@ mod tests {
             sandbox_policy: json!({}),
             managed_skill_ids: Vec::new(),
             mcp_allowlist: json!([]),
+            tool_allowlist: default_agent_tool_allowlist(),
             is_owner: false,
             can_manage: false,
             can_administer: false,
@@ -36484,6 +39436,7 @@ mod tests {
             sandbox_policy: json!({ "mode": "workspace-write", "network_access": true }),
             managed_skill_ids: Vec::new(),
             mcp_allowlist: json!([]),
+            tool_allowlist: default_agent_tool_allowlist(),
         }
     }
 
@@ -37262,6 +40215,7 @@ mod tests {
                     enabled: true,
                     disabled_reason: None,
                 }],
+                tool_allowlist: default_agent_tool_allowlist(),
             }),
         )
         .await
@@ -37430,6 +40384,7 @@ mod tests {
                     enabled: true,
                     disabled_reason: None,
                 }],
+                tool_allowlist: default_agent_tool_allowlist(),
             }),
         )
         .await
@@ -37958,6 +40913,7 @@ mod tests {
                     enabled: true,
                     disabled_reason: None,
                 }],
+                tool_allowlist: default_agent_tool_allowlist(),
             }),
         )
         .await
@@ -38518,6 +41474,10 @@ mod tests {
                 authentication_channel_id: channel.id,
                 redirect_uris: json!(["https://example.test/callback"]),
                 agent_ids: vec![agent_id],
+                widget_history_enabled: false,
+                login_required: true,
+                allowed_origins: Vec::new(),
+                tool_allowlist: None,
             }),
         )
         .await
@@ -39029,6 +41989,10 @@ mod tests {
                 authentication_channel_id: channel.id,
                 redirect_uris: json!(["https://example.test/callback"]),
                 agent_ids: vec![agent_id],
+                widget_history_enabled: false,
+                login_required: true,
+                allowed_origins: Vec::new(),
+                tool_allowlist: None,
             }),
         )
         .await
@@ -39072,6 +42036,7 @@ mod tests {
                     model_subject_type: attribution.subject_type.into(),
                     model_subject_user_id: attribution.subject_user_id,
                     model_source_integration_app_id: attribution.source_integration_app_id,
+                    external_user_context: None,
                 },
             )
             .await
@@ -39141,6 +42106,7 @@ mod tests {
             sandbox_policy: agent.sandbox_policy.clone(),
             managed_skill_ids: agent.managed_skill_ids.clone(),
             mcp_allowlist: agent.mcp_allowlist.clone(),
+            tool_allowlist: agent.tool_allowlist.clone(),
         }
     }
 

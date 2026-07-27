@@ -170,6 +170,372 @@ test('widget serializes rapid submissions and exposes pending UI', async ({ page
   expect(runRequests).toBe(1);
 });
 
+test('widget rotates an external credential without releasing a pending submission lock', async ({ page }) => {
+  const firstRunId = '70000000-0000-0000-0000-000000000010';
+  const secondRunId = '70000000-0000-0000-0000-000000000011';
+  const integrationSessionId = '71000000-0000-0000-0000-000000000010';
+  const hubSessionId = '72000000-0000-0000-0000-000000000010';
+  const heldRoutes: { renewal?: Route; firstRun?: Route } = {};
+  const postedRuns: Array<{ token: string | undefined; body: Record<string, unknown> }> = [];
+  let renewalRequests = 0;
+  await page.route(/^https?:\/\/[^/]+\/api\//, async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === '/api/widget/session') return route.fulfill({ json: {
+      id: 'agent-id', name: 'Renewal Widget Agent', instructions: '',
+      expires_at: new Date(Date.now() + 30_000).toISOString(), history_enabled: false
+    } });
+    if (path === '/api/widget/session/renew' && request.method() === 'POST') {
+      renewalRequests += 1;
+      heldRoutes.renewal = route;
+      return;
+    }
+    if (path === '/api/widget/runs' && request.method() === 'POST') {
+      postedRuns.push({ token: request.headers()['x-agent-hub-embed-token'], body: request.postDataJSON() as Record<string, unknown> });
+      if (postedRuns.length === 1) {
+        heldRoutes.firstRun = route;
+        return;
+      }
+      return route.fulfill({ json: {
+        id: secondRunId, agent_id: 'agent-id', automation_id: null, integration_session_id: integrationSessionId,
+        parent_run_id: null, runtime_id: null, hub_session_id: hubSessionId, hub_message_id: null, hub_turn_id: null,
+        session_ownership_generation: null, status: 'pending', initial_message: 'Second message', native_session_id: null,
+        work_dir_ref: null, source: 'widget', created_at: new Date().toISOString(), updated_at: new Date().toISOString()
+      } });
+    }
+    if (path === `/api/runs/${firstRunId}/events/stream` || path === `/api/runs/${secondRunId}/events/stream`) {
+      return route.fulfill({ contentType: 'text/event-stream', body: '' });
+    }
+    return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });
+  });
+
+  await page.goto('/widget#token=ahw_original');
+  await expect(page.getByText('Renewal Widget Agent')).toBeVisible();
+  await expect.poll(() => renewalRequests).toBe(1);
+  await page.getByRole('textbox', { name: 'Message' }).fill('First message');
+  await page.getByRole('button', { name: 'Send' }).click();
+  await expect(page.getByRole('button', { name: 'Sending...' })).toBeDisabled();
+  if (!heldRoutes.renewal) throw new Error('Widget renewal must be held');
+  expect(postedRuns).toHaveLength(0);
+
+  await heldRoutes.renewal.fulfill({ json: {
+    token: 'ahw_renewed', expires_at: new Date(Date.now() + 15 * 60_000).toISOString()
+  } });
+  await expect.poll(() => postedRuns.length).toBe(1);
+  if (!heldRoutes.firstRun) throw new Error('First Widget Run must be held after renewal');
+  await expect(page.getByRole('textbox', { name: 'Message' })).toHaveValue('First message');
+  await expect(page.getByRole('button', { name: 'Sending...' })).toBeDisabled();
+  await page.locator('form').evaluate((form) => (form as HTMLFormElement).requestSubmit());
+  await page.waitForTimeout(100);
+  expect(postedRuns).toHaveLength(1);
+
+  await heldRoutes.firstRun.fulfill({ json: {
+    id: firstRunId, agent_id: 'agent-id', automation_id: null, integration_session_id: integrationSessionId,
+    parent_run_id: null, runtime_id: null, hub_session_id: hubSessionId, hub_message_id: null, hub_turn_id: null,
+    session_ownership_generation: null, status: 'pending', initial_message: 'First message', native_session_id: null,
+    work_dir_ref: null, source: 'widget', created_at: new Date().toISOString(), updated_at: new Date().toISOString()
+  } });
+  await expect(page.getByRole('textbox', { name: 'Message' })).toHaveValue('');
+
+  await page.getByRole('textbox', { name: 'Message' }).fill('Second message');
+  await expect(page.getByRole('button', { name: 'Send' })).toBeEnabled();
+  await page.getByRole('textbox', { name: 'Message' }).press('Enter');
+  await expect.poll(() => postedRuns.length).toBe(2);
+  expect(postedRuns[0].token).toBe('ahw_renewed');
+  expect(postedRuns[1].token).toBe('ahw_renewed');
+  expect(postedRuns[1].body).toMatchObject({
+    message: 'Second message', integration_session_id: integrationSessionId, hub_session_id: hubSessionId
+  });
+});
+
+test('widget retries the selected credential renewal after another renewal finishes', async ({ page }) => {
+  const heldRenewal: { current?: Route } = {};
+  const renewalTokens: string[] = [];
+  await page.route(/^https?:\/\/[^/]+\/api\//, async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    const token = request.headers()['x-agent-hub-embed-token'];
+    if (path === '/api/widget/session') {
+      const selected = token === 'ahw_first' ? 'First Renewal Agent' : 'Second Renewal Agent';
+      return route.fulfill({ json: {
+        id: token === 'ahw_first' ? 'first-agent' : 'second-agent',
+        name: selected,
+        instructions: '',
+        expires_at: new Date(Date.now() + 30_000).toISOString(),
+        history_enabled: false
+      } });
+    }
+    if (path === '/api/widget/session/renew' && request.method() === 'POST') {
+      renewalTokens.push(token ?? '');
+      if (token === 'ahw_first') {
+        heldRenewal.current = route;
+        return;
+      }
+      if (token === 'ahw_second') {
+        return route.fulfill({ json: {
+          token: 'ahw_second_renewed',
+          expires_at: new Date(Date.now() + 15 * 60_000).toISOString()
+        } });
+      }
+    }
+    return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });
+  });
+
+  await page.goto('/widget');
+  await page.setContent('<div id="widget-host"></div>');
+  await page.evaluate(() => {
+    (window as unknown as { widgetMessages: Record<string, unknown>[] }).widgetMessages = [];
+    window.addEventListener('message', (event) => {
+      const store = (window as unknown as { widgetMessages: Record<string, unknown>[] }).widgetMessages;
+      if (event.data?.type?.startsWith('agent-hub:')) store.push(event.data);
+    });
+    const iframe = document.createElement('iframe');
+    iframe.title = 'widget-renewal-race';
+    iframe.src = '/widget';
+    document.querySelector('#widget-host')?.appendChild(iframe);
+  });
+  const iframe = page.locator('iframe[title="widget-renewal-race"]');
+  const widget = page.frameLocator('iframe[title="widget-renewal-race"]');
+  await expect(widget.getByText('Agent Widget')).toBeVisible();
+  await expect.poll(() => page.evaluate(() => {
+    const messages = (window as unknown as { widgetMessages: Record<string, unknown>[] }).widgetMessages;
+    return messages.some((message) => message.type === 'agent-hub:ready');
+  })).toBeTruthy();
+  const channelId = await page.evaluate(() => {
+    const messages = (window as unknown as { widgetMessages: Record<string, unknown>[] }).widgetMessages;
+    return messages.find((message) => message.type === 'agent-hub:ready')?.channelId as string;
+  });
+
+  await iframe.evaluate((element, channel) => {
+    (element as HTMLIFrameElement).contentWindow?.postMessage({
+      type: 'agent-hub:init', channelId: channel, token: 'ahw_first'
+    }, '*');
+  }, channelId);
+  await expect(widget.getByRole('heading', { name: 'First Renewal Agent' })).toBeVisible();
+  await expect.poll(() => renewalTokens).toEqual(['ahw_first']);
+  if (!heldRenewal.current) throw new Error('First credential renewal was not held');
+
+  await iframe.evaluate((element, channel) => {
+    (element as HTMLIFrameElement).contentWindow?.postMessage({
+      type: 'agent-hub:session-select', channelId: channel, token: 'ahw_second'
+    }, '*');
+  }, channelId);
+  await expect(widget.getByRole('heading', { name: 'Second Renewal Agent' })).toBeVisible();
+  await page.waitForTimeout(100);
+  expect(renewalTokens).toEqual(['ahw_first']);
+
+  await heldRenewal.current.fulfill({ json: {
+    token: 'ahw_first_renewed',
+    expires_at: new Date(Date.now() + 15 * 60_000).toISOString()
+  } });
+  await expect.poll(() => renewalTokens, { timeout: 5_000 }).toContain('ahw_second');
+  await expect(widget.getByRole('heading', { name: 'Second Renewal Agent' })).toBeVisible();
+});
+
+test('widget restores its exact external session and draft without listing disabled history', async ({ page }) => {
+  const integrationSessionId = '71000000-0000-0000-0000-000000000020';
+  const hubSessionId = '72000000-0000-0000-0000-000000000020';
+  const runId = '70000000-0000-0000-0000-000000000020';
+  let historyListRequests = 0;
+  let messageRequests = 0;
+  await page.addInitScript(({ sessionId, hubId }) => {
+    sessionStorage.setItem('agent-hub-widget-state-v1', JSON.stringify({
+      token: 'ahw_restored', expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(), historyEnabled: false,
+      target: { integrationSessionId: sessionId, hubSessionId: hubId },
+      draft: 'Draft restored after refresh', draftClientMessageKey: 'restored-client-key'
+    }));
+  }, { sessionId: integrationSessionId, hubId: hubSessionId });
+  await page.route(/^https?:\/\/[^/]+\/api\//, async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === '/api/widget/session') return route.fulfill({ json: {
+      id: 'agent-id', name: 'Restored Widget Agent', instructions: '',
+      expires_at: new Date(Date.now() + 60 * 60_000).toISOString(), history_enabled: false
+    } });
+    if (path === '/api/widget/sessions') {
+      historyListRequests += 1;
+      return route.fulfill({ json: [] });
+    }
+    if (path === `/api/widget/sessions/${integrationSessionId}/messages`) {
+      messageRequests += 1;
+      return route.fulfill({ json: [{
+        id: 'message-id', session_id: hubSessionId, sequence: 1, role: 'user', message_kind: 'message',
+        content: 'Restored user message', payload: {}, delivery_mode: 'next_turn', delivery_state: 'delivered',
+        client_message_key: 'stored-key', expected_native_turn_id: null, turn_id: null, run_id: runId,
+        accepted_at: new Date().toISOString()
+      }] });
+    }
+    if (path === `/api/widget/sessions/${integrationSessionId}/events`) return route.fulfill({ json: [
+      { seq: 1, run_id: runId, event_type: 'message', role: 'assistant', content: 'Restored assistant reply', payload: {}, created_at: new Date().toISOString() },
+      { seq: 2, run_id: runId, event_type: 'status', role: null, content: 'completed', payload: { status: 'completed' }, created_at: new Date().toISOString() }
+    ] });
+    if (path === `/api/runs/${runId}/events/stream`) return route.fulfill({ contentType: 'text/event-stream', body: '' });
+    return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });
+  });
+
+  await page.goto('/widget');
+  await expect(page.getByRole('heading', { name: 'Restored Widget Agent' })).toBeVisible();
+  await expect(page.getByText('Restored assistant reply', { exact: true })).toBeVisible();
+  await expect(page.getByRole('textbox', { name: 'Message' })).toHaveValue('Draft restored after refresh');
+  await expect(page.getByRole('button', { name: 'History' })).toHaveCount(0);
+  expect(historyListRequests).toBe(0);
+
+  await page.reload();
+  await expect(page.getByText('Restored assistant reply', { exact: true })).toBeVisible();
+  await expect(page.getByRole('textbox', { name: 'Message' })).toHaveValue('Draft restored after refresh');
+  expect(messageRequests).toBeGreaterThanOrEqual(2);
+  expect(historyListRequests).toBe(0);
+});
+
+test('public Widget uses an app-scoped visitor key and restores its anonymous session without history', async ({ page }) => {
+  const hubSessionId = '72000000-0000-0000-0000-000000000040';
+  const runId = '70000000-0000-0000-0000-000000000040';
+  const accessRequests: Array<{ client_id: string; visitor_key: string }> = [];
+  const runTokens: string[] = [];
+  const pageErrors: string[] = [];
+  const consoleErrors: string[] = [];
+  let transcriptRequests = 0;
+  let historyRequests = 0;
+  page.on('pageerror', (error) => pageErrors.push(error.message));
+  page.on('console', (message) => { if (message.type() === 'error') consoleErrors.push(message.text()); });
+  await page.route('**/widget?app=ahc_public', async (route) => {
+    const shellUrl = new URL(route.request().url());
+    shellUrl.search = '';
+    await route.continue({ url: shellUrl.toString() });
+  });
+  await page.route(/^https?:\/\/[^/]+\/api\//, async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === '/api/widget/public/access' && request.method() === 'POST') {
+      accessRequests.push(request.postDataJSON() as { client_id: string; visitor_key: string });
+      return route.fulfill({ json: {
+        access_token: `ahwp_public_${accessRequests.length}`,
+        expires_in: 3_600,
+        widget_session_id: 'public-widget-session',
+        agent: { id: 'agent-id', name: 'Public Widget Agent', instructions: '' },
+        app: { client_id: 'ahc_public', name: 'Public App' }
+      } });
+    }
+    if (path === '/api/widget/runs' && request.method() === 'POST') {
+      runTokens.push(request.headers()['x-agent-hub-embed-token'] ?? '');
+      return route.fulfill({ json: {
+        id: runId, agent_id: 'agent-id', automation_id: null, integration_session_id: null,
+        parent_run_id: null, runtime_id: null, hub_session_id: hubSessionId, hub_message_id: null, hub_turn_id: null,
+        session_ownership_generation: null, status: 'completed', initial_message: 'Public question', native_session_id: null,
+        work_dir_ref: null, source: 'widget', created_at: new Date().toISOString(), updated_at: new Date().toISOString()
+      } });
+    }
+    if (path === `/api/runs/${runId}/events/stream`) return route.fulfill({ contentType: 'text/event-stream', body: '' });
+    if (path === `/api/widget/sessions/${hubSessionId}/messages`) {
+      transcriptRequests += 1;
+      return route.fulfill({ json: [{
+        id: 'public-message', session_id: hubSessionId, sequence: 1, role: 'user', message_kind: 'message',
+        content: 'Public question', payload: {}, delivery_mode: 'next_turn', delivery_state: 'delivered',
+        client_message_key: 'public-key', expected_native_turn_id: null, turn_id: null, run_id: runId,
+        accepted_at: new Date().toISOString()
+      }] });
+    }
+    if (path === `/api/widget/sessions/${hubSessionId}/events`) return route.fulfill({ json: [
+      { seq: 1, run_id: runId, event_type: 'message', role: 'assistant', content: 'Public answer', payload: {}, created_at: new Date().toISOString() },
+      { seq: 2, run_id: runId, event_type: 'status', role: null, content: 'completed', payload: { status: 'completed' }, created_at: new Date().toISOString() }
+    ] });
+    if (path === '/api/widget/sessions') {
+      historyRequests += 1;
+      return route.fulfill({ json: [] });
+    }
+    return route.fulfill({ status: 404, json: { error: `Unhandled public Widget route: ${path}` } });
+  });
+
+  await page.goto('/widget?app=ahc_public');
+  await expect(page.getByRole('heading', { name: 'Public Widget Agent' })).toBeVisible();
+  await page.getByRole('textbox', { name: 'Message' }).fill('Public question');
+  await page.getByRole('button', { name: 'Send' }).click();
+  await expect.poll(() => runTokens).toEqual(['ahwp_public_1']);
+  await page.getByRole('textbox', { name: 'Message' }).fill('Draft retained through public token rotation');
+  await expect.poll(() => page.evaluate((sessionId) => {
+    const state = sessionStorage.getItem('agent-hub-public-widget-state-v1:ahc_public');
+    return state?.includes(sessionId) ?? false;
+  }, hubSessionId)).toBeTruthy();
+
+  await page.reload();
+  await expect(page.getByText('Public answer', { exact: true })).toBeVisible();
+  await expect(page.getByRole('textbox', { name: 'Message' })).toHaveValue('Draft retained through public token rotation');
+  await expect(page.getByRole('button', { name: 'History' })).toHaveCount(0);
+  expect(accessRequests).toHaveLength(2);
+  expect(accessRequests[0].client_id).toBe('ahc_public');
+  expect(accessRequests[1].visitor_key).toBe(accessRequests[0].visitor_key);
+  expect(accessRequests[0].visitor_key).not.toBe('');
+  expect(transcriptRequests).toBeGreaterThan(0);
+  expect(historyRequests).toBe(0);
+  await page.setViewportSize({ width: 390, height: 844 });
+  const dimensions = await page.evaluate(() => ({ scrollWidth: document.documentElement.scrollWidth, innerWidth: window.innerWidth }));
+  expect(dimensions.scrollWidth).toBeLessThanOrEqual(dimensions.innerWidth);
+  expect(pageErrors).toEqual([]);
+  expect(consoleErrors).toEqual([]);
+});
+
+test('widget history switch detaches stale output without stopping the previous Run', async ({ page }) => {
+  const sessionA = '71000000-0000-0000-0000-000000000030';
+  const hubA = '72000000-0000-0000-0000-000000000030';
+  const runA = '70000000-0000-0000-0000-000000000030';
+  const sessionB = '71000000-0000-0000-0000-000000000031';
+  const hubB = '72000000-0000-0000-0000-000000000031';
+  const runB = '70000000-0000-0000-0000-000000000031';
+  let staleStream: Route | undefined;
+  let stopRequests = 0;
+  const storedMessage = (id: string, hubSessionId: string, runId: string, content: string) => ({
+    id, session_id: hubSessionId, sequence: 1, role: 'user', message_kind: 'message', content, payload: {},
+    delivery_mode: 'next_turn', delivery_state: 'delivered', client_message_key: null,
+    expected_native_turn_id: null, turn_id: null, run_id: runId, accepted_at: new Date().toISOString()
+  });
+  await page.route(/^https?:\/\/[^/]+\/api\//, async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === '/api/widget/session') return route.fulfill({ json: {
+      id: 'agent-id', name: 'History Widget Agent', instructions: '',
+      expires_at: new Date(Date.now() + 60 * 60_000).toISOString(), history_enabled: true
+    } });
+    if (path === '/api/widget/sessions') return route.fulfill({ json: [
+      { id: sessionA, hub_session_id: hubA, created_at: new Date().toISOString(), updated_at: new Date().toISOString(), preview: 'Session A' },
+      { id: sessionB, hub_session_id: hubB, created_at: new Date().toISOString(), updated_at: new Date().toISOString(), preview: 'Session B' }
+    ] });
+    if (path === `/api/widget/sessions/${sessionA}/messages`) return route.fulfill({ json: [storedMessage('message-a', hubA, runA, 'Question A')] });
+    if (path === `/api/widget/sessions/${sessionA}/events`) return route.fulfill({ json: [] });
+    if (path === `/api/widget/sessions/${sessionB}/messages`) return route.fulfill({ json: [storedMessage('message-b', hubB, runB, 'Question B')] });
+    if (path === `/api/widget/sessions/${sessionB}/events`) return route.fulfill({ json: [
+      { seq: 1, run_id: runB, event_type: 'message', role: 'assistant', content: 'Answer B', payload: {}, created_at: new Date().toISOString() },
+      { seq: 2, run_id: runB, event_type: 'status', role: null, content: 'completed', payload: { status: 'completed' }, created_at: new Date().toISOString() }
+    ] });
+    if (path === `/api/runs/${runA}/events/stream`) {
+      staleStream = route;
+      return;
+    }
+    if (path === `/api/runs/${runB}/events/stream`) return route.fulfill({ contentType: 'text/event-stream', body: '' });
+    if (path.endsWith('/stop')) {
+      stopRequests += 1;
+      return route.fulfill({ status: 500, json: { error: 'Unexpected stop' } });
+    }
+    return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });
+  });
+
+  await page.goto('/widget#token=ahw_history');
+  await expect(page.getByText('History Widget Agent')).toBeVisible();
+  await page.getByRole('button', { name: 'History' }).click();
+  await page.getByRole('button', { name: /Session A/ }).click();
+  await expect(page.getByText('Question A', { exact: true })).toBeVisible();
+  await expect.poll(() => Boolean(staleStream)).toBeTruthy();
+
+  await page.getByRole('button', { name: 'History' }).click();
+  await page.getByRole('button', { name: /Session B/ }).click();
+  await expect(page.getByText('Answer B', { exact: true })).toBeVisible();
+  if (!staleStream) throw new Error('Previous Widget Run stream was not opened');
+  await staleStream.fulfill({
+    contentType: 'text/event-stream',
+    body: `event: run_event\ndata: ${JSON.stringify({ seq: 1, run_id: runA, event_type: 'message', role: 'assistant', content: 'Late answer A', payload: {}, created_at: new Date().toISOString() })}\n\n`
+  }).catch(() => undefined);
+  await page.waitForTimeout(100);
+  await expect(page.getByText('Late answer A', { exact: true })).toHaveCount(0);
+  expect(stopRequests).toBe(0);
+});
+
 test('widget stream ignores malformed SSE JSON and keeps later events', async ({ page }) => {
   const runId = '70000000-0000-0000-0000-000000000002';
   const pageErrors: string[] = [];
@@ -903,7 +1269,11 @@ test(consoleRunTestTitle, async ({ page, context, baseURL }) => {
   await mcpDialog.getByLabel('Name', { exact: true }).fill('filesystem');
   await mcpDialog.getByLabel('Command').fill('fs');
   await mcpDialog.getByRole('button', { name: 'Save changes' }).click();
-  await expect(mcpPanel.getByRole('table', { name: 'MCP allowlist' })).toContainText('filesystem');
+  const mcpTable = mcpPanel.getByRole('table', { name: 'MCP allowlist' });
+  await expect(mcpTable).toContainText('filesystem');
+  page.once('dialog', (confirmation) => confirmation.accept());
+  await mcpTable.getByRole('button', { name: 'Delete filesystem' }).click();
+  await expect(mcpTable.getByText('filesystem', { exact: true })).toHaveCount(0);
   await expect(page.getByRole('heading', { name: managedAgentName, level: 1 })).toBeVisible();
 
   await page.goto('/sessions');
@@ -1183,7 +1553,7 @@ test(consoleRunTestTitle, async ({ page, context, baseURL }) => {
   const runtimeDetail = page.getByRole('region', { name: 'Runtime details' });
   await expect(runtimeDetail.getByText('online').first()).toBeVisible();
   await expect(runtimeDetail.getByText('driver:pi').first()).toBeVisible();
-  await expect(runtimeDetail.getByText('unmanaged').first()).toBeVisible();
+  await expect(runtimeDetail.locator('dt', { hasText: /^Execution engine version$/ }).locator('..').locator('dd')).toHaveText('0.81.1');
   await expect(runtimeDetail.locator('dt', { hasText: /^Model proxy$/ }).locator('..').locator('dd')).toHaveText('Enabled');
 
   await page.goto('/skills');

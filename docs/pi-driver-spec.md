@@ -75,8 +75,10 @@ Pi `models.json` 为每个 Run 的 `main` binding 创建一个 provider：
 
 ## 工具策略
 
-Pi standalone 没有统一的 sandbox policy RPC 参数。Runtime 采用保守的
-tool allowlist，不得把 Hub policy 静默放宽：
+Pi standalone 没有统一的 sandbox policy RPC 参数。Hub 先从 Agent 的显式
+tool allowlist 开始；Integration App 配置存在时取交集。公开 Widget 再限制为
+`read,grep,find,ls`，并把 sandbox 改为 read-only、关闭网络和 MCP。Runtime 最后
+按下表与 sandbox policy 再取更严格结果，不得把 Hub policy 静默放宽：
 
 | Hub sandbox policy | `network_access` | Pi builtin tools |
 | --- | --- | --- |
@@ -85,6 +87,16 @@ tool allowlist，不得把 Hub policy 静默放宽：
 | `workspace-write` | `true` | 上述工具加 `bash` |
 | `danger-full-access` | `false` | `read,grep,find,ls,edit,write` |
 | `danger-full-access` | `true` | 上述工具加 `bash` |
+
+`integration` 不是 Pi builtin 名称。只有有效策略仍包含它时，Runtime 才把当前
+Integration Session 声明的具体工具名加入 Pi allowlist；没有 Integration context
+时不会凭该标志生成工具。Agent/App/public/sandbox 任一层拒绝的工具都不能被后续层
+重新加入。
+
+Pi 的 `--tools` 和 Linux Landlock 文件权限都在进程启动时固定。Runtime 记录在线
+Pi 进程的有效工具集合；配置刷新不打断活动 Turn，但下一 Turn 的有效集合发生变化时，
+Runtime 必须先停止空闲 Pi，再从同一 JSONL 恢复同一个 Native Session 并传入新的
+`--tools`。集合未变化时继续复用原进程。
 
 Pi 进程仍运行在 Runtime 的非 root 用户、容器/操作系统隔离和每个 Session
 Workspace 下。此表不承诺其他执行引擎 sandbox 的字节级等价；若部署要求比 Runtime

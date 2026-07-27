@@ -7,10 +7,13 @@ import {
   IntegrationApp,
   IntegrationAppOptions,
   IntegrationAppSecretResponse,
-  UpdateIntegrationAppRequest
+  UpdateIntegrationAppRequest,
+  User
 } from './api/client';
 import { FormDialog } from './components/form-dialog';
+import { normalizeToolAllowlist, publicWidgetTools, ToolAllowlistPicker } from './components/tool-allowlist';
 import { useI18n } from './i18n';
+import type { TranslationKey } from './i18n';
 
 type AppDialog =
   | { kind: 'create' }
@@ -33,12 +36,14 @@ function IntegrationAppForm({
   app,
   options,
   agents,
+  canConfigureAnonymous,
   onClose,
   onSubmit
 }: {
   app?: IntegrationApp;
   options: IntegrationAppOptions;
   agents: Agent[];
+  canConfigureAnonymous: boolean;
   onClose: () => void;
   onSubmit: (request: CreateIntegrationAppRequest | UpdateIntegrationAppRequest) => Promise<void>;
 }) {
@@ -56,8 +61,13 @@ function IntegrationAppForm({
   const [channelId, setChannelId] = useState(initialChannelId);
   const [redirectUris, setRedirectUris] = useState(app?.redirect_uris.length ? [...app.redirect_uris] : ['']);
   const [agentIds, setAgentIds] = useState<string[]>(app?.agent_ids ?? []);
+  const [widgetHistoryEnabled, setWidgetHistoryEnabled] = useState(app?.widget_history_enabled ?? false);
+  const [loginRequired, setLoginRequired] = useState(app?.login_required ?? true);
+  const [allowedOrigins, setAllowedOrigins] = useState(app?.allowed_origins?.length ? [...app.allowed_origins] : ['']);
+  const [restrictTools, setRestrictTools] = useState(app?.tool_allowlist !== null && app?.tool_allowlist !== undefined);
+  const [toolAllowlist, setToolAllowlist] = useState(() => normalizeToolAllowlist(app?.tool_allowlist));
   const [pending, setPending] = useState(false);
-  const [error, setError] = useState(false);
+  const [error, setError] = useState<TranslationKey | null>(null);
   const availableAgents = useMemo(() => agents.filter((agent) => agent.can_invoke), [agents]);
   const channels = useMemo(
     () => options.authentication_channels.filter((channel) => channel.platform_id === platformId),
@@ -81,9 +91,26 @@ function IntegrationAppForm({
   }
 
   function toggleAgent(agentId: string, selected: boolean) {
+    if (!loginRequired) {
+      setAgentIds(selected ? [agentId] : []);
+      return;
+    }
     setAgentIds((current) => selected
       ? [...new Set([...current, agentId])]
       : current.filter((id) => id !== agentId));
+  }
+
+  function updateAllowedOrigin(index: number, value: string) {
+    setAllowedOrigins((current) => current.map((origin, originIndex) => originIndex === index ? value : origin));
+  }
+
+  function isExactOrigin(value: string) {
+    try {
+      const url = new URL(value);
+      return (url.protocol === 'https:' || url.protocol === 'http:') && url.origin === value;
+    } catch {
+      return false;
+    }
   }
 
   async function submit(event: FormEvent) {
@@ -91,11 +118,22 @@ function IntegrationAppForm({
     if (submittingRef.current) return;
     submittingRef.current = true;
     setPending(true);
-    setError(false);
+    setError(null);
+    const normalizedOrigins = allowedOrigins.map((origin) => origin.trim()).filter(Boolean);
+    if (!loginRequired && (agentIds.length !== 1 || normalizedOrigins.length === 0 || normalizedOrigins.some((origin) => !isExactOrigin(origin)))) {
+      setError(agentIds.length !== 1 ? 'anonymousWidgetAgentRequired' : 'allowedOriginsInvalid');
+      submittingRef.current = false;
+      setPending(false);
+      return;
+    }
     const common = {
       name: name.trim(),
       redirect_uris: redirectUris.map((uri) => uri.trim()).filter(Boolean),
-      agent_ids: agentIds
+      agent_ids: agentIds,
+      widget_history_enabled: loginRequired && widgetHistoryEnabled,
+      login_required: loginRequired,
+      allowed_origins: loginRequired ? [] : normalizedOrigins,
+      tool_allowlist: restrictTools ? toolAllowlist : null
     };
     try {
       await onSubmit(isEditing ? common : {
@@ -104,7 +142,7 @@ function IntegrationAppForm({
         authentication_channel_id: channelId
       });
     } catch {
-      if (mountedRef.current) setError(true);
+      if (mountedRef.current) setError('integrationAppSaveFailed');
     } finally {
       submittingRef.current = false;
       if (mountedRef.current) setPending(false);
@@ -142,12 +180,38 @@ function IntegrationAppForm({
           </div>
           <button className="secondary integration-add-uri" type="button" onClick={() => setRedirectUris((current) => [...current, ''])}><Plus size={16} /> {t('addRedirectUri')}</button>
         </fieldset>
+        {canConfigureAnonymous && <label className="check-row"><input type="checkbox" checked={!loginRequired} onChange={(event) => {
+          const anonymous = event.target.checked;
+          setLoginRequired(!anonymous);
+          if (anonymous) {
+            setAgentIds((current) => current.slice(0, 1));
+            setWidgetHistoryEnabled(false);
+            const narrowedTools = toolAllowlist.filter((tool) => publicWidgetTools.includes(tool as typeof publicWidgetTools[number]));
+            setToolAllowlist(narrowedTools);
+            if (narrowedTools.length === 0) setRestrictTools(false);
+          }
+        }} /><span>{t('anonymousPublicWidget')}</span></label>}
         <fieldset className="integration-fieldset integration-agent-selector">
           <legend>{t('delegatedAgents')}</legend>
           {availableAgents.length === 0 && <span>{t('noInvocableAgents')}</span>}
-          {availableAgents.map((agent) => <label className="check-row" key={agent.id}><input type="checkbox" aria-label={replaceName(t('delegateAgent'), agent.name)} checked={agentIds.includes(agent.id)} onChange={(event) => toggleAgent(agent.id, event.target.checked)} /><span>{agent.name}</span></label>)}
+          {availableAgents.map((agent) => <label className="check-row" key={agent.id}><input type={loginRequired ? 'checkbox' : 'radio'} name={loginRequired ? undefined : 'anonymous-widget-agent'} aria-label={replaceName(t('delegateAgent'), agent.name)} checked={agentIds.includes(agent.id)} onChange={(event) => toggleAgent(agent.id, event.target.checked)} /><span>{agent.name}</span></label>)}
         </fieldset>
-        {error && <div className="error" role="alert">{t('integrationAppSaveFailed')}</div>}
+        {!loginRequired && <>
+          <fieldset className="integration-fieldset">
+            <legend>{t('allowedOrigins')}</legend>
+            <div className="integration-uri-list">
+              {allowedOrigins.map((origin, index) => <div className="integration-uri-row" key={index}>
+                <label>{t('allowedOriginLabel').replace('{index}', String(index + 1))}<input aria-label={t('allowedOriginLabel').replace('{index}', String(index + 1))} value={origin} placeholder="https://example.com" onChange={(event) => updateAllowedOrigin(index, event.target.value)} /></label>
+                <button className="icon-button" type="button" disabled={allowedOrigins.length === 1} aria-label={t('removeAllowedOrigin').replace('{index}', String(index + 1))} title={t('removeAllowedOrigin').replace('{index}', String(index + 1))} onClick={() => setAllowedOrigins((current) => current.filter((_, originIndex) => originIndex !== index))}><Trash2 size={17} /></button>
+              </div>)}
+            </div>
+            <button className="secondary integration-add-uri" type="button" onClick={() => setAllowedOrigins((current) => [...current, ''])}><Plus size={16} /> {t('addAllowedOrigin')}</button>
+          </fieldset>
+        </>}
+        <label className="check-row"><input type="checkbox" checked={restrictTools} onChange={(event) => setRestrictTools(event.target.checked)} /><span>{t('restrictAppTools')}</span></label>
+        {restrictTools && <ToolAllowlistPicker value={toolAllowlist} onChange={setToolAllowlist} disabled={pending} legend={t('toolAllowlist')} tools={loginRequired ? undefined : publicWidgetTools} />}
+        {loginRequired && <label className="check-row"><input type="checkbox" checked={widgetHistoryEnabled} onChange={(event) => setWidgetHistoryEnabled(event.target.checked)} /><span>{t('widgetHistoryEnabled')}</span></label>}
+        {error && <div className="error" role="alert">{t(error)}</div>}
       </form>
     </FormDialog>
   );
@@ -212,6 +276,8 @@ function WidgetLinksDialog({ app, agents, onClose }: { app: IntegrationApp; agen
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const mountedRef = useRef(true);
   const agentById = useMemo(() => new Map(agents.map((agent) => [agent.id, agent])), [agents]);
+  const publicLink = `${window.location.origin}/widget?app=${encodeURIComponent(app.client_id)}`;
+  const loginRequired = app.login_required !== false;
   useEffect(() => () => { mountedRef.current = false; }, []);
 
   async function generate(agentId: string) {
@@ -231,7 +297,7 @@ function WidgetLinksDialog({ app, agents, onClose }: { app: IntegrationApp; agen
 
   async function copyLink(agentId: string) {
     try {
-      await navigator.clipboard.writeText(links[agentId]);
+      await navigator.clipboard.writeText(agentId === 'public' ? publicLink : links[agentId]);
       setCopiedId(agentId);
     } catch {
       setCopiedId(null);
@@ -239,6 +305,8 @@ function WidgetLinksDialog({ app, agents, onClose }: { app: IntegrationApp; agen
   }
 
   return <FormDialog title={t('widgetLinks')} eyebrow={app.name} onClose={onClose} className="integration-widgets-dialog" footer={<button className="primary" type="button" onClick={onClose}>{t('close')}</button>}>
+    {!loginRequired && <div className="integration-widget-list"><div className="integration-widget-row"><strong>{t('publicWidgetLink')}</strong><div className="integration-widget-link"><code>{publicLink}</code><button className="icon-button" type="button" aria-label={t('copyPublicWidgetLink')} title={t('copyPublicWidgetLink')} onClick={() => copyLink('public')}>{copiedId === 'public' ? <Check size={17} /> : <Copy size={17} />}</button><a className="icon-button" aria-label={t('openPublicWidget')} title={t('openPublicWidget')} href={publicLink} target="_blank" rel="noreferrer"><ExternalLink size={17} /></a></div></div></div>}
+    {loginRequired && <>
     {app.agent_ids.length === 0 && <div className="state-panel">{t('noDelegatedAgents')}</div>}
     <div className="integration-widget-list">
       {app.agent_ids.map((agentId) => {
@@ -252,10 +320,11 @@ function WidgetLinksDialog({ app, agents, onClose }: { app: IntegrationApp; agen
         </div>;
       })}
     </div>
+    </>}
   </FormDialog>;
 }
 
-export function IntegrationAppsPage() {
+export function IntegrationAppsPage({ currentUser }: { currentUser: User }) {
   const { locale, t } = useI18n();
   const mountedRef = useRef(true);
   const loadGenerationRef = useRef(0);
@@ -347,8 +416,8 @@ export function IntegrationAppsPage() {
         })}</tbody>
       </table>
     </div>}
-    {dialog?.kind === 'create' && <IntegrationAppForm options={options} agents={agents} onClose={closeDialog} onSubmit={createApp} />}
-    {dialog?.kind === 'edit' && <IntegrationAppForm app={dialog.app} options={options} agents={agents} onClose={closeDialog} onSubmit={(request) => updateApp(dialog.app, request)} />}
+    {dialog?.kind === 'create' && <IntegrationAppForm options={options} agents={agents} canConfigureAnonymous={currentUser.role === 'admin' || currentUser.role === 'super_admin'} onClose={closeDialog} onSubmit={createApp} />}
+    {dialog?.kind === 'edit' && <IntegrationAppForm app={dialog.app} options={options} agents={agents} canConfigureAnonymous={currentUser.role === 'admin' || currentUser.role === 'super_admin'} onClose={closeDialog} onSubmit={(request) => updateApp(dialog.app, request)} />}
     {dialog?.kind === 'rotate' && <RotateSecretDialog app={dialog.app} onClose={closeDialog} onRotated={(result) => {
       setApps((current) => current.map((app) => app.id === result.integration_app.id ? result.integration_app : app));
       setDialog({ kind: 'secret', result });

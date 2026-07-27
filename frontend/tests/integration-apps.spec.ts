@@ -51,6 +51,10 @@ type IntegrationAppFixture = {
   authentication_channel_id: string;
   redirect_uris: string[];
   agent_ids: string[];
+  widget_history_enabled: boolean;
+  login_required: boolean;
+  allowed_origins: string[];
+  tool_allowlist: string[] | null;
   created_at: string;
   updated_at: string;
 };
@@ -64,11 +68,16 @@ const initialApp: IntegrationAppFixture = {
   authentication_channel_id: channelOne,
   redirect_uris: ['https://existing.example.com/callback'],
   agent_ids: [alphaAgent],
+  widget_history_enabled: false,
+  login_required: true,
+  allowed_origins: [],
+  tool_allowlist: null,
   created_at: now,
   updated_at: now
 };
 
-async function installIntegrationApi(page: Page) {
+async function installIntegrationApi(page: Page, { role }: { role?: 'member' | 'admin' | 'super_admin' } = {}) {
+  const currentRole = role ?? 'member';
   let apps = [{ ...initialApp }];
   let createBody: Record<string, unknown> | null = null;
   let updateBody: Record<string, unknown> | null = null;
@@ -79,7 +88,7 @@ async function installIntegrationApi(page: Page) {
     const request = route.request();
     const path = new URL(request.url()).pathname;
     if (!path.startsWith('/api/')) return route.continue();
-    if (path === '/api/auth/me') return route.fulfill({ json: currentUser });
+    if (path === '/api/auth/me') return route.fulfill({ json: { ...currentUser, role: currentRole } });
     if (path === '/api/integration-app-options') {
       return route.fulfill({ json: { external_platforms: platforms, authentication_channels: channels } });
     }
@@ -143,6 +152,10 @@ test('Integration Apps are a first-level table workflow and create reveals the s
   await dialog.getByRole('textbox', { name: 'Redirect URI 2' }).fill('https://created.example.com/secondary');
   await dialog.getByRole('checkbox', { name: 'Delegate Alpha Agent' }).check();
   await dialog.getByRole('checkbox', { name: 'Delegate Beta Agent' }).check();
+  await expect(dialog.getByRole('checkbox', { name: 'Allow anonymous public Widget' })).toHaveCount(0);
+  await dialog.getByRole('checkbox', { name: "Further restrict this App's tools" }).check();
+  await dialog.getByRole('checkbox', { name: 'read' }).check();
+  await expect(dialog.getByRole('checkbox', { name: 'Enable Widget history' })).not.toBeChecked();
   await dialog.getByRole('button', { name: 'Create Integration App' }).click();
 
   expect(fixture.createBody()).toEqual({
@@ -150,7 +163,11 @@ test('Integration Apps are a first-level table workflow and create reveals the s
     external_platform_id: platformTwo,
     authentication_channel_id: channelTwo,
     redirect_uris: ['https://created.example.com/callback', 'https://created.example.com/secondary'],
-    agent_ids: [alphaAgent, betaAgent]
+    agent_ids: [alphaAgent, betaAgent],
+    widget_history_enabled: false,
+    login_required: true,
+    allowed_origins: [],
+    tool_allowlist: ['read']
   });
   const secretDialog = page.getByRole('dialog', { name: 'Integration App secret' });
   await expect(secretDialog.getByText('ahs_created_once', { exact: true })).toBeVisible();
@@ -171,11 +188,16 @@ test('editing keeps origin immutable and secret rotation has an explicit subform
   await editDialog.getByRole('textbox', { name: 'Name', exact: true }).fill('Renamed App');
   await editDialog.getByRole('textbox', { name: 'Redirect URI 1' }).fill('https://renamed.example.com/callback');
   await editDialog.getByRole('checkbox', { name: 'Delegate Beta Agent' }).check();
+  await editDialog.getByRole('checkbox', { name: 'Enable Widget history' }).check();
   await editDialog.getByRole('button', { name: 'Save changes' }).click();
   expect(fixture.updateBody()).toEqual({
     name: 'Renamed App',
     redirect_uris: ['https://renamed.example.com/callback'],
-    agent_ids: [alphaAgent, betaAgent]
+    agent_ids: [alphaAgent, betaAgent],
+    widget_history_enabled: true,
+    login_required: true,
+    allowed_origins: [],
+    tool_allowlist: null
   });
   await expect(page.getByRole('table', { name: 'Integration App list' })).toContainText('Renamed App');
 
@@ -199,6 +221,35 @@ test('each delegated Agent gets its own one-hour Widget link', async ({ page }) 
   await expect(link).toHaveAttribute('href', new RegExp(`/widget#token=ahe_${alphaAgent}$`));
   await expect(link).not.toHaveAttribute('href', /\?token=/);
   await expect(dialog.getByRole('button', { name: 'Copy Widget link for Alpha Agent' })).toBeVisible();
+});
+
+test('admin configures an anonymous public Widget with one Agent, exact Origins, and narrowed tools', async ({ page }) => {
+  const fixture = await installIntegrationApi(page, { role: 'admin' });
+  await page.goto('/integrations');
+
+  await page.getByRole('button', { name: 'Create Integration App' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Create Integration App' });
+  await dialog.getByRole('textbox', { name: 'Name', exact: true }).fill('Public App');
+  await dialog.getByRole('textbox', { name: 'Redirect URI 1' }).fill('https://public.example.com/callback');
+  await dialog.getByRole('checkbox', { name: 'Allow anonymous public Widget' }).check();
+  await dialog.getByRole('radio', { name: 'Delegate Alpha Agent' }).check();
+  await dialog.getByRole('textbox', { name: 'Allowed Origin 1' }).fill('https://public.example.com');
+  await dialog.getByRole('checkbox', { name: "Further restrict this App's tools" }).check();
+  await dialog.getByRole('checkbox', { name: 'read' }).check();
+  await dialog.getByRole('checkbox', { name: 'grep' }).check();
+  await dialog.getByRole('button', { name: 'Create Integration App' }).click();
+
+  expect(fixture.createBody()).toMatchObject({
+    login_required: false,
+    agent_ids: [alphaAgent],
+    allowed_origins: ['https://public.example.com'],
+    tool_allowlist: ['read', 'grep']
+  });
+  await page.getByRole('dialog', { name: 'Integration App secret' }).locator('.modal-actions').getByRole('button', { name: 'Close', exact: true }).click();
+  await page.getByRole('button', { name: 'Widget links for Public App' }).click();
+  const link = page.getByRole('link', { name: 'Open public Widget' });
+  await expect(link).toHaveAttribute('href', new RegExp('/widget\\?app=ahc_created$'));
+  await expect(link).not.toHaveAttribute('href', /token=/);
 });
 
 test('Integration Apps and its form fit a 390px Chinese viewport', async ({ page }) => {

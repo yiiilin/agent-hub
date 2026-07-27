@@ -345,17 +345,30 @@ test('Embed JWT exchanges into a widget session through postMessage', async ({ p
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
   await expect(page.getByText('admin@example.com')).toBeVisible();
 
+  const modelResponse = await page.request.post('/api/model-connections', { data: {
+    scope: 'personal',
+    name: `JWT Widget model ${Date.now()}-${test.info().workerIndex}`,
+    base_url: 'http://fake-model-provider:8080',
+    api_type: 'openai_responses',
+    allowed_model_ids: ['hub-proxy-smoke'],
+    api_key: 'dev-model-provider-api-key'
+  } });
+  expect(modelResponse.ok()).toBeTruthy();
+  const model = await modelResponse.json() as { id: string };
+  const modelSelection = { connection_id: model.id, model_id: 'hub-proxy-smoke' };
   const response = await page.request.post('/api/agents', {
-    data: { name: `JWT Widget Agent ${Date.now()}`, instructions: 'Widget JWT exchange test.', visibility: 'private' }
+    data: { name: `JWT Widget Agent ${Date.now()}`, instructions: 'Widget JWT exchange test.', visibility: 'private', model_selection: modelSelection }
   });
   expect(response.ok()).toBeTruthy();
   const agent = await response.json();
   const jwt = signEmbedJwt(agent.id, agent.owner_id);
   const secondResponse = await page.request.post('/api/agents', {
-    data: { name: `Second Widget Agent ${Date.now()}`, instructions: 'Second widget session.', visibility: 'private' }
+    data: { name: `Second Widget Agent ${Date.now()}`, instructions: 'Second widget session.', visibility: 'private', model_selection: modelSelection }
   });
+  expect(secondResponse.ok()).toBeTruthy();
   const secondAgent = await secondResponse.json();
   const secondSessionResponse = await page.request.post('/api/embed/sessions', { data: { agent_id: secondAgent.id } });
+  expect(secondSessionResponse.ok()).toBeTruthy();
   const secondSession = await secondSessionResponse.json();
 
   await page.setContent('<div id="widget-host"></div>');
@@ -411,10 +424,19 @@ test('Embed JWT exchanges into a widget session through postMessage', async ({ p
     await heldWidgetRun;
     await route.continue();
   });
+  await frame.getByLabel('Message').fill('Draft survives failed credential exchange');
   await page.locator('iframe[title="widget"]').evaluate((iframe, channel) => {
     (iframe as HTMLIFrameElement).contentWindow?.postMessage({ type: 'agent-hub:message-submit', channelId: channel, message: 'Host submitted widget message' }, '*');
   }, channelId);
   await expect.poll(() => widgetRunPosts).toBe(1);
+  await expect(frame.getByRole('button', { name: 'Sending...' })).toBeDisabled();
+  const failedExchangeResponse = page.waitForResponse((response) => response.request().method() === 'POST'
+    && new URL(response.url()).pathname === '/api/embed/exchange');
+  await page.locator('iframe[title="widget"]').evaluate((iframe, channel) => {
+    (iframe as HTMLIFrameElement).contentWindow?.postMessage({ type: 'agent-hub:embed-jwt', channelId: channel, jwt: 'not-a-valid-embed-jwt' }, '*');
+  }, channelId);
+  expect((await failedExchangeResponse).status()).toBe(401);
+  await expect(frame.getByLabel('Message')).toHaveValue('Draft survives failed credential exchange');
   await expect(frame.getByRole('button', { name: 'Sending...' })).toBeDisabled();
   await page.locator('iframe[title="widget"]').evaluate((iframe, data) => {
     (iframe as HTMLIFrameElement).contentWindow?.postMessage({ type: 'agent-hub:session-select', channelId: data.channelId, token: data.token }, '*');
@@ -439,6 +461,7 @@ test('Embed JWT exchanges into a widget session through postMessage', async ({ p
   await expect(frame.getByText('completed run')).toHaveCount(0);
   await page.request.delete(`/api/agents/${agent.id}`);
   await page.request.delete(`/api/agents/${secondAgent.id}`);
+  await page.request.delete(`/api/model-connections/${model.id}`);
 });
 
 test('Auth boundary checks reject polluted or unauthorized embed flows', async ({ baseURL }) => {

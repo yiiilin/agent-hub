@@ -2,5 +2,5 @@
   "name": "Widget parent messaging and scoped Run browser workflows",
   "type": "browser",
   "timeout_ms": 180000,
-  "covers": ["WGT-002", "WGT-004"]
+  "covers": ["WGT-002", "WGT-004", "WGT-005"]
 }

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { Buffer } from 'node:buffer';
 import { createHmac, randomUUID } from 'node:crypto';
 import { ApiClient, loginAsAdmin, poll } from '../../support/api.mjs';
 
@@ -43,6 +44,15 @@ function assertOpaque(value, prefix, label) {
 function embedOptions(token, expectedStatus) {
   return {
     headers: { 'x-agent-hub-embed-token': token },
+    ...(expectedStatus === undefined ? {} : { expectedStatus })
+  };
+}
+
+function basicWidgetOptions(clientId, clientSecret, expectedStatus) {
+  return {
+    headers: {
+      authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}`
+    },
     ...(expectedStatus === undefined ? {} : { expectedStatus })
   };
 }
@@ -146,6 +156,51 @@ async function readWidgetSseUntilTurnStarted(baseURL, runId, token) {
   }
 }
 
+async function readWidgetSessionSseEvent(baseURL, sessionId, token) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 20_000);
+  try {
+    const response = await fetch(
+      new URL(`/api/widget/sessions/${sessionId}/events/stream?after=0`, baseURL),
+      {
+        headers: {
+          accept: 'text/event-stream',
+          'x-agent-hub-embed-token': token
+        },
+        signal: controller.signal
+      }
+    );
+    assert.equal(response.status, 200, `Widget Session SSE returned ${response.status}`);
+    assert.match(response.headers.get('content-type') ?? '', /^text\/event-stream\b/);
+    assert.ok(response.body, 'Widget Session SSE must return a body');
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true }).replaceAll('\r\n', '\n');
+      let separator = buffer.indexOf('\n\n');
+      while (separator >= 0) {
+        const frame = parseSseFrame(buffer.slice(0, separator));
+        buffer = buffer.slice(separator + 2);
+        if (frame.event === 'run_event') return JSON.parse(frame.data);
+        separator = buffer.indexOf('\n\n');
+      }
+    }
+    throw new Error('Widget Session SSE closed before a Run event');
+  } catch (error) {
+    if (controller.signal.aborted && error?.name === 'AbortError') {
+      throw new Error('Timed out waiting for Widget Session SSE event');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    controller.abort();
+  }
+}
+
 async function corsPreflight(baseURL, origin) {
   const response = await fetch(new URL('/api/widget/runs', baseURL), {
     method: 'OPTIONS',
@@ -241,7 +296,8 @@ export default async function widgetEmbedApiScenario(context) {
       external_platform_id: firstPlatform.id,
       authentication_channel_id: firstChannel.id,
       redirect_uris: [firstRedirectUri],
-      agent_ids: [primaryAgent.id, secondaryAgent.id]
+      agent_ids: [primaryAgent.id, secondaryAgent.id],
+      widget_history_enabled: true
     });
     const firstApp = firstAppSecret.integration_app;
     const { data: secondAppSecret } = await ownerClient.post('/api/integration-apps', {
@@ -249,7 +305,8 @@ export default async function widgetEmbedApiScenario(context) {
       external_platform_id: secondPlatform.id,
       authentication_channel_id: secondChannel.id,
       redirect_uris: [secondRedirectUri],
-      agent_ids: [secondaryAgent.id]
+      agent_ids: [secondaryAgent.id],
+      widget_history_enabled: false
     });
     const secondApp = secondAppSecret.integration_app;
     assertUuid(firstApp.id, 'First Integration App id');
@@ -325,6 +382,166 @@ export default async function widgetEmbedApiScenario(context) {
       (await widgetClient.get('/api/widget/session', embedOptions(integrationSession.token))).data.id,
       primaryAgent.id
     );
+
+    const externalTenantId = uniqueSlug(context, 'qa-widget-tenant');
+    const externalUserId = uniqueSlug(context, 'qa-widget-external-user');
+    const externalAccessBody = {
+      agent_id: primaryAgent.id,
+      tenant_id: externalTenantId,
+      external_user_id: externalUserId,
+      username: `${externalUserId}-name`,
+      display_name: 'QA External Widget User',
+      email: `${externalUserId}@example.com`,
+      attributes: { plan: 'qa', revision: 1 }
+    };
+    await widgetClient.post(
+      '/api/widget/access',
+      externalAccessBody,
+      basicWidgetOptions(firstApp.client_id, `${firstAppSecret.client_secret}-invalid`, 401)
+    );
+    const { data: externalAccess } = await widgetClient.post(
+      '/api/widget/access',
+      externalAccessBody,
+      basicWidgetOptions(firstApp.client_id, firstAppSecret.client_secret)
+    );
+    assertOpaque(externalAccess.token, 'ahw_', 'External Widget credential');
+    assert.equal(externalAccess.agent.id, primaryAgent.id);
+    assert.equal(externalAccess.history_enabled, true);
+    const externalCredentialTtl = Date.parse(externalAccess.expires_at) - Date.now();
+    assert.ok(externalCredentialTtl > 10 * 60_000 && externalCredentialTtl <= 16 * 60_000);
+    const { data: externalWidgetSession } = await widgetClient.get(
+      '/api/widget/session',
+      embedOptions(externalAccess.token)
+    );
+    assert.equal(externalWidgetSession.id, primaryAgent.id);
+    assert.equal(externalWidgetSession.history_enabled, true);
+
+    const externalMessage = context.unique('QA external Widget history message');
+    const { data: externalRun } = await widgetClient.post('/api/widget/runs', {
+      message: externalMessage,
+      parent_run_id: null,
+      client_message_key: uniqueSlug(context, 'qa-external-widget-message')
+    }, embedOptions(externalAccess.token));
+    assertUuid(externalRun.id, 'External Widget Run id');
+    assertUuid(externalRun.integration_session_id, 'External Widget Integration Session id');
+    assertUuid(externalRun.hub_session_id, 'External Widget Hub Session id');
+    await poll(
+      async () => (await ownerClient.get(`/api/runs/${externalRun.id}`)).data,
+      (run) => run.status === 'completed',
+      { timeoutMs: 60_000, description: 'external Widget Run to complete through Pi' }
+    );
+
+    const { data: externalHistory } = await widgetClient.get(
+      '/api/widget/sessions',
+      embedOptions(externalAccess.token)
+    );
+    assert.equal(externalHistory.length, 1);
+    assert.equal(externalHistory[0].id, externalRun.integration_session_id);
+    assert.equal(externalHistory[0].hub_session_id, externalRun.hub_session_id);
+    assert.equal(externalHistory[0].preview, externalMessage);
+    const { data: externalMessages } = await widgetClient.get(
+      `/api/widget/sessions/${externalRun.integration_session_id}/messages`,
+      embedOptions(externalAccess.token)
+    );
+    assert.equal(
+      externalMessages.some((message) => message.role === 'user' && message.content === externalMessage),
+      true
+    );
+    const { data: externalEvents } = await widgetClient.get(
+      `/api/widget/sessions/${externalRun.integration_session_id}/events`,
+      embedOptions(externalAccess.token)
+    );
+    assert.equal(externalEvents.some((event) => event.run_id === externalRun.id), true);
+    const externalStreamEvent = await readWidgetSessionSseEvent(
+      context.baseURL,
+      externalRun.integration_session_id,
+      externalAccess.token
+    );
+    assert.equal(externalStreamEvent.run_id, externalRun.id);
+
+    const { data: otherUserAccess } = await widgetClient.post('/api/widget/access', {
+      ...externalAccessBody,
+      external_user_id: `${externalUserId}-other`,
+      username: `${externalUserId}-other`,
+      email: `${externalUserId}-other@example.com`
+    }, basicWidgetOptions(firstApp.client_id, firstAppSecret.client_secret));
+    assert.deepEqual(
+      (await widgetClient.get('/api/widget/sessions', embedOptions(otherUserAccess.token))).data,
+      []
+    );
+    await widgetClient.get(
+      `/api/widget/sessions/${externalRun.integration_session_id}/messages`,
+      embedOptions(otherUserAccess.token, 404)
+    );
+    const { data: otherTenantAccess } = await widgetClient.post('/api/widget/access', {
+      ...externalAccessBody,
+      tenant_id: `${externalTenantId}-other`
+    }, basicWidgetOptions(firstApp.client_id, firstAppSecret.client_secret));
+    assert.deepEqual(
+      (await widgetClient.get('/api/widget/sessions', embedOptions(otherTenantAccess.token))).data,
+      []
+    );
+    await widgetClient.get(
+      `/api/widget/sessions/${externalRun.integration_session_id}/messages`,
+      embedOptions(otherTenantAccess.token, 404)
+    );
+
+    const trustedRenewalHeaders = {
+      ...embedOptions(externalAccess.token).headers,
+      ...basicWidgetOptions(firstApp.client_id, firstAppSecret.client_secret).headers
+    };
+    const { data: renewedExternalAccess } = await widgetClient.post(
+      '/api/widget/session/renew',
+      {
+        profile: {
+          username: `${externalUserId}-name`,
+          display_name: 'QA External Widget User Updated',
+          email: `${externalUserId}@example.com`,
+          attributes: { plan: 'qa', revision: 2 }
+        }
+      },
+      { headers: trustedRenewalHeaders }
+    );
+    assertOpaque(renewedExternalAccess.token, 'ahw_', 'Renewed external Widget credential');
+    assert.notEqual(renewedExternalAccess.token, externalAccess.token);
+    await widgetClient.get('/api/widget/session', embedOptions(externalAccess.token, 401));
+    const { data: continuedExternalRun } = await widgetClient.post('/api/widget/runs', {
+      message: context.unique('QA renewed Widget continuation'),
+      integration_session_id: externalRun.integration_session_id,
+      hub_session_id: externalRun.hub_session_id,
+      parent_run_id: null,
+      client_message_key: uniqueSlug(context, 'qa-renewed-widget-message')
+    }, embedOptions(renewedExternalAccess.token));
+    assert.equal(continuedExternalRun.integration_session_id, externalRun.integration_session_id);
+    assert.equal(continuedExternalRun.hub_session_id, externalRun.hub_session_id);
+    await poll(
+      async () => (await ownerClient.get(`/api/runs/${continuedExternalRun.id}`)).data,
+      (run) => run.status === 'completed',
+      { timeoutMs: 60_000, description: 'renewed external Widget continuation to complete' }
+    );
+
+    const { data: historyDisabledApp } = await ownerClient.request(
+      `/api/integration-apps/${firstApp.id}`,
+      {
+        method: 'PATCH',
+        body: {
+          name: firstAppName,
+          redirect_uris: [firstRedirectUri],
+          agent_ids: [primaryAgent.id, secondaryAgent.id],
+          widget_history_enabled: false
+        }
+      }
+    );
+    assert.equal(historyDisabledApp.widget_history_enabled, false);
+    await widgetClient.get(
+      '/api/widget/sessions',
+      embedOptions(renewedExternalAccess.token, 403)
+    );
+    const { data: exactHistoryAfterDisable } = await widgetClient.get(
+      `/api/widget/sessions/${externalRun.integration_session_id}/messages`,
+      embedOptions(renewedExternalAccess.token)
+    );
+    assert.equal(exactHistoryAfterDisable.length >= 2, true);
 
     const allowedPreflight = await corsPreflight(context.baseURL, 'http://localhost:5173');
     assert.ok([200, 204].includes(allowedPreflight.status));
@@ -427,7 +644,8 @@ export default async function widgetEmbedApiScenario(context) {
         body: {
           name: firstAppName,
           redirect_uris: [firstRedirectUri],
-          agent_ids: [secondaryAgent.id]
+          agent_ids: [secondaryAgent.id],
+          widget_history_enabled: false
         }
       }
     );

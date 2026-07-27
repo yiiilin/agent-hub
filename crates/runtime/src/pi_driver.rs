@@ -418,6 +418,18 @@ impl PiFilesystemSandbox {
                 let fixture =
                     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../deploy/fake-pi-rpc.sh");
                 Self::add_optional_file(&mut rules, &fixture, LANDLOCK_FILE_READ_ONLY)?;
+                for dependency in [
+                    "/usr/bin/basename",
+                    "/usr/bin/date",
+                    "/usr/bin/jq",
+                    "/usr/bin/mkdir",
+                ] {
+                    Self::add_optional_file(
+                        &mut rules,
+                        Path::new(dependency),
+                        LANDLOCK_FILE_READ_ONLY,
+                    )?;
+                }
             }
         }
 
@@ -1737,7 +1749,15 @@ impl PiRunState {
 }
 
 pub(super) fn pi_tool_allowlist(agent: &AgentDto) -> Vec<String> {
-    let mut tools = vec!["read", "grep", "find", "ls"];
+    let enabled = agent
+        .tool_allowlist
+        .iter()
+        .map(|tool| tool.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut tools = ["read", "grep", "find", "ls"]
+        .into_iter()
+        .filter(|tool| enabled.contains(tool))
+        .collect::<Vec<_>>();
     let mode = agent
         .sandbox_policy
         .get("mode")
@@ -1748,12 +1768,17 @@ pub(super) fn pi_tool_allowlist(agent: &AgentDto) -> Vec<String> {
         "workspace-write" | "workspaceWrite" | "danger-full-access" | "dangerFullAccess"
     );
     if writable {
-        tools.extend(["edit", "write"]);
+        tools.extend(
+            ["edit", "write"]
+                .into_iter()
+                .filter(|tool| enabled.contains(tool)),
+        );
         if agent
             .sandbox_policy
             .get("network_access")
             .and_then(Value::as_bool)
             .unwrap_or(false)
+            && enabled.contains("bash")
         {
             tools.push("bash");
         }
@@ -1763,9 +1788,16 @@ pub(super) fn pi_tool_allowlist(agent: &AgentDto) -> Vec<String> {
 
 pub(super) fn pi_tool_allowlist_for_claim(claim: &ClaimRunResponse) -> anyhow::Result<Vec<String>> {
     let mut tools = pi_tool_allowlist(&claim.agent);
-    for name in integration_tool_names(claim.integration_context.as_ref())? {
-        if !tools.contains(&name) {
-            tools.push(name);
+    if claim
+        .agent
+        .tool_allowlist
+        .iter()
+        .any(|tool| tool == "integration")
+    {
+        for name in integration_tool_names(claim.integration_context.as_ref())? {
+            if !tools.contains(&name) {
+                tools.push(name);
+            }
         }
     }
     Ok(tools)
@@ -1834,7 +1866,8 @@ pub(super) fn pi_prompt_text(claim: &ClaimRunResponse) -> anyhow::Result<String>
         let envelope = json!({
             "message": prompt,
             "attachments": context.attachments,
-            "tool_result": context.tool_result
+            "tool_result": context.tool_result,
+            "external_user": context.external_user
         });
         prompt.push_str("\n\n");
         prompt.push_str(PI_INTEGRATION_CONTEXT_LABEL);
