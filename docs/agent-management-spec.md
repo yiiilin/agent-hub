@@ -10,7 +10,7 @@
 6. Integration App 不再放在 Agent 配置 Tab 中，而是独立一级导航；Agent 页只可展示与其有关的读取摘要或跳转入口。
 7. Agent 删除不可逆；取消未完成 Run，删除可执行配置、关联和运行数据，保留最小 Agent 展示快照与 Historical Sessions 只读历史。
 8. Session 永久绑定创建时选择的 Agent；切换 Agent 必须新建 Session。
-9. tool allowlist 只能包含 `read`、`grep`、`find`、`ls`、`edit`、`write`、`bash` 和 `integration`，至少选择一项且不能重复。它进入 execution configuration fingerprint；下一 Turn 按最新配置刷新，活动 Turn 不被中途扩大权限。
+9. tool allowlist 只能包含 `read`、`grep`、`find`、`ls`、`edit`、`write`、`bash`、`skill_exec` 和 `integration`，至少选择一项且不能重复。它进入 execution configuration fingerprint；下一 Turn 按最新配置刷新，活动 Turn 不被中途扩大权限。`skill_exec` 只执行已启用 Skill Package manifest 中声明的 `bin/*`，不授予通用终端。
 
 ## 非目标
 
@@ -26,7 +26,7 @@
 - 管理台不出现 raw model policy JSON、sandbox policy 或 inline Skill 编辑器；模型只通过结构化 Model Connection 和 reasoning controls 配置。
 - Skill 选择器默认收起，已启用 Skill 在主页直接可见。
 - MCP 表格中 secret 始终脱敏，保存脱敏占位符不覆盖旧值。
-- 新建和编辑 Agent 使用统一工具选择器；保存后读取到规范顺序的 allowlist，Runtime 最终仍与 sandbox policy 取更严格结果。
+- 新建和编辑 Agent 使用统一工具选择器；保存后读取到规范顺序的 allowlist，Runtime 最终仍与 App policy、sandbox policy 和实际 Package 可执行清单取更严格结果，且 Skill 不会自动补回未授权的 `read`。
 - 删除 Agent 后历史 Session 仍可查看，所有新消息、Run 或 Turn 入口被拒绝。
 
 ## 测试计划

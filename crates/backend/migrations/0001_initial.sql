@@ -808,7 +808,7 @@ CREATE TABLE public.agents (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     runtime_id uuid,
     mcp_allowlist jsonb DEFAULT '[]'::jsonb NOT NULL,
-    tool_allowlist jsonb DEFAULT '["read", "grep", "find", "ls", "edit", "write", "bash", "integration"]'::jsonb NOT NULL,
+    tool_allowlist jsonb DEFAULT '["read", "grep", "find", "ls", "edit", "write", "bash", "skill_exec", "integration"]'::jsonb NOT NULL,
     sandbox_policy jsonb DEFAULT '{"mode": "workspace-write", "network_access": true}'::jsonb NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     public_to uuid[] DEFAULT '{}'::uuid[] NOT NULL,
@@ -1413,8 +1413,61 @@ CREATE TABLE public.skills (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     revision bigint DEFAULT 1 NOT NULL,
     content_checksum_sha256 text NOT NULL,
+    current_package_id uuid,
     CONSTRAINT skills_content_checksum_sha256_shape CHECK ((content_checksum_sha256 ~ '^[0-9a-f]{64}$'::text)),
     CONSTRAINT skills_revision_positive CHECK ((revision > 0))
+);
+
+CREATE TABLE public.skill_packages (
+    id uuid NOT NULL,
+    skill_id uuid NOT NULL,
+    owner_id uuid NOT NULL,
+    object_key text NOT NULL,
+    format_version integer DEFAULT 1 NOT NULL,
+    size_bytes bigint NOT NULL,
+    checksum_sha256 text NOT NULL,
+    files jsonb DEFAULT '[]'::jsonb NOT NULL,
+    created_at timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    CONSTRAINT skill_packages_checksum_shape CHECK ((checksum_sha256 ~ '^[0-9a-f]{64}$'::text)),
+    CONSTRAINT skill_packages_format_version_check CHECK ((format_version = 1)),
+    CONSTRAINT skill_packages_object_key_check CHECK ((btrim(object_key) <> ''::text)),
+    CONSTRAINT skill_packages_size_check CHECK (((size_bytes > 0) AND (size_bytes <= 268435456)))
+);
+
+CREATE TABLE public.run_skill_packages (
+    run_id uuid NOT NULL,
+    skill_id uuid NOT NULL,
+    package_id uuid NOT NULL,
+    object_key text NOT NULL,
+    format_version integer NOT NULL,
+    size_bytes bigint NOT NULL,
+    checksum_sha256 text NOT NULL,
+    files jsonb NOT NULL,
+    CONSTRAINT run_skill_packages_checksum_shape CHECK ((checksum_sha256 ~ '^[0-9a-f]{64}$'::text)),
+    CONSTRAINT run_skill_packages_format_version_check CHECK ((format_version = 1)),
+    CONSTRAINT run_skill_packages_size_check CHECK ((size_bytes > 0))
+);
+
+CREATE TABLE public.skill_package_deletion_queue (
+    object_key text NOT NULL,
+    owner_id uuid NOT NULL,
+    attempts bigint DEFAULT 0 NOT NULL,
+    last_error text,
+    created_at timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    updated_at timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    CONSTRAINT skill_package_deletion_queue_attempts_check CHECK ((attempts >= 0)),
+    CONSTRAINT skill_package_deletion_queue_object_key_check CHECK ((btrim(object_key) <> ''::text))
+);
+
+CREATE TABLE public.user_erasure_skill_objects (
+    user_id uuid NOT NULL,
+    object_key text NOT NULL,
+    attempts bigint DEFAULT 0 NOT NULL,
+    last_error text,
+    created_at timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    updated_at timestamp(3) with time zone DEFAULT CURRENT_TIMESTAMP(3) NOT NULL,
+    CONSTRAINT user_erasure_skill_objects_attempts_check CHECK ((attempts >= 0)),
+    CONSTRAINT user_erasure_skill_objects_object_key_check CHECK ((btrim(object_key) <> ''::text))
 );
 
 CREATE TABLE public.system_default_model_selection (
@@ -1643,6 +1696,18 @@ ALTER TABLE ONLY public.runtimes
 ALTER TABLE ONLY public.session_bundle_deletion_queue
     ADD CONSTRAINT session_bundle_deletion_queue_pkey PRIMARY KEY (object_key);
 
+ALTER TABLE ONLY public.skill_package_deletion_queue
+    ADD CONSTRAINT skill_package_deletion_queue_pkey PRIMARY KEY (object_key);
+
+ALTER TABLE ONLY public.skill_packages
+    ADD CONSTRAINT skill_packages_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY public.skill_packages
+    ADD CONSTRAINT skill_packages_object_key_key UNIQUE (object_key);
+
+ALTER TABLE ONLY public.run_skill_packages
+    ADD CONSTRAINT run_skill_packages_pkey PRIMARY KEY (run_id, skill_id);
+
 ALTER TABLE ONLY public.sessions
     ADD CONSTRAINT sessions_pkey PRIMARY KEY (token_hash);
 
@@ -1657,6 +1722,9 @@ ALTER TABLE ONLY public.user_erasure_audit
 
 ALTER TABLE ONLY public.user_erasure_bundle_objects
     ADD CONSTRAINT user_erasure_bundle_objects_pkey PRIMARY KEY (user_id, object_key);
+
+ALTER TABLE ONLY public.user_erasure_skill_objects
+    ADD CONSTRAINT user_erasure_skill_objects_pkey PRIMARY KEY (user_id, object_key);
 
 ALTER TABLE ONLY public.user_erasure_jobs
     ADD CONSTRAINT user_erasure_jobs_pkey PRIMARY KEY (user_id);
@@ -1765,9 +1833,21 @@ CREATE UNIQUE INDEX runtimes_pending_token_hash_unique_idx ON public.runtimes US
 
 CREATE INDEX session_bundle_deletion_queue_agent_idx ON public.session_bundle_deletion_queue USING btree (agent_id, created_at, object_key);
 
+CREATE INDEX skill_package_deletion_queue_created_idx ON public.skill_package_deletion_queue USING btree (created_at, object_key);
+
+CREATE INDEX skill_package_deletion_queue_owner_idx ON public.skill_package_deletion_queue USING btree (owner_id, created_at, object_key);
+
+CREATE INDEX skill_packages_owner_idx ON public.skill_packages USING btree (owner_id, created_at, id);
+
+CREATE INDEX skill_packages_skill_idx ON public.skill_packages USING btree (skill_id, created_at, id);
+
+CREATE INDEX run_skill_packages_object_idx ON public.run_skill_packages USING btree (object_key, run_id);
+
 CREATE INDEX skills_owner_created_idx ON public.skills USING btree (owner_id, created_at DESC);
 
 CREATE INDEX user_erasure_bundle_objects_user_idx ON public.user_erasure_bundle_objects USING btree (user_id, created_at, object_key);
+
+CREATE INDEX user_erasure_skill_objects_user_idx ON public.user_erasure_skill_objects USING btree (user_id, created_at, object_key);
 
 CREATE INDEX user_erasure_jobs_requested_idx ON public.user_erasure_jobs USING btree (requested_at, user_id);
 
@@ -2072,8 +2152,20 @@ ALTER TABLE ONLY public.session_bundle_deletion_queue
 ALTER TABLE ONLY public.sessions
     ADD CONSTRAINT sessions_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE;
 
+ALTER TABLE ONLY public.run_skill_packages
+    ADD CONSTRAINT run_skill_packages_run_id_fkey FOREIGN KEY (run_id) REFERENCES public.runs(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.skill_packages
+    ADD CONSTRAINT skill_packages_owner_id_fkey FOREIGN KEY (owner_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.skill_packages
+    ADD CONSTRAINT skill_packages_skill_id_fkey FOREIGN KEY (skill_id) REFERENCES public.skills(id) ON DELETE CASCADE;
+
 ALTER TABLE ONLY public.skills
     ADD CONSTRAINT skills_owner_id_fkey FOREIGN KEY (owner_id) REFERENCES public.users(id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.skills
+    ADD CONSTRAINT skills_current_package_id_fkey FOREIGN KEY (current_package_id) REFERENCES public.skill_packages(id) ON DELETE SET NULL;
 
 ALTER TABLE ONLY public.system_default_model_selection
     ADD CONSTRAINT system_default_model_selection_model_connection_id_fkey FOREIGN KEY (model_connection_id) REFERENCES public.model_connections(id) ON DELETE CASCADE;
@@ -2083,6 +2175,9 @@ ALTER TABLE ONLY public.system_default_model_selection
 
 ALTER TABLE ONLY public.user_erasure_bundle_objects
     ADD CONSTRAINT user_erasure_bundle_objects_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.user_erasure_jobs(user_id) ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.user_erasure_skill_objects
+    ADD CONSTRAINT user_erasure_skill_objects_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.user_erasure_jobs(user_id) ON DELETE CASCADE;
 
 -- Required control-plane singleton rows.
 INSERT INTO public.auth_policy

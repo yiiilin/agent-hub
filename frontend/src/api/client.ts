@@ -189,8 +189,29 @@ export type Skill = {
   content: string;
   revision: number;
   content_checksum_sha256: string;
+  package: SkillPackage | null;
   created_at: string;
   updated_at: string;
+};
+
+export type SkillPackageFile = {
+  path: string;
+  size_bytes: number;
+  checksum_sha256: string;
+  executable: boolean;
+};
+
+export type SkillPackage = {
+  id: string;
+  format_version: number;
+  size_bytes: number;
+  checksum_sha256: string;
+  files: SkillPackageFile[];
+};
+
+export type SkillPackageUploadFile = {
+  path: string;
+  file: File;
 };
 
 export type Runtime = {
@@ -689,13 +710,14 @@ export type BulkDeleteSkillsRequest = {
 };
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const headers = new Headers(init.headers);
+  if (!(typeof FormData !== 'undefined' && init.body instanceof FormData) && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json');
+  }
   const response = await fetch(path, {
     ...init,
     credentials: 'include',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(init.headers ?? {})
-    }
+    headers
   });
   if (!response.ok) {
     const body = await response.json().catch(() => null) as { error?: unknown } | null;
@@ -1051,6 +1073,14 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify({ name, description, content })
     }),
+  replaceSkillPackage: (skillId: string, files: readonly SkillPackageUploadFile[]) => {
+    const body = new FormData();
+    body.append('manifest', JSON.stringify({ paths: files.map((entry) => entry.path) }));
+    files.forEach((entry, index) => body.append(`file-${index}`, entry.file, entry.file.name));
+    return request<Skill>(`/api/skills/${skillId}/package`, { method: 'PUT', body });
+  },
+  deleteSkillPackage: (skillId: string, signal?: AbortSignal) =>
+    request<Skill>(`/api/skills/${skillId}/package`, { method: 'DELETE', signal }),
   deleteSkill: (skillId: string, signal?: AbortSignal) =>
     request<void>(`/api/skills/${skillId}`, { method: 'DELETE', signal }),
   bulkDeleteSkills: (skillIds: string[], signal?: AbortSignal) =>

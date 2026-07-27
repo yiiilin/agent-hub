@@ -69,6 +69,8 @@ services:
       HUB_BUNDLE_S3_SERVER_SIDE_ENCRYPTION: ${HUB_BUNDLE_S3_SERVER_SIDE_ENCRYPTION:-}
       HUB_BUNDLE_S3_KMS_KEY_ID: ${HUB_BUNDLE_S3_KMS_KEY_ID:-}
       HUB_BUNDLE_S3_ALLOW_HTTP: ${HUB_BUNDLE_S3_ALLOW_HTTP:-true}
+      HUB_SKILL_PACKAGE_STORAGE: ${HUB_SKILL_PACKAGE_STORAGE:-s3}
+      HUB_SKILL_PACKAGE_LOCAL_DIR: ${HUB_SKILL_PACKAGE_LOCAL_DIR:-/var/lib/agent-hub/skill-packages}
       RUST_LOG: ${BACKEND_RUST_LOG:-agent_hub_backend=info,tower_http=info}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/readyz"]

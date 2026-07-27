@@ -6,7 +6,7 @@ PI_DIR="${ROOT_DIR}/third_party/pi"
 PI_VERSION="0.81.1"
 PI_COMMIT="20be4b18d4c57487f8993d2762bace129f0cf7c6"
 PI_PATCH="${ROOT_DIR}/third_party/pi-patches/0001-add-rpc-reload-models.patch"
-PI_PATCH_SHA256="89dadcabc9d91e30f17c1a1688b3af1e3600f171befad038c8cddb91e4f82c01"
+PI_PATCH_SHA256="50d376fa2288d1e1f16392a82a74ca7185db035c455e0bf88cc7b87cd374f7d9"
 MODEL_DATA_DIR="${ROOT_DIR}/third_party/pi-model-data/v${PI_VERSION}"
 MODEL_DATA_SHA256="27928526a62db7d9f808b9efebe1d2529d782ace46c9e9dacc327c7dfb2a261e"
 BUN_VERSION="1.3.14"
@@ -153,6 +153,10 @@ cp -a "$MODEL_DATA_DIR/." "$PI_DATA_DIR/"
 npm --prefix "$PI_BUILD_DIR" run build:offline
 RPC_MODE_JS="$PI_BUILD_DIR/packages/coding-agent/dist/modes/rpc/rpc-mode.js"
 require_file "$RPC_MODE_JS"
+grep -q 'case "reload_resources"' "$RPC_MODE_JS" || {
+  echo "compiled Pi RPC mode is missing reload_resources" >&2
+  exit 1
+}
 grep -q 'case "reload_models"' "$RPC_MODE_JS" || {
   echo "compiled Pi RPC mode is missing reload_models" >&2
   exit 1

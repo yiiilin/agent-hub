@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     env, fs as stdfs,
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
@@ -31,7 +31,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::{
     fs,
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
     sync::{mpsc as tokio_mpsc, oneshot, Notify},
     task::{JoinHandle, JoinSet},
@@ -39,9 +39,6 @@ use tokio::{
 use tracing::{info, warn};
 use uuid::Uuid;
 use walkdir::WalkDir;
-
-#[cfg(test)]
-use std::io::Read;
 
 mod pi_driver;
 mod session_bundle;
@@ -55,6 +52,9 @@ const ENGINE_EVENT_QUEUE_CAPACITY: usize = 64;
 const SESSION_SUPERVISOR_METADATA_FILE: &str = "session.json";
 const SESSION_CLEANUP_DIRECTORY: &str = "session-cleanups";
 const SESSION_CLEANUP_STATE_FILE: &str = "state.json";
+const SKILL_PACKAGE_CACHE_DIRECTORY: &str = "skill-package-cache";
+const SKILL_EXEC_DIRECTORY: &str = "skill-exec";
+const SKILL_EXEC_CATALOG_FILE: &str = "catalog.json";
 
 #[derive(Clone)]
 struct Config {
@@ -92,6 +92,12 @@ struct HubClient {
     hub_url: String,
     runtime_token: Arc<std::sync::RwLock<String>>,
     protocol_capabilities: HashSet<String>,
+}
+
+#[derive(Clone, Copy)]
+enum SkillPackageDownloadRoute {
+    Run { run_id: Uuid },
+    Session { session_id: Uuid },
 }
 
 #[derive(Default)]
@@ -256,8 +262,13 @@ impl RuntimeSessionCommandDispatcher {
                 return;
             };
             let key = RuntimeSessionCommandKey::from(&command);
-            match apply_runtime_session_command(&manager, &command, local_skills_dir.as_deref())
-                .await
+            match apply_runtime_session_command(
+                &manager,
+                Some(&client),
+                &command,
+                local_skills_dir.as_deref(),
+            )
+            .await
             {
                 Ok(applied) => {
                     loop {
@@ -945,6 +956,7 @@ async fn run_registered_cycle(
 
 async fn apply_runtime_session_command(
     manager: &SessionSupervisorManager,
+    client: Option<&HubClient>,
     command: &RuntimeSessionCommandDto,
     local_skills_dir: Option<&Path>,
 ) -> anyhow::Result<AppliedRuntimeSessionCommand> {
@@ -981,6 +993,7 @@ async fn apply_runtime_session_command(
                     command.ownership_generation,
                     configuration,
                     fingerprint,
+                    client,
                     local_skills_dir,
                 )
                 .await
@@ -1291,6 +1304,120 @@ impl HubClient {
             return Ok(None);
         }
         Ok(Some(response.error_for_status()?.json().await?))
+    }
+
+    async fn cache_skill_package(
+        &self,
+        work_root: &Path,
+        route: SkillPackageDownloadRoute,
+        ownership_generation: i64,
+        skill_id: Uuid,
+        package: &SkillPackageDto,
+    ) -> anyhow::Result<PathBuf> {
+        validate_skill_package_manifest(package)?;
+        anyhow::ensure!(ownership_generation > 0, "invalid ownership generation");
+        let cache_root = work_root.join(SKILL_PACKAGE_CACHE_DIRECTORY);
+        fs::create_dir_all(&cache_root)
+            .await
+            .context("create Skill package cache")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&cache_root, stdfs::Permissions::from_mode(0o700))
+                .await
+                .context("protect Skill package cache")?;
+        }
+        let destination = cache_root.join(format!("{}.tar.zst", package.checksum_sha256));
+        if skill_package_cache_entry_is_valid(&destination, package).await? {
+            return Ok(destination);
+        }
+
+        let url = match route {
+            SkillPackageDownloadRoute::Run { run_id } => format!(
+                "{}/api/runtime/runs/{run_id}/skills/{skill_id}/package",
+                self.hub_url
+            ),
+            SkillPackageDownloadRoute::Session { session_id } => format!(
+                "{}/api/runtime/sessions/{session_id}/skills/{skill_id}/packages/{}",
+                self.hub_url, package.id
+            ),
+        };
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(self.runtime_credential())
+            .header("x-agent-hub-ownership-generation", ownership_generation)
+            .send()
+            .await?
+            .error_for_status()?;
+        let response_size = response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .context("Skill package download is missing a valid Content-Length")?;
+        anyhow::ensure!(
+            response_size == package.size_bytes,
+            "Skill package Content-Length does not match its manifest"
+        );
+
+        let temporary = cache_root.join(format!(
+            ".{}-{}.tmp",
+            package.checksum_sha256,
+            Uuid::new_v4().simple()
+        ));
+        let write_result: anyhow::Result<()> = async {
+            let mut options = fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                options.mode(0o600);
+            }
+            let mut output = options
+                .open(&temporary)
+                .await
+                .context("create Skill package cache staging file")?;
+            let mut received = 0_u64;
+            let mut hasher = Sha256::new();
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.context("stream Skill package from Hub")?;
+                received = received
+                    .checked_add(chunk.len() as u64)
+                    .context("Skill package download size overflowed")?;
+                anyhow::ensure!(
+                    received <= package.size_bytes,
+                    "Skill package download exceeds its manifest size"
+                );
+                hasher.update(&chunk);
+                output.write_all(&chunk).await?;
+            }
+            anyhow::ensure!(
+                received == package.size_bytes,
+                "Skill package download ended before its manifest size"
+            );
+            let checksum = format!("{:x}", hasher.finalize());
+            anyhow::ensure!(
+                checksum == package.checksum_sha256,
+                "Skill package download checksum does not match its manifest"
+            );
+            output.sync_all().await?;
+            fs::rename(&temporary, &destination)
+                .await
+                .context("commit Skill package cache entry")?;
+            stdfs::File::open(&cache_root)
+                .context("open Skill package cache directory")?
+                .sync_all()
+                .context("sync Skill package cache directory")?;
+            Ok(())
+        }
+        .await;
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temporary).await;
+        }
+        write_result?;
+        Ok(destination)
     }
 
     async fn append_event(
@@ -1640,6 +1767,7 @@ async fn execute_run(
         &claim,
         Some(&model_proxy.base_url),
         config.local_skills_dir.as_deref(),
+        Some(client),
     )
     .await?;
     info!(
@@ -1955,6 +2083,7 @@ async fn execute_managed_run_inner(
         &claim,
         Some(&model_proxy.base_url),
         config.local_skills_dir.as_deref(),
+        Some(client),
     )
     .await?;
     let metadata =
@@ -2537,6 +2666,9 @@ enum SessionSupervisorCommand {
     RefreshConfiguration {
         response: oneshot::Sender<anyhow::Result<()>>,
     },
+    ReloadConfiguration {
+        response: oneshot::Sender<anyhow::Result<()>>,
+    },
     Stop,
 }
 
@@ -2572,6 +2704,12 @@ impl PersistentSessionProcess {
     fn ensure_running(&mut self) -> anyhow::Result<()> {
         match self {
             Self::Pi(process) => process.ensure_running(),
+        }
+    }
+
+    fn reload_configuration(&mut self) -> anyhow::Result<()> {
+        match self {
+            Self::Pi(process) => process.reload_resources(),
         }
     }
 }
@@ -2704,6 +2842,9 @@ impl SessionSupervisor {
                     }
                     Ok(SessionSupervisorCommand::RefreshConfiguration { response }) => {
                         let _ = response.send(Ok(()));
+                    }
+                    Ok(SessionSupervisorCommand::ReloadConfiguration { response }) => {
+                        let _ = response.send(process.reload_configuration());
                     }
                     Ok(SessionSupervisorCommand::Stop)
                     | Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -2846,6 +2987,20 @@ impl SessionSupervisor {
             .map_err(|_| anyhow::anyhow!("Session supervisor actor is not running"))?;
         result.await.map_err(|_| {
             anyhow::anyhow!("Session supervisor actor stopped before configuration refresh")
+        })?
+    }
+
+    async fn reload_configuration(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.stopped.load(Ordering::Acquire),
+            "Session supervisor is stopped"
+        );
+        let (response, result) = oneshot::channel();
+        self.command_tx
+            .send(SessionSupervisorCommand::ReloadConfiguration { response })
+            .map_err(|_| anyhow::anyhow!("Session supervisor actor is not running"))?;
+        result.await.map_err(|_| {
+            anyhow::anyhow!("Session supervisor actor stopped before configuration reload")
         })?
     }
 
@@ -4728,6 +4883,7 @@ impl SessionSupervisorManager {
         ownership_generation: i64,
         configuration: &AgentExecutionConfigurationDto,
         configuration_fingerprint: &str,
+        client: Option<&HubClient>,
         local_skills_dir: Option<&Path>,
     ) -> anyhow::Result<()> {
         let supervisor = {
@@ -4754,7 +4910,7 @@ impl SessionSupervisorManager {
                 }
             }
         };
-        if let Some(supervisor) = supervisor {
+        if let Some(supervisor) = supervisor.as_ref() {
             supervisor.wait_for_configuration_refresh().await?;
         }
         {
@@ -4787,8 +4943,18 @@ impl SessionSupervisorManager {
             configuration_fingerprint,
             PiModelConfigurationMaterialization::PreserveExisting,
             local_skills_dir,
+            client.map(|client| SkillPackageMaterializationContext {
+                client,
+                work_root: &self.work_root,
+                ownership_generation,
+                route: SkillPackageDownloadRoute::Session { session_id },
+            }),
         )
-        .await
+        .await?;
+        if let Some(supervisor) = supervisor.as_ref() {
+            supervisor.reload_configuration().await?;
+        }
+        Ok(())
     }
 
     async fn interrupt(
@@ -5289,6 +5455,32 @@ async fn remove_hub_fenced_session_cleanup(
         );
         return;
     }
+    let skill_exec_path = cleanup.path.join("engine-state").join(SKILL_EXEC_DIRECTORY);
+    let permission_result =
+        tokio::task::spawn_blocking(move || make_tree_owner_writable(&skill_exec_path)).await;
+    match permission_result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            manager.finish_released_session_cleanup_attempt(&cleanup);
+            warn!(
+                session_id = %cleanup.session_id,
+                ownership_generation = cleanup.ownership_generation,
+                error = %error,
+                "failed to make released Session Skill execution tree removable"
+            );
+            return;
+        }
+        Err(error) => {
+            manager.finish_released_session_cleanup_attempt(&cleanup);
+            warn!(
+                session_id = %cleanup.session_id,
+                ownership_generation = cleanup.ownership_generation,
+                error = %error,
+                "released Session cleanup permission task stopped"
+            );
+            return;
+        }
+    }
     match fs::remove_dir_all(&cleanup.path).await {
         Ok(()) => {
             if let Err(error) = manager.complete_released_session_cleanup(&cleanup) {
@@ -5719,7 +5911,7 @@ async fn prepare_run_env(
     claim: &ClaimRunResponse,
     model_base_url: Option<&str>,
 ) -> anyhow::Result<RunEnv> {
-    prepare_run_env_with_local_skills(root, claim, model_base_url, None).await
+    prepare_run_env_with_local_skills(root, claim, model_base_url, None, None).await
 }
 
 async fn prepare_run_env_with_local_skills(
@@ -5727,6 +5919,7 @@ async fn prepare_run_env_with_local_skills(
     claim: &ClaimRunResponse,
     model_base_url: Option<&str>,
     local_skills_dir: Option<&Path>,
+    client: Option<&HubClient>,
 ) -> anyhow::Result<RunEnv> {
     let paths = SessionPaths::for_claim(root, claim)?;
     fs::create_dir_all(&paths.workspace).await?;
@@ -5745,6 +5938,14 @@ async fn prepare_run_env_with_local_skills(
         &runtime_fingerprint,
         PiModelConfigurationMaterialization::RunBindings { model_base_url },
         local_skills_dir,
+        client.map(|client| SkillPackageMaterializationContext {
+            client,
+            work_root: root,
+            ownership_generation: claim.run.session_ownership_generation.unwrap_or_default(),
+            route: SkillPackageDownloadRoute::Run {
+                run_id: claim.run.id,
+            },
+        }),
     )
     .await?;
     let run_env = RunEnv {
@@ -5764,12 +5965,455 @@ struct PiExecutionMaterializationMarker {
     configuration_fingerprint: String,
     materialization_sha256: String,
     owned_skill_directories: Vec<String>,
+    #[serde(default)]
+    owned_package_directories: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
 enum PiModelConfigurationMaterialization<'a> {
     RunBindings { model_base_url: Option<&'a str> },
     PreserveExisting,
+}
+
+#[derive(Clone, Copy)]
+struct SkillPackageMaterializationContext<'a> {
+    client: &'a HubClient,
+    work_root: &'a Path,
+    ownership_generation: i64,
+    route: SkillPackageDownloadRoute,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct SkillExecCatalog {
+    version: u32,
+    skills: Vec<SkillExecCatalogEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct SkillExecCatalogEntry {
+    name: String,
+    source_id: Uuid,
+    package_id: Uuid,
+    package_root: String,
+    executables: Vec<String>,
+}
+
+fn is_lowercase_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn skill_package_path_is_safe(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && !path.contains('\0')
+        && path != "SKILL.md"
+        && path
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
+fn validate_skill_package_manifest(package: &SkillPackageDto) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !package.id.is_nil()
+            && package.format_version == 1
+            && package.size_bytes > 0
+            && package.size_bytes <= MAX_SKILL_PACKAGE_ARCHIVE_BYTES
+            && is_lowercase_sha256_hex(&package.checksum_sha256)
+            && !package.files.is_empty()
+            && package.files.len() <= MAX_SKILL_PACKAGE_FILES,
+        "Skill package metadata is invalid"
+    );
+    let mut paths = BTreeSet::new();
+    let mut expanded_size = 0_u64;
+    for file in &package.files {
+        expanded_size = expanded_size
+            .checked_add(file.size_bytes)
+            .context("Skill package expanded size overflowed")?;
+        anyhow::ensure!(
+            skill_package_path_is_safe(&file.path)
+                && paths.insert(file.path.clone())
+                && is_lowercase_sha256_hex(&file.checksum_sha256)
+                && file.executable == file.path.starts_with("bin/")
+                && expanded_size <= MAX_SKILL_PACKAGE_EXPANDED_BYTES,
+            "Skill package file metadata is invalid"
+        );
+    }
+    let sorted = paths.into_iter().collect::<Vec<_>>();
+    for path in &sorted {
+        let prefix = format!("{path}/");
+        anyhow::ensure!(
+            !sorted
+                .iter()
+                .any(|candidate| candidate.starts_with(&prefix)),
+            "Skill package paths overlap a file and directory"
+        );
+    }
+    Ok(())
+}
+
+async fn skill_package_cache_entry_is_valid(
+    path: &Path,
+    package: &SkillPackageDto,
+) -> anyhow::Result<bool> {
+    let metadata = match fs::metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() || metadata.len() != package.size_bytes {
+        return Ok(false);
+    }
+    let mut file = fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()) == package.checksum_sha256)
+}
+
+fn stable_skill_package_directory(skill_id: Uuid, package_id: Uuid) -> String {
+    format!("{}-{}", skill_id.simple(), package_id.simple())
+}
+
+fn extract_skill_package_archive(
+    archive_path: &Path,
+    package: &SkillPackageDto,
+    destination: &Path,
+) -> anyhow::Result<()> {
+    validate_skill_package_manifest(package)?;
+    let mut archive_file = stdfs::File::open(archive_path).context("open cached Skill package")?;
+    let archive_metadata = archive_file
+        .metadata()
+        .context("inspect cached Skill package")?;
+    anyhow::ensure!(
+        archive_metadata.is_file() && archive_metadata.len() == package.size_bytes,
+        "cached Skill package size does not match its manifest"
+    );
+    let mut archive_hasher = Sha256::new();
+    let mut archive_buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = archive_file.read(&mut archive_buffer)?;
+        if read == 0 {
+            break;
+        }
+        archive_hasher.update(&archive_buffer[..read]);
+    }
+    anyhow::ensure!(
+        format!("{:x}", archive_hasher.finalize()) == package.checksum_sha256,
+        "cached Skill package checksum does not match its manifest"
+    );
+    archive_file.seek(SeekFrom::Start(0))?;
+    anyhow::ensure!(
+        !destination.exists(),
+        "Skill package extraction destination already exists"
+    );
+    stdfs::create_dir_all(destination).context("create Skill package extraction root")?;
+    let decoder = zstd::Decoder::new(archive_file).context("decode Skill package zstd stream")?;
+    let mut archive = tar::Archive::new(decoder);
+    let expected = package
+        .files
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect::<BTreeMap<_, _>>();
+    let mut extracted = BTreeSet::new();
+    let mut expanded_size = 0_u64;
+    for entry in archive
+        .entries()
+        .context("read Skill package tar entries")?
+    {
+        let mut entry = entry.context("read Skill package tar entry")?;
+        anyhow::ensure!(
+            entry.header().entry_type() == tar::EntryType::Regular,
+            "Skill package contains a non-regular entry"
+        );
+        let entry_path = entry.path_bytes();
+        let entry_path = std::str::from_utf8(entry_path.as_ref())
+            .context("Skill package entry path is not UTF-8")?;
+        anyhow::ensure!(
+            skill_package_path_is_safe(entry_path),
+            "Skill package contains an unsafe entry path"
+        );
+        let expected_file = expected
+            .get(entry_path)
+            .context("Skill package contains a path not declared by its manifest")?;
+        anyhow::ensure!(
+            extracted.insert(entry_path.to_owned()),
+            "Skill package contains a duplicate path"
+        );
+        anyhow::ensure!(
+            entry.size() == expected_file.size_bytes,
+            "Skill package entry size does not match its manifest"
+        );
+        let archive_executable = entry.header().mode()? & 0o111 != 0;
+        anyhow::ensure!(
+            archive_executable == expected_file.executable,
+            "Skill package entry executable mode does not match its manifest"
+        );
+        expanded_size = expanded_size
+            .checked_add(entry.size())
+            .context("Skill package expanded size overflowed")?;
+        anyhow::ensure!(
+            expanded_size <= MAX_SKILL_PACKAGE_EXPANDED_BYTES,
+            "Skill package expanded size exceeds the limit"
+        );
+
+        let output_path = destination.join(entry_path);
+        if let Some(parent) = output_path.parent() {
+            stdfs::create_dir_all(parent).context("create Skill package output directory")?;
+        }
+        #[cfg(unix)]
+        let mut output = {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            stdfs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(if expected_file.executable {
+                    0o755
+                } else {
+                    0o444
+                })
+                .open(&output_path)
+                .context("create Skill package output file")?
+        };
+        #[cfg(not(unix))]
+        let mut output = stdfs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&output_path)
+            .context("create Skill package output file")?;
+        let mut written = 0_u64;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = entry
+                .read(&mut buffer)
+                .context("read Skill package entry contents")?;
+            if read == 0 {
+                break;
+            }
+            written = written
+                .checked_add(read as u64)
+                .context("Skill package entry size overflowed")?;
+            anyhow::ensure!(
+                written <= expected_file.size_bytes,
+                "Skill package entry exceeds its manifest size"
+            );
+            hasher.update(&buffer[..read]);
+            output
+                .write_all(&buffer[..read])
+                .context("write Skill package output file")?;
+        }
+        anyhow::ensure!(
+            written == expected_file.size_bytes,
+            "Skill package entry ended before its manifest size"
+        );
+        anyhow::ensure!(
+            format!("{:x}", hasher.finalize()) == expected_file.checksum_sha256,
+            "Skill package entry checksum does not match its manifest"
+        );
+        output
+            .sync_all()
+            .context("sync Skill package output file")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            stdfs::set_permissions(
+                &output_path,
+                stdfs::Permissions::from_mode(if expected_file.executable {
+                    0o755
+                } else {
+                    0o444
+                }),
+            )?;
+        }
+    }
+    anyhow::ensure!(
+        extracted.len() == expected.len() && expected.keys().all(|path| extracted.contains(*path)),
+        "Skill package is missing a manifest file"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn protect_skill_exec_tree(root: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    for entry in WalkDir::new(root).follow_links(false) {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        anyhow::ensure!(
+            metadata.is_dir() || metadata.is_file(),
+            "Skill execution source contains an unsupported file type"
+        );
+        let relative = entry.path().strip_prefix(root)?;
+        let mode = if metadata.is_dir()
+            && (relative.as_os_str().is_empty()
+                || relative == Path::new("packages")
+                || relative == Path::new("tmp"))
+        {
+            0o700
+        } else if metadata.is_dir() || metadata.permissions().mode() & 0o111 != 0 {
+            0o500
+        } else {
+            0o400
+        };
+        stdfs::set_permissions(entry.path(), stdfs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn protect_skill_exec_tree(_root: &Path) -> anyhow::Result<()> {
+    anyhow::bail!("private Skill execution sources require a Unix runtime")
+}
+
+#[cfg(unix)]
+fn make_tree_owner_writable(root: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !root.exists() {
+        return Ok(());
+    }
+    for entry in WalkDir::new(root).follow_links(false) {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        let mode = if metadata.is_dir() { 0o700 } else { 0o600 };
+        stdfs::set_permissions(entry.path(), stdfs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_tree_owner_writable(_root: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+async fn materialize_skill_packages(
+    paths: &SessionPaths,
+    configuration: &AgentExecutionConfigurationDto,
+    stage_agent_dir: &Path,
+    stage_skill_exec_dir: &Path,
+    package_context: Option<SkillPackageMaterializationContext<'_>>,
+) -> anyhow::Result<Vec<String>> {
+    let stage_packages_root = stage_skill_exec_dir.join("packages");
+    fs::create_dir_all(&stage_packages_root).await?;
+    fs::create_dir_all(stage_skill_exec_dir.join("tmp")).await?;
+    let canonical_engine_state = fs::canonicalize(&paths.engine_state)
+        .await
+        .context("canonicalize Session engine state")?;
+    anyhow::ensure!(
+        canonical_engine_state.is_absolute(),
+        "Session engine state path is not absolute"
+    );
+    let final_packages_root = canonical_engine_state
+        .join(SKILL_EXEC_DIRECTORY)
+        .join("packages");
+    let mut package_directories = Vec::new();
+    let mut catalog_entries = Vec::new();
+    let mut seen_package_directories = BTreeSet::new();
+    for skill in &configuration.skills {
+        let Some(package) = skill.package.as_ref() else {
+            continue;
+        };
+        let source_id = skill
+            .source_id
+            .context("packaged Skill is missing its source id")?;
+        let context = package_context.context(
+            "Skill package materialization requires an authenticated Hub download context",
+        )?;
+        let archive_path = context
+            .client
+            .cache_skill_package(
+                context.work_root,
+                context.route,
+                context.ownership_generation,
+                source_id,
+                package,
+            )
+            .await
+            .with_context(|| format!("cache Skill package for {}", skill.name))?;
+        let package_directory = stable_skill_package_directory(source_id, package.id);
+        anyhow::ensure!(
+            seen_package_directories.insert(package_directory.clone()),
+            "execution configuration contains a duplicate Skill package destination"
+        );
+        let staged_package_root = stage_packages_root.join(&package_directory);
+        let archive_path_for_extract = archive_path.clone();
+        let package_for_extract = package.clone();
+        let staged_package_root_for_extract = staged_package_root.clone();
+        tokio::task::spawn_blocking(move || {
+            extract_skill_package_archive(
+                &archive_path_for_extract,
+                &package_for_extract,
+                &staged_package_root_for_extract,
+            )
+        })
+        .await
+        .context("Skill package extraction task stopped")??;
+
+        let pi_skill_root = stage_agent_dir
+            .join("skills")
+            .join(skill_directory_name(&skill.name));
+        let package_source = staged_package_root.clone();
+        let pi_skill_destination = pi_skill_root.clone();
+        tokio::task::spawn_blocking(move || {
+            copy_directory_snapshot(&package_source, &pi_skill_destination)
+        })
+        .await
+        .context("Pi Skill package copy task stopped")??;
+
+        let package_root = final_packages_root.join(&package_directory);
+        anyhow::ensure!(
+            package_root.starts_with(&final_packages_root),
+            "Skill package root escaped the private execution source"
+        );
+        let package_root = package_root
+            .to_str()
+            .context("Skill package root is not UTF-8")?
+            .to_owned();
+        let mut executables = package
+            .files
+            .iter()
+            .filter(|file| file.executable)
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        executables.sort();
+        catalog_entries.push(SkillExecCatalogEntry {
+            name: skill.name.clone(),
+            source_id,
+            package_id: package.id,
+            package_root,
+            executables,
+        });
+        package_directories.push(package_directory);
+    }
+    package_directories.sort();
+    catalog_entries.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.package_id.cmp(&right.package_id))
+    });
+    stdfs::write(
+        stage_skill_exec_dir.join(SKILL_EXEC_CATALOG_FILE),
+        serde_json::to_vec_pretty(&SkillExecCatalog {
+            version: 1,
+            skills: catalog_entries,
+        })?,
+    )
+    .context("stage private Skill execution catalog")?;
+    protect_skill_exec_tree(stage_skill_exec_dir)?;
+    Ok(package_directories)
 }
 
 fn pi_agent_directory(pi_home: &Path) -> PathBuf {
@@ -5782,12 +6426,15 @@ async fn synchronize_pi_execution_configuration(
     configuration_fingerprint: &str,
     model_configuration: PiModelConfigurationMaterialization<'_>,
     local_skills_dir: Option<&Path>,
+    package_context: Option<SkillPackageMaterializationContext<'_>>,
 ) -> anyhow::Result<()> {
     let agent_dir = pi_agent_directory(&paths.engine_state);
+    let skill_exec_dir = paths.engine_state.join(SKILL_EXEC_DIRECTORY);
     let stage = paths
         .staging
         .join(format!("pi-execution-config-{}", Uuid::new_v4()));
     let stage_agent_dir = stage.join("agent");
+    let stage_skill_exec_dir = stage.join(SKILL_EXEC_DIRECTORY);
     let result: anyhow::Result<()> = async {
         fs::create_dir_all(stage_agent_dir.join("skills")).await?;
         let instructions = format!("{}\n", configuration.instructions.trim_end());
@@ -5801,7 +6448,7 @@ async fn synchronize_pi_execution_configuration(
                     .context("stage per-Session Pi models config")?;
             }
             PiModelConfigurationMaterialization::PreserveExisting => {
-                let _ = validated_pi_execution_materialization(&agent_dir)?;
+                let _ = validated_pi_execution_materialization(&agent_dir, &skill_exec_dir)?;
                 let models_json = stdfs::read_to_string(agent_dir.join("models.json"))
                     .context("read current per-Session Pi models config")?;
                 let parsed = serde_json::from_str::<Value>(&models_json)
@@ -5826,15 +6473,27 @@ async fn synchronize_pi_execution_configuration(
         let skills = serde_json::to_value(&configuration.skills)?;
         // Hub Skills are applied last so an inline/managed Skill overrides runtime-local content.
         materialize_skills(&stage_agent_dir, &skills).await?;
+        let owned_package_directories = materialize_skill_packages(
+            paths,
+            configuration,
+            &stage_agent_dir,
+            &stage_skill_exec_dir,
+            package_context,
+        )
+        .await?;
         let owned_skill_directories =
             skill_directory_entries(&stage_agent_dir.join("skills")).await?;
-        let materialization_sha256 =
-            pi_execution_materialization_sha256(&stage_agent_dir, &owned_skill_directories)?;
+        let materialization_sha256 = pi_execution_materialization_sha256(
+            &stage_agent_dir,
+            &owned_skill_directories,
+            &stage_skill_exec_dir,
+        )?;
         let marker = PiExecutionMaterializationMarker {
-            format_version: 1,
+            format_version: 2,
             configuration_fingerprint: configuration_fingerprint.to_owned(),
             materialization_sha256,
             owned_skill_directories,
+            owned_package_directories,
         };
         write_private_file(
             &stage_agent_dir.join(PI_MATERIALIZATION_MARKER_FILE),
@@ -5842,12 +6501,23 @@ async fn synchronize_pi_execution_configuration(
         )
         .context("stage Pi execution configuration marker")?;
 
-        if pi_materialization_is_current(&agent_dir, &marker) {
+        if pi_materialization_is_current(&agent_dir, &skill_exec_dir, &marker) {
             return Ok(());
         }
-        commit_pi_execution_materialization(&agent_dir, &stage_agent_dir, &marker).await
+        commit_pi_execution_materialization(
+            &agent_dir,
+            &skill_exec_dir,
+            &stage_agent_dir,
+            &stage_skill_exec_dir,
+            &marker,
+        )
     }
     .await;
+    if let Err(error) = make_tree_owner_writable(&stage) {
+        if result.is_ok() {
+            return Err(error).context("make Pi execution staging tree removable");
+        }
+    }
     if let Err(cleanup_error) = fs::remove_dir_all(&stage).await {
         if cleanup_error.kind() != std::io::ErrorKind::NotFound {
             if result.is_ok() {
@@ -5984,6 +6654,87 @@ fn pi_thinking_level_map(effort: ReasoningEffort, _thinking_level: &str) -> Valu
 fn pi_execution_materialization_sha256(
     agent_dir: &Path,
     skill_dirs: &[String],
+    skill_exec_dir: &Path,
+) -> anyhow::Result<String> {
+    let mut paths = ["AGENTS.md", "models.json", "skills-manifest.json"]
+        .into_iter()
+        .map(|path| (format!("pi-agent/{path}"), agent_dir.join(path)))
+        .collect::<Vec<_>>();
+    for directory in skill_dirs {
+        paths.extend(
+            WalkDir::new(agent_dir.join("skills").join(directory))
+                .follow_links(false)
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|entry| {
+                    let path = entry.into_path();
+                    let relative = path
+                        .strip_prefix(agent_dir)
+                        .expect("walked Pi Skill path has its configured root");
+                    (format!("pi-agent/{}", relative.to_string_lossy()), path)
+                }),
+        );
+    }
+    paths.push((
+        format!("{SKILL_EXEC_DIRECTORY}/{SKILL_EXEC_CATALOG_FILE}"),
+        skill_exec_dir.join(SKILL_EXEC_CATALOG_FILE),
+    ));
+    let packages_root = skill_exec_dir.join("packages");
+    paths.extend(
+        WalkDir::new(&packages_root)
+            .follow_links(false)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|entry| {
+                let path = entry.into_path();
+                let relative = path
+                    .strip_prefix(&packages_root)
+                    .expect("walked Skill execution path has its configured root");
+                let logical = if relative.as_os_str().is_empty() {
+                    format!("{SKILL_EXEC_DIRECTORY}/packages")
+                } else {
+                    format!(
+                        "{SKILL_EXEC_DIRECTORY}/packages/{}",
+                        relative.to_string_lossy()
+                    )
+                };
+                (logical, path)
+            }),
+    );
+    paths.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut digest = Sha256::new();
+    for (logical, path) in paths {
+        let metadata = stdfs::symlink_metadata(&path)?;
+        digest.update(logical.as_bytes());
+        digest.update([0]);
+        if metadata.is_dir() {
+            digest.update(b"directory");
+        } else if metadata.is_file() {
+            digest.update(b"file");
+            digest.update(stdfs::read(&path)?);
+        } else {
+            anyhow::bail!("materialized Pi configuration contains an unsupported file type");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            digest.update((metadata.permissions().mode() & 0o777).to_le_bytes());
+        }
+        digest.update([0]);
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn legacy_pi_execution_materialization_sha256(
+    agent_dir: &Path,
+    skill_dirs: &[String],
 ) -> anyhow::Result<String> {
     let mut paths = ["AGENTS.md", "models.json", "skills-manifest.json"]
         .into_iter()
@@ -6011,19 +6762,34 @@ fn pi_execution_materialization_sha256(
         } else if metadata.is_file() {
             digest.update(stdfs::read(&path)?);
         } else {
-            anyhow::bail!("materialized Pi configuration contains an unsupported file type");
+            anyhow::bail!("legacy Pi configuration contains an unsupported file type");
         }
         digest.update([0]);
     }
-    Ok(digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn legacy_pi_materialization_is_current(
+    agent_dir: &Path,
+    marker: &PiExecutionMaterializationMarker,
+) -> bool {
+    marker.format_version == 1
+        && marker.owned_package_directories.is_empty()
+        && marker
+            .owned_skill_directories
+            .iter()
+            .all(|directory| is_single_normal_path_component(directory))
+        && private_file_permissions_are_valid(&agent_dir.join(PI_MATERIALIZATION_MARKER_FILE))
+        && private_file_permissions_are_valid(&agent_dir.join("AGENTS.md"))
+        && private_file_permissions_are_valid(&agent_dir.join("models.json"))
+        && private_file_permissions_are_valid(&agent_dir.join("skills-manifest.json"))
+        && legacy_pi_execution_materialization_sha256(agent_dir, &marker.owned_skill_directories)
+            .is_ok_and(|digest| digest == marker.materialization_sha256)
 }
 
 fn pi_materialization_is_current(
     agent_dir: &Path,
+    skill_exec_dir: &Path,
     desired: &PiExecutionMaterializationMarker,
 ) -> bool {
     let marker_path = agent_dir.join(PI_MATERIALIZATION_MARKER_FILE);
@@ -6043,15 +6809,20 @@ fn pi_materialization_is_current(
             .owned_skill_directories
             .iter()
             .any(|directory| !is_single_normal_path_component(directory))
+        || desired
+            .owned_package_directories
+            .iter()
+            .any(|directory| !is_single_normal_path_component(directory))
     {
         return false;
     }
-    pi_execution_materialization_sha256(agent_dir, &desired.owned_skill_directories)
+    pi_execution_materialization_sha256(agent_dir, &desired.owned_skill_directories, skill_exec_dir)
         .is_ok_and(|digest| digest == desired.materialization_sha256)
 }
 
 fn validated_pi_execution_materialization(
     agent_dir: &Path,
+    skill_exec_dir: &Path,
 ) -> anyhow::Result<PiExecutionMaterializationMarker> {
     let marker: PiExecutionMaterializationMarker = serde_json::from_slice(
         &stdfs::read(agent_dir.join(PI_MATERIALIZATION_MARKER_FILE))
@@ -6059,42 +6830,134 @@ fn validated_pi_execution_materialization(
     )
     .context("parse current Pi execution configuration marker")?;
     anyhow::ensure!(
-        marker.format_version == 1 && pi_materialization_is_current(agent_dir, &marker),
+        (marker.format_version == 2
+            && pi_materialization_is_current(agent_dir, skill_exec_dir, &marker))
+            || legacy_pi_materialization_is_current(agent_dir, &marker),
         "current per-Session Pi configuration materialization is invalid"
     );
     Ok(marker)
 }
 
-async fn commit_pi_execution_materialization(
+fn commit_pi_execution_materialization(
     agent_dir: &Path,
+    skill_exec_dir: &Path,
     stage_agent_dir: &Path,
+    stage_skill_exec_dir: &Path,
     marker: &PiExecutionMaterializationMarker,
 ) -> anyhow::Result<()> {
-    fs::create_dir_all(agent_dir.join("skills")).await?;
+    stdfs::create_dir_all(agent_dir.join("skills"))?;
+    let stage_root = stage_agent_dir
+        .parent()
+        .context("Pi execution staging directory has no root")?;
+    let backup_root = stage_root.join("previous");
+    stdfs::create_dir_all(&backup_root)?;
     let previous_owned = previous_pi_owned_skill_directories(agent_dir);
-    for directory in &marker.owned_skill_directories {
-        let target = agent_dir.join("skills").join(directory);
-        remove_materialized_path(&target).await?;
-        fs::rename(stage_agent_dir.join("skills").join(directory), &target)
-            .await
-            .with_context(|| format!("install managed Pi Skill directory {directory}"))?;
-    }
-    for directory in previous_owned {
-        if !marker.owned_skill_directories.contains(&directory) {
-            remove_materialized_path(&agent_dir.join("skills").join(directory)).await?;
+    let owned_skill_directories = previous_owned
+        .into_iter()
+        .chain(marker.owned_skill_directories.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let mut backup_targets = owned_skill_directories
+        .iter()
+        .map(|directory| {
+            (
+                agent_dir.join("skills").join(directory),
+                backup_root.join("skills").join(directory),
+            )
+        })
+        .collect::<Vec<_>>();
+    backup_targets.extend(
+        [
+            "AGENTS.md",
+            "models.json",
+            "skills-manifest.json",
+            PI_MATERIALIZATION_MARKER_FILE,
+        ]
+        .into_iter()
+        .map(|filename| {
+            (
+                agent_dir.join(filename),
+                backup_root.join("agent-files").join(filename),
+            )
+        }),
+    );
+    backup_targets.push((
+        skill_exec_dir.to_path_buf(),
+        backup_root.join(SKILL_EXEC_DIRECTORY),
+    ));
+
+    let mut backed_up = Vec::new();
+    for (target, backup) in &backup_targets {
+        match stdfs::symlink_metadata(target) {
+            Ok(_) => {
+                if let Some(parent) = backup.parent() {
+                    stdfs::create_dir_all(parent)?;
+                }
+                if let Err(error) = stdfs::rename(target, backup) {
+                    for (restore_target, restore_backup) in backed_up.iter().rev() {
+                        let _ = stdfs::rename(restore_backup, restore_target);
+                    }
+                    return Err(error).context("stage previous Skill materialization");
+                }
+                backed_up.push((target.clone(), backup.clone()));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
     }
-    for filename in ["AGENTS.md", "models.json", "skills-manifest.json"] {
-        fs::rename(stage_agent_dir.join(filename), agent_dir.join(filename))
-            .await
-            .with_context(|| format!("install Pi {filename}"))?;
+
+    let mut installed = Vec::new();
+    let install_result: anyhow::Result<()> = (|| {
+        for directory in &marker.owned_skill_directories {
+            let target = agent_dir.join("skills").join(directory);
+            stdfs::rename(stage_agent_dir.join("skills").join(directory), &target)
+                .with_context(|| format!("install managed Pi Skill directory {directory}"))?;
+            installed.push(target);
+        }
+        for filename in ["AGENTS.md", "models.json", "skills-manifest.json"] {
+            let target = agent_dir.join(filename);
+            stdfs::rename(stage_agent_dir.join(filename), &target)
+                .with_context(|| format!("install Pi {filename}"))?;
+            installed.push(target);
+        }
+        stdfs::rename(stage_skill_exec_dir, skill_exec_dir)
+            .context("install private Skill execution source")?;
+        installed.push(skill_exec_dir.to_path_buf());
+        let marker_target = agent_dir.join(PI_MATERIALIZATION_MARKER_FILE);
+        stdfs::rename(
+            stage_agent_dir.join(PI_MATERIALIZATION_MARKER_FILE),
+            &marker_target,
+        )
+        .context("commit Pi execution configuration marker")?;
+        installed.push(marker_target);
+        for directory in [
+            agent_dir.join("skills"),
+            agent_dir.to_path_buf(),
+            agent_dir
+                .parent()
+                .context("Pi Agent directory has no parent")?
+                .to_path_buf(),
+            skill_exec_dir
+                .parent()
+                .context("Skill execution directory has no parent")?
+                .to_path_buf(),
+        ] {
+            stdfs::File::open(directory)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = install_result {
+        for path in installed.iter().rev() {
+            let _ = make_tree_owner_writable(path);
+            let _ = remove_materialized_path_sync(path);
+        }
+        for (target, backup) in backed_up.iter().rev() {
+            if let Some(parent) = target.parent() {
+                let _ = stdfs::create_dir_all(parent);
+            }
+            let _ = stdfs::rename(backup, target);
+        }
+        return Err(error).context("replace Session Skill materialization");
     }
-    fs::rename(
-        stage_agent_dir.join(PI_MATERIALIZATION_MARKER_FILE),
-        agent_dir.join(PI_MATERIALIZATION_MARKER_FILE),
-    )
-    .await
-    .context("commit Pi execution configuration marker")?;
     Ok(())
 }
 
@@ -6162,10 +7025,10 @@ fn is_single_normal_path_component(value: &str) -> bool {
     }
 }
 
-async fn remove_materialized_path(path: &Path) -> anyhow::Result<()> {
-    match fs::symlink_metadata(path).await {
-        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path).await?,
-        Ok(_) => fs::remove_file(path).await?,
+fn remove_materialized_path_sync(path: &Path) -> anyhow::Result<()> {
+    match stdfs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => stdfs::remove_dir_all(path)?,
+        Ok(_) => stdfs::remove_file(path)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
@@ -6493,6 +7356,108 @@ mod tests {
 
     type RecordedHubRequests = Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
 
+    enum TestSkillArchiveEntry<'a> {
+        File {
+            path: &'a str,
+            contents: &'a [u8],
+            mode: u32,
+        },
+        Symlink {
+            path: &'a str,
+            target: &'a str,
+        },
+    }
+
+    fn build_test_skill_archive(entries: &[TestSkillArchiveEntry<'_>]) -> Vec<u8> {
+        let encoder = zstd::Encoder::new(Vec::new(), 1).unwrap();
+        let mut archive = tar::Builder::new(encoder);
+        for entry in entries {
+            match entry {
+                TestSkillArchiveEntry::File {
+                    path,
+                    contents,
+                    mode,
+                } => {
+                    let mut header = tar::Header::new_gnu();
+                    header.set_entry_type(tar::EntryType::Regular);
+                    header.set_size(contents.len() as u64);
+                    header.set_uid(0);
+                    header.set_gid(0);
+                    header.set_mtime(0);
+                    header.set_mode(*mode);
+                    header.set_cksum();
+                    archive.append_data(&mut header, path, *contents).unwrap();
+                }
+                TestSkillArchiveEntry::Symlink { path, target } => {
+                    let mut header = tar::Header::new_gnu();
+                    header.set_entry_type(tar::EntryType::Symlink);
+                    header.set_size(0);
+                    header.set_uid(0);
+                    header.set_gid(0);
+                    header.set_mtime(0);
+                    header.set_mode(0o777);
+                    header.set_link_name(target).unwrap();
+                    header.set_cksum();
+                    archive
+                        .append_data(&mut header, path, std::io::empty())
+                        .unwrap();
+                }
+            }
+        }
+        let encoder = archive.into_inner().unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn test_skill_package_for_archive(
+        package_id: Uuid,
+        archive: &[u8],
+        files: &[(&str, &[u8], bool)],
+    ) -> SkillPackageDto {
+        SkillPackageDto {
+            id: package_id,
+            format_version: 1,
+            size_bytes: archive.len() as u64,
+            checksum_sha256: format!("{:x}", Sha256::digest(archive)),
+            files: files
+                .iter()
+                .map(|(path, contents, executable)| SkillPackageFileDto {
+                    path: (*path).into(),
+                    size_bytes: contents.len() as u64,
+                    checksum_sha256: format!("{:x}", Sha256::digest(contents)),
+                    executable: *executable,
+                })
+                .collect(),
+        }
+    }
+
+    fn build_test_skill_package(
+        package_id: Uuid,
+        files: &[(&str, &[u8], bool)],
+    ) -> (SkillPackageDto, Vec<u8>) {
+        let entries = files
+            .iter()
+            .map(|(path, contents, executable)| TestSkillArchiveEntry::File {
+                path,
+                contents,
+                mode: if *executable { 0o755 } else { 0o444 },
+            })
+            .collect::<Vec<_>>();
+        let archive = build_test_skill_archive(&entries);
+        (
+            test_skill_package_for_archive(package_id, &archive, files),
+            archive,
+        )
+    }
+
+    fn test_skill_package_response(bytes: &[u8]) -> Response {
+        let mut response = Response::new(Body::from(bytes.to_vec()));
+        response.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            bytes.len().to_string().parse().unwrap(),
+        );
+        response
+    }
+
     #[test]
     fn runtime_enrollment_response_defaults_protocol_capabilities_to_empty() {
         let response: RuntimeRegisterResponse = serde_json::from_value(json!({
@@ -6502,6 +7467,304 @@ mod tests {
         .unwrap();
 
         assert!(response.protocol_capabilities.is_empty());
+    }
+
+    #[test]
+    fn skill_presence_does_not_restore_read_tool_permission() {
+        let mut claim = test_claim();
+        claim.agent.tool_allowlist = vec!["grep".into()];
+        claim.execution_configuration.tool_allowlist = vec!["grep".into()];
+
+        assert_eq!(
+            pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap(),
+            ["grep"]
+        );
+    }
+
+    #[test]
+    fn skill_exec_requires_final_permission_and_an_executable_package_file() {
+        let mut claim = test_claim();
+        claim.agent.tool_allowlist = vec!["read".into(), "skill_exec".into()];
+        claim.execution_configuration.tool_allowlist = vec!["read".into(), "skill_exec".into()];
+        claim.execution_configuration.skills[0].package = Some(SkillPackageDto {
+            id: Uuid::new_v4(),
+            format_version: 1,
+            size_bytes: 1,
+            checksum_sha256: "0".repeat(64),
+            files: vec![SkillPackageFileDto {
+                path: "bin/client".into(),
+                size_bytes: 1,
+                checksum_sha256: "1".repeat(64),
+                executable: true,
+            }],
+        });
+
+        assert_eq!(
+            pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap(),
+            ["read", "skill_exec"]
+        );
+
+        claim.execution_configuration.tool_allowlist = vec!["read".into()];
+        assert_eq!(
+            pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap(),
+            ["read"]
+        );
+
+        claim.execution_configuration.tool_allowlist = vec!["read".into(), "skill_exec".into()];
+        claim.execution_configuration.skills[0]
+            .package
+            .as_mut()
+            .unwrap()
+            .files[0]
+            .executable = false;
+        assert_eq!(
+            pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap(),
+            ["read"]
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_package_cache_streams_validates_and_recovers_corrupt_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_id = Uuid::new_v4();
+        let skill_id = Uuid::new_v4();
+        let (package, archive) = build_test_skill_package(
+            Uuid::new_v4(),
+            &[("references/guide.txt", b"guide\n", false)],
+        );
+        let archive = Arc::new(archive);
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = Router::new().route(
+            "/api/runtime/runs/{run_id}/skills/{skill_id}/package",
+            get({
+                let archive = Arc::clone(&archive);
+                let requests = Arc::clone(&requests);
+                move |AxumPath((actual_run_id, actual_skill_id)): AxumPath<(Uuid, Uuid)>,
+                      headers: HeaderMap| {
+                    let archive = Arc::clone(&archive);
+                    let requests = Arc::clone(&requests);
+                    async move {
+                        assert_eq!(actual_run_id, run_id);
+                        assert_eq!(actual_skill_id, skill_id);
+                        requests.lock().unwrap().push(headers);
+                        test_skill_package_response(&archive)
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hub_addr = listener.local_addr().unwrap();
+        let hub = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = HubClient {
+            http: reqwest::Client::new(),
+            hub_url: format!("http://{hub_addr}"),
+            runtime_token: Arc::new(std::sync::RwLock::new("runtime-secret".into())),
+            protocol_capabilities: HashSet::new(),
+        };
+        let route = SkillPackageDownloadRoute::Run { run_id };
+
+        let cached = client
+            .cache_skill_package(temp.path(), route, 7, skill_id, &package)
+            .await
+            .unwrap();
+        assert_eq!(fs::read(&cached).await.unwrap(), *archive);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let cache_root = temp.path().join(SKILL_PACKAGE_CACHE_DIRECTORY);
+            assert_eq!(
+                stdfs::metadata(cache_root).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert_eq!(
+                stdfs::metadata(&cached).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let cached_again = client
+            .cache_skill_package(temp.path(), route, 7, skill_id, &package)
+            .await
+            .unwrap();
+        assert_eq!(cached_again, cached);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+
+        let mut corrupt = archive.as_ref().clone();
+        corrupt[0] ^= 0xff;
+        fs::write(&cached, corrupt).await.unwrap();
+        client
+            .cache_skill_package(temp.path(), route, 7, skill_id, &package)
+            .await
+            .unwrap();
+        assert_eq!(fs::read(&cached).await.unwrap(), *archive);
+
+        let mut wrong_size = package.clone();
+        wrong_size.size_bytes += 1;
+        assert!(client
+            .cache_skill_package(temp.path(), route, 7, skill_id, &wrong_size)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Content-Length"));
+        let mut wrong_checksum = package.clone();
+        wrong_checksum.checksum_sha256 = "0".repeat(64);
+        assert!(client
+            .cache_skill_package(temp.path(), route, 7, skill_id, &wrong_checksum)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("checksum"));
+
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 4);
+            assert!(requests.iter().all(|headers| {
+                headers[header::AUTHORIZATION] == "Bearer runtime-secret"
+                    && headers["x-agent-hub-ownership-generation"] == "7"
+            }));
+        }
+        let mut cache_entries = fs::read_dir(temp.path().join(SKILL_PACKAGE_CACHE_DIRECTORY))
+            .await
+            .unwrap();
+        while let Some(entry) = cache_entries.next_entry().await.unwrap() {
+            assert!(!entry.file_name().to_string_lossy().ends_with(".tmp"));
+        }
+        hub.abort();
+    }
+
+    #[test]
+    fn safe_skill_package_extraction_rejects_malicious_or_mismatched_tar_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let valid_files = [("bin/client", b"client".as_slice(), true)];
+        let (valid_package, valid_archive) = build_test_skill_package(Uuid::new_v4(), &valid_files);
+        let valid_path = temp.path().join("valid.tar.zst");
+        stdfs::write(&valid_path, valid_archive).unwrap();
+        let valid_destination = temp.path().join("valid");
+        extract_skill_package_archive(&valid_path, &valid_package, &valid_destination).unwrap();
+        assert_eq!(
+            stdfs::read(valid_destination.join("bin/client")).unwrap(),
+            b"client"
+        );
+
+        let cases = vec![
+            (
+                "symlink",
+                build_test_skill_archive(&[TestSkillArchiveEntry::Symlink {
+                    path: "bin/client",
+                    target: "../../escape",
+                }]),
+                valid_files.to_vec(),
+            ),
+            (
+                "path-mismatch",
+                build_test_skill_archive(&[TestSkillArchiveEntry::File {
+                    path: "bin/other",
+                    contents: b"client",
+                    mode: 0o755,
+                }]),
+                valid_files.to_vec(),
+            ),
+            (
+                "duplicate",
+                build_test_skill_archive(&[
+                    TestSkillArchiveEntry::File {
+                        path: "bin/client",
+                        contents: b"client",
+                        mode: 0o755,
+                    },
+                    TestSkillArchiveEntry::File {
+                        path: "bin/client",
+                        contents: b"client",
+                        mode: 0o755,
+                    },
+                ]),
+                valid_files.to_vec(),
+            ),
+            (
+                "missing",
+                build_test_skill_archive(&[]),
+                valid_files.to_vec(),
+            ),
+            (
+                "mode-mismatch",
+                build_test_skill_archive(&[TestSkillArchiveEntry::File {
+                    path: "bin/client",
+                    contents: b"client",
+                    mode: 0o444,
+                }]),
+                valid_files.to_vec(),
+            ),
+        ];
+        for (name, archive, files) in cases {
+            let package = test_skill_package_for_archive(Uuid::new_v4(), &archive, &files);
+            let archive_path = temp.path().join(format!("{name}.tar.zst"));
+            stdfs::write(&archive_path, archive).unwrap();
+            assert!(
+                extract_skill_package_archive(
+                    &archive_path,
+                    &package,
+                    &temp.path().join(format!("extract-{name}")),
+                )
+                .is_err(),
+                "unsafe archive case {name} was accepted"
+            );
+        }
+
+        let size_archive = build_test_skill_archive(&[TestSkillArchiveEntry::File {
+            path: "references/data",
+            contents: b"abc",
+            mode: 0o444,
+        }]);
+        let mut size_package = test_skill_package_for_archive(
+            Uuid::new_v4(),
+            &size_archive,
+            &[("references/data", b"abcd", false)],
+        );
+        size_package.files[0].checksum_sha256 = format!("{:x}", Sha256::digest(b"abc"));
+        let size_path = temp.path().join("size.tar.zst");
+        stdfs::write(&size_path, size_archive).unwrap();
+        assert!(extract_skill_package_archive(
+            &size_path,
+            &size_package,
+            &temp.path().join("extract-size"),
+        )
+        .is_err());
+
+        let checksum_archive = build_test_skill_archive(&[TestSkillArchiveEntry::File {
+            path: "references/data",
+            contents: b"abc",
+            mode: 0o444,
+        }]);
+        let mut checksum_package = test_skill_package_for_archive(
+            Uuid::new_v4(),
+            &checksum_archive,
+            &[("references/data", b"abc", false)],
+        );
+        checksum_package.files[0].checksum_sha256 = "0".repeat(64);
+        let checksum_path = temp.path().join("checksum.tar.zst");
+        stdfs::write(&checksum_path, checksum_archive).unwrap();
+        assert!(extract_skill_package_archive(
+            &checksum_path,
+            &checksum_package,
+            &temp.path().join("extract-checksum"),
+        )
+        .is_err());
+
+        let oversized_archive = build_test_skill_archive(&[]);
+        let mut oversized_package = test_skill_package_for_archive(
+            Uuid::new_v4(),
+            &oversized_archive,
+            &[("references/data", b"", false)],
+        );
+        oversized_package.files[0].size_bytes = MAX_SKILL_PACKAGE_EXPANDED_BYTES + 1;
+        let oversized_path = temp.path().join("oversized.tar.zst");
+        stdfs::write(&oversized_path, oversized_archive).unwrap();
+        assert!(extract_skill_package_archive(
+            &oversized_path,
+            &oversized_package,
+            &temp.path().join("extract-oversized"),
+        )
+        .is_err());
     }
 
     #[tokio::test]
@@ -6932,6 +8195,367 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configuration_refresh_upgrades_a_legacy_package_free_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let claim = test_claim();
+        let run_env = prepare_run_env(temp.path(), &claim, Some("http://127.0.0.1:1/v1"))
+            .await
+            .unwrap();
+        let paths = SessionPaths::for_claim(temp.path(), &claim).unwrap();
+        let agent_dir = pi_agent_directory(&run_env.engine_state_root);
+        let marker_path = agent_dir.join(PI_MATERIALIZATION_MARKER_FILE);
+        let mut marker: PiExecutionMaterializationMarker =
+            serde_json::from_slice(&fs::read(&marker_path).await.unwrap()).unwrap();
+        marker.format_version = 1;
+        marker.owned_package_directories.clear();
+        marker.materialization_sha256 =
+            legacy_pi_execution_materialization_sha256(&agent_dir, &marker.owned_skill_directories)
+                .unwrap();
+        write_private_file(&marker_path, &serde_json::to_vec_pretty(&marker).unwrap()).unwrap();
+        fs::remove_dir_all(paths.engine_state.join(SKILL_EXEC_DIRECTORY))
+            .await
+            .unwrap();
+
+        let mut refreshed = claim.execution_configuration.clone();
+        refreshed.revision += 1;
+        refreshed.instructions = "upgraded guidance".into();
+        let fingerprint = execution_configuration_fingerprint(&refreshed).unwrap();
+        synchronize_pi_execution_configuration(
+            &paths,
+            &refreshed,
+            &fingerprint,
+            PiModelConfigurationMaterialization::PreserveExisting,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let upgraded: PiExecutionMaterializationMarker =
+            serde_json::from_slice(&fs::read(&marker_path).await.unwrap()).unwrap();
+        assert_eq!(upgraded.format_version, 2);
+        assert!(paths
+            .engine_state
+            .join(SKILL_EXEC_DIRECTORY)
+            .join(SKILL_EXEC_CATALOG_FILE)
+            .is_file());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn packaged_skills_refresh_atomically_reuse_cache_and_isolate_sessions() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_id = Uuid::new_v4();
+        let mut claim = test_claim();
+        claim.run.runtime_id = Some(runtime_id);
+        let run_id = claim.run.id;
+        let session_id = claim.run.hub_session_id.unwrap();
+        let skill_id = claim.execution_configuration.skills[0].source_id.unwrap();
+        let (package_a, archive_a) = build_test_skill_package(
+            Uuid::new_v4(),
+            &[
+                ("bin/client", b"#!/bin/sh\necho a\n", true),
+                ("references/guide.txt", b"guide a\n", false),
+            ],
+        );
+        let (package_b, archive_b) = build_test_skill_package(
+            Uuid::new_v4(),
+            &[
+                ("bin/client-next", b"#!/bin/sh\necho b\n", true),
+                ("references/next.txt", b"guide b\n", false),
+            ],
+        );
+        claim.execution_configuration.skills[0].package = Some(package_a.clone());
+        claim.expected_configuration_fingerprint =
+            execution_configuration_fingerprint(&claim.execution_configuration).unwrap();
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let archive_a = Arc::new(archive_a);
+        let archive_b = Arc::new(archive_b);
+        let app = Router::new()
+            .route(
+                "/api/runtime/runs/{run_id}/skills/{skill_id}/package",
+                get({
+                    let archive_a = Arc::clone(&archive_a);
+                    let requests = Arc::clone(&requests);
+                    move |AxumPath((actual_run_id, actual_skill_id)): AxumPath<(Uuid, Uuid)>| {
+                        let archive_a = Arc::clone(&archive_a);
+                        let requests = Arc::clone(&requests);
+                        async move {
+                            assert_eq!((actual_run_id, actual_skill_id), (run_id, skill_id));
+                            requests.lock().unwrap().push(format!(
+                                "run:{actual_run_id}:{actual_skill_id}"
+                            ));
+                            test_skill_package_response(&archive_a)
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/runtime/sessions/{session_id}/skills/{skill_id}/packages/{package_id}",
+                get({
+                    let archive_b = Arc::clone(&archive_b);
+                    let requests = Arc::clone(&requests);
+                    let package_b_id = package_b.id;
+                    move |AxumPath((actual_session_id, actual_skill_id, actual_package_id)): AxumPath<(
+                        Uuid,
+                        Uuid,
+                        Uuid,
+                    )>| {
+                        let archive_b = Arc::clone(&archive_b);
+                        let requests = Arc::clone(&requests);
+                        async move {
+                            assert_eq!(actual_session_id, session_id);
+                            assert_eq!(actual_skill_id, skill_id);
+                            assert_eq!(actual_package_id, package_b_id);
+                            requests.lock().unwrap().push(format!(
+                                "session:{actual_session_id}:{actual_skill_id}:{actual_package_id}"
+                            ));
+                            test_skill_package_response(&archive_b)
+                        }
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hub_addr = listener.local_addr().unwrap();
+        let hub = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = HubClient {
+            http: reqwest::Client::new(),
+            hub_url: format!("http://{hub_addr}"),
+            runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
+            protocol_capabilities: HashSet::new(),
+        };
+
+        let first_env = prepare_run_env_with_local_skills(
+            temp.path(),
+            &claim,
+            Some("http://127.0.0.1:1/v1"),
+            None,
+            Some(&client),
+        )
+        .await
+        .unwrap();
+        let first_paths = SessionPaths::for_session(temp.path(), session_id);
+        let skill_slug = skill_directory_name(&claim.execution_configuration.skills[0].name);
+        let pi_skill_root = pi_agent_directory(&first_env.engine_state_root)
+            .join("skills")
+            .join(&skill_slug);
+        assert!(pi_skill_root.join("SKILL.md").is_file());
+        assert_eq!(
+            fs::read_to_string(pi_skill_root.join("references/guide.txt"))
+                .await
+                .unwrap(),
+            "guide a\n"
+        );
+        let package_a_directory = stable_skill_package_directory(skill_id, package_a.id);
+        let package_a_root = first_paths
+            .engine_state
+            .join(SKILL_EXEC_DIRECTORY)
+            .join("packages")
+            .join(&package_a_directory);
+        assert!(package_a_root.join("bin/client").is_file());
+        let catalog_path = first_paths
+            .engine_state
+            .join(SKILL_EXEC_DIRECTORY)
+            .join(SKILL_EXEC_CATALOG_FILE);
+        let catalog: SkillExecCatalog =
+            serde_json::from_slice(&fs::read(&catalog_path).await.unwrap()).unwrap();
+        assert_eq!(catalog.version, 1);
+        assert_eq!(catalog.skills.len(), 1);
+        assert_eq!(catalog.skills[0].name, "repo-review");
+        assert_eq!(catalog.skills[0].source_id, skill_id);
+        assert_eq!(catalog.skills[0].package_id, package_a.id);
+        assert_eq!(catalog.skills[0].executables, ["bin/client"]);
+        assert_eq!(
+            stdfs::canonicalize(&catalog.skills[0].package_root).unwrap(),
+            stdfs::canonicalize(&package_a_root).unwrap()
+        );
+        let canonical_packages_root =
+            stdfs::canonicalize(package_a_root.parent().unwrap()).unwrap();
+        assert!(Path::new(&catalog.skills[0].package_root).starts_with(canonical_packages_root));
+        assert_eq!(
+            fs::metadata(&package_a_root)
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o500
+        );
+        assert_eq!(
+            fs::metadata(package_a_root.join("bin/client"))
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o500
+        );
+        assert_eq!(
+            fs::metadata(&catalog_path)
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o400
+        );
+        assert_eq!(
+            fs::metadata(
+                first_paths
+                    .engine_state
+                    .join(SKILL_EXEC_DIRECTORY)
+                    .join("tmp")
+            )
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+                & 0o777,
+            0o700
+        );
+
+        let manager = SessionSupervisorManager::new(temp.path().to_path_buf(), runtime_id, 2);
+        manager.reserve_claim(&claim).unwrap();
+        manager.complete_fake_claim(&claim).await.unwrap();
+        let mut refreshed = claim.execution_configuration.clone();
+        refreshed.revision += 1;
+        refreshed.model_selection = None;
+        refreshed.model_settings = AgentModelSettings::default();
+        refreshed.model_bindings.clear();
+        refreshed.skills[0].package = Some(package_b.clone());
+        let refreshed_fingerprint = execution_configuration_fingerprint(&refreshed).unwrap();
+        let command = RuntimeSessionCommandDto {
+            command_id: Uuid::new_v4(),
+            session_id,
+            ownership_generation: 1,
+            command: "refresh_configuration".into(),
+            run_id: None,
+            turn_id: None,
+            native_session_id: None,
+            native_turn_id: None,
+            message: None,
+            configuration_revision: Some(refreshed.revision),
+            fingerprint: Some(refreshed_fingerprint.clone()),
+            execution_configuration: Some(refreshed.clone()),
+        };
+        let applied = apply_runtime_session_command(&manager, Some(&client), &command, None)
+            .await
+            .unwrap();
+        assert_eq!(applied.outcome, "applied", "{:?}", applied.native_error);
+        assert!(!package_a_root.exists());
+        assert!(!pi_skill_root.join("bin/client").exists());
+        assert_eq!(
+            fs::read_to_string(pi_skill_root.join("references/next.txt"))
+                .await
+                .unwrap(),
+            "guide b\n"
+        );
+        let package_b_root = first_paths
+            .engine_state
+            .join(SKILL_EXEC_DIRECTORY)
+            .join("packages")
+            .join(stable_skill_package_directory(skill_id, package_b.id));
+        assert!(package_b_root.join("bin/client-next").is_file());
+        assert!(first_paths
+            .engine_state
+            .join(SKILL_EXEC_DIRECTORY)
+            .join("tmp")
+            .is_dir());
+
+        let catalog_inode = fs::metadata(&catalog_path).await.unwrap().ino();
+        let marker_path =
+            pi_agent_directory(&first_paths.engine_state).join(PI_MATERIALIZATION_MARKER_FILE);
+        let marker_inode = fs::metadata(&marker_path).await.unwrap().ino();
+        let mut invalid_refresh = refreshed.clone();
+        invalid_refresh.revision += 1;
+        invalid_refresh.skills[0].package.as_mut().unwrap().files[0].checksum_sha256 =
+            "0".repeat(64);
+        let invalid_fingerprint = execution_configuration_fingerprint(&invalid_refresh).unwrap();
+        assert!(manager
+            .refresh_execution_configuration(
+                session_id,
+                1,
+                &invalid_refresh,
+                &invalid_fingerprint,
+                Some(&client),
+                None,
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            fs::metadata(&catalog_path).await.unwrap().ino(),
+            catalog_inode
+        );
+        assert_eq!(
+            fs::metadata(&marker_path).await.unwrap().ino(),
+            marker_inode
+        );
+        assert!(package_b_root.join("bin/client-next").is_file());
+
+        let broker_runtime_file = first_paths
+            .engine_state
+            .join(SKILL_EXEC_DIRECTORY)
+            .join("tmp/runtime-state");
+        fs::write(&broker_runtime_file, "runtime state")
+            .await
+            .unwrap();
+        manager
+            .refresh_execution_configuration(
+                session_id,
+                1,
+                &refreshed,
+                &refreshed_fingerprint,
+                Some(&client),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&catalog_path).await.unwrap().ino(),
+            catalog_inode
+        );
+        assert_eq!(
+            fs::metadata(&marker_path).await.unwrap().ino(),
+            marker_inode
+        );
+        assert!(broker_runtime_file.is_file());
+
+        let mut isolated_claim = claim.clone();
+        isolated_claim.run.id = Uuid::new_v4();
+        isolated_claim.run.hub_session_id = Some(Uuid::new_v4());
+        isolated_claim.expected_configuration_fingerprint =
+            execution_configuration_fingerprint(&isolated_claim.execution_configuration).unwrap();
+        let isolated_env = prepare_run_env_with_local_skills(
+            temp.path(),
+            &isolated_claim,
+            Some("http://127.0.0.1:2/v1"),
+            None,
+            Some(&client),
+        )
+        .await
+        .unwrap();
+        let isolated_package_root = isolated_env
+            .engine_state_root
+            .join(SKILL_EXEC_DIRECTORY)
+            .join("packages")
+            .join(package_a_directory);
+        assert!(isolated_package_root.join("references/guide.txt").is_file());
+        assert!(package_b_root.join("references/next.txt").is_file());
+        assert_ne!(isolated_package_root, package_b_root);
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "cache misses: {requests:?}");
+        assert!(requests[0].starts_with("run:"));
+        assert!(requests[1].starts_with("session:"));
+        drop(requests);
+        manager.shutdown();
+        hub.abort();
+    }
+
+    #[tokio::test]
     async fn online_refresh_without_bindings_preserves_pi_provider_routes_until_the_next_run() {
         let temp = tempfile::tempdir().unwrap();
         let runtime_id = Uuid::new_v4();
@@ -7018,7 +8642,7 @@ mod tests {
             execution_configuration: Some(refreshed),
         };
 
-        let applied = apply_runtime_session_command(&manager, &command, None)
+        let applied = apply_runtime_session_command(&manager, None, &command, None)
             .await
             .unwrap();
 
@@ -7088,6 +8712,83 @@ mod tests {
         assert!(next_models.contains("gpt-main-next"));
         assert!(next_models.contains(&next_binding_id.to_string()));
         manager.shutdown();
+    }
+
+    #[tokio::test]
+    async fn online_refresh_reloads_pi_resources_without_restarting_the_process() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("pi-resource-refresh.pid");
+        let request_log = temp.path().join("pi-resource-refresh.jsonl");
+        let request_log_env = format!("FAKE_PI_REQUEST_LOG={}", request_log.display());
+        let pi_bin = write_fake_pi_wrapper(
+            &temp,
+            &pid_file,
+            &["FAKE_PI_DISABLE_MODEL=1", &request_log_env],
+        );
+        let runtime_id = Uuid::new_v4();
+        let mut claim = test_claim();
+        claim.run.runtime_id = Some(runtime_id);
+        let session_id = claim.run.hub_session_id.unwrap();
+        let metadata =
+            session_supervisor_metadata_for_claim(runtime_id, &claim, "test-engine").unwrap();
+        let run_env = prepare_run_env(temp.path(), &claim, None).await.unwrap();
+        let manager = SessionSupervisorManager::new(temp.path().to_path_buf(), runtime_id, 1);
+        let supervisor = manager
+            .ensure_pi(
+                metadata,
+                pi_bin.display().to_string(),
+                run_env,
+                pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap(),
+                Duration::from_secs(2),
+                None,
+            )
+            .await
+            .unwrap();
+        let initial_pid = std::fs::read_to_string(&pid_file).unwrap();
+
+        let mut refreshed = claim.execution_configuration.clone();
+        refreshed.revision += 1;
+        refreshed.model_selection = None;
+        refreshed.model_settings = AgentModelSettings::default();
+        refreshed.model_bindings.clear();
+        refreshed.skills[0].content = "Use the refreshed Skill.".into();
+        refreshed.skills[0].content_checksum_sha256 = format!(
+            "{:x}",
+            Sha256::digest(refreshed.skills[0].content.as_bytes())
+        );
+        let fingerprint = execution_configuration_fingerprint(&refreshed).unwrap();
+
+        manager
+            .refresh_execution_configuration(session_id, 1, &refreshed, &fingerprint, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&pid_file).unwrap(), initial_pid);
+        let requests = std::fs::read_to_string(&request_log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["type"] == "reload_resources")
+                .count(),
+            1
+        );
+        let skill_markdown = fs::read_to_string(
+            pi_agent_directory(&SessionPaths::for_session(temp.path(), session_id).engine_state)
+                .join("skills")
+                .join(skill_directory_name("repo-review"))
+                .join("SKILL.md"),
+        )
+        .await
+        .unwrap();
+        assert!(skill_markdown.ends_with("\n\nUse the refreshed Skill.\n"));
+
+        supervisor.shutdown();
+        manager.shutdown();
+        assert_process_group_reaped_or_clean_up(&pid_file);
     }
 
     #[tokio::test]
@@ -7177,6 +8878,7 @@ mod tests {
                 &updated,
                 None,
                 Some(&invalid_local_skills),
+                None,
             )
             .await
             .is_err(),
@@ -7303,6 +9005,17 @@ mod tests {
                 .await
                 .unwrap();
         }
+        fs::create_dir_all(paths.engine_state.join("skill-exec/packages/private/bin"))
+            .await
+            .unwrap();
+        fs::write(
+            paths
+                .engine_state
+                .join("skill-exec/packages/private/bin/client"),
+            "private executable",
+        )
+        .await
+        .unwrap();
         manager
             .request_checkpoint(session_id, 1, RuntimeCheckpointReason::Idle)
             .unwrap();
@@ -7390,6 +9103,7 @@ mod tests {
             "pi-session.jsonl"
         );
         assert!(!restored.join("engine-state/.pi").exists());
+        assert!(!restored.join("engine-state/skill-exec").exists());
         assert!(!restored
             .join(format!(
                 "engine-state/sessions/decoy-{native_session_id}.jsonl"
@@ -8364,6 +10078,53 @@ mod tests {
             .unwrap();
         assert!(manager.heartbeat_request().cleaned_sessions.is_empty());
         server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hub_fenced_cleanup_removes_read_only_skill_execution_packages() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_id = Uuid::new_v4();
+        let manager = SessionSupervisorManager::new(temp.path().to_path_buf(), runtime_id, 1);
+        let mut claim = test_claim();
+        claim.run.hub_session_id = Some(Uuid::new_v4());
+        let session_id = claim.run.hub_session_id.unwrap();
+        manager.reserve_claim(&claim).unwrap();
+        manager.complete_fake_claim(&claim).await.unwrap();
+        let paths = SessionPaths::for_session(temp.path(), session_id);
+        let package_root = paths
+            .engine_state
+            .join(SKILL_EXEC_DIRECTORY)
+            .join("packages/package/bin");
+        fs::create_dir_all(&package_root).await.unwrap();
+        fs::write(package_root.join("client"), b"#!/bin/sh\n")
+            .await
+            .unwrap();
+        stdfs::set_permissions(&package_root, stdfs::Permissions::from_mode(0o500)).unwrap();
+        stdfs::set_permissions(
+            package_root.parent().unwrap(),
+            stdfs::Permissions::from_mode(0o500),
+        )
+        .unwrap();
+
+        let cleanup = manager
+            .reconcile_owned_snapshots(&[])
+            .unwrap()
+            .pop()
+            .unwrap();
+        remove_hub_fenced_session_cleanup(&manager, cleanup.clone()).await;
+        let removed = !cleanup.path.exists();
+        let acknowledged = !manager.heartbeat_request().cleaned_sessions.is_empty();
+        if !removed {
+            make_tree_owner_writable(&cleanup.path.join("engine-state").join(SKILL_EXEC_DIRECTORY))
+                .unwrap();
+            stdfs::remove_dir_all(&cleanup.path).unwrap();
+        }
+
+        assert!(removed);
+        assert!(acknowledged);
     }
 
     #[tokio::test]
@@ -9389,6 +11150,7 @@ mod tests {
                 model_base_url: Some("http://127.0.0.1:4567/v1"),
             },
             None,
+            None,
         )
         .await
         .unwrap();
@@ -9438,6 +11200,7 @@ mod tests {
             &refreshed,
             &refreshed_fingerprint,
             PiModelConfigurationMaterialization::PreserveExisting,
+            None,
             None,
         )
         .await
@@ -11790,7 +13553,7 @@ while IFS= read -r line; do
     get_state)
       jq -cn --arg id "$request_id" --arg file "$session_file" '{{type:"response",id:$id,command:"get_state",success:true,data:{{sessionFile:$file,sessionId:"idle-pi"}}}}'
       ;;
-    reload_models|set_model|set_thinking_level)
+    reload_resources|reload_models|set_model|set_thinking_level)
       jq -cn --arg id "$request_id" --arg command "$command" '{{type:"response",id:$id,command:$command,success:true,data:null}}'
       ;;
     prompt)
@@ -11966,7 +13729,7 @@ while IFS= read -r line; do
     get_state)
       jq -cn --arg id "$request_id" --arg file "$session_file" --arg session "$session_id" '{{type:"response",id:$id,command:"get_state",success:true,data:{{sessionFile:$file,sessionId:$session}}}}'
       ;;
-    reload_models|set_model|set_thinking_level)
+    reload_resources|reload_models|set_model|set_thinking_level)
       jq -cn --arg id "$request_id" --arg command "$command" '{{type:"response",id:$id,command:$command,success:true,data:null}}'
       ;;
     prompt)
@@ -12202,9 +13965,10 @@ done
         claim.expected_configuration_fingerprint =
             execution_configuration_fingerprint(&claim.execution_configuration).unwrap();
 
-        let env = prepare_run_env_with_local_skills(temp.path(), &claim, None, Some(&local_root))
-            .await
-            .unwrap();
+        let env =
+            prepare_run_env_with_local_skills(temp.path(), &claim, None, Some(&local_root), None)
+                .await
+                .unwrap();
 
         assert!(pi_agent_directory(&env.engine_state_root)
             .join("skills")
@@ -12231,9 +13995,10 @@ done
         claim.expected_configuration_fingerprint =
             execution_configuration_fingerprint(&claim.execution_configuration).unwrap();
 
-        let env = prepare_run_env_with_local_skills(temp.path(), &claim, None, Some(&local_root))
-            .await
-            .unwrap();
+        let env =
+            prepare_run_env_with_local_skills(temp.path(), &claim, None, Some(&local_root), None)
+                .await
+                .unwrap();
         let content = fs::read_to_string(
             pi_agent_directory(&env.engine_state_root)
                 .join("skills")
@@ -12588,6 +14353,7 @@ done
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect(),
+            package: None,
         }
     }
 

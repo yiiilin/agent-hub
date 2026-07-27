@@ -482,6 +482,7 @@ test('widget history switch detaches stale output without stopping the previous 
   const runB = '70000000-0000-0000-0000-000000000031';
   let staleStream: Route | undefined;
   let stopRequests = 0;
+  let credentialBoundRunStreams = 0;
   const storedMessage = (id: string, hubSessionId: string, runId: string, content: string) => ({
     id, session_id: hubSessionId, sequence: 1, role: 'user', message_kind: 'message', content, payload: {},
     delivery_mode: 'next_turn', delivery_state: 'delivered', client_message_key: null,
@@ -504,11 +505,15 @@ test('widget history switch detaches stale output without stopping the previous 
       { seq: 1, run_id: runB, event_type: 'message', role: 'assistant', content: 'Answer B', payload: {}, created_at: new Date().toISOString() },
       { seq: 2, run_id: runB, event_type: 'status', role: null, content: 'completed', payload: { status: 'completed' }, created_at: new Date().toISOString() }
     ] });
-    if (path === `/api/runs/${runA}/events/stream`) {
+    if (path === `/api/widget/sessions/${sessionA}/events/stream`) {
       staleStream = route;
       return;
     }
-    if (path === `/api/runs/${runB}/events/stream`) return route.fulfill({ contentType: 'text/event-stream', body: '' });
+    if (path === `/api/widget/sessions/${sessionB}/events/stream`) return route.fulfill({ contentType: 'text/event-stream', body: '' });
+    if (path === `/api/runs/${runA}/events/stream` || path === `/api/runs/${runB}/events/stream`) {
+      credentialBoundRunStreams += 1;
+      return route.fulfill({ status: 403, json: { error: 'Historical Runs require Session-scoped streaming' } });
+    }
     if (path.endsWith('/stop')) {
       stopRequests += 1;
       return route.fulfill({ status: 500, json: { error: 'Unexpected stop' } });
@@ -533,6 +538,7 @@ test('widget history switch detaches stale output without stopping the previous 
   }).catch(() => undefined);
   await page.waitForTimeout(100);
   await expect(page.getByText('Late answer A', { exact: true })).toHaveCount(0);
+  expect(credentialBoundRunStreams).toBe(0);
   expect(stopRequests).toBe(0);
 });
 

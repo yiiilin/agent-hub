@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>客户工作台助手</title>
+    <link rel="stylesheet" href="/assets/example.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <span class="product-mark" aria-hidden="true">CX</span>
+      <div><strong>示例客户工作台</strong><span>认证用户助手</span></div>
+      <span class="access-state authenticated">已登录</span>
+    </header>
+    <main class="integration-layout">
+      <aside class="context-panel" aria-label="当前用户和接入信息">
+        <p class="eyebrow">AUTHENTICATED WIDGET</p>
+        <h1 id="app-name">客户工作台助手</h1>
+        <div class="identity">
+          <span class="avatar" id="user-initials" aria-hidden="true">--</span>
+          <div><strong id="display-name">加载中</strong><span id="username"></span></div>
+        </div>
+        <dl class="fact-list">
+          <div><dt>智能体</dt><dd id="agent-name">加载中</dd></div>
+          <div><dt>租户</dt><dd id="tenant-id">加载中</dd></div>
+          <div><dt>邮箱</dt><dd id="email">加载中</dd></div>
+          <div><dt>历史会话</dt><dd>已开启</dd></div>
+        </dl>
+        <section class="tool-section" aria-labelledby="authenticated-tools-title">
+          <h2 id="authenticated-tools-title">可用工具</h2>
+          <div class="tool-list" id="tool-list"></div>
+        </section>
+      </aside>
+      <section class="widget-stage" aria-label="认证用户助手对话">
+        <div class="widget-status"><span class="status-dot"></span><span id="connection-status">正在确认身份</span></div>
+        <iframe id="widget" title="认证用户助手" allow="clipboard-write"></iframe>
+      </section>
+    </main>
+    <script type="module" src="/assets/authenticated.js"></script>
+  </body>
+</html>

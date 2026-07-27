@@ -336,7 +336,7 @@ fn canonical_host(url: &Url) -> Result<String> {
     })
 }
 
-fn validate_object_key(value: &str) -> Result<()> {
+pub(crate) fn validate_object_key(value: &str) -> Result<()> {
     anyhow::ensure!(!value.is_empty(), "Bundle object key must not be empty");
     anyhow::ensure!(
         value
@@ -347,7 +347,7 @@ fn validate_object_key(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_sha256(value: &str) -> Result<()> {
+pub(crate) fn validate_sha256(value: &str) -> Result<()> {
     anyhow::ensure!(
         value.len() == 64
             && value

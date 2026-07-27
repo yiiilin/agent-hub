@@ -1334,6 +1334,7 @@ type WidgetExchange = {
   id: string;
   message: string;
   runId: string | null;
+  streamSessionId: string | null;
   initialEvents: RunEvent[];
   displayRun: boolean;
 };
@@ -1612,6 +1613,9 @@ function WidgetApp({ token, appClientId }: { token?: string; appClientId?: strin
         id: item.id,
         message: item.content ?? '',
         runId: item.run_id,
+        streamSessionId: accessToken.startsWith('ahw_')
+          ? target.integrationSessionId ?? target.hubSessionId
+          : null,
         initialEvents: item.run_id ? mergeRunEvents([], eventsByRun.get(item.run_id) ?? []) : [],
         displayRun: item.run_id !== null && finalMessageIndexForRun.get(item.run_id) === index
       })));
@@ -1709,6 +1713,7 @@ function WidgetApp({ token, appClientId }: { token?: string; appClientId?: strin
             id: `widget-run-${createdRun.id}`,
             message: content,
             runId: createdRun.id,
+            streamSessionId: null,
             initialEvents: [],
             displayRun: true
           }]);
@@ -1945,7 +1950,7 @@ function WidgetApp({ token, appClientId }: { token?: string; appClientId?: strin
           {transcriptLoading && exchanges.length === 0 && <div className="widget-transcript-state">{t('loadingMessages')}</div>}
           {exchanges.map((exchange) => <React.Fragment key={exchange.id}>
             <ChatMessageBubble agentName={agent?.name ?? null} content={exchange.message} role="user" />
-            {exchange.displayRun && exchange.runId && <WidgetRunConsole runId={exchange.runId} token={sessionToken} initialEvents={exchange.initialEvents} agentName={agent?.name ?? null} onEvent={reportWidgetRunEvent} />}
+            {exchange.displayRun && exchange.runId && <WidgetRunConsole runId={exchange.runId} streamSessionId={exchange.streamSessionId} token={sessionToken} initialEvents={exchange.initialEvents} agentName={agent?.name ?? null} onEvent={reportWidgetRunEvent} />}
           </React.Fragment>)}
           {pendingMessage && <>
             <ChatMessageBubble agentName={agent?.name ?? null} content={pendingMessage} role="user" />
@@ -1965,7 +1970,7 @@ function WidgetApp({ token, appClientId }: { token?: string; appClientId?: strin
   );
 }
 
-function WidgetRunConsole({ runId, token, initialEvents, agentName, onEvent }: { runId: string; token: string; initialEvents: RunEvent[]; agentName: string | null; onEvent: (event: RunEvent) => void }) {
+function WidgetRunConsole({ runId, streamSessionId, token, initialEvents, agentName, onEvent }: { runId: string; streamSessionId: string | null; token: string; initialEvents: RunEvent[]; agentName: string | null; onEvent: (event: RunEvent) => void }) {
   const [events, setEvents] = useState<RunEvent[]>(() => mergeRunEvents([], initialEvents));
 
   useEffect(() => {
@@ -1976,17 +1981,22 @@ function WidgetRunConsole({ runId, token, initialEvents, agentName, onEvent }: {
     const controller = new AbortController();
     const abortForPageExit = () => controller.abort();
     window.addEventListener('pagehide', abortForPageExit, { once: true });
-    api.streamWidgetRunEvents(runId, token, controller.signal, (parsed) => {
+    const receiveEvent = (parsed: RunEvent) => {
+      if (parsed.run_id !== runId) return;
       setEvents((current) => mergeRunEvents(current, [parsed]));
       onEvent(parsed);
-    }).catch((err) => {
+    };
+    const stream = streamSessionId
+      ? api.streamWidgetSessionEvents(streamSessionId, token, controller.signal, receiveEvent)
+      : api.streamWidgetRunEvents(runId, token, controller.signal, receiveEvent);
+    stream.catch((err) => {
       if (!controller.signal.aborted) console.error(err);
     });
     return () => {
       window.removeEventListener('pagehide', abortForPageExit);
       controller.abort();
     };
-  }, [onEvent, runId, token]);
+  }, [onEvent, runId, streamSessionId, token]);
 
   const timeline = useMemo<WidgetTimelineItem[]>(() => {
     const entries: WidgetTimelineEntry[] = projectActivities(events).map((activity) => ({

@@ -189,6 +189,9 @@ while IFS= read -r line; do
     get_state)
       response "$line" "get_state" "$(jq -cn --arg file "$session_path" --arg id "$session_id" --arg provider "$model_provider" --arg model "$model_id" --arg thinking "$thinking_level" '{sessionFile:$file,sessionId:$id,model:(if $provider == "" then null else {provider:$provider,id:$model} end),thinkingLevel:$thinking}')"
       ;;
+    reload_resources)
+      response "$line" "reload_resources" "null"
+      ;;
     reload_models)
       load_models
       models_loaded="true"

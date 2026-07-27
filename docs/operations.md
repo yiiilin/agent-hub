@@ -22,7 +22,8 @@ target/pi-runtime/linux-x64/pi --version
 `third_party/pi-model-data/v0.81.1/` 的完整 tree SHA-256，然后在 `/tmp` 的
 一次性源码导出中应用补丁并构建 release directory。`--skip-install` 只用于本机
 已存在与 lockfile 匹配的 `third_party/pi/node_modules` 时复用依赖；不能作为干净
-构建证明。
+构建证明。构建还会检查编译后的 RPC mode 同时包含 `reload_resources` 和
+`reload_models`，防止生成无法在线重载 Skill 或模型配置的 artifact。
 
 model-data snapshot 的 freshness 定义为：目录版本与 Pi pin 相同，tree hash 与
 构建脚本常量一致，并且该 pin 的 offline build 通过。升级 Pi、修改 provider
@@ -33,6 +34,11 @@ artifact 并执行真实 standalone RPC smoke；不能仅修改版本字符串�
 把 provider key 写入 Pi 配置。模型请求始终经 Runtime loopback -> Hub model
 gateway；Bundle 只保存 Pi recovery JSONL 和 Workspace。Hub 不提供执行引擎
 rollout API，Pi 随完整 Runtime 镜像发布。
+
+Session 配置原子物化成功后，Runtime 对空闲 Pi 调用原生 `reload_resources`，使其
+重新发现 AGENTS.md 和 Skills；活动 Turn 延迟到终态后执行。这个操作不重启 Pi
+进程或创建新的 Native Session。只有最终工具集合变化时，Runtime 才在下一 Turn
+前替换空闲进程，并从原 JSONL 恢复同一个 Native Session。
 
 ## 生产 Compose
 
@@ -45,6 +51,7 @@ rollout API，Pi 随完整 Runtime 镜像发布。
 - `HUB_MODEL_GATEWAY_AUTH_TOKEN`，使用 `openssl rand -hex 32` 生成，只供 Hub 和 Model Gateway 之间鉴权。
 - `EMBED_JWT_SECRET`，使用部署专属随机值。
 - `HUB_BUNDLE_S3_ACCESS_KEY_ID` 和 `HUB_BUNDLE_S3_SECRET_ACCESS_KEY`，只用于 Compose 内部、不对宿主机发布端口的 MinIO。
+- Compose 默认 `HUB_SKILL_PACKAGE_STORAGE=s3`，Skill Package 与 Session Bundle 共用上述私有 S3-compatible 服务和凭据，但使用独立对象前缀。需要改为 Hub 本地卷时显式设为 `local`。
 
 默认启动生产 Hub：
 
@@ -88,9 +95,9 @@ E2E_COMPOSE_PROJECT=agent-hub-dev npm --prefix frontend run test:e2e
 | Volume | 容器路径 | 内容 |
 | --- | --- | --- |
 | `postgres-data` | `/var/lib/postgresql/data` | Hub 数据库 |
-| `hub-data` | `/var/lib/agent-hub` | Hub 持久数据及兼容保留的旧 artifact 数据 |
-| `runtime-data` | `/var/lib/agent-hub-runtime` | Runtime credential、在线 Session 目录和暂存文件 |
-| `bundle-store-data` | `/data` | Compose 内置 MinIO 中的 Session Bundle 对象 |
+| `hub-data` | `/var/lib/agent-hub` | Hub 持久数据；使用 local backend 时还包含 Skill Package 对象 |
+| `runtime-data` | `/var/lib/agent-hub-runtime` | Runtime credential、在线 Session 目录、Skill 压缩缓存和暂存文件 |
+| `bundle-store-data` | `/data` | Compose 内置 MinIO 中的 Session Bundle 与 Skill Package 对象 |
 
 不要在 Runtime 尚有 Session 时删除 `runtime-data`。其中可能有尚未成功写入 Session Bundle 的最新 Workspace 状态。
 
@@ -115,7 +122,9 @@ Runtime 被普通或强制删除后，原 Runtime identity 和 credential 永久
 
 ## Runtime 本地数据和 Session Bundle
 
-每个在线 Session 位于 `RUNTIME_WORK_ROOT/sessions/<session-id>/`，包含独立的 `workspace/`、作为隔离 Pi `HOME` 的 `engine-state/`、本地 `supervisor/` 元数据和 `staging/`。`engine-state/.pi/agent/` 是 Hub 可重建配置，`engine-state/sessions/` 是 Pi native JSONL。不同 Session 不共享 Workspace、Pi HOME 或 JSONL。
+每个在线 Session 位于 `RUNTIME_WORK_ROOT/sessions/<session-id>/`，包含独立的 `workspace/`、作为隔离 Pi `HOME` 的 `engine-state/`、本地 `supervisor/` 元数据和 `staging/`。`engine-state/.pi/agent/` 是 Hub 可重建配置，`engine-state/sessions/` 是 Pi native JSONL，`engine-state/skill-exec/` 是该 Session 私有的 Skill Package 执行副本、catalog 和调用临时目录。不同 Session 不共享 Workspace、Pi HOME、解包目录或 JSONL。
+
+Runtime 仅在 `RUNTIME_WORK_ROOT/skill-package-cache/` 共享按归档 SHA-256 命名的压缩缓存。该目录为 `0700`，缓存文件为 `0600`；每次命中仍校验大小和 checksum，损坏项原子重新下载。缓存不是权威数据，当前没有应用内 GC；部署需监控该目录容量，离线清理时应先停止 Runtime，且不要删除 Session 私有目录来代替清缓存。
 
 Session 空闲 15 分钟后，Runtime 默认停止其 Pi RPC 进程并生成一个 `tar.zst` Session Bundle。Bundle 只包含：
 
@@ -125,7 +134,7 @@ Session 空闲 15 分钟后，Runtime 默认停止其 Pi RPC 进程并生成一�
 | `native-session/sessions/<file>.jsonl` | 恢复同一 Native Session 的唯一 Pi JSONL |
 | `manifest.json` | Hub/Pi Session 标识、Bundle generation、Hub history checkpoint、生成时 Pi 版本，以及内容大小和校验声明 |
 
-Runtime 按 JSONL 第一行的 `type=session` 和 `id=<native_session_id>` 选择唯一恢复文件，不依赖文件名。恢复只接受 `native-session/`、`native-session/sessions/` 和一个直接子级 `.jsonl`，并在提交恢复目录前再次验证 header 与 manifest 匹配。Bundle 不包含 `.pi/agent`、Runtime credential、模型密钥、OAuth secret、Agent/Skill/MCP 配置、settings、extensions、日志、缓存、Pi binary 或其他 Session。Agent/Skill/model binding 文件由 Hub 在下一 Turn 前按当前配置重新生成。
+Runtime 按 JSONL 第一行的 `type=session` 和 `id=<native_session_id>` 选择唯一恢复文件，不依赖文件名。恢复只接受 `native-session/`、`native-session/sessions/` 和一个直接子级 `.jsonl`，并在提交恢复目录前再次验证 header 与 manifest 匹配。Bundle 不包含 `.pi/agent`、`skill-exec/`、Skill Package 或 Runtime 压缩缓存、Runtime credential、模型密钥、OAuth secret、Agent/Skill/MCP 配置、settings、extensions、日志、Pi binary 或其他 Session。Agent/Skill/model binding 文件由 Hub 在下一 Turn 前按当前配置重新生成。
 
 物理删除 Hub Skill 会请求相关在线 Session 刷新派生配置。空闲 Session 立即处理，活动 Turn 结束或被停止后处理；这只修改 `engine-state/` 中 Hub-owned 文件，不修改 `workspace/`、Bundle 或 native transcript。
 
@@ -164,6 +173,25 @@ HUB_BUNDLE_S3_ALLOW_HTTP=false
 Endpoint 只允许 HTTP/HTTPS，且不能包含 query 或 fragment。HTTPS 是默认要求；仅受控内网的开发存储需要 HTTP 时，显式设置 `HUB_BUNDLE_S3_ALLOW_HTTP=true`。Server-side encryption 可留空，也可设为 `AES256` 或 `aws:kms`；只有 `aws:kms` 可同时设置 KMS key ID。
 
 S3 credential、bucket 和对象 URL 只存在于 Hub。Runtime 的上传和下载都只连接 Hub，不获得 S3 credential、预签名 URL，也不直接访问对象存储。
+
+## Skill Package 存储和运行
+
+Skill Package 支持两种 Hub 存储 backend：
+
+```text
+HUB_SKILL_PACKAGE_STORAGE=s3
+HUB_SKILL_PACKAGE_LOCAL_DIR=/var/lib/agent-hub/skill-packages
+```
+
+- `s3` 复用 `HUB_BUNDLE_S3_*` 配置；必须已设置 `HUB_BUNDLE_S3_ENDPOINT`。生产和开发 Compose 默认使用此模式。
+- `local` 将对象原子写入 `HUB_SKILL_PACKAGE_LOCAL_DIR`，目录权限为 `0700`、文件为 `0600`。该目录必须位于持久卷并纳入备份；此模式不需要 S3 才能上传 Skill Package，也不改变 Session Bundle 自身是否可用。
+- 未显式设置 backend 时，有 S3 配置则选择 `s3`，否则选择 `local`。其他值会使 Hub 启动失败。
+
+用户上传的目录必须以根 `SKILL.md` 为入口，只接受普通文件和安全相对路径。最多 1024 个文件、展开后 512 MiB、Hub 生成的 `tar.zst` 最多 256 MiB。`bin/` 下文件会进入 `skill_exec` 可执行清单，其他文件只读；符号链接、设备、socket、FIFO 和未在 manifest 中声明的内容不会被接受。
+
+领取 Run 时 Hub 固定 Package 快照；替换 Package 不改变在途 Run。Runtime 带 credential 和 Session `ownership_generation` 从 Hub 下载，验证归档及逐文件 checksum 后在 Session staging 中解包，再原子切换 `.pi/agent/skills/` 与 `skill-exec/`。失败时旧物化版本继续保留。旧对象由 Hub 的持久删除队列重试清理，运维不应手工按对象前缀批量删除。
+
+`skill_exec` 只有在 Agent/App 最终工具策略允许且当前 Package 确有 `bin/*` 时才出现。它不经过 shell，只能按当前 Session catalog 精确启动程序；Linux Landlock 将 Package 设为只读，并给每次调用单独的临时 `HOME`/`TMPDIR`。默认超时 30 秒、最大 300 秒，stdin 和 stdout/stderr 各有 1 MiB 限制。非 Linux Runtime 不支持该工具。
 
 ## Runtime Engine 镜像升级和回滚
 

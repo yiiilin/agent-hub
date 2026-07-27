@@ -101,15 +101,17 @@ session-root/
   engine-state/     # Session 专属 Pi HOME
     .pi/agent/       # Hub 可重建 instructions、models 和 Skills
     sessions/        # Pi native Session JSONL
+    skill-exec/      # Session 私有 Package 执行副本、catalog 和临时目录
   supervisor/       # owner/generation、进程和恢复所需的本地元数据
   staging/          # 临时 Bundle 文件；不属于归档内容
 ```
 
-- 不同 Session 不共享可写 Workspace、Pi HOME、生成配置或 native JSONL。
+- 不同 Session 不共享可写 Workspace、Pi HOME、生成配置、Package 解包目录或 native JSONL。Runtime 只在 `RUNTIME_WORK_ROOT/skill-package-cache/` 共享按 SHA-256 命名并反复校验的只读压缩包缓存。
 - Agent instructions、Skills 和 Model Connection references 由 Hub 数据重新生成，只在 Turn 之间按当前 fingerprint 写入；活动 Turn 保持稳定文件集，真实 provider key 永不进入 Session 目录。本迭代不物化 MCP 或子 Agent。
+- Run 领取时快照其 Skill Package，保证活动 Run 不受随后替换影响；Session refresh 使用当前 Package。Runtime 经 Hub 下载并校验 generation、归档大小、归档 checksum、文件 manifest 与 tar entry 后，在 staging 中完整生成 `.pi/agent/skills/` 和 `skill-exec/`，再共同原子切换。失败保留上一个完整物化版本。
 - Skill 物理删除后，Hub 为受影响在线 Session 发出 generation-fenced `refresh_configuration`，携带当前完整配置与 fingerprint。空闲 Session 立即原子 materialize；活动 Turn 只记住命令，到终态后处理并回执。
 - 过期 refresh 回执不得清除更新的待刷新状态；下一 heartbeat 继续下发最新 fingerprint。刷新只物化 Hub 管理的配置文件，不写 Workspace。
-- 刷新本身不打断或立即重启 Pi；如果下一 Turn 的有效 Pi 工具集合与在线进程启动时不同，Runtime 在 Turn 开始前停止空闲进程，并从同一 JSONL 恢复同一个 Native Session。工具集合未变化时继续复用在线进程。
+- 原子物化成功后，Runtime 对空闲 Pi 调用原生 `reload_resources`，使其重新发现 AGENTS.md 和 Skills；活动 Turn 延迟到终态后执行。刷新不创建新进程或 Native Session；如果下一 Turn 的有效 Pi 工具集合与在线进程启动时不同，Runtime 才在 Turn 开始前停止空闲进程，并从同一 JSONL 恢复同一个 Native Session。
 - Runtime 进程重启后从持久化目录发现仍由自己拥有的在线 Session；不得仅因 Runtime 进程退出就丢弃目录。
 
 ## Session Bundle
@@ -125,7 +127,7 @@ native-session/  # 只含 sessions/<one Pi JSONL>
 - 打包前停止 Pi RPC 进程，确保 JSONL 已落盘。
 - 创建端解析每个直接位于 Pi `sessions/` 下的 `.jsonl` 首行，只选择 `type=session` 且 `id` 等于 manifest native Session id 的唯一文件；文件名不参与身份判断。
 - 恢复端只接受 `native-session/`、`native-session/sessions/` 和一个直接子级 `.jsonl`，并在提交目录前验证该 JSONL header 与 manifest 匹配。
-- 排除 `.pi/agent`、Hub 认证、model proxy token、Runtime Credential、logs、caches、settings、extensions、Skills、Pi binary、其他 Session JSONL 和可由 Hub 重建的配置。
+- 排除 `.pi/agent`、`skill-exec/`、Skill Package/Runtime 压缩缓存、Hub 认证、model proxy token、Runtime Credential、logs、caches、settings、extensions、Pi binary、其他 Session JSONL 和可由 Hub 重建的配置。
 - 普通文件、目录和不会逃逸归档根的安全 symlink 可进入 Bundle；拒绝 device、socket、FIFO、路径穿越和逃逸链接。
 - Runtime 流式计算压缩 Bundle checksum、压缩大小和内容声明；恢复 Runtime 在解包前验证。Hub 不 unpack、scan、hash 或完整缓冲 Bundle。
 - 每个 Session 只保留一个成功 generation。新对象完整写入后，Hub 在校验 current ownership generation 和小型 commit metadata 后原子切换 current pointer，再删除旧对象；失败上传永不成为 current。
@@ -134,6 +136,7 @@ native-session/  # 只含 sessions/<one Pi JSONL>
 ## Hub 与网络边界
 
 - Runtime 的注册/heartbeat、Session command/event 和 Bundle 上传/下载等系统流量只与 Hub 通信。Pi artifact 随 Runtime 镜像交付，不由 Runtime 下载。
+- Skill Package 下载同样只走 Runtime -> Hub；Runtime 不获得 Package 对象存储凭据、bucket、object key 对应 URL 或 signed URL。
 - Pi Responses 请求经 Runtime loopback proxy 到 Hub，再由 Hub 使用数据库中的 Model Connection 访问 provider；Runtime 不持有 provider URL credential，也没有 direct fallback。
 - Bundle 上传为 Runtime -> Hub -> S3-compatible storage；下载反向经过 Hub。Runtime 不获得 S3 credential、bucket、object URL 或 signed URL。
 - Hub 对 Bundle body 只做带 backpressure 的流式转发和大小限制，不承担内容计算。中断传输从头重试。
@@ -150,7 +153,7 @@ native-session/  # 只含 sessions/<one Pi JSONL>
 ## 验收测试边界
 
 - 数据库：origin 完整性、消息顺序、Session/Agent 不可变绑定、ownership generation fencing 和 current Bundle 原子切换。
-- Runtime：目录隔离、一个 Native Session 多 Turn、steer/interrupt race、进程重启恢复、idle/drain/version 时序、Skill refresh 空闲/活动/过期命令和安全 tar.zst。
+- Runtime：目录隔离、一个 Native Session 多 Turn、steer/interrupt race、进程重启恢复、idle/drain/version 时序、Skill refresh 空闲/活动/过期命令、Package 缓存/安全解包/私有执行副本/Bundle 排除和安全 tar.zst。
 - Hub streaming：认证、generation、size limit、backpressure、中断传输和 S3-compatible HTTP/HTTPS 配置。
 - 版本：固定 submodule/model-data/patch checksum、baseline standalone 构建、最终镜像无 Node/npm/Bun，以及整镜像 rollback 流程。
 - 浏览器：desktop 与 390px 下的会话列表和来源筛选、Agent 选择新建对话、SSE 实时回复、可读 Pi 活动折叠、多 Turn 历史恢复、Historical Session 只读、立即引导、显式停止和 Runtime drain/delete。

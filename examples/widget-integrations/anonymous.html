@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>公开知识助手</title>
+    <link rel="stylesheet" href="/assets/example.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <span class="product-mark" aria-hidden="true">AH</span>
+      <div><strong>示例文档站</strong><span>公开知识助手</span></div>
+      <span class="access-state">匿名访问</span>
+    </header>
+    <main class="integration-layout">
+      <aside class="context-panel" aria-label="接入信息">
+        <p class="eyebrow">PUBLIC WIDGET</p>
+        <h1 id="app-name">公开知识助手</h1>
+        <dl class="fact-list">
+          <div><dt>智能体</dt><dd id="agent-name">加载中</dd></div>
+          <div><dt>用户</dt><dd>匿名访客</dd></div>
+          <div><dt>历史会话</dt><dd>关闭</dd></div>
+        </dl>
+        <section class="tool-section" aria-labelledby="public-tools-title">
+          <h2 id="public-tools-title">可用工具</h2>
+          <div class="tool-list" id="tool-list"></div>
+        </section>
+      </aside>
+      <section class="widget-stage" aria-label="公开知识助手对话">
+        <div class="widget-status"><span class="status-dot"></span><span id="connection-status">正在连接</span></div>
+        <iframe id="widget" title="公开知识助手" allow="clipboard-write"></iframe>
+      </section>
+    </main>
+    <script type="module" src="/assets/anonymous.js"></script>
+  </body>
+</html>

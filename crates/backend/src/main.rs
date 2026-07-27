@@ -4,8 +4,9 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     env,
+    io::Read,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path as FsPath, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -24,7 +25,7 @@ use async_stream::stream;
 use async_trait::async_trait;
 use axum::{
     body::{Body, Bytes},
-    extract::{Form, Path, Query, State},
+    extract::{DefaultBodyLimit, Form, Multipart, Path, Query, State},
     http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -44,6 +45,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Number, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Row, Transaction};
+use tokio::io::AsyncWriteExt;
 use tower_http::{
     cors::CorsLayer,
     services::{ServeDir, ServeFile},
@@ -55,8 +57,10 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 mod session_bundle_store;
+mod skill_package_store;
 
 use session_bundle_store::{S3BundleStore, S3BundleStoreConfig};
+use skill_package_store::SkillPackageStore;
 
 type HmacSha256 = Hmac<Sha256>;
 const REDACTED_SECRET: &str = "********";
@@ -68,6 +72,8 @@ const MODEL_PROXY_SSE_LINE_MAX_BYTES: usize = 64 * 1024;
 const DATABASE_READINESS_TIMEOUT: Duration = Duration::from_millis(500);
 const DEFAULT_SESSION_BUNDLE_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const DEFAULT_FRONTEND_DIST_DIR: &str = "frontend/dist";
+const SKILL_PACKAGE_UPLOAD_BODY_LIMIT: usize =
+    MAX_SKILL_PACKAGE_EXPANDED_BYTES as usize + 2 * 1024 * 1024;
 const TOOL_REQUEST_BATCH_FINGERPRINT_KEY: &str = "tool_request_batch_fingerprint";
 const RUNTIME_CAPABILITY_SQL: &str = "
            AND (
@@ -134,6 +140,7 @@ struct AppState {
     model_gateway_url: String,
     model_gateway_auth_token: Arc<Zeroizing<String>>,
     session_bundle_store: Option<Arc<S3BundleStore>>,
+    skill_package_store: Option<Arc<SkillPackageStore>>,
     session_bundle_max_bytes: u64,
     auth_providers: Vec<Arc<dyn AuthProvider>>,
     session_issuer: Arc<dyn SessionIssuer>,
@@ -269,6 +276,7 @@ async fn main() -> anyhow::Result<()> {
         .read_timeout(model_proxy_timeout)
         .build()?;
     let session_bundle_store = session_bundle_store_from_env()?;
+    let skill_package_store = skill_package_store_from_env(session_bundle_store.clone())?;
     let session_bundle_max_bytes = session_bundle_max_bytes_from_env()?;
     let state = AppState {
         pool,
@@ -294,6 +302,7 @@ async fn main() -> anyhow::Result<()> {
         model_gateway_url,
         model_gateway_auth_token,
         session_bundle_store,
+        skill_package_store: Some(skill_package_store),
         session_bundle_max_bytes,
         auth_providers: vec![
             Arc::new(PasswordAuthProvider),
@@ -315,6 +324,10 @@ async fn main() -> anyhow::Result<()> {
     let erasure_state = Arc::new(state.clone());
     tokio::spawn(async move {
         user_erasure_loop(erasure_state).await;
+    });
+    let skill_package_deletion_state = Arc::new(state.clone());
+    tokio::spawn(async move {
+        skill_package_deletion_loop(skill_package_deletion_state).await;
     });
 
     let app = build_router(state);
@@ -520,6 +533,12 @@ fn build_router(state: AppState) -> Router {
             get(get_skill).patch(update_skill).delete(delete_skill),
         )
         .route(
+            "/api/skills/{skill_id}/package",
+            put(replace_skill_package)
+                .delete(delete_skill_package)
+                .layer(DefaultBodyLimit::max(SKILL_PACKAGE_UPLOAD_BODY_LIMIT)),
+        )
+        .route(
             "/api/automations",
             get(list_automations).post(create_automation),
         )
@@ -591,6 +610,14 @@ fn build_router(state: AppState) -> Router {
         .route("/api/runtime/register", post(runtime_register))
         .route("/api/runtime/heartbeat", post(runtime_heartbeat))
         .route("/api/runtime/runs/claim", post(runtime_claim_run))
+        .route(
+            "/api/runtime/runs/{run_id}/skills/{skill_id}/package",
+            get(runtime_download_run_skill_package),
+        )
+        .route(
+            "/api/runtime/sessions/{session_id}/skills/{skill_id}/packages/{package_id}",
+            get(runtime_download_session_skill_package),
+        )
         .route(
             "/api/runtime/runs/{run_id}/turn/begin",
             post(runtime_begin_turn),
@@ -881,6 +908,10 @@ fn openapi_document() -> Value {
                 "patch": { "summary": "Update skill", "parameters": [id("skill_id")], "requestBody": body("SkillWriteRequest"), "responses": { "200": response("Skill"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } },
                 "delete": { "summary": "Permanently delete skill and detach it from agents", "parameters": [id("skill_id")], "responses": { "204": no_content(), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } }
             },
+            "/api/skills/{skill_id}/package": {
+                "put": { "summary": "Replace a Skill package from an ordered multipart file manifest", "parameters": [id("skill_id")], "requestBody": { "required": true, "content": { "multipart/form-data": { "schema": { "type": "object", "required": ["manifest"], "properties": { "manifest": { "type": "string", "description": "JSON object with an ordered paths array; following fields are file-0, file-1, and so on." } }, "additionalProperties": { "type": "string", "format": "binary" } } } } }, "responses": { "200": response("Skill"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" }, "502": { "description": "Skill package object upload failed" }, "503": { "description": "Skill package object storage is not configured" } } },
+                "delete": { "summary": "Remove the current Skill package files while retaining SKILL.md content", "parameters": [id("skill_id")], "responses": { "200": response("Skill"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } }
+            },
             "/api/automations": {
                 "get": { "summary": "List automations", "responses": { "200": list_response("Automation"), "401": { "$ref": "#/components/responses/Unauthorized" } } },
                 "post": { "summary": "Create automation", "requestBody": body("CreateAutomationRequest"), "responses": { "200": response("Automation"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" } } }
@@ -909,6 +940,8 @@ fn openapi_document() -> Value {
             "/api/runtime/register": { "post": { "summary": "Consume a one-time enrollment token and create an immutable Runtime identity", "security": [{ "runtimeEnrollmentBearer": [] }], "requestBody": body("RuntimeRegisterRequest"), "responses": { "200": response("RuntimeRegisterResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" } } } },
             "/api/runtime/heartbeat": { "post": { "summary": "Heartbeat and complete staged Runtime credential rotation", "security": [{ "runtimeBearer": [] }], "requestBody": body("RuntimeHeartbeatRequest"), "responses": { "200": response("RuntimeHeartbeatResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/runtime/runs/claim": { "post": { "summary": "Claim one capacity-fenced Run and its exclusive Session ownership generation", "security": [{ "runtimeBearer": [] }], "requestBody": body("RuntimeClaimRunRequest"), "responses": { "200": response("ClaimRunResponse"), "204": no_content(), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" } } } },
+            "/api/runtime/runs/{run_id}/skills/{skill_id}/package": { "get": { "summary": "Stream an active Run's snapshotted Skill package to its owning Runtime", "security": [{ "runtimeBearer": [] }], "parameters": [id("run_id"), id("skill_id"), required_header("x-agent-hub-ownership-generation", json!({ "type": "integer", "minimum": 1 }))], "responses": { "200": { "description": "Skill package tar.zst stream", "content": { "application/zstd": { "schema": { "type": "string", "format": "binary" } } } }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "502": { "description": "Skill package object download failed" }, "503": { "description": "Skill package object storage is not configured" } } } },
+            "/api/runtime/sessions/{session_id}/skills/{skill_id}/packages/{package_id}": { "get": { "summary": "Stream a current Skill package while refreshing an owned Session", "security": [{ "runtimeBearer": [] }], "parameters": [id("session_id"), id("skill_id"), id("package_id"), required_header("x-agent-hub-ownership-generation", json!({ "type": "integer", "minimum": 1 }))], "responses": { "200": { "description": "Skill package tar.zst stream", "content": { "application/zstd": { "schema": { "type": "string", "format": "binary" } } } }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "502": { "description": "Skill package object download failed" }, "503": { "description": "Skill package object storage is not configured" } } } },
             "/api/runtime/model-proxy/v1/responses": { "post": { "summary": "Proxy one run-scoped Responses API request through its selected Model Connection", "security": [{ "modelProxyBearer": [] }], "parameters": [required_header("x-agent-hub-run-id", json!({ "type": "string", "format": "uuid" })), required_header("x-agent-hub-model-binding-id", json!({ "type": "string", "format": "uuid" }))], "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "additionalProperties": true } } } }, "responses": { "200": { "description": "Responses JSON or SSE from the selected upstream protocol" }, "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" }, "502": { "description": "Model upstream transport failed" }, "504": { "description": "Model upstream timed out" } } } },
             "/api/runtime/runs/{run_id}/turn/begin": { "post": { "summary": "Bind synchronized configuration and begin generation-fenced Turn delivery", "security": [{ "runtimeBearer": [] }], "parameters": [id("run_id")], "requestBody": body("RuntimeBeginTurnRequest"), "responses": { "200": response("BeginRuntimeTurnResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/runtime/sessions/{session_id}/commands/{command_id}/complete": { "post": { "summary": "Acknowledge one generation-fenced Session command outcome", "security": [{ "runtimeBearer": [] }], "parameters": [id("session_id"), id("command_id")], "requestBody": body("RuntimeCompleteSessionCommandRequest"), "responses": { "200": response("CompleteRuntimeSessionCommandResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
@@ -1091,11 +1124,11 @@ fn openapi_schemas() -> Value {
         "ModelTokenUsagePage": { "type": "object", "additionalProperties": false, "required": ["items", "next_cursor"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/ModelTokenUsage" } }, "next_cursor": { "anyOf": [{ "$ref": "#/components/schemas/ModelLedgerCursor" }, { "type": "null" }] } } },
         "ModelCallErrorPage": { "type": "object", "additionalProperties": false, "required": ["items", "next_cursor"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/ModelCallError" } }, "next_cursor": { "anyOf": [{ "$ref": "#/components/schemas/ModelLedgerCursor" }, { "type": "null" }] } } },
         "ReasoningEffort": { "type": "string", "enum": ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] },
-        "AgentToolName": { "type": "string", "enum": ["read", "grep", "find", "ls", "edit", "write", "bash", "integration"] },
+        "AgentToolName": { "type": "string", "enum": ["read", "grep", "find", "ls", "edit", "write", "bash", "skill_exec", "integration"] },
         "SubagentDefinition": { "type": "object", "additionalProperties": false, "required": ["name", "description", "developer_instructions"], "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 64 }, "description": { "type": "string", "minLength": 1, "maxLength": 512 }, "developer_instructions": { "type": "string", "minLength": 1, "maxLength": 100000 }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings_override": { "$ref": "#/components/schemas/AgentModelSettingsOverride" }, "enabled": { "type": "boolean", "default": true }, "disabled_reason": { "type": ["string", "null"] } } },
         "Agent": { "type": "object", "required": ["id", "owner_id", "name", "instructions", "visibility", "public_to", "runtime_id", "model_selection", "model_settings", "subagents", "model_policy", "sandbox_policy", "managed_skill_ids", "mcp_allowlist", "tool_allowlist", "is_owner", "can_manage", "can_administer", "can_invoke", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": uuid(), "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string", "enum": ["private", "public", "public_to"] }, "public_to": { "type": "array", "items": uuid() }, "runtime_id": { "anyOf": [uuid(), { "type": "null" }] }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "subagents": { "type": "array", "items": { "$ref": "#/components/schemas/SubagentDefinition" } }, "model_policy": {}, "sandbox_policy": {}, "managed_skill_ids": { "type": "array", "items": uuid() }, "mcp_allowlist": {}, "tool_allowlist": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/components/schemas/AgentToolName" } }, "is_owner": { "type": "boolean" }, "can_manage": { "type": "boolean" }, "can_administer": { "type": "boolean" }, "can_invoke": { "type": "boolean" }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
         "CreateAgentRequest": { "type": "object", "additionalProperties": false, "required": ["name", "instructions", "visibility"], "properties": { "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string" }, "public_to": { "type": "array", "items": uuid() }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "subagents": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/SubagentDefinition" } }, "tool_allowlist": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/components/schemas/AgentToolName" }, "default": ["read", "grep", "find", "ls", "edit", "write", "bash", "integration"] } } },
-        "UpdateAgentRequest": { "type": "object", "additionalProperties": false, "required": ["name", "instructions", "visibility", "public_to", "runtime_id", "model_selection", "model_settings", "subagents", "sandbox_policy", "managed_skill_ids", "mcp_allowlist"], "properties": { "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string" }, "public_to": { "type": "array", "items": uuid() }, "runtime_id": { "anyOf": [uuid(), { "type": "null" }] }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "subagents": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/SubagentDefinition" } }, "sandbox_policy": { "type": "object" }, "managed_skill_ids": { "type": "array", "items": uuid() }, "mcp_allowlist": {}, "tool_allowlist": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/components/schemas/AgentToolName" }, "default": ["read", "grep", "find", "ls", "edit", "write", "bash", "integration"] } } },
+        "UpdateAgentRequest": { "type": "object", "additionalProperties": false, "required": ["name", "instructions", "visibility", "public_to", "runtime_id", "model_selection", "model_settings", "subagents", "sandbox_policy", "managed_skill_ids", "mcp_allowlist"], "properties": { "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string" }, "public_to": { "type": "array", "items": uuid() }, "runtime_id": { "anyOf": [uuid(), { "type": "null" }] }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "subagents": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/SubagentDefinition" } }, "sandbox_policy": { "type": "object" }, "managed_skill_ids": { "type": "array", "items": uuid() }, "mcp_allowlist": {}, "tool_allowlist": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/components/schemas/AgentToolName" }, "default": ["read", "grep", "find", "ls", "edit", "write", "bash", "skill_exec", "integration"] } } },
         "Run": { "type": "object", "required": ["id", "agent_id", "automation_id", "integration_session_id", "parent_run_id", "runtime_id", "hub_session_id", "hub_message_id", "hub_turn_id", "session_ownership_generation", "status", "initial_message", "native_session_id", "work_dir_ref", "source", "created_at", "updated_at"], "properties": { "id": uuid(), "agent_id": uuid(), "automation_id": { "anyOf": [uuid(), { "type": "null" }] }, "integration_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "parent_run_id": { "anyOf": [uuid(), { "type": "null" }] }, "runtime_id": { "anyOf": [uuid(), { "type": "null" }] }, "hub_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "hub_message_id": { "anyOf": [uuid(), { "type": "null" }] }, "hub_turn_id": { "anyOf": [uuid(), { "type": "null" }] }, "session_ownership_generation": { "type": ["integer", "null"] }, "status": { "type": "string" }, "initial_message": { "type": "string" }, "native_session_id": { "type": ["string", "null"] }, "work_dir_ref": { "type": ["string", "null"] }, "source": { "type": "string" }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
         "RunListResponse": { "type": "object", "required": ["items", "total", "page", "page_size"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/Run" } }, "total": { "type": "integer", "minimum": 0 }, "page": { "type": "integer", "minimum": 1 }, "page_size": { "type": "integer", "minimum": 1, "maximum": 100 } } },
         "CreateRunRequest": { "type": "object", "required": ["message"], "properties": { "message": { "type": "string" }, "hub_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "parent_run_id": { "anyOf": [uuid(), { "type": "null" }] }, "client_message_key": { "type": ["string", "null"] } } },
@@ -1110,7 +1143,9 @@ fn openapi_schemas() -> Value {
         "CreateHubSessionMessageRequest": { "type": "object", "required": ["content"], "properties": { "content": { "type": "string" }, "payload": {}, "delivery_mode": { "type": ["string", "null"] }, "client_message_key": { "type": ["string", "null"] }, "parent_run_id": { "anyOf": [uuid(), { "type": "null" }] } } },
         "SessionMessageAcceptance": { "type": "object", "required": ["message", "run"], "properties": { "message": { "$ref": "#/components/schemas/HubSessionMessage" }, "run": { "anyOf": [{ "$ref": "#/components/schemas/Run" }, { "type": "null" }] } } },
         "RunEvent": { "type": "object", "required": ["seq", "event_id", "run_id", "event_type", "payload", "created_at"], "properties": { "seq": { "type": "integer" }, "event_id": uuid(), "run_id": uuid(), "event_type": { "type": "string" }, "role": { "type": ["string", "null"] }, "content": { "type": ["string", "null"] }, "payload": {}, "created_at": { "type": "string", "format": "date-time" } } },
-        "Skill": { "type": "object", "required": ["id", "owner_id", "name", "description", "content", "revision", "content_checksum_sha256", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": uuid(), "name": { "type": "string" }, "description": { "type": "string" }, "content": { "type": "string" }, "revision": { "type": "integer", "minimum": 1 }, "content_checksum_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
+        "Skill": { "type": "object", "required": ["id", "owner_id", "name", "description", "content", "revision", "content_checksum_sha256", "package", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": uuid(), "name": { "type": "string" }, "description": { "type": "string" }, "content": { "type": "string" }, "revision": { "type": "integer", "minimum": 1 }, "content_checksum_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "package": { "anyOf": [{ "$ref": "#/components/schemas/SkillPackage" }, { "type": "null" }] }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
+        "SkillPackage": { "type": "object", "additionalProperties": false, "required": ["id", "format_version", "size_bytes", "checksum_sha256", "files"], "properties": { "id": uuid(), "format_version": { "type": "integer", "enum": [1] }, "size_bytes": { "type": "integer", "minimum": 1, "maximum": 268435456 }, "checksum_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "files": { "type": "array", "maxItems": 1024, "items": { "$ref": "#/components/schemas/SkillPackageFile" } } } },
+        "SkillPackageFile": { "type": "object", "additionalProperties": false, "required": ["path", "size_bytes", "checksum_sha256", "executable"], "properties": { "path": { "type": "string" }, "size_bytes": { "type": "integer", "minimum": 0 }, "checksum_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "executable": { "type": "boolean" } } },
         "SkillWriteRequest": { "type": "object", "required": ["name", "description", "content"], "properties": { "name": { "type": "string" }, "description": { "type": "string" }, "content": { "type": "string" } } },
         "BulkDeleteSkillsRequest": { "type": "object", "additionalProperties": false, "required": ["skill_ids"], "properties": { "skill_ids": { "type": "array", "minItems": 1, "maxItems": 100, "uniqueItems": true, "items": uuid() } } },
         "BulkDeleteSkillsResponse": { "type": "object", "additionalProperties": false, "required": ["deleted_skill_ids"], "properties": { "deleted_skill_ids": { "type": "array", "items": uuid() } } },
@@ -1147,7 +1182,7 @@ fn openapi_schemas() -> Value {
         "RunResume": { "type": "object", "additionalProperties": false, "required": ["native_session_id", "work_dir_ref"], "properties": { "native_session_id": { "type": "string" }, "work_dir_ref": { "type": ["string", "null"] } } },
         "ClaimRunResponse": { "type": "object", "required": ["run", "agent", "execution_configuration", "expected_configuration_fingerprint", "integration_context", "resume", "model_proxy_token", "session_context"], "properties": { "run": { "$ref": "#/components/schemas/Run" }, "agent": { "$ref": "#/components/schemas/Agent" }, "execution_configuration": { "$ref": "#/components/schemas/AgentExecutionConfiguration" }, "expected_configuration_fingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }, "integration_context": {}, "resume": { "anyOf": [{ "$ref": "#/components/schemas/RunResume" }, { "type": "null" }] }, "model_proxy_token": { "type": "string" }, "session_context": {} } },
         "AgentExecutionConfiguration": { "type": "object", "additionalProperties": false, "required": ["revision", "instructions", "model_selection", "model_settings", "subagents", "model_bindings", "model_policy", "sandbox_policy", "skills", "mcp_allowlist", "tool_allowlist"], "properties": { "revision": { "type": "integer", "minimum": 1 }, "instructions": { "type": "string" }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "subagents": { "type": "array", "items": { "$ref": "#/components/schemas/SubagentDefinition" } }, "model_bindings": { "type": "array", "items": { "$ref": "#/components/schemas/RunModelBinding" } }, "model_policy": {}, "sandbox_policy": {}, "skills": { "type": "array", "items": { "$ref": "#/components/schemas/AgentExecutionSkill" } }, "mcp_allowlist": {}, "tool_allowlist": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/components/schemas/AgentToolName" } } } },
-        "AgentExecutionSkill": { "type": "object", "additionalProperties": false, "required": ["source", "source_id", "name", "description", "content", "revision", "content_checksum_sha256"], "properties": { "source": { "type": "string", "enum": ["managed"] }, "source_id": { "anyOf": [uuid(), { "type": "null" }] }, "name": { "type": "string" }, "description": { "type": "string" }, "content": { "type": "string" }, "revision": { "type": "integer", "minimum": 1 }, "content_checksum_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" } } },
+        "AgentExecutionSkill": { "type": "object", "additionalProperties": false, "required": ["source", "source_id", "name", "description", "content", "revision", "content_checksum_sha256", "package"], "properties": { "source": { "type": "string", "enum": ["managed"] }, "source_id": { "anyOf": [uuid(), { "type": "null" }] }, "name": { "type": "string" }, "description": { "type": "string" }, "content": { "type": "string" }, "revision": { "type": "integer", "minimum": 1 }, "content_checksum_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "package": { "anyOf": [{ "$ref": "#/components/schemas/SkillPackage" }, { "type": "null" }] } } },
         "AppendRunEventRequest": { "type": "object", "required": ["event_type", "role", "content", "payload", "waiting_tool"], "properties": { "event_type": { "type": "string" }, "role": { "type": ["string", "null"] }, "content": { "type": ["string", "null"] }, "payload": {}, "waiting_tool": { "anyOf": [{ "$ref": "#/components/schemas/WaitingToolRunTransition" }, { "type": "null" }] } } },
         "WaitingToolRunTransition": { "type": "object", "required": ["native_session_id", "work_dir_ref"], "properties": { "native_session_id": { "type": "string" }, "work_dir_ref": { "type": "string" } } },
         "FinalizeToolRequestsRequest": { "type": "object", "required": ["integration_session_id", "native_session_id", "work_dir_ref", "tool_requests"], "properties": { "integration_session_id": uuid(), "native_session_id": { "type": "string" }, "work_dir_ref": { "type": "string" }, "tool_requests": { "type": "array", "items": { "type": "object" } } } },
@@ -1704,6 +1739,17 @@ async fn begin_user_erasure(
     .await?;
 
     sqlx::query(
+        "INSERT INTO user_erasure_skill_objects (user_id, object_key)
+         SELECT $1, object_key FROM skill_packages WHERE owner_id = $1
+         UNION
+         SELECT $1, object_key FROM skill_package_deletion_queue WHERE owner_id = $1
+         ON CONFLICT (user_id, object_key) DO NOTHING",
+    )
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
         "UPDATE runtime_session_cleanup_obligations AS cleanup
          SET erasure_user_id = $1
          WHERE cleanup.session_id IN (
@@ -1978,6 +2024,55 @@ async fn process_user_erasure_job(state: &AppState, user_id: Uuid) -> Result<(),
             }
         }
     }
+    let skill_objects = sqlx::query_scalar::<_, String>(
+        "SELECT object_key FROM user_erasure_skill_objects
+         WHERE user_id = $1 ORDER BY created_at, object_key",
+    )
+    .bind(user_id)
+    .fetch_all(&state.pool)
+    .await?;
+    if !skill_objects.is_empty() {
+        let store = state.skill_package_store.as_ref().ok_or_else(|| {
+            ApiError::service_unavailable("Skill package object storage is not configured")
+        })?;
+        for object_key in skill_objects {
+            match store.delete(&object_key).await {
+                Ok(()) => {
+                    let mut tx = state.pool.begin().await?;
+                    sqlx::query(
+                        "DELETE FROM user_erasure_skill_objects
+                         WHERE user_id = $1 AND object_key = $2",
+                    )
+                    .bind(user_id)
+                    .bind(&object_key)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query("DELETE FROM skill_package_deletion_queue WHERE object_key = $1")
+                        .bind(&object_key)
+                        .execute(&mut *tx)
+                        .await?;
+                    tx.commit().await?;
+                }
+                Err(error) => {
+                    sqlx::query(
+                        "UPDATE user_erasure_skill_objects
+                         SET attempts = attempts + 1,
+                             last_error = 'object store delete failed', updated_at = now()
+                         WHERE user_id = $1 AND object_key = $2",
+                    )
+                    .bind(user_id)
+                    .bind(&object_key)
+                    .execute(&state.pool)
+                    .await?;
+                    warn!(user_id = %user_id, object_key = %object_key, error = %error,
+                        "failed to delete erased user's Skill package object");
+                    return Err(ApiError::bad_gateway(
+                        "failed to delete one or more Skill package objects",
+                    ));
+                }
+            }
+        }
+    }
     finalize_user_erasure(state, user_id).await
 }
 
@@ -1997,6 +2092,8 @@ async fn finalize_user_erasure(state: &AppState, user_id: Uuid) -> Result<(), Ap
     let pending_objects: bool = sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1 FROM user_erasure_bundle_objects WHERE user_id = $1
+             UNION ALL
+             SELECT 1 FROM user_erasure_skill_objects WHERE user_id = $1
          )",
     )
     .bind(user_id)
@@ -6441,6 +6538,39 @@ fn confirm_runtime_hostname(expected: &str, supplied: &str) -> Result<(), ApiErr
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillPackageUploadManifest {
+    paths: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct StagedSkillPackageFile {
+    path: String,
+    staged_path: PathBuf,
+    size_bytes: u64,
+    checksum_sha256: String,
+    executable: bool,
+}
+
+struct StagedSkillPackageUpload {
+    _staging: tempfile::TempDir,
+    name: String,
+    description: String,
+    content: String,
+    archive_path: Option<PathBuf>,
+    archive_size_bytes: Option<u64>,
+    archive_checksum_sha256: Option<String>,
+    files: Vec<SkillPackageFileDto>,
+}
+
+#[derive(Debug)]
+struct LockedSkillChange {
+    affected_agent_ids: Vec<Uuid>,
+    current_package_id: Option<Uuid>,
+    current_package_object_key: Option<String>,
+}
+
 async fn load_runtime_drain_response_tx(
     tx: &mut Transaction<'_, Postgres>,
     runtime_id: Uuid,
@@ -6479,11 +6609,17 @@ async fn list_skills(
 ) -> Result<Json<Vec<SkillDto>>, ApiError> {
     let user = require_user(&state, &headers).await?;
     let rows = sqlx::query(
-        "SELECT id, owner_id, name, description, content, revision,
-                content_checksum_sha256, created_at, updated_at
+        "SELECT skills.id, skills.owner_id, skills.name, skills.description,
+                skills.content, skills.revision, skills.content_checksum_sha256,
+                skills.created_at, skills.updated_at,
+                packages.id AS package_id, packages.format_version AS package_format_version,
+                packages.size_bytes AS package_size_bytes,
+                packages.checksum_sha256 AS package_checksum_sha256,
+                packages.files AS package_files
          FROM skills
-         WHERE owner_id = $1
-         ORDER BY created_at DESC",
+         LEFT JOIN skill_packages AS packages ON packages.id = skills.current_package_id
+         WHERE skills.owner_id = $1
+         ORDER BY skills.created_at DESC",
     )
     .bind(user.id)
     .fetch_all(&state.pool)
@@ -6499,22 +6635,23 @@ async fn create_skill(
     let user = require_user(&state, &headers).await?;
     validate_skill_payload(&req.name, &req.content)?;
     let content = req.content.trim();
-    let row = sqlx::query(
+    let skill_id = Uuid::new_v4();
+    sqlx::query(
         "INSERT INTO skills
              (id, owner_id, name, description, content, content_checksum_sha256)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         RETURNING id, owner_id, name, description, content, revision,
-                   content_checksum_sha256, created_at, updated_at",
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
-    .bind(Uuid::new_v4())
+    .bind(skill_id)
     .bind(user.id)
     .bind(req.name.trim())
     .bind(req.description.trim())
     .bind(content)
     .bind(sha256_hex(content))
-    .fetch_one(&state.pool)
+    .execute(&state.pool)
     .await?;
-    Ok(Json(skill_from_row(row)))
+    Ok(Json(
+        load_skill_owned_by_user(&state.pool, skill_id, user.id).await?,
+    ))
 }
 
 async fn get_skill(
@@ -6537,13 +6674,13 @@ async fn update_skill(
     let user = require_user(&state, &headers).await?;
     validate_skill_payload(&req.name, &req.content)?;
     let content = req.content.trim();
-    let row = sqlx::query(
+    let mut tx = state.pool.begin().await?;
+    let locked = lock_skill_change_tx(&mut tx, skill_id, user.id).await?;
+    let updated = sqlx::query(
         "UPDATE skills
          SET name = $1, description = $2, content = $3,
              revision = revision + 1, content_checksum_sha256 = $4, updated_at = now()
-         WHERE id = $5 AND owner_id = $6
-         RETURNING id, owner_id, name, description, content, revision,
-                   content_checksum_sha256, created_at, updated_at",
+         WHERE id = $5 AND owner_id = $6",
     )
     .bind(req.name.trim())
     .bind(req.description.trim())
@@ -6551,11 +6688,591 @@ async fn update_skill(
     .bind(sha256_hex(content))
     .bind(skill_id)
     .bind(user.id)
-    .fetch_optional(&state.pool)
+    .execute(&mut *tx)
     .await?;
-    row.map(skill_from_row)
-        .map(Json)
-        .ok_or(ApiError::not_found("skill not found"))
+    if updated.rows_affected() != 1 {
+        return Err(ApiError::not_found("skill not found"));
+    }
+    publish_skill_configuration_change_tx(&mut tx, &locked.affected_agent_ids).await?;
+    tx.commit().await?;
+    Ok(Json(
+        load_skill_owned_by_user(&state.pool, skill_id, user.id).await?,
+    ))
+}
+
+async fn replace_skill_package(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(skill_id): Path<Uuid>,
+    multipart: Multipart,
+) -> Result<Json<SkillDto>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    load_skill_owned_by_user(&state.pool, skill_id, user.id).await?;
+    let upload = stage_skill_package_upload(multipart).await?;
+    let store =
+        state
+            .skill_package_store
+            .as_ref()
+            .cloned()
+            .ok_or(ApiError::service_unavailable(
+                "Skill package object storage is not configured",
+            ))?;
+    let package_id = upload.archive_path.as_ref().map(|_| Uuid::new_v4());
+    let object_key = package_id
+        .map(|package_id| format!("skill-packages/{}/{skill_id}/{package_id}.tar.zst", user.id));
+    if let (Some(path), Some(size_bytes), Some(checksum_sha256), Some(object_key)) = (
+        upload.archive_path.as_deref(),
+        upload.archive_size_bytes,
+        upload.archive_checksum_sha256.as_deref(),
+        object_key.as_deref(),
+    ) {
+        if let Err(error) = store
+            .put_file(object_key, path, size_bytes, checksum_sha256)
+            .await
+        {
+            warn!(skill_id = %skill_id, error = %error, "Skill package object upload failed");
+            return Err(ApiError::bad_gateway("Skill package object upload failed"));
+        }
+    }
+
+    if let Err(error) = commit_skill_package_upload(
+        &state.pool,
+        skill_id,
+        user.id,
+        package_id,
+        object_key.as_deref(),
+        &upload,
+    )
+    .await
+    {
+        if let Some(object_key) = object_key.as_deref() {
+            if let Err(cleanup_error) =
+                enqueue_skill_package_deletion(&state.pool, user.id, object_key).await
+            {
+                warn!(skill_id = %skill_id, error = ?cleanup_error,
+                    "failed to queue an uncommitted or ambiguously committed Skill package object");
+            }
+        }
+        return Err(error);
+    }
+    process_skill_package_deletion_queue(&state).await;
+    Ok(Json(
+        load_skill_owned_by_user(&state.pool, skill_id, user.id).await?,
+    ))
+}
+
+async fn delete_skill_package(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(skill_id): Path<Uuid>,
+) -> Result<Json<SkillDto>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    let mut tx = state.pool.begin().await?;
+    let locked = lock_skill_change_tx(&mut tx, skill_id, user.id).await?;
+    let Some(package_id) = locked.current_package_id else {
+        tx.commit().await?;
+        return Ok(Json(
+            load_skill_owned_by_user(&state.pool, skill_id, user.id).await?,
+        ));
+    };
+    sqlx::query(
+        "UPDATE skills
+         SET current_package_id = NULL, revision = revision + 1, updated_at = now()
+         WHERE id = $1 AND owner_id = $2",
+    )
+    .bind(skill_id)
+    .bind(user.id)
+    .execute(&mut *tx)
+    .await?;
+    if let Some(object_key) = locked.current_package_object_key.as_deref() {
+        enqueue_skill_package_deletion_tx(&mut tx, user.id, object_key).await?;
+    }
+    sqlx::query("DELETE FROM skill_packages WHERE id = $1")
+        .bind(package_id)
+        .execute(&mut *tx)
+        .await?;
+    publish_skill_configuration_change_tx(&mut tx, &locked.affected_agent_ids).await?;
+    tx.commit().await?;
+    process_skill_package_deletion_queue(&state).await;
+    Ok(Json(
+        load_skill_owned_by_user(&state.pool, skill_id, user.id).await?,
+    ))
+}
+
+async fn lock_skill_change_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    skill_id: Uuid,
+    owner_id: Uuid,
+) -> Result<LockedSkillChange, ApiError> {
+    let affected_agent_ids = sqlx::query_scalar::<_, Uuid>(
+        "SELECT agent_id FROM agent_skills
+         WHERE skill_id = $1 ORDER BY agent_id",
+    )
+    .bind(skill_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    if !affected_agent_ids.is_empty() {
+        sqlx::query("SELECT id FROM agents WHERE id = ANY($1) ORDER BY id FOR UPDATE")
+            .bind(&affected_agent_ids)
+            .fetch_all(&mut **tx)
+            .await?;
+    }
+    let row = sqlx::query(
+        "SELECT skills.current_package_id, packages.object_key
+         FROM skills
+         LEFT JOIN skill_packages AS packages ON packages.id = skills.current_package_id
+         WHERE skills.id = $1 AND skills.owner_id = $2
+         FOR UPDATE OF skills",
+    )
+    .bind(skill_id)
+    .bind(owner_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ApiError::not_found("skill not found"))?;
+    Ok(LockedSkillChange {
+        affected_agent_ids,
+        current_package_id: row.get("current_package_id"),
+        current_package_object_key: row.get("object_key"),
+    })
+}
+
+async fn publish_skill_configuration_change_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    affected_agent_ids: &[Uuid],
+) -> Result<(), ApiError> {
+    if affected_agent_ids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "UPDATE agents
+         SET execution_config_revision = execution_config_revision + 1, updated_at = now()
+         WHERE id = ANY($1)",
+    )
+    .bind(affected_agent_ids)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE hub_sessions AS sessions
+         SET configuration_refresh_revision = GREATEST(
+                 sessions.configuration_refresh_revision,
+                 agents.execution_config_revision
+             ),
+             updated_at = now()
+         FROM agents
+         WHERE sessions.agent_id = agents.id
+           AND agents.id = ANY($1)
+           AND sessions.runtime_owner_id IS NOT NULL
+           AND sessions.lifecycle_status IN ('restoring', 'online')",
+    )
+    .bind(affected_agent_ids)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn enqueue_skill_package_deletion_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    owner_id: Uuid,
+    object_key: &str,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "INSERT INTO skill_package_deletion_queue (object_key, owner_id)
+         VALUES ($1, $2) ON CONFLICT (object_key) DO NOTHING",
+    )
+    .bind(object_key)
+    .bind(owner_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn enqueue_skill_package_deletion(
+    pool: &PgPool,
+    owner_id: Uuid,
+    object_key: &str,
+) -> Result<(), ApiError> {
+    let mut tx = pool.begin().await?;
+    enqueue_skill_package_deletion_tx(&mut tx, owner_id, object_key).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn commit_skill_package_upload(
+    pool: &PgPool,
+    skill_id: Uuid,
+    owner_id: Uuid,
+    package_id: Option<Uuid>,
+    object_key: Option<&str>,
+    upload: &StagedSkillPackageUpload,
+) -> Result<(), ApiError> {
+    let mut tx = pool.begin().await?;
+    let locked = lock_skill_change_tx(&mut tx, skill_id, owner_id).await?;
+    if let Some(package_id) = package_id {
+        sqlx::query(
+            "INSERT INTO skill_packages
+                 (id, skill_id, owner_id, object_key, format_version,
+                  size_bytes, checksum_sha256, files)
+             VALUES ($1, $2, $3, $4, 1, $5, $6, $7)",
+        )
+        .bind(package_id)
+        .bind(skill_id)
+        .bind(owner_id)
+        .bind(object_key.expect("packaged upload has an object key"))
+        .bind(
+            i64::try_from(upload.archive_size_bytes.expect("packaged upload has size"))
+                .map_err(|_| ApiError::bad_request("Skill package archive size is too large"))?,
+        )
+        .bind(
+            upload
+                .archive_checksum_sha256
+                .as_deref()
+                .expect("packaged upload has checksum"),
+        )
+        .bind(
+            serde_json::to_value(&upload.files)
+                .map_err(|_| ApiError::internal("Skill package file manifest is invalid"))?,
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query(
+        "UPDATE skills
+         SET name = $1, description = $2, content = $3,
+             content_checksum_sha256 = $4, current_package_id = $5,
+             revision = revision + 1, updated_at = now()
+         WHERE id = $6 AND owner_id = $7",
+    )
+    .bind(&upload.name)
+    .bind(&upload.description)
+    .bind(&upload.content)
+    .bind(sha256_hex(&upload.content))
+    .bind(package_id)
+    .bind(skill_id)
+    .bind(owner_id)
+    .execute(&mut *tx)
+    .await?;
+    if let Some(old_object_key) = locked.current_package_object_key.as_deref() {
+        enqueue_skill_package_deletion_tx(&mut tx, owner_id, old_object_key).await?;
+    }
+    if let Some(old_package_id) = locked.current_package_id {
+        sqlx::query("DELETE FROM skill_packages WHERE id = $1")
+            .bind(old_package_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    publish_skill_configuration_change_tx(&mut tx, &locked.affected_agent_ids).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn stage_skill_package_upload(
+    mut multipart: Multipart,
+) -> Result<StagedSkillPackageUpload, ApiError> {
+    let mut manifest_field = multipart
+        .next_field()
+        .await
+        .map_err(|_| ApiError::bad_request("Skill package multipart body is invalid"))?
+        .ok_or(ApiError::bad_request("Skill package manifest is required"))?;
+    if manifest_field.name() != Some("manifest") {
+        return Err(ApiError::bad_request(
+            "Skill package manifest must be the first multipart field",
+        ));
+    }
+    let mut manifest_bytes = Vec::new();
+    while let Some(chunk) = manifest_field
+        .chunk()
+        .await
+        .map_err(|_| ApiError::bad_request("Skill package manifest is invalid"))?
+    {
+        if manifest_bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
+            return Err(ApiError::bad_request("Skill package manifest is too large"));
+        }
+        manifest_bytes.extend_from_slice(&chunk);
+    }
+    drop(manifest_field);
+    let manifest: SkillPackageUploadManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|_| ApiError::bad_request("Skill package manifest must be valid JSON"))?;
+    validate_skill_package_paths(&manifest.paths)?;
+
+    let staging = tempfile::tempdir()
+        .map_err(|_| ApiError::internal("failed to create Skill package staging directory"))?;
+    let mut staged_files = Vec::with_capacity(manifest.paths.len());
+    let mut expanded_size = 0_u64;
+    for (index, package_path) in manifest.paths.iter().enumerate() {
+        let expected_field_name = format!("file-{index}");
+        let mut field = multipart
+            .next_field()
+            .await
+            .map_err(|_| ApiError::bad_request("Skill package multipart body is invalid"))?
+            .ok_or(ApiError::bad_request("Skill package file is missing"))?;
+        if field.name() != Some(expected_field_name.as_str()) {
+            return Err(ApiError::bad_request(
+                "Skill package file fields do not match the manifest order",
+            ));
+        }
+        let staged_path = staging.path().join(&expected_field_name);
+        let mut output = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&staged_path)
+            .await
+            .map_err(|_| ApiError::internal("failed to stage Skill package file"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            output
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .await
+                .map_err(|_| ApiError::internal("failed to protect staged Skill package file"))?;
+        }
+        let mut file_size = 0_u64;
+        let mut hasher = Sha256::new();
+        while let Some(chunk) = field
+            .chunk()
+            .await
+            .map_err(|_| ApiError::bad_request("Skill package file body is invalid"))?
+        {
+            file_size = file_size
+                .checked_add(chunk.len() as u64)
+                .ok_or(ApiError::bad_request(
+                    "Skill package expanded size is too large",
+                ))?;
+            expanded_size =
+                expanded_size
+                    .checked_add(chunk.len() as u64)
+                    .ok_or(ApiError::bad_request(
+                        "Skill package expanded size is too large",
+                    ))?;
+            if expanded_size > MAX_SKILL_PACKAGE_EXPANDED_BYTES {
+                return Err(ApiError::bad_request(
+                    "Skill package expanded size exceeds the limit",
+                ));
+            }
+            hasher.update(&chunk);
+            output
+                .write_all(&chunk)
+                .await
+                .map_err(|_| ApiError::internal("failed to stage Skill package file"))?;
+        }
+        output
+            .sync_all()
+            .await
+            .map_err(|_| ApiError::internal("failed to sync staged Skill package file"))?;
+        staged_files.push(StagedSkillPackageFile {
+            path: package_path.clone(),
+            staged_path,
+            size_bytes: file_size,
+            checksum_sha256: format!("{:x}", hasher.finalize()),
+            executable: package_path.starts_with("bin/"),
+        });
+    }
+    if multipart
+        .next_field()
+        .await
+        .map_err(|_| ApiError::bad_request("Skill package multipart body is invalid"))?
+        .is_some()
+    {
+        return Err(ApiError::bad_request(
+            "Skill package contains an undeclared multipart field",
+        ));
+    }
+
+    let skill_markdown = staged_files
+        .iter()
+        .find(|file| file.path == "SKILL.md")
+        .ok_or(ApiError::bad_request(
+            "Skill package must contain a root SKILL.md",
+        ))?;
+    let markdown = tokio::fs::read(&skill_markdown.staged_path)
+        .await
+        .map_err(|_| ApiError::internal("failed to read staged SKILL.md"))?;
+    let (name, description, content) = parse_uploaded_skill_markdown(&markdown)?;
+    let extra_files = staged_files
+        .iter()
+        .filter(|file| file.path != "SKILL.md")
+        .cloned()
+        .collect::<Vec<_>>();
+    let files = extra_files
+        .iter()
+        .map(|file| SkillPackageFileDto {
+            path: file.path.clone(),
+            size_bytes: file.size_bytes,
+            checksum_sha256: file.checksum_sha256.clone(),
+            executable: file.executable,
+        })
+        .collect::<Vec<_>>();
+    let (archive_path, archive_size_bytes, archive_checksum_sha256) = if extra_files.is_empty() {
+        (None, None, None)
+    } else {
+        let archive_path = staging.path().join("package.tar.zst");
+        let build_path = archive_path.clone();
+        let (size_bytes, checksum_sha256) = tokio::task::spawn_blocking(move || {
+            build_skill_package_archive(&build_path, &extra_files)
+        })
+        .await
+        .map_err(|_| ApiError::internal("Skill package archive task failed"))?
+        .map_err(|error| {
+            warn!(error = %error, "failed to build Skill package archive");
+            ApiError::internal("failed to build Skill package archive")
+        })?;
+        if size_bytes > MAX_SKILL_PACKAGE_ARCHIVE_BYTES {
+            return Err(ApiError::bad_request(
+                "Skill package archive size exceeds the limit",
+            ));
+        }
+        (Some(archive_path), Some(size_bytes), Some(checksum_sha256))
+    };
+    Ok(StagedSkillPackageUpload {
+        _staging: staging,
+        name,
+        description,
+        content,
+        archive_path,
+        archive_size_bytes,
+        archive_checksum_sha256,
+        files,
+    })
+}
+
+fn validate_skill_package_paths(paths: &[String]) -> Result<(), ApiError> {
+    if paths.is_empty() || paths.len() > MAX_SKILL_PACKAGE_FILES {
+        return Err(ApiError::bad_request(
+            "Skill package must contain 1 to 1024 files",
+        ));
+    }
+    let mut unique = BTreeSet::new();
+    for path in paths {
+        let safe = !path.is_empty()
+            && !path.starts_with('/')
+            && !path.contains('\\')
+            && !path.contains('\0')
+            && path
+                .split('/')
+                .all(|component| !component.is_empty() && component != "." && component != "..");
+        if !safe || !unique.insert(path.clone()) {
+            return Err(ApiError::bad_request(
+                "Skill package paths must be unique safe relative paths",
+            ));
+        }
+    }
+    if !unique.contains("SKILL.md") {
+        return Err(ApiError::bad_request(
+            "Skill package must contain a root SKILL.md",
+        ));
+    }
+    let sorted = unique.into_iter().collect::<Vec<_>>();
+    for (index, path) in sorted.iter().enumerate() {
+        let directory_prefix = format!("{path}/");
+        if sorted
+            .get(index + 1)
+            .is_some_and(|next| next.starts_with(&directory_prefix))
+        {
+            return Err(ApiError::bad_request(
+                "Skill package paths must not overlap files and directories",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_uploaded_skill_markdown(bytes: &[u8]) -> Result<(String, String, String), ApiError> {
+    #[derive(Deserialize)]
+    struct Frontmatter {
+        name: String,
+        description: Option<String>,
+    }
+
+    let markdown =
+        std::str::from_utf8(bytes).map_err(|_| ApiError::bad_request("SKILL.md must be UTF-8"))?;
+    let markdown = markdown.strip_prefix('\u{feff}').unwrap_or(markdown);
+    let mut lines = markdown.split_inclusive('\n');
+    let first = lines
+        .next()
+        .filter(|line| line.trim() == "---")
+        .ok_or(ApiError::bad_request(
+            "SKILL.md must start with YAML frontmatter",
+        ))?;
+    let frontmatter_start = first.len();
+    let mut offset = frontmatter_start;
+    let mut frontmatter_end = None;
+    let mut content_start = None;
+    for line in lines {
+        if line.trim() == "---" {
+            frontmatter_end = Some(offset);
+            content_start = Some(offset + line.len());
+            break;
+        }
+        offset += line.len();
+    }
+    let frontmatter_end = frontmatter_end.ok_or(ApiError::bad_request(
+        "SKILL.md YAML frontmatter is not closed",
+    ))?;
+    let parsed: Frontmatter =
+        serde_yaml_ng::from_str(&markdown[frontmatter_start..frontmatter_end])
+            .map_err(|_| ApiError::bad_request("SKILL.md YAML frontmatter is invalid"))?;
+    let name = parsed.name.trim().to_owned();
+    let description = parsed
+        .description
+        .unwrap_or_else(|| name.clone())
+        .trim()
+        .to_owned();
+    let content = markdown[content_start.expect("frontmatter close has content offset")..]
+        .trim()
+        .to_owned();
+    validate_skill_payload(&name, &content)?;
+    Ok((
+        name.clone(),
+        if description.is_empty() {
+            name
+        } else {
+            description
+        },
+        content,
+    ))
+}
+
+fn build_skill_package_archive(
+    archive_path: &FsPath,
+    files: &[StagedSkillPackageFile],
+) -> anyhow::Result<(u64, String)> {
+    let archive = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(archive_path)
+        .context("create Skill package archive")?;
+    let encoder = zstd::Encoder::new(archive, 3).context("create Skill package compressor")?;
+    let mut builder = tar::Builder::new(encoder);
+    for file in files {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(file.size_bytes);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        header.set_mode(if file.executable { 0o755 } else { 0o444 });
+        header.set_cksum();
+        let input = std::fs::File::open(&file.staged_path).context("open staged Skill file")?;
+        builder
+            .append_data(&mut header, FsPath::new(&file.path), input)
+            .context("append Skill package file")?;
+    }
+    let encoder = builder.into_inner().context("finish Skill package tar")?;
+    let archive = encoder
+        .finish()
+        .context("finish Skill package compression")?;
+    archive.sync_all().context("sync Skill package archive")?;
+    let size_bytes = archive.metadata()?.len();
+    let mut input = std::fs::File::open(archive_path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok((size_bytes, format!("{:x}", hasher.finalize())))
 }
 
 async fn delete_skill(
@@ -6565,6 +7282,7 @@ async fn delete_skill(
 ) -> Result<StatusCode, ApiError> {
     let user = require_user(&state, &headers).await?;
     delete_skills_for_user(&state.pool, user.id, &[skill_id]).await?;
+    process_skill_package_deletion_queue(&state).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -6575,6 +7293,7 @@ async fn bulk_delete_skills(
 ) -> Result<Json<BulkDeleteSkillsResponse>, ApiError> {
     let user = require_user(&state, &headers).await?;
     let deleted_skill_ids = delete_skills_for_user(&state.pool, user.id, &req.skill_ids).await?;
+    process_skill_package_deletion_queue(&state).await;
     Ok(Json(BulkDeleteSkillsResponse { deleted_skill_ids }))
 }
 
@@ -6624,6 +7343,17 @@ async fn delete_skills_for_user(
     if owned_ids != ordered_skill_ids {
         return Err(ApiError::not_found("skill not found"));
     }
+    sqlx::query(
+        "INSERT INTO skill_package_deletion_queue (object_key, owner_id)
+         SELECT packages.object_key, packages.owner_id
+         FROM skill_packages AS packages
+         JOIN skills ON skills.current_package_id = packages.id
+         WHERE skills.id = ANY($1)
+         ON CONFLICT (object_key) DO NOTHING",
+    )
+    .bind(&ordered_skill_ids)
+    .execute(&mut *tx)
+    .await?;
     if !affected_agent_ids.is_empty() {
         sqlx::query(
             "UPDATE agents
@@ -6657,6 +7387,81 @@ async fn delete_skills_for_user(
         .await?;
     tx.commit().await?;
     Ok(ordered_skill_ids)
+}
+
+async fn process_skill_package_deletion_queue(state: &AppState) {
+    let object_keys = match sqlx::query_scalar::<_, String>(
+        "SELECT queue.object_key
+         FROM skill_package_deletion_queue AS queue
+         WHERE NOT EXISTS (
+             SELECT 1
+             FROM run_skill_packages AS snapshots
+             JOIN runs ON runs.id = snapshots.run_id
+             WHERE snapshots.object_key = queue.object_key
+               AND runs.status IN ('pending', 'running', 'waiting_tool')
+         )
+           AND NOT EXISTS (
+             SELECT 1 FROM skill_packages
+             WHERE skill_packages.object_key = queue.object_key
+           )
+         ORDER BY queue.created_at, queue.object_key
+         LIMIT 100",
+    )
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(object_keys) => object_keys,
+        Err(error) => {
+            warn!(error = %error, "failed to read Skill package deletion queue");
+            return;
+        }
+    };
+    let Some(store) = state.skill_package_store.as_ref() else {
+        if !object_keys.is_empty() {
+            warn!("Skill package deletion queue cannot run without object storage");
+        }
+        return;
+    };
+    for object_key in object_keys {
+        match store.delete(&object_key).await {
+            Ok(()) => {
+                if let Err(error) =
+                    sqlx::query("DELETE FROM skill_package_deletion_queue WHERE object_key = $1")
+                        .bind(&object_key)
+                        .execute(&state.pool)
+                        .await
+                {
+                    warn!(object_key = %object_key, error = %error,
+                        "failed to acknowledge Skill package object deletion");
+                }
+            }
+            Err(error) => {
+                if let Err(database_error) = sqlx::query(
+                    "UPDATE skill_package_deletion_queue
+                     SET attempts = attempts + 1,
+                         last_error = 'object store delete failed', updated_at = now()
+                     WHERE object_key = $1",
+                )
+                .bind(&object_key)
+                .execute(&state.pool)
+                .await
+                {
+                    warn!(object_key = %object_key, error = %database_error,
+                        "failed to record Skill package deletion failure");
+                }
+                warn!(object_key = %object_key, error = %error,
+                    "failed to delete queued Skill package object");
+            }
+        }
+    }
+}
+
+async fn skill_package_deletion_loop(state: Arc<AppState>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(30));
+    loop {
+        tick.tick().await;
+        process_skill_package_deletion_queue(&state).await;
+    }
 }
 
 async fn list_automations(
@@ -7061,13 +7866,15 @@ async fn create_widget_access(
     let expires_at = Utc::now() + ChronoDuration::minutes(15);
     insert_widget_access_session_tx(
         &mut tx,
-        app.id,
-        req.agent_id,
-        resolved.user.id,
-        resolved.identity_id,
-        &external_user,
-        &token,
-        expires_at,
+        WidgetAccessSessionInsert {
+            oauth_app_id: app.id,
+            agent_id: req.agent_id,
+            owner_id: resolved.user.id,
+            external_identity_id: resolved.identity_id,
+            external_user: &external_user,
+            token: &token,
+            expires_at,
+        },
     )
     .await?;
     let agent = sqlx::query(
@@ -10380,20 +11187,71 @@ async fn runtime_claim_run(
     let execution_config_revision: i64 = agent_row.get("a_execution_config_revision");
     let skill_rows = sqlx::query(
         "SELECT s.id, s.name, s.description, s.content, s.revision,
-                s.content_checksum_sha256
+                s.content_checksum_sha256,
+                COALESCE(snapshots.package_id, packages.id) AS package_id,
+                COALESCE(snapshots.format_version, packages.format_version)
+                    AS package_format_version,
+                COALESCE(snapshots.object_key, packages.object_key) AS package_object_key,
+                COALESCE(snapshots.size_bytes, packages.size_bytes) AS package_size_bytes,
+                COALESCE(snapshots.checksum_sha256, packages.checksum_sha256)
+                    AS package_checksum_sha256,
+                COALESCE(snapshots.files, packages.files) AS package_files
          FROM agent_skills a_s
          JOIN skills s ON s.id = a_s.skill_id
+         LEFT JOIN skill_packages AS packages ON packages.id = s.current_package_id
+         LEFT JOIN run_skill_packages AS snapshots
+           ON snapshots.run_id = $3 AND snapshots.skill_id = s.id
          WHERE a_s.agent_id = $1 AND s.owner_id = $2
-         ORDER BY s.name, s.id",
+         ORDER BY s.name, s.id
+         FOR SHARE OF s",
     )
     .bind(agent.id)
     .bind(agent.owner_id)
+    .bind(run_id)
     .fetch_all(&mut *tx)
     .await?;
+    for skill_row in &skill_rows {
+        let Some(package_id) = skill_row.get::<Option<Uuid>, _>("package_id") else {
+            continue;
+        };
+        sqlx::query(
+            "INSERT INTO run_skill_packages
+                 (run_id, skill_id, package_id, object_key, format_version,
+                  size_bytes, checksum_sha256, files)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (run_id, skill_id) DO NOTHING",
+        )
+        .bind(run_id)
+        .bind(skill_row.get::<Uuid, _>("id"))
+        .bind(package_id)
+        .bind(skill_row.get::<String, _>("package_object_key"))
+        .bind(skill_row.get::<i32, _>("package_format_version"))
+        .bind(skill_row.get::<i64, _>("package_size_bytes"))
+        .bind(skill_row.get::<String, _>("package_checksum_sha256"))
+        .bind(skill_row.get::<Value, _>("package_files"))
+        .execute(&mut *tx)
+        .await?;
+    }
+    let existing_model_bindings = load_run_model_bindings_tx(&mut tx, run_id).await?;
+    let model_bindings = if existing_model_bindings.is_empty() {
+        create_run_model_bindings_tx(&mut tx, run_id, &agent).await?
+    } else {
+        let main_binding = existing_model_bindings
+            .iter()
+            .find(|binding| binding.binding_key.eq_ignore_ascii_case("main"))
+            .ok_or(ApiError::internal(
+                "Run Model Binding snapshot has no main binding",
+            ))?;
+        agent.model_selection = Some(ModelSelectionDto {
+            connection_id: main_binding.model_connection_id,
+            model_id: main_binding.model_id.clone(),
+        });
+        agent.model_settings = main_binding.model_settings.clone();
+        existing_model_bindings
+    };
     let mut execution_configuration =
         build_agent_execution_configuration(&agent, execution_config_revision, skill_rows)?;
-    execution_configuration.model_bindings =
-        create_run_model_bindings_tx(&mut tx, run_id, &agent).await?;
+    execution_configuration.model_bindings = model_bindings;
     let expected_configuration_fingerprint =
         execution_configuration_fingerprint(&execution_configuration)
             .map_err(|error| ApiError::internal(error.to_string()))?;
@@ -10455,6 +11313,136 @@ async fn runtime_claim_run(
         session_context,
     })
     .into_response())
+}
+
+async fn runtime_download_run_skill_package(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((run_id, skill_id)): Path<(Uuid, Uuid)>,
+) -> Result<Response, ApiError> {
+    let runtime_id = require_runtime(&state, &headers).await?;
+    let ownership_generation =
+        parse_required_header::<i64>(&headers, "x-agent-hub-ownership-generation")?;
+    validate_ownership_generation(ownership_generation)?;
+    let row = sqlx::query(
+        "SELECT snapshots.package_id, snapshots.object_key, snapshots.size_bytes,
+                snapshots.checksum_sha256, runs.runtime_id,
+                runs.session_ownership_generation, runs.status
+         FROM run_skill_packages AS snapshots
+         JOIN runs ON runs.id = snapshots.run_id
+         WHERE snapshots.run_id = $1 AND snapshots.skill_id = $2",
+    )
+    .bind(run_id)
+    .bind(skill_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(ApiError::not_found("Run Skill package not found"))?;
+    if row.get::<Option<Uuid>, _>("runtime_id") != Some(runtime_id)
+        || row.get::<Option<i64>, _>("session_ownership_generation") != Some(ownership_generation)
+        || !matches!(
+            row.get::<String, _>("status").as_str(),
+            "running" | "waiting_tool"
+        )
+    {
+        return Err(ApiError::forbidden(
+            "runtime does not own this active Run generation",
+        ));
+    }
+    skill_package_download_response(
+        &state,
+        row.get("package_id"),
+        row.get("object_key"),
+        row.get("size_bytes"),
+        row.get("checksum_sha256"),
+    )
+    .await
+}
+
+async fn runtime_download_session_skill_package(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((session_id, skill_id, package_id)): Path<(Uuid, Uuid, Uuid)>,
+) -> Result<Response, ApiError> {
+    let runtime_id = require_runtime(&state, &headers).await?;
+    let ownership_generation =
+        parse_required_header::<i64>(&headers, "x-agent-hub-ownership-generation")?;
+    validate_ownership_generation(ownership_generation)?;
+    let row = sqlx::query(
+        "SELECT packages.object_key, packages.size_bytes, packages.checksum_sha256,
+                sessions.runtime_owner_id, sessions.ownership_generation,
+                sessions.lifecycle_status
+         FROM hub_sessions AS sessions
+         JOIN agents ON agents.id = sessions.agent_id AND agents.deleted_at IS NULL
+         JOIN agent_skills ON agent_skills.agent_id = agents.id
+         JOIN skills ON skills.id = agent_skills.skill_id
+                    AND skills.owner_id = agents.owner_id
+         JOIN skill_packages AS packages ON packages.id = skills.current_package_id
+         WHERE sessions.id = $1 AND skills.id = $2 AND packages.id = $3",
+    )
+    .bind(session_id)
+    .bind(skill_id)
+    .bind(package_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(ApiError::not_found("Session Skill package not found"))?;
+    if row.get::<Option<Uuid>, _>("runtime_owner_id") != Some(runtime_id)
+        || row.get::<i64, _>("ownership_generation") != ownership_generation
+        || !matches!(
+            row.get::<String, _>("lifecycle_status").as_str(),
+            "restoring" | "online"
+        )
+    {
+        return Err(ApiError::forbidden(
+            "runtime does not own this Session generation",
+        ));
+    }
+    skill_package_download_response(
+        &state,
+        package_id,
+        row.get("object_key"),
+        row.get("size_bytes"),
+        row.get("checksum_sha256"),
+    )
+    .await
+}
+
+async fn skill_package_download_response(
+    state: &AppState,
+    package_id: Uuid,
+    object_key: String,
+    size_bytes: i64,
+    checksum_sha256: String,
+) -> Result<Response, ApiError> {
+    let store = state
+        .skill_package_store
+        .as_ref()
+        .ok_or(ApiError::service_unavailable(
+            "Skill package object storage is not configured",
+        ))?;
+    let object = store.get(&object_key).await.map_err(|error| {
+        warn!(package_id = %package_id, error = %error, "Skill package object download failed");
+        ApiError::bad_gateway("Skill package object download failed")
+    })?;
+    let mut response = Response::new(object.body);
+    *response.status_mut() = StatusCode::OK;
+    let response_headers = response.headers_mut();
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/zstd"),
+    );
+    insert_response_header(response_headers, header::CONTENT_LENGTH, size_bytes)?;
+    for (name, value) in [
+        ("x-agent-hub-skill-package-id", package_id.to_string()),
+        ("x-agent-hub-skill-package-sha256", checksum_sha256),
+    ] {
+        response_headers.insert(
+            HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| ApiError::internal("invalid Skill package response header name"))?,
+            HeaderValue::from_str(&value)
+                .map_err(|_| ApiError::internal("invalid Skill package response header value"))?,
+        );
+    }
+    Ok(response)
 }
 
 async fn runtime_append_event(
@@ -12280,17 +13268,21 @@ async fn insert_embed_session_tx(
     Ok(embed_session_id)
 }
 
-async fn insert_widget_access_session_tx(
-    tx: &mut Transaction<'_, Postgres>,
+struct WidgetAccessSessionInsert<'a> {
     oauth_app_id: Uuid,
     agent_id: Uuid,
     owner_id: Uuid,
     external_identity_id: Uuid,
-    external_user: &ExternalUserContextDto,
-    token: &str,
+    external_user: &'a ExternalUserContextDto,
+    token: &'a str,
     expires_at: DateTime<Utc>,
+}
+
+async fn insert_widget_access_session_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session: WidgetAccessSessionInsert<'_>,
 ) -> Result<Uuid, ApiError> {
-    let profile_snapshot = serde_json::to_value(external_user)
+    let profile_snapshot = serde_json::to_value(session.external_user)
         .map_err(|_| ApiError::internal("external user profile could not be encoded"))?;
     sqlx::query_scalar(
         "INSERT INTO embed_sessions
@@ -12300,14 +13292,14 @@ async fn insert_widget_access_session_tx(
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          RETURNING id",
     )
-    .bind(sha256_hex(token))
-    .bind(agent_id)
-    .bind(owner_id)
-    .bind(oauth_app_id)
-    .bind(expires_at)
-    .bind(&external_user.tenant_id)
-    .bind(&external_user.external_user_id)
-    .bind(external_identity_id)
+    .bind(sha256_hex(session.token))
+    .bind(session.agent_id)
+    .bind(session.owner_id)
+    .bind(session.oauth_app_id)
+    .bind(session.expires_at)
+    .bind(&session.external_user.tenant_id)
+    .bind(&session.external_user.external_user_id)
+    .bind(session.external_identity_id)
     .bind(profile_snapshot)
     .fetch_one(&mut **tx)
     .await
@@ -15013,10 +16005,16 @@ async fn load_skill_owned_by_user(
     user_id: Uuid,
 ) -> Result<SkillDto, ApiError> {
     let row = sqlx::query(
-        "SELECT id, owner_id, name, description, content, revision,
-                content_checksum_sha256, created_at, updated_at
+        "SELECT skills.id, skills.owner_id, skills.name, skills.description,
+                skills.content, skills.revision, skills.content_checksum_sha256,
+                skills.created_at, skills.updated_at,
+                packages.id AS package_id, packages.format_version AS package_format_version,
+                packages.size_bytes AS package_size_bytes,
+                packages.checksum_sha256 AS package_checksum_sha256,
+                packages.files AS package_files
          FROM skills
-         WHERE id = $1 AND owner_id = $2",
+         LEFT JOIN skill_packages AS packages ON packages.id = skills.current_package_id
+         WHERE skills.id = $1 AND skills.owner_id = $2",
     )
     .bind(skill_id)
     .bind(user_id)
@@ -15194,6 +16192,7 @@ fn build_agent_execution_configuration(
                 content: row.get("content"),
                 revision: row.get("revision"),
                 content_checksum_sha256: row.get("content_checksum_sha256"),
+                package: execution_skill_package_from_row(&row),
             },
         );
     }
@@ -15209,6 +16208,23 @@ fn build_agent_execution_configuration(
         skills: skills.into_values().collect(),
         mcp_allowlist: agent.mcp_allowlist.clone(),
         tool_allowlist: agent.tool_allowlist.clone(),
+    })
+}
+
+fn execution_skill_package_from_row(row: &sqlx::postgres::PgRow) -> Option<SkillPackageDto> {
+    let id = row
+        .try_get::<Option<Uuid>, _>("package_id")
+        .ok()
+        .flatten()?;
+    Some(SkillPackageDto {
+        id,
+        format_version: u32::try_from(row.get::<i32, _>("package_format_version"))
+            .expect("Skill package format version is constrained"),
+        size_bytes: u64::try_from(row.get::<i64, _>("package_size_bytes"))
+            .expect("Skill package size is constrained"),
+        checksum_sha256: row.get("package_checksum_sha256"),
+        files: serde_json::from_value(row.get("package_files"))
+            .expect("Skill package file manifest is constrained"),
     })
 }
 
@@ -15338,9 +16354,14 @@ async fn load_agent_execution_configuration_tx(
     agent.subagents = load_subagents_tx(tx, agent.id).await?;
     let skill_rows = sqlx::query(
         "SELECT skills.id, skills.name, skills.description, skills.content,
-                skills.revision, skills.content_checksum_sha256
+                skills.revision, skills.content_checksum_sha256,
+                packages.id AS package_id, packages.format_version AS package_format_version,
+                packages.size_bytes AS package_size_bytes,
+                packages.checksum_sha256 AS package_checksum_sha256,
+                packages.files AS package_files
          FROM agent_skills
          JOIN skills ON skills.id = agent_skills.skill_id
+         LEFT JOIN skill_packages AS packages ON packages.id = skills.current_package_id
          WHERE agent_skills.agent_id = $1 AND skills.owner_id = $2
          ORDER BY skills.name, skills.id",
     )
@@ -15426,6 +16447,45 @@ async fn create_run_model_binding_tx(
     .execute(&mut **tx)
     .await?;
     Ok(binding)
+}
+
+async fn load_run_model_bindings_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    run_id: Uuid,
+) -> Result<Vec<RunModelBindingDto>, ApiError> {
+    let rows = sqlx::query(
+        "SELECT id, run_id, binding_key, model_connection_id,
+                connection_name_snapshot, connection_scope_snapshot,
+                model_id, api_type, model_settings
+         FROM run_model_bindings
+         WHERE run_id = $1
+         ORDER BY lower(binding_key), id",
+    )
+    .bind(run_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| RunModelBindingDto {
+            id: row.get("id"),
+            run_id: row.get("run_id"),
+            binding_key: row.get("binding_key"),
+            model_connection_id: row.get("model_connection_id"),
+            connection_name_snapshot: row.get("connection_name_snapshot"),
+            connection_scope_snapshot: match row
+                .get::<String, _>("connection_scope_snapshot")
+                .as_str()
+            {
+                "global" => ModelConnectionScope::Global,
+                "personal" => ModelConnectionScope::Personal,
+                _ => unreachable!("Model Connection scope is constrained"),
+            },
+            model_id: row.get("model_id"),
+            api_type: model_upstream_protocol_from_name(&row.get::<String, _>("api_type")),
+            model_settings: serde_json::from_value(row.get("model_settings"))
+                .expect("Run Model Binding settings are constrained"),
+        })
+        .collect())
 }
 
 async fn create_run_model_bindings_tx(
@@ -17852,6 +18912,29 @@ fn session_bundle_store_from_env() -> anyhow::Result<Option<Arc<S3BundleStore>>>
     Ok(Some(Arc::new(store)))
 }
 
+fn skill_package_store_from_env(
+    s3_store: Option<Arc<S3BundleStore>>,
+) -> anyhow::Result<Arc<SkillPackageStore>> {
+    let backend = env::var("HUB_SKILL_PACKAGE_STORAGE").unwrap_or_else(|_| {
+        if s3_store.is_some() {
+            "s3".into()
+        } else {
+            "local".into()
+        }
+    });
+    let store = match backend.trim() {
+        "s3" => SkillPackageStore::s3(
+            s3_store.context("HUB_SKILL_PACKAGE_STORAGE=s3 requires HUB_BUNDLE_S3_ENDPOINT")?,
+        ),
+        "local" => SkillPackageStore::local(PathBuf::from(
+            env::var("HUB_SKILL_PACKAGE_LOCAL_DIR")
+                .unwrap_or_else(|_| "/var/lib/agent-hub/skill-packages".into()),
+        ))?,
+        _ => anyhow::bail!("HUB_SKILL_PACKAGE_STORAGE must be local or s3"),
+    };
+    Ok(Arc::new(store))
+}
+
 fn parse_model_proxy_timeout(value: Option<&str>) -> anyhow::Result<Duration> {
     let Some(value) = value else {
         return Ok(DEFAULT_MODEL_PROXY_TIMEOUT);
@@ -18242,6 +19325,7 @@ fn agent_from_row(row: sqlx::postgres::PgRow) -> AgentDto {
 }
 
 fn skill_from_row(row: sqlx::postgres::PgRow) -> SkillDto {
+    let package_id = row.try_get::<Option<Uuid>, _>("package_id").ok().flatten();
     SkillDto {
         id: row.get("id"),
         owner_id: row.get("owner_id"),
@@ -18250,6 +19334,16 @@ fn skill_from_row(row: sqlx::postgres::PgRow) -> SkillDto {
         content: row.get("content"),
         revision: row.get("revision"),
         content_checksum_sha256: row.get("content_checksum_sha256"),
+        package: package_id.map(|id| SkillPackageDto {
+            id,
+            format_version: u32::try_from(row.get::<i32, _>("package_format_version"))
+                .expect("Skill package format version is constrained"),
+            size_bytes: u64::try_from(row.get::<i64, _>("package_size_bytes"))
+                .expect("Skill package size is constrained"),
+            checksum_sha256: row.get("package_checksum_sha256"),
+            files: serde_json::from_value(row.get("package_files"))
+                .expect("Skill package file manifest is constrained"),
+        }),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
@@ -19600,6 +20694,15 @@ mod tests {
             ("/api/admin/users/{user_id}/password", &["put"][..]),
             ("/api/admin/users/{user_id}/role", &["put"][..]),
             ("/api/skills", &["get", "post", "delete"][..]),
+            ("/api/skills/{skill_id}/package", &["put", "delete"][..]),
+            (
+                "/api/runtime/runs/{run_id}/skills/{skill_id}/package",
+                &["get"][..],
+            ),
+            (
+                "/api/runtime/sessions/{session_id}/skills/{skill_id}/packages/{package_id}",
+                &["get"][..],
+            ),
         ] {
             for method in methods {
                 assert!(
@@ -19631,6 +20734,22 @@ mod tests {
             openapi_document()["components"]["schemas"]["AgentExecutionSkill"]["properties"]
                 ["source"]["enum"],
             json!(["managed"])
+        );
+        assert_eq!(
+            openapi_document()["components"]["schemas"]["Skill"]["properties"]["package"]["anyOf"]
+                [0]["$ref"],
+            "#/components/schemas/SkillPackage"
+        );
+        assert_eq!(
+            openapi_document()["components"]["schemas"]["AgentExecutionSkill"]["properties"]
+                ["package"]["anyOf"][0]["$ref"],
+            "#/components/schemas/SkillPackage"
+        );
+        assert!(
+            openapi_document()["components"]["schemas"]["AgentToolName"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("skill_exec"))
         );
         let execution_configuration =
             &openapi_document()["components"]["schemas"]["AgentExecutionConfiguration"];
@@ -20411,6 +21530,208 @@ mod tests {
     }
 
     #[test]
+    fn skill_package_paths_require_one_root_manifest_and_reject_ambiguous_paths() {
+        assert!(validate_skill_package_paths(&[
+            "SKILL.md".into(),
+            "bin/client".into(),
+            "references/guide.md".into(),
+        ])
+        .is_ok());
+        for paths in [
+            vec!["bin/client".into()],
+            vec!["SKILL.md".into(), "../secret".into()],
+            vec!["SKILL.md".into(), "/absolute".into()],
+            vec!["SKILL.md".into(), "bin\\client".into()],
+            vec!["SKILL.md".into(), "bin/client".into(), "bin/client".into()],
+            vec![
+                "SKILL.md".into(),
+                "resources".into(),
+                "resources/file".into(),
+            ],
+        ] {
+            assert!(validate_skill_package_paths(&paths).is_err(), "{paths:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_package_multipart_protocol_stages_manifest_files_in_declared_order() {
+        use axum::extract::FromRequest;
+
+        let boundary = "agent-hub-skill-package-test";
+        let mut body = Vec::new();
+        for (name, filename, content_type, contents) in [
+            (
+                "manifest",
+                None,
+                "application/json",
+                br#"{"paths":["SKILL.md","bin/client","references/guide.md"]}"#.as_slice(),
+            ),
+            (
+                "file-0",
+                Some("SKILL.md"),
+                "text/markdown",
+                b"---\nname: deploy\ndescription: Deploy client\n---\n\nUse bin/client.\n"
+                    .as_slice(),
+            ),
+            (
+                "file-1",
+                Some("client"),
+                "application/octet-stream",
+                b"client-bytes".as_slice(),
+            ),
+            (
+                "file-2",
+                Some("guide.md"),
+                "text/markdown",
+                b"guide".as_slice(),
+            ),
+        ] {
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            body.extend_from_slice(
+                format!(
+                    "Content-Disposition: form-data; name=\"{name}\"{}\r\n",
+                    filename
+                        .map_or_else(String::new, |filename| format!("; filename=\"{filename}\""))
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+            body.extend_from_slice(contents);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        let request = axum::http::Request::builder()
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let multipart = Multipart::from_request(request, &()).await.unwrap();
+        let upload = stage_skill_package_upload(multipart).await.unwrap();
+
+        assert_eq!(upload.name, "deploy");
+        assert_eq!(upload.description, "Deploy client");
+        assert_eq!(upload.content, "Use bin/client.");
+        assert_eq!(
+            upload
+                .files
+                .iter()
+                .map(|file| (file.path.as_str(), file.executable))
+                .collect::<Vec<_>>(),
+            [("bin/client", true), ("references/guide.md", false)]
+        );
+        assert!(upload
+            .archive_path
+            .as_ref()
+            .is_some_and(|path| path.is_file()));
+        assert!(upload.archive_size_bytes.is_some_and(|size| size > 0));
+        assert!(upload.archive_checksum_sha256.is_some());
+    }
+
+    #[test]
+    fn uploaded_skill_markdown_uses_yaml_metadata_and_body() {
+        let parsed = parse_uploaded_skill_markdown(
+            b"---\nname: deploy-client\ndescription: Deploy through the approved client\nmetadata:\n  owner: platform\n---\n\n# Instructions\n\nRun the client.\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.0, "deploy-client");
+        assert_eq!(parsed.1, "Deploy through the approved client");
+        assert_eq!(parsed.2, "# Instructions\n\nRun the client.");
+        assert!(parse_uploaded_skill_markdown(b"not frontmatter").is_err());
+        assert!(parse_uploaded_skill_markdown(b"---\nname: empty\n---\n").is_err());
+        assert!(parse_uploaded_skill_markdown(&[0xff, 0xfe]).is_err());
+    }
+
+    #[test]
+    fn skill_package_archive_contains_only_declared_regular_files_with_fixed_modes() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = root.path().join("binary");
+        let reference = root.path().join("reference");
+        std::fs::write(&binary, b"binary-bytes").unwrap();
+        std::fs::write(&reference, b"reference-bytes").unwrap();
+        let files = vec![
+            StagedSkillPackageFile {
+                path: "bin/client".into(),
+                staged_path: binary,
+                size_bytes: 12,
+                checksum_sha256: format!("{:x}", Sha256::digest(b"binary-bytes")),
+                executable: true,
+            },
+            StagedSkillPackageFile {
+                path: "references/guide.md".into(),
+                staged_path: reference,
+                size_bytes: 15,
+                checksum_sha256: format!("{:x}", Sha256::digest(b"reference-bytes")),
+                executable: false,
+            },
+        ];
+        let archive_path = root.path().join("package.tar.zst");
+        let (size, checksum) = build_skill_package_archive(&archive_path, &files).unwrap();
+        assert_eq!(size, std::fs::metadata(&archive_path).unwrap().len());
+        assert_eq!(
+            checksum,
+            format!(
+                "{:x}",
+                Sha256::digest(std::fs::read(&archive_path).unwrap())
+            )
+        );
+
+        let decoder = zstd::Decoder::new(std::fs::File::open(archive_path).unwrap()).unwrap();
+        let mut archive = tar::Archive::new(decoder);
+        let entries = archive
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                let mut entry = entry.unwrap();
+                assert!(entry.header().entry_type().is_file());
+                let path = entry.path().unwrap().to_string_lossy().into_owned();
+                let mode = entry.header().mode().unwrap();
+                let mut contents = Vec::new();
+                entry.read_to_end(&mut contents).unwrap();
+                (path, mode, contents)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries[0],
+            ("bin/client".into(), 0o755, b"binary-bytes".to_vec())
+        );
+        assert_eq!(
+            entries[1],
+            (
+                "references/guide.md".into(),
+                0o444,
+                b"reference-bytes".to_vec()
+            )
+        );
+    }
+
+    fn staged_skill_package_upload(
+        name: &str,
+        content: &str,
+        archive_contents: &str,
+    ) -> StagedSkillPackageUpload {
+        let staging = tempfile::tempdir().unwrap();
+        let archive_path = staging.path().join("package.tar.zst");
+        std::fs::write(&archive_path, archive_contents).unwrap();
+        StagedSkillPackageUpload {
+            _staging: staging,
+            name: name.into(),
+            description: format!("{name} description"),
+            content: content.into(),
+            archive_path: Some(archive_path),
+            archive_size_bytes: Some(archive_contents.len() as u64),
+            archive_checksum_sha256: Some(sha256_hex(archive_contents)),
+            files: vec![SkillPackageFileDto {
+                path: "bin/client".into(),
+                size_bytes: 6,
+                checksum_sha256: sha256_hex("client"),
+                executable: true,
+            }],
+        }
+    }
+
+    #[test]
     fn model_gateway_configuration_is_explicit_and_validated() {
         let (url, token) =
             validate_model_gateway_config("http://model-gateway:8090/", "gateway-token").unwrap();
@@ -20501,6 +21822,312 @@ mod tests {
             .await
             .unwrap(),
             (2, sha256_hex("check tests too"))
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn skill_package_replacement_is_atomic_and_publishes_configuration_refresh(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM agents WHERE id = $1")
+            .bind(fixture.agent_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        let skill_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO skills
+                 (id, owner_id, name, description, content, content_checksum_sha256)
+             VALUES ($1, $2, 'Initial Skill', 'initial', 'initial content', $3)",
+        )
+        .bind(skill_id)
+        .bind(owner_id)
+        .bind(sha256_hex("initial content"))
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO agent_skills (agent_id, skill_id) VALUES ($1, $2)")
+            .bind(fixture.agent_id)
+            .bind(skill_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        let _ = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+
+        let first_package_id = Uuid::new_v4();
+        let first_object_key =
+            format!("skill-packages/{owner_id}/{skill_id}/{first_package_id}.tar.zst");
+        let first = staged_skill_package_upload("Packaged Skill", "first body", "archive-one");
+        commit_skill_package_upload(
+            &fixture.state.pool,
+            skill_id,
+            owner_id,
+            Some(first_package_id),
+            Some(&first_object_key),
+            &first,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query_as::<_, (i64, Option<Uuid>, String, String)>(
+                "SELECT revision, current_package_id, name, content
+                 FROM skills WHERE id = $1",
+            )
+            .bind(skill_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            (
+                2,
+                Some(first_package_id),
+                "Packaged Skill".into(),
+                "first body".into()
+            )
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (i64, i64)>(
+                "SELECT agents.execution_config_revision,
+                        sessions.configuration_refresh_revision
+                 FROM agents
+                 JOIN hub_sessions AS sessions ON sessions.agent_id = agents.id
+                 WHERE agents.id = $1 AND sessions.id = $2",
+            )
+            .bind(fixture.agent_id)
+            .bind(fixture.hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            (2, 2)
+        );
+
+        let failed_package_id = Uuid::new_v4();
+        let failed = staged_skill_package_upload("Must Roll Back", "failed body", "archive-fail");
+        assert!(commit_skill_package_upload(
+            &fixture.state.pool,
+            skill_id,
+            owner_id,
+            Some(failed_package_id),
+            Some(&first_object_key),
+            &failed,
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            sqlx::query_as::<_, (i64, Option<Uuid>, i64, i64)>(
+                "SELECT skills.revision, skills.current_package_id,
+                        agents.execution_config_revision,
+                        sessions.configuration_refresh_revision
+                 FROM skills
+                 JOIN agent_skills ON agent_skills.skill_id = skills.id
+                 JOIN agents ON agents.id = agent_skills.agent_id
+                 JOIN hub_sessions AS sessions ON sessions.agent_id = agents.id
+                 WHERE skills.id = $1 AND sessions.id = $2",
+            )
+            .bind(skill_id)
+            .bind(fixture.hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            (2, Some(first_package_id), 2, 2)
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM skill_packages WHERE id = $1",)
+                .bind(failed_package_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM skill_package_deletion_queue")
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let second_package_id = Uuid::new_v4();
+        let second_object_key =
+            format!("skill-packages/{owner_id}/{skill_id}/{second_package_id}.tar.zst");
+        let second = staged_skill_package_upload("Packaged Skill", "second body", "archive-two");
+        commit_skill_package_upload(
+            &fixture.state.pool,
+            skill_id,
+            owner_id,
+            Some(second_package_id),
+            Some(&second_object_key),
+            &second,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query_as::<_, (i64, Option<Uuid>, i64, i64)>(
+                "SELECT skills.revision, skills.current_package_id,
+                        agents.execution_config_revision,
+                        sessions.configuration_refresh_revision
+                 FROM skills
+                 JOIN agent_skills ON agent_skills.skill_id = skills.id
+                 JOIN agents ON agents.id = agent_skills.agent_id
+                 JOIN hub_sessions AS sessions ON sessions.agent_id = agents.id
+                 WHERE skills.id = $1 AND sessions.id = $2",
+            )
+            .bind(skill_id)
+            .bind(fixture.hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            (3, Some(second_package_id), 3, 3)
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM skill_packages WHERE id = $1",)
+                .bind(first_package_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT object_key FROM skill_package_deletion_queue",)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap(),
+            first_object_key
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn skill_package_deletion_queue_preserves_current_and_active_run_objects(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM agents WHERE id = $1")
+            .bind(fixture.agent_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        let skill_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO skills
+                 (id, owner_id, name, description, content, content_checksum_sha256)
+             VALUES ($1, $2, 'Queued Skill', 'queued', 'queued content', $3)",
+        )
+        .bind(skill_id)
+        .bind(owner_id)
+        .bind(sha256_hex("queued content"))
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        let store_root = tempfile::tempdir().unwrap();
+        let store = Arc::new(SkillPackageStore::local(store_root.path().to_path_buf()).unwrap());
+        let current_package_id = Uuid::new_v4();
+        let current_object_key =
+            format!("skill-packages/{owner_id}/{skill_id}/{current_package_id}.tar.zst");
+        let current = staged_skill_package_upload("Queued Skill", "current", "current-object");
+        store
+            .put_file(
+                &current_object_key,
+                current.archive_path.as_deref().unwrap(),
+                current.archive_size_bytes.unwrap(),
+                current.archive_checksum_sha256.as_deref().unwrap(),
+            )
+            .await
+            .unwrap();
+        commit_skill_package_upload(
+            &fixture.state.pool,
+            skill_id,
+            owner_id,
+            Some(current_package_id),
+            Some(&current_object_key),
+            &current,
+        )
+        .await
+        .unwrap();
+
+        let _ = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        let snapshotted_package_id = Uuid::new_v4();
+        let snapshotted_object_key =
+            format!("skill-packages/{owner_id}/{skill_id}/{snapshotted_package_id}.tar.zst");
+        let snapshotted =
+            staged_skill_package_upload("Queued Skill", "snapshot", "snapshot-object");
+        store
+            .put_file(
+                &snapshotted_object_key,
+                snapshotted.archive_path.as_deref().unwrap(),
+                snapshotted.archive_size_bytes.unwrap(),
+                snapshotted.archive_checksum_sha256.as_deref().unwrap(),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO run_skill_packages
+                 (run_id, skill_id, package_id, object_key, format_version,
+                  size_bytes, checksum_sha256, files)
+             VALUES ($1, $2, $3, $4, 1, $5, $6, $7)",
+        )
+        .bind(fixture.run_id)
+        .bind(skill_id)
+        .bind(snapshotted_package_id)
+        .bind(&snapshotted_object_key)
+        .bind(snapshotted.archive_size_bytes.unwrap() as i64)
+        .bind(snapshotted.archive_checksum_sha256.as_deref().unwrap())
+        .bind(serde_json::to_value(&snapshotted.files).unwrap())
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        enqueue_skill_package_deletion(&fixture.state.pool, owner_id, &current_object_key)
+            .await
+            .unwrap();
+        enqueue_skill_package_deletion(&fixture.state.pool, owner_id, &snapshotted_object_key)
+            .await
+            .unwrap();
+
+        let mut deletion_state = fixture.state.as_ref().clone();
+        deletion_state.skill_package_store = Some(store.clone());
+        process_skill_package_deletion_queue(&deletion_state).await;
+        assert!(store.get(&current_object_key).await.is_ok());
+        assert!(store.get(&snapshotted_object_key).await.is_ok());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM skill_package_deletion_queue")
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap(),
+            2
+        );
+
+        sqlx::query("DELETE FROM skill_packages WHERE id = $1")
+            .bind(current_package_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE runs SET status = 'pending' WHERE id = $1")
+            .bind(fixture.run_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        process_skill_package_deletion_queue(&deletion_state).await;
+        assert!(store.get(&current_object_key).await.is_err());
+        assert!(store.get(&snapshotted_object_key).await.is_ok());
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT object_key FROM skill_package_deletion_queue")
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap(),
+            snapshotted_object_key
+        );
+
+        sqlx::query("UPDATE runs SET status = 'completed' WHERE id = $1")
+            .bind(fixture.run_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        process_skill_package_deletion_queue(&deletion_state).await;
+        assert!(store.get(&snapshotted_object_key).await.is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM skill_package_deletion_queue")
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap(),
+            0
         );
     }
 
@@ -28819,6 +30446,248 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn runtime_skill_package_download_separates_run_snapshot_from_session_current_package(
+        pool: PgPool,
+    ) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM agents WHERE id = $1")
+            .bind(fixture.agent_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        let skill_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO skills
+                 (id, owner_id, name, description, content, content_checksum_sha256)
+             VALUES ($1, $2, 'Download Skill', 'download', 'read package', $3)",
+        )
+        .bind(skill_id)
+        .bind(owner_id)
+        .bind(sha256_hex("read package"))
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO agent_skills (agent_id, skill_id) VALUES ($1, $2)")
+            .bind(fixture.agent_id)
+            .bind(skill_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+
+        let object_root = tempfile::tempdir().unwrap();
+        let source_root = tempfile::tempdir().unwrap();
+        let store = Arc::new(SkillPackageStore::local(object_root.path().to_path_buf()).unwrap());
+        let file_manifest = vec![SkillPackageFileDto {
+            path: "bin/client".into(),
+            size_bytes: 6,
+            checksum_sha256: sha256_hex("client"),
+            executable: true,
+        }];
+        let first_bytes = b"run-package";
+        let first_checksum = format!("{:x}", Sha256::digest(first_bytes));
+        let first_package_id = Uuid::new_v4();
+        let first_object_key =
+            format!("skill-packages/{owner_id}/{skill_id}/{first_package_id}.tar.zst");
+        let first_source = source_root.path().join("first.tar.zst");
+        tokio::fs::write(&first_source, first_bytes).await.unwrap();
+        store
+            .put_file(
+                &first_object_key,
+                &first_source,
+                first_bytes.len() as u64,
+                &first_checksum,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO skill_packages
+                 (id, skill_id, owner_id, object_key, format_version,
+                  size_bytes, checksum_sha256, files)
+             VALUES ($1, $2, $3, $4, 1, $5, $6, $7)",
+        )
+        .bind(first_package_id)
+        .bind(skill_id)
+        .bind(owner_id)
+        .bind(&first_object_key)
+        .bind(first_bytes.len() as i64)
+        .bind(&first_checksum)
+        .bind(serde_json::to_value(&file_manifest).unwrap())
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE skills SET current_package_id = $1 WHERE id = $2")
+            .bind(first_package_id)
+            .bind(skill_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+
+        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        assert_eq!(
+            claim.execution_configuration.skills[0]
+                .package
+                .as_ref()
+                .map(|package| package.id),
+            Some(first_package_id)
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT package_id FROM run_skill_packages
+                 WHERE run_id = $1 AND skill_id = $2",
+            )
+            .bind(claim.run.id)
+            .bind(skill_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            first_package_id
+        );
+
+        let second_bytes = b"session-package";
+        let second_checksum = format!("{:x}", Sha256::digest(second_bytes));
+        let second_package_id = Uuid::new_v4();
+        let second_object_key =
+            format!("skill-packages/{owner_id}/{skill_id}/{second_package_id}.tar.zst");
+        let second_source = source_root.path().join("second.tar.zst");
+        tokio::fs::write(&second_source, second_bytes)
+            .await
+            .unwrap();
+        store
+            .put_file(
+                &second_object_key,
+                &second_source,
+                second_bytes.len() as u64,
+                &second_checksum,
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO skill_packages
+                 (id, skill_id, owner_id, object_key, format_version,
+                  size_bytes, checksum_sha256, files)
+             VALUES ($1, $2, $3, $4, 1, $5, $6, $7)",
+        )
+        .bind(second_package_id)
+        .bind(skill_id)
+        .bind(owner_id)
+        .bind(&second_object_key)
+        .bind(second_bytes.len() as i64)
+        .bind(&second_checksum)
+        .bind(serde_json::to_value(&file_manifest).unwrap())
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE skills SET current_package_id = $1 WHERE id = $2")
+            .bind(second_package_id)
+            .bind(skill_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM skill_packages WHERE id = $1")
+            .bind(first_package_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+
+        let mut state = (*fixture.state).clone();
+        state.skill_package_store = Some(store);
+        let state = Arc::new(state);
+        let package_headers = |token: &str, generation: i64| {
+            let mut headers = bearer_headers(token);
+            headers.insert(
+                "x-agent-hub-ownership-generation",
+                HeaderValue::from_str(&generation.to_string()).unwrap(),
+            );
+            headers
+        };
+        let stale_run = runtime_download_run_skill_package(
+            State(state.clone()),
+            package_headers(&fixture.runtime_token, 2),
+            Path((claim.run.id, skill_id)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale_run.status, StatusCode::FORBIDDEN);
+
+        let other_runtime_token = format!("ahrt_{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO runtimes
+                 (id, token_hash, hostname, labels, engine_version, capabilities,
+                  sandbox_mode, status)
+             VALUES ($1, $2, $3, '{}', 'test', '{}'::jsonb,
+                     'workspace-write', 'online')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(sha256_hex(&other_runtime_token))
+        .bind(format!("skill-download-{}", Uuid::new_v4().simple()))
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let foreign_run = runtime_download_run_skill_package(
+            State(state.clone()),
+            package_headers(&other_runtime_token, 1),
+            Path((claim.run.id, skill_id)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(foreign_run.status, StatusCode::FORBIDDEN);
+
+        let run_response = runtime_download_run_skill_package(
+            State(state.clone()),
+            package_headers(&fixture.runtime_token, 1),
+            Path((claim.run.id, skill_id)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            run_response.headers()["x-agent-hub-skill-package-id"],
+            first_package_id.to_string()
+        );
+        assert_eq!(
+            axum::body::to_bytes(run_response.into_body(), 1024)
+                .await
+                .unwrap(),
+            first_bytes.as_slice()
+        );
+
+        let stale_session = runtime_download_session_skill_package(
+            State(state.clone()),
+            package_headers(&fixture.runtime_token, 2),
+            Path((fixture.hub_session_id, skill_id, second_package_id)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale_session.status, StatusCode::FORBIDDEN);
+        let old_session = runtime_download_session_skill_package(
+            State(state.clone()),
+            package_headers(&fixture.runtime_token, 1),
+            Path((fixture.hub_session_id, skill_id, first_package_id)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(old_session.status, StatusCode::NOT_FOUND);
+
+        let session_response = runtime_download_session_skill_package(
+            State(state),
+            package_headers(&fixture.runtime_token, 1),
+            Path((fixture.hub_session_id, skill_id, second_package_id)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            session_response.headers()["x-agent-hub-skill-package-id"],
+            second_package_id.to_string()
+        );
+        assert_eq!(
+            axum::body::to_bytes(session_response.into_body(), 1024)
+                .await
+                .unwrap(),
+            second_bytes.as_slice()
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn retained_owner_bundle_retry_reuses_commit_without_rewriting_current_object(
         pool: PgPool,
     ) {
@@ -32225,6 +34094,44 @@ mod tests {
         .await
         .unwrap();
 
+        let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM agents WHERE id = $1")
+            .bind(fixture.agent_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        let skill_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO skills
+                 (id, owner_id, name, description, content, content_checksum_sha256)
+             VALUES ($1, $2, 'Restore Skill', 'restore', 'initial', $3)",
+        )
+        .bind(skill_id)
+        .bind(owner_id)
+        .bind(sha256_hex("initial"))
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO agent_skills (agent_id, skill_id) VALUES ($1, $2)")
+            .bind(fixture.agent_id)
+            .bind(skill_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        let first_package_id = Uuid::new_v4();
+        let first_object_key =
+            format!("skill-packages/{owner_id}/{skill_id}/{first_package_id}.tar.zst");
+        let first_package = staged_skill_package_upload("Restore Skill", "package A", "archive A");
+        commit_skill_package_upload(
+            &fixture.state.pool,
+            skill_id,
+            owner_id,
+            Some(first_package_id),
+            Some(&first_object_key),
+            &first_package,
+        )
+        .await
+        .unwrap();
+
         let restoring_run_id =
             insert_pending_session_run(&fixture.state.pool, fixture.hub_session_id).await;
         let restoring_turn_id: Uuid =
@@ -32280,6 +34187,41 @@ mod tests {
             .await
             .unwrap(),
             ("pending".into(), None)
+        );
+        let restoring_package = restoring_claim
+            .execution_configuration
+            .skills
+            .iter()
+            .find(|skill| skill.source_id == Some(skill_id))
+            .and_then(|skill| skill.package.as_ref())
+            .unwrap();
+        assert_eq!(restoring_package.id, first_package_id);
+
+        let second_package_id = Uuid::new_v4();
+        let second_object_key =
+            format!("skill-packages/{owner_id}/{skill_id}/{second_package_id}.tar.zst");
+        let second_package = staged_skill_package_upload("Restore Skill", "package B", "archive B");
+        commit_skill_package_upload(
+            &fixture.state.pool,
+            skill_id,
+            owner_id,
+            Some(second_package_id),
+            Some(&second_object_key),
+            &second_package,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT package_id FROM run_skill_packages
+                 WHERE run_id = $1 AND skill_id = $2",
+            )
+            .bind(restoring_run_id)
+            .bind(skill_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            first_package_id
         );
 
         let admin_token = create_super_admin_session(&fixture.state.pool).await;
@@ -32346,6 +34288,20 @@ mod tests {
         assert_eq!(reclaimed.run.id, restoring_run_id);
         assert_eq!(reclaimed.run.status, "running");
         assert_eq!(reclaimed.run.session_ownership_generation, Some(4));
+        assert_eq!(
+            reclaimed.execution_configuration.model_bindings,
+            restoring_claim.execution_configuration.model_bindings
+        );
+        assert_eq!(
+            reclaimed
+                .execution_configuration
+                .skills
+                .iter()
+                .find(|skill| skill.source_id == Some(skill_id))
+                .and_then(|skill| skill.package.as_ref())
+                .map(|package| package.id),
+            Some(first_package_id)
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -42139,6 +44095,7 @@ mod tests {
             model_gateway_url: "http://127.0.0.1:1".into(),
             model_gateway_auth_token: Arc::new(Zeroizing::new("test-gateway-token".into())),
             session_bundle_store: None,
+            skill_package_store: None,
             session_bundle_max_bytes: DEFAULT_SESSION_BUNDLE_MAX_BYTES,
             auth_providers: Vec::new(),
             session_issuer: Arc::new(BrowserSessionIssuer),
@@ -42872,6 +44829,7 @@ mod tests {
             model_gateway_url: "http://127.0.0.1:1".into(),
             model_gateway_auth_token: Arc::new(Zeroizing::new("test-gateway-token".into())),
             session_bundle_store: None,
+            skill_package_store: None,
             session_bundle_max_bytes: DEFAULT_SESSION_BUNDLE_MAX_BYTES,
             auth_providers: Vec::new(),
             session_issuer: Arc::new(BrowserSessionIssuer),

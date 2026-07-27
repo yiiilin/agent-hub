@@ -868,9 +868,32 @@ pub struct SkillDto {
     pub content: String,
     pub revision: i64,
     pub content_checksum_sha256: String,
+    #[serde(default)]
+    pub package: Option<SkillPackageDto>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillPackageFileDto {
+    pub path: String,
+    pub size_bytes: u64,
+    pub checksum_sha256: String,
+    pub executable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillPackageDto {
+    pub id: Uuid,
+    pub format_version: u32,
+    pub size_bytes: u64,
+    pub checksum_sha256: String,
+    pub files: Vec<SkillPackageFileDto>,
+}
+
+pub const MAX_SKILL_PACKAGE_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_SKILL_PACKAGE_EXPANDED_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_SKILL_PACKAGE_FILES: usize = 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentExecutionConfigurationDto {
@@ -901,6 +924,8 @@ pub struct AgentExecutionSkillDto {
     pub content: String,
     pub revision: i64,
     pub content_checksum_sha256: String,
+    #[serde(default)]
+    pub package: Option<SkillPackageDto>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1020,7 +1045,7 @@ pub fn execution_configuration_fingerprint(
 
     let mut names = BTreeSet::new();
     let mut skills = configuration.skills.clone();
-    for skill in &skills {
+    for skill in &mut skills {
         if skill.revision <= 0 {
             return Err(ExecutionConfigurationError(
                 "Skill revision must be positive",
@@ -1046,6 +1071,45 @@ pub fn execution_configuration_fingerprint(
                 "Skill content checksum does not match",
             ));
         }
+        if let Some(package) = &mut skill.package {
+            if package.id.is_nil()
+                || package.format_version != 1
+                || package.size_bytes == 0
+                || package.size_bytes > MAX_SKILL_PACKAGE_ARCHIVE_BYTES
+                || !is_lowercase_sha256(&package.checksum_sha256)
+                || package.files.is_empty()
+                || package.files.len() > MAX_SKILL_PACKAGE_FILES
+            {
+                return Err(ExecutionConfigurationError(
+                    "Skill package metadata is invalid",
+                ));
+            }
+            package
+                .files
+                .sort_by(|left, right| left.path.cmp(&right.path));
+            let mut paths = BTreeSet::new();
+            let mut expanded_bytes = 0_u64;
+            for file in &package.files {
+                let path_is_safe = !file.path.is_empty()
+                    && !file.path.starts_with('/')
+                    && !file.path.contains('\\')
+                    && file.path != "SKILL.md"
+                    && file.path.split('/').all(|component| {
+                        !component.is_empty() && component != "." && component != ".."
+                    });
+                expanded_bytes = expanded_bytes.saturating_add(file.size_bytes);
+                if !path_is_safe
+                    || !paths.insert(file.path.clone())
+                    || !is_lowercase_sha256(&file.checksum_sha256)
+                    || file.executable != file.path.starts_with("bin/")
+                    || expanded_bytes > MAX_SKILL_PACKAGE_EXPANDED_BYTES
+                {
+                    return Err(ExecutionConfigurationError(
+                        "Skill package file metadata is invalid",
+                    ));
+                }
+            }
+        }
     }
     skills.sort_by(|left, right| {
         left.name
@@ -1063,6 +1127,7 @@ pub fn execution_configuration_fingerprint(
                 "description": skill.description,
                 "revision": skill.revision,
                 "content_checksum_sha256": skill.content_checksum_sha256,
+                "package": skill.package,
             })
         })
         .collect::<Vec<_>>();
@@ -1085,6 +1150,13 @@ pub fn execution_configuration_fingerprint(
         "sha256:{}",
         sha256_hex(canonical_json(&value).as_bytes())
     ))
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn normalized_agent_tool_allowlist(
@@ -1546,6 +1618,7 @@ pub const AGENT_TOOL_NAMES: &[&str] = &[
     "edit",
     "write",
     "bash",
+    "skill_exec",
     "integration",
 ];
 
@@ -2622,6 +2695,7 @@ mod tests {
                 content: content.into(),
                 revision: 3,
                 content_checksum_sha256: sha256_hex(content.as_bytes()),
+                package: None,
             }],
             mcp_allowlist: json!([]),
             tool_allowlist: default_agent_tool_allowlist(),
@@ -3160,6 +3234,7 @@ mod tests {
                 content: content.into(),
                 revision: 1,
                 content_checksum_sha256: sha256_hex(content.as_bytes()),
+                package: None,
             }],
             mcp_allowlist: json!([]),
             tool_allowlist: default_agent_tool_allowlist(),

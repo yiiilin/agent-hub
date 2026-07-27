@@ -7,6 +7,7 @@ const ownerId = '10000000-0000-4000-8000-000000000001';
 const alphaId = '20000000-0000-4000-8000-000000000001';
 const betaId = '20000000-0000-4000-8000-000000000002';
 const agentId = '30000000-0000-4000-8000-000000000001';
+const packageId = '60000000-0000-4000-8000-000000000001';
 const now = '2026-07-11T08:00:00.000Z';
 
 const automaticModelSettings: AgentModelSettings = {
@@ -24,8 +25,15 @@ const automaticModelSettings: AgentModelSettings = {
 };
 
 const skills = [
-  { id: alphaId, owner_id: ownerId, name: 'Alpha review', description: 'Used review skill', content: 'Alpha content', revision: 2, content_checksum_sha256: 'a'.repeat(64), created_at: '2026-07-01T08:00:00.000Z', updated_at: '2026-07-10T08:00:00.000Z' },
-  { id: betaId, owner_id: ownerId, name: 'Beta notes', description: '', content: 'Beta content', revision: 1, content_checksum_sha256: 'b'.repeat(64), created_at: '2026-07-02T08:00:00.000Z', updated_at: '2026-07-09T08:00:00.000Z' }
+  {
+    id: alphaId, owner_id: ownerId, name: 'Alpha review', description: 'Used review skill', content: 'Alpha content', revision: 2, content_checksum_sha256: 'a'.repeat(64),
+    package: {
+      id: packageId, format_version: 1, size_bytes: 2048, checksum_sha256: 'c'.repeat(64),
+      files: [{ path: 'bin/review.sh', size_bytes: 512, checksum_sha256: 'd'.repeat(64), executable: true }]
+    },
+    created_at: '2026-07-01T08:00:00.000Z', updated_at: '2026-07-10T08:00:00.000Z'
+  },
+  { id: betaId, owner_id: ownerId, name: 'Beta notes', description: '', content: 'Beta content', revision: 1, content_checksum_sha256: 'b'.repeat(64), package: null, created_at: '2026-07-02T08:00:00.000Z', updated_at: '2026-07-09T08:00:00.000Z' }
 ];
 
 const agents = [{
@@ -48,7 +56,7 @@ async function mockSkills(page: Page, options: { failSkills?: boolean; failAgent
       createCount += 1;
       await options.createGate;
       const body = route.request().postDataJSON() as { name: string; description: string; content: string };
-      await route.fulfill({ json: { ...body, id: '20000000-0000-4000-8000-000000000003', owner_id: ownerId, revision: 1, content_checksum_sha256: 'c'.repeat(64), created_at: now, updated_at: now } });
+      await route.fulfill({ json: { ...body, id: '20000000-0000-4000-8000-000000000003', owner_id: ownerId, revision: 1, content_checksum_sha256: 'c'.repeat(64), package: null, created_at: now, updated_at: now } });
       return;
     }
     if (options.failSkills) await route.fulfill({ status: 500, json: { error: 'private database detail' } });
@@ -113,6 +121,108 @@ test('skills loading failures are retryable and agent failure does not discard s
   await expect(page.getByRole('heading', { name: 'Skill not found' })).toBeVisible();
 });
 
+test('skill package metadata and files are visible and package removal keeps the Skill', async ({ page }) => {
+  await mockSkills(page);
+  let packageDeleteCount = 0;
+  await page.route(`**/api/skills/${alphaId}/package`, async (route) => {
+    expect(route.request().method()).toBe('DELETE');
+    packageDeleteCount += 1;
+    await route.fulfill({ json: { ...skills[0], revision: 3, package: null, updated_at: now } });
+  });
+  await page.goto(`/skills/${alphaId}`);
+
+  const packagePanel = page.locator('.skill-package-panel');
+  await expect(packagePanel.getByRole('heading', { name: 'Skill package' })).toBeVisible();
+  await expect(packagePanel).toContainText(packageId);
+  await expect(packagePanel).toContainText('Format version1');
+  await expect(packagePanel).toContainText('2 KB');
+  await expect(packagePanel).toContainText('c'.repeat(64));
+  await expect(packagePanel.getByRole('list', { name: 'Package files' })).toContainText('bin/review.sh');
+  await expect(packagePanel).toContainText('Executable');
+
+  const confirmation = page.waitForEvent('dialog');
+  const removeClick = packagePanel.getByRole('button', { name: 'Remove package' }).click();
+  const dialog = await confirmation;
+  expect(dialog.message()).toBe('Remove the attached package? The Skill will be kept.');
+  await dialog.accept();
+  await removeClick;
+
+  await expect(packagePanel).toContainText('No package attached.');
+  await expect(packagePanel.getByRole('status')).toHaveText('Skill package removed.');
+  await expect(page.getByRole('heading', { name: 'Alpha review' })).toBeVisible();
+  await expect(page).toHaveURL(`/skills/${alphaId}`);
+  expect(packageDeleteCount).toBe(1);
+});
+
+test('directory package upload preserves nested paths and sends ordered multipart fields', async ({ page }) => {
+  await mockSkills(page);
+  let multipartBody = '';
+  let contentType = '';
+  await page.route(`**/api/skills/${betaId}/package`, async (route) => {
+    expect(route.request().method()).toBe('PUT');
+    multipartBody = route.request().postData() ?? '';
+    contentType = route.request().headers()['content-type'] ?? '';
+    await route.fulfill({ json: {
+      ...skills[1],
+      name: 'Uploaded review',
+      description: 'Uploaded package',
+      content: '# Uploaded',
+      revision: 2,
+      content_checksum_sha256: 'e'.repeat(64),
+      package: {
+        id: packageId,
+        format_version: 1,
+        size_bytes: 4096,
+        checksum_sha256: 'f'.repeat(64),
+        files: [
+          { path: 'scripts/check.sh', size_bytes: 17, checksum_sha256: '1'.repeat(64), executable: false },
+          { path: 'references/guide.md', size_bytes: 7, checksum_sha256: '2'.repeat(64), executable: false }
+        ]
+      },
+      updated_at: now
+    } });
+  });
+  await page.goto(`/skills/${betaId}`);
+  await page.getByRole('button', { name: 'Upload package' }).click();
+
+  const packageDialog = page.getByRole('dialog', { name: 'Upload package' });
+  const directoryInput = packageDialog.locator('input[data-package-input="directory"]');
+  await expect(directoryInput).toHaveJSProperty('webkitdirectory', true);
+  await expect(directoryInput).toHaveAttribute('multiple', '');
+  await directoryInput.evaluate((input: HTMLInputElement) => {
+    const data = new DataTransfer();
+    const entries = [
+      ['SKILL.md', 'review-kit/SKILL.md', '---\nname: Uploaded review\ndescription: Uploaded package\n---\n# Uploaded'],
+      ['check.sh', 'review-kit/scripts/check.sh', '#!/bin/sh\necho ok'],
+      ['guide.md', 'review-kit/references/guide.md', '# Guide']
+    ];
+    for (const [name, relativePath, body] of entries) {
+      const file = new File([body], name, { type: 'text/plain' });
+      Object.defineProperty(file, 'webkitRelativePath', { value: relativePath });
+      data.items.add(file);
+    }
+    Object.defineProperty(input, 'files', { configurable: true, value: data.files });
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+
+  const selection = packageDialog.getByRole('region', { name: 'Selected files' });
+  await expect(selection).toContainText('SKILL.md');
+  await expect(selection).toContainText('scripts/check.sh');
+  await expect(selection).toContainText('references/guide.md');
+  await expect(selection).not.toContainText('review-kit/');
+  await packageDialog.getByRole('button', { name: 'Upload package' }).click();
+
+  expect(contentType).toMatch(/^multipart\/form-data; boundary=/);
+  expect(contentType).not.toContain('application/json');
+  expect(multipartBody).toContain('{"paths":["SKILL.md","scripts/check.sh","references/guide.md"]}');
+  expect(multipartBody.indexOf('name="manifest"')).toBeLessThan(multipartBody.indexOf('name="file-0"'));
+  expect(multipartBody.indexOf('name="file-0"')).toBeLessThan(multipartBody.indexOf('name="file-1"'));
+  expect(multipartBody.indexOf('name="file-1"')).toBeLessThan(multipartBody.indexOf('name="file-2"'));
+  await expect(page.getByRole('heading', { name: 'Uploaded review' })).toBeVisible();
+  await expect(page.locator('.skill-package-panel').getByRole('list', { name: 'Package files' })).toContainText('references/guide.md');
+  await expect(page.locator('.skill-package-panel').getByRole('status')).toHaveText('Skill package uploaded.');
+});
+
 test('bulk delete sends one all-or-nothing request for item and visible selections', async ({ page }) => {
   await mockSkills(page);
   let deleteCount = 0;
@@ -159,10 +269,13 @@ test('bulk delete sends one all-or-nothing request for item and visible selectio
 });
 
 test('skills ignore late responses after unmount and fit a 390px localized viewport', async ({ page }) => {
+  const pageErrors: string[] = [];
+  const consoleErrors: string[] = [];
   let releaseSkills!: () => void;
   const skillsGate = new Promise<void>((resolve) => { releaseSkills = resolve; });
   await mockSession(page);
   await page.route('**/api/skills', async (route) => { await skillsGate; await route.fulfill({ json: skills }); });
+  await page.route(`**/api/skills/${alphaId}`, (route) => route.fulfill({ json: skills[0] }));
   await page.route('**/api/agents', (route) => route.fulfill({ json: agents }));
   await page.route('**/api/users', (route) => route.fulfill({ json: [] }));
   await page.setViewportSize({ width: 390, height: 844 });
@@ -171,13 +284,21 @@ test('skills ignore late responses after unmount and fit a 390px localized viewp
   releaseSkills();
   await expect(page.getByText('Create Agent', { exact: true })).toBeVisible();
 
+  page.on('pageerror', (error) => pageErrors.push(error.message));
+  page.on('console', (message) => { if (message.type() === 'error') consoleErrors.push(message.text()); });
   await page.goto('/skills');
   await expect(page.getByRole('link', { name: /Alpha review/ })).toBeVisible();
   await page.getByLabel('Language').selectOption('zh-CN');
   await expect(page.getByRole('heading', { name: '技能' })).toBeVisible();
+  await page.getByRole('link', { name: /Alpha review/ }).click();
+  await expect(page.getByRole('heading', { name: '技能包' })).toBeVisible();
+  await page.getByRole('button', { name: '替换技能包' }).click();
+  await expect(page.getByRole('dialog', { name: '替换技能包' })).toBeVisible();
   const dimensions = await page.evaluate(() => ({ scrollWidth: document.documentElement.scrollWidth, innerWidth: window.innerWidth }));
   expect(dimensions.scrollWidth).toBeLessThanOrEqual(dimensions.innerWidth);
   await expect(page.getByRole('complementary', { name: '主导航' })).toBeVisible();
+  expect(pageErrors).toEqual([]);
+  expect(consoleErrors).toEqual([]);
 });
 
 test('create modal traps focus, closes with Escape, restores focus, and prevents duplicate submit', async ({ page }) => {

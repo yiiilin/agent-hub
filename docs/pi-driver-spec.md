@@ -23,8 +23,9 @@ session-root/
   engine-state/              # Pi 的隔离 HOME
     .pi/agent/AGENTS.md      # Hub 生成的 Agent 指令
     .pi/agent/models.json    # 只指向 Runtime loopback proxy
-    .pi/agent/skills/        # Hub/本地 Skill 快照
+    .pi/agent/skills/        # 当前 Session 的 Hub/本地 Skill 快照
     sessions/                # Pi JSONL native session state
+    skill-exec/              # 当前 Session 的 Package 执行副本、catalog 和临时目录
   supervisor/session.json    # Hub owner/generation/idle metadata
   staging/                   # 不归档的临时文件
 ```
@@ -47,6 +48,7 @@ Runtime 明确传递 Workspace cwd、进程组、受限环境变量和工具 all
 | 新 Session / Bundle 恢复 | `get_state` | 保存 Pi Native Session ID 和 `sessionFile` |
 | 设置主模型 | `set_model` | provider 仅是当前 Run binding 的本地代理 |
 | 设置推理强度 | `set_thinking_level` | Pi `max` 可通过 model map 映射到 upstream `ultra` |
+| 原子配置刷新 | `reload_resources` | 重新发现 AGENTS.md 和 Skills，不重启进程或 Native Session |
 | 空闲用户消息 | `prompt` | Hub 已持久化的有序普通消息合并为一次 prompt |
 | active Turn 的立即引导 | `steer` | 只针对当前 Hub Turn；旧 Turn 被拒绝时回到下一 Turn |
 | 显式停止 | `abort` | 不撤销已写文件、已执行命令或已持久化事件 |
@@ -93,10 +95,22 @@ Integration Session 声明的具体工具名加入 Pi allowlist；没有 Integra
 时不会凭该标志生成工具。Agent/App/public/sandbox 任一层拒绝的工具都不能被后续层
 重新加入。
 
+`skill_exec` 也是 Runtime 注册的 Pi Extension 工具，不是 Pi builtin 或 `bash` 的
+别名。启用 Skill 不会自动补回 `read`；只有最终 execution configuration 允许
+`skill_exec`，且当前 Session 至少一个已启用 Package 的 manifest 声明了 `bin/*`
+可执行文件时，Runtime 才注册该工具。调用只接受 catalog 中精确的 Skill 名和
+`bin/` 相对路径，不经过 shell。脚本 shebang 只接受一个受控解释器：直接解释器
+路径不得带参数，`/usr/bin/env` 后也只能有一个解释器名。Runtime 为每次调用创建
+私有临时 HOME，以 Linux Landlock 将 Package 设为只读，并按最终文件工具权限限制
+Workspace；若最终策略没有任何可读 Workspace 的文件工具，`skill_exec` 也不能读取
+Workspace。参数、stdin、stdout/stderr、超时和子进程组均有硬限制；主程序正常退出
+后也会终止其遗留后台进程。非 Linux Runtime 不提供 `skill_exec`。
+
 Pi 的 `--tools` 和 Linux Landlock 文件权限都在进程启动时固定。Runtime 记录在线
-Pi 进程的有效工具集合；配置刷新不打断活动 Turn，但下一 Turn 的有效集合发生变化时，
-Runtime 必须先停止空闲 Pi，再从同一 JSONL 恢复同一个 Native Session 并传入新的
-`--tools`。集合未变化时继续复用原进程。
+Pi 进程的有效工具集合。配置刷新不打断活动 Turn；Runtime 在配置文件原子切换后
+调用 Pi 原生 `reload_resources`，使原进程重新发现 AGENTS.md 和 Skills。下一 Turn
+的有效工具集合发生变化时，Runtime 必须先停止空闲 Pi，再从同一 JSONL 恢复同一个
+Native Session 并传入新的 `--tools`；集合未变化时不重启进程。
 
 Pi 进程仍运行在 Runtime 的非 root 用户、容器/操作系统隔离和每个 Session
 Workspace 下。此表不承诺其他执行引擎 sandbox 的字节级等价；若部署要求比 Runtime
@@ -110,7 +124,7 @@ Bundle 只包含 `workspace/`、`manifest.json` 和 `native-session/`。最后�
 中的 `native_session_id` 相同的 Pi recovery JSONL。
 创建和恢复都不以文件名判断 Session 身份。不得包含：
 
-- `.pi/agent/models.json`、`auth.json`、settings、extensions、Skills 或缓存；
+- `.pi/agent/models.json`、`auth.json`、settings、extensions、Skills、`skill-exec/` 或缓存；
 - Hub Runtime credential、model-proxy token、provider key、S3 credential；
 - Pi binary、日志、npm/Bun 目录、session index/metadata 或其他 Session 文件。
 

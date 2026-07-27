@@ -1,6 +1,6 @@
-import { ArrowLeft, Plus, Save, Search, Sparkles, Trash2 } from 'lucide-react';
+import { ArrowLeft, Files, FolderOpen, PackageOpen, Plus, Save, Search, Sparkles, Trash2, Upload } from 'lucide-react';
 import { FormEvent, MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Agent, api, ApiError, Skill } from './api/client';
+import { Agent, api, ApiError, Skill, SkillPackageUploadFile } from './api/client';
 import { FormDialog } from './components/form-dialog';
 import { MarkdownEditor } from './components/markdown-editor';
 import { useI18n } from './i18n';
@@ -17,6 +17,28 @@ function appLink(event: MouseEvent<HTMLAnchorElement>, path: string, navigate: N
 
 function skillUsage(skillId: string, agents: Agent[]) {
   return agents.filter((agent) => agent.managed_skill_ids.includes(skillId));
+}
+
+function formatFileSize(sizeBytes: number, locale: string) {
+  if (sizeBytes < 1024) return `${sizeBytes} B`;
+  const units = ['KB', 'MB', 'GB'];
+  let value = sizeBytes / 1024;
+  let unit = units[0];
+  for (let index = 1; index < units.length && value >= 1024; index += 1) {
+    value /= 1024;
+    unit = units[index];
+  }
+  return `${new Intl.NumberFormat(locale, { maximumFractionDigits: 1 }).format(value)} ${unit}`;
+}
+
+function selectedPackageFiles(fileList: FileList, fromDirectory: boolean): SkillPackageUploadFile[] {
+  const files = Array.from(fileList);
+  const paths = files.map((file) => file.webkitRelativePath || file.name);
+  const firstRoot = paths[0]?.split('/')[0];
+  const rootPrefix = fromDirectory && firstRoot && paths.every((path) => path.startsWith(`${firstRoot}/`))
+    ? `${firstRoot}/`
+    : '';
+  return files.map((file, index) => ({ file, path: paths[index].slice(rootPrefix.length) }));
 }
 
 function CreateSkillModal({ onClose, onCreated }: { onClose: () => void; onCreated: (skill: Skill) => void }) {
@@ -67,6 +89,83 @@ function CreateSkillModal({ onClose, onCreated }: { onClose: () => void; onCreat
           <MarkdownEditor label={t('content')} required value={content} onChange={setContent} />
           {error && <div className="error" role="alert">{t('skillSaveFailed')}</div>}
         </form>
+    </FormDialog>
+  );
+}
+
+function SkillPackageModal({
+  replacing,
+  onClose,
+  onUpload
+}: {
+  replacing: boolean;
+  onClose: () => void;
+  onUpload: (files: readonly SkillPackageUploadFile[]) => Promise<void>;
+}) {
+  const { locale, t } = useI18n();
+  const filesButtonRef = useRef<HTMLButtonElement>(null);
+  const filesInputRef = useRef<HTMLInputElement>(null);
+  const directoryInputRef = useRef<HTMLInputElement>(null);
+  const submittingRef = useRef(false);
+  const mountedRef = useRef(true);
+  const [files, setFiles] = useState<SkillPackageUploadFile[]>([]);
+  const [pending, setPending] = useState(false);
+  const [uploadFailed, setUploadFailed] = useState(false);
+
+  useEffect(() => () => { mountedRef.current = false; }, []);
+
+  const uniquePaths = new Set(files.map((entry) => entry.path));
+  const valid = files.length > 0 && uniquePaths.size === files.length && uniquePaths.has('SKILL.md');
+
+  function select(fileList: FileList | null, fromDirectory: boolean) {
+    if (!fileList) return;
+    setFiles(selectedPackageFiles(fileList, fromDirectory));
+    setUploadFailed(false);
+  }
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    if (submittingRef.current || !valid) return;
+    submittingRef.current = true;
+    setPending(true);
+    setUploadFailed(false);
+    try {
+      await onUpload(files);
+      if (mountedRef.current) onClose();
+    } catch {
+      if (mountedRef.current) setUploadFailed(true);
+    } finally {
+      submittingRef.current = false;
+      if (mountedRef.current) setPending(false);
+    }
+  }
+
+  return (
+    <FormDialog
+      title={t(replacing ? 'replaceSkillPackage' : 'uploadSkillPackage')}
+      eyebrow={t('skillPackage')}
+      busy={pending}
+      onClose={onClose}
+      initialFocusRef={filesButtonRef}
+      className="skill-package-modal"
+      footer={<><button className="secondary" type="button" onClick={onClose} disabled={pending}>{t('cancel')}</button><button className="primary" form="skill-package-form" type="submit" disabled={pending || !valid}><Upload size={16} /> {pending ? t('uploading') : t('uploadSkillPackage')}</button></>}
+    >
+      <form id="skill-package-form" className="stack" onSubmit={submit}>
+        <div className="skill-package-picker-actions">
+          <button ref={filesButtonRef} className="secondary" type="button" disabled={pending} onClick={() => filesInputRef.current?.click()}><Files size={16} /> {t('selectPackageFiles')}</button>
+          <button className="secondary" type="button" disabled={pending} onClick={() => directoryInputRef.current?.click()}><FolderOpen size={16} /> {t('selectPackageFolder')}</button>
+          <input ref={filesInputRef} hidden data-package-input="files" type="file" multiple disabled={pending} onChange={(event) => select(event.currentTarget.files, false)} />
+          <input ref={(node) => { directoryInputRef.current = node; if (node) node.webkitdirectory = true; }} hidden data-package-input="directory" type="file" multiple disabled={pending} onChange={(event) => select(event.currentTarget.files, true)} />
+        </div>
+        <section className="skill-package-selection" aria-label={t('selectedPackageFiles')}>
+          <div className="skill-package-selection-header"><h3>{t('selectedPackageFiles')}</h3><span>{t('packageFileCount').replace('{count}', String(files.length))}</span></div>
+          {files.length === 0
+            ? <p className="muted">{t('noPackageFilesSelected')}</p>
+            : <ol>{files.map((entry) => <li key={entry.path}><code>{entry.path}</code><span>{formatFileSize(entry.file.size, locale)}</span></li>)}</ol>}
+        </section>
+        {files.length > 0 && !valid && <div className="error" role="alert">{t('skillPackageFilesInvalid')}</div>}
+        {uploadFailed && <div className="error" role="alert">{t('skillPackageUploadFailed')}</div>}
+      </form>
     </FormDialog>
   );
 }
@@ -232,6 +331,10 @@ export function SkillDetailPage({ skillId, navigate, setNavigationBlocker }: { s
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<TranslationKey | null>(null);
   const [saved, setSaved] = useState(false);
+  const [packageOpen, setPackageOpen] = useState(false);
+  const [packagePending, setPackagePending] = useState(false);
+  const [packageError, setPackageError] = useState<TranslationKey | null>(null);
+  const [packageNotice, setPackageNotice] = useState<TranslationKey | null>(null);
 
   const load = useCallback(() => {
     const generation = ++generationRef.current;
@@ -263,19 +366,20 @@ export function SkillDetailPage({ skillId, navigate, setNavigationBlocker }: { s
   }, [load]);
 
   const dirty = Boolean(skill) && (name !== skill?.name || description !== skill?.description || content !== skill?.content);
+  const busy = pending || packagePending;
   useEffect(() => {
-    if (!dirty && !pending) { setNavigationBlocker(null); return; }
-    const blocker = () => pending ? false : window.confirm(t('unsavedSkillConfirm'));
+    if (!dirty && !busy) { setNavigationBlocker(null); return; }
+    const blocker = () => busy ? false : window.confirm(t('unsavedSkillConfirm'));
     setNavigationBlocker(blocker);
     const beforeUnload = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ''; };
     window.addEventListener('beforeunload', beforeUnload);
     return () => { setNavigationBlocker(null); window.removeEventListener('beforeunload', beforeUnload); };
-  }, [dirty, pending, setNavigationBlocker, t]);
+  }, [busy, dirty, setNavigationBlocker, t]);
 
   async function save(event: FormEvent) {
     event.preventDefault();
     if (mutationRef.current || !skill) return;
-    mutationRef.current = true; setPending(true); setError(null); setSaved(false);
+    mutationRef.current = true; setPending(true); setError(null); setSaved(false); setPackageNotice(null);
     try {
       const response = await api.updateSkill(skill.id, name, description, content);
       if (mountedRef.current) { setSkill(response); setName(response.name); setDescription(response.description); setContent(response.content); setSaved(true); }
@@ -294,6 +398,53 @@ export function SkillDetailPage({ skillId, navigate, setNavigationBlocker }: { s
     finally { mutationRef.current = false; if (mountedRef.current) setPending(false); }
   }
 
+  async function uploadPackage(files: readonly SkillPackageUploadFile[]) {
+    if (mutationRef.current || !skill) throw new Error('Skill mutation is already pending');
+    mutationRef.current = true;
+    setPackagePending(true);
+    setPackageError(null);
+    setPackageNotice(null);
+    try {
+      const response = await api.replaceSkillPackage(skill.id, files);
+      if (mountedRef.current) {
+        setSkill(response);
+        setName(response.name);
+        setDescription(response.description);
+        setContent(response.content);
+        setSaved(false);
+        setPackageNotice('skillPackageUploaded');
+      }
+    } finally {
+      mutationRef.current = false;
+      if (mountedRef.current) setPackagePending(false);
+    }
+  }
+
+  async function removePackage() {
+    if (mutationRef.current || !skill?.package) return;
+    if (!window.confirm(t('confirmDeleteSkillPackage'))) return;
+    mutationRef.current = true;
+    setPackagePending(true);
+    setPackageError(null);
+    setPackageNotice(null);
+    try {
+      const response = await api.deleteSkillPackage(skill.id);
+      if (mountedRef.current) {
+        setSkill(response);
+        setName(response.name);
+        setDescription(response.description);
+        setContent(response.content);
+        setSaved(false);
+        setPackageNotice('skillPackageRemoved');
+      }
+    } catch {
+      if (mountedRef.current) setPackageError('skillPackageDeleteFailed');
+    } finally {
+      mutationRef.current = false;
+      if (mountedRef.current) setPackagePending(false);
+    }
+  }
+
   if (loading) return <div className="workspace-page"><div className="panel state-panel">{t('loadingSkill')}</div></div>;
   if (notFound) return <div className="workspace-page"><div className="panel state-panel"><h1>{t('skillNotFound')}</h1><button className="secondary" onClick={() => navigate('/skills', true)}>{t('backToSkills')}</button></div></div>;
   if (loadError || !skill) return <div className="workspace-page"><div className="panel state-panel" role="alert"><p>{t('skillLoadFailed')}</p><button className="secondary" onClick={load}>{t('retry')}</button></div></div>;
@@ -301,25 +452,49 @@ export function SkillDetailPage({ skillId, navigate, setNavigationBlocker }: { s
   return (
     <div className="workspace-page skill-detail-page">
       <header className="page-header skill-detail-header">
-        <div><button className="text-button back-button" type="button" disabled={pending} onClick={() => navigate('/skills')}><ArrowLeft size={16} /> {t('backToSkills')}</button><h1>{skill.name}</h1><p>{skill.description || t('noDescription')}</p></div>
+        <div><button className="text-button back-button" type="button" disabled={busy} onClick={() => navigate('/skills')}><ArrowLeft size={16} /> {t('backToSkills')}</button><h1>{skill.name}</h1><p>{skill.description || t('noDescription')}</p></div>
       </header>
       <div className="skill-detail-layout">
         <section className="panel skill-editor">
           <div className="section-title"><Sparkles size={18} /> {t('editSkill')}</div>
           <form className="stack" onSubmit={save}>
-            <label>{t('name')}<input required disabled={pending} value={name} onChange={(event) => { setName(event.target.value); setSaved(false); }} /></label>
-            <label>{t('description')}<input disabled={pending} value={description} onChange={(event) => { setDescription(event.target.value); setSaved(false); }} /></label>
-            <MarkdownEditor className="skill-content" label={t('content')} required disabled={pending} value={content} onChange={(markdown) => { setContent(markdown); setSaved(false); }} />
+            <label>{t('name')}<input required disabled={busy} value={name} onChange={(event) => { setName(event.target.value); setSaved(false); }} /></label>
+            <label>{t('description')}<input disabled={busy} value={description} onChange={(event) => { setDescription(event.target.value); setSaved(false); }} /></label>
+            <MarkdownEditor className="skill-content" label={t('content')} required disabled={busy} value={content} onChange={(markdown) => { setContent(markdown); setSaved(false); }} />
             {error && <div className="error" role="alert">{t(error)}</div>}
             {saved && <div className="success" role="status">{t('changesSaved')}</div>}
-            <div className="button-row"><button className="primary" disabled={pending || !dirty}><Save size={16} /> {pending ? t('saving') : t('saveSkill')}</button><button className="secondary danger" type="button" disabled={pending} onClick={remove}><Trash2 size={16} /> {t('deleteSkill')}</button></div>
+            <div className="button-row"><button className="primary" disabled={busy || !dirty}><Save size={16} /> {pending ? t('saving') : t('saveSkill')}</button><button className="secondary danger" type="button" disabled={busy} onClick={remove}><Trash2 size={16} /> {t('deleteSkill')}</button></div>
           </form>
         </section>
         <aside className="skill-sidebar">
+          <section className="panel skill-package-panel">
+            <div className="skill-package-heading"><PackageOpen size={18} /><h2>{t('skillPackage')}</h2></div>
+            {skill.package ? <>
+              <dl className="metadata-list skill-package-metadata">
+                <div><dt>{t('packageId')}</dt><dd><code>{skill.package.id}</code></dd></div>
+                <div><dt>{t('packageFormatVersion')}</dt><dd>{skill.package.format_version}</dd></div>
+                <div><dt>{t('packageSize')}</dt><dd>{formatFileSize(skill.package.size_bytes, locale)}</dd></div>
+                <div><dt>{t('packageChecksum')}</dt><dd><code>{skill.package.checksum_sha256}</code></dd></div>
+              </dl>
+              <div className="skill-package-files-heading"><h3>{t('packageFiles')}</h3><span>{t('packageFileCount').replace('{count}', String(skill.package.files.length))}</span></div>
+              <ul className="skill-package-files" aria-label={t('packageFiles')}>{skill.package.files.map((file) => <li key={file.path}>
+                <div><code>{file.path}</code>{file.executable && <span>{t('executableFile')}</span>}</div>
+                <small>{formatFileSize(file.size_bytes, locale)}</small>
+                <code className="skill-package-file-checksum">{file.checksum_sha256}</code>
+              </li>)}</ul>
+            </> : <p className="muted">{t('noSkillPackage')}</p>}
+            {packageError && <div className="error" role="alert">{t(packageError)}</div>}
+            {packageNotice && <div className="success" role="status">{t(packageNotice)}</div>}
+            <div className="skill-package-actions">
+              <button className="secondary" type="button" disabled={busy || dirty} onClick={() => { setPackageError(null); setPackageNotice(null); setPackageOpen(true); }}><Upload size={16} /> {t(skill.package ? 'replaceSkillPackage' : 'uploadSkillPackage')}</button>
+              {skill.package && <button className="secondary danger" type="button" disabled={busy || dirty} onClick={removePackage}><Trash2 size={16} /> {packagePending ? t('deleting') : t('removeSkillPackage')}</button>}
+            </div>
+          </section>
           <section className="panel"><h2>{t('details')}</h2><dl className="metadata-list"><div><dt>{t('created')}</dt><dd>{new Date(skill.created_at).toLocaleString(locale)}</dd></div><div><dt>{t('updated')}</dt><dd>{new Date(skill.updated_at).toLocaleString(locale)}</dd></div></dl></section>
-          <section className="panel"><h2>{t('attachedAgents')}</h2>{agentsError ? <div className="warning" role="alert">{t('attachedAgentsUnavailable')}</div> : attachedAgents.length === 0 ? <p className="muted">{t('noAttachedAgents')}</p> : <ul className="attached-agent-list">{attachedAgents.map((agent) => <li key={agent.id}><a href={`/agents/${agent.id}`} aria-disabled={pending || undefined} tabIndex={pending ? -1 : undefined} onClick={(event) => pending ? event.preventDefault() : appLink(event, `/agents/${agent.id}`, navigate)}>{agent.name}</a></li>)}</ul>}</section>
+          <section className="panel"><h2>{t('attachedAgents')}</h2>{agentsError ? <div className="warning" role="alert">{t('attachedAgentsUnavailable')}</div> : attachedAgents.length === 0 ? <p className="muted">{t('noAttachedAgents')}</p> : <ul className="attached-agent-list">{attachedAgents.map((agent) => <li key={agent.id}><a href={`/agents/${agent.id}`} aria-disabled={busy || undefined} tabIndex={busy ? -1 : undefined} onClick={(event) => busy ? event.preventDefault() : appLink(event, `/agents/${agent.id}`, navigate)}>{agent.name}</a></li>)}</ul>}</section>
         </aside>
       </div>
+      {packageOpen && <SkillPackageModal replacing={Boolean(skill.package)} onClose={() => setPackageOpen(false)} onUpload={uploadPackage} />}
     </div>
   );
 }

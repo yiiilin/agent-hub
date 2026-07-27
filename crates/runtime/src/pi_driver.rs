@@ -28,6 +28,10 @@ use super::{
     SessionSteerOutcome, SessionSupervisorCommand, ENGINE_EVENT_QUEUE_CAPACITY,
 };
 
+mod skill_exec;
+
+use skill_exec::{SkillExecBroker, SKILL_EXEC_EXTENSION_SOURCE};
+
 const PI_SESSION_DIRECTORY: &str = "sessions";
 const PI_AGENT_DIRECTORY: &str = ".pi/agent";
 const PI_HOME_DIRECTORY: &str = ".pi/home";
@@ -35,8 +39,18 @@ const PI_TEMP_DIRECTORY: &str = ".pi/tmp";
 const PI_PROCESS_PATH: &str = "/usr/bin:/bin";
 const PI_INTEGRATION_EXTENSION_FILE: &str = "agent-hub-integration-tools.mjs";
 const PI_INTEGRATION_TOOLS_FILE: &str = "agent-hub-integration-tools.json";
+const PI_SKILL_EXEC_EXTENSION_FILE: &str = "agent-hub-skill-exec.mjs";
 const PI_INTEGRATION_CONTEXT_LABEL: &str = "Agent Hub Integration context (JSON):";
-const PI_BUILTIN_TOOL_NAMES: &[&str] = &["read", "grep", "find", "ls", "edit", "write", "bash"];
+const PI_BUILTIN_TOOL_NAMES: &[&str] = &[
+    "read",
+    "grep",
+    "find",
+    "ls",
+    "edit",
+    "write",
+    "bash",
+    "skill_exec",
+];
 const PI_INTEGRATION_EXTENSION_SOURCE: &str = r#"import { readFileSync } from "node:fs";
 
 const definitions = JSON.parse(
@@ -83,6 +97,20 @@ fn pi_integration_extension_path(run_env: &RunEnv) -> PathBuf {
 
 fn pi_integration_tools_path(run_env: &RunEnv) -> PathBuf {
     pi_agent_directory(run_env).join(PI_INTEGRATION_TOOLS_FILE)
+}
+
+fn pi_skill_exec_extension_path(run_env: &RunEnv) -> PathBuf {
+    pi_agent_directory(run_env).join(PI_SKILL_EXEC_EXTENSION_FILE)
+}
+
+fn materialize_skill_exec_extension(run_env: &RunEnv, enabled: bool) -> anyhow::Result<()> {
+    let extension_path = pi_skill_exec_extension_path(run_env);
+    if !enabled {
+        return remove_file_if_present(&extension_path);
+    }
+    prepare_private_directory(&pi_agent_directory(run_env), "Pi Agent directory")?;
+    replace_private_file(&extension_path, SKILL_EXEC_EXTENSION_SOURCE.as_bytes())
+        .context("write Skill execution Extension")
 }
 
 fn normalized_integration_tools(
@@ -698,6 +726,7 @@ pub(super) struct PersistentPiRpcProcess {
     line_rx: Option<mpsc::Receiver<anyhow::Result<String>>>,
     stdout_reader: Option<std::thread::JoinHandle<()>>,
     stderr_reader: Option<std::thread::JoinHandle<Result<usize, std::io::Error>>>,
+    skill_exec_broker: Option<SkillExecBroker>,
     cancellation: Arc<EngineCancellation>,
     timeout: Duration,
 }
@@ -727,6 +756,12 @@ impl PersistentPiRpcProcess {
         let saved_session = saved_session
             .map(|path| validate_saved_session_path(&session_dir, path))
             .transpose()?;
+        let skill_exec_enabled = tools.iter().any(|tool| tool == "skill_exec");
+        materialize_skill_exec_extension(run_env, skill_exec_enabled)?;
+        let skill_exec_broker = skill_exec_enabled
+            .then(|| SkillExecBroker::start(run_env, tools))
+            .transpose()
+            .context("start Skill execution broker")?;
 
         #[cfg(target_os = "linux")]
         let filesystem_sandbox = PiFilesystemSandbox::prepare(
@@ -754,6 +789,10 @@ impl PersistentPiRpcProcess {
         if integration_extension.is_file() {
             command.arg("--extension").arg(&integration_extension);
         }
+        let skill_exec_extension = pi_skill_exec_extension_path(run_env);
+        if skill_exec_extension.is_file() {
+            command.arg("--extension").arg(&skill_exec_extension);
+        }
         command
             .arg("--no-themes")
             .arg("--no-prompt-templates")
@@ -771,6 +810,11 @@ impl PersistentPiRpcProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(broker) = &skill_exec_broker {
+            command
+                .env("AGENT_HUB_SKILL_EXEC_SOCKET", broker.socket_path())
+                .env("AGENT_HUB_SKILL_EXEC_TOKEN", broker.token());
+        }
         if let Some(saved_session) = &saved_session {
             command.arg("--session").arg(saved_session);
         }
@@ -835,6 +879,7 @@ impl PersistentPiRpcProcess {
             line_rx: Some(line_rx),
             stdout_reader: Some(stdout_reader),
             stderr_reader: Some(stderr_reader),
+            skill_exec_broker,
             cancellation,
             timeout,
         };
@@ -864,6 +909,14 @@ impl PersistentPiRpcProcess {
         if let Some(status) = child.try_wait().context("poll Pi RPC process")? {
             anyhow::bail!("Pi RPC process exited with status {status}");
         }
+        Ok(())
+    }
+
+    pub(super) fn reload_resources(&mut self) -> anyhow::Result<()> {
+        self.ensure_running()?;
+        let started_at = Instant::now();
+        let request_id = self.send_request(json!({ "type": "reload_resources" }))?;
+        self.wait_for_response(&request_id, "reload_resources", started_at, None, None)?;
         Ok(())
     }
 
@@ -997,7 +1050,8 @@ impl PersistentPiRpcProcess {
                             );
                         }
                         Ok(command @ SessionSupervisorCommand::Execute { .. })
-                        | Ok(command @ SessionSupervisorCommand::RefreshConfiguration { .. }) => {
+                        | Ok(command @ SessionSupervisorCommand::RefreshConfiguration { .. })
+                        | Ok(command @ SessionSupervisorCommand::ReloadConfiguration { .. }) => {
                             deferred_commands
                                 .as_deref_mut()
                                 .context("controlled Pi execution has no deferred command queue")?
@@ -1219,6 +1273,7 @@ impl PersistentPiRpcProcess {
         if let Some(reader) = self.stderr_reader.take() {
             let _ = reader.join();
         }
+        self.skill_exec_broker.take();
     }
 }
 
@@ -1787,9 +1842,26 @@ pub(super) fn pi_tool_allowlist(agent: &AgentDto) -> Vec<String> {
 }
 
 pub(super) fn pi_tool_allowlist_for_claim(claim: &ClaimRunResponse) -> anyhow::Result<Vec<String>> {
-    let mut tools = pi_tool_allowlist(&claim.agent);
+    let mut effective_agent = claim.agent.clone();
+    effective_agent.tool_allowlist = claim.execution_configuration.tool_allowlist.clone();
+    effective_agent.sandbox_policy = claim.execution_configuration.sandbox_policy.clone();
+    let mut tools = pi_tool_allowlist(&effective_agent);
+    let skill_exec_enabled = claim
+        .execution_configuration
+        .tool_allowlist
+        .iter()
+        .any(|tool| tool == "skill_exec")
+        && claim.execution_configuration.skills.iter().any(|skill| {
+            skill
+                .package
+                .as_ref()
+                .is_some_and(|package| package.files.iter().any(|file| file.executable))
+        });
+    if skill_exec_enabled && !tools.iter().any(|tool| tool == "skill_exec") {
+        tools.push("skill_exec".into());
+    }
     if claim
-        .agent
+        .execution_configuration
         .tool_allowlist
         .iter()
         .any(|tool| tool == "integration")
