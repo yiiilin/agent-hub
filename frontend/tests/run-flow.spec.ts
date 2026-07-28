@@ -99,9 +99,11 @@ test('widget matches the platform chat interaction and event presentation', asyn
     }
     if (path === `/api/runs/${runId}/events/stream`) {
       const events = [
-        { seq: 1, run_id: runId, event_type: 'item', role: null, content: null, payload: { item_id: 'reasoning-1', item_type: 'reasoning', phase: 'completed', summary: ['Checked the request.'], duration_ms: 800 }, created_at: '2026-07-24T10:00:01.000Z' },
-        { seq: 2, run_id: runId, event_type: 'message', role: 'assistant', content: 'Hello from the agent.', payload: {}, created_at: '2026-07-24T10:00:02.000Z' },
-        { seq: 3, run_id: runId, event_type: 'status', role: null, content: 'completed', payload: { status: 'completed' }, created_at: '2026-07-24T10:00:03.000Z' }
+        { seq: 1, run_id: runId, event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'pi-retry-1', item_type: 'retry', phase: 'started', attempt: 1, max_attempts: 3, delay_ms: 2000 }, created_at: '2026-07-24T10:00:00.500Z' },
+        { seq: 2, run_id: runId, event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'pi-retry-1', item_type: 'retry', phase: 'completed', attempt: 1, success: true }, created_at: '2026-07-24T10:00:00.800Z' },
+        { seq: 3, run_id: runId, event_type: 'item', role: null, content: null, payload: { item_id: 'reasoning-1', item_type: 'reasoning', phase: 'completed', summary: ['Checked the request.'], duration_ms: 800 }, created_at: '2026-07-24T10:00:01.000Z' },
+        { seq: 4, run_id: runId, event_type: 'message', role: 'assistant', content: 'Hello from the agent.', payload: {}, created_at: '2026-07-24T10:00:02.000Z' },
+        { seq: 5, run_id: runId, event_type: 'status', role: null, content: 'completed', payload: { status: 'completed' }, created_at: '2026-07-24T10:00:03.000Z' }
       ];
       return route.fulfill({
         contentType: 'text/event-stream',
@@ -126,10 +128,88 @@ test('widget matches the platform chat interaction and event presentation', asyn
   const activity = page.locator('.session-activity-events');
   await expect(activity).toContainText('Worked for 3 sec');
   await activity.locator('summary').click();
+  await expect(activity).toContainText('Retrying model request');
+  await expect(activity).toContainText('1/3 · 2000 ms');
   await expect(activity).toContainText('Checked the request.');
   await expect(composer).toHaveValue('');
   await expect(page.getByRole('button', { name: 'Send' })).toBeDisabled();
   expect(runRequests).toBe(1);
+});
+
+test('widget repairs incomplete Markdown while an assistant response is streaming', async ({ page }) => {
+  const runId = '70000000-0000-0000-0000-000000000099';
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === '/api/widget/session') return route.fulfill({ json: { id: 'agent-id', name: 'Streaming Widget Agent', instructions: '' } });
+    if (path === '/api/widget/runs' && request.method() === 'POST') return route.fulfill({ json: {
+      id: runId, agent_id: 'agent-id', automation_id: null, integration_session_id: null,
+      parent_run_id: null, runtime_id: null, status: 'running', initial_message: 'Stream Markdown',
+      native_session_id: null, work_dir_ref: null, source: 'widget', created_at: '2026-07-24T10:00:00.000Z', updated_at: '2026-07-24T10:00:00.000Z'
+    } });
+    if (path === `/api/runs/${runId}/events/stream`) {
+      const delta = { seq: 1, run_id: runId, event_type: 'message_delta', role: 'assistant', content: '**Streaming answer', payload: {}, created_at: '2026-07-24T10:00:01.000Z' };
+      return route.fulfill({ contentType: 'text/event-stream', body: `event: run_event\ndata: ${JSON.stringify(delta)}\n\n` });
+    }
+    return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });
+  });
+
+  await page.goto('/widget#token=widget-streamdown-token');
+  const composer = page.getByRole('textbox', { name: 'Message' });
+  await composer.fill('Stream Markdown');
+  await composer.press('Enter');
+  const assistant = page.locator('.session-bubble.role-assistant').filter({ hasText: 'Streaming answer' });
+  await expect(assistant.locator('[data-streamdown="strong"]')).toHaveText('Streaming answer');
+  await expect(assistant).not.toContainText('**');
+});
+
+test('widget shows a visible error when a run fails without an assistant message', async ({ page }) => {
+  const runId = '70000000-0000-0000-0000-000000000098';
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === '/api/widget/session') return route.fulfill({ json: { id: 'agent-id', name: 'Failing Widget Agent', instructions: '' } });
+    if (path === '/api/widget/runs' && request.method() === 'POST') return route.fulfill({ json: {
+      id: runId, agent_id: 'agent-id', automation_id: null, integration_session_id: null,
+      parent_run_id: null, runtime_id: null, status: 'running', initial_message: 'Trigger failure',
+      native_session_id: null, work_dir_ref: null, source: 'widget', created_at: '2026-07-24T10:00:00.000Z', updated_at: '2026-07-24T10:00:00.000Z'
+    } });
+    if (path === `/api/runs/${runId}/events/stream`) {
+      const failed = { seq: 1, run_id: runId, event_type: 'status', role: null, content: 'failed', payload: { status: 'failed' }, created_at: '2026-07-24T10:00:01.000Z' };
+      return route.fulfill({ contentType: 'text/event-stream', body: `event: run_event\ndata: ${JSON.stringify(failed)}\n\n` });
+    }
+    return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });
+  });
+
+  await page.goto('/widget#token=widget-failure-token');
+  const composer = page.getByRole('textbox', { name: 'Message' });
+  await composer.fill('Trigger failure');
+  await composer.press('Enter');
+  await expect(page.getByRole('alert')).toHaveText('The request could not be completed. Retry.');
+  await expect(page.locator('.session-thinking')).toHaveCount(0);
+});
+
+test('widget shows a visible error when the run event stream fails', async ({ page }) => {
+  const runId = '70000000-0000-0000-0000-000000000097';
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === '/api/widget/session') return route.fulfill({ json: { id: 'agent-id', name: 'Disconnected Widget Agent', instructions: '' } });
+    if (path === '/api/widget/runs' && request.method() === 'POST') return route.fulfill({ json: {
+      id: runId, agent_id: 'agent-id', automation_id: null, integration_session_id: null,
+      parent_run_id: null, runtime_id: null, status: 'running', initial_message: 'Disconnect stream',
+      native_session_id: null, work_dir_ref: null, source: 'widget', created_at: '2026-07-24T10:00:00.000Z', updated_at: '2026-07-24T10:00:00.000Z'
+    } });
+    if (path === `/api/runs/${runId}/events/stream`) return route.fulfill({ status: 502, json: { error: 'upstream unavailable' } });
+    return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });
+  });
+
+  await page.goto('/widget#token=widget-stream-failure-token');
+  const composer = page.getByRole('textbox', { name: 'Message' });
+  await composer.fill('Disconnect stream');
+  await composer.press('Enter');
+  await expect(page.getByRole('alert')).toHaveText('The request could not be completed. Retry.');
+  await expect(page.locator('.session-thinking')).toHaveCount(0);
 });
 
 test('widget serializes rapid submissions and exposes pending UI', async ({ page }) => {

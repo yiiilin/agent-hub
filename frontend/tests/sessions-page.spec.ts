@@ -802,7 +802,60 @@ test('conversation streams replies, folds readable activity, steers, stops, and 
   await expect(detail.getByRole('textbox', { name: 'Message' })).toHaveCount(0);
 });
 
-test('assistant messages render GFM Markdown while user messages stay literal text', async ({ page }) => {
+test('assistant messages render Streamdown Markdown while user messages stay literal text', async ({ page }) => {
+  const diagnostics: string[] = [];
+  page.on('pageerror', (error) => diagnostics.push(`page: ${error.message}`));
+  page.on('console', (message) => {
+    if (message.type() === 'error') diagnostics.push(`console: ${message.text()}`);
+  });
+  page.on('response', (response) => {
+    const path = new URL(response.url()).pathname;
+    if (path.startsWith('/api/') && response.status() >= 400) diagnostics.push(`api: ${response.status()} ${path}`);
+  });
+  const assistantMarkdown = [
+    '## Deployment result',
+    '',
+    '- API is ready',
+    '- Worker is ready',
+    '',
+    '中文~~旧状态~~新状态',
+    '',
+    '| Service | Status |',
+    '| --- | ---: |',
+    '| API | Ready |',
+    '',
+    '```typescript',
+    'const deploymentConfiguration = { endpoint: "https://example.com/a/very/long/javascript/path", retries: 3, timeoutMilliseconds: 30_000, preserveConversationHistory: true };',
+    '```',
+    '',
+    '```javascript',
+    'const a = 1;',
+    'const b = 2;',
+    'a + b;',
+    '```',
+    '',
+    'Inline math: $a^2+b^2=c^2$.',
+    '',
+    '$$',
+    'E = mc^2',
+    '$$',
+    '',
+    '```mermaid',
+    'flowchart LR',
+    '  Request --> Response',
+    '```',
+    '',
+    '<details>',
+    '<summary>More details</summary>',
+    '',
+    '<mark>Highlighted safely</mark> and press <kbd>Enter</kbd>.',
+    '',
+    '</details>',
+    '',
+    '<script>window.mustNotRun = true</script>',
+    '',
+    'Use `status --json` and [Open docs](https://example.com/docs).'
+  ].join('\n');
   await installSessionApi(page, { activeMessages: [
     message('active', 1, 'user', '## Keep this user Markdown literal', {
       accepted_at: '2026-07-17T10:00:00.000Z'
@@ -811,7 +864,7 @@ test('assistant messages render GFM Markdown while user messages stay literal te
       'active',
       2,
       'assistant',
-      '## Deployment result\n\n- API is ready\n- Worker is ready\n\nUse `status --json`.\n\n[Open docs](https://example.com/docs)',
+      assistantMarkdown,
       { accepted_at: '2026-07-17T10:00:04.000Z' }
     )
   ] });
@@ -824,9 +877,43 @@ test('assistant messages render GFM Markdown while user messages stay literal te
   await expect(userMessage.locator('.session-message-text')).toContainText('## Keep this user Markdown literal');
   await expect(assistantMessage.locator('h2')).toHaveText('Deployment result');
   await expect(assistantMessage.locator('li')).toHaveText(['API is ready', 'Worker is ready']);
-  await expect(assistantMessage.locator('code')).toHaveText('status --json');
+  await expect(assistantMessage.locator('del')).toHaveText('旧状态');
+  await expect(assistantMessage.locator('[data-streamdown="table"]')).toContainText('Ready');
+  await expect(assistantMessage.locator('[data-streamdown="code-block"][data-language="typescript"]')).toContainText('const deploymentConfiguration');
+  await expect(assistantMessage.locator('.katex')).toHaveCount(2);
+  await expect(assistantMessage.locator('[data-streamdown="mermaid"] svg')).toBeVisible();
+  await expect(assistantMessage.locator('details summary')).toHaveText('More details');
+  await expect(assistantMessage.locator('mark')).toHaveText('Highlighted safely');
+  await expect(assistantMessage.locator('kbd')).toHaveText('Enter');
+  await expect(assistantMessage.locator('script')).toHaveCount(0);
+  expect(await page.evaluate(() => Boolean((window as Window & { mustNotRun?: boolean }).mustNotRun))).toBe(false);
+  await expect(assistantMessage.locator('[data-streamdown="inline-code"]').filter({ hasText: 'status --json' })).toHaveText('status --json');
   await expect(assistantMessage.getByRole('link', { name: 'Open docs' })).toHaveAttribute('target', '_blank');
   await expect(assistantMessage.getByRole('link', { name: 'Open docs' })).toHaveAttribute('rel', 'noreferrer');
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(assistantMessage.locator('[data-streamdown="mermaid"] svg')).toBeVisible();
+  const codeLines = assistantMessage.locator('[data-streamdown="code-block"][data-language="javascript"] pre > code > span');
+  await expect(codeLines).toHaveCount(3);
+  const lineTops = await codeLines.evaluateAll((lines) => lines.map((line) => line.getBoundingClientRect().top));
+  expect(lineTops[1]).toBeGreaterThan(lineTops[0]);
+  expect(lineTops[2]).toBeGreaterThan(lineTops[1]);
+  const lineNumberContent = await codeLines.evaluateAll((lines) => lines.map((line) => getComputedStyle(line, '::before').content));
+  expect(lineNumberContent.every((content) => content.includes('counter('))).toBe(true);
+  const codeBlock = assistantMessage.locator('[data-streamdown="code-block"][data-language="typescript"]');
+  const codeBody = codeBlock.locator('[data-streamdown="code-block-body"]');
+  await expect(codeBlock.locator('pre')).toHaveCSS('white-space', 'pre');
+  await expect(codeBody).toHaveCSS('overflow-x', 'auto');
+  const codeDimensions = await codeBody.evaluate((element) => ({
+    clientWidth: element.clientWidth,
+    scrollWidth: element.scrollWidth
+  }));
+  expect(codeDimensions.scrollWidth).toBeGreaterThan(codeDimensions.clientWidth);
+  const dimensions = await page.evaluate(() => ({
+    clientWidth: document.documentElement.clientWidth,
+    scrollWidth: document.documentElement.scrollWidth
+  }));
+  expect(dimensions.scrollWidth).toBeLessThanOrEqual(dimensions.clientWidth);
+  expect(diagnostics).toEqual([]);
 });
 
 test('mobile conversation keeps the Session list in a dismissible drawer', async ({ page }) => {

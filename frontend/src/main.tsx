@@ -2162,14 +2162,18 @@ function WidgetApp({ token, appClientId }: { token?: string; appClientId?: strin
 }
 
 function WidgetRunConsole({ runId, streamSessionId, token, initialEvents, agentName, onEvent, onTerminal, startedAt }: { runId: string; streamSessionId: string | null; token: string; initialEvents: RunEvent[]; agentName: string | null; onEvent: (event: RunEvent) => void; onTerminal: () => void; startedAt?: number }) {
+  const { t } = useI18n();
   const [events, setEvents] = useState<RunEvent[]>(() => mergeRunEvents([], initialEvents));
+  const [streamError, setStreamError] = useState(false);
   const initialEventCursor = Math.max(0, ...initialEvents.map((event) => event.seq));
 
   useEffect(() => {
     setEvents(mergeRunEvents([], initialEvents));
+    setStreamError(false);
   }, [runId]);
 
   useEffect(() => {
+    setStreamError(false);
     const controller = new AbortController();
     const abortForPageExit = () => controller.abort();
     window.addEventListener('pagehide', abortForPageExit, { once: true });
@@ -2183,7 +2187,10 @@ function WidgetRunConsole({ runId, streamSessionId, token, initialEvents, agentN
       ? api.streamWidgetSessionEvents(streamSessionId, token, controller.signal, receiveEvent, initialEventCursor)
       : api.streamWidgetRunEvents(runId, token, controller.signal, receiveEvent, initialEventCursor);
     stream.catch((err) => {
-      if (!controller.signal.aborted) console.error(err);
+      if (!controller.signal.aborted) {
+        setStreamError(true);
+        console.error(err);
+      }
     });
     return () => {
       window.removeEventListener('pagehide', abortForPageExit);
@@ -2229,18 +2236,25 @@ function WidgetRunConsole({ runId, streamSessionId, token, initialEvents, agentN
       return items;
     }, []);
   }, [events]);
-  const terminal = events.some((event) => {
-    if (event.event_type !== 'status') return false;
+  let terminalStatus: string | null = null;
+  for (const event of events) {
+    if (event.event_type !== 'status') continue;
     const status = event.content ?? (typeof event.payload.status === 'string' ? event.payload.status : null);
-    return status !== null && widgetTerminalStatuses.has(status);
-  });
+    if (status !== null && widgetTerminalStatuses.has(status)) terminalStatus = status;
+  }
+  const terminal = terminalStatus !== null;
+  const runFailed = terminalStatus === 'failed' || events.some((event) => event.event_type === 'error');
+  const hasCompleteAssistantMessage = events.some((event) => (
+    event.event_type === 'message' && event.role === 'assistant' && Boolean(event.content)
+  ));
   const hasAssistantMessage = timeline.some((entry) => entry.kind === 'message');
   const processingWindow = useMemo(() => runProcessingWindow(events, startedAt), [events, startedAt]);
 
   return <>{timeline.map((entry) => entry.kind === 'activity-group'
     ? <ChatActivityGroup activities={entry.activities} endedAt={processingWindow.endedAt} key={entry.id} startedAt={processingWindow.startedAt} />
-    : <ChatMessageBubble agentName={agentName} content={entry.content} key={entry.id} role="assistant" />)}
-    {!terminal && !hasAssistantMessage && <ChatThinkingBubble />}
+    : <ChatMessageBubble agentName={agentName} content={entry.content} key={entry.id} role="assistant" streaming={!terminal && !hasCompleteAssistantMessage} />)}
+    {(runFailed || streamError) && <div className="session-banner error widget-run-error" role="alert">{t('genericError')}</div>}
+    {!terminal && !streamError && !hasAssistantMessage && <ChatThinkingBubble />}
   </>;
 }
 

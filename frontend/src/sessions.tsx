@@ -1,11 +1,11 @@
-import { ArrowUp, Bot, Brain, ChevronDown, ChevronRight, FilePenLine, ImageIcon, ListChecks, Minimize2, PanelLeft, Plus, Search, Square, Terminal, Trash2, Users, Wrench, X } from 'lucide-react';
-import { FormEvent, type TouchEvent, type WheelEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import { ArrowUp, Bot, Brain, ChevronDown, ChevronRight, FilePenLine, ImageIcon, ListChecks, Minimize2, PanelLeft, Plus, RefreshCw, Search, Square, Terminal, Trash2, Users, Wrench, X } from 'lucide-react';
+import { FormEvent, lazy, Suspense, type TouchEvent, type WheelEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api, type Agent, type HubSession, type HubSessionMessage, type RunEvent } from './api/client';
 import { useI18n } from './i18n';
 import type { TranslationKey } from './i18n';
 import { discardConversationDraft, loadConversationDraft, loadSelectedSessionAgent, saveConversationDraft, saveSelectedSessionAgent } from './session-drafts';
+
+const ChatMarkdown = lazy(() => import('./components/chat-markdown'));
 
 const lifecycleKeys: Record<string, TranslationKey> = {
   waiting_for_runtime: 'sessionStatusWaitingRuntime',
@@ -45,7 +45,7 @@ function mergeSessionMessages(current: HubSessionMessage[], incoming: HubSession
   return [...merged.values()].sort((left, right) => left.sequence - right.sequence);
 }
 
-type ActivityKind = 'reasoning' | 'command' | 'file' | 'tool' | 'search' | 'plan' | 'image' | 'subagent' | 'compaction' | 'review' | 'wait';
+type ActivityKind = 'reasoning' | 'command' | 'file' | 'tool' | 'search' | 'plan' | 'image' | 'subagent' | 'compaction' | 'review' | 'wait' | 'retry';
 
 export type ActivityEntry = {
   id: string;
@@ -91,7 +91,8 @@ const activityKeys: Record<ActivityKind, TranslationKey> = {
   subagent: 'activitySubagent',
   compaction: 'activityCompaction',
   review: 'activityReview',
-  wait: 'activityWait'
+  wait: 'activityWait',
+  retry: 'activityRetry'
 };
 
 function formatActivityDuration(
@@ -188,6 +189,7 @@ function activityKind(itemType: string): ActivityKind | null {
   if (itemType === 'contextCompaction') return 'compaction';
   if (itemType === 'enteredReviewMode' || itemType === 'exitedReviewMode') return 'review';
   if (itemType === 'sleep') return 'wait';
+  if (itemType === 'retry') return 'retry';
   return null;
 }
 
@@ -234,6 +236,13 @@ function activityFromEvent(event: RunEvent): ActivityEntry | null {
   } else if (kind === 'search') summary = payloadString(event.payload, 'query');
   else if (kind === 'plan') summary = payloadString(event.payload, 'text');
   else if (kind === 'image') summary = payloadString(event.payload, 'path');
+  else if (kind === 'retry' && phase === 'started') {
+    const attempt = payloadNumber(event.payload, 'attempt');
+    const maxAttempts = payloadNumber(event.payload, 'max_attempts');
+    const delayMs = payloadNumber(event.payload, 'delay_ms');
+    const progress = attempt === null ? null : maxAttempts === null ? `${attempt}` : `${attempt}/${maxAttempts}`;
+    summary = [progress, delayMs === null ? null : `${delayMs} ms`].filter(Boolean).join(' · ') || null;
+  }
   return {
     id: `activity-${event.run_id}-${itemId ?? event.seq}`,
     runId: event.run_id,
@@ -307,6 +316,7 @@ function ActivityIcon({ kind }: { kind: ActivityKind }) {
   if (kind === 'plan') return <ListChecks size={15} />;
   if (kind === 'image') return <ImageIcon size={15} />;
   if (kind === 'subagent') return <Users size={15} />;
+  if (kind === 'retry') return <RefreshCw size={15} />;
   return <Minimize2 size={15} />;
 }
 
@@ -321,7 +331,8 @@ export function ChatMessageBubble({
   guidance,
   role,
   state,
-  stateLabel
+  stateLabel,
+  streaming = false
 }: {
   agentName: string | null;
   content: string;
@@ -329,6 +340,7 @@ export function ChatMessageBubble({
   role: string;
   state?: string;
   stateLabel?: string;
+  streaming?: boolean;
 }) {
   const { t } = useI18n();
   return <article className={`session-bubble role-${role}`}>
@@ -336,7 +348,7 @@ export function ChatMessageBubble({
     <div className="session-message-body">
       <header>{role !== 'user' && <strong>{role === 'assistant' ? agentName ?? t('assistant') : role}</strong>}{state && state !== 'delivered' && <span className={`message-state ${state}`}>{stateLabel}</span>}</header>
       {role === 'assistant'
-        ? <div className="session-message-text session-message-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noreferrer" /> }}>{content}</ReactMarkdown></div>
+        ? <div className="session-message-text session-message-markdown"><Suspense fallback={<span className="session-message-markdown-loading">{content}</span>}><ChatMarkdown content={content} streaming={streaming} /></Suspense></div>
         : <div className="session-message-text">{content}</div>}
       {guidance && <small>{guidance}</small>}
     </div>
