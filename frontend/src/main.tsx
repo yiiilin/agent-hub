@@ -7,7 +7,7 @@ import type { TranslationKey } from './i18n';
 import { FormDialog } from './components/form-dialog';
 import { MarkdownEditor } from './components/markdown-editor';
 import { SkillDetailPage, SkillsPage } from './skills';
-import { ChatActivityGroup, ChatMessageBubble, ChatThinkingBubble, mergeRunEvents, projectActivities, resizeComposer, selectSessionMessagePage, sessionMessageRequestLimit, SessionsPage, type ActivityEntry } from './sessions';
+import { ChatActivityGroup, ChatMessageBubble, ChatThinkingBubble, mergeRunEvents, projectActivities, resizeComposer, runProcessingWindow, selectSessionMessagePage, sessionMessageRequestLimit, SessionsPage, type ActivityEntry } from './sessions';
 import { AdministrationPage } from './administration';
 import { AgentPage as AgentDetailPage, AgentsPage } from './agents';
 import { IntegrationAppsPage } from './integrations';
@@ -1360,6 +1360,7 @@ type WidgetExchange = {
   id: string;
   message: string;
   runId: string | null;
+  startedAt?: number;
   streamSessionId: string | null;
   initialEvents: RunEvent[];
   displayRun: boolean;
@@ -1392,6 +1393,7 @@ function widgetExchangesFromHistory(
     id: item.id,
     message: item.content ?? '',
     runId: item.run_id,
+    startedAt: Number.isFinite(Date.parse(item.accepted_at)) ? Date.parse(item.accepted_at) : undefined,
     streamSessionId: accessToken.startsWith('ahw_')
       ? target.integrationSessionId ?? target.hubSessionId
       : null,
@@ -1466,6 +1468,12 @@ type WidgetTimelineItem = WidgetTimelineMessage
   | { kind: 'activity-group'; id: string; activities: ActivityEntry[] };
 
 const widgetTerminalStatuses = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
+
+function isWidgetTerminalEvent(event: RunEvent) {
+  if (event.event_type !== 'status') return false;
+  const status = event.content ?? (typeof event.payload.status === 'string' ? event.payload.status : null);
+  return status !== null && widgetTerminalStatuses.has(status);
+}
 
 function WidgetApp({ token, appClientId }: { token?: string; appClientId?: string }) {
   const { language, setLanguage, t } = useI18n();
@@ -1704,6 +1712,13 @@ function WidgetApp({ token, appClientId }: { token?: string; appClientId?: strin
     }
   }, [scrollChatToBottom, t]);
 
+  const refreshWidgetTranscriptAfterTerminal = useCallback(() => {
+    const target = selectedSessionRef.current;
+    const accessToken = sessionTokenRef.current;
+    if (!target || !accessToken) return;
+    void loadWidgetTranscript(accessToken, target, logicalSessionGeneration.current);
+  }, [loadWidgetTranscript]);
+
   const loadOlderWidgetMessages = useCallback(async () => {
     const target = selectedSessionRef.current;
     const beforeSequence = widgetOldestSequenceRef.current;
@@ -1863,16 +1878,23 @@ function WidgetApp({ token, appClientId }: { token?: string; appClientId?: strin
           hubSessionId: createdRun.hub_session_id
         });
       }
-      setExchanges((current) => current.some((exchange) => exchange.runId === createdRun.id)
-        ? current
-        : [...current, {
-            id: `widget-run-${createdRun.id}`,
-            message: content,
-            runId: createdRun.id,
-            streamSessionId: null,
-            initialEvents: [],
-            displayRun: true
-          }]);
+      setExchanges((current) => {
+        const runAlreadyDisplayed = current.some((exchange) => exchange.runId === createdRun.id);
+        const id = runAlreadyDisplayed
+          ? `widget-message-${clientMessageKey}`
+          : `widget-run-${createdRun.id}`;
+        if (current.some((exchange) => exchange.id === id)) return current;
+        const startedAt = Date.parse(createdRun.created_at);
+        return [...current, {
+          id,
+          message: content,
+          runId: createdRun.id,
+          startedAt: Number.isFinite(startedAt) ? startedAt : undefined,
+          streamSessionId: null,
+          initialEvents: [],
+          displayRun: !runAlreadyDisplayed
+        }];
+      });
       if (messageRef.current === content) clearDraft();
       if (historyEnabledRef.current) {
         void refreshWidgetHistory(sessionTokenRef.current, credentialSelectionGeneration.current);
@@ -2119,7 +2141,7 @@ function WidgetApp({ token, appClientId }: { token?: string; appClientId?: strin
           {transcriptLoading && exchanges.length === 0 && <div className="widget-transcript-state">{t('loadingMessages')}</div>}
           {exchanges.map((exchange) => <React.Fragment key={exchange.id}>
             <ChatMessageBubble agentName={agent?.name ?? null} content={exchange.message} role="user" />
-            {exchange.displayRun && exchange.runId && <WidgetRunConsole runId={exchange.runId} streamSessionId={exchange.streamSessionId} token={sessionToken} initialEvents={exchange.initialEvents} agentName={agent?.name ?? null} onEvent={reportWidgetRunEvent} />}
+            {exchange.displayRun && exchange.runId && <WidgetRunConsole runId={exchange.runId} streamSessionId={exchange.streamSessionId} token={sessionToken} initialEvents={exchange.initialEvents} agentName={agent?.name ?? null} onEvent={reportWidgetRunEvent} onTerminal={refreshWidgetTranscriptAfterTerminal} startedAt={exchange.startedAt} />}
           </React.Fragment>)}
           {pendingMessage && <>
             <ChatMessageBubble agentName={agent?.name ?? null} content={pendingMessage} role="user" />
@@ -2139,8 +2161,9 @@ function WidgetApp({ token, appClientId }: { token?: string; appClientId?: strin
   );
 }
 
-function WidgetRunConsole({ runId, streamSessionId, token, initialEvents, agentName, onEvent }: { runId: string; streamSessionId: string | null; token: string; initialEvents: RunEvent[]; agentName: string | null; onEvent: (event: RunEvent) => void }) {
+function WidgetRunConsole({ runId, streamSessionId, token, initialEvents, agentName, onEvent, onTerminal, startedAt }: { runId: string; streamSessionId: string | null; token: string; initialEvents: RunEvent[]; agentName: string | null; onEvent: (event: RunEvent) => void; onTerminal: () => void; startedAt?: number }) {
   const [events, setEvents] = useState<RunEvent[]>(() => mergeRunEvents([], initialEvents));
+  const initialEventCursor = Math.max(0, ...initialEvents.map((event) => event.seq));
 
   useEffect(() => {
     setEvents(mergeRunEvents([], initialEvents));
@@ -2154,10 +2177,11 @@ function WidgetRunConsole({ runId, streamSessionId, token, initialEvents, agentN
       if (parsed.run_id !== runId) return;
       setEvents((current) => mergeRunEvents(current, [parsed]));
       onEvent(parsed);
+      if (isWidgetTerminalEvent(parsed)) onTerminal();
     };
     const stream = streamSessionId
-      ? api.streamWidgetSessionEvents(streamSessionId, token, controller.signal, receiveEvent)
-      : api.streamWidgetRunEvents(runId, token, controller.signal, receiveEvent);
+      ? api.streamWidgetSessionEvents(streamSessionId, token, controller.signal, receiveEvent, initialEventCursor)
+      : api.streamWidgetRunEvents(runId, token, controller.signal, receiveEvent, initialEventCursor);
     stream.catch((err) => {
       if (!controller.signal.aborted) console.error(err);
     });
@@ -2165,7 +2189,7 @@ function WidgetRunConsole({ runId, streamSessionId, token, initialEvents, agentN
       window.removeEventListener('pagehide', abortForPageExit);
       controller.abort();
     };
-  }, [onEvent, runId, streamSessionId, token]);
+  }, [initialEventCursor, onEvent, onTerminal, runId, streamSessionId, token]);
 
   const timeline = useMemo<WidgetTimelineItem[]>(() => {
     const entries: WidgetTimelineEntry[] = projectActivities(events).map((activity) => ({
@@ -2211,9 +2235,10 @@ function WidgetRunConsole({ runId, streamSessionId, token, initialEvents, agentN
     return status !== null && widgetTerminalStatuses.has(status);
   });
   const hasAssistantMessage = timeline.some((entry) => entry.kind === 'message');
+  const processingWindow = useMemo(() => runProcessingWindow(events, startedAt), [events, startedAt]);
 
   return <>{timeline.map((entry) => entry.kind === 'activity-group'
-    ? <ChatActivityGroup activities={entry.activities} key={entry.id} />
+    ? <ChatActivityGroup activities={entry.activities} endedAt={processingWindow.endedAt} key={entry.id} startedAt={processingWindow.startedAt} />
     : <ChatMessageBubble agentName={agentName} content={entry.content} key={entry.id} role="assistant" />)}
     {!terminal && !hasAssistantMessage && <ChatThinkingBubble />}
   </>;

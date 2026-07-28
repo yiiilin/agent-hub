@@ -772,7 +772,7 @@ test('conversation streams replies, folds readable activity, steers, stops, and 
 
   const activity = detail.locator('details.session-activity-events').first();
   await expect(activity).not.toHaveAttribute('open', '');
-  await expect(activity.locator('summary')).toContainText('Worked for 2.5 sec');
+  await expect(activity.locator('summary')).toContainText('Worked for 3.5 sec');
   await expect(activity.locator('.session-activity-chevron')).toHaveCSS('transform', 'none');
   await activity.locator('summary').click();
   await expect(activity).toHaveAttribute('open', '');
@@ -800,6 +800,33 @@ test('conversation streams replies, folds readable activity, steers, stops, and 
   await page.getByRole('button', { name: /Deleted Agent/ }).click();
   await expect(detail.getByText('Retained answer.', { exact: true })).toBeVisible();
   await expect(detail.getByRole('textbox', { name: 'Message' })).toHaveCount(0);
+});
+
+test('assistant messages render GFM Markdown while user messages stay literal text', async ({ page }) => {
+  await installSessionApi(page, { activeMessages: [
+    message('active', 1, 'user', '## Keep this user Markdown literal', {
+      accepted_at: '2026-07-17T10:00:00.000Z'
+    }),
+    message(
+      'active',
+      2,
+      'assistant',
+      '## Deployment result\n\n- API is ready\n- Worker is ready\n\nUse `status --json`.\n\n[Open docs](https://example.com/docs)',
+      { accepted_at: '2026-07-17T10:00:04.000Z' }
+    )
+  ] });
+  await page.goto('/sessions');
+
+  const detail = page.getByRole('region', { name: 'Session details' });
+  const userMessage = detail.locator('.session-bubble.role-user').filter({ hasText: 'Keep this user Markdown literal' });
+  const assistantMessage = detail.locator('.session-bubble.role-assistant').filter({ hasText: 'Deployment result' });
+  await expect(userMessage.locator('h2')).toHaveCount(0);
+  await expect(userMessage.locator('.session-message-text')).toContainText('## Keep this user Markdown literal');
+  await expect(assistantMessage.locator('h2')).toHaveText('Deployment result');
+  await expect(assistantMessage.locator('li')).toHaveText(['API is ready', 'Worker is ready']);
+  await expect(assistantMessage.locator('code')).toHaveText('status --json');
+  await expect(assistantMessage.getByRole('link', { name: 'Open docs' })).toHaveAttribute('target', '_blank');
+  await expect(assistantMessage.getByRole('link', { name: 'Open docs' })).toHaveAttribute('rel', 'noreferrer');
 });
 
 test('mobile conversation keeps the Session list in a dismissible drawer', async ({ page }) => {

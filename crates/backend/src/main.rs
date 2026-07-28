@@ -12164,7 +12164,7 @@ async fn runtime_complete_run(
         json!({ "status": status }),
     )
     .await?;
-    if status == "interrupted" {
+    if matches!(status, "completed" | "failed" | "interrupted") {
         move_queued_steers_to_next_turn_tx(
             &mut tx,
             hub_session_id,
@@ -13831,8 +13831,8 @@ async fn request_run_interrupt_tx(
 async fn move_queued_steers_to_next_turn_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: Uuid,
-    interrupted_run_id: Uuid,
-    interrupted_turn_id: Uuid,
+    terminal_run_id: Uuid,
+    terminal_turn_id: Uuid,
     ownership_generation: i64,
 ) -> Result<(), ApiError> {
     let queued = sqlx::query(
@@ -13844,8 +13844,8 @@ async fn move_queued_steers_to_next_turn_tx(
          FOR UPDATE",
     )
     .bind(session_id)
-    .bind(interrupted_turn_id)
-    .bind(interrupted_run_id)
+    .bind(terminal_turn_id)
+    .bind(terminal_run_id)
     .fetch_all(&mut **tx)
     .await?;
     let Some(first) = queued.first() else {
@@ -13914,13 +13914,13 @@ async fn move_queued_steers_to_next_turn_tx(
         .bind(first_message_id)
         .bind(next_turn_id)
         .bind(ownership_generation)
-        .bind(interrupted_run_id)
+        .bind(terminal_run_id)
         .bind(session_id)
         .execute(&mut **tx)
         .await?;
         if inserted.rows_affected() != 1 {
             return Err(ApiError::conflict(
-                "interrupted Run disappeared before queued Steering Messages were moved",
+                "terminal Run disappeared before queued Steering Messages were moved",
             ));
         }
         (next_run_id, next_turn_id)
@@ -13943,7 +13943,7 @@ async fn move_queued_steers_to_next_turn_tx(
            AND next.hub_session_id = $3 AND previous.hub_session_id = $3",
     )
     .bind(next_run_id)
-    .bind(interrupted_run_id)
+    .bind(terminal_run_id)
     .bind(session_id)
     .execute(&mut **tx)
     .await?;
@@ -13966,7 +13966,7 @@ async fn move_queued_steers_to_next_turn_tx(
     )
     .bind(next_run_id)
     .bind(&message_ids)
-    .bind(interrupted_run_id)
+    .bind(terminal_run_id)
     .execute(&mut **tx)
     .await?;
     sqlx::query(
@@ -13975,7 +13975,7 @@ async fn move_queued_steers_to_next_turn_tx(
     )
     .bind(next_run_id)
     .bind(&message_ids)
-    .bind(interrupted_run_id)
+    .bind(terminal_run_id)
     .execute(&mut **tx)
     .await?;
     sqlx::query(
@@ -13984,14 +13984,14 @@ async fn move_queued_steers_to_next_turn_tx(
     )
     .bind(next_run_id)
     .bind(&message_ids)
-    .bind(interrupted_run_id)
+    .bind(terminal_run_id)
     .execute(&mut **tx)
     .await?;
     sqlx::query(
         "UPDATE runs SET hub_message_id = NULL, updated_at = now()
          WHERE id = $1 AND hub_message_id = ANY($2)",
     )
-    .bind(interrupted_run_id)
+    .bind(terminal_run_id)
     .bind(&message_ids)
     .execute(&mut **tx)
     .await?;
@@ -28559,6 +28559,120 @@ mod tests {
         )
         .unwrap();
         assert_eq!(claimed.run.id, late.run.id);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn completed_run_moves_queued_steer_to_a_claimable_next_turn(pool: PgPool) {
+        let fixture = integration_runtime_fixture(pool).await;
+        let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM agents WHERE id = $1")
+            .bind(fixture.agent_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        let model_connection_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO model_connections
+                 (id, scope, name, base_url, api_type, allowed_model_ids,
+                  api_key_ciphertext, api_key_nonce, created_by)
+             VALUES ($1, 'global', 'Completed Race Model', 'https://models.example.test',
+                     'openai_responses', ARRAY['completed-race-model'], $2, $3, $4)",
+        )
+        .bind(model_connection_id)
+        .bind(vec![1_u8; 17])
+        .bind(vec![2_u8; 12])
+        .bind(owner_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE agents SET model_connection_id = $1, model_id = 'completed-race-model'
+             WHERE id = $2",
+        )
+        .bind(model_connection_id)
+        .bind(fixture.agent_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let queued = create_integration_message(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.integration_token),
+            Path(fixture.session_id),
+            Json(CreateIntegrationMessageRequest {
+                content: "continue after natural completion".into(),
+                attachments: json!([]),
+                client_message_key: Some("completed-race-next-turn".into()),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(queued.run.id, fixture.run_id);
+        assert_eq!(queued.message.delivery_mode, "steer");
+        assert_eq!(queued.message.delivery_state, "queued");
+
+        let completed = runtime_complete_run(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(fixture.run_id),
+            runtime_write_generation(
+                1,
+                CompleteRunRequest {
+                    status: "completed".into(),
+                    native_session_id: Some("naturally-completed-session".into()),
+                    work_dir_ref: Some("retained-workspace".into()),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(completed.status, "completed");
+
+        let moved: (String, String, Option<String>, Uuid, Uuid) = sqlx::query_as(
+            "SELECT delivery_mode, delivery_state, expected_native_turn_id, turn_id, run_id
+             FROM hub_session_messages WHERE id = $1",
+        )
+        .bind(queued.message.id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(moved.0, "next_turn");
+        assert_eq!(moved.1, "queued");
+        assert_eq!(moved.2, None);
+        assert_ne!(moved.3, fixture.turn_id);
+        assert_ne!(moved.4, fixture.run_id);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM runs WHERE id = $1")
+                .bind(moved.4)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap(),
+            "pending"
+        );
+
+        let claimed = runtime_claim_run(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Json(RuntimeClaimRunRequest {
+                available_new_session_slots: 0,
+                ready_owned_sessions: vec![RuntimeOwnedSessionGenerationDto {
+                    session_id: fixture.hub_session_id,
+                    ownership_generation: 1,
+                }],
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(claimed.status(), StatusCode::OK);
+        let claimed: ClaimRunResponse = serde_json::from_slice(
+            &axum::body::to_bytes(claimed.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claimed.run.id, moved.4);
     }
 
     #[sqlx::test(migrations = "./migrations")]

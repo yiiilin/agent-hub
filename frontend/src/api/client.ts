@@ -763,9 +763,17 @@ async function streamRunEventsWithHeaders(
   runId: string,
   headers: HeadersInit,
   signal: AbortSignal,
-  onEvent: (event: RunEvent) => void
+  onEvent: (event: RunEvent) => void,
+  after = 0
 ) {
-  return streamEventsWithHeaders(`/api/runs/${runId}/events/stream`, headers, signal, onEvent);
+  const path = `/api/runs/${runId}/events/stream`;
+  return streamEventsWithHeaders(eventStreamPath(path, after), headers, signal, onEvent);
+}
+
+function eventStreamPath(path: string, after: number) {
+  if (!Number.isFinite(after) || after <= 0) return path;
+  const query = new URLSearchParams({ after: String(Math.trunc(after)) });
+  return `${path}?${query.toString()}`;
 }
 
 async function streamEventsWithHeaders(
@@ -817,13 +825,15 @@ async function streamWidgetRunEvents(
   runId: string,
   token: string,
   signal: AbortSignal,
-  onEvent: (event: RunEvent) => void
+  onEvent: (event: RunEvent) => void,
+  after = 0
 ) {
   return streamRunEventsWithHeaders(
     runId,
     { 'X-Agent-Hub-Embed-Token': token },
     signal,
-    onEvent
+    onEvent,
+    after
   );
 }
 
@@ -831,10 +841,12 @@ async function streamWidgetSessionEvents(
   sessionId: string,
   token: string,
   signal: AbortSignal,
-  onEvent: (event: RunEvent) => void
+  onEvent: (event: RunEvent) => void,
+  after = 0
 ) {
+  const path = `/api/widget/sessions/${encodeURIComponent(sessionId)}/events/stream`;
   return streamEventsWithHeaders(
-    `/api/widget/sessions/${encodeURIComponent(sessionId)}/events/stream`,
+    eventStreamPath(path, after),
     { 'X-Agent-Hub-Embed-Token': token },
     signal,
     onEvent

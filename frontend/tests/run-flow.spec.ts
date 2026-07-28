@@ -94,7 +94,7 @@ test('widget matches the platform chat interaction and event presentation', asyn
       return route.fulfill({ json: {
         id: runId, agent_id: 'agent-id', automation_id: null, integration_session_id: null,
         parent_run_id: null, runtime_id: null, status: 'running', initial_message: 'Hello agent',
-        native_session_id: null, work_dir_ref: null, source: 'widget', created_at: new Date().toISOString(), updated_at: new Date().toISOString()
+        native_session_id: null, work_dir_ref: null, source: 'widget', created_at: '2026-07-24T10:00:00.000Z', updated_at: '2026-07-24T10:00:00.000Z'
       } });
     }
     if (path === `/api/runs/${runId}/events/stream`) {
@@ -124,7 +124,7 @@ test('widget matches the platform chat interaction and event presentation', asyn
   await expect(page.getByText('Hello from the agent.', { exact: true })).toBeVisible();
   await expect(page.getByText('assistant: Hello from the agent.', { exact: true })).toHaveCount(0);
   const activity = page.locator('.session-activity-events');
-  await expect(activity).toContainText(/Worked for/);
+  await expect(activity).toContainText('Worked for 3 sec');
   await activity.locator('summary').click();
   await expect(activity).toContainText('Checked the request.');
   await expect(composer).toHaveValue('');
@@ -330,6 +330,129 @@ test('widget retries the selected credential renewal after another renewal finis
   } });
   await expect.poll(() => renewalTokens, { timeout: 5_000 }).toContain('ahw_second');
   await expect(widget.getByRole('heading', { name: 'Second Renewal Agent' })).toBeVisible();
+});
+
+test('widget carries a queued steer into the next turn after the active run completes', async ({ page }) => {
+  const integrationSessionId = '71000000-0000-0000-0000-000000000060';
+  const hubSessionId = '72000000-0000-0000-0000-000000000060';
+  const firstRunId = '70000000-0000-0000-0000-000000000060';
+  const secondRunId = '70000000-0000-0000-0000-000000000061';
+  const firstAcceptedAt = '2026-07-28T01:00:00.000Z';
+  const secondAcceptedAt = '2026-07-28T01:00:01.000Z';
+  let runPosts = 0;
+  let historyReloads = 0;
+  let migrated = false;
+  let secondCompleted = false;
+  let releaseFirstTerminal!: () => void;
+  const firstTerminalGate = new Promise<void>((resolve) => { releaseFirstTerminal = resolve; });
+  const sessionStreamCursors: number[] = [];
+  const firstEvents = [
+    { seq: 1, run_id: firstRunId, event_type: 'message', role: 'user', content: 'First turn question', payload: {}, created_at: firstAcceptedAt },
+    { seq: 2, run_id: firstRunId, event_type: 'message', role: 'assistant', content: 'First turn answer', payload: {}, created_at: '2026-07-28T01:00:02.000Z' },
+    { seq: 3, run_id: firstRunId, event_type: 'status', role: null, content: 'completed', payload: { status: 'completed' }, created_at: '2026-07-28T01:00:03.000Z' }
+  ];
+  const queuedEvent = { seq: 4, run_id: secondRunId, event_type: 'message', role: 'user', content: 'Second turn question', payload: {}, created_at: secondAcceptedAt };
+  const secondEvents = [
+    { seq: 5, run_id: secondRunId, event_type: 'message', role: 'assistant', content: 'Second turn answer', payload: {}, created_at: '2026-07-28T01:00:04.000Z' },
+    { seq: 6, run_id: secondRunId, event_type: 'status', role: null, content: 'completed', payload: { status: 'completed' }, created_at: '2026-07-28T01:00:05.000Z' }
+  ];
+  const userMessage = (id: string, sequence: number, content: string, runId: string, acceptedAt: string) => ({
+    id,
+    session_id: hubSessionId,
+    sequence,
+    role: 'user',
+    message_kind: 'message',
+    content,
+    payload: {},
+    delivery_mode: sequence === 1 ? 'next_turn' : migrated ? 'next_turn' : 'steer',
+    delivery_state: sequence === 1 || secondCompleted ? 'delivered' : 'queued',
+    client_message_key: `two-turn-${sequence}`,
+    expected_native_turn_id: null,
+    turn_id: `turn-${sequence}`,
+    run_id: runId,
+    accepted_at: acceptedAt
+  });
+
+  await page.route(/^https?:\/\/[^/]+\/api\//, async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const path = url.pathname;
+    if (path === '/api/widget/session') return route.fulfill({ json: {
+      id: 'agent-id', name: 'Two Turn Widget Agent', instructions: '',
+      expires_at: new Date(Date.now() + 60 * 60_000).toISOString(), history_enabled: false
+    } });
+    if (path === '/api/widget/runs' && request.method() === 'POST') {
+      runPosts += 1;
+      return route.fulfill({ json: {
+        id: firstRunId, agent_id: 'agent-id', automation_id: null,
+        integration_session_id: integrationSessionId, parent_run_id: null, runtime_id: 'runtime-id',
+        hub_session_id: hubSessionId, hub_message_id: null, hub_turn_id: 'turn-1',
+        session_ownership_generation: 1, status: 'running',
+        initial_message: runPosts === 1 ? 'First turn question' : 'Second turn question',
+        native_session_id: 'native-session', work_dir_ref: 'workspace', source: 'widget',
+        created_at: firstAcceptedAt, updated_at: firstAcceptedAt
+      } });
+    }
+    if (path === `/api/runs/${firstRunId}/events/stream`) {
+      await firstTerminalGate;
+      migrated = true;
+      return route.fulfill({
+        contentType: 'text/event-stream',
+        body: firstEvents.map((event) => `event: run_event\ndata: ${JSON.stringify(event)}\n\n`).join('')
+      });
+    }
+    if (path === `/api/widget/sessions/${integrationSessionId}/messages`) {
+      historyReloads += 1;
+      return route.fulfill({ json: [
+        userMessage('two-turn-message-1', 1, 'First turn question', firstRunId, firstAcceptedAt),
+        userMessage('two-turn-message-2', 2, 'Second turn question', secondRunId, secondAcceptedAt)
+      ] });
+    }
+    if (path === `/api/widget/sessions/${integrationSessionId}/events`) {
+      return route.fulfill({ json: [
+        ...firstEvents,
+        queuedEvent,
+        ...(secondCompleted ? secondEvents : [])
+      ] });
+    }
+    if (path === `/api/widget/sessions/${integrationSessionId}/events/stream`) {
+      const after = Number(url.searchParams.get('after') ?? '0');
+      sessionStreamCursors.push(after);
+      if (after >= queuedEvent.seq && !secondCompleted) {
+        secondCompleted = true;
+        return route.fulfill({
+          contentType: 'text/event-stream',
+          body: secondEvents.map((event) => `event: run_event\ndata: ${JSON.stringify(event)}\n\n`).join('')
+        });
+      }
+      return route.fulfill({ contentType: 'text/event-stream', body: '' });
+    }
+    return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });
+  });
+
+  await page.goto('/widget#token=ahw_two_turns');
+  await expect(page.getByText('Two Turn Widget Agent')).toBeVisible();
+  const composer = page.getByRole('textbox', { name: 'Message' });
+  await composer.fill('First turn question');
+  await composer.press('Enter');
+  await expect.poll(() => runPosts).toBe(1);
+  await expect(composer).toBeEmpty();
+  await expect(page.locator('.widget-transcript').getByText('First turn question', { exact: true })).toBeVisible();
+
+  await composer.fill('Second turn question');
+  await composer.press('Enter');
+  await expect.poll(() => runPosts).toBe(2);
+  await expect(composer).toBeEmpty();
+  try {
+    await expect(page.locator('.widget-transcript').getByText('Second turn question', { exact: true })).toBeVisible();
+  } finally {
+    releaseFirstTerminal();
+  }
+
+  await expect(page.getByText('First turn answer', { exact: true })).toBeVisible();
+  await expect(page.getByText('Second turn answer', { exact: true })).toBeVisible();
+  await expect.poll(() => historyReloads).toBeGreaterThan(0);
+  expect(sessionStreamCursors).toContain(queuedEvent.seq);
 });
 
 test('widget restores its exact external session and draft without listing disabled history', async ({ page }) => {

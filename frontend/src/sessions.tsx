@@ -1,5 +1,7 @@
 import { ArrowUp, Bot, Brain, ChevronDown, ChevronRight, FilePenLine, ImageIcon, ListChecks, Minimize2, PanelLeft, Plus, Search, Square, Terminal, Trash2, Users, Wrench, X } from 'lucide-react';
 import { FormEvent, type TouchEvent, type WheelEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { api, type Agent, type HubSession, type HubSessionMessage, type RunEvent } from './api/client';
 import { useI18n } from './i18n';
 import type { TranslationKey } from './i18n';
@@ -92,11 +94,17 @@ const activityKeys: Record<ActivityKind, TranslationKey> = {
   wait: 'activityWait'
 };
 
-function formatActivityDuration(activities: ActivityEntry[], locale: string) {
+function formatActivityDuration(
+  activities: ActivityEntry[],
+  locale: string,
+  startedAt?: number,
+  endedAt?: number
+) {
+  const activityStartedAt = Math.min(...activities.map((activity) => activity.occurredAt));
+  const activityEndedAt = Math.max(...activities.map((activity) => activity.endedAt));
   const milliseconds = Math.max(
     0,
-    Math.max(...activities.map((activity) => activity.endedAt))
-      - Math.min(...activities.map((activity) => activity.occurredAt))
+    (endedAt ?? activityEndedAt) - (startedAt ?? activityStartedAt)
   );
   const seconds = milliseconds / 1000;
   if (seconds < 60) {
@@ -127,6 +135,23 @@ export function mergeRunEvents(current: RunEvent[], incoming: RunEvent[]) {
 
 function payloadString(payload: Record<string, unknown>, key: string) {
   return typeof payload[key] === 'string' ? payload[key] as string : null;
+}
+
+export function runProcessingWindow(events: RunEvent[], acceptedAt?: number) {
+  const starts = events
+    .filter((event) => event.event_type === 'message' && event.role === 'user')
+    .map((event) => eventTimestamp(event.created_at))
+    .filter((timestamp) => timestamp > 0);
+  if (acceptedAt !== undefined && acceptedAt > 0) starts.push(acceptedAt);
+  const terminalEnds = events.filter((event) => {
+    if (event.event_type !== 'status') return false;
+    const status = event.content ?? payloadString(event.payload, 'status');
+    return status !== null && terminalRunStatuses.has(status);
+  }).map((event) => eventTimestamp(event.created_at)).filter((timestamp) => timestamp > 0);
+  return {
+    startedAt: starts.length > 0 ? Math.min(...starts) : undefined,
+    endedAt: terminalEnds.length > 0 ? Math.min(...terminalEnds) : undefined
+  };
 }
 
 function payloadNumber(payload: Record<string, unknown>, key: string) {
@@ -285,9 +310,9 @@ function ActivityIcon({ kind }: { kind: ActivityKind }) {
   return <Minimize2 size={15} />;
 }
 
-export function ChatActivityGroup({ activities }: { activities: ActivityEntry[] }) {
+export function ChatActivityGroup({ activities, startedAt, endedAt }: { activities: ActivityEntry[]; startedAt?: number; endedAt?: number }) {
   const { locale, t } = useI18n();
-  return <details className="session-activity-events"><summary><span>{t('agentActivityDuration').replace('{duration}', formatActivityDuration(activities, locale))}</span><ChevronRight className="session-activity-chevron" size={16} aria-hidden="true" /></summary><div>{activities.map((activity) => <div className="session-activity-row" key={activity.id}><span className="session-activity-icon" aria-hidden="true"><ActivityIcon kind={activity.kind} /></span><div className="session-activity-content"><strong>{t(activityKeys[activity.kind])}</strong>{activity.summary && (activity.kind === 'command' ? <code>{activity.summary}</code> : <span className="session-activity-summary">{activity.summary}</span>)}{activity.output && <div className="session-activity-output"><span>{t('activityOutput')}</span><pre>{activity.output}</pre></div>}</div></div>)}</div></details>;
+  return <details className="session-activity-events"><summary><span>{t('agentActivityDuration').replace('{duration}', formatActivityDuration(activities, locale, startedAt, endedAt))}</span><ChevronRight className="session-activity-chevron" size={16} aria-hidden="true" /></summary><div>{activities.map((activity) => <div className="session-activity-row" key={activity.id}><span className="session-activity-icon" aria-hidden="true"><ActivityIcon kind={activity.kind} /></span><div className="session-activity-content"><strong>{t(activityKeys[activity.kind])}</strong>{activity.summary && (activity.kind === 'command' ? <code>{activity.summary}</code> : <span className="session-activity-summary">{activity.summary}</span>)}{activity.output && <div className="session-activity-output"><span>{t('activityOutput')}</span><pre>{activity.output}</pre></div>}</div></div>)}</div></details>;
 }
 
 export function ChatMessageBubble({
@@ -310,7 +335,9 @@ export function ChatMessageBubble({
     {role !== 'user' && <span className="session-message-avatar" aria-hidden="true"><Bot size={17} /></span>}
     <div className="session-message-body">
       <header>{role !== 'user' && <strong>{role === 'assistant' ? agentName ?? t('assistant') : role}</strong>}{state && state !== 'delivered' && <span className={`message-state ${state}`}>{stateLabel}</span>}</header>
-      <div className="session-message-text">{content}</div>
+      {role === 'assistant'
+        ? <div className="session-message-text session-message-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} components={{ a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noreferrer" /> }}>{content}</ReactMarkdown></div>
+        : <div className="session-message-text">{content}</div>}
       {guidance && <small>{guidance}</small>}
     </div>
   </article>;
@@ -489,6 +516,16 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
     () => events.filter((event) => sessionRunIdSet.has(event.run_id)),
     [events, sessionRunIdSet]
   );
+  const runProcessingWindows = useMemo(() => new Map(sessionRunIds.map((runId) => {
+    const acceptedAt = sessionMessages
+      .filter((message) => message.run_id === runId && message.role === 'user')
+      .map((message) => eventTimestamp(message.accepted_at))
+      .filter((timestamp) => timestamp > 0);
+    return [runId, runProcessingWindow(
+      sessionEvents.filter((event) => event.run_id === runId),
+      acceptedAt.length > 0 ? Math.min(...acceptedAt) : undefined
+    )] as const;
+  })), [sessionEvents, sessionMessages, sessionRunIds]);
   const activeRunId = useMemo(() => [...sessionMessages].reverse().find((message) => message.run_id)?.run_id ?? null, [sessionMessages]);
   const activeRunUserMessage = activeRunId
     ? [...sessionMessages].reverse().find((message) => message.run_id === activeRunId && message.role === 'user') ?? null
@@ -928,7 +965,12 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
               {!conversationDraft && !messagesLoading && messagesError && <div className="operation-state error" role="alert">{t('messagesLoadFailed')}</div>}
               {!conversationDraft && !messagesLoading && !messagesError && timelineItems.length === 0 && <div className="operation-state">{t('noMessages')}</div>}
               {!conversationDraft && timelineItems.map((entry) => entry.kind === 'activity-group'
-                ? <ChatActivityGroup activities={entry.activities} key={entry.id} />
+                ? <ChatActivityGroup
+                  activities={entry.activities}
+                  endedAt={runProcessingWindows.get(entry.runId)?.endedAt}
+                  key={entry.id}
+                  startedAt={runProcessingWindows.get(entry.runId)?.startedAt}
+                />
                 : <ChatMessageBubble
                   agentName={conversationAgentName}
                   content={entry.content}
