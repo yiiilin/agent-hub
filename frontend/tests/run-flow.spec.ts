@@ -473,6 +473,221 @@ test('public Widget uses an app-scoped visitor key and restores its anonymous se
   expect(consoleErrors).toEqual([]);
 });
 
+test('widget follows only at the bottom and prepends older history without moving the reading position', async ({ page }) => {
+  const integrationSessionId = '71000000-0000-0000-0000-000000000040';
+  const hubSessionId = '72000000-0000-0000-0000-000000000040';
+  const timestamp = new Date().toISOString();
+  const messages = Array.from({ length: 60 }, (_, index) => ({
+    id: `history-message-${index + 1}`,
+    session_id: hubSessionId,
+    sequence: index + 1,
+    role: 'user',
+    message_kind: 'message',
+    content: `Widget history message ${index + 1}`,
+    payload: {},
+    delivery_mode: 'next_turn',
+    delivery_state: 'delivered',
+    client_message_key: null,
+    expected_native_turn_id: null,
+    turn_id: null,
+    run_id: null,
+    accepted_at: timestamp
+  }));
+  let releaseOlderPage!: () => void;
+  const olderPageGate = new Promise<void>((resolve) => { releaseOlderPage = resolve; });
+  let releaseFirstRun!: () => void;
+  const firstRunGate = new Promise<void>((resolve) => { releaseFirstRun = resolve; });
+  let releaseSecondRun!: () => void;
+  const secondRunGate = new Promise<void>((resolve) => { releaseSecondRun = resolve; });
+  let runCount = 0;
+
+  await page.addInitScript(({ sessionId, hubId, now }) => {
+    sessionStorage.setItem('agent-hub-widget-state-v1', JSON.stringify({
+      token: 'ahw_scroll',
+      expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+      historyEnabled: true,
+      target: { integrationSessionId: sessionId, hubSessionId: hubId },
+      draft: '',
+      draftClientMessageKey: null,
+      storedAt: now
+    }));
+  }, { sessionId: integrationSessionId, hubId: hubSessionId, now: timestamp });
+
+  await page.route(/^https?:\/\/[^/]+\/api\//, async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const path = url.pathname;
+    if (path === '/api/widget/session') return route.fulfill({ json: {
+      id: 'agent-id', name: 'Scrolling Widget Agent', instructions: '',
+      expires_at: new Date(Date.now() + 60 * 60_000).toISOString(), history_enabled: true
+    } });
+    if (path === '/api/widget/sessions') return route.fulfill({ json: [{
+      id: integrationSessionId,
+      hub_session_id: hubSessionId,
+      created_at: timestamp,
+      updated_at: timestamp,
+      preview: 'Widget history message 1'
+    }] });
+    if (path === `/api/widget/sessions/${integrationSessionId}/messages`) {
+      const beforeValue = url.searchParams.get('before_sequence');
+      const limitValue = url.searchParams.get('limit');
+      const beforeSequence = beforeValue === null ? null : Number(beforeValue);
+      const limit = limitValue === null ? null : Number(limitValue);
+      if (beforeSequence !== null) await olderPageGate;
+      const pageItems = messages.filter((item) => beforeSequence === null || item.sequence < beforeSequence);
+      return route.fulfill({ json: limit === null ? pageItems : pageItems.slice(Math.max(0, pageItems.length - limit)) });
+    }
+    if (path === `/api/widget/sessions/${integrationSessionId}/events`) return route.fulfill({ json: [] });
+    if (path === '/api/widget/runs' && request.method() === 'POST') {
+      const currentRun = ++runCount;
+      await (currentRun === 1 ? firstRunGate : secondRunGate);
+      const body = request.postDataJSON() as { message: string };
+      return route.fulfill({ json: {
+        id: `widget-scroll-run-${currentRun}`,
+        agent_id: 'agent-id', automation_id: null, integration_session_id: integrationSessionId,
+        parent_run_id: null, runtime_id: null, hub_session_id: hubSessionId,
+        hub_message_id: null, hub_turn_id: null, session_ownership_generation: 1,
+        status: 'pending', initial_message: body.message, native_session_id: null,
+        work_dir_ref: null, source: 'widget', created_at: timestamp, updated_at: timestamp
+      } });
+    }
+    if (path.endsWith('/events/stream')) return route.fulfill({ contentType: 'text/event-stream', body: '' });
+    return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });
+  });
+
+  await page.goto('/widget');
+  const scroll = page.locator('.session-chat-scroll');
+  const composer = page.getByRole('textbox', { name: 'Message' });
+  const anchor = page.getByText('Widget history message 11', { exact: true });
+  await expect(page.getByText('Widget history message 60', { exact: true })).toBeVisible();
+  await expect(anchor).toHaveCount(1);
+  await expect(page.getByText('Widget history message 1', { exact: true })).toHaveCount(0);
+  const bottomDistance = () => scroll.evaluate((element) => (
+    element.scrollHeight - element.clientHeight - element.scrollTop
+  ));
+  await expect.poll(bottomDistance).toBeLessThanOrEqual(1);
+
+  const firstRequest = page.waitForRequest((request) => new URL(request.url()).pathname === '/api/widget/runs');
+  await composer.fill('Follow this Widget message.');
+  await page.getByRole('button', { name: 'Send' }).click();
+  await firstRequest;
+  await expect(page.locator('.session-message-text', { hasText: /^Follow this Widget message\.$/ })).toBeVisible();
+  await expect.poll(bottomDistance).toBeLessThanOrEqual(1);
+  releaseFirstRun();
+  await expect(composer).toBeEmpty();
+
+  await scroll.hover();
+  await page.mouse.wheel(0, -480);
+  await page.evaluate(() => new Promise<void>((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+  }));
+  const readingTop = await scroll.evaluate((element) => element.scrollTop);
+  expect(readingTop).toBeGreaterThan(64);
+  expect(await bottomDistance()).toBeGreaterThan(24);
+  const secondRequest = page.waitForRequest((request) => new URL(request.url()).pathname === '/api/widget/runs');
+  await composer.fill('Do not move this Widget reading position.');
+  await page.getByRole('button', { name: 'Send' }).click();
+  await secondRequest;
+  await expect(page.locator('.session-message-text', { hasText: /^Do not move this Widget reading position\.$/ })).toBeVisible();
+  await expect.poll(async () => Math.abs(await scroll.evaluate((element) => element.scrollTop) - readingTop))
+    .toBeLessThanOrEqual(2);
+  releaseSecondRun();
+  await expect(composer).toBeEmpty();
+
+  const olderRequest = page.waitForRequest((request) => {
+    const requestUrl = new URL(request.url());
+    return requestUrl.pathname === `/api/widget/sessions/${integrationSessionId}/messages`
+      && requestUrl.searchParams.get('before_sequence') === '11';
+  });
+  await expect(page.locator('.widget-transcript')).toHaveAttribute('aria-busy', 'false');
+  await scroll.hover();
+  await page.mouse.wheel(0, -100_000);
+  await olderRequest;
+  await expect(anchor).toBeVisible();
+  const anchorTop = await anchor.evaluate((element) => element.getBoundingClientRect().top);
+  releaseOlderPage();
+  await expect(page.getByText('Widget history message 1', { exact: true })).toHaveCount(1);
+  await expect.poll(async () => Math.abs(
+    await anchor.evaluate((element) => element.getBoundingClientRect().top) - anchorTop
+  )).toBeLessThanOrEqual(2);
+  await expect.poll(() => scroll.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+});
+
+test('an upward gesture loads older Widget history when the current page has no visible exchanges', async ({ page }) => {
+  const integrationSessionId = '71000000-0000-0000-0000-000000000041';
+  const hubSessionId = '72000000-0000-0000-0000-000000000041';
+  const timestamp = new Date().toISOString();
+  const messages = Array.from({ length: 60 }, (_, index) => ({
+    id: `short-widget-history-${index + 1}`,
+    session_id: hubSessionId,
+    sequence: index + 1,
+    role: index < 10 ? 'user' : 'assistant',
+    message_kind: 'message',
+    content: index < 10 ? `Earlier Widget history ${index + 1}` : `Hidden assistant history ${index + 1}`,
+    payload: {},
+    delivery_mode: 'next_turn',
+    delivery_state: 'delivered',
+    client_message_key: null,
+    expected_native_turn_id: null,
+    turn_id: null,
+    run_id: null,
+    accepted_at: timestamp
+  }));
+
+  await page.addInitScript(({ sessionId, hubId, now }) => {
+    sessionStorage.setItem('agent-hub-widget-state-v1', JSON.stringify({
+      token: 'ahw_short_history',
+      expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+      historyEnabled: true,
+      target: { integrationSessionId: sessionId, hubSessionId: hubId },
+      draft: '',
+      draftClientMessageKey: null,
+      storedAt: now
+    }));
+  }, { sessionId: integrationSessionId, hubId: hubSessionId, now: timestamp });
+
+  await page.route(/^https?:\/\/[^/]+\/api\//, async (route) => {
+    const url = new URL(route.request().url());
+    const path = url.pathname;
+    if (path === '/api/widget/session') return route.fulfill({ json: {
+      id: 'agent-id', name: 'Short History Widget Agent', instructions: '',
+      expires_at: new Date(Date.now() + 60 * 60_000).toISOString(), history_enabled: true
+    } });
+    if (path === '/api/widget/sessions') return route.fulfill({ json: [{
+      id: integrationSessionId,
+      hub_session_id: hubSessionId,
+      created_at: timestamp,
+      updated_at: timestamp,
+      preview: 'Earlier Widget history 1'
+    }] });
+    if (path === `/api/widget/sessions/${integrationSessionId}/messages`) {
+      const beforeValue = url.searchParams.get('before_sequence');
+      const limitValue = url.searchParams.get('limit');
+      const beforeSequence = beforeValue === null ? null : Number(beforeValue);
+      const limit = limitValue === null ? messages.length : Number(limitValue);
+      const pageItems = messages.filter((item) => beforeSequence === null || item.sequence < beforeSequence);
+      return route.fulfill({ json: pageItems.slice(Math.max(0, pageItems.length - limit)) });
+    }
+    if (path === `/api/widget/sessions/${integrationSessionId}/events`) return route.fulfill({ json: [] });
+    return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });
+  });
+
+  await page.goto('/widget');
+  const scroll = page.locator('.session-chat-scroll');
+  await expect(page.getByText('Earlier Widget history 1', { exact: true })).toHaveCount(0);
+  expect(await scroll.evaluate((element) => element.scrollHeight <= element.clientHeight)).toBe(true);
+
+  const olderRequest = page.waitForRequest((request) => {
+    const url = new URL(request.url());
+    return url.pathname === `/api/widget/sessions/${integrationSessionId}/messages`
+      && url.searchParams.get('before_sequence') === '11';
+  });
+  await scroll.hover();
+  await page.mouse.wheel(0, -120);
+  await olderRequest;
+  await expect(page.getByText('Earlier Widget history 1', { exact: true })).toBeVisible();
+});
+
 test('widget history switch detaches stale output without stopping the previous Run', async ({ page }) => {
   const sessionA = '71000000-0000-0000-0000-000000000030';
   const hubA = '72000000-0000-0000-0000-000000000030';

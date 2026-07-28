@@ -54,7 +54,12 @@ function message(sessionId: string, sequence: number, role: string, content: str
   };
 }
 
-async function installSessionApi(page: Page) {
+async function installSessionApi(page: Page, options: {
+  activeMessages?: Array<Record<string, unknown>>;
+  activeStreamGate?: Promise<void>;
+  activeStreamRefreshesSession?: boolean;
+  olderMessagePageGate?: Promise<void>;
+} = {}) {
   const active = session('active', activeAgentId, 'Active Agent', 'hub_native', { active_turn_id: 'turn-active' });
   const external = session('external', activeAgentId, 'External Agent', 'external', { active_turn_id: 'turn-external' });
   const historical = session('historical', deletedAgentId, 'Deleted Agent', 'hub_native', {
@@ -73,7 +78,7 @@ async function installSessionApi(page: Page) {
   let externalStreamCount = 0;
   let sessions = [active, external, historical, multiTurn];
   const messages: Record<string, Array<Record<string, unknown>>> = {
-    active: [
+    active: options.activeMessages ?? [
       message('active', 1, 'user', 'Inspect the deployment.', { accepted_at: '2026-07-17T10:00:00.000Z' }),
       message('active', 2, 'assistant', 'The deployment is running.', { run_id: 'run-active', accepted_at: '2026-07-17T10:00:04.000Z' })
     ],
@@ -115,7 +120,8 @@ async function installSessionApi(page: Page) {
 
   await page.route('**/api/**', async (route: Route) => {
     const request = route.request();
-    const path = new URL(request.url()).pathname;
+    const url = new URL(request.url());
+    const path = url.pathname;
     if (!path.startsWith('/api/')) return route.continue();
     if (path === '/api/auth/me') return route.fulfill({ json: { id: ownerId, username: 'session-owner', email: 'session@example.com', display_name: 'Session owner', role: 'member' } });
     if (path === '/api/auth/logout' && request.method() === 'POST') return route.fulfill({ status: 204 });
@@ -142,10 +148,21 @@ async function installSessionApi(page: Page) {
       return route.fulfill({ json: created });
     }
     const messageMatch = path.match(/^\/api\/sessions\/([^/]+)\/messages$/);
-    if (messageMatch && request.method() === 'GET') return route.fulfill({ json: messages[messageMatch[1]] ?? [] });
+    if (messageMatch && request.method() === 'GET') {
+      const beforeValue = url.searchParams.get('before_sequence');
+      const limitValue = url.searchParams.get('limit');
+      const beforeSequence = beforeValue === null ? null : Number(beforeValue);
+      const limit = limitValue === null ? null : Number(limitValue);
+      if (beforeSequence !== null && options.olderMessagePageGate) await options.olderMessagePageGate;
+      const page = (messages[messageMatch[1]] ?? [])
+        .filter((item) => beforeSequence === null || Number(item.sequence) < beforeSequence);
+      return route.fulfill({
+        json: limit === null ? page : page.slice(Math.max(0, page.length - limit))
+      });
+    }
     if (messageMatch?.[1] === 'active' && request.method() === 'POST') {
       steerBody = request.postDataJSON() as Record<string, unknown>;
-      const accepted = message('active', 3, 'user', String(steerBody.content), { delivery_mode: 'steer', delivery_state: 'delivering', run_id: 'run-active', accepted_at: '2026-07-17T10:00:07.000Z' });
+      const accepted = message('active', messages.active.length + 1, 'user', String(steerBody.content), { delivery_mode: 'steer', delivery_state: 'delivering', run_id: 'run-active', accepted_at: '2026-07-17T10:00:07.000Z' });
       messages.active.push(accepted);
       return route.fulfill({ json: { message: accepted, run: { id: 'run-active', hub_session_id: 'active', status: 'running' } } });
     }
@@ -177,6 +194,11 @@ async function installSessionApi(page: Page) {
         return route.fulfill({ contentType: 'text/event-stream', body: `event: run_event\ndata: ${JSON.stringify(completed)}\n\n` });
       }
       if (streamMatch[1] !== 'run-active') return route.fulfill({ contentType: 'text/event-stream', body: '' });
+      await options.activeStreamGate;
+      if (options.activeStreamRefreshesSession) {
+        const turnStarted = { seq: 6, run_id: 'run-active', event_type: 'turn_started', role: null, content: null, payload: { native_turn_id: 'native-turn-active' }, created_at: '2026-07-17T10:00:05.000Z' };
+        return route.fulfill({ contentType: 'text/event-stream', body: `event: run_event\ndata: ${JSON.stringify(turnStarted)}\n\n` });
+      }
       const liveMessage = { seq: 6, run_id: 'run-active', event_type: 'message', role: 'assistant', content: 'Live assistant response.', payload: {}, created_at: '2026-07-17T10:00:05.000Z' };
       const liveTool = { seq: 7, run_id: 'run-active', event_type: 'tool_request', role: null, content: null, payload: { tool_request_id: 'tool-one', tool_name: 'shell' }, created_at: '2026-07-17T10:00:03.500Z' };
       return route.fulfill({ contentType: 'text/event-stream', body: `event: run_event\ndata: ${JSON.stringify(liveMessage)}\n\nevent: run_event\ndata: ${JSON.stringify(liveTool)}\n\n` });
@@ -397,6 +419,195 @@ test('composer grows from two lines to at most five lines', async ({ page }) => 
   expect(Math.abs(sixLineHeight - fiveLineHeight)).toBeLessThanOrEqual(1);
 });
 
+test('conversation follows new user and assistant output only while already at the bottom', async ({ page }) => {
+  let releaseActiveStream!: () => void;
+  const activeStreamGate = new Promise<void>((resolve) => { releaseActiveStream = resolve; });
+  await installSessionApi(page, { activeStreamGate });
+  await page.goto('/sessions');
+
+  const detail = page.getByRole('region', { name: 'Session details' });
+  const scroll = detail.locator('.session-chat-scroll');
+  await expect(detail.getByText('The deployment is running.', { exact: true })).toBeVisible();
+  await page.addStyleTag({ content: '.session-transcript > * { min-height: 240px; }' });
+  await expect.poll(() => scroll.evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(true);
+
+  const bottomDistance = () => scroll.evaluate((element) => (
+    element.scrollHeight - element.clientHeight - element.scrollTop
+  ));
+  await scroll.evaluate((element) => { element.scrollTop = element.scrollHeight; });
+  await expect.poll(bottomDistance).toBeLessThanOrEqual(1);
+
+  const composer = detail.getByRole('textbox', { name: 'Message' });
+  await composer.fill('Keep following my message.');
+  await detail.getByRole('button', { name: 'Send' }).click();
+  await expect(detail.getByText('Keep following my message.', { exact: true })).toBeVisible();
+  await expect.poll(bottomDistance).toBeLessThanOrEqual(1);
+
+  releaseActiveStream();
+  await expect(detail.getByText('Live assistant response.', { exact: true })).toBeVisible();
+  await expect.poll(bottomDistance).toBeLessThanOrEqual(1);
+
+  await scroll.hover();
+  await page.mouse.wheel(0, -100_000);
+  await page.evaluate(() => new Promise<void>((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+  }));
+  await expect.poll(() => scroll.evaluate((element) => element.scrollTop)).toBeLessThanOrEqual(1);
+  await composer.fill('Do not steal my scroll position.');
+  await detail.getByRole('button', { name: 'Send' }).click();
+  await expect(detail.getByText('Do not steal my scroll position.', { exact: true })).toBeVisible();
+  await expect.poll(() => scroll.evaluate((element) => element.scrollTop)).toBeLessThanOrEqual(1);
+});
+
+test('opening history starts at the latest message and prepends older messages without moving the reading position', async ({ page }) => {
+  let releaseOlderPage!: () => void;
+  const olderMessagePageGate = new Promise<void>((resolve) => { releaseOlderPage = resolve; });
+  const activeMessages = Array.from({ length: 60 }, (_, index) => message(
+    'active',
+    index + 1,
+    'user',
+    `History message ${index + 1}`,
+    { run_id: null, turn_id: null }
+  ));
+  await installSessionApi(page, { activeMessages, olderMessagePageGate });
+  await page.goto('/sessions');
+
+  const detail = page.getByRole('region', { name: 'Session details' });
+  const scroll = detail.locator('.session-chat-scroll');
+  const anchor = detail.getByText('History message 11', { exact: true });
+  await expect(anchor).toHaveCount(1);
+  await expect(detail.getByText('History message 1', { exact: true })).toHaveCount(0);
+  await expect(detail.getByText('History message 60', { exact: true })).toBeVisible();
+  await expect(detail.locator('.session-transcript')).toHaveAttribute('aria-busy', 'false');
+  await expect.poll(() => scroll.evaluate((element) => (
+    element.scrollHeight - element.clientHeight - element.scrollTop
+  ))).toBeLessThanOrEqual(1);
+
+  const olderRequest = page.waitForRequest((request) => {
+    const url = new URL(request.url());
+    return url.pathname === '/api/sessions/active/messages'
+      && url.searchParams.get('before_sequence') === '11';
+  });
+  await scroll.hover();
+  await page.mouse.wheel(0, -100_000);
+  await olderRequest;
+  await expect(anchor).toBeVisible();
+  const anchorTop = await anchor.evaluate((element) => element.getBoundingClientRect().top);
+  releaseOlderPage();
+
+  await expect(detail.getByText('History message 1', { exact: true })).toHaveCount(1);
+  await expect.poll(async () => Math.abs(
+    await anchor.evaluate((element) => element.getBoundingClientRect().top) - anchorTop
+  )).toBeLessThanOrEqual(2);
+  await expect.poll(() => scroll.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+});
+
+test('an upward gesture loads older Session messages when the current page does not overflow', async ({ page }) => {
+  const activeMessages = Array.from({ length: 60 }, (_, index) => message(
+    'active',
+    index + 1,
+    index < 10 ? 'user' : 'assistant',
+    index < 10 ? `Earlier short history ${index + 1}` : '',
+    { run_id: null, turn_id: null }
+  ));
+  await installSessionApi(page, { activeMessages });
+  await page.goto('/sessions');
+
+  const detail = page.getByRole('region', { name: 'Session details' });
+  const scroll = detail.locator('.session-chat-scroll');
+  await expect(detail.getByText('Earlier short history 1', { exact: true })).toHaveCount(0);
+  expect(await scroll.evaluate((element) => element.scrollHeight <= element.clientHeight)).toBe(true);
+
+  const olderRequest = page.waitForRequest((request) => {
+    const url = new URL(request.url());
+    return url.pathname === '/api/sessions/active/messages'
+      && url.searchParams.get('before_sequence') === '11';
+  });
+  await scroll.evaluate((element) => {
+    const start = new Touch({ identifier: 1, target: element, clientX: 20, clientY: 80 });
+    const end = new Touch({ identifier: 1, target: element, clientX: 20, clientY: 140 });
+    element.dispatchEvent(new TouchEvent('touchstart', { bubbles: true, touches: [start] }));
+    element.dispatchEvent(new TouchEvent('touchend', { bubbles: true, changedTouches: [end] }));
+  });
+  await olderRequest;
+  await expect(detail.getByText('Earlier short history 1', { exact: true })).toBeVisible();
+});
+
+test('a live Session refresh clears an invalidated older-message request', async ({ page }) => {
+  let releaseOlderPage!: () => void;
+  const olderMessagePageGate = new Promise<void>((resolve) => { releaseOlderPage = resolve; });
+  let releaseActiveStream!: () => void;
+  const activeStreamGate = new Promise<void>((resolve) => { releaseActiveStream = resolve; });
+  const activeMessages = Array.from({ length: 60 }, (_, index) => message(
+    'active',
+    index + 1,
+    'user',
+    `Concurrent history message ${index + 1}`,
+    { run_id: index === 59 ? 'run-active' : null, turn_id: null }
+  ));
+  await installSessionApi(page, {
+    activeMessages,
+    activeStreamGate,
+    activeStreamRefreshesSession: true,
+    olderMessagePageGate
+  });
+  await page.goto('/sessions');
+
+  const detail = page.getByRole('region', { name: 'Session details' });
+  const scroll = detail.locator('.session-chat-scroll');
+  const transcript = detail.locator('.session-transcript');
+  await expect(transcript).toHaveAttribute('aria-busy', 'false');
+
+  const olderRequest = page.waitForRequest((request) => {
+    const url = new URL(request.url());
+    return url.pathname === '/api/sessions/active/messages'
+      && url.searchParams.get('before_sequence') === '11';
+  });
+  await scroll.hover();
+  await page.mouse.wheel(0, -100_000);
+  await olderRequest;
+  await expect(transcript).toHaveAttribute('aria-busy', 'true');
+
+  const refreshRequest = page.waitForRequest((request) => {
+    const url = new URL(request.url());
+    return url.pathname === '/api/sessions/active/messages'
+      && url.searchParams.get('before_sequence') === null;
+  });
+  releaseActiveStream();
+  await refreshRequest;
+  releaseOlderPage();
+  await expect(transcript).toHaveAttribute('aria-busy', 'false');
+});
+
+test('mobile history opens at the latest message and loads earlier messages without horizontal overflow', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const activeMessages = Array.from({ length: 60 }, (_, index) => message(
+    'active',
+    index + 1,
+    'user',
+    `Mobile history message ${index + 1}`,
+    { run_id: null, turn_id: null }
+  ));
+  await installSessionApi(page, { activeMessages });
+  await page.goto('/sessions');
+
+  const detail = page.getByRole('region', { name: 'Session details' });
+  const scroll = detail.locator('.session-chat-scroll');
+  const anchor = detail.getByText('Mobile history message 11', { exact: true });
+  await expect(detail.getByText('Mobile history message 60', { exact: true })).toBeVisible();
+  await expect(detail.getByText('Mobile history message 1', { exact: true })).toHaveCount(0);
+  await expect(detail.locator('.session-transcript')).toHaveAttribute('aria-busy', 'false');
+  await expect.poll(() => scroll.evaluate((element) => (
+    element.scrollHeight - element.clientHeight - element.scrollTop
+  ))).toBeLessThanOrEqual(1);
+
+  await scroll.hover();
+  await page.mouse.wheel(0, -100_000);
+  await expect(detail.getByText('Mobile history message 1', { exact: true })).toHaveCount(1);
+  await expect(anchor).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+});
+
 test('a terminal Run refreshes a queued user message to its durable delivery state', async ({ page }) => {
   await installSessionApi(page);
   await page.goto('/sessions');
@@ -491,7 +702,7 @@ test('switching Sessions does not leak the previous transcript or Run stream whi
     const match = new URL(request.url()).pathname.match(/^\/api\/runs\/([^/]+)\/events\/stream$/);
     if (match) streamedRunIds.push(match[1]);
   });
-  await page.route('**/api/sessions/external/messages', async (route) => {
+  await page.route('**/api/sessions/external/messages*', async (route) => {
     markExternalMessagesRequested();
     await externalMessagesGate;
     await route.fallback();

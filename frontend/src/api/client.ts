@@ -343,6 +343,11 @@ export type HubSessionMessage = {
   accepted_at: string;
 };
 
+export type SessionMessagePageQuery = {
+  beforeSequence?: number;
+  limit: number;
+};
+
 export type CreateHubSessionMessage = {
   content: string;
   payload?: unknown;
@@ -741,6 +746,12 @@ function modelLedgerPath(path: string, query: ModelLedgerQuery = {}) {
   return serialized ? `${path}?${serialized}` : path;
 }
 
+function sessionMessagePagePath(path: string, query: SessionMessagePageQuery) {
+  const params = new URLSearchParams({ limit: String(query.limit) });
+  if (query.beforeSequence !== undefined) params.set('before_sequence', String(query.beforeSequence));
+  return `${path}?${params.toString()}`;
+}
+
 export class ApiError extends Error {
   constructor(public readonly status: number, public readonly code: 'request_failed' | 'mcp_redacted_secret_missing') {
     super('Request failed');
@@ -1095,6 +1106,8 @@ export const api = {
     request<HubSession>(`/api/sessions/${sessionId}`, { signal }),
   sessionMessages: (sessionId: string, signal?: AbortSignal) =>
     request<HubSessionMessage[]>(`/api/sessions/${sessionId}/messages`, { signal }),
+  sessionMessagePage: (sessionId: string, query: SessionMessagePageQuery, signal?: AbortSignal) =>
+    request<HubSessionMessage[]>(sessionMessagePagePath(`/api/sessions/${sessionId}/messages`, query), { signal }),
   createSessionMessage: (sessionId: string, message: CreateHubSessionMessage, signal?: AbortSignal) =>
     request<SessionMessageAcceptance>(`/api/sessions/${sessionId}/messages`, {
       method: 'POST',
@@ -1232,6 +1245,11 @@ export const api = {
     }),
   widgetSessionMessages: (token: string, sessionId: string, signal?: AbortSignal) =>
     request<HubSessionMessage[]>(`/api/widget/sessions/${encodeURIComponent(sessionId)}/messages`, {
+      signal,
+      headers: { 'X-Agent-Hub-Embed-Token': token }
+    }),
+  widgetSessionMessagePage: (token: string, sessionId: string, query: SessionMessagePageQuery, signal?: AbortSignal) =>
+    request<HubSessionMessage[]>(sessionMessagePagePath(`/api/widget/sessions/${encodeURIComponent(sessionId)}/messages`, query), {
       signal,
       headers: { 'X-Agent-Hub-Embed-Token': token }
     }),

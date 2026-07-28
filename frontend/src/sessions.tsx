@@ -1,5 +1,5 @@
 import { ArrowUp, Bot, Brain, ChevronDown, ChevronRight, FilePenLine, ImageIcon, ListChecks, Minimize2, PanelLeft, Plus, Search, Square, Terminal, Trash2, Users, Wrench, X } from 'lucide-react';
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { FormEvent, type TouchEvent, type WheelEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api, type Agent, type HubSession, type HubSessionMessage, type RunEvent } from './api/client';
 import { useI18n } from './i18n';
 import type { TranslationKey } from './i18n';
@@ -24,6 +24,24 @@ const deliveryKeys: Record<string, TranslationKey> = {
 };
 
 const terminalRunStatuses = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
+const sessionMessagePageSize = 50;
+export const sessionMessageRequestLimit = sessionMessagePageSize + 1;
+const chatBottomThreshold = 24;
+const chatHistoryThreshold = 64;
+
+export function selectSessionMessagePage(messages: HubSessionMessage[]) {
+  const hasMore = messages.length > sessionMessagePageSize;
+  return {
+    hasMore,
+    items: hasMore ? messages.slice(messages.length - sessionMessagePageSize) : messages
+  };
+}
+
+function mergeSessionMessages(current: HubSessionMessage[], incoming: HubSessionMessage[]) {
+  const merged = new Map(current.map((message) => [message.id, message]));
+  for (const message of incoming) merged.set(message.id, message);
+  return [...merged.values()].sort((left, right) => left.sequence - right.sequence);
+}
 
 type ActivityKind = 'reasoning' | 'command' | 'file' | 'tool' | 'search' | 'plan' | 'image' | 'subagent' | 'compaction' | 'review' | 'wait';
 
@@ -329,6 +347,13 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
   const streamGeneration = useRef(0);
   const sessionRefreshGeneration = useRef(0);
   const conversationDraftGeneration = useRef(0);
+  const chatScrollRef = useRef<HTMLDivElement>(null);
+  const followBottomRef = useRef(true);
+  const historyPagingReadyRef = useRef(false);
+  const lastChatScrollTopRef = useRef(0);
+  const olderMessagesLoadingRef = useRef(false);
+  const historyAnchorRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
+  const chatTouchStartYRef = useRef<number | null>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const [sessions, setSessions] = useState<HubSession[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
@@ -343,6 +368,8 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
   const [loadError, setLoadError] = useState(false);
   const [messagesLoading, setMessagesLoading] = useState(false);
   const [messagesError, setMessagesError] = useState(false);
+  const [hasOlderMessages, setHasOlderMessages] = useState(false);
+  const [olderMessagesLoading, setOlderMessagesLoading] = useState(false);
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
   const [stopping, setStopping] = useState(false);
@@ -413,8 +440,15 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
   useEffect(() => {
     const generation = ++messageLoadGeneration.current;
     const controller = new AbortController();
+    followBottomRef.current = true;
+    historyPagingReadyRef.current = false;
+    lastChatScrollTopRef.current = 0;
+    olderMessagesLoadingRef.current = false;
+    historyAnchorRef.current = null;
     setMessages([]);
     setEvents([]);
+    setHasOlderMessages(false);
+    setOlderMessagesLoading(false);
     setActionError(false);
     setConversationCreateError(false);
     setStopRequestedRunId(null);
@@ -425,8 +459,12 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
     }
     setMessagesLoading(true);
     setMessagesError(false);
-    api.sessionMessages(selectedId, controller.signal).then((response) => {
-      if (mountedRef.current && generation === messageLoadGeneration.current) setMessages(response);
+    api.sessionMessagePage(selectedId, { limit: sessionMessageRequestLimit }, controller.signal).then((response) => {
+      if (mountedRef.current && generation === messageLoadGeneration.current) {
+        const page = selectSessionMessagePage(response);
+        setMessages(page.items);
+        setHasOlderMessages(page.hasMore);
+      }
     }).catch((error) => {
       if (mountedRef.current && generation === messageLoadGeneration.current && (error as Error)?.name !== 'AbortError') setMessagesError(true);
     }).finally(() => {
@@ -486,6 +524,78 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
     selectedSession && !historyReadOnly && selectedSession.origin.kind === 'hub_native'
   );
 
+  const loadOlderMessages = useCallback(async () => {
+    const beforeSequence = sessionMessages[0]?.sequence;
+    if (!selectedId || beforeSequence === undefined || !hasOlderMessages || olderMessagesLoadingRef.current) return;
+    const generation = messageLoadGeneration.current;
+    olderMessagesLoadingRef.current = true;
+    setOlderMessagesLoading(true);
+    try {
+      const response = await api.sessionMessagePage(selectedId, {
+        beforeSequence,
+        limit: sessionMessageRequestLimit
+      });
+      const page = selectSessionMessagePage(response);
+      const runIds = [...new Set(page.items.flatMap((message) => message.run_id ? [message.run_id] : []))];
+      const eventResults = await Promise.allSettled(runIds.map((runId) => api.runEvents(runId)));
+      if (!mountedRef.current || generation !== messageLoadGeneration.current) return;
+      const scroll = chatScrollRef.current;
+      if (scroll) {
+        historyAnchorRef.current = {
+          scrollHeight: scroll.scrollHeight,
+          scrollTop: scroll.scrollTop
+        };
+      }
+      const loadedEvents = eventResults.flatMap((result) => result.status === 'fulfilled' ? result.value : []);
+      if (loadedEvents.length > 0) setEvents((current) => mergeRunEvents(current, loadedEvents));
+      setMessages((current) => mergeSessionMessages(current, page.items));
+      setHasOlderMessages(page.hasMore);
+    } catch {
+      if (mountedRef.current && generation === messageLoadGeneration.current) setActionError(true);
+    } finally {
+      olderMessagesLoadingRef.current = false;
+      if (mountedRef.current) setOlderMessagesLoading(false);
+    }
+  }, [hasOlderMessages, selectedId, sessionMessages]);
+
+  const requestOlderMessages = useCallback(() => {
+    if (!historyPagingReadyRef.current || !hasOlderMessages || messagesLoading) return;
+    followBottomRef.current = false;
+    void loadOlderMessages();
+  }, [hasOlderMessages, loadOlderMessages, messagesLoading]);
+
+  const handleChatScroll = useCallback(() => {
+    const scroll = chatScrollRef.current;
+    if (!scroll) return;
+    const scrollingUp = scroll.scrollTop < lastChatScrollTopRef.current - 1;
+    lastChatScrollTopRef.current = scroll.scrollTop;
+    followBottomRef.current = scroll.scrollHeight - scroll.clientHeight - scroll.scrollTop <= chatBottomThreshold;
+    if (historyPagingReadyRef.current
+      && scrollingUp
+      && scroll.scrollTop <= chatHistoryThreshold) {
+      requestOlderMessages();
+    }
+  }, [requestOlderMessages]);
+
+  const handleChatWheel = useCallback((event: WheelEvent<HTMLDivElement>) => {
+    const scroll = chatScrollRef.current;
+    if (event.deltaY < 0 && scroll && scroll.scrollTop <= chatHistoryThreshold) requestOlderMessages();
+  }, [requestOlderMessages]);
+
+  const handleChatTouchStart = useCallback((event: TouchEvent<HTMLDivElement>) => {
+    chatTouchStartYRef.current = event.touches[0]?.clientY ?? null;
+  }, []);
+
+  const handleChatTouchEnd = useCallback((event: TouchEvent<HTMLDivElement>) => {
+    const startY = chatTouchStartYRef.current;
+    chatTouchStartYRef.current = null;
+    const endY = event.changedTouches[0]?.clientY;
+    const scroll = chatScrollRef.current;
+    if (startY !== null && endY !== undefined && endY > startY + 12 && scroll && scroll.scrollTop <= chatHistoryThreshold) {
+      requestOlderMessages();
+    }
+  }, [requestOlderMessages]);
+
   useEffect(() => {
     const generation = ++eventLoadGeneration.current;
     const controller = new AbortController();
@@ -506,7 +616,7 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
       const refreshGeneration = ++sessionRefreshGeneration.current;
       void Promise.allSettled([
         api.session(selectedSession.id, controller.signal),
-        api.sessionMessages(selectedSession.id, controller.signal)
+        api.sessionMessagePage(selectedSession.id, { limit: sessionMessageRequestLimit }, controller.signal)
       ]).then(([sessionResult, messageResult]) => {
         if (!mountedRef.current
           || generation !== streamGeneration.current
@@ -518,7 +628,7 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
         }
         if (messageResult.status === 'fulfilled') {
           messageLoadGeneration.current += 1;
-          setMessages(messageResult.value);
+          setMessages((current) => mergeSessionMessages(current, selectSessionMessagePage(messageResult.value).items));
           setMessagesError(false);
           setMessagesLoading(false);
         }
@@ -637,6 +747,22 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
       return items;
     }, []);
   }, [timeline]);
+
+  useLayoutEffect(() => {
+    const scroll = chatScrollRef.current;
+    if (!scroll) return;
+    const anchor = historyAnchorRef.current;
+    if (anchor) {
+      scroll.scrollTop = anchor.scrollTop + scroll.scrollHeight - anchor.scrollHeight;
+      lastChatScrollTopRef.current = scroll.scrollTop;
+      historyAnchorRef.current = null;
+      historyPagingReadyRef.current = true;
+      return;
+    }
+    if (followBottomRef.current) scroll.scrollTop = scroll.scrollHeight;
+    lastChatScrollTopRef.current = scroll.scrollTop;
+    if (!messagesLoading) historyPagingReadyRef.current = true;
+  }, [messagesLoading, selectedId, showThinking, timelineItems]);
 
   function lifecycleLabel(status: string) {
     return t(lifecycleKeys[status] ?? 'sessionStatusUnknown');
@@ -791,13 +917,13 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
             {conversationDraft && <button className="icon-button session-discard-draft" type="button" aria-label={t('discardDraft')} title={t('discardDraft')} onClick={discardCurrentDraft}><Trash2 size={16} /></button>}
             {selectedSession && <span className={`status ${selectedSession.lifecycle_status}`}>{lifecycleLabel(selectedSession.lifecycle_status)}</span>}
           </header>
-          <div className="session-chat-scroll">
+          <div className="session-chat-scroll" ref={chatScrollRef} onScroll={handleChatScroll} onWheel={handleChatWheel} onTouchStart={handleChatTouchStart} onTouchEnd={handleChatTouchEnd}>
             {selectedSession?.lifecycle_status === 'recovery_failed' && <div className="session-banner error" role="alert"><strong>{t('sessionStatusRecoveryFailed')}</strong><span>{selectedSession.recovery_error ?? t('recoveryFailedFallback')}</span></div>}
             {(selectedSession?.lifecycle_status === 'historical' || selectedSession?.agent_deleted_at) && <div className="session-banner"><strong>{t('historicalSession')}</strong><span>{t('historicalSessionHelp')}</span></div>}
             {stopRequestedRunId && <div className="session-banner success" role="status">{t('stopRequested')}</div>}
             {actionError && <div className="session-banner error" role="alert">{t('genericError')}</div>}
             {conversationCreateError && <div className="session-banner error" role="alert">{t('conversationCreateFailed')}</div>}
-            <div className="session-transcript" aria-busy={messagesLoading}>
+            <div className="session-transcript" aria-busy={messagesLoading || olderMessagesLoading}>
               {!conversationDraft && messagesLoading && <div className="operation-state" role="status">{t('loadingMessages')}</div>}
               {!conversationDraft && !messagesLoading && messagesError && <div className="operation-state error" role="alert">{t('messagesLoadFailed')}</div>}
               {!conversationDraft && !messagesLoading && !messagesError && timelineItems.length === 0 && <div className="operation-state">{t('noMessages')}</div>}

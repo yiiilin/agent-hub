@@ -34,6 +34,30 @@ test('root opens Sessions and places it first in workspace navigation', async ({
   await expect(workspace.getByRole('button', { name: 'Sessions' })).toHaveAttribute('aria-current', 'page');
 });
 
+test('mobile primary navigation opens as a dismissible menu without crowding the page', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await installBaseApi(page);
+  await page.goto('/agents');
+
+  const navigation = page.getByRole('navigation', { name: 'Primary navigation' });
+  const toggle = page.getByRole('button', { name: 'Primary navigation', exact: true });
+  await expect(navigation).toBeHidden();
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+  await expect(page.getByLabel('Language')).toBeVisible();
+
+  await toggle.click();
+  await expect(navigation).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Close', exact: true }).first()).toHaveAttribute('aria-expanded', 'true');
+  await page.keyboard.press('Escape');
+  await expect(navigation).toBeHidden();
+
+  await toggle.click();
+  await navigation.getByRole('button', { name: 'Sessions', exact: true }).click();
+  await expect(page).toHaveURL(/\/sessions$/);
+  await expect(navigation).toBeHidden();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+});
+
 test('Agent instructions switch between rich text and Markdown source without losing content', async ({ page }) => {
   await installBaseApi(page);
   await page.goto('/agents');

@@ -1,5 +1,5 @@
-import { Activity, ArrowUp, BookOpen, Bot, BrainCircuit, Check, CirclePause, Clock, Copy, ExternalLink, History, KeyRound, Languages, LogOut, Monitor, Plug, Plus, RotateCcw, Save, Search, Send, Settings, ShieldAlert, Sparkles, Trash2, Workflow, X } from 'lucide-react';
-import React, { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Activity, ArrowUp, BookOpen, Bot, BrainCircuit, Check, CirclePause, Clock, Copy, ExternalLink, History, KeyRound, Languages, LogOut, Menu, Monitor, Plug, Plus, RotateCcw, Save, Search, Send, Settings, ShieldAlert, Sparkles, Trash2, Workflow, X } from 'lucide-react';
+import React, { FormEvent, type TouchEvent, type WheelEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Agent, api, ApiError, ApiKey, ApiKeyValidity, Automation, HubSession, HubSessionMessage, Run, RunEvent, Runtime, RuntimeEnrollmentToken, User, WidgetAgent, WidgetHistorySession } from './api/client';
 import { I18nProvider, useI18n } from './i18n';
@@ -7,7 +7,7 @@ import type { TranslationKey } from './i18n';
 import { FormDialog } from './components/form-dialog';
 import { MarkdownEditor } from './components/markdown-editor';
 import { SkillDetailPage, SkillsPage } from './skills';
-import { ChatActivityGroup, ChatMessageBubble, ChatThinkingBubble, mergeRunEvents, projectActivities, resizeComposer, SessionsPage, type ActivityEntry } from './sessions';
+import { ChatActivityGroup, ChatMessageBubble, ChatThinkingBubble, mergeRunEvents, projectActivities, resizeComposer, selectSessionMessagePage, sessionMessageRequestLimit, SessionsPage, type ActivityEntry } from './sessions';
 import { AdministrationPage } from './administration';
 import { AgentPage as AgentDetailPage, AgentsPage } from './agents';
 import { IntegrationAppsPage } from './integrations';
@@ -125,7 +125,25 @@ function App() {
 function Shell({ user, children }: { user: User | null; children: React.ReactNode }) {
   const { language, setLanguage, t } = useI18n();
   const currentRoute = parseRoute().name;
+  const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
   const current = (name: Route['name']) => currentRoute === name || (name === 'skills' && currentRoute === 'skill') ? 'page' as const : undefined;
+
+  useEffect(() => setMobileNavigationOpen(false), [currentRoute]);
+
+  useEffect(() => {
+    if (!mobileNavigationOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setMobileNavigationOpen(false);
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [mobileNavigationOpen]);
+
+  function goTo(path: string) {
+    setMobileNavigationOpen(false);
+    navigate(path);
+  }
+
   async function logout() {
     if (!canNavigate()) return;
     if (user) clearConversationDrafts(user.id);
@@ -135,26 +153,32 @@ function Shell({ user, children }: { user: User | null; children: React.ReactNod
   }
   return (
     <div className="app-shell">
-      <aside className="sidebar" aria-label={t('primaryNavigation')}>
-        <div className="brand"><Workflow size={22} /> Agent Hub</div>
-        <nav className="nav-groups" aria-label={t('primaryNavigation')}>
+      <aside className={`sidebar${mobileNavigationOpen ? ' navigation-open' : ''}`} aria-label={t('primaryNavigation')}>
+        <div className="sidebar-top">
+          <div className="brand"><span className="brand-mark"><Workflow size={18} /></span><span>Agent Hub</span></div>
+          <button className="icon-button mobile-nav-toggle" type="button" aria-controls="primary-navigation" aria-expanded={mobileNavigationOpen} aria-label={mobileNavigationOpen ? t('close') : t('primaryNavigation')} onClick={() => setMobileNavigationOpen((open) => !open)}>
+            {mobileNavigationOpen ? <X size={18} /> : <Menu size={18} />}
+          </button>
+        </div>
+        <nav id="primary-navigation" className="nav-groups" aria-label={t('primaryNavigation')}>
           <div className="nav-group"><span>{t('workspace')}</span>
-            <button className="nav-button" aria-current={current('sessions')} onClick={() => navigate('/sessions')}><Activity size={18} /> {t('sessions')}</button>
-            <button className="nav-button" aria-current={current('agents') ?? current('agent')} onClick={() => navigate('/agents')}><Bot size={18} /> {t('agents')}</button>
-            <button className="nav-button" aria-current={current('integrations')} onClick={() => navigate('/integrations')}><Plug size={18} /> {t('integrationApps')}</button>
-            <button className="nav-button" aria-current={current('automations')} onClick={() => navigate('/automations')}><Clock size={18} /> {t('automations')}</button>
+            <button className="nav-button" aria-current={current('sessions')} onClick={() => goTo('/sessions')}><Activity size={18} /> {t('sessions')}</button>
+            <button className="nav-button" aria-current={current('agents') ?? current('agent')} onClick={() => goTo('/agents')}><Bot size={18} /> {t('agents')}</button>
+            <button className="nav-button" aria-current={current('integrations')} onClick={() => goTo('/integrations')}><Plug size={18} /> {t('integrationApps')}</button>
+            <button className="nav-button" aria-current={current('automations')} onClick={() => goTo('/automations')}><Clock size={18} /> {t('automations')}</button>
           </div>
           <div className="nav-group"><span>{t('resources')}</span>
-            <button className="nav-button" aria-current={current('skills')} onClick={() => navigate('/skills')}><Sparkles size={18} /> {t('skills')}</button>
-            <button className="nav-button" aria-current={current('models')} onClick={() => navigate('/models')}><BrainCircuit size={18} /> {t('models')}</button>
-            <button className="nav-button" aria-current={current('apiKeys')} onClick={() => navigate('/api-keys')}><KeyRound size={18} /> {t('apiKeys')}</button>
+            <button className="nav-button" aria-current={current('skills')} onClick={() => goTo('/skills')}><Sparkles size={18} /> {t('skills')}</button>
+            <button className="nav-button" aria-current={current('models')} onClick={() => goTo('/models')}><BrainCircuit size={18} /> {t('models')}</button>
+            <button className="nav-button" aria-current={current('apiKeys')} onClick={() => goTo('/api-keys')}><KeyRound size={18} /> {t('apiKeys')}</button>
           </div>
           <div className="nav-group"><span>{t('system')}</span>
-            <button className="nav-button" aria-current={current('runtimes')} onClick={() => navigate('/runtimes')}><Monitor size={18} /> {t('runtimes')}</button>
-            {(user?.role === 'admin' || user?.role === 'super_admin') && <button className="nav-button" aria-current={current('administration')} onClick={() => navigate('/administration')}><Settings size={18} /> {t('administration')}</button>}
-            <button className="nav-button" aria-current={current('docs')} onClick={() => navigate('/docs')}><BookOpen size={18} /> {t('apiDocs')}</button>
+            <button className="nav-button" aria-current={current('runtimes')} onClick={() => goTo('/runtimes')}><Monitor size={18} /> {t('runtimes')}</button>
+            {(user?.role === 'admin' || user?.role === 'super_admin') && <button className="nav-button" aria-current={current('administration')} onClick={() => goTo('/administration')}><Settings size={18} /> {t('administration')}</button>}
+            <button className="nav-button" aria-current={current('docs')} onClick={() => goTo('/docs')}><BookOpen size={18} /> {t('apiDocs')}</button>
           </div>
         </nav>
+        {mobileNavigationOpen && <button className="navigation-backdrop" type="button" aria-label={t('close')} onClick={() => setMobileNavigationOpen(false)} />}
         <div className="sidebar-footer">
           <label className="language-control"><Languages size={16} /><span className="sr-only">{t('language')}</span><select aria-label={t('language')} value={language} onChange={(event) => setLanguage(event.target.value as 'en' | 'zh-CN')}><option value="en">{t('english')}</option><option value="zh-CN">{t('chinese')}</option></select></label>
           <div className="account-row">{user && <span>{user.email ?? user.username}</span>}{user && <button className="icon-button" title={t('logout')} aria-label={t('logout')} onClick={logout}><LogOut size={17} /></button>}</div>
@@ -191,12 +215,14 @@ function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
   return (
     <div className="login-screen">
       <form className="login-panel" onSubmit={submit}>
-        <div className="login-heading"><h1>Agent Hub</h1><select aria-label={t('language')} value={language} onChange={(event) => setLanguage(event.target.value as 'en' | 'zh-CN')}><option value="en">English</option><option value="zh-CN">简体中文</option></select></div>
+        <div className="login-heading"><div className="login-brand"><span className="brand-mark"><Workflow size={19} /></span><h1>Agent Hub</h1></div><select aria-label={t('language')} value={language} onChange={(event) => setLanguage(event.target.value as 'en' | 'zh-CN')}><option value="en">English</option><option value="zh-CN">简体中文</option></select></div>
         <label>{t('email')}<input aria-label={t('email')} value={email} onChange={(event) => setEmail(event.target.value)} /></label>
         <label>{t('password')}<input aria-label={t('password')} type="password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
         {error && <div className="error">{t(error)}</div>}
-        <button className="primary" type="submit">{t('signIn')}</button>
-        {oidcMockEnabled && <button className="secondary" type="button" onClick={() => { const params = new URLSearchParams({ email, sub: `mock:${email}` }); window.location.href = `/api/auth/oidc/mock/start?${params}`; }}>{t('signInOidc')}</button>}
+        <div className="login-actions">
+          <button className="primary" type="submit">{t('signIn')}</button>
+          {oidcMockEnabled && <button className="secondary" type="button" onClick={() => { const params = new URLSearchParams({ email, sub: `mock:${email}` }); window.location.href = `/api/auth/oidc/mock/start?${params}`; }}>{t('signInOidc')}</button>}
+        </div>
       </form>
     </div>
   );
@@ -1344,6 +1370,38 @@ type WidgetSessionTarget = {
   hubSessionId: string;
 };
 
+function widgetExchangesFromHistory(
+  messages: HubSessionMessage[],
+  events: RunEvent[],
+  accessToken: string,
+  target: WidgetSessionTarget,
+  laterRunIds = new Set<string>()
+) {
+  const eventsByRun = new Map<string, RunEvent[]>();
+  for (const event of events) {
+    const current = eventsByRun.get(event.run_id) ?? [];
+    current.push(event);
+    eventsByRun.set(event.run_id, current);
+  }
+  const userMessages = messages.filter((item) => item.role === 'user' && item.content !== null);
+  const finalMessageIndexForRun = new Map<string, number>();
+  userMessages.forEach((item, index) => {
+    if (item.run_id) finalMessageIndexForRun.set(item.run_id, index);
+  });
+  return userMessages.map((item, index): WidgetExchange => ({
+    id: item.id,
+    message: item.content ?? '',
+    runId: item.run_id,
+    streamSessionId: accessToken.startsWith('ahw_')
+      ? target.integrationSessionId ?? target.hubSessionId
+      : null,
+    initialEvents: item.run_id ? mergeRunEvents([], eventsByRun.get(item.run_id) ?? []) : [],
+    displayRun: item.run_id !== null
+      && finalMessageIndexForRun.get(item.run_id) === index
+      && !laterRunIds.has(item.run_id)
+  }));
+}
+
 type StoredWidgetState = {
   token: string;
   expiresAt?: string;
@@ -1442,11 +1500,21 @@ function WidgetApp({ token, appClientId }: { token?: string; appClientId?: strin
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState('');
   const [transcriptLoading, setTranscriptLoading] = useState(false);
+  const [hasOlderWidgetMessages, setHasOlderWidgetMessages] = useState(false);
+  const [olderWidgetMessagesLoading, setOlderWidgetMessagesLoading] = useState(false);
   const [credentialEpoch, setCredentialEpoch] = useState(0);
   const [publicAccessReady, setPublicAccessReady] = useState(!publicWidget);
   const [channelId] = useState(widgetChannelId);
   const widgetRef = useRef<HTMLDivElement>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
+  const widgetFollowBottomRef = useRef(true);
+  const widgetHistoryPagingReadyRef = useRef(false);
+  const widgetLastScrollTopRef = useRef(0);
+  const widgetOlderMessagesLoadingRef = useRef(false);
+  const widgetOldestSequenceRef = useRef<number | null>(null);
+  const widgetHistoryEventsRef = useRef<RunEvent[]>([]);
+  const widgetHistoryAnchorRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
+  const widgetTouchStartYRef = useRef<number | null>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const sessionTokenRef = useRef(bootstrap.sessionToken);
   const selectedSessionRef = useRef<WidgetSessionTarget | null>(bootstrap.target);
@@ -1473,11 +1541,24 @@ function WidgetApp({ token, appClientId }: { token?: string; appClientId?: strin
     window.parent.postMessage({ type, channelId, ...payload }, origin);
   }, [channelId]);
 
-  const scrollChatToBottom = useCallback(() => {
+  const scrollChatToBottom = useCallback((force = false) => {
+    if (force) widgetFollowBottomRef.current = true;
     requestAnimationFrame(() => {
       const scroll = chatScrollRef.current;
-      if (scroll) scroll.scrollTop = scroll.scrollHeight;
+      if (scroll && widgetFollowBottomRef.current) scroll.scrollTop = scroll.scrollHeight;
     });
+  }, []);
+
+  const resetWidgetTranscriptPagination = useCallback(() => {
+    widgetFollowBottomRef.current = true;
+    widgetHistoryPagingReadyRef.current = false;
+    widgetLastScrollTopRef.current = 0;
+    widgetOlderMessagesLoadingRef.current = false;
+    widgetOldestSequenceRef.current = null;
+    widgetHistoryEventsRef.current = [];
+    widgetHistoryAnchorRef.current = null;
+    setHasOlderWidgetMessages(false);
+    setOlderWidgetMessagesLoading(false);
   }, []);
 
   const updateDraft = useCallback((nextMessage: string) => {
@@ -1558,6 +1639,7 @@ function WidgetApp({ token, appClientId }: { token?: string; appClientId?: strin
     setHistorySessions([]);
     setHistoryError('');
     setTranscriptLoading(false);
+    resetWidgetTranscriptPagination();
     updateSelectedSession(null);
     setExchanges([]);
     setPendingMessage(null);
@@ -1565,7 +1647,7 @@ function WidgetApp({ token, appClientId }: { token?: string; appClientId?: strin
     setError('');
     setCredentialEpoch((current) => current + 1);
     return true;
-  }, [clearDraft, updateSelectedSession]);
+  }, [clearDraft, resetWidgetTranscriptPagination, updateSelectedSession]);
 
   const exchangeEmbedJwt = useCallback(async (jwt: string) => {
     const requestGeneration = ++exchangeRequestGeneration.current;
@@ -1590,36 +1672,25 @@ function WidgetApp({ token, appClientId }: { token?: string; appClientId?: strin
     target: WidgetSessionTarget,
     expectedLogicalGeneration: number
   ) => {
+    widgetHistoryPagingReadyRef.current = false;
     setTranscriptLoading(true);
     try {
-      const [messages, events] = await Promise.all([
-        api.widgetSessionMessages(accessToken, target.integrationSessionId ?? target.hubSessionId),
+      const [messageResponse, events] = await Promise.all([
+        api.widgetSessionMessagePage(
+          accessToken,
+          target.integrationSessionId ?? target.hubSessionId,
+          { limit: sessionMessageRequestLimit }
+        ),
         api.widgetSessionEvents(accessToken, target.integrationSessionId ?? target.hubSessionId)
       ]);
       if (expectedLogicalGeneration !== logicalSessionGeneration.current
         || !sameWidgetSessionTarget(target, selectedSessionRef.current)) return;
-      const eventsByRun = new Map<string, RunEvent[]>();
-      for (const event of events) {
-        const current = eventsByRun.get(event.run_id) ?? [];
-        current.push(event);
-        eventsByRun.set(event.run_id, current);
-      }
-      const userMessages = messages.filter((item) => item.role === 'user' && item.content !== null);
-      const finalMessageIndexForRun = new Map<string, number>();
-      userMessages.forEach((item, index) => {
-        if (item.run_id) finalMessageIndexForRun.set(item.run_id, index);
-      });
-      setExchanges(userMessages.map((item, index) => ({
-        id: item.id,
-        message: item.content ?? '',
-        runId: item.run_id,
-        streamSessionId: accessToken.startsWith('ahw_')
-          ? target.integrationSessionId ?? target.hubSessionId
-          : null,
-        initialEvents: item.run_id ? mergeRunEvents([], eventsByRun.get(item.run_id) ?? []) : [],
-        displayRun: item.run_id !== null && finalMessageIndexForRun.get(item.run_id) === index
-      })));
-      scrollChatToBottom();
+      const page = selectSessionMessagePage(messageResponse);
+      widgetHistoryEventsRef.current = events;
+      widgetOldestSequenceRef.current = page.items[0]?.sequence ?? null;
+      setHasOlderWidgetMessages(page.hasMore);
+      setExchanges(widgetExchangesFromHistory(page.items, events, accessToken, target));
+      scrollChatToBottom(true);
     } catch {
       if (expectedLogicalGeneration === logicalSessionGeneration.current
         && sameWidgetSessionTarget(target, selectedSessionRef.current)) {
@@ -1632,6 +1703,90 @@ function WidgetApp({ token, appClientId }: { token?: string; appClientId?: strin
       }
     }
   }, [scrollChatToBottom, t]);
+
+  const loadOlderWidgetMessages = useCallback(async () => {
+    const target = selectedSessionRef.current;
+    const beforeSequence = widgetOldestSequenceRef.current;
+    if (!target || beforeSequence === null || !hasOlderWidgetMessages || widgetOlderMessagesLoadingRef.current) return;
+    const logicalGeneration = logicalSessionGeneration.current;
+    const accessToken = sessionTokenRef.current;
+    widgetOlderMessagesLoadingRef.current = true;
+    setOlderWidgetMessagesLoading(true);
+    try {
+      const response = await api.widgetSessionMessagePage(
+        accessToken,
+        target.integrationSessionId ?? target.hubSessionId,
+        { beforeSequence, limit: sessionMessageRequestLimit }
+      );
+      if (logicalGeneration !== logicalSessionGeneration.current
+        || !sameWidgetSessionTarget(target, selectedSessionRef.current)) return;
+      const page = selectSessionMessagePage(response);
+      const scroll = chatScrollRef.current;
+      if (scroll) {
+        widgetHistoryAnchorRef.current = {
+          scrollHeight: scroll.scrollHeight,
+          scrollTop: scroll.scrollTop
+        };
+      }
+      widgetOldestSequenceRef.current = page.items[0]?.sequence ?? null;
+      setHasOlderWidgetMessages(page.hasMore);
+      setExchanges((current) => {
+        const existingIds = new Set(current.map((exchange) => exchange.id));
+        const laterRunIds = new Set(current.flatMap((exchange) => exchange.runId ? [exchange.runId] : []));
+        const older = widgetExchangesFromHistory(
+          page.items,
+          widgetHistoryEventsRef.current,
+          accessToken,
+          target,
+          laterRunIds
+        ).filter((exchange) => !existingIds.has(exchange.id));
+        return [...older, ...current];
+      });
+    } catch {
+      if (logicalGeneration === logicalSessionGeneration.current) setError(t('genericError'));
+    } finally {
+      widgetOlderMessagesLoadingRef.current = false;
+      if (logicalGeneration === logicalSessionGeneration.current) setOlderWidgetMessagesLoading(false);
+    }
+  }, [hasOlderWidgetMessages, t]);
+
+  const requestOlderWidgetMessages = useCallback(() => {
+    if (!widgetHistoryPagingReadyRef.current || !hasOlderWidgetMessages || transcriptLoading) return;
+    widgetFollowBottomRef.current = false;
+    void loadOlderWidgetMessages();
+  }, [hasOlderWidgetMessages, loadOlderWidgetMessages, transcriptLoading]);
+
+  const handleWidgetChatScroll = useCallback(() => {
+    const scroll = chatScrollRef.current;
+    if (!scroll) return;
+    const scrollingUp = scroll.scrollTop < widgetLastScrollTopRef.current - 1;
+    widgetLastScrollTopRef.current = scroll.scrollTop;
+    widgetFollowBottomRef.current = scroll.scrollHeight - scroll.clientHeight - scroll.scrollTop <= 24;
+    if (widgetHistoryPagingReadyRef.current
+      && scrollingUp
+      && scroll.scrollTop <= 64) {
+      requestOlderWidgetMessages();
+    }
+  }, [requestOlderWidgetMessages]);
+
+  const handleWidgetChatWheel = useCallback((event: WheelEvent<HTMLDivElement>) => {
+    const scroll = chatScrollRef.current;
+    if (event.deltaY < 0 && scroll && scroll.scrollTop <= 64) requestOlderWidgetMessages();
+  }, [requestOlderWidgetMessages]);
+
+  const handleWidgetChatTouchStart = useCallback((event: TouchEvent<HTMLDivElement>) => {
+    widgetTouchStartYRef.current = event.touches[0]?.clientY ?? null;
+  }, []);
+
+  const handleWidgetChatTouchEnd = useCallback((event: TouchEvent<HTMLDivElement>) => {
+    const startY = widgetTouchStartYRef.current;
+    widgetTouchStartYRef.current = null;
+    const endY = event.changedTouches[0]?.clientY;
+    const scroll = chatScrollRef.current;
+    if (startY !== null && endY !== undefined && endY > startY + 12 && scroll && scroll.scrollTop <= 64) {
+      requestOlderWidgetMessages();
+    }
+  }, [requestOlderWidgetMessages]);
 
   const refreshWidgetHistory = useCallback(async (accessToken: string, expectedCredentialGeneration: number) => {
     setHistoryLoading(true);
@@ -1659,6 +1814,7 @@ function WidgetApp({ token, appClientId }: { token?: string; appClientId?: strin
     }
     logicalSessionGeneration.current += 1;
     const generation = logicalSessionGeneration.current;
+    resetWidgetTranscriptPagination();
     updateSelectedSession(nextTarget);
     setExchanges([]);
     setPendingMessage(null);
@@ -1669,7 +1825,7 @@ function WidgetApp({ token, appClientId }: { token?: string; appClientId?: strin
     if (nextTarget && sessionTokenRef.current.startsWith('ahw_')) {
       void loadWidgetTranscript(sessionTokenRef.current, nextTarget, generation);
     }
-  }, [clearDraft, loadWidgetTranscript, updateSelectedSession]);
+  }, [clearDraft, loadWidgetTranscript, resetWidgetTranscriptPagination, updateSelectedSession]);
 
   const startWidgetRun = useCallback(async (content: string) => {
     if (!sessionTokenRef.current || !content.trim() || runPendingRef.current || (publicWidget && !publicAccessReadyRef.current)) return;
@@ -1735,6 +1891,7 @@ function WidgetApp({ token, appClientId }: { token?: string; appClientId?: strin
   }, [clearDraft, postWidgetMessage, publicWidget, refreshWidgetHistory, scrollChatToBottom, t, updateSelectedSession]);
 
   const reportWidgetRunEvent = useCallback((event: RunEvent) => {
+    widgetHistoryEventsRef.current = mergeRunEvents(widgetHistoryEventsRef.current, [event]);
     postWidgetMessage('agent-hub:run-event', { runId: event.run_id, event });
     scrollChatToBottom();
   }, [postWidgetMessage, scrollChatToBottom]);
@@ -1896,9 +2053,21 @@ function WidgetApp({ token, appClientId }: { token?: string; appClientId?: strin
     resizeComposer(composerRef.current);
   }, [message]);
 
-  useEffect(() => {
-    scrollChatToBottom();
-  }, [exchanges, pendingMessage, scrollChatToBottom]);
+  useLayoutEffect(() => {
+    const scroll = chatScrollRef.current;
+    if (!scroll) return;
+    const anchor = widgetHistoryAnchorRef.current;
+    if (anchor) {
+      scroll.scrollTop = anchor.scrollTop + scroll.scrollHeight - anchor.scrollHeight;
+      widgetLastScrollTopRef.current = scroll.scrollTop;
+      widgetHistoryAnchorRef.current = null;
+      widgetHistoryPagingReadyRef.current = true;
+      return;
+    }
+    if (widgetFollowBottomRef.current) scroll.scrollTop = scroll.scrollHeight;
+    widgetLastScrollTopRef.current = scroll.scrollTop;
+    if (!transcriptLoading) widgetHistoryPagingReadyRef.current = true;
+  }, [exchanges, pendingMessage, transcriptLoading]);
 
   useEffect(() => {
     if (!hostOrigin || !widgetRef.current) return;
@@ -1944,9 +2113,9 @@ function WidgetApp({ token, appClientId }: { token?: string; appClientId?: strin
           </button>;
         })}</div>}
       </aside>}
-      <div className="session-chat-scroll" ref={chatScrollRef}>
+      <div className="session-chat-scroll" ref={chatScrollRef} onScroll={handleWidgetChatScroll} onWheel={handleWidgetChatWheel} onTouchStart={handleWidgetChatTouchStart} onTouchEnd={handleWidgetChatTouchEnd}>
         {error && <div className="session-banner error" role="alert">{error}</div>}
-        <div className="session-transcript widget-transcript" aria-live="polite">
+        <div className="session-transcript widget-transcript" aria-live="polite" aria-busy={transcriptLoading || olderWidgetMessagesLoading}>
           {transcriptLoading && exchanges.length === 0 && <div className="widget-transcript-state">{t('loadingMessages')}</div>}
           {exchanges.map((exchange) => <React.Fragment key={exchange.id}>
             <ChatMessageBubble agentName={agent?.name ?? null} content={exchange.message} role="user" />

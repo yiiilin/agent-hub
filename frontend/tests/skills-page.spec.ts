@@ -280,6 +280,7 @@ test('skills ignore late responses after unmount and fit a 390px localized viewp
   await page.route('**/api/users', (route) => route.fulfill({ json: [] }));
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto('/skills');
+  await page.getByRole('button', { name: 'Primary navigation', exact: true }).click();
   await page.getByRole('button', { name: 'Agents', exact: true }).click();
   releaseSkills();
   await expect(page.getByText('Create Agent', { exact: true })).toBeVisible();

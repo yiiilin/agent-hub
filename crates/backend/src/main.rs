@@ -75,6 +75,21 @@ const DEFAULT_FRONTEND_DIST_DIR: &str = "frontend/dist";
 const SKILL_PACKAGE_UPLOAD_BODY_LIMIT: usize =
     MAX_SKILL_PACKAGE_EXPANDED_BYTES as usize + 2 * 1024 * 1024;
 const TOOL_REQUEST_BATCH_FINGERPRINT_KEY: &str = "tool_request_batch_fingerprint";
+const SESSION_MESSAGE_PAGE_SQL: &str =
+    "SELECT id, session_id, sequence, role, message_kind, content, payload,
+            delivery_mode, delivery_state, client_message_key,
+            expected_native_turn_id, turn_id, run_id, accepted_at
+     FROM (
+         SELECT id, session_id, sequence, role, message_kind, content, payload,
+                delivery_mode, delivery_state, client_message_key,
+                expected_native_turn_id, turn_id, run_id, accepted_at
+         FROM hub_session_messages
+         WHERE session_id = $1
+           AND ($2::bigint IS NULL OR sequence < $2)
+         ORDER BY sequence DESC
+         LIMIT COALESCE($3::bigint, 9223372036854775807)
+     ) AS message_page
+     ORDER BY sequence";
 const RUNTIME_CAPABILITY_SQL: &str = "
            AND (
              a.model_policy->>'provider' IS DISTINCT FROM 'hub-proxy'
@@ -891,7 +906,7 @@ fn openapi_document() -> Value {
             "/api/sessions": { "get": { "summary": "List owned sessions", "responses": { "200": list_response("HubSession"), "401": { "$ref": "#/components/responses/Unauthorized" } } } },
             "/api/sessions/{session_id}": { "get": { "summary": "Get owned session", "parameters": [id("session_id")], "responses": { "200": response("HubSession"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/sessions/{session_id}/messages": {
-                "get": { "summary": "List owned session messages", "parameters": [id("session_id")], "responses": { "200": list_response("HubSessionMessage"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } },
+                "get": { "summary": "List owned session messages", "parameters": [id("session_id"), { "name": "before_sequence", "in": "query", "required": false, "schema": { "type": "integer", "format": "int64", "minimum": 1 } }, { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "format": "int64", "minimum": 1, "maximum": 100 } }], "responses": { "200": list_response("HubSessionMessage"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } },
                 "post": { "summary": "Send an owned session message", "parameters": [id("session_id")], "requestBody": body("CreateHubSessionMessageRequest"), "responses": { "200": response("SessionMessageAcceptance"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } }
             },
             "/api/runs/{run_id}": { "get": { "summary": "Get run", "parameters": [id("run_id")], "responses": { "200": response("Run"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
@@ -983,7 +998,7 @@ fn openapi_document() -> Value {
             "/api/widget/session": { "get": { "summary": "Get Widget credential metadata and Agent", "security": [{ "embedToken": [] }], "responses": { "200": response("WidgetSession"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/widget/session/renew": { "post": { "summary": "Rotate one external Widget credential in place", "security": [{ "embedToken": [] }], "requestBody": body("RenewWidgetSessionRequest"), "responses": { "200": response("WidgetTokenResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" } } } },
             "/api/widget/sessions": { "get": { "summary": "List history enabled Sessions in the exact external Widget scope", "security": [{ "embedToken": [] }], "responses": { "200": list_response("WidgetHistorySession"), "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" } } } },
-            "/api/widget/sessions/{session_id}/messages": { "get": { "summary": "List one exact external Widget Session's messages", "security": [{ "embedToken": [] }], "parameters": [id("session_id")], "responses": { "200": list_response("HubSessionMessage"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
+            "/api/widget/sessions/{session_id}/messages": { "get": { "summary": "List one exact external Widget Session's messages", "security": [{ "embedToken": [] }], "parameters": [id("session_id"), { "name": "before_sequence", "in": "query", "required": false, "schema": { "type": "integer", "format": "int64", "minimum": 1 } }, { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "format": "int64", "minimum": 1, "maximum": 100 } }], "responses": { "200": list_response("HubSessionMessage"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/widget/sessions/{session_id}/events": { "get": { "summary": "List one exact external Widget Session's Run events", "security": [{ "embedToken": [] }], "parameters": [id("session_id")], "responses": { "200": list_response("RunEvent"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/widget/sessions/{session_id}/events/stream": { "get": { "summary": "Stream one exact external Widget Session's Run events", "security": [{ "embedToken": [] }], "parameters": [id("session_id")], "responses": { "200": { "description": "Server-sent event stream", "content": { "text/event-stream": { "schema": { "type": "string" } } } }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/widget/runs": { "post": { "summary": "Create widget run", "security": [{ "embedToken": [] }], "requestBody": body("CreateWidgetRunRequest"), "responses": { "200": response("Run"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" } } } },
@@ -5811,11 +5826,30 @@ async fn get_hub_session(
     Ok(Json(hub_session_from_row(row)))
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct SessionMessageListQuery {
+    before_sequence: Option<i64>,
+    limit: Option<i64>,
+}
+
+impl SessionMessageListQuery {
+    fn validated(self) -> Result<(Option<i64>, Option<i64>), ApiError> {
+        if self.before_sequence.is_some_and(|sequence| sequence < 1)
+            || self.limit.is_some_and(|limit| !(1..=100).contains(&limit))
+        {
+            return Err(ApiError::bad_request("invalid Session message pagination"));
+        }
+        Ok((self.before_sequence, self.limit))
+    }
+}
+
 async fn list_hub_session_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(session_id): Path<Uuid>,
+    Query(query): Query<SessionMessageListQuery>,
 ) -> Result<Json<Vec<HubSessionMessageDto>>, ApiError> {
+    let (before_sequence, limit) = query.validated()?;
     let user = require_user(&state, &headers).await?;
     let owned: bool = sqlx::query_scalar(
         "SELECT EXISTS (
@@ -5829,17 +5863,12 @@ async fn list_hub_session_messages(
     if !owned {
         return Err(ApiError::not_found("session not found"));
     }
-    let rows = sqlx::query(
-        "SELECT id, session_id, sequence, role, message_kind, content, payload,
-                delivery_mode, delivery_state, client_message_key,
-                expected_native_turn_id, turn_id, run_id, accepted_at
-         FROM hub_session_messages
-         WHERE session_id = $1
-         ORDER BY sequence",
-    )
-    .bind(session_id)
-    .fetch_all(&state.pool)
-    .await?;
+    let rows = sqlx::query(SESSION_MESSAGE_PAGE_SQL)
+        .bind(session_id)
+        .bind(before_sequence)
+        .bind(limit)
+        .fetch_all(&state.pool)
+        .await?;
     Ok(Json(rows.into_iter().map(hub_message_from_row).collect()))
 }
 
@@ -8145,7 +8174,9 @@ async fn list_widget_session_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(session_id): Path<Uuid>,
+    Query(query): Query<SessionMessageListQuery>,
 ) -> Result<Json<Vec<HubSessionMessageDto>>, ApiError> {
+    let (before_sequence, limit) = query.validated()?;
     let token = embed_token_from_headers(&headers)
         .ok_or(ApiError::unauthorized("missing embed session"))?;
     let mut tx = state.pool.begin().await?;
@@ -8159,16 +8190,12 @@ async fn list_widget_session_messages(
         false,
     )
     .await?;
-    let rows = sqlx::query(
-        "SELECT id, session_id, sequence, role, message_kind, content, payload,
-                delivery_mode, delivery_state, client_message_key,
-                expected_native_turn_id, turn_id, run_id, accepted_at
-         FROM hub_session_messages
-         WHERE session_id = $1 ORDER BY sequence",
-    )
-    .bind(scoped.hub_session_id)
-    .fetch_all(&mut *tx)
-    .await?;
+    let rows = sqlx::query(SESSION_MESSAGE_PAGE_SQL)
+        .bind(scoped.hub_session_id)
+        .bind(before_sequence)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(Json(rows.into_iter().map(hub_message_from_row).collect()))
 }
@@ -19773,6 +19800,53 @@ mod tests {
     }
 
     #[test]
+    fn session_message_pagination_validates_bounds_and_is_documented() {
+        assert_eq!(
+            SessionMessageListQuery {
+                before_sequence: Some(42),
+                limit: Some(51),
+            }
+            .validated()
+            .unwrap(),
+            (Some(42), Some(51))
+        );
+        for query in [
+            SessionMessageListQuery {
+                before_sequence: Some(0),
+                limit: None,
+            },
+            SessionMessageListQuery {
+                before_sequence: None,
+                limit: Some(101),
+            },
+        ] {
+            assert_eq!(
+                query.validated().unwrap_err().status,
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        let document = openapi_document();
+        for path in [
+            "/api/sessions/{session_id}/messages",
+            "/api/widget/sessions/{session_id}/messages",
+        ] {
+            let parameters = document["paths"][path]["get"]["parameters"]
+                .as_array()
+                .unwrap();
+            assert!(parameters
+                .iter()
+                .any(|parameter| parameter["name"] == "before_sequence"));
+            assert!(parameters
+                .iter()
+                .any(|parameter| parameter["name"] == "limit"));
+            assert!(document["paths"][path]["get"]["responses"]
+                .get("400")
+                .is_some());
+        }
+    }
+
+    #[test]
     fn public_widget_tool_policy_is_read_only_and_app_scoped() {
         let mut tools = default_agent_tool_allowlist();
         let mut sandbox_policy = json!({ "mode": "workspace-write", "network_access": true });
@@ -24373,7 +24447,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .uri(format!(
-                        "/api/widget/sessions/{primary_session_id}/messages"
+                        "/api/widget/sessions/{primary_session_id}/messages?limit=1"
                     ))
                     .header("x-agent-hub-embed-token", &primary.token)
                     .body(Body::empty())
@@ -25370,6 +25444,41 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content.as_deref(), Some("first"));
         assert_eq!(messages[1].content.as_deref(), Some("second"));
+
+        let latest_request = axum::http::Request::builder()
+            .uri(format!("/api/sessions/{hub_session_id}/messages?limit=1"))
+            .header(header::COOKIE, format!("agent_hub_session={owner_token}"))
+            .body(Body::empty())
+            .unwrap();
+        let latest_response = app.clone().oneshot(latest_request).await.unwrap();
+        assert_eq!(latest_response.status(), StatusCode::OK);
+        let latest: Vec<HubSessionMessageDto> = serde_json::from_slice(
+            &axum::body::to_bytes(latest_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].content.as_deref(), Some("second"));
+
+        let older_request = axum::http::Request::builder()
+            .uri(format!(
+                "/api/sessions/{hub_session_id}/messages?before_sequence={}&limit=1",
+                latest[0].sequence
+            ))
+            .header(header::COOKIE, format!("agent_hub_session={owner_token}"))
+            .body(Body::empty())
+            .unwrap();
+        let older_response = app.clone().oneshot(older_request).await.unwrap();
+        assert_eq!(older_response.status(), StatusCode::OK);
+        let older: Vec<HubSessionMessageDto> = serde_json::from_slice(
+            &axum::body::to_bytes(older_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(older.len(), 1);
+        assert_eq!(older[0].content.as_deref(), Some("first"));
 
         let forbidden_request = axum::http::Request::builder()
             .uri(format!("/api/sessions/{hub_session_id}"))
@@ -38842,6 +38951,7 @@ mod tests {
             State(state.clone()),
             session_headers(&session_token),
             Path(session_id),
+            Query(SessionMessageListQuery::default()),
         )
         .await
         .unwrap()
@@ -39315,6 +39425,7 @@ mod tests {
             State(state.clone()),
             session_headers(&session_owner_token),
             Path(fixture.hub_session_id),
+            Query(SessionMessageListQuery::default()),
         )
         .await
         .unwrap()
