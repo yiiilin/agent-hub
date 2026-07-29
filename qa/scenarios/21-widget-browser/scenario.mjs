@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { Buffer } from 'node:buffer';
+import { randomUUID } from 'node:crypto';
 import { ApiClient, loginAsAdmin, poll } from '../../support/api.mjs';
 import { withBrowser } from '../../support/browser.mjs';
 
@@ -50,13 +51,10 @@ async function assertNoHorizontalOverflow(page, label) {
   assert.ok(overflow <= 1, `${label} horizontal overflow: ${overflow}px`);
 }
 
-async function assertWidgetNoHorizontalOverflow(iframe, label) {
-  const overflow = await iframe.evaluate((element) => {
-    const documentElement = element.contentDocument?.documentElement;
-    if (!documentElement) return null;
-    return documentElement.scrollWidth - documentElement.clientWidth;
-  });
-  assert.notEqual(overflow, null, `${label} must expose a same-origin document`);
+async function assertWidgetNoHorizontalOverflow(widget, label) {
+  const overflow = await widget.locator('html').evaluate((documentElement) => (
+    documentElement.scrollWidth - documentElement.clientWidth
+  ));
   assert.ok(overflow <= 1, `${label} horizontal overflow: ${overflow}px`);
 }
 
@@ -69,6 +67,10 @@ async function postToWidget(iframe, data) {
 export default async function widgetBrowserScenario(scenarioContext) {
   const adminClient = new ApiClient(scenarioContext.baseURL);
   await loginAsAdmin(adminClient);
+  const hubURL = new URL(scenarioContext.baseURL);
+  const hostURL = new URL('/widget-host', scenarioContext.baseURL);
+  hostURL.hostname = 'localhost';
+  const hostOrigin = hostURL.origin;
 
   const agents = [];
   let modelConnectionId = null;
@@ -101,30 +103,35 @@ export default async function widgetBrowserScenario(scenarioContext) {
       authentication_channel_id: trustedChannel.id,
       redirect_uris: [new URL('/qa-widget-browser/callback', scenarioContext.baseURL).href],
       agent_ids: agents.map((agent) => agent.id),
-      widget_history_enabled: true
+      widget_history_enabled: true,
+      allowed_origins: [hostOrigin]
     });
     const integrationApp = appSecret.integration_app;
     const externalUserId = uniqueSlug(scenarioContext, 'qa-widget-browser-user');
     const externalTenantId = uniqueSlug(scenarioContext, 'qa-widget-browser-tenant');
     const sessions = [];
     for (const agent of agents) {
-      const { data } = await adminClient.post('/api/widget/access', {
+      const clientInstanceId = randomUUID();
+      const { data } = await adminClient.post('/api/client/access', {
         agent_id: agent.id,
+        client_instance_id: clientInstanceId,
         external_user_id: externalUserId,
         tenant_id: externalTenantId,
         username: externalUserId,
         display_name: 'QA Widget Browser User',
         email: `${externalUserId}@example.com`,
-        attributes: { scenario: 'widget-browser' }
+        attributes: { scenario: 'widget-browser' },
+        client_tools: []
       }, {
         headers: {
           authorization: basicAuthorization(integrationApp.client_id, appSecret.client_secret)
         }
       });
-      assert.equal(typeof data.token, 'string', 'Widget access must return an opaque token');
-      assert.equal(data.token.startsWith('ahw_'), true, 'Widget access must use the external prefix');
+      assert.equal(typeof data.access_token, 'string', 'Client access must return an opaque token');
+      assert.equal(data.access_token.startsWith('ahw_'), true, 'Client access must use the external prefix');
+      assert.equal(data.client_instance_id, clientInstanceId);
       assert.equal(data.history_enabled, true);
-      sessions.push(data);
+      sessions.push({ ...data, token: data.access_token });
     }
 
     await withBrowser(scenarioContext, {
@@ -132,7 +139,7 @@ export default async function widgetBrowserScenario(scenarioContext) {
         { method: 'POST', pathname: '/api/embed/exchange', status: 401, times: 1 }
       ]
     }, async ({ page, context, browserErrors }) => {
-      await page.goto('/widget', { waitUntil: 'domcontentloaded' });
+      await page.goto(hostURL.href, { waitUntil: 'domcontentloaded' });
       await page.setContent(`
         <!doctype html>
         <html>
@@ -146,16 +153,16 @@ export default async function widgetBrowserScenario(scenarioContext) {
           <body><main id="widget-host"></main></body>
         </html>
       `);
-      await page.evaluate(() => {
+      await page.evaluate((widgetURL) => {
         window.widgetMessages = [];
         window.addEventListener('message', (event) => {
           if (event.data?.type?.startsWith('agent-hub:')) window.widgetMessages.push(event.data);
         });
         const iframe = document.createElement('iframe');
         iframe.title = 'Agent Hub Widget';
-        iframe.src = '/widget';
+        iframe.src = widgetURL;
         document.querySelector('#widget-host')?.appendChild(iframe);
-      });
+      }, new URL('/widget', hubURL).href);
 
       const iframe = page.locator('iframe[title="Agent Hub Widget"]');
       const widget = page.frameLocator('iframe[title="Agent Hub Widget"]');
@@ -214,12 +221,12 @@ export default async function widgetBrowserScenario(scenarioContext) {
         );
         assert.equal(resize.channelId, channelId);
         await assertNoHorizontalOverflow(page, 'Desktop Widget host');
-        await assertWidgetNoHorizontalOverflow(iframe, 'Desktop Widget');
+        await assertWidgetNoHorizontalOverflow(widget, 'Desktop Widget');
 
         let runRequests = 0;
         const runRequestBodies = [];
         const heldFirstRun = new Promise((resolve) => { releaseHeldRun = resolve; });
-        await page.route('**/api/widget/runs', async (route) => {
+        await page.route('**/api/client/runs', async (route) => {
           if (route.request().method() !== 'POST') {
             await route.continue();
             return;
@@ -236,7 +243,7 @@ export default async function widgetBrowserScenario(scenarioContext) {
         await widget.getByRole('textbox', { name: 'Message' }).fill(preservedDraft);
         const runResponsePromise = page.waitForResponse((response) => (
           response.request().method() === 'POST'
-          && new URL(response.url()).pathname === '/api/widget/runs'
+          && new URL(response.url()).pathname === '/api/client/runs'
         ));
         await postToWidget(iframe, {
           type: 'agent-hub:message-submit',
@@ -289,11 +296,14 @@ export default async function widgetBrowserScenario(scenarioContext) {
         const createdRun = await runResponse.json();
         assert.equal(runRequestBodies.length, 1);
         assert.equal(runRequestBodies[0].message, firstMessage);
-        assert.equal(runRequestBodies[0].parent_run_id, null);
+        assert.equal(typeof runRequestBodies[0].client_message_key, 'string');
+        assert.equal(Object.hasOwn(runRequestBodies[0], 'parent_run_id'), false);
+        assert.equal(Object.hasOwn(runRequestBodies[0], 'session_id'), false);
         assert.equal(createdRun.agent_id, agents[0].id);
         assert.ok(createdRun.id, 'Widget Run must return an id');
+        assert.ok(createdRun.integration_session_id, 'External Client Run must return its Integration Session id');
         const runStreamUrl = new URL(
-          `/api/runs/${createdRun.id}/events/stream`,
+          `/api/client/sessions/${createdRun.integration_session_id}/events/stream`,
           scenarioContext.baseURL
         ).href;
 
@@ -336,28 +346,24 @@ export default async function widgetBrowserScenario(scenarioContext) {
         await widget.getByRole('button', { name: 'History' }).click();
         await widget.getByRole('button', { name: new RegExp(firstMessage) }).waitFor();
         await widget.getByRole('button', { name: 'Close history' }).click();
-        await poll(async () => iframe.evaluate((element) => {
-          const stored = element.contentWindow?.sessionStorage.getItem('agent-hub-widget-state-v1');
+        await poll(async () => widget.locator('html').evaluate(() => {
+          const stored = sessionStorage.getItem('agent-hub-widget-ui-v2:authenticated');
           return stored ? JSON.parse(stored) : null;
         }), (stored) => (
           stored?.draft === preservedDraft
-          && stored?.target?.integrationSessionId === createdRun.integration_session_id
-          && stored?.target?.hubSessionId === createdRun.hub_session_id
+          && stored?.sessionId === createdRun.integration_session_id
+          && typeof stored?.draftClientMessageKey === 'string'
         ), {
           timeoutMs: 10_000,
           description: 'Widget draft and exact Session ids to reach sessionStorage'
         });
 
         await page.evaluate(() => { window.widgetMessages = []; });
-        await iframe.evaluate((element) => element.contentWindow?.location.reload());
-        await widget.getByRole('heading', { name: agents[0].name }).waitFor();
-        await widget.getByText(COMPLETION_TEXT, { exact: true }).waitFor();
-        assert.equal(
-          await widget.getByRole('textbox', { name: 'Message' }).inputValue(),
-          preservedDraft,
-          'Reload must restore the current Widget draft'
-        );
-        await widget.getByRole('button', { name: 'History' }).waitFor();
+        await iframe.evaluate((element) => {
+          const source = element.getAttribute('src');
+          if (source) element.setAttribute('src', source);
+        });
+        await widget.getByText('Agent Widget', { exact: true }).waitFor();
         const reloadedReady = await waitForHostMessage(
           page,
           (message) => message.type === 'agent-hub:ready' && message.bound !== true,
@@ -377,6 +383,14 @@ export default async function widgetBrowserScenario(scenarioContext) {
           'reloaded Widget origin-bound ready message'
         );
         assert.equal(widgetSessionLoads, 2, 'Reload must restore the same credential without extra selection');
+        await widget.getByRole('heading', { name: agents[0].name }).waitFor();
+        await widget.getByText(COMPLETION_TEXT, { exact: true }).waitFor();
+        assert.equal(
+          await widget.getByRole('textbox', { name: 'Message' }).inputValue(),
+          preservedDraft,
+          'Reload must restore the current Widget draft'
+        );
+        await widget.getByRole('button', { name: 'History' }).waitFor();
 
         await postToWidget(iframe, {
           type: 'agent-hub:session-select',
@@ -396,7 +410,7 @@ export default async function widgetBrowserScenario(scenarioContext) {
         await widget.getByLabel('Language').selectOption('zh-CN');
         await widget.getByRole('button', { name: '发送' }).waitFor();
         await assertNoHorizontalOverflow(page, '390px Widget host');
-        await assertWidgetNoHorizontalOverflow(iframe, '390px Widget');
+        await assertWidgetNoHorizontalOverflow(widget, '390px Widget');
 
         const allowedStreamAbort = `requestfailed: GET ${runStreamUrl}: net::ERR_ABORTED`;
         const unexpectedBrowserErrors = browserErrors.filter((error) => error !== allowedStreamAbort);

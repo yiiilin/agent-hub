@@ -43,6 +43,10 @@ async function createAgentThroughUi(page: Page, name: string, instructions: stri
   return responsePromise;
 }
 
+async function installEmptyClientMessagePages(page: Page) {
+  await page.route(/\/api\/client\/sessions\/[^/]+\/messages(?:\?.*)?$/, (route) => route.fulfill({ json: [] }));
+}
+
 test('priority helper only accepts a prioritized or runtime-owned target run', () => {
   const runId = '10000000-0000-4000-8000-000000000001';
   expect(() => validatePrioritizeResult(runId, `${runId}|pending||f|t`)).not.toThrow();
@@ -84,26 +88,29 @@ test('widget remains usable when randomUUID is unavailable on non-secure HTTP', 
 
 test('widget matches the platform chat interaction and event presentation', async ({ page }) => {
   const runId = '70000000-0000-0000-0000-000000000000';
+  const sessionId = '71000000-0000-0000-0000-000000000000';
   let runRequests = 0;
+  let startedAt = 0;
   await page.route('**/api/**', async (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
     if (path === '/api/widget/session') return route.fulfill({ json: { id: 'agent-id', name: 'Chat Widget Agent', instructions: '' } });
-    if (path === '/api/widget/runs' && request.method() === 'POST') {
+    if (path === '/api/client/runs' && request.method() === 'POST') {
       runRequests += 1;
+      startedAt = Date.now();
       return route.fulfill({ json: {
-        id: runId, agent_id: 'agent-id', automation_id: null, integration_session_id: null,
+        id: runId, agent_id: 'agent-id', automation_id: null, integration_session_id: sessionId,
         parent_run_id: null, runtime_id: null, status: 'running', initial_message: 'Hello agent',
-        native_session_id: null, work_dir_ref: null, source: 'widget', created_at: '2026-07-24T10:00:00.000Z', updated_at: '2026-07-24T10:00:00.000Z'
+        native_session_id: null, work_dir_ref: null, source: 'widget', created_at: new Date(startedAt).toISOString(), updated_at: new Date(startedAt).toISOString()
       } });
     }
-    if (path === `/api/runs/${runId}/events/stream`) {
+    if (path === `/api/client/sessions/${sessionId}/events/stream`) {
       const events = [
-        { seq: 1, run_id: runId, event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'pi-retry-1', item_type: 'retry', phase: 'started', attempt: 1, max_attempts: 3, delay_ms: 2000 }, created_at: '2026-07-24T10:00:00.500Z' },
-        { seq: 2, run_id: runId, event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'pi-retry-1', item_type: 'retry', phase: 'completed', attempt: 1, success: true }, created_at: '2026-07-24T10:00:00.800Z' },
-        { seq: 3, run_id: runId, event_type: 'item', role: null, content: null, payload: { item_id: 'reasoning-1', item_type: 'reasoning', phase: 'completed', summary: ['Checked the request.'], duration_ms: 800 }, created_at: '2026-07-24T10:00:01.000Z' },
-        { seq: 4, run_id: runId, event_type: 'message', role: 'assistant', content: 'Hello from the agent.', payload: {}, created_at: '2026-07-24T10:00:02.000Z' },
-        { seq: 5, run_id: runId, event_type: 'status', role: null, content: 'completed', payload: { status: 'completed' }, created_at: '2026-07-24T10:00:03.000Z' }
+        { seq: 1, run_id: runId, event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'pi-retry-1', item_type: 'retry', phase: 'started', attempt: 1, max_attempts: 3, delay_ms: 2000 }, created_at: new Date(startedAt + 500).toISOString() },
+        { seq: 2, run_id: runId, event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'pi-retry-1', item_type: 'retry', phase: 'completed', attempt: 1, success: true }, created_at: new Date(startedAt + 800).toISOString() },
+        { seq: 3, run_id: runId, event_type: 'item', role: null, content: null, payload: { item_id: 'reasoning-1', item_type: 'reasoning', phase: 'completed', summary: ['Checked the request.'], duration_ms: 800 }, created_at: new Date(startedAt + 1_000).toISOString() },
+        { seq: 4, run_id: runId, event_type: 'message', role: 'assistant', content: 'Hello from the agent.', payload: {}, created_at: new Date(startedAt + 2_000).toISOString() },
+        { seq: 5, run_id: runId, event_type: 'status', role: null, content: 'completed', payload: { status: 'completed' }, created_at: new Date(startedAt + 3_000).toISOString() }
       ];
       return route.fulfill({
         contentType: 'text/event-stream',
@@ -112,6 +119,7 @@ test('widget matches the platform chat interaction and event presentation', asyn
     }
     return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });
   });
+  await installEmptyClientMessagePages(page);
 
   await page.goto('/widget#token=widget-token');
   const composer = page.getByRole('textbox', { name: 'Message' });
@@ -138,21 +146,23 @@ test('widget matches the platform chat interaction and event presentation', asyn
 
 test('widget repairs incomplete Markdown while an assistant response is streaming', async ({ page }) => {
   const runId = '70000000-0000-0000-0000-000000000099';
+  const sessionId = '71000000-0000-0000-0000-000000000099';
   await page.route('**/api/**', async (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
     if (path === '/api/widget/session') return route.fulfill({ json: { id: 'agent-id', name: 'Streaming Widget Agent', instructions: '' } });
-    if (path === '/api/widget/runs' && request.method() === 'POST') return route.fulfill({ json: {
-      id: runId, agent_id: 'agent-id', automation_id: null, integration_session_id: null,
+    if (path === '/api/client/runs' && request.method() === 'POST') return route.fulfill({ json: {
+      id: runId, agent_id: 'agent-id', automation_id: null, integration_session_id: sessionId,
       parent_run_id: null, runtime_id: null, status: 'running', initial_message: 'Stream Markdown',
       native_session_id: null, work_dir_ref: null, source: 'widget', created_at: '2026-07-24T10:00:00.000Z', updated_at: '2026-07-24T10:00:00.000Z'
     } });
-    if (path === `/api/runs/${runId}/events/stream`) {
+    if (path === `/api/client/sessions/${sessionId}/events/stream`) {
       const delta = { seq: 1, run_id: runId, event_type: 'message_delta', role: 'assistant', content: '**Streaming answer', payload: {}, created_at: '2026-07-24T10:00:01.000Z' };
       return route.fulfill({ contentType: 'text/event-stream', body: `event: run_event\ndata: ${JSON.stringify(delta)}\n\n` });
     }
     return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });
   });
+  await installEmptyClientMessagePages(page);
 
   await page.goto('/widget#token=widget-streamdown-token');
   const composer = page.getByRole('textbox', { name: 'Message' });
@@ -165,21 +175,23 @@ test('widget repairs incomplete Markdown while an assistant response is streamin
 
 test('widget shows a visible error when a run fails without an assistant message', async ({ page }) => {
   const runId = '70000000-0000-0000-0000-000000000098';
+  const sessionId = '71000000-0000-0000-0000-000000000098';
   await page.route('**/api/**', async (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
     if (path === '/api/widget/session') return route.fulfill({ json: { id: 'agent-id', name: 'Failing Widget Agent', instructions: '' } });
-    if (path === '/api/widget/runs' && request.method() === 'POST') return route.fulfill({ json: {
-      id: runId, agent_id: 'agent-id', automation_id: null, integration_session_id: null,
+    if (path === '/api/client/runs' && request.method() === 'POST') return route.fulfill({ json: {
+      id: runId, agent_id: 'agent-id', automation_id: null, integration_session_id: sessionId,
       parent_run_id: null, runtime_id: null, status: 'running', initial_message: 'Trigger failure',
       native_session_id: null, work_dir_ref: null, source: 'widget', created_at: '2026-07-24T10:00:00.000Z', updated_at: '2026-07-24T10:00:00.000Z'
     } });
-    if (path === `/api/runs/${runId}/events/stream`) {
+    if (path === `/api/client/sessions/${sessionId}/events/stream`) {
       const failed = { seq: 1, run_id: runId, event_type: 'status', role: null, content: 'failed', payload: { status: 'failed' }, created_at: '2026-07-24T10:00:01.000Z' };
       return route.fulfill({ contentType: 'text/event-stream', body: `event: run_event\ndata: ${JSON.stringify(failed)}\n\n` });
     }
     return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });
   });
+  await installEmptyClientMessagePages(page);
 
   await page.goto('/widget#token=widget-failure-token');
   const composer = page.getByRole('textbox', { name: 'Message' });
@@ -191,18 +203,20 @@ test('widget shows a visible error when a run fails without an assistant message
 
 test('widget shows a visible error when the run event stream fails', async ({ page }) => {
   const runId = '70000000-0000-0000-0000-000000000097';
+  const sessionId = '71000000-0000-0000-0000-000000000097';
   await page.route('**/api/**', async (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
     if (path === '/api/widget/session') return route.fulfill({ json: { id: 'agent-id', name: 'Disconnected Widget Agent', instructions: '' } });
-    if (path === '/api/widget/runs' && request.method() === 'POST') return route.fulfill({ json: {
-      id: runId, agent_id: 'agent-id', automation_id: null, integration_session_id: null,
+    if (path === '/api/client/runs' && request.method() === 'POST') return route.fulfill({ json: {
+      id: runId, agent_id: 'agent-id', automation_id: null, integration_session_id: sessionId,
       parent_run_id: null, runtime_id: null, status: 'running', initial_message: 'Disconnect stream',
       native_session_id: null, work_dir_ref: null, source: 'widget', created_at: '2026-07-24T10:00:00.000Z', updated_at: '2026-07-24T10:00:00.000Z'
     } });
-    if (path === `/api/runs/${runId}/events/stream`) return route.fulfill({ status: 502, json: { error: 'upstream unavailable' } });
+    if (path === `/api/client/sessions/${sessionId}/events/stream`) return route.fulfill({ status: 502, json: { error: 'upstream unavailable' } });
     return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });
   });
+  await installEmptyClientMessagePages(page);
 
   await page.goto('/widget#token=widget-stream-failure-token');
   const composer = page.getByRole('textbox', { name: 'Message' });
@@ -214,20 +228,22 @@ test('widget shows a visible error when the run event stream fails', async ({ pa
 
 test('widget serializes rapid submissions and exposes pending UI', async ({ page }) => {
   const runId = '70000000-0000-0000-0000-000000000001';
+  const sessionId = '71000000-0000-0000-0000-000000000001';
   let runRequests = 0;
   const heldRoute: { current?: Route } = {};
   await page.route('**/api/**', async (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
     if (path === '/api/widget/session') return route.fulfill({ json: { agent_id: 'agent-id', name: 'Pending Widget Agent' } });
-    if (path === '/api/widget/runs' && request.method() === 'POST') {
+    if (path === '/api/client/runs' && request.method() === 'POST') {
       runRequests += 1;
       heldRoute.current = route;
       return;
     }
-    if (path === `/api/runs/${runId}/events/stream`) return route.fulfill({ contentType: 'text/event-stream', body: '' });
+    if (path === `/api/client/sessions/${sessionId}/events/stream`) return route.fulfill({ contentType: 'text/event-stream', body: '' });
     return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });
   });
+  await installEmptyClientMessagePages(page);
   await page.goto('/widget#token=widget-token');
   await expect(page.getByText('Pending Widget Agent')).toBeVisible();
   await page.locator('textarea').fill('Submit once');
@@ -241,7 +257,7 @@ test('widget serializes rapid submissions and exposes pending UI', async ({ page
   await expect(page.getByRole('button', { name: 'Sending...' })).toBeDisabled();
   if (!heldRoute.current) throw new Error('Widget run route was not captured');
   await heldRoute.current.fulfill({ json: {
-    id: runId, agent_id: 'agent-id', automation_id: null, integration_session_id: null,
+    id: runId, agent_id: 'agent-id', automation_id: null, integration_session_id: sessionId,
     parent_run_id: null, runtime_id: null, status: 'pending', initial_message: 'Submit once',
     native_session_id: null, work_dir_ref: null, source: 'widget', created_at: new Date().toISOString(), updated_at: new Date().toISOString()
   } });
@@ -265,13 +281,13 @@ test('widget rotates an external credential without releasing a pending submissi
       id: 'agent-id', name: 'Renewal Widget Agent', instructions: '',
       expires_at: new Date(Date.now() + 30_000).toISOString(), history_enabled: false
     } });
-    if (path === '/api/widget/session/renew' && request.method() === 'POST') {
+    if (path === '/api/client/renew' && request.method() === 'POST') {
       renewalRequests += 1;
       heldRoutes.renewal = route;
       return;
     }
-    if (path === '/api/widget/runs' && request.method() === 'POST') {
-      postedRuns.push({ token: request.headers()['x-agent-hub-embed-token'], body: request.postDataJSON() as Record<string, unknown> });
+    if (path === '/api/client/runs' && request.method() === 'POST') {
+      postedRuns.push({ token: request.headers().authorization?.replace(/^Bearer\s+/i, ''), body: request.postDataJSON() as Record<string, unknown> });
       if (postedRuns.length === 1) {
         heldRoutes.firstRun = route;
         return;
@@ -283,11 +299,12 @@ test('widget rotates an external credential without releasing a pending submissi
         work_dir_ref: null, source: 'widget', created_at: new Date().toISOString(), updated_at: new Date().toISOString()
       } });
     }
-    if (path === `/api/runs/${firstRunId}/events/stream` || path === `/api/runs/${secondRunId}/events/stream`) {
+    if (path === `/api/client/sessions/${integrationSessionId}/events/stream`) {
       return route.fulfill({ contentType: 'text/event-stream', body: '' });
     }
     return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });
   });
+  await installEmptyClientMessagePages(page);
 
   await page.goto('/widget#token=ahw_original');
   await expect(page.getByText('Renewal Widget Agent')).toBeVisible();
@@ -324,17 +341,19 @@ test('widget rotates an external credential without releasing a pending submissi
   expect(postedRuns[0].token).toBe('ahw_renewed');
   expect(postedRuns[1].token).toBe('ahw_renewed');
   expect(postedRuns[1].body).toMatchObject({
-    message: 'Second message', integration_session_id: integrationSessionId, hub_session_id: hubSessionId
+    message: 'Second message', session_id: integrationSessionId
   });
 });
 
-test('widget retries the selected credential renewal after another renewal finishes', async ({ page }) => {
+test('widget renews a newly selected credential independently from the previous client', async ({ page }) => {
   const heldRenewal: { current?: Route } = {};
   const renewalTokens: string[] = [];
   await page.route(/^https?:\/\/[^/]+\/api\//, async (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
-    const token = request.headers()['x-agent-hub-embed-token'];
+    const token = path === '/api/widget/session'
+      ? request.headers()['x-agent-hub-embed-token']
+      : request.headers().authorization?.replace(/^Bearer\s+/i, '');
     if (path === '/api/widget/session') {
       const selected = token === 'ahw_first' ? 'First Renewal Agent' : 'Second Renewal Agent';
       return route.fulfill({ json: {
@@ -345,7 +364,7 @@ test('widget retries the selected credential renewal after another renewal finis
         history_enabled: false
       } });
     }
-    if (path === '/api/widget/session/renew' && request.method() === 'POST') {
+    if (path === '/api/client/renew' && request.method() === 'POST') {
       renewalTokens.push(token ?? '');
       if (token === 'ahw_first') {
         heldRenewal.current = route;
@@ -401,14 +420,12 @@ test('widget retries the selected credential renewal after another renewal finis
     }, '*');
   }, channelId);
   await expect(widget.getByRole('heading', { name: 'Second Renewal Agent' })).toBeVisible();
-  await page.waitForTimeout(100);
-  expect(renewalTokens).toEqual(['ahw_first']);
+  await expect.poll(() => renewalTokens).toContain('ahw_second');
 
   await heldRenewal.current.fulfill({ json: {
     token: 'ahw_first_renewed',
     expires_at: new Date(Date.now() + 15 * 60_000).toISOString()
-  } });
-  await expect.poll(() => renewalTokens, { timeout: 5_000 }).toContain('ahw_second');
+  } }).catch(() => undefined);
   await expect(widget.getByRole('heading', { name: 'Second Renewal Agent' })).toBeVisible();
 });
 
@@ -420,6 +437,7 @@ test('widget carries a queued steer into the next turn after the active run comp
   const firstAcceptedAt = '2026-07-28T01:00:00.000Z';
   const secondAcceptedAt = '2026-07-28T01:00:01.000Z';
   let runPosts = 0;
+  const runMessageKeys: string[] = [];
   let historyReloads = 0;
   let migrated = false;
   let secondCompleted = false;
@@ -446,7 +464,7 @@ test('widget carries a queued steer into the next turn after the active run comp
     payload: {},
     delivery_mode: sequence === 1 ? 'next_turn' : migrated ? 'next_turn' : 'steer',
     delivery_state: sequence === 1 || secondCompleted ? 'delivered' : 'queued',
-    client_message_key: `two-turn-${sequence}`,
+    client_message_key: runMessageKeys[sequence - 1] ?? `two-turn-${sequence}`,
     expected_native_turn_id: null,
     turn_id: `turn-${sequence}`,
     run_id: runId,
@@ -461,8 +479,9 @@ test('widget carries a queued steer into the next turn after the active run comp
       id: 'agent-id', name: 'Two Turn Widget Agent', instructions: '',
       expires_at: new Date(Date.now() + 60 * 60_000).toISOString(), history_enabled: false
     } });
-    if (path === '/api/widget/runs' && request.method() === 'POST') {
+    if (path === '/api/client/runs' && request.method() === 'POST') {
       runPosts += 1;
+      runMessageKeys.push((request.postDataJSON() as { client_message_key: string }).client_message_key);
       return route.fulfill({ json: {
         id: firstRunId, agent_id: 'agent-id', automation_id: null,
         integration_session_id: integrationSessionId, parent_run_id: null, runtime_id: 'runtime-id',
@@ -473,31 +492,31 @@ test('widget carries a queued steer into the next turn after the active run comp
         created_at: firstAcceptedAt, updated_at: firstAcceptedAt
       } });
     }
-    if (path === `/api/runs/${firstRunId}/events/stream`) {
-      await firstTerminalGate;
-      migrated = true;
-      return route.fulfill({
-        contentType: 'text/event-stream',
-        body: firstEvents.map((event) => `event: run_event\ndata: ${JSON.stringify(event)}\n\n`).join('')
-      });
-    }
-    if (path === `/api/widget/sessions/${integrationSessionId}/messages`) {
+    if (path === `/api/client/sessions/${integrationSessionId}/messages`) {
       historyReloads += 1;
       return route.fulfill({ json: [
         userMessage('two-turn-message-1', 1, 'First turn question', firstRunId, firstAcceptedAt),
-        userMessage('two-turn-message-2', 2, 'Second turn question', secondRunId, secondAcceptedAt)
+        ...(runPosts >= 2 ? [userMessage('two-turn-message-2', 2, 'Second turn question', secondRunId, secondAcceptedAt)] : [])
       ] });
     }
-    if (path === `/api/widget/sessions/${integrationSessionId}/events`) {
+    if (path === `/api/client/sessions/${integrationSessionId}/events`) {
       return route.fulfill({ json: [
         ...firstEvents,
         queuedEvent,
         ...(secondCompleted ? secondEvents : [])
       ] });
     }
-    if (path === `/api/widget/sessions/${integrationSessionId}/events/stream`) {
+    if (path === `/api/client/sessions/${integrationSessionId}/events/stream`) {
       const after = Number(url.searchParams.get('after') ?? '0');
       sessionStreamCursors.push(after);
+      if (after === 0) {
+        await firstTerminalGate;
+        migrated = true;
+        return route.fulfill({
+          contentType: 'text/event-stream',
+          body: [...firstEvents, queuedEvent].map((event) => `event: run_event\ndata: ${JSON.stringify(event)}\n\n`).join('')
+        });
+      }
       if (after >= queuedEvent.seq && !secondCompleted) {
         secondCompleted = true;
         return route.fulfill({
@@ -541,58 +560,66 @@ test('widget restores its exact external session and draft without listing disab
   const runId = '70000000-0000-0000-0000-000000000020';
   let historyListRequests = 0;
   let messageRequests = 0;
-  await page.addInitScript(({ sessionId, hubId }) => {
-    sessionStorage.setItem('agent-hub-widget-state-v1', JSON.stringify({
-      token: 'ahw_restored', expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(), historyEnabled: false,
-      target: { integrationSessionId: sessionId, hubSessionId: hubId },
+  await page.addInitScript(({ sessionId }) => {
+    sessionStorage.setItem('agent-hub-widget-ui-v2:authenticated', JSON.stringify({
+      sessionId,
       draft: 'Draft restored after refresh', draftClientMessageKey: 'restored-client-key'
     }));
-  }, { sessionId: integrationSessionId, hubId: hubSessionId });
+  }, { sessionId: integrationSessionId });
   await page.route(/^https?:\/\/[^/]+\/api\//, async (route) => {
     const path = new URL(route.request().url()).pathname;
     if (path === '/api/widget/session') return route.fulfill({ json: {
       id: 'agent-id', name: 'Restored Widget Agent', instructions: '',
       expires_at: new Date(Date.now() + 60 * 60_000).toISOString(), history_enabled: false
     } });
-    if (path === '/api/widget/sessions') {
+    if (path === '/api/client/sessions') {
       historyListRequests += 1;
       return route.fulfill({ json: [] });
     }
-    if (path === `/api/widget/sessions/${integrationSessionId}/messages`) {
+    if (path === `/api/client/sessions/${integrationSessionId}/messages`) {
       messageRequests += 1;
       return route.fulfill({ json: [{
         id: 'message-id', session_id: hubSessionId, sequence: 1, role: 'user', message_kind: 'message',
         content: 'Restored user message', payload: {}, delivery_mode: 'next_turn', delivery_state: 'delivered',
         client_message_key: 'stored-key', expected_native_turn_id: null, turn_id: null, run_id: runId,
         accepted_at: new Date().toISOString()
+      }, {
+        id: 'assistant-message-id', session_id: hubSessionId, sequence: 2, role: 'assistant', message_kind: 'message',
+        content: 'Restored assistant reply', payload: {}, delivery_mode: 'next_turn', delivery_state: 'delivered',
+        client_message_key: null, expected_native_turn_id: null, turn_id: null, run_id: runId,
+        accepted_at: new Date().toISOString()
       }] });
     }
-    if (path === `/api/widget/sessions/${integrationSessionId}/events`) return route.fulfill({ json: [
+    if (path === `/api/client/sessions/${integrationSessionId}/events`) return route.fulfill({ json: [
       { seq: 1, run_id: runId, event_type: 'message', role: 'assistant', content: 'Restored assistant reply', payload: {}, created_at: new Date().toISOString() },
       { seq: 2, run_id: runId, event_type: 'status', role: null, content: 'completed', payload: { status: 'completed' }, created_at: new Date().toISOString() }
     ] });
-    if (path === `/api/runs/${runId}/events/stream`) return route.fulfill({ contentType: 'text/event-stream', body: '' });
+    if (path === `/api/client/sessions/${integrationSessionId}/events/stream`) return route.fulfill({ contentType: 'text/event-stream', body: '' });
     return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });
   });
 
-  await page.goto('/widget');
+  await page.goto('/widget#token=ahw_restored');
   await expect(page.getByRole('heading', { name: 'Restored Widget Agent' })).toBeVisible();
   await expect(page.getByText('Restored assistant reply', { exact: true })).toBeVisible();
   await expect(page.getByRole('textbox', { name: 'Message' })).toHaveValue('Draft restored after refresh');
   await expect(page.getByRole('button', { name: 'History' })).toHaveCount(0);
   expect(historyListRequests).toBe(0);
 
-  await page.reload();
+  await page.goto('/widget?refresh=1#token=ahw_restored_after_reload');
   await expect(page.getByText('Restored assistant reply', { exact: true })).toBeVisible();
   await expect(page.getByRole('textbox', { name: 'Message' })).toHaveValue('Draft restored after refresh');
   expect(messageRequests).toBeGreaterThanOrEqual(2);
   expect(historyListRequests).toBe(0);
+  expect(await page.evaluate(() => JSON.stringify({
+    local: { ...localStorage },
+    session: { ...sessionStorage }
+  }))).not.toContain('ahw_restored');
 });
 
 test('public Widget uses an app-scoped visitor key and restores its anonymous session without history', async ({ page }) => {
   const hubSessionId = '72000000-0000-0000-0000-000000000040';
   const runId = '70000000-0000-0000-0000-000000000040';
-  const accessRequests: Array<{ client_id: string; visitor_key: string }> = [];
+  const accessRequests: Array<{ client_id: string; visitor_key: string; client_instance_id: string; session_id?: string }> = [];
   const runTokens: string[] = [];
   const pageErrors: string[] = [];
   const consoleErrors: string[] = [];
@@ -608,18 +635,20 @@ test('public Widget uses an app-scoped visitor key and restores its anonymous se
   await page.route(/^https?:\/\/[^/]+\/api\//, async (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
-    if (path === '/api/widget/public/access' && request.method() === 'POST') {
-      accessRequests.push(request.postDataJSON() as { client_id: string; visitor_key: string });
+    if (path === '/api/client/anonymous/access' && request.method() === 'POST') {
+      const body = request.postDataJSON() as { client_id: string; visitor_key: string; client_instance_id: string; session_id?: string };
+      accessRequests.push(body);
       return route.fulfill({ json: {
         access_token: `ahwp_public_${accessRequests.length}`,
         expires_in: 3_600,
-        widget_session_id: 'public-widget-session',
+        session_id: body.session_id ?? null,
         agent: { id: 'agent-id', name: 'Public Widget Agent', instructions: '' },
-        app: { client_id: 'ahc_public', name: 'Public App' }
+        history_enabled: false,
+        tool_names: []
       } });
     }
-    if (path === '/api/widget/runs' && request.method() === 'POST') {
-      runTokens.push(request.headers()['x-agent-hub-embed-token'] ?? '');
+    if (path === '/api/client/runs' && request.method() === 'POST') {
+      runTokens.push(request.headers().authorization?.replace(/^Bearer\s+/i, '') ?? '');
       return route.fulfill({ json: {
         id: runId, agent_id: 'agent-id', automation_id: null, integration_session_id: null,
         parent_run_id: null, runtime_id: null, hub_session_id: hubSessionId, hub_message_id: null, hub_turn_id: null,
@@ -627,21 +656,26 @@ test('public Widget uses an app-scoped visitor key and restores its anonymous se
         work_dir_ref: null, source: 'widget', created_at: new Date().toISOString(), updated_at: new Date().toISOString()
       } });
     }
-    if (path === `/api/runs/${runId}/events/stream`) return route.fulfill({ contentType: 'text/event-stream', body: '' });
-    if (path === `/api/widget/sessions/${hubSessionId}/messages`) {
+    if (path === `/api/client/sessions/${hubSessionId}/events/stream`) return route.fulfill({ contentType: 'text/event-stream', body: '' });
+    if (path === `/api/client/sessions/${hubSessionId}/messages`) {
       transcriptRequests += 1;
       return route.fulfill({ json: [{
         id: 'public-message', session_id: hubSessionId, sequence: 1, role: 'user', message_kind: 'message',
         content: 'Public question', payload: {}, delivery_mode: 'next_turn', delivery_state: 'delivered',
         client_message_key: 'public-key', expected_native_turn_id: null, turn_id: null, run_id: runId,
         accepted_at: new Date().toISOString()
+      }, {
+        id: 'public-answer', session_id: hubSessionId, sequence: 2, role: 'assistant', message_kind: 'message',
+        content: 'Public answer', payload: {}, delivery_mode: 'next_turn', delivery_state: 'delivered',
+        client_message_key: null, expected_native_turn_id: null, turn_id: null, run_id: runId,
+        accepted_at: new Date().toISOString()
       }] });
     }
-    if (path === `/api/widget/sessions/${hubSessionId}/events`) return route.fulfill({ json: [
+    if (path === `/api/client/sessions/${hubSessionId}/events`) return route.fulfill({ json: [
       { seq: 1, run_id: runId, event_type: 'message', role: 'assistant', content: 'Public answer', payload: {}, created_at: new Date().toISOString() },
       { seq: 2, run_id: runId, event_type: 'status', role: null, content: 'completed', payload: { status: 'completed' }, created_at: new Date().toISOString() }
     ] });
-    if (path === '/api/widget/sessions') {
+    if (path === '/api/client/sessions') {
       historyRequests += 1;
       return route.fulfill({ json: [] });
     }
@@ -654,10 +688,12 @@ test('public Widget uses an app-scoped visitor key and restores its anonymous se
   await page.getByRole('button', { name: 'Send' }).click();
   await expect.poll(() => runTokens).toEqual(['ahwp_public_1']);
   await page.getByRole('textbox', { name: 'Message' }).fill('Draft retained through public token rotation');
-  await expect.poll(() => page.evaluate((sessionId) => {
-    const state = sessionStorage.getItem('agent-hub-public-widget-state-v1:ahc_public');
-    return state?.includes(sessionId) ?? false;
-  }, hubSessionId)).toBeTruthy();
+  await expect.poll(() => page.evaluate(({ sessionId, expectedDraft }) => {
+    const ui = sessionStorage.getItem('agent-hub-widget-ui-v2:ahc_public');
+    const currentSession = localStorage.getItem('agent-hub:anonymous:ahc_public:session');
+    const state = ui ? JSON.parse(ui) as { sessionId?: string; draft?: string } : null;
+    return state?.sessionId === sessionId && state.draft === expectedDraft && currentSession === sessionId;
+  }, { sessionId: hubSessionId, expectedDraft: 'Draft retained through public token rotation' })).toBeTruthy();
 
   await page.reload();
   await expect(page.getByText('Public answer', { exact: true })).toBeVisible();
@@ -666,6 +702,8 @@ test('public Widget uses an app-scoped visitor key and restores its anonymous se
   expect(accessRequests).toHaveLength(2);
   expect(accessRequests[0].client_id).toBe('ahc_public');
   expect(accessRequests[1].visitor_key).toBe(accessRequests[0].visitor_key);
+  expect(accessRequests[1].client_instance_id).toBe(accessRequests[0].client_instance_id);
+  expect(accessRequests[1].session_id).toBe(hubSessionId);
   expect(accessRequests[0].visitor_key).not.toBe('');
   expect(transcriptRequests).toBeGreaterThan(0);
   expect(historyRequests).toBe(0);
@@ -704,17 +742,13 @@ test('widget follows only at the bottom and prepends older history without movin
   const secondRunGate = new Promise<void>((resolve) => { releaseSecondRun = resolve; });
   let runCount = 0;
 
-  await page.addInitScript(({ sessionId, hubId, now }) => {
-    sessionStorage.setItem('agent-hub-widget-state-v1', JSON.stringify({
-      token: 'ahw_scroll',
-      expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
-      historyEnabled: true,
-      target: { integrationSessionId: sessionId, hubSessionId: hubId },
+  await page.addInitScript(({ sessionId }) => {
+    sessionStorage.setItem('agent-hub-widget-ui-v2:authenticated', JSON.stringify({
+      sessionId,
       draft: '',
-      draftClientMessageKey: null,
-      storedAt: now
+      draftClientMessageKey: 'widget-scroll-draft-key'
     }));
-  }, { sessionId: integrationSessionId, hubId: hubSessionId, now: timestamp });
+  }, { sessionId: integrationSessionId });
 
   await page.route(/^https?:\/\/[^/]+\/api\//, async (route) => {
     const request = route.request();
@@ -724,14 +758,14 @@ test('widget follows only at the bottom and prepends older history without movin
       id: 'agent-id', name: 'Scrolling Widget Agent', instructions: '',
       expires_at: new Date(Date.now() + 60 * 60_000).toISOString(), history_enabled: true
     } });
-    if (path === '/api/widget/sessions') return route.fulfill({ json: [{
+    if (path === '/api/client/sessions') return route.fulfill({ json: [{
       id: integrationSessionId,
       hub_session_id: hubSessionId,
       created_at: timestamp,
       updated_at: timestamp,
       preview: 'Widget history message 1'
     }] });
-    if (path === `/api/widget/sessions/${integrationSessionId}/messages`) {
+    if (path === `/api/client/sessions/${integrationSessionId}/messages`) {
       const beforeValue = url.searchParams.get('before_sequence');
       const limitValue = url.searchParams.get('limit');
       const beforeSequence = beforeValue === null ? null : Number(beforeValue);
@@ -740,8 +774,8 @@ test('widget follows only at the bottom and prepends older history without movin
       const pageItems = messages.filter((item) => beforeSequence === null || item.sequence < beforeSequence);
       return route.fulfill({ json: limit === null ? pageItems : pageItems.slice(Math.max(0, pageItems.length - limit)) });
     }
-    if (path === `/api/widget/sessions/${integrationSessionId}/events`) return route.fulfill({ json: [] });
-    if (path === '/api/widget/runs' && request.method() === 'POST') {
+    if (path === `/api/client/sessions/${integrationSessionId}/events`) return route.fulfill({ json: [] });
+    if (path === '/api/client/runs' && request.method() === 'POST') {
       const currentRun = ++runCount;
       await (currentRun === 1 ? firstRunGate : secondRunGate);
       const body = request.postDataJSON() as { message: string };
@@ -758,7 +792,7 @@ test('widget follows only at the bottom and prepends older history without movin
     return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });
   });
 
-  await page.goto('/widget');
+  await page.goto('/widget#token=ahw_scroll');
   const scroll = page.locator('.session-chat-scroll');
   const composer = page.getByRole('textbox', { name: 'Message' });
   const anchor = page.getByText('Widget history message 11', { exact: true });
@@ -770,7 +804,7 @@ test('widget follows only at the bottom and prepends older history without movin
   ));
   await expect.poll(bottomDistance).toBeLessThanOrEqual(1);
 
-  const firstRequest = page.waitForRequest((request) => new URL(request.url()).pathname === '/api/widget/runs');
+  const firstRequest = page.waitForRequest((request) => new URL(request.url()).pathname === '/api/client/runs');
   await composer.fill('Follow this Widget message.');
   await page.getByRole('button', { name: 'Send' }).click();
   await firstRequest;
@@ -787,7 +821,7 @@ test('widget follows only at the bottom and prepends older history without movin
   const readingTop = await scroll.evaluate((element) => element.scrollTop);
   expect(readingTop).toBeGreaterThan(64);
   expect(await bottomDistance()).toBeGreaterThan(24);
-  const secondRequest = page.waitForRequest((request) => new URL(request.url()).pathname === '/api/widget/runs');
+  const secondRequest = page.waitForRequest((request) => new URL(request.url()).pathname === '/api/client/runs');
   await composer.fill('Do not move this Widget reading position.');
   await page.getByRole('button', { name: 'Send' }).click();
   await secondRequest;
@@ -799,7 +833,7 @@ test('widget follows only at the bottom and prepends older history without movin
 
   const olderRequest = page.waitForRequest((request) => {
     const requestUrl = new URL(request.url());
-    return requestUrl.pathname === `/api/widget/sessions/${integrationSessionId}/messages`
+    return requestUrl.pathname === `/api/client/sessions/${integrationSessionId}/messages`
       && requestUrl.searchParams.get('before_sequence') === '11';
   });
   await expect(page.locator('.widget-transcript')).toHaveAttribute('aria-busy', 'false');
@@ -824,7 +858,7 @@ test('an upward gesture loads older Widget history when the current page has no 
     id: `short-widget-history-${index + 1}`,
     session_id: hubSessionId,
     sequence: index + 1,
-    role: index < 10 ? 'user' : 'assistant',
+    role: index < 10 ? 'user' : 'tool',
     message_kind: 'message',
     content: index < 10 ? `Earlier Widget history ${index + 1}` : `Hidden assistant history ${index + 1}`,
     payload: {},
@@ -837,17 +871,13 @@ test('an upward gesture loads older Widget history when the current page has no 
     accepted_at: timestamp
   }));
 
-  await page.addInitScript(({ sessionId, hubId, now }) => {
-    sessionStorage.setItem('agent-hub-widget-state-v1', JSON.stringify({
-      token: 'ahw_short_history',
-      expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
-      historyEnabled: true,
-      target: { integrationSessionId: sessionId, hubSessionId: hubId },
+  await page.addInitScript(({ sessionId }) => {
+    sessionStorage.setItem('agent-hub-widget-ui-v2:authenticated', JSON.stringify({
+      sessionId,
       draft: '',
-      draftClientMessageKey: null,
-      storedAt: now
+      draftClientMessageKey: 'short-widget-history-draft-key'
     }));
-  }, { sessionId: integrationSessionId, hubId: hubSessionId, now: timestamp });
+  }, { sessionId: integrationSessionId });
 
   await page.route(/^https?:\/\/[^/]+\/api\//, async (route) => {
     const url = new URL(route.request().url());
@@ -856,14 +886,14 @@ test('an upward gesture loads older Widget history when the current page has no 
       id: 'agent-id', name: 'Short History Widget Agent', instructions: '',
       expires_at: new Date(Date.now() + 60 * 60_000).toISOString(), history_enabled: true
     } });
-    if (path === '/api/widget/sessions') return route.fulfill({ json: [{
+    if (path === '/api/client/sessions') return route.fulfill({ json: [{
       id: integrationSessionId,
       hub_session_id: hubSessionId,
       created_at: timestamp,
       updated_at: timestamp,
       preview: 'Earlier Widget history 1'
     }] });
-    if (path === `/api/widget/sessions/${integrationSessionId}/messages`) {
+    if (path === `/api/client/sessions/${integrationSessionId}/messages`) {
       const beforeValue = url.searchParams.get('before_sequence');
       const limitValue = url.searchParams.get('limit');
       const beforeSequence = beforeValue === null ? null : Number(beforeValue);
@@ -871,18 +901,21 @@ test('an upward gesture loads older Widget history when the current page has no 
       const pageItems = messages.filter((item) => beforeSequence === null || item.sequence < beforeSequence);
       return route.fulfill({ json: pageItems.slice(Math.max(0, pageItems.length - limit)) });
     }
-    if (path === `/api/widget/sessions/${integrationSessionId}/events`) return route.fulfill({ json: [] });
+    if (path === `/api/client/sessions/${integrationSessionId}/events`) return route.fulfill({ json: [] });
+    if (path === `/api/client/sessions/${integrationSessionId}/events/stream`) {
+      return route.fulfill({ contentType: 'text/event-stream', body: '' });
+    }
     return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });
   });
 
-  await page.goto('/widget');
+  await page.goto('/widget#token=ahw_short_history');
   const scroll = page.locator('.session-chat-scroll');
   await expect(page.getByText('Earlier Widget history 1', { exact: true })).toHaveCount(0);
   expect(await scroll.evaluate((element) => element.scrollHeight <= element.clientHeight)).toBe(true);
 
   const olderRequest = page.waitForRequest((request) => {
     const url = new URL(request.url());
-    return url.pathname === `/api/widget/sessions/${integrationSessionId}/messages`
+    return url.pathname === `/api/client/sessions/${integrationSessionId}/messages`
       && url.searchParams.get('before_sequence') === '11';
   });
   await scroll.hover();
@@ -912,22 +945,30 @@ test('widget history switch detaches stale output without stopping the previous 
       id: 'agent-id', name: 'History Widget Agent', instructions: '',
       expires_at: new Date(Date.now() + 60 * 60_000).toISOString(), history_enabled: true
     } });
-    if (path === '/api/widget/sessions') return route.fulfill({ json: [
+    if (path === '/api/client/sessions') return route.fulfill({ json: [
       { id: sessionA, hub_session_id: hubA, created_at: new Date().toISOString(), updated_at: new Date().toISOString(), preview: 'Session A' },
       { id: sessionB, hub_session_id: hubB, created_at: new Date().toISOString(), updated_at: new Date().toISOString(), preview: 'Session B' }
     ] });
-    if (path === `/api/widget/sessions/${sessionA}/messages`) return route.fulfill({ json: [storedMessage('message-a', hubA, runA, 'Question A')] });
-    if (path === `/api/widget/sessions/${sessionA}/events`) return route.fulfill({ json: [] });
-    if (path === `/api/widget/sessions/${sessionB}/messages`) return route.fulfill({ json: [storedMessage('message-b', hubB, runB, 'Question B')] });
-    if (path === `/api/widget/sessions/${sessionB}/events`) return route.fulfill({ json: [
+    if (path === `/api/client/sessions/${sessionA}/messages`) return route.fulfill({ json: [storedMessage('message-a', hubA, runA, 'Question A')] });
+    if (path === `/api/client/sessions/${sessionA}/events`) return route.fulfill({ json: [] });
+    if (path === `/api/client/sessions/${sessionB}/messages`) return route.fulfill({ json: [
+      storedMessage('message-b', hubB, runB, 'Question B'),
+      {
+        ...storedMessage('answer-b', hubB, runB, 'Answer B'),
+        sequence: 2,
+        role: 'assistant',
+        client_message_key: null
+      }
+    ] });
+    if (path === `/api/client/sessions/${sessionB}/events`) return route.fulfill({ json: [
       { seq: 1, run_id: runB, event_type: 'message', role: 'assistant', content: 'Answer B', payload: {}, created_at: new Date().toISOString() },
       { seq: 2, run_id: runB, event_type: 'status', role: null, content: 'completed', payload: { status: 'completed' }, created_at: new Date().toISOString() }
     ] });
-    if (path === `/api/widget/sessions/${sessionA}/events/stream`) {
+    if (path === `/api/client/sessions/${sessionA}/events/stream`) {
       staleStream = route;
       return;
     }
-    if (path === `/api/widget/sessions/${sessionB}/events/stream`) return route.fulfill({ contentType: 'text/event-stream', body: '' });
+    if (path === `/api/client/sessions/${sessionB}/events/stream`) return route.fulfill({ contentType: 'text/event-stream', body: '' });
     if (path === `/api/runs/${runA}/events/stream` || path === `/api/runs/${runB}/events/stream`) {
       credentialBoundRunStreams += 1;
       return route.fulfill({ status: 403, json: { error: 'Historical Runs require Session-scoped streaming' } });
@@ -962,6 +1003,7 @@ test('widget history switch detaches stale output without stopping the previous 
 
 test('widget stream ignores malformed SSE JSON and keeps later events', async ({ page }) => {
   const runId = '70000000-0000-0000-0000-000000000002';
+  const sessionId = '71000000-0000-0000-0000-000000000002';
   const pageErrors: string[] = [];
   const consoleErrors: string[] = [];
   page.on('pageerror', (error) => pageErrors.push(error.message));
@@ -970,17 +1012,18 @@ test('widget stream ignores malformed SSE JSON and keeps later events', async ({
     const request = route.request();
     const path = new URL(request.url()).pathname;
     if (path === '/api/widget/session') return route.fulfill({ json: { agent_id: 'agent-id', name: 'Malformed Widget Agent' } });
-    if (path === '/api/widget/runs' && request.method() === 'POST') return route.fulfill({ json: {
-      id: runId, agent_id: 'agent-id', automation_id: null, integration_session_id: null,
+    if (path === '/api/client/runs' && request.method() === 'POST') return route.fulfill({ json: {
+      id: runId, agent_id: 'agent-id', automation_id: null, integration_session_id: sessionId,
       parent_run_id: null, runtime_id: null, status: 'running', initial_message: 'Malformed stream',
       native_session_id: null, work_dir_ref: null, source: 'widget', created_at: new Date().toISOString(), updated_at: new Date().toISOString()
     } });
-    if (path === `/api/runs/${runId}/events/stream`) return route.fulfill({
+    if (path === `/api/client/sessions/${sessionId}/events/stream`) return route.fulfill({
       contentType: 'text/event-stream',
       body: `event: run_event\ndata: {malformed\n\nevent: run_event\ndata: ${JSON.stringify({ seq: 2, run_id: runId, event_type: 'message', role: 'assistant', content: 'Valid widget event', payload: {}, created_at: new Date().toISOString() })}\n\n`
     });
     return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });
   });
+  await installEmptyClientMessagePages(page);
   await page.goto('/widget#token=widget-token');
   await expect(page.getByText('Malformed Widget Agent')).toBeVisible();
   await page.getByRole('textbox', { name: 'Message' }).fill('Malformed stream');
@@ -988,6 +1031,104 @@ test('widget stream ignores malformed SSE JSON and keeps later events', async ({
   await expect(page.getByText('Valid widget event', { exact: true })).toBeVisible();
   expect(pageErrors).toEqual([]);
   expect(consoleErrors).toEqual([]);
+});
+
+test('widget dispatches and renders ordered Client Tool technical events at desktop and 390px', async ({ page }) => {
+  const runId = '70000000-0000-0000-0000-000000000070';
+  const sessionId = '71000000-0000-0000-0000-000000000070';
+  const toolCallId = '73000000-0000-0000-0000-000000000070';
+  let startedAt = 0;
+  const pageErrors: string[] = [];
+  const consoleErrors: string[] = [];
+  const failedApi: string[] = [];
+  const claims: unknown[] = [];
+  const results: unknown[] = [];
+  page.on('pageerror', (error) => pageErrors.push(error.message));
+  page.on('console', (message) => { if (message.type() === 'error') consoleErrors.push(message.text()); });
+  page.on('response', (response) => {
+    const path = new URL(response.url()).pathname;
+    if (path.startsWith('/api/') && response.status() >= 400) failedApi.push(`${response.status()} ${path}`);
+  });
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const path = url.pathname;
+    if (path === '/api/widget/session') return route.fulfill({ json: {
+      id: 'agent-id', name: 'Client Tool Widget Agent', instructions: '',
+      expires_at: new Date(Date.now() + 60 * 60_000).toISOString(), history_enabled: false
+    } });
+    if (path === '/api/client/runs' && request.method() === 'POST') {
+      startedAt = Date.now();
+      return route.fulfill({ json: {
+        id: runId, agent_id: 'agent-id', automation_id: null, integration_session_id: sessionId,
+        parent_run_id: null, runtime_id: null, hub_session_id: '72000000-0000-0000-0000-000000000070',
+        hub_message_id: null, hub_turn_id: null, session_ownership_generation: null,
+        status: 'waiting_tool', initial_message: 'Open the panel', native_session_id: 'native-session',
+        work_dir_ref: 'workspace', source: 'widget', created_at: new Date(startedAt).toISOString(),
+        updated_at: new Date(startedAt).toISOString()
+      } });
+    }
+    if (path === `/api/client/sessions/${sessionId}/messages`) return route.fulfill({ json: [] });
+    if (path === `/api/client/sessions/${sessionId}/events/stream`) {
+      if (url.searchParams.has('after')) return route.fulfill({ contentType: 'text/event-stream', body: '' });
+      const events = [
+        { seq: 1, run_id: runId, event_type: 'tool_request', role: 'assistant', content: null, payload: { tool_call_id: toolCallId, tool_name: 'open_panel', arguments: { panel: 'usage' }, batch_id: runId, expires_at: new Date(startedAt + 300_000).toISOString() }, created_at: new Date(startedAt + 100).toISOString() },
+        { seq: 2, run_id: runId, event_type: 'client_tool_result', role: 'tool', content: null, payload: { tool_call_id: toolCallId, tool_name: 'open_panel', status: 'error', result: { status: 'error', error: { code: 'tool_handler_not_registered', message: 'No handler is registered.', retryable: false } }, elapsed_ms: 500 }, created_at: new Date(startedAt + 600).toISOString() },
+        { seq: 3, run_id: runId, event_type: 'message', role: 'assistant', content: 'The host did not register that action.', payload: {}, created_at: new Date(startedAt + 700).toISOString() },
+        { seq: 4, run_id: runId, event_type: 'status', role: null, content: 'completed', payload: { status: 'completed' }, created_at: new Date(startedAt + 800).toISOString() }
+      ];
+      return route.fulfill({
+        contentType: 'text/event-stream',
+        body: events.map((event) => `event: run_event\nid: ${event.seq}\ndata: ${JSON.stringify(event)}\n\n`).join('')
+      });
+    }
+    if (path === `/api/client/tool-calls/${toolCallId}/claim` && request.method() === 'POST') {
+      claims.push(request.postDataJSON());
+      return route.fulfill({ json: { status: 'claimed', terminal: false } });
+    }
+    if (path === `/api/client/tool-calls/${toolCallId}/result` && request.method() === 'POST') {
+      results.push(request.postDataJSON());
+      return route.fulfill({ json: { run: null, tool_request: { id: toolCallId, status: 'completed' } } });
+    }
+    return route.fulfill({ status: 404, json: { error: `Unhandled Client Tool Widget route: ${path}` } });
+  });
+
+  await page.goto('/widget#token=client-tool-widget-token');
+  await page.getByRole('textbox', { name: 'Message' }).fill('Open the panel');
+  await page.getByRole('button', { name: 'Send' }).click();
+  await expect(page.getByText('The host did not register that action.', { exact: true })).toBeVisible();
+  const details = page.locator('details.session-activity-events');
+  await expect(details).toBeVisible();
+  await details.locator('summary').click();
+  await expect(details).toContainText('open_panel');
+  await expect(details).toContainText('failed');
+  await expect(details).toContainText('0.5 sec');
+  await expect(details).toContainText('tool_handler_not_registered');
+  await expect.poll(() => claims.length).toBe(1);
+  await expect.poll(() => results.length).toBe(1);
+  expect(results[0]).toEqual({ result: {
+    status: 'error',
+    error: {
+      code: 'tool_handler_not_registered',
+      message: 'No handler is registered for Client Tool "open_panel"',
+      retryable: false
+    }
+  } });
+  await expect(page.locator('.session-transcript > *')).toHaveCount(3);
+  await expect(page.locator('.session-transcript > *').nth(0)).toContainText('Open the panel');
+  await expect(page.locator('.session-transcript > *').nth(1)).toHaveClass(/session-activity-events/);
+  await expect(page.locator('.session-transcript > *').nth(2)).toContainText('The host did not register that action.');
+  await page.setViewportSize({ width: 390, height: 844 });
+  const dimensions = await page.evaluate(() => ({
+    documentWidth: document.documentElement.scrollWidth,
+    viewportWidth: window.innerWidth,
+    widgetWidth: document.querySelector('.widget')?.scrollWidth ?? 0
+  }));
+  expect(dimensions.documentWidth).toBeLessThanOrEqual(dimensions.viewportWidth);
+  expect(dimensions.widgetWidth).toBeLessThanOrEqual(dimensions.viewportWidth);
+  expect(pageErrors).toEqual([]);
+  expect(consoleErrors).toEqual([]);
+  expect(failedApi).toEqual([]);
 });
 
 function modelProxyConfigProbe(workDirRef: string) {

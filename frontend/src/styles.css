@@ -916,7 +916,12 @@ textarea {
 .session-activity-row code, .session-activity-row span { min-width: 0; overflow-wrap: anywhere; }
 .session-activity-icon { width: 22px; height: 22px; display: grid; place-items: center; color: #67676d; }
 .session-activity-content { min-width: 0; display: grid; gap: 5px; color: #525258; }
+.session-activity-heading { min-width: 0; display: flex; align-items: center; gap: 7px; }
 .session-activity-content strong { color: #3c3c40; font-size: 11px; }
+.session-activity-status { border: 1px solid #d8dde4; border-radius: 999px; padding: 1px 6px; background: #fff; color: #626b78; font-size: 9px; font-weight: 700; }
+.session-activity-elapsed { color: #747b86; font-size: 10px; font-variant-numeric: tabular-nums; }
+.session-activity-status.status-success { border-color: #c8dfd3; background: #edf7f1; color: #256747; }
+.session-activity-status:is(.status-error, .status-timeout, .status-timed_out, .status-unknown, .status-cancelled) { border-color: #ead1ce; background: #fff2f1; color: #9a3d37; }
 .session-activity-content > code { display: block; color: #303136; white-space: pre-wrap; }
 .session-activity-summary { white-space: pre-wrap; }
 .session-activity-output { min-width: 0; display: grid; gap: 3px; border-left: 2px solid #d7d7d7; padding-left: 8px; }
@@ -1127,6 +1132,16 @@ textarea {
 .integration-agent-selector > span { color: #6c788a; font-size: 13px; }
 .integration-agent-selector .check-row { min-width: 0; border-bottom: 1px solid #edf1f5; padding: 7px 3px; }
 .integration-agent-selector .check-row:last-child { border-bottom: 0; }
+.integration-client-tools-empty { color: #6c788a; font-size: 13px; }
+.integration-origin-risk { margin: 0; color: #69778b; font-size: 12px; line-height: 1.45; }
+.integration-client-tool-list { min-width: 0; display: grid; border: 1px solid #d7e0e9; }
+.integration-client-tool-row { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 10px; border-bottom: 1px solid #e0e7ef; padding: 9px 10px; }
+.integration-client-tool-row:last-child { border-bottom: 0; }
+.integration-client-tool-row > span:first-child { min-width: 0; display: grid; gap: 3px; }
+.integration-client-tool-row code, .integration-client-tool-row small { min-width: 0; overflow-wrap: anywhere; }
+.integration-client-tool-row small { color: #69778b; }
+.integration-client-tool-dialog { width: min(100%, 620px); z-index: 1; }
+.integration-client-tool-schema { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.5; }
 .integration-secret-warning, .integration-rotate-warning { margin: 0; color: #5d687a; line-height: 1.55; }
 .integration-secret-warning { border-left: 3px solid #b7791f; padding: 9px 11px; background: #fff9eb; color: #684d16; }
 .integration-credential-list { margin: 14px 0 0; display: grid; border: 1px solid #d7e0e9; }

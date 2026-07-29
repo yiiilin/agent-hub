@@ -1,6 +1,13 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import {
+  existsSync,
+  lstatSync,
+  readFileSync,
+  readdirSync,
+  readlinkSync
+} from 'node:fs';
+import { lstat, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -819,6 +826,99 @@ function xmlEscape(value) {
     .replaceAll("'", '&apos;');
 }
 
+function resultObservation(result) {
+  if (result.status === 'passed') return 'Scenario completed with every assertion satisfied.';
+  if (result.status === 'failed') return result.error ?? 'Scenario failed without a diagnostic.';
+  if (result.status === 'blocked') return result.reason ?? 'Scenario prerequisite was unavailable.';
+  if (result.status === 'not_run') return result.reason ?? 'Scenario did not run.';
+  return result.reason ?? 'Available evidence could not verify this claim.';
+}
+
+export function buildClaimRecords(catalog, results, {
+  revision = 'unknown',
+  sourceFingerprint = 'unknown',
+  environment = { id: 'unknown', class: 'unknown', base_url: null }
+} = {}) {
+  const features = new Map(catalog.features.map((feature) => [feature.id, feature]));
+  const records = [];
+  for (const result of results) {
+    for (const claimId of result.covers ?? []) {
+      const feature = features.get(claimId);
+      if (!feature) throw new Error(`Scenario ${result.id} references unknown claim ${claimId}`);
+      const artifacts = ['junit.xml'];
+      if (result.status === 'failed') artifacts.push(`${result.id}/failure.json`);
+      records.push({
+        claim_id: claimId,
+        title: feature.title,
+        scenario_id: result.id,
+        status: result.status,
+        contract_source: `qa/features.json#${claimId}`,
+        revision,
+        source_fingerprint: sourceFingerprint,
+        environment,
+        action: `qa/scenarios/${result.id}/scenario.mjs`,
+        oracle: feature.title,
+        result: result.status === 'passed'
+          ? `passed in ${result.duration_ms} ms`
+          : result.status === 'failed'
+            ? `failed in ${result.duration_ms} ms`
+            : result.status,
+        observation: resultObservation(result),
+        artifacts,
+        verified_at: result.finished_at ?? null,
+        freshness: 'Invalidated by relevant source, working-tree fingerprint, Compose configuration, dependency mode, fixture, actor permission, or scenario oracle changes.'
+      });
+    }
+  }
+  return records;
+}
+
+async function collectArtifactEntries(root, current, excluded, entries) {
+  const children = await readdir(current, { withFileTypes: true });
+  children.sort((left, right) => left.name.localeCompare(right.name));
+  for (const child of children) {
+    const absolute = join(current, child.name);
+    const path = relative(root, absolute).split(sep).join('/');
+    if (excluded.has(path)) continue;
+    const metadata = await lstat(absolute);
+    if (metadata.isSymbolicLink()) {
+      throw new Error(`QA artifacts must not contain symbolic links: ${path}`);
+    }
+    if (metadata.isDirectory()) {
+      await collectArtifactEntries(root, absolute, excluded, entries);
+    } else if (metadata.isFile()) {
+      const body = await readFile(absolute);
+      entries.push({
+        path,
+        bytes: body.byteLength,
+        sha256: createHash('sha256').update(body).digest('hex')
+      });
+    }
+  }
+}
+
+export async function writeArtifactManifest(
+  artifactsRoot,
+  createdAt = new Date().toISOString()
+) {
+  const excluded = ['artifact-manifest.json', 'summary.json'];
+  const entries = [];
+  await collectArtifactEntries(artifactsRoot, artifactsRoot, new Set(excluded), entries);
+  entries.sort((left, right) => left.path.localeCompare(right.path));
+  const manifest = {
+    version: 1,
+    algorithm: 'sha256',
+    created_at: createdAt,
+    excluded,
+    entries
+  };
+  await writeFile(
+    join(artifactsRoot, 'artifact-manifest.json'),
+    `${JSON.stringify(manifest, null, 2)}\n`
+  );
+  return manifest;
+}
+
 function coverageLine(label, report) {
   return `${label}: ${report.fully_covered_feature_count}/${report.feature_count} fully covered (${report.fully_covered_feature_percent}%), ${report.scenario_feature_count} scenario-covered`;
 }
@@ -860,33 +960,68 @@ function reportCoverage(coverage) {
   }
 }
 
-export async function writeSummary(artifactsRoot, project, baseURL, results, coverage) {
+function countStatuses(results, statuses) {
+  return Object.fromEntries(statuses.map((status) => [
+    status,
+    results.filter((result) => result.status === status).length
+  ]));
+}
+
+export async function writeSummary(
+  artifactsRoot,
+  project,
+  baseURL,
+  results,
+  coverage,
+  metadata = {}
+) {
+  const qualityGates = metadata.quality_gates ?? [];
+  const scenarioCounts = countStatuses(
+    results,
+    ['passed', 'failed', 'blocked', 'not_run', 'unverified']
+  );
+  const gateCounts = countStatuses(qualityGates, ['passed', 'failed']);
   const summary = redactSecrets({
+    ...metadata,
     project,
     base_url: baseURL,
-    passed: results.filter((result) => result.status === 'passed').length,
-    failed: results.filter((result) => result.status === 'failed').length,
-    not_run: results.filter((result) => result.status === 'not_run').length,
+    counts: {
+      scenarios: scenarioCounts,
+      quality_gates: gateCounts
+    },
+    passed: scenarioCounts.passed,
+    failed: scenarioCounts.failed,
+    blocked: scenarioCounts.blocked,
+    not_run: scenarioCounts.not_run,
+    unverified: scenarioCounts.unverified,
     scenarios: results,
     coverage
   });
   await writeFile(join(artifactsRoot, 'summary.json'), `${JSON.stringify(summary, null, 2)}\n`);
   const safeResults = summary.scenarios;
-  const failures = summary.failed;
-  const skipped = summary.not_run;
-  const durationSeconds = safeResults.reduce((total, result) => total + result.duration_ms, 0) / 1_000;
+  const safeGates = summary.quality_gates ?? [];
+  const failures = summary.failed + gateCounts.failed;
+  const skipped = summary.blocked + summary.not_run + summary.unverified;
+  const durationSeconds = [...safeResults, ...safeGates]
+    .reduce((total, result) => total + (result.duration_ms ?? 0), 0) / 1_000;
   const cases = safeResults.map((result) => {
     const outcome = result.status === 'failed'
       ? `<failure message="${xmlEscape(result.error)}">${xmlEscape(result.error)}</failure>`
-      : result.status === 'not_run'
+      : ['blocked', 'not_run', 'unverified'].includes(result.status)
         ? `<skipped message="${xmlEscape(result.reason)}">${xmlEscape(result.reason)}</skipped>`
         : '';
     return `  <testcase classname="agent-hub.qa.${result.type}" name="${xmlEscape(result.id)}" status="${result.status}" time="${(result.duration_ms / 1_000).toFixed(3)}">${outcome}</testcase>`;
-  }).join('\n');
+  });
+  const gateCases = safeGates.map((gate) => {
+    const outcome = gate.status === 'failed'
+      ? `<failure message="${xmlEscape(gate.error)}">${xmlEscape(gate.error)}</failure>`
+      : '';
+    return `  <testcase classname="agent-hub.qa.gate" name="${xmlEscape(gate.id)}" status="${gate.status}" time="${((gate.duration_ms ?? 0) / 1_000).toFixed(3)}">${outcome}</testcase>`;
+  });
   const properties = ['selected', 'overall']
     .map((scope) => `    <property name="coverage.${scope}" value="${xmlEscape(JSON.stringify(coverage[scope]))}"/>`)
     .join('\n');
-  const junit = `<?xml version="1.0" encoding="UTF-8"?>\n<testsuite name="agent-hub-qa" tests="${safeResults.length}" failures="${failures}" skipped="${skipped}" time="${durationSeconds.toFixed(3)}">\n  <properties>\n${properties}\n  </properties>\n${cases}\n</testsuite>\n`;
+  const junit = `<?xml version="1.0" encoding="UTF-8"?>\n<testsuite name="agent-hub-qa" tests="${safeResults.length + safeGates.length}" failures="${failures}" skipped="${skipped}" time="${durationSeconds.toFixed(3)}">\n  <properties>\n${properties}\n  </properties>\n${[...cases, ...gateCases].join('\n')}\n</testsuite>\n`;
   await writeFile(join(artifactsRoot, 'junit.xml'), junit);
 }
 
@@ -907,8 +1042,11 @@ export async function executeScenarioQueue(scenarios, executeScenario) {
         id: remaining.id,
         name: remaining.name,
         type: remaining.type,
+        covers: remaining.covers ?? [],
         status: 'not_run',
         duration_ms: 0,
+        started_at: null,
+        finished_at: null,
         reason
       });
     }
@@ -945,6 +1083,174 @@ async function finalizeArtifacts(artifactsPath) {
   await assertArtifactTreeSafe(artifactsPath);
 }
 
+const SOURCE_DIRECTORIES = new Set([
+  'crates',
+  'deploy',
+  'docs',
+  'frontend',
+  'gateway',
+  'qa',
+  'scripts',
+  'sdk',
+  'third_party'
+]);
+const SOURCE_ROOT_FILES = new Set([
+  '.dockerignore',
+  '.gitmodules',
+  'AGENTS.md',
+  'Cargo.lock',
+  'Cargo.toml',
+  'compose.dev.yml',
+  'compose.yml'
+]);
+
+function gitBuffer(root, args) {
+  const result = spawnSync('git', args, {
+    cwd: root,
+    encoding: 'buffer',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    maxBuffer: 64 * 1024 * 1024
+  });
+  if (result.error || result.status !== 0) {
+    const detail = result.error?.message
+      || result.stderr?.toString('utf8').trim()
+      || `exit ${result.status}`;
+    throw new Error(`git ${args.join(' ')} failed: ${detail}`);
+  }
+  return result.stdout;
+}
+
+function isSourceFingerprintPath(path) {
+  const normalized = path.split('\\').join('/');
+  if (!normalized || normalized.startsWith('../') || normalized.includes('/../')) return false;
+  const separator = normalized.indexOf('/');
+  if (separator < 0) return SOURCE_ROOT_FILES.has(normalized);
+  return SOURCE_DIRECTORIES.has(normalized.slice(0, separator))
+    && !normalized.startsWith('qa/artifacts/');
+}
+
+export function readSourceIdentity(root = repoRoot) {
+  const revision = gitBuffer(root, ['rev-parse', 'HEAD']).toString('utf8').trim();
+  const status = gitBuffer(root, [
+    'status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignore-submodules=none'
+  ]);
+  const submodules = gitBuffer(root, ['submodule', 'status', '--recursive']).toString('utf8').trim();
+  const paths = gitBuffer(root, [
+    'ls-files', '-z', '--cached', '--others', '--exclude-standard'
+  ]).toString('utf8').split('\0').filter(isSourceFingerprintPath).sort();
+  const fingerprint = createHash('sha256');
+  fingerprint.update(`revision\0${revision}\0status\0`);
+  fingerprint.update(status);
+  fingerprint.update(`\0submodules\0${submodules}\0`);
+  for (const path of paths) {
+    const absolute = resolve(root, path);
+    const fromRoot = relative(root, absolute);
+    if (fromRoot === '..' || fromRoot.startsWith(`..${sep}`)) {
+      throw new Error(`Source fingerprint path escaped the repository: ${path}`);
+    }
+    const metadata = lstatSync(absolute);
+    fingerprint.update(`path\0${path}\0mode\0${metadata.mode.toString(8)}\0`);
+    if (metadata.isSymbolicLink()) {
+      fingerprint.update(`link\0${readlinkSync(absolute)}\0`);
+    } else if (metadata.isFile()) {
+      fingerprint.update(readFileSync(absolute));
+      fingerprint.update('\0');
+    }
+  }
+  return {
+    revision,
+    dirty: status.byteLength > 0,
+    working_tree_fingerprint: fingerprint.digest('hex'),
+    submodules: submodules ? submodules.split('\n') : []
+  };
+}
+
+export const SDK_QUALITY_GATES = Object.freeze([
+  { id: 'sdk-test', args: ['test'], command: 'npm test' },
+  { id: 'sdk-build', args: ['run', 'build'], command: 'npm run build' },
+  { id: 'sdk-pack-dry-run', args: ['pack', '--dry-run'], command: 'npm pack --dry-run' }
+]);
+
+export function runSdkQualityGates(root = repoRoot, execute = spawnSync) {
+  const cwd = join(root, 'sdk', 'typescript');
+  const records = [];
+  const logs = [];
+  for (const gate of SDK_QUALITY_GATES) {
+    const startedAt = new Date();
+    const result = execute('npm', gate.args, {
+      cwd,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 20 * 1024 * 1024
+    });
+    const finishedAt = new Date();
+    const passed = !result.error && result.status === 0;
+    const error = passed
+      ? undefined
+      : result.error?.message || result.stderr?.trim() || `exit ${result.status}`;
+    records.push({
+      id: gate.id,
+      command: gate.command,
+      status: passed ? 'passed' : 'failed',
+      duration_ms: finishedAt.getTime() - startedAt.getTime(),
+      started_at: startedAt.toISOString(),
+      finished_at: finishedAt.toISOString(),
+      exit_code: result.status,
+      ...(result.signal ? { signal: result.signal } : {}),
+      ...(error ? { error } : {})
+    });
+    logs.push([
+      `$ ${gate.command}`,
+      result.stdout ?? '',
+      result.stderr ?? '',
+      `[${passed ? 'passed' : 'failed'}; exit=${result.status ?? 'none'}]`
+    ].filter(Boolean).join('\n'));
+  }
+  return { records, log: `${logs.join('\n\n')}\n` };
+}
+
+function qaDependencyModes() {
+  return [
+    { name: 'Agent Hub backend, frontend, model gateway, and Runtime', mode: 'real', detail: 'Built from the recorded working tree.' },
+    { name: 'Pi standalone execution engine', mode: 'real', detail: 'Bundled Runtime engine.' },
+    { name: 'PostgreSQL 16', mode: 'real', detail: 'Isolated Compose database and volume.' },
+    { name: 'Chromium', mode: 'real', detail: 'Local Playwright-managed browser.' },
+    { name: 'OpenAI Responses model provider', mode: 'emulated', detail: 'Deterministic local fake-model-provider.' },
+    { name: 'S3-compatible bundle storage', mode: 'emulated', detail: 'Isolated MinIO service.' },
+    { name: 'OIDC provider', mode: 'mocked', detail: 'Built-in Mock OIDC flow.' }
+  ];
+}
+
+async function writeRunReport(
+  artifactsRoot,
+  project,
+  baseURL,
+  results,
+  coverage,
+  metadata
+) {
+  await writeSummary(artifactsRoot, project, baseURL, results, coverage, metadata);
+  await finalizeArtifacts(artifactsRoot);
+  const manifest = await writeArtifactManifest(artifactsRoot, metadata.finished_at);
+  await finalizeArtifacts(artifactsRoot);
+  const finalMetadata = {
+    ...metadata,
+    artifacts: {
+      manifest: 'artifact-manifest.json',
+      algorithm: manifest.algorithm,
+      entry_count: manifest.entries.length,
+      excluded: manifest.excluded,
+      artifact_safety_scan: {
+        status: 'passed',
+        scanner: 'qa/support/secrets.mjs',
+        scanned_at: new Date().toISOString()
+      }
+    }
+  };
+  await writeSummary(artifactsRoot, project, baseURL, results, coverage, finalMetadata);
+  await finalizeArtifacts(artifactsRoot);
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.help) {
@@ -977,16 +1283,36 @@ async function main() {
     if (!coverage.overall.complete) process.exitCode = 1;
     return;
   }
-  const runId = new Date().toISOString().replaceAll(':', '-').replaceAll('.', '-');
+  const runStartedAt = new Date();
+  const runId = runStartedAt.toISOString().replaceAll(':', '-').replaceAll('.', '-');
   const artifactsRoot = join(qaRoot, 'artifacts', runId);
   await mkdir(artifactsRoot, { recursive: true });
   const project = process.env.QA_COMPOSE_PROJECT?.trim()
     || `agent-hub-qa-${Date.now().toString(36)}-${process.pid}`;
   const compose = new ComposeHarness({ repoRoot, project });
+  const sourceAtStart = readSourceIdentity();
+  const sdkQuality = runSdkQualityGates();
+  await writeFile(join(artifactsRoot, 'sdk-quality-gates.log'), redactSecrets(sdkQuality.log));
+  for (const gate of sdkQuality.records) {
+    console.log(`[${gate.status === 'passed' ? 'PASS' : 'FAIL'}] ${gate.id} (${gate.duration_ms} ms)`);
+  }
+  const qualityGateFailed = sdkQuality.records.some((gate) => gate.status === 'failed');
+  const environment = {
+    id: project,
+    class: 'owned_ephemeral',
+    owner: runId,
+    compose_file: 'compose.dev.yml',
+    base_url: null,
+    disposition: 'not_provisioned',
+    ownership_evidence: `Unique Compose project ${project} created by this QA run.`,
+    retained_resources: ['Local Docker images and build cache'],
+    contaminated_before_teardown: false
+  };
   let started = false;
   let baseURL = '';
   let interrupted = false;
   let environmentContaminated = false;
+  let results = [];
 
   const stopForSignal = async (signal) => {
     if (interrupted) return;
@@ -1009,13 +1335,20 @@ async function main() {
     compose.start();
     baseURL = compose.frontendURL();
     await healthCheck(baseURL);
+    environment.base_url = baseURL;
+    environment.disposition = 'active';
+    environment.baseline_checks = [
+      'Compose up --build --wait completed for the unique project.',
+      `${baseURL}/healthz returned 200.`
+    ];
     console.log(`QA environment ready: ${baseURL}`);
 
-    const results = await executeScenarioQueue(scenarios, async (scenario) => {
+    results = await executeScenarioQueue(scenarios, async (scenario) => {
       const artifactsDir = join(artifactsRoot, scenario.id);
       await mkdir(artifactsDir, { recursive: true });
       console.log(`\n[RUN ] ${scenario.id} (${scenario.type}) ${scenario.name}`);
       const startedAt = Date.now();
+      const scenarioStartedAt = new Date(startedAt).toISOString();
       const worker = spawnSync(process.execPath, [workerPath], {
         cwd: repoRoot,
         env: {
@@ -1034,6 +1367,7 @@ async function main() {
         killSignal: 'SIGTERM'
       });
       const durationMs = Date.now() - startedAt;
+      const scenarioFinishedAt = new Date().toISOString();
       if (!worker.error && worker.status === 0) {
         try {
           await finalizeArtifacts(artifactsDir);
@@ -1041,12 +1375,31 @@ async function main() {
           const error = 'QA artifact finalization failed; unsafe artifacts were removed.';
           console.error(`[FAIL] ${scenario.id}: ${error}`);
           return {
-            result: { id: scenario.id, name: scenario.name, type: scenario.type, status: 'failed', duration_ms: durationMs, error }
+            result: {
+              id: scenario.id,
+              name: scenario.name,
+              type: scenario.type,
+              covers: scenario.covers,
+              status: 'failed',
+              duration_ms: durationMs,
+              started_at: scenarioStartedAt,
+              finished_at: scenarioFinishedAt,
+              error
+            }
           };
         }
         console.log(`[PASS] ${scenario.id} (${durationMs} ms)`);
         return {
-          result: { id: scenario.id, name: scenario.name, type: scenario.type, status: 'passed', duration_ms: durationMs }
+          result: {
+            id: scenario.id,
+            name: scenario.name,
+            type: scenario.type,
+            covers: scenario.covers,
+            status: 'passed',
+            duration_ms: durationMs,
+            started_at: scenarioStartedAt,
+            finished_at: scenarioFinishedAt
+          }
         };
       }
       const hardTimeout = isWorkerHardTimeout(worker);
@@ -1071,7 +1424,17 @@ async function main() {
       }
       console.error(`[FAIL] ${scenario.id}: ${error}`);
       return {
-        result: { id: scenario.id, name: scenario.name, type: scenario.type, status: 'failed', duration_ms: durationMs, error },
+        result: {
+          id: scenario.id,
+          name: scenario.name,
+          type: scenario.type,
+          covers: scenario.covers,
+          status: 'failed',
+          duration_ms: durationMs,
+          started_at: scenarioStartedAt,
+          finished_at: scenarioFinishedAt,
+          error
+        },
         hardTimeout
       };
     });
@@ -1079,13 +1442,69 @@ async function main() {
       console.error(`[NOT RUN] ${result.id}: ${result.reason}`);
     }
 
-    await writeSummary(artifactsRoot, project, baseURL, results, coverage);
+    environment.contaminated_before_teardown = environmentContaminated;
+    if (options.keepEnv && !environmentContaminated) {
+      environment.disposition = 'retained';
+      environment.cleanup_command = `docker compose -p ${project} -f compose.dev.yml down --volumes --remove-orphans`;
+      console.log(`Keeping QA environment ${project} at ${baseURL}`);
+      started = false;
+    } else {
+      const down = compose.down();
+      let remaining;
+      try {
+        remaining = compose.remainingRuntimeResources();
+      } catch (error) {
+        remaining = { unknown: true };
+        environment.teardown_error = error instanceof Error ? error.message : String(error);
+      }
+      environment.remaining_runtime_resources = remaining;
+      const noRemainingResources = remaining.unknown !== true
+        && Object.values(remaining).every((values) => values.length === 0);
+      environment.disposition = down.status === 0 && !down.error && noRemainingResources
+        ? 'removed'
+        : 'contaminated';
+      started = false;
+    }
+
+    const sourceAtFinish = readSourceIdentity();
+    const sourceStable = sourceAtStart.revision === sourceAtFinish.revision
+      && sourceAtStart.working_tree_fingerprint === sourceAtFinish.working_tree_fingerprint;
+    const finishedAt = new Date().toISOString();
+    const claimEnvironment = {
+      id: environment.id,
+      class: environment.class,
+      base_url: environment.base_url,
+      disposition: environment.disposition
+    };
+    const claims = buildClaimRecords(repository.catalog, results, {
+      revision: sourceAtStart.revision,
+      sourceFingerprint: sourceAtStart.working_tree_fingerprint,
+      environment: claimEnvironment
+    });
+    await writeRunReport(artifactsRoot, project, baseURL, results, coverage, {
+      run_id: runId,
+      started_at: runStartedAt.toISOString(),
+      finished_at: finishedAt,
+      source: {
+        ...sourceAtStart,
+        stable_during_run: sourceStable,
+        finished_revision: sourceAtFinish.revision,
+        finished_working_tree_fingerprint: sourceAtFinish.working_tree_fingerprint
+      },
+      environment,
+      dependencies: qaDependencyModes(),
+      quality_gates: sdkQuality.records,
+      claims,
+      invocation: ['qa/run-all.sh', ...process.argv.slice(2)].join(' ')
+    });
     const passed = results.filter((result) => result.status === 'passed').length;
     const failed = results.filter((result) => result.status === 'failed').length;
     const notRun = results.filter((result) => result.status === 'not_run').length;
     console.log(`\nQA summary: ${passed} passed, ${failed} failed, ${notRun} not run`);
     console.log(`Artifacts: ${artifactsRoot}`);
-    if (failed > 0) process.exitCode = 1;
+    if (failed > 0 || qualityGateFailed || !sourceStable || environment.disposition === 'contaminated') {
+      process.exitCode = 1;
+    }
   } finally {
     process.removeListener('SIGINT', stopForSignal);
     process.removeListener('SIGTERM', stopForSignal);
@@ -1096,8 +1515,7 @@ async function main() {
       process.exitCode = 1;
     }
     if (started) {
-      if (options.keepEnv && !environmentContaminated) console.log(`Keeping QA environment ${project} at ${baseURL}`);
-      else compose.down();
+      compose.down();
     }
   }
 }

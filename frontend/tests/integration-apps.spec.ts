@@ -55,6 +55,11 @@ type IntegrationAppFixture = {
   login_required: boolean;
   allowed_origins: string[];
   tool_allowlist: string[] | null;
+  client_tool_definitions: Array<{
+    name: string;
+    description: string;
+    input_schema: Record<string, unknown>;
+  }>;
   created_at: string;
   updated_at: string;
 };
@@ -72,6 +77,7 @@ const initialApp: IntegrationAppFixture = {
   login_required: true,
   allowed_origins: [],
   tool_allowlist: null,
+  client_tool_definitions: [],
   created_at: now,
   updated_at: now
 };
@@ -167,7 +173,8 @@ test('Integration Apps are a first-level table workflow and create reveals the s
     widget_history_enabled: false,
     login_required: true,
     allowed_origins: [],
-    tool_allowlist: ['read']
+    tool_allowlist: ['read'],
+    client_tool_definitions: []
   });
   const secretDialog = page.getByRole('dialog', { name: 'Integration App secret' });
   await expect(secretDialog.getByText('ahs_created_once', { exact: true })).toBeVisible();
@@ -197,7 +204,8 @@ test('editing keeps origin immutable and secret rotation has an explicit subform
     widget_history_enabled: true,
     login_required: true,
     allowed_origins: [],
-    tool_allowlist: null
+    tool_allowlist: null,
+    client_tool_definitions: []
   });
   await expect(page.getByRole('table', { name: 'Integration App list' })).toContainText('Renamed App');
 
@@ -234,6 +242,18 @@ test('admin configures an anonymous public Widget with one Agent, exact Origins,
   await dialog.getByRole('checkbox', { name: 'Allow anonymous public Widget' }).check();
   await dialog.getByRole('radio', { name: 'Delegate Alpha Agent' }).check();
   await dialog.getByRole('textbox', { name: 'Allowed Origin 1' }).fill('https://public.example.com');
+  await expect(dialog.getByText(/HTTP Origins expose bearer credentials/)).toBeVisible();
+  await dialog.getByRole('button', { name: 'Add Client Tool' }).click();
+  const toolDialog = page.getByRole('dialog', { name: 'Add Client Tool' });
+  await toolDialog.getByRole('textbox', { name: 'Tool name' }).fill('show_notice');
+  await toolDialog.getByRole('textbox', { name: 'Description' }).fill('Show a notice in the host application.');
+  await toolDialog.getByRole('textbox', { name: 'input_schema' }).fill(JSON.stringify({
+    type: 'object',
+    properties: { message: { type: 'string' } },
+    required: ['message']
+  }));
+  await toolDialog.getByRole('button', { name: 'Add Client Tool' }).click();
+  await expect(dialog.getByRole('table', { name: 'Client Tool list' })).toContainText('show_notice');
   await dialog.getByRole('checkbox', { name: "Further restrict this App's tools" }).check();
   await dialog.getByRole('checkbox', { name: 'read' }).check();
   await dialog.getByRole('checkbox', { name: 'grep' }).check();
@@ -243,13 +263,80 @@ test('admin configures an anonymous public Widget with one Agent, exact Origins,
     login_required: false,
     agent_ids: [alphaAgent],
     allowed_origins: ['https://public.example.com'],
-    tool_allowlist: ['read', 'grep']
+    client_tool_definitions: [{
+      name: 'show_notice',
+      description: 'Show a notice in the host application.',
+      input_schema: {
+        type: 'object',
+        properties: { message: { type: 'string' } },
+        required: ['message']
+      }
+    }]
   });
+  expect(fixture.createBody()?.tool_allowlist).toEqual(expect.arrayContaining(['read', 'grep', 'integration']));
   await page.getByRole('dialog', { name: 'Integration App secret' }).locator('.modal-actions').getByRole('button', { name: 'Close', exact: true }).click();
   await page.getByRole('button', { name: 'Widget links for Public App' }).click();
   const link = page.getByRole('link', { name: 'Open public Widget' });
   await expect(link).toHaveAttribute('href', new RegExp('/widget\\?app=ahc_created$'));
   await expect(link).not.toHaveAttribute('href', /token=/);
+});
+
+test('anonymous Client Tool definitions validate and support add, edit, and delete', async ({ page }) => {
+  await installIntegrationApi(page, { role: 'admin' });
+  await page.goto('/integrations');
+  await page.getByRole('button', { name: 'Create Integration App' }).click();
+  const appDialog = page.getByRole('dialog', { name: 'Create Integration App' });
+  await appDialog.getByRole('checkbox', { name: 'Allow anonymous public Widget' }).check();
+
+  await appDialog.getByRole('button', { name: 'Add Client Tool' }).click();
+  const createToolDialog = page.getByRole('dialog', { name: 'Add Client Tool' });
+  const name = createToolDialog.getByRole('textbox', { name: 'Tool name' });
+  const description = createToolDialog.getByRole('textbox', { name: 'Description' });
+  const schema = createToolDialog.getByRole('textbox', { name: 'input_schema' });
+  await name.fill('bad name');
+  await description.fill('Open a panel.');
+  await createToolDialog.getByRole('button', { name: 'Add Client Tool' }).click();
+  await expect(createToolDialog.getByRole('alert')).toContainText('unique 1-64 character name');
+
+  await name.fill('open_panel');
+  await description.fill('   ');
+  await createToolDialog.getByRole('button', { name: 'Add Client Tool' }).click();
+  await expect(createToolDialog.getByRole('alert')).toHaveText('Description is required.');
+
+  await description.fill('Open a panel.');
+  await schema.fill('{broken');
+  await createToolDialog.getByRole('button', { name: 'Add Client Tool' }).click();
+  await expect(createToolDialog.getByRole('alert')).toContainText('must be valid JSON');
+  await schema.fill('{"type":"string"}');
+  await createToolDialog.getByRole('button', { name: 'Add Client Tool' }).click();
+  await expect(createToolDialog.getByRole('alert')).toContainText('type set to object');
+
+  await schema.fill('{"type":"object","properties":{"panel":{"type":"string"}}}');
+  await createToolDialog.getByRole('button', { name: 'Add Client Tool' }).click();
+  const list = appDialog.getByRole('table', { name: 'Client Tool list' });
+  await expect(list).toContainText('open_panel');
+
+  await appDialog.getByRole('button', { name: 'Add Client Tool' }).click();
+  const secondToolDialog = page.getByRole('dialog', { name: 'Add Client Tool' });
+  await secondToolDialog.getByRole('textbox', { name: 'Tool name' }).fill('close_panel');
+  await secondToolDialog.getByRole('textbox', { name: 'Description' }).fill('Close a panel.');
+  await secondToolDialog.getByRole('button', { name: 'Add Client Tool' }).click();
+  await expect(list).toContainText('close_panel');
+
+  await appDialog.getByRole('button', { name: 'Edit Client Tool open_panel' }).click();
+  const editToolDialog = page.getByRole('dialog', { name: 'Edit Client Tool' });
+  await editToolDialog.getByRole('textbox', { name: 'Tool name' }).fill('close_panel');
+  await editToolDialog.getByRole('textbox', { name: 'Description' }).fill('Open the selected panel.');
+  await editToolDialog.getByRole('button', { name: 'Save changes' }).click();
+  await expect(editToolDialog.getByRole('alert')).toContainText('unique 1-64 character name');
+  await editToolDialog.getByRole('textbox', { name: 'Tool name' }).fill('open_panel');
+  await editToolDialog.getByRole('button', { name: 'Save changes' }).click();
+  await expect(list).toContainText('Open the selected panel.');
+
+  await appDialog.getByRole('button', { name: 'Delete Client Tool open_panel' }).click();
+  await appDialog.getByRole('button', { name: 'Delete Client Tool close_panel' }).click();
+  await expect(appDialog.getByText('No Client Tools configured.')).toBeVisible();
+  await expect(list).toHaveCount(0);
 });
 
 test('Integration Apps and its form fit a 390px Chinese viewport', async ({ page }) => {

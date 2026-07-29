@@ -931,7 +931,10 @@ CREATE TABLE public.embed_sessions (
     profile_snapshot jsonb DEFAULT '{}'::jsonb NOT NULL,
     anonymous boolean DEFAULT false NOT NULL,
     anonymous_key_hash text,
-    CONSTRAINT embed_sessions_anonymous_shape CHECK ((((anonymous = false) AND (anonymous_key_hash IS NULL)) OR ((anonymous = true) AND (oauth_app_id IS NOT NULL) AND (anonymous_key_hash IS NOT NULL) AND (anonymous_key_hash ~ '^[0-9a-f]{64}$'::text) AND (external_tenant_id IS NULL) AND (external_user_id IS NULL) AND (external_identity_id IS NULL))))
+    client_instance_id uuid,
+    client_tool_definitions jsonb DEFAULT '[]'::jsonb NOT NULL,
+    CONSTRAINT embed_sessions_anonymous_shape CHECK ((((anonymous = false) AND (anonymous_key_hash IS NULL)) OR ((anonymous = true) AND (oauth_app_id IS NOT NULL) AND (anonymous_key_hash IS NOT NULL) AND (anonymous_key_hash ~ '^[0-9a-f]{64}$'::text) AND (external_tenant_id IS NULL) AND (external_user_id IS NULL) AND (external_identity_id IS NULL)))),
+    CONSTRAINT embed_sessions_client_tools_array CHECK ((jsonb_typeof(client_tool_definitions) = 'array'::text))
 );
 
 CREATE TABLE public.external_identities (
@@ -1104,17 +1107,25 @@ CREATE TABLE public.integration_sessions (
 
 CREATE TABLE public.integration_tool_requests (
     id uuid NOT NULL,
-    session_id uuid NOT NULL,
+    session_id uuid,
+    hub_session_id uuid NOT NULL,
     run_id uuid NOT NULL,
+    position integer DEFAULT 0 NOT NULL,
     tool_name text NOT NULL,
     arguments jsonb DEFAULT '{}'::jsonb NOT NULL,
     status text NOT NULL,
+    claimed_by_client_instance_id uuid,
+    claimed_at timestamp with time zone,
     result_payload jsonb,
+    result_checksum_sha256 text,
     result_event_id uuid,
     expires_at timestamp with time zone NOT NULL,
     responded_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    follow_up_run_id uuid
+    follow_up_run_id uuid,
+    CONSTRAINT integration_tool_requests_position_nonnegative CHECK ((position >= 0)),
+    CONSTRAINT integration_tool_requests_result_checksum_shape CHECK (((result_checksum_sha256 IS NULL) OR (result_checksum_sha256 ~ '^[0-9a-f]{64}$'::text))),
+    CONSTRAINT integration_tool_requests_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'claimed'::text, 'completed'::text, 'timed_out'::text, 'unknown'::text, 'cancelled'::text])))
 );
 
 CREATE TABLE public.model_call_errors (
@@ -1244,7 +1255,9 @@ CREATE TABLE public.oauth_apps (
     login_required boolean DEFAULT true NOT NULL,
     allowed_origins jsonb DEFAULT '[]'::jsonb NOT NULL,
     tool_allowlist jsonb,
+    client_tool_definitions jsonb DEFAULT '[]'::jsonb NOT NULL,
     CONSTRAINT oauth_apps_allowed_origins_array CHECK ((jsonb_typeof(allowed_origins) = 'array'::text)),
+    CONSTRAINT oauth_apps_client_tools_array CHECK ((jsonb_typeof(client_tool_definitions) = 'array'::text)),
     CONSTRAINT oauth_apps_public_widget_shape CHECK (((login_required = true) OR (widget_history_enabled = false))),
     CONSTRAINT oauth_apps_tool_allowlist_array CHECK (((tool_allowlist IS NULL) OR (jsonb_typeof(tool_allowlist) = 'array'::text)))
 );
@@ -1337,6 +1350,9 @@ CREATE TABLE public.runs (
     model_subject_user_id uuid,
     model_source_integration_app_id uuid,
     external_user_context jsonb,
+    client_instance_id uuid,
+    client_tool_snapshot jsonb DEFAULT '[]'::jsonb NOT NULL,
+    CONSTRAINT runs_client_tool_snapshot_array CHECK ((jsonb_typeof(client_tool_snapshot) = 'array'::text)),
     CONSTRAINT runs_model_subject_shape_check CHECK (((model_subject_type <> 'integration_app'::text) OR (model_subject_user_id IS NULL))),
     CONSTRAINT runs_model_subject_type_check CHECK ((model_subject_type = ANY (ARRAY['user'::text, 'integration_app'::text, 'system'::text]))),
     CONSTRAINT runs_session_ownership_generation_nonnegative CHECK (((session_ownership_generation IS NULL) OR (session_ownership_generation >= 0)))
@@ -1565,9 +1581,6 @@ ALTER TABLE ONLY public.embed_jwt_replays
     ADD CONSTRAINT embed_jwt_replays_pkey PRIMARY KEY (jti);
 
 ALTER TABLE ONLY public.embed_sessions
-    ADD CONSTRAINT embed_sessions_hub_session_key UNIQUE (hub_session_id);
-
-ALTER TABLE ONLY public.embed_sessions
     ADD CONSTRAINT embed_sessions_id_unique UNIQUE (id);
 
 ALTER TABLE ONLY public.embed_sessions
@@ -1755,7 +1768,11 @@ CREATE INDEX subagent_model_connection_idx ON public.subagent_definitions USING 
 
 CREATE INDEX embed_sessions_oauth_app_idx ON public.embed_sessions USING btree (oauth_app_id) WHERE (oauth_app_id IS NOT NULL);
 
-CREATE UNIQUE INDEX embed_sessions_anonymous_visitor_key_idx ON public.embed_sessions USING btree (oauth_app_id, anonymous_key_hash) WHERE (anonymous = true);
+CREATE UNIQUE INDEX embed_sessions_anonymous_instance_idx ON public.embed_sessions USING btree (oauth_app_id, anonymous_key_hash, client_instance_id) WHERE ((anonymous = true) AND (client_instance_id IS NOT NULL));
+
+CREATE UNIQUE INDEX embed_sessions_external_instance_idx ON public.embed_sessions USING btree (oauth_app_id, agent_id, external_identity_id, client_instance_id) WHERE ((anonymous = false) AND (external_identity_id IS NOT NULL) AND (client_instance_id IS NOT NULL));
+
+CREATE INDEX embed_sessions_hub_session_idx ON public.embed_sessions USING btree (hub_session_id) WHERE (hub_session_id IS NOT NULL);
 
 CREATE INDEX embed_sessions_widget_scope_idx ON public.embed_sessions USING btree (oauth_app_id, agent_id, external_tenant_id, external_identity_id) WHERE (external_identity_id IS NOT NULL);
 
@@ -1824,6 +1841,10 @@ CREATE INDEX runs_parent_idx ON public.runs USING btree (parent_run_id);
 CREATE INDEX runs_status_created_idx ON public.runs USING btree (status, created_at);
 
 CREATE INDEX runs_widget_session_idx ON public.runs USING btree (widget_session_id, created_at);
+
+CREATE UNIQUE INDEX integration_tool_requests_run_position_idx ON public.integration_tool_requests USING btree (run_id, position);
+
+CREATE INDEX integration_tool_requests_hub_status_idx ON public.integration_tool_requests USING btree (hub_session_id, status, position);
 
 CREATE INDEX runtime_enrollment_tokens_created_at_idx ON public.runtime_enrollment_tokens USING btree (created_at DESC);
 
@@ -2016,6 +2037,9 @@ ALTER TABLE ONLY public.integration_sessions
 
 ALTER TABLE ONLY public.integration_tool_requests
     ADD CONSTRAINT integration_tool_requests_follow_up_run_id_fkey FOREIGN KEY (follow_up_run_id) REFERENCES public.runs(id) ON DELETE SET NULL;
+
+ALTER TABLE ONLY public.integration_tool_requests
+    ADD CONSTRAINT integration_tool_requests_hub_session_id_fkey FOREIGN KEY (hub_session_id) REFERENCES public.hub_sessions(id) ON DELETE RESTRICT;
 
 ALTER TABLE ONLY public.integration_tool_requests
     ADD CONSTRAINT integration_tool_requests_run_id_fkey FOREIGN KEY (run_id) REFERENCES public.runs(id) ON DELETE CASCADE;

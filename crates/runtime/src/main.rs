@@ -2334,10 +2334,6 @@ fn build_tool_request_batch(
     if final_status != "waiting_tool" {
         return Ok(None);
     }
-    let integration_session_id = claim
-        .run
-        .integration_session_id
-        .context("waiting tool run is missing an Integration session id")?;
     let tool_requests = events
         .into_iter()
         .filter(|event| event.event_type == "tool_request")
@@ -2351,7 +2347,7 @@ fn build_tool_request_batch(
         anyhow::bail!("waiting tool turn did not produce any tool requests");
     }
     Ok(Some(FinalizeToolRequestsRequest {
-        integration_session_id,
+        integration_session_id: claim.run.integration_session_id,
         native_session_id: native_session_id
             .context("waiting tool run is missing a Native Session id")?
             .to_owned(),
@@ -7280,16 +7276,22 @@ fn fake_engine_events(claim: &ClaimRunResponse) -> (Vec<AppendRunEventRequest>, 
     }
 
     let assistant_content = if claim.run.source == "integration:tool_result" {
+        let tool_results = claim
+            .integration_context
+            .as_ref()
+            .map(|context| {
+                if context.tool_results.is_empty() {
+                    context.tool_result.clone().unwrap_or_else(|| json!({}))
+                } else {
+                    serde_json::to_value(&context.tool_results).unwrap_or_else(|_| json!([]))
+                }
+            })
+            .unwrap_or_else(|| json!({}));
         format!(
             "Fake Execution Engine completed integration tool result for agent '{}'. {}. Result: {}",
             claim.agent.name,
             compact(&claim.run.initial_message),
-            claim
-                .integration_context
-                .as_ref()
-                .and_then(|context| context.tool_result.as_ref())
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "{}".into())
+            tool_results
         )
     } else {
         format!(
@@ -7839,6 +7841,7 @@ mod tests {
             tools: json!([{ "name": "echo" }]),
             attachments: json!([]),
             tool_result: None,
+            tool_results: Vec::new(),
             external_user: None,
         });
         let client = HubClient {
@@ -7878,12 +7881,43 @@ mod tests {
         .unwrap()
         .expect("a waiting turn should produce one finalize batch");
 
-        assert_eq!(batch.integration_session_id, integration_session_id);
+        assert_eq!(batch.integration_session_id, Some(integration_session_id));
         assert_eq!(batch.native_session_id, "native-session-for-tools");
         assert_eq!(batch.work_dir_ref, "/runtime/workdir");
         assert_eq!(batch.tool_requests.len(), 2);
         assert_eq!(batch.tool_requests[0].payload, first.payload);
         assert_eq!(batch.tool_requests[1].payload, second.payload);
+    }
+
+    #[test]
+    fn anonymous_client_waiting_turn_builds_batch_without_integration_session() {
+        let mut claim = test_claim();
+        claim.run.integration_session_id = None;
+        claim.integration_context = Some(IntegrationContextDto {
+            tools: json!([{
+                "name": "show_notice",
+                "description": "Show a notice",
+                "input_schema": { "type": "object" }
+            }]),
+            attachments: json!([]),
+            tool_result: None,
+            tool_results: Vec::new(),
+            external_user: None,
+        });
+        let request = test_tool_request_event();
+
+        let batch = build_tool_request_batch(
+            &claim,
+            vec![request.clone()],
+            "waiting_tool",
+            Some("anonymous-native-session"),
+            "/runtime/anonymous-workdir",
+        )
+        .unwrap()
+        .expect("an anonymous Client Tool turn should produce one finalize batch");
+
+        assert!(batch.integration_session_id.is_none());
+        assert_eq!(batch.tool_requests[0].payload, request.payload);
     }
 
     fn test_tool_request_event() -> AppendRunEventRequest {
@@ -7932,6 +7966,7 @@ mod tests {
             tools: json!([{ "name": "echo" }]),
             attachments: json!([]),
             tool_result: None,
+            tool_results: Vec::new(),
             external_user: None,
         });
         let run_id = claim.run.id;
@@ -7971,6 +8006,7 @@ mod tests {
             tools: json!([{ "name": "echo" }]),
             attachments: json!([]),
             tool_result: None,
+            tool_results: Vec::new(),
             external_user: None,
         });
 
@@ -8034,7 +8070,7 @@ mod tests {
             protocol_capabilities: HashSet::from([ATOMIC_WAITING_TOOL_BATCH_CAPABILITY.into()]),
         };
         let batch = FinalizeToolRequestsRequest {
-            integration_session_id: Uuid::new_v4(),
+            integration_session_id: Some(Uuid::new_v4()),
             native_session_id: "response-loss-native-session".into(),
             work_dir_ref: "/runtime/workdir".into(),
             tool_requests: vec![FinalizeToolRequestEvent {
@@ -11304,18 +11340,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persistent_pi_rpc_process_maps_integration_tools_to_waiting_requests() {
+    async fn persistent_pi_rpc_process_maps_client_tool_internal_name_to_external_request() {
         let temp = tempfile::tempdir().unwrap();
         let pid_file = temp.path().join("pi-integration-tool.pid");
         let pi_bin = write_fake_pi_wrapper(&temp, &pid_file, &["FAKE_PI_DISABLE_MODEL=1"]);
         let mut claim = test_claim();
         claim.run.initial_message = "fixture:integration".into();
-        claim.run.integration_session_id = Some(Uuid::new_v4());
+        claim.run.integration_session_id = None;
         claim.integration_context = Some(IntegrationContextDto {
             tools: json!([{
-                "name": "echo",
-                "description": "Echo integration input",
-                "parameters": { "type": "object" }
+                "name": "bash",
+                "description": "Show a browser notice",
+                "input_schema": { "type": "object" }
             }]),
             attachments: json!([{
                 "kind": "text",
@@ -11326,6 +11362,7 @@ mod tests {
                 "url": null
             }]),
             tool_result: None,
+            tool_results: Vec::new(),
             external_user: None,
         });
         let run_env = prepare_run_env(temp.path(), &claim, Some("http://127.0.0.1:1/v1"))
@@ -11350,12 +11387,12 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].payload["source_id"], "platform|tool-call");
-        assert_eq!(requests[0].payload["tool_name"], "echo");
+        assert_eq!(requests[0].payload["tool_name"], "bash");
         assert_eq!(
             requests[0].payload["tool_request_id"],
             stable_tool_request_uuid(
                 claim.run.id,
-                "echo",
+                "bash",
                 Some("platform|tool-call"),
                 &requests[0].payload["arguments"],
             )
@@ -11402,6 +11439,7 @@ mod tests {
             }]),
             attachments: json!([]),
             tool_result: None,
+            tool_results: Vec::new(),
             external_user: None,
         });
 
@@ -11481,6 +11519,31 @@ mod tests {
         );
 
         claim.run.id = Uuid::new_v4();
+        let client_schema = json!({
+            "type": "object",
+            "properties": { "message": { "type": "string" } },
+            "required": ["message"]
+        });
+        claim.integration_context.as_mut().unwrap().tools = json!([{
+            "name": "bash",
+            "description": "A Client Tool may share an external built-in name",
+            "input_schema": client_schema
+        }]);
+        prepare_run_env(temp.path(), &claim, None).await.unwrap();
+        let client_catalog: Value =
+            serde_json::from_slice(&fs::read(&catalog_path).await.unwrap()).unwrap();
+        let internal_name = client_catalog[0]["name"].as_str().unwrap();
+        assert!(internal_name.starts_with("agent_hub_client_tool_"));
+        assert_ne!(internal_name, "bash");
+        assert_eq!(client_catalog[0]["label"], "bash");
+        assert_eq!(client_catalog[0]["external_name"], "bash");
+        assert_eq!(client_catalog[0]["parameters"], client_schema);
+        assert!(pi_driver::pi_tool_allowlist_for_claim(&claim)
+            .unwrap()
+            .iter()
+            .any(|name| name == internal_name));
+
+        claim.run.id = Uuid::new_v4();
         claim.integration_context.as_mut().unwrap().tools = json!([]);
         prepare_run_env(temp.path(), &claim, None).await.unwrap();
         assert!(!catalog_path.exists());
@@ -11505,6 +11568,26 @@ mod tests {
                 "text": "tool result with \"quotes\"",
                 "nested": { "values": [1, true, null, { "line": "first\nsecond" }] }
             })),
+            tool_results: vec![
+                ClientToolContinuationResultDto {
+                    tool_call_id: Uuid::from_u128(1),
+                    tool_name: "show_notice".into(),
+                    result: ClientToolResultDto::Success {
+                        output: json!({ "visible": true }),
+                    },
+                },
+                ClientToolContinuationResultDto {
+                    tool_call_id: Uuid::from_u128(2),
+                    tool_name: "request_confirmation".into(),
+                    result: ClientToolResultDto::Error {
+                        error: ClientToolErrorDto {
+                            code: "user_rejected".into(),
+                            message: "The user rejected the action".into(),
+                            retryable: false,
+                        },
+                    },
+                },
+            ],
             external_user: Some(ExternalUserContextDto {
                 external_user_id: "external-42".into(),
                 tenant_id: "tenant-7".into(),
@@ -11547,6 +11630,11 @@ mod tests {
                     .unwrap()
             )
             .unwrap()
+        );
+        assert_eq!(
+            envelope["tool_results"],
+            serde_json::to_value(&claim.integration_context.as_ref().unwrap().tool_results)
+                .unwrap()
         );
     }
 

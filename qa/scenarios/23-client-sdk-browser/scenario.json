@@ -1,0 +1,6 @@
+{
+  "name": "Published Client SDK browser grants, Client Tools, multi-tab isolation, and anonymous recovery",
+  "type": "browser",
+  "timeout_ms": 300000,
+  "covers": ["CLT-001", "CLT-002", "CLT-003", "CLT-004", "SDK-001"]
+}

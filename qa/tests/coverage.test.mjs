@@ -13,12 +13,15 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import {
+  buildClaimRecords,
   calculateCoverage,
   CoverageValidationError,
   loadCoverageRepository,
   readCanonicalOpenApiOperations,
+  readSourceIdentity,
   validateCatalog,
   validateScenarioManifest,
+  writeArtifactManifest,
   writeSummary
 } from '../runner.mjs';
 
@@ -682,7 +685,139 @@ test('summary JSON and JUnit expose selected and overall coverage with gaps', as
   assert.match(junit, /&quot;missing_required_layers&quot;/);
 });
 
-test('--coverage reports current repository as 73/73 without invoking Docker', (t) => {
+test('claim records keep each executed scenario claim independently auditable', () => {
+  const catalog = minimalCatalog();
+  const records = buildClaimRecords(catalog, [{
+    id: '02-example-browser',
+    name: 'Browser claim',
+    type: 'browser',
+    covers: ['EX-001'],
+    status: 'passed',
+    duration_ms: 25,
+    started_at: '2026-07-29T00:00:00.000Z',
+    finished_at: '2026-07-29T00:00:00.025Z'
+  }], {
+    revision: 'a'.repeat(40),
+    sourceFingerprint: 'b'.repeat(64),
+    environment: {
+      id: 'agent-hub-qa-fixture',
+      class: 'owned_ephemeral',
+      base_url: 'http://127.0.0.1:1234'
+    }
+  });
+
+  assert.equal(records.length, 1);
+  assert.deepEqual(records[0], {
+    claim_id: 'EX-001',
+    title: 'Example behavior',
+    scenario_id: '02-example-browser',
+    status: 'passed',
+    contract_source: 'qa/features.json#EX-001',
+    revision: 'a'.repeat(40),
+    source_fingerprint: 'b'.repeat(64),
+    environment: {
+      id: 'agent-hub-qa-fixture',
+      class: 'owned_ephemeral',
+      base_url: 'http://127.0.0.1:1234'
+    },
+    action: 'qa/scenarios/02-example-browser/scenario.mjs',
+    oracle: 'Example behavior',
+    result: 'passed in 25 ms',
+    observation: 'Scenario completed with every assertion satisfied.',
+    artifacts: ['junit.xml'],
+    verified_at: '2026-07-29T00:00:00.025Z',
+    freshness: 'Invalidated by relevant source, working-tree fingerprint, Compose configuration, dependency mode, fixture, actor permission, or scenario oracle changes.'
+  });
+});
+
+test('artifact manifest hashes retained evidence and excludes recursive report files', async (t) => {
+  const root = fixtureRepository(t);
+  const artifacts = join(root, 'artifacts');
+  mkdirSync(join(artifacts, 'scenario'), { recursive: true });
+  writeFileSync(join(artifacts, 'scenario', 'observation.json'), '{"ok":true}\n');
+  writeFileSync(join(artifacts, 'summary.json'), '{}\n');
+
+  const manifest = await writeArtifactManifest(artifacts, '2026-07-29T00:00:00.000Z');
+  assert.equal(manifest.algorithm, 'sha256');
+  assert.deepEqual(manifest.excluded, ['artifact-manifest.json', 'summary.json']);
+  assert.deepEqual(manifest.entries.map((entry) => entry.path), ['scenario/observation.json']);
+  assert.equal(manifest.entries[0].bytes, 12);
+  assert.match(manifest.entries[0].sha256, /^[a-f0-9]{64}$/);
+  assert.deepEqual(
+    JSON.parse(readFileSync(join(artifacts, 'artifact-manifest.json'), 'utf8')),
+    manifest
+  );
+});
+
+test('summary records source, environment, dependency, gate, claim, and artifact evidence', async (t) => {
+  const root = fixtureRepository(t);
+  const artifacts = join(root, 'artifacts');
+  mkdirSync(artifacts);
+  const coverage = { selected: { complete: true }, overall: { complete: true } };
+  await writeSummary(artifacts, 'fixture', 'http://127.0.0.1:1', [], coverage, {
+    run_id: 'run-fixture',
+    started_at: '2026-07-29T00:00:00.000Z',
+    finished_at: '2026-07-29T00:00:01.000Z',
+    source: {
+      revision: 'a'.repeat(40),
+      dirty: true,
+      working_tree_fingerprint: 'b'.repeat(64),
+      stable_during_run: true
+    },
+    environment: { id: 'fixture', class: 'owned_ephemeral', disposition: 'removed' },
+    dependencies: [{ name: 'model-provider', mode: 'emulated' }],
+    quality_gates: [{ id: 'sdk-test', status: 'passed', duration_ms: 10 }],
+    claims: [{ claim_id: 'EX-001', status: 'passed' }],
+    artifacts: {
+      manifest: 'artifact-manifest.json',
+      artifact_safety_scan: { status: 'passed', scanner: 'qa/support/secrets.mjs' }
+    }
+  });
+
+  const summary = JSON.parse(readFileSync(join(artifacts, 'summary.json'), 'utf8'));
+  assert.equal(summary.run_id, 'run-fixture');
+  assert.equal(summary.source.stable_during_run, true);
+  assert.equal(summary.environment.disposition, 'removed');
+  assert.equal(summary.dependencies[0].mode, 'emulated');
+  assert.equal(summary.quality_gates[0].id, 'sdk-test');
+  assert.equal(summary.claims[0].claim_id, 'EX-001');
+  assert.equal(summary.artifacts.artifact_safety_scan.status, 'passed');
+  assert.deepEqual(summary.counts, {
+    scenarios: { passed: 0, failed: 0, blocked: 0, not_run: 0, unverified: 0 },
+    quality_gates: { passed: 1, failed: 0 }
+  });
+  const junit = readFileSync(join(artifacts, 'junit.xml'), 'utf8');
+  assert.match(junit, /classname="agent-hub\.qa\.gate" name="sdk-test"/);
+});
+
+test('source fingerprint detects subsequent changes to a dirty gateway file', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'agent-hub-source-fingerprint-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  mkdirSync(join(root, 'gateway'), { recursive: true });
+  writeFileSync(join(root, 'gateway', 'server.go'), 'package gateway\n\nconst version = "base"\n');
+
+  for (const args of [
+    ['init'],
+    ['config', 'user.email', 'qa@example.invalid'],
+    ['config', 'user.name', 'Agent Hub QA'],
+    ['add', 'gateway/server.go'],
+    ['commit', '-m', 'fixture']
+  ]) {
+    const result = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  }
+
+  writeFileSync(join(root, 'gateway', 'server.go'), 'package gateway\n\nconst version = "dirty-one"\n');
+  const first = readSourceIdentity(root);
+  writeFileSync(join(root, 'gateway', 'server.go'), 'package gateway\n\nconst version = "dirty-two"\n');
+  const second = readSourceIdentity(root);
+
+  assert.equal(first.dirty, true);
+  assert.equal(second.dirty, true);
+  assert.notEqual(first.working_tree_fingerprint, second.working_tree_fingerprint);
+});
+
+test('--coverage reports every current feature without invoking Docker', (t) => {
   const root = mkdtempSync(join(tmpdir(), 'agent-hub-coverage-command-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const bin = join(root, 'bin');
@@ -700,8 +835,8 @@ test('--coverage reports current repository as 73/73 without invoking Docker', (
   assert.equal(readFileSync(join(repoRoot, 'qa', 'runner.mjs'), 'utf8').includes("./support/browser.mjs"), false);
   const overall = result.stdout.match(/Overall repository coverage: (\d+)\/(\d+) fully covered/);
   assert.ok(overall, result.stdout);
-  assert.equal(Number(overall[1]), 73);
-  assert.equal(Number(overall[2]), 73);
+  assert.equal(Number(overall[1]), 81);
+  assert.equal(Number(overall[2]), 81);
   assert.match(result.stdout, /Coverage validation passed\./);
   assert.equal(result.stdout.includes('Unmapped OpenAPI operations'), false);
   assert.equal(result.stdout.includes('Unmapped UI routes'), false);

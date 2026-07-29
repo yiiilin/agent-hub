@@ -157,8 +157,21 @@ export default async function integrationsBrowserScenario(scenarioContext) {
       await page.goto('/login', { waitUntil: 'domcontentloaded' });
       await page.getByLabel('Email').fill(ownerEmail);
       await page.getByRole('button', { name: 'Sign in with Mock OIDC' }).click();
-      await page.waitForURL((url) => url.pathname === '/agents');
+      await page.waitForURL((url) => url.pathname === '/sessions');
       await page.getByText(ownerEmail, { exact: true }).waitFor();
+
+      const owner = await responseJson(await request.get('/api/auth/me'), 'Read Integration App owner');
+      assert.equal(owner.email, ownerEmail);
+      const { data: promotedOwner } = await adminClient.request(
+        `/api/admin/users/${owner.id}/role`,
+        { method: 'PUT', body: { role: 'admin' } }
+      );
+      assert.equal(promotedOwner.user.role, 'admin', 'Integration App owner must be promoted to administrator');
+      const browserOwner = await responseJson(
+        await request.get('/api/auth/me'),
+        'Read promoted Integration App owner'
+      );
+      assert.equal(browserOwner.role, 'admin', 'Browser session must observe the administrator role');
 
       const agentNames = [
         scenarioContext.unique('QA Integration Alpha'),
@@ -247,7 +260,12 @@ export default async function integrationsBrowserScenario(scenarioContext) {
           external_platform_id: platform.id,
           authentication_channel_id: channel.id,
           redirect_uris: createRedirects,
-          agent_ids: [agents[0].id, agents[1].id]
+          agent_ids: [agents[0].id, agents[1].id],
+          widget_history_enabled: false,
+          login_required: true,
+          allowed_origins: [],
+          tool_allowlist: null,
+          client_tool_definitions: []
         });
         const clientSecret = await readAndCopyClientSecret(page, secretDialog, 'Created Integration App');
         return { app: body.integration_app, clientSecret };
@@ -277,6 +295,9 @@ export default async function integrationsBrowserScenario(scenarioContext) {
       assert.equal(Object.hasOwn(createdDetail, 'client_secret'), false, 'Read response must not repeat the client secret');
       assert.deepEqual(createdDetail.redirect_uris, createRedirects);
       assert.equal(createdDetail.agent_ids.length, 2);
+      assert.equal(createdDetail.login_required, true);
+      assert.deepEqual(createdDetail.allowed_origins, []);
+      assert.deepEqual(createdDetail.client_tool_definitions, []);
 
       await page.reload({ waitUntil: 'networkidle' });
       await appRow(page.getByRole('table', { name: 'Integration App list' }), createName).waitFor();
@@ -325,12 +346,20 @@ export default async function integrationsBrowserScenario(scenarioContext) {
       assert.deepEqual(updateBody, {
         name: editedName,
         redirect_uris: editedRedirects,
-        agent_ids: [agents[1].id, agents[2].id]
+        agent_ids: [agents[1].id, agents[2].id],
+        widget_history_enabled: false,
+        login_required: true,
+        allowed_origins: [],
+        tool_allowlist: null,
+        client_tool_definitions: []
       });
       assert.equal(Object.hasOwn(updateBody, 'external_platform_id'), false, 'Edit must not submit a replacement platform');
       assert.equal(Object.hasOwn(updateBody, 'authentication_channel_id'), false, 'Edit must not submit a replacement channel');
       assert.equal(updated.external_platform_id, platform.id, 'Edit must preserve the original platform');
       assert.equal(updated.authentication_channel_id, channel.id, 'Edit must preserve the original channel');
+      assert.equal(updated.login_required, true);
+      assert.deepEqual(updated.allowed_origins, []);
+      assert.deepEqual(updated.client_tool_definitions, []);
       await editDialog.waitFor({ state: 'detached' });
       const editedRow = appRow(page.getByRole('table', { name: 'Integration App list' }), editedName);
       await editedRow.waitFor();
@@ -418,6 +447,219 @@ export default async function integrationsBrowserScenario(scenarioContext) {
       assert.equal(widgetTokens[0] !== widgetTokens[1], true, 'Delegated Agents must receive distinct Widget tokens');
       assert.equal(await widgetDialog.count(), 0, 'Closing Widget links must remove token-bearing DOM');
       await assertNoSensitiveDom(page, 'After Widget links close');
+
+      const anonymousName = scenarioContext.unique('QA Anonymous Integration App');
+      const anonymousEditedName = scenarioContext.unique('QA Anonymous Integration App Edited');
+      const anonymousRedirects = [`https://${ownerSlug}.example.com/public/callback`];
+      const anonymousOrigins = [
+        `http://${ownerSlug}.example.com:8080`,
+        `https://${ownerSlug}.example.com`
+      ];
+      const anonymousEditedOrigins = [
+        anonymousOrigins[0],
+        `https://${ownerSlug}.example.com:8443`
+      ];
+      const anonymousTool = {
+        name: 'show_notice',
+        description: 'Show a notice in the host application.',
+        input_schema: {
+          type: 'object',
+          properties: { message: { type: 'string' } },
+          required: ['message']
+        }
+      };
+      const anonymousEditedTool = {
+        ...anonymousTool,
+        description: 'Show a persistent notice in the host application.'
+      };
+
+      await page.getByRole('button', { name: 'Create Integration App', exact: true }).first().click();
+      const anonymousCreateDialog = page.getByRole('dialog', { name: 'Create Integration App' });
+      await anonymousCreateDialog.waitFor();
+      await anonymousCreateDialog.getByRole('textbox', { name: 'Name', exact: true }).fill(anonymousName);
+      await anonymousCreateDialog.getByRole('combobox', { name: 'External platform' }).selectOption(platform.id);
+      await anonymousCreateDialog.getByRole('combobox', { name: 'Authentication channel' }).selectOption(channel.id);
+      await anonymousCreateDialog.getByRole('textbox', { name: 'Redirect URI 1' }).fill(anonymousRedirects[0]);
+      await anonymousCreateDialog.getByRole('checkbox', { name: 'Allow anonymous public Widget' }).check();
+      await anonymousCreateDialog.getByRole('textbox', { name: 'Allowed Origin 1' }).fill(anonymousOrigins[0]);
+      await anonymousCreateDialog.getByText(
+        'HTTP Origins expose bearer credentials to network interception and may be blocked as mixed content.',
+        { exact: true }
+      ).waitFor();
+      await anonymousCreateDialog.getByRole('radio', { name: `Delegate ${agents[0].name}` }).check();
+      await anonymousCreateDialog.getByRole('button', { name: 'Add allowed Origin' }).click();
+      await anonymousCreateDialog.getByRole('textbox', { name: 'Allowed Origin 2' }).fill(anonymousOrigins[1]);
+
+      await anonymousCreateDialog.getByRole('button', { name: 'Add Client Tool' }).click();
+      const validationToolDialog = page.getByRole('dialog', { name: 'Add Client Tool' });
+      const validationToolName = validationToolDialog.getByRole('textbox', { name: 'Tool name' });
+      const validationToolDescription = validationToolDialog.getByRole('textbox', { name: 'Description' });
+      const validationToolSchema = validationToolDialog.getByRole('textbox', { name: 'input_schema' });
+      await validationToolName.fill('bad name');
+      await validationToolDescription.fill('Open a panel in the host application.');
+      await validationToolDialog.getByRole('button', { name: 'Add Client Tool' }).click();
+      assert.match(await validationToolDialog.getByRole('alert').innerText(), /unique 1-64 character name/);
+      await validationToolName.fill('open_panel');
+      await validationToolDescription.fill('   ');
+      await validationToolDialog.getByRole('button', { name: 'Add Client Tool' }).click();
+      assert.equal(await validationToolDialog.getByRole('alert').innerText(), 'Description is required.');
+      await validationToolDescription.fill('Open a panel in the host application.');
+      await validationToolSchema.fill('{broken');
+      await validationToolDialog.getByRole('button', { name: 'Add Client Tool' }).click();
+      assert.match(await validationToolDialog.getByRole('alert').innerText(), /must be valid JSON/);
+      await validationToolSchema.fill('{"type":"string"}');
+      await validationToolDialog.getByRole('button', { name: 'Add Client Tool' }).click();
+      assert.match(await validationToolDialog.getByRole('alert').innerText(), /type set to object/);
+      await validationToolSchema.fill(JSON.stringify({
+        type: 'object',
+        properties: { panel: { type: 'string' } }
+      }));
+      await validationToolDialog.getByRole('button', { name: 'Add Client Tool' }).click();
+
+      const anonymousToolList = anonymousCreateDialog.getByRole('table', { name: 'Client Tool list' });
+      await anonymousToolList.getByText('open_panel', { exact: true }).waitFor();
+      await anonymousCreateDialog.getByRole('button', { name: 'Edit Client Tool open_panel' }).click();
+      const editValidationToolDialog = page.getByRole('dialog', { name: 'Edit Client Tool' });
+      await editValidationToolDialog.getByRole('textbox', { name: 'Description' }).fill('Open the selected panel.');
+      await editValidationToolDialog.getByRole('button', { name: 'Save changes' }).click();
+      await anonymousToolList.getByText('Open the selected panel.', { exact: true }).waitFor();
+      await anonymousCreateDialog.getByRole('button', { name: 'Delete Client Tool open_panel' }).click();
+      await anonymousCreateDialog.getByText('No Client Tools configured.', { exact: true }).waitFor();
+      assert.equal(await anonymousToolList.count(), 0, 'Deleted Client Tool must leave no table behind');
+
+      await anonymousCreateDialog.getByRole('button', { name: 'Add Client Tool' }).click();
+      const finalToolDialog = page.getByRole('dialog', { name: 'Add Client Tool' });
+      await finalToolDialog.getByRole('textbox', { name: 'Tool name' }).fill(anonymousTool.name);
+      await finalToolDialog.getByRole('textbox', { name: 'Description' }).fill(anonymousTool.description);
+      await finalToolDialog.getByRole('textbox', { name: 'input_schema' }).fill(JSON.stringify(anonymousTool.input_schema));
+      await finalToolDialog.getByRole('button', { name: 'Add Client Tool' }).click();
+      await anonymousCreateDialog.getByRole('table', { name: 'Client Tool list' })
+        .getByText(anonymousTool.name, { exact: true }).waitFor();
+
+      await anonymousCreateDialog.getByRole('checkbox', { name: "Further restrict this App's tools" }).check();
+      await anonymousCreateDialog.getByRole('checkbox', { name: 'read', exact: true }).check();
+      await anonymousCreateDialog.getByRole('checkbox', { name: 'grep', exact: true }).check();
+      const integrationTool = anonymousCreateDialog.getByRole('checkbox', { name: 'integration', exact: true });
+      assert.equal(await integrationTool.isChecked(), true, 'Client Tools must force integration into the tool allowlist');
+      await integrationTool.click();
+      assert.equal(await integrationTool.isChecked(), true, 'integration must not be removable while Client Tools exist');
+
+      const anonymousCreateResponsePromise = waitForResponse(page, 'POST', '/api/integration-apps');
+      const anonymousSecretDialog = page.getByRole('dialog', { name: 'Integration App secret' });
+      const anonymousCreated = await withSensitiveTracingPaused({
+        context,
+        page,
+        dialog: anonymousSecretDialog
+      }, async () => {
+        await anonymousCreateDialog.getByRole('button', { name: 'Create Integration App', exact: true }).click();
+        const response = await anonymousCreateResponsePromise;
+        const body = await responseJson(response, 'Create anonymous Integration App');
+        assert.deepEqual(response.request().postDataJSON(), {
+          name: anonymousName,
+          external_platform_id: platform.id,
+          authentication_channel_id: channel.id,
+          redirect_uris: anonymousRedirects,
+          agent_ids: [agents[0].id],
+          widget_history_enabled: false,
+          login_required: false,
+          allowed_origins: anonymousOrigins,
+          tool_allowlist: ['read', 'grep', 'integration'],
+          client_tool_definitions: [anonymousTool]
+        });
+        await readAndCopyClientSecret(
+          page,
+          anonymousSecretDialog,
+          'Created anonymous Integration App'
+        );
+        return body.integration_app;
+      });
+      assert.equal(await anonymousSecretDialog.count(), 0, 'Closing anonymous creation secret must remove its dialog');
+      await assertNoSensitiveDom(page, 'After anonymous creation secret closes');
+
+      const anonymousRow = appRow(page.getByRole('table', { name: 'Integration App list' }), anonymousName);
+      await anonymousRow.waitFor();
+      assert.equal(
+        (await anonymousRow.innerText()).includes(agents[0].name),
+        true,
+        'Anonymous Integration App must remain fixed to one Agent'
+      );
+      const anonymousCreatedDetail = await responseJson(
+        await request.get(`/api/integration-apps/${anonymousCreated.id}`),
+        'Read created anonymous Integration App'
+      );
+      assert.equal(Object.hasOwn(anonymousCreatedDetail, 'client_secret'), false, 'Anonymous detail must redact the secret');
+      assert.equal(anonymousCreatedDetail.login_required, false);
+      assert.deepEqual(anonymousCreatedDetail.allowed_origins, anonymousOrigins);
+      assert.deepEqual(anonymousCreatedDetail.client_tool_definitions, [anonymousTool]);
+      assert.deepEqual(anonymousCreatedDetail.agent_ids, [agents[0].id]);
+      assert.deepEqual(anonymousCreatedDetail.tool_allowlist, ['read', 'grep', 'integration']);
+
+      await page.reload({ waitUntil: 'networkidle' });
+      await page.getByRole('button', { name: `Edit ${anonymousName}` }).click();
+      const anonymousEditDialog = page.getByRole('dialog', { name: 'Edit Integration App' });
+      await anonymousEditDialog.waitFor();
+      assert.equal(
+        await anonymousEditDialog.getByRole('checkbox', { name: 'Allow anonymous public Widget' }).isChecked(),
+        true,
+        'Persisted anonymous mode must be selected in the edit form'
+      );
+      assert.equal(
+        await anonymousEditDialog.getByRole('radio', { name: `Delegate ${agents[0].name}` }).isChecked(),
+        true,
+        'Persisted anonymous Agent must remain selected'
+      );
+      const persistedOrigins = await Promise.all(anonymousOrigins.map((_, index) => (
+        anonymousEditDialog.getByRole('textbox', { name: `Allowed Origin ${index + 1}` }).inputValue()
+      )));
+      assert.deepEqual(persistedOrigins, anonymousOrigins);
+      assert.equal(
+        await anonymousEditDialog.getByRole('checkbox', { name: 'integration', exact: true }).isChecked(),
+        true,
+        'Persisted anonymous tool allowlist must include integration'
+      );
+
+      await anonymousEditDialog.getByRole('textbox', { name: 'Name', exact: true }).fill(anonymousEditedName);
+      await anonymousEditDialog.getByRole('textbox', { name: 'Allowed Origin 2' }).fill(anonymousEditedOrigins[1]);
+      await anonymousEditDialog.getByRole('button', { name: `Edit Client Tool ${anonymousTool.name}` }).click();
+      const anonymousToolEditDialog = page.getByRole('dialog', { name: 'Edit Client Tool' });
+      await anonymousToolEditDialog.waitFor();
+      await anonymousToolEditDialog.getByRole('textbox', { name: 'Description' }).fill(anonymousEditedTool.description);
+      await anonymousToolEditDialog.getByRole('button', { name: 'Save changes' }).click();
+      await anonymousEditDialog.getByRole('table', { name: 'Client Tool list' })
+        .getByText(anonymousEditedTool.description, { exact: true }).waitFor();
+
+      const anonymousUpdatePath = `/api/integration-apps/${anonymousCreated.id}`;
+      const anonymousUpdateResponsePromise = waitForResponse(page, 'PATCH', anonymousUpdatePath);
+      await anonymousEditDialog.getByRole('button', { name: 'Save changes', exact: true }).click();
+      const anonymousUpdateResponse = await anonymousUpdateResponsePromise;
+      const anonymousUpdated = await responseJson(anonymousUpdateResponse, 'Update anonymous Integration App');
+      assert.deepEqual(anonymousUpdateResponse.request().postDataJSON(), {
+        name: anonymousEditedName,
+        redirect_uris: anonymousRedirects,
+        agent_ids: [agents[0].id],
+        widget_history_enabled: false,
+        login_required: false,
+        allowed_origins: anonymousEditedOrigins,
+        tool_allowlist: ['read', 'grep', 'integration'],
+        client_tool_definitions: [anonymousEditedTool]
+      });
+      assert.equal(anonymousUpdated.login_required, false);
+      assert.deepEqual(anonymousUpdated.allowed_origins, anonymousEditedOrigins);
+      assert.deepEqual(anonymousUpdated.client_tool_definitions, [anonymousEditedTool]);
+      await anonymousEditDialog.waitFor({ state: 'detached' });
+
+      const anonymousUpdatedDetail = await responseJson(
+        await request.get(anonymousUpdatePath),
+        'Read updated anonymous Integration App'
+      );
+      assert.equal(Object.hasOwn(anonymousUpdatedDetail, 'client_secret'), false, 'Updated anonymous detail must redact the secret');
+      assert.equal(anonymousUpdatedDetail.login_required, false);
+      assert.deepEqual(anonymousUpdatedDetail.allowed_origins, anonymousEditedOrigins);
+      assert.deepEqual(anonymousUpdatedDetail.client_tool_definitions, [anonymousEditedTool]);
+      assert.deepEqual(anonymousUpdatedDetail.agent_ids, [agents[0].id]);
+      assert.deepEqual(anonymousUpdatedDetail.tool_allowlist, ['read', 'grep', 'integration']);
+      await appRow(page.getByRole('table', { name: 'Integration App list' }), anonymousEditedName).waitFor();
+      await assertNoHorizontalOverflow(page, 'Desktop Integration App table with anonymous App');
 
       await page.setViewportSize({ width: 390, height: 844 });
       await page.getByLabel('Language').selectOption('zh-CN');

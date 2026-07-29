@@ -2,13 +2,14 @@
 import json
 import os
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 
 API_KEY = os.environ["FAKE_MODEL_PROVIDER_API_KEY"]
 PORT = int(os.environ.get("FAKE_MODEL_PROVIDER_PORT", "8080"))
 INTEGRATION_CONTEXT_LABEL = "Agent Hub Integration context (JSON):\n"
+CLIENT_TOOL_PREFIX = "agent_hub_client_tool_"
 
 
 def iter_strings(value):
@@ -38,13 +39,30 @@ def integration_context(request):
     return latest
 
 
-def has_function_tool(request, name):
-    return any(
-        isinstance(tool, dict)
-        and tool.get("type") == "function"
-        and tool.get("name") == name
+def function_tool_name(request, external_name):
+    function_tools = [
+        tool
         for tool in request.get("tools", [])
-    )
+        if isinstance(tool, dict)
+        and tool.get("type") == "function"
+        and isinstance(tool.get("name"), str)
+    ]
+    for tool in function_tools:
+        if tool["name"] == external_name:
+            return external_name
+
+    for tool in function_tools:
+        if tool["name"].startswith(CLIENT_TOOL_PREFIX):
+            return tool["name"]
+
+    context = integration_context(request)
+    context_tools = context.get("tools", []) if context else []
+    if any(
+        isinstance(tool, dict) and tool.get("name") == external_name
+        for tool in context_tools
+    ):
+        return function_tools[0]["name"] if function_tools else None
+    return None
 
 
 def latest_user_text(request):
@@ -136,25 +154,29 @@ class Handler(BaseHTTPRequestHandler):
             }
         else:
             model = request.get("model", "hub-proxy-smoke")
+            context = integration_context(request)
             if (
                 request.get("stream") is True
-                and latest_user_text(request) == "fixture:hold"
+                and (
+                    latest_user_text(request) == "fixture:hold"
+                    or (context and context.get("message") == "fixture:hold")
+                )
             ):
                 self.send_responses_hold(model)
                 return
-            context = integration_context(request)
+            tool_name = function_tool_name(request, "echo")
             if (
                 context
                 and context.get("tool_result") is None
                 and "Please use the echo tool and preserve attachments"
                 in context.get("message", "")
-                and has_function_tool(request, "echo")
+                and tool_name
             ):
                 arguments = {
                     "message": context["message"],
                     "attachments": context.get("attachments", []),
                 }
-                self.send_responses_function_call(model, arguments, request)
+                self.send_responses_function_call(model, arguments, request, tool_name)
                 return
             text = "Fake model completed run through the Hub model proxy."
             output = {
@@ -212,13 +234,13 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
 
-    def send_responses_function_call(self, model, arguments, request):
+    def send_responses_function_call(self, model, arguments, request, tool_name):
         arguments_json = json.dumps(arguments, separators=(",", ":"))
         output = {
             "id": "fc_integration_echo",
             "type": "function_call",
             "call_id": "platform|tool-call",
-            "name": "echo",
+            "name": tool_name,
             "arguments": arguments_json,
             "status": "completed",
         }
@@ -581,4 +603,4 @@ class Handler(BaseHTTPRequestHandler):
         return
 
 
-HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()

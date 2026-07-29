@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Agent Hub Client SDK QA host</title>
+  </head>
+  <body>
+    <main>
+      <h1>Agent Hub Client SDK QA host</h1>
+      <p id="status">Starting</p>
+      <button id="open-observer" type="button" disabled>Open observer tab</button>
+    </main>
+    <script type="importmap">
+      { "imports": { "@agent-hub/client": "/sdk/index.js" } }
+    </script>
+    <script type="module" src="/app.mjs"></script>
+  </body>
+</html>

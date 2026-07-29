@@ -79,7 +79,8 @@ Pi `models.json` 为每个 Run 的 `main` binding 创建一个 provider：
 
 Pi standalone 没有统一的 sandbox policy RPC 参数。Hub 先从 Agent 的显式
 tool allowlist 开始；Integration App 配置存在时取交集。公开 Widget 再限制为
-`read,grep,find,ls`，并把 sandbox 改为 read-only、关闭网络和 MCP。Runtime 最后
+`read,grep,find,ls,integration`，并把 sandbox 改为 read-only、关闭网络和 MCP；
+其中 `integration` 只能展开为管理员在该公开 App 上配置的 Client Tools。Runtime 最后
 按下表与 sandbox policy 再取更严格结果，不得把 Hub policy 静默放宽：
 
 | Hub sandbox policy | `network_access` | Pi builtin tools |
@@ -91,9 +92,15 @@ tool allowlist 开始；Integration App 配置存在时取交集。公开 Widget
 | `danger-full-access` | `true` | 上述工具加 `bash` |
 
 `integration` 不是 Pi builtin 名称。只有有效策略仍包含它时，Runtime 才把当前
-Integration Session 声明的具体工具名加入 Pi allowlist；没有 Integration context
-时不会凭该标志生成工具。Agent/App/public/sandbox 任一层拒绝的工具都不能被后续层
-重新加入。
+Run Tool Snapshot 中的具体工具加入 Pi allowlist；没有 Snapshot 时不会凭该标志生成
+工具。Runtime 为 Client Tool 使用隐藏内部命名空间，向 Hub 回传事件时恢复应用定义的
+原始名称，避免覆盖 Pi builtin、Skill 或其他扩展工具。Agent/App/public/sandbox 任一层
+拒绝的工具都不能被后续层重新加入。
+
+同一模型响应产生的 Client Tool calls 作为一个有序批次结束当前 Pi Turn。Hub 等浏览器
+按顺序提交所有普通终态结果后，只启动一个 continuation，并把整批结构化 tool results
+写回同一 Native Session。执行未知、中断或五分钟超时不得生成 continuation，也不得在
+新 Runtime 或新浏览器标签页重放调用。
 
 `skill_exec` 也是 Runtime 注册的 Pi Extension 工具，不是 Pi builtin 或 `bash` 的
 别名。启用 Skill 不会自动补回 `read`；只有最终 execution configuration 允许

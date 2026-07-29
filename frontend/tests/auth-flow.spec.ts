@@ -419,11 +419,13 @@ test('Embed JWT exchanges into a widget session through postMessage', async ({ p
   let widgetRunPosts = 0;
   let releaseWidgetRun!: () => void;
   const heldWidgetRun = new Promise<void>((resolve) => { releaseWidgetRun = resolve; });
-  await page.route('**/api/widget/runs', async (route) => {
+  await page.route('**/api/client/runs', async (route) => {
     widgetRunPosts += 1;
     await heldWidgetRun;
     await route.continue();
   });
+  const widgetRunResponsePromise = page.waitForResponse((response) => response.request().method() === 'POST'
+    && new URL(response.url()).pathname === '/api/client/runs');
   await frame.getByLabel('Message').fill('Draft survives failed credential exchange');
   await page.locator('iframe[title="widget"]').evaluate((iframe, channel) => {
     (iframe as HTMLIFrameElement).contentWindow?.postMessage({ type: 'agent-hub:message-submit', channelId: channel, message: 'Host submitted widget message' }, '*');
@@ -444,6 +446,8 @@ test('Embed JWT exchanges into a widget session through postMessage', async ({ p
   }, { channelId, token: exchangedSession.token });
   await expect(frame.getByRole('button', { name: 'Sending...' })).toBeDisabled();
   releaseWidgetRun();
+  const widgetRunResponse = await widgetRunResponsePromise;
+  expect(widgetRunResponse.ok(), await widgetRunResponse.text()).toBeTruthy();
   await expect(frame.getByText('completed run')).toBeVisible({ timeout: 30_000 });
   expect(widgetRunPosts).toBe(1);
   await expect(frame.getByRole('button', { name: 'Send' })).toBeEnabled();
@@ -458,6 +462,7 @@ test('Embed JWT exchanges into a widget session through postMessage', async ({ p
     (iframe as HTMLIFrameElement).contentWindow?.postMessage({ type: 'agent-hub:session-select', channelId: data.channelId, token: data.token }, '*');
   }, { channelId, token: secondSession.token });
   await expect(frame.getByText(secondAgent.name)).toBeVisible();
+  await expect(frame.getByLabel('Message')).toHaveValue('');
   await expect(frame.getByText('completed run')).toHaveCount(0);
   await page.request.delete(`/api/agents/${agent.id}`);
   await page.request.delete(`/api/agents/${secondAgent.id}`);

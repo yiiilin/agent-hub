@@ -200,7 +200,7 @@ async function installSessionApi(page: Page, options: {
         return route.fulfill({ contentType: 'text/event-stream', body: `event: run_event\ndata: ${JSON.stringify(turnStarted)}\n\n` });
       }
       const liveMessage = { seq: 6, run_id: 'run-active', event_type: 'message', role: 'assistant', content: 'Live assistant response.', payload: {}, created_at: '2026-07-17T10:00:05.000Z' };
-      const liveTool = { seq: 7, run_id: 'run-active', event_type: 'tool_request', role: null, content: null, payload: { tool_request_id: 'tool-one', tool_name: 'shell' }, created_at: '2026-07-17T10:00:03.500Z' };
+      const liveTool = { seq: 7, run_id: 'run-active', event_type: 'tool_request', role: null, content: null, payload: { tool_call_id: 'tool-one', tool_name: 'open_panel', arguments: { panel: 'deployments' } }, created_at: '2026-07-17T10:00:02.000Z' };
       return route.fulfill({ contentType: 'text/event-stream', body: `event: run_event\ndata: ${JSON.stringify(liveMessage)}\n\nevent: run_event\ndata: ${JSON.stringify(liveTool)}\n\n` });
     }
     const eventsMatch = path.match(/^\/api\/runs\/([^/]+)\/events$/);
@@ -219,7 +219,7 @@ async function installSessionApi(page: Page, options: {
         { seq: 3, run_id: 'run-active', event_type: 'item', role: null, content: null, payload: { item_id: 'reasoning-1', item_type: 'reasoning', phase: 'completed', summary: ['Checked the deployment state.'] }, created_at: '2026-07-17T10:00:02.000Z' },
         { seq: 4, run_id: 'run-active', event_type: 'item', role: null, content: null, payload: { item_id: 'command-1', item_type: 'commandExecution', phase: 'completed', command: 'kubectl get deployment', output: 'deployment/api ready', status: 'completed', duration_ms: 2000 }, created_at: '2026-07-17T10:00:03.000Z' },
         { seq: 5, run_id: 'run-active', event_type: 'usage', role: null, content: null, payload: { input_tokens: 12 }, created_at: '2026-07-17T10:00:03.500Z' },
-        { seq: 8, run_id: 'run-active', event_type: 'tool_result', role: 'tool', content: 'Tool result for shell: {"api_key":"must-not-render"}', payload: { tool_request_id: 'tool-one', message: { result: { api_key: 'must-not-render' } } }, created_at: '2026-07-17T10:00:03.500Z' }
+        { seq: 8, run_id: 'run-active', event_type: 'client_tool_result', role: 'tool', content: null, payload: { tool_call_id: 'tool-one', tool_name: 'open_panel', result: { status: 'success', output: { opened: true } }, elapsed_ms: 1500 }, created_at: '2026-07-17T10:00:03.500Z' }
       ] : persistedAnswers[eventsMatch[1]] ?? [] });
     }
     if (path === '/api/runs/run-active/stop' && request.method() === 'POST') {
@@ -784,8 +784,10 @@ test('conversation streams replies, folds readable activity, steers, stops, and 
   await expect(activity).toContainText('kubectl get deployment');
   await expect(activity).toContainText('deployment/api ready');
   await expect(activity).toContainText('Used tool');
-  await expect(activity).toContainText('shell');
-  await expect(detail.getByText(/must-not-render/)).toHaveCount(0);
+  await expect(activity).toContainText('open_panel');
+  await expect(activity).toContainText('succeeded');
+  await expect(activity).toContainText('1.5 sec');
+  await expect(activity).toContainText('"opened": true');
   await expect(detail.getByText('status', { exact: true })).toHaveCount(0);
   await expect(detail.getByText('usage', { exact: true })).toHaveCount(0);
 

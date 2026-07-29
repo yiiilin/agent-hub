@@ -69,11 +69,35 @@ export class ComposeHarness {
   }
 
   down() {
-    this.run(['down', '--volumes', '--remove-orphans'], {
+    return this.run(['down', '--volumes', '--remove-orphans'], {
       capture: false,
       allowFailure: true,
       timeoutMs: 2 * 60_000
     });
+  }
+
+  remainingRuntimeResources() {
+    const filter = `label=com.docker.compose.project=${this.project}`;
+    const commands = [
+      ['container', 'ls', '--all', '--quiet', '--filter', filter],
+      ['network', 'ls', '--quiet', '--filter', filter],
+      ['volume', 'ls', '--quiet', '--filter', filter]
+    ];
+    const [containers, networks, volumes] = commands.map((args) => {
+      const result = spawnSync('docker', args, {
+        cwd: this.repoRoot,
+        env: this.environment,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 30_000
+      });
+      if (result.error || result.status !== 0) {
+        const detail = result.error?.message || result.stderr?.trim() || `exit ${result.status}`;
+        throw new Error(`${commandText(args)} failed: ${detail}`);
+      }
+      return result.stdout.split('\n').map((value) => value.trim()).filter(Boolean);
+    });
+    return { containers, networks, volumes };
   }
 
   frontendURL() {

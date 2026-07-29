@@ -1,5 +1,5 @@
 export const builtInTools = ['read', 'grep', 'find', 'ls', 'edit', 'write', 'bash', 'skill_exec', 'integration'] as const;
-export const publicWidgetTools = ['read', 'grep', 'find', 'ls'] as const;
+export const publicWidgetTools = ['read', 'grep', 'find', 'ls', 'integration'] as const;
 
 export type BuiltInTool = (typeof builtInTools)[number];
 

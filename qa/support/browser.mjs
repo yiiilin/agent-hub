@@ -32,6 +32,7 @@ function matchesHttpError(response, allowance) {
   return response.status() === allowance.status
     && request.method() === allowance.method
     && url.pathname === allowance.pathname
+    && (allowance.origin === undefined || url.origin === allowance.origin)
     && allowance.remaining > 0;
 }
 
@@ -61,35 +62,51 @@ export async function withBrowser(scenarioContext, options, run) {
     screenshots: false
   });
   await context.tracing.start({ snapshots: true, sources: true });
-  const page = await context.newPage();
   const browserErrors = [];
   const baseOrigin = new URL(scenarioContext.baseURL).origin;
+  const monitoredOrigins = new Set([baseOrigin, ...(options.monitoredOrigins ?? [])]);
   const allowedHttpErrors = (options.allowedHttpErrors ?? []).map((allowance) => ({
     ...allowance,
     remaining: allowance.times ?? 1
   }));
-  page.on('pageerror', (error) => browserErrors.push(`pageerror: ${error.message}`));
-  page.on('console', (message) => {
-    const location = message.location();
-    const isHttpFailureNoise = message.text().startsWith('Failed to load resource:')
-      && location.url.startsWith(baseOrigin);
-    if (message.type() === 'error' && !isHttpFailureNoise) {
-      browserErrors.push(`console: ${message.text()}`);
-    }
-  });
-  page.on('response', (response) => {
-    if (new URL(response.url()).origin !== baseOrigin || response.status() < 400) return;
-    const allowance = allowedHttpErrors.find((candidate) => matchesHttpError(response, candidate));
-    if (allowance) {
-      allowance.remaining -= 1;
-      return;
-    }
-    browserErrors.push(`response: ${response.status()} ${response.request().method()} ${response.url()}`);
-  });
-  page.on('requestfailed', (request) => {
-    if (new URL(request.url()).origin !== baseOrigin) return;
-    browserErrors.push(`requestfailed: ${request.method()} ${request.url()}: ${request.failure()?.errorText ?? 'unknown error'}`);
-  });
+  const observedPages = new WeakSet();
+  const observePage = (observedPage) => {
+    if (observedPages.has(observedPage)) return;
+    observedPages.add(observedPage);
+    observedPage.on('pageerror', (error) => browserErrors.push(`pageerror: ${error.message}`));
+    observedPage.on('console', (message) => {
+      const location = message.location();
+      let locationOrigin = null;
+      try {
+        locationOrigin = location.url ? new URL(location.url).origin : null;
+      } catch {
+        locationOrigin = null;
+      }
+      const isHttpFailureNoise = message.text().startsWith('Failed to load resource:')
+        && locationOrigin !== null
+        && monitoredOrigins.has(locationOrigin);
+      if (message.type() === 'error' && !isHttpFailureNoise) {
+        browserErrors.push(`console: ${message.text()}`);
+      }
+    });
+    observedPage.on('response', (response) => {
+      const url = new URL(response.url());
+      if (!monitoredOrigins.has(url.origin) || response.status() < 400) return;
+      const allowance = allowedHttpErrors.find((candidate) => matchesHttpError(response, candidate));
+      if (allowance) {
+        allowance.remaining -= 1;
+        return;
+      }
+      browserErrors.push(`response: ${response.status()} ${response.request().method()} ${response.url()}`);
+    });
+    observedPage.on('requestfailed', (request) => {
+      if (!monitoredOrigins.has(new URL(request.url()).origin)) return;
+      browserErrors.push(`requestfailed: ${request.method()} ${request.url()}: ${request.failure()?.errorText ?? 'unknown error'}`);
+    });
+  };
+  context.on('page', observePage);
+  const page = await context.newPage();
+  observePage(page);
 
   let tracingStopped = false;
   try {

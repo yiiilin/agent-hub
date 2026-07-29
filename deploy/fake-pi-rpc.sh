@@ -139,9 +139,11 @@ emit_completion() {
 
 emit_integration_tool_request() {
   arguments='{"message":"fixture:integration","attachments":[{"kind":"text","name":"qa-note.txt","content_type":"text/plain","size_bytes":32,"text":"quoted text, arrays [1, 2], and a second line\nkept exactly","url":null}]}'
-  jq -cn --argjson arguments "$arguments" '{type:"tool_execution_start",toolCallId:"platform|tool-call|fc_integration_echo",toolName:"echo",args:$arguments}'
-  jq -cn --argjson arguments "$arguments" '{type:"tool_execution_end",toolCallId:"platform|tool-call|fc_integration_echo",toolName:"echo",args:$arguments,result:{content:[{type:"text",text:"Integration tool request delegated to Agent Hub."}],details:{pending:true},terminate:true},isError:false}'
-  jq -cn --argjson arguments "$arguments" '{type:"turn_end",message:{role:"assistant",content:[{type:"toolCall",id:"platform|tool-call|fc_integration_echo",name:"echo",arguments:$arguments}],stopReason:"toolUse",usage:{input:42,output:12,totalTokens:54}},toolResults:[]}'
+  integration_catalog="${PI_CODING_AGENT_DIR:-${HOME:?HOME is required}/.pi/agent}/agent-hub-integration-tools.json"
+  tool_name="$(jq -er '.[0].name | select(type == "string" and length > 0)' "$integration_catalog")"
+  jq -cn --arg tool_name "$tool_name" --argjson arguments "$arguments" '{type:"tool_execution_start",toolCallId:"platform|tool-call|fc_integration_echo",toolName:$tool_name,args:$arguments}'
+  jq -cn --arg tool_name "$tool_name" --argjson arguments "$arguments" '{type:"tool_execution_end",toolCallId:"platform|tool-call|fc_integration_echo",toolName:$tool_name,args:$arguments,result:{content:[{type:"text",text:"Integration tool request delegated to Agent Hub."}],details:{pending:true},terminate:true},isError:false}'
+  jq -cn --arg tool_name "$tool_name" --argjson arguments "$arguments" '{type:"turn_end",message:{role:"assistant",content:[{type:"toolCall",id:"platform|tool-call|fc_integration_echo",name:$tool_name,arguments:$arguments}],stopReason:"toolUse",usage:{input:42,output:12,totalTokens:54}},toolResults:[]}'
   jq -cn '{type:"agent_end",messages:[],willRetry:false}'
   jq -cn '{type:"agent_settled"}'
   append_session_event "assistant"

@@ -1,6 +1,6 @@
 {
-  "name": "Integration App management and Widget link browser workflows",
+  "name": "Integration App management, anonymous configuration, and Widget link browser workflows",
   "type": "browser",
   "timeout_ms": 240000,
-  "covers": ["IAP-001", "IAP-002"]
+  "covers": ["IAP-001", "IAP-002", "IAP-003"]
 }

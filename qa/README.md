@@ -1,8 +1,10 @@
 # Agent Hub QA Scenarios
 
 This directory contains unattended end-to-end scenarios that use an isolated
-Docker Compose environment. The environment uses a fake Pi RPC process, a fake
-model provider, and Mock OIDC; it does not call a real AI service.
+Docker Compose environment. The environment runs the real Hub, Runtime, bundled
+Pi standalone, PostgreSQL, model gateway, and Chromium. It uses a deterministic
+fake model provider, Mock OIDC, and MinIO, so it does not call a real AI, OAuth,
+or S3 service.
 
 ## Coverage contract
 
@@ -56,14 +58,22 @@ Useful filters and diagnostics:
 `--type api` does not import Playwright or start Chromium. All selected
 scenarios share one freshly created Compose environment. Unless `--keep-env`
 is set, the runner removes its containers, network, and volumes when it exits.
+Every executable run first gates the published TypeScript SDK with `npm test`,
+`npm run build`, and `npm pack --dry-run`; a gate failure makes the overall run
+fail even if selected scenarios pass.
 `--coverage` validates the catalog, manifests, evidence markers, OpenAPI
 operations, UI routes, required layers, and Compose domains entirely offline.
 It exits non-zero while planned scenario gaps remain.
 
 Results are written under `qa/artifacts/<run-id>/`. Every run produces
-`summary.json` and `junit.xml`. A failed scenario also records its error and
-Compose logs; browser failures include a screenshot, browser diagnostics, and
-a Playwright trace.
+`summary.json`, `junit.xml`, `sdk-quality-gates.log`, and
+`artifact-manifest.json`. The summary records the Git revision and dirty-tree
+fingerprint before and after execution, the owned environment and teardown
+disposition, real/emulated/mocked dependency modes, and one result record per
+executed feature claim. The manifest hashes retained diagnostic files with
+SHA-256, and the final recursive artifact safety scan result is recorded in the
+summary. A failed scenario also records its error and Compose logs; browser
+failures include a screenshot, browser diagnostics, and a Playwright trace.
 
 ## Add a scenario
 

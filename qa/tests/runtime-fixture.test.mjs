@@ -94,10 +94,11 @@ test('QA Compose allocates two isolated 24-bit network subnets', () => {
 
 test('fake model provider preserves Responses success, error, auth, and usage behavior', async (t) => {
   const baseURL = await startFakeProvider(t);
-  const request = (body, authorization = 'Bearer fixture-provider-key') => fetch(`${baseURL}/v1/responses`, {
+  const request = (body, authorization = 'Bearer fixture-provider-key', signal) => fetch(`${baseURL}/v1/responses`, {
     method: 'POST',
     headers: { authorization, 'content-type': 'application/json' },
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
+    signal
   });
 
   assert.equal((await request({}, 'Bearer wrong-key')).status, 401);
@@ -128,6 +129,64 @@ test('fake model provider preserves Responses success, error, auth, and usage be
       output_tokens_details: { reasoning_tokens: 5 }
     }
   });
+
+  const clientToolName = 'agent_hub_client_tool_1';
+  const clientTool = await request({
+    model: 'hub-proxy-smoke',
+    input: `Agent Hub Integration context (JSON):\n${JSON.stringify({
+      message: 'Please use the echo tool and preserve attachments',
+      attachments: [],
+      tool_result: null,
+      tool_results: [],
+      external_user: null
+    })}`,
+    tools: [{
+      type: 'function',
+      name: clientToolName,
+      description: 'Echo the supplied message.',
+      parameters: { type: 'object' }
+    }]
+  });
+  assert.equal(clientTool.status, 200);
+  const clientToolBody = await clientTool.json();
+  assert.equal(clientToolBody.output[0].type, 'function_call');
+  assert.equal(clientToolBody.output[0].name, clientToolName);
+  assert.equal(clientToolBody.output[0].call_id, 'platform|tool-call');
+
+  const holdController = new AbortController();
+  const hold = await request({
+    model: 'hub-proxy-smoke',
+    stream: true,
+    input: `Agent Hub Integration context (JSON):\n${JSON.stringify({
+      message: 'fixture:hold',
+      attachments: [],
+      tool_result: null,
+      tool_results: [],
+      external_user: null
+    })}`
+  }, 'Bearer fixture-provider-key', holdController.signal);
+  assert.equal(hold.status, 200);
+  const holdBody = hold.text().then(
+    () => 'completed',
+    (error) => holdController.signal.aborted ? 'aborted' : Promise.reject(error)
+  );
+  const holdOutcome = await Promise.race([
+    holdBody,
+    new Promise((resolveHeld) => setTimeout(() => resolveHeld('held'), 250))
+  ]);
+  const concurrent = await request(
+    { model: 'hub-proxy-smoke', input: 'concurrent while hold is open' },
+    'Bearer fixture-provider-key',
+    AbortSignal.timeout(1_000)
+  );
+  assert.equal(
+    concurrent.status,
+    200,
+    'A held streaming response must not block a later model request'
+  );
+  holdController.abort();
+  await holdBody;
+  assert.equal(holdOutcome, 'held', 'Integration Context hold response must remain open');
 
   const failure = await request({ model: 'custom-model', input: 'fixture:model-error' });
   assert.equal(failure.status, 200);

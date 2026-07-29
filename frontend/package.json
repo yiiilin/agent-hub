@@ -9,6 +9,7 @@
     "test:e2e": "playwright test"
   },
   "dependencies": {
+    "@agent-hub/client": "file:../sdk/typescript",
     "@mdxeditor/editor": "4.0.4",
     "@streamdown/cjk": "^1.0.3",
     "@streamdown/code": "^1.1.1",

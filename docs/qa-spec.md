@@ -18,7 +18,7 @@ Agent Hub V1 的每项功能必须能追溯到自动化证据。QA 不要求把�
 | 层级 | 主要职责 |
 | --- | --- |
 | Rust | 纯逻辑、序列化、数据库约束、协议状态机、并发与安全边界 |
-| API QA | 真实 PostgreSQL、Hub、Runtime、fake Pi RPC、fake model provider 和 Mock OIDC 的契约与负路径 |
+| API QA | 真实 PostgreSQL、Hub、Runtime、Pi standalone 与 model gateway，以及 fake model provider、Mock OIDC 和 MinIO 边界替代的契约与负路径 |
 | Browser QA | 真实前端与后端关键工作流、交互状态、desktop/390px、i18n、console/network |
 
 覆盖完成必须同时满足：
@@ -42,8 +42,8 @@ Agent Hub V1 的每项功能必须能追溯到自动化证据。QA 不要求把�
 - Session、Message、Run、Turn、SSE、steer、interrupt、Native Session 和 Workspace 隔离。
 - Runtime enrollment、credential、ownership、drain/delete、Session Bundle、recovery 和 Runtime Engine 版本。
 - Automation CRUD、manual/webhook/interval/cron、scheduler 和 Run history。
-- Integration App、OAuth、External Session、SSE、attachment、tool request/result 和权限失效。
-- Widget session、origin 隔离、session select、message submit、stop 和 `postMessage`。
+- Integration App、OAuth、External Session、Client Access Credential、SSE、attachment、Run Tool Snapshot、Client Tool claim/result/batch/timeout 和权限失效。
+- Browser SDK 与 Widget 的认证/匿名初始化、Origin 隔离、多标签页、session select、message idempotency、SSE resume、续期/重新授权、IndexedDB 防重放、stop 和 `postMessage`。
 - 所有管理台页面的 desktop/390px、英文/中文、loading/error/empty 和浏览器诊断。
 
 ## 场景契约
@@ -61,13 +61,15 @@ Agent Hub V1 的每项功能必须能追溯到自动化证据。QA 不要求把�
 
 ## 测试环境
 
-全部场景使用本地 fake Pi RPC、fake model provider、Mock OIDC 和 S3-compatible 开发存储，不访问真实 AI、OAuth、S3 或 GitHub 服务。不得为测试新增绕过生产认证或授权的后门。
+全部场景运行真实 Hub、Runtime、内嵌 Pi standalone、PostgreSQL 和 model gateway；外部边界使用本地 fake model provider、Mock OIDC 和 MinIO，不访问真实 AI、OAuth、S3 或 GitHub 服务。不得为测试新增绕过生产认证或授权的后门。
+
+每次可执行场景运行都先执行 TypeScript SDK 的 `npm test`、`npm run build` 和 `npm pack --dry-run`。任一 SDK 门禁失败都使整次 QA 失败，但仍可继续收集所选场景的独立证据。
 
 一次完整运行只启动一套隔离 Compose 环境。普通场景失败后继续运行其余场景；若 worker 触发 OS-level hard timeout，则当前场景记为 `failed`，后续已选择场景全部记为 `not_run` 并注明共享环境可能已污染，且不得再启动 worker。随后仍按正常流程 teardown 这一套 Compose；运行结束或收到信号时删除容器、网络和 QA 数据卷。暖缓存完整运行目标不超过十分钟。
 
 ## 诊断和产物
 
-每次运行生成 `summary.json` 和 `junit.xml`。失败场景保存脱敏错误和 Compose 日志；浏览器失败另存 screenshot、browser diagnostics 和 Playwright trace。Browser QA 将未允许的同源 `4xx/5xx`、request failure、page error 和 console error 视为失败。
+每次运行生成 `summary.json`、`junit.xml`、SDK 门禁日志和 SHA-256 `artifact-manifest.json`。Summary 记录源码 revision、执行前后 dirty-tree fingerprint、时间窗口、`owned_ephemeral` 环境身份与实际 teardown disposition、依赖的 real/emulated/mocked 模式，以及每个场景实际执行的 claim 记录。失败场景保存脱敏错误和 Compose 日志；浏览器失败另存 screenshot、browser diagnostics 和 Playwright trace。Browser QA 将未允许的同源 `4xx/5xx`、request failure、page error 和 console error 视为失败。最终保留树必须通过递归脱敏与 secret/artifact safety 扫描，扫描结论写入 Summary。
 
 产物不得包含 session、API Key、OAuth/client secret、Runtime Credential、model provider key、MCP secret 或 webhook token 明文。
 

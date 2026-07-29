@@ -41,6 +41,7 @@ const PI_INTEGRATION_EXTENSION_FILE: &str = "agent-hub-integration-tools.mjs";
 const PI_INTEGRATION_TOOLS_FILE: &str = "agent-hub-integration-tools.json";
 const PI_SKILL_EXEC_EXTENSION_FILE: &str = "agent-hub-skill-exec.mjs";
 const PI_INTEGRATION_CONTEXT_LABEL: &str = "Agent Hub Integration context (JSON):";
+const PI_CLIENT_TOOL_PREFIX: &str = "agent_hub_client_tool_";
 const PI_BUILTIN_TOOL_NAMES: &[&str] = &[
     "read",
     "grep",
@@ -124,23 +125,26 @@ fn normalized_integration_tools(
         .as_array()
         .context("Integration tools must be an array")?;
     let mut names = HashSet::new();
-    let mut normalized = Vec::with_capacity(tools.len());
+    let mut parsed = Vec::with_capacity(tools.len());
     for tool in tools {
-        let name = tool
+        let external_name = tool
             .get("name")
             .and_then(Value::as_str)
             .filter(|name| !name.trim().is_empty())
             .context("Integration tool name is required")?;
         anyhow::ensure!(
-            !name.contains(','),
+            !external_name.contains(','),
             "Integration tool name cannot contain a comma"
         );
+        let client_managed = tool.get("input_schema").is_some();
+        if !client_managed {
+            anyhow::ensure!(
+                !PI_BUILTIN_TOOL_NAMES.contains(&external_name),
+                "Integration tool name conflicts with a Pi built-in tool"
+            );
+        }
         anyhow::ensure!(
-            !PI_BUILTIN_TOOL_NAMES.contains(&name),
-            "Integration tool name conflicts with a Pi built-in tool"
-        );
-        anyhow::ensure!(
-            names.insert(name.to_owned()),
+            names.insert(external_name.to_owned()),
             "Integration tool names must be unique"
         );
         let description = match tool.get("description") {
@@ -148,14 +152,47 @@ fn normalized_integration_tools(
             Some(Value::Null) | None => String::new(),
             Some(_) => anyhow::bail!("Integration tool description must be a string"),
         };
-        let parameters = match tool.get("parameters") {
+        let parameters = match if client_managed {
+            tool.get("input_schema")
+        } else {
+            tool.get("parameters")
+        } {
             Some(parameters @ Value::Object(_)) => parameters.clone(),
             Some(Value::Null) | None => json!({ "type": "object" }),
             Some(_) => anyhow::bail!("Integration tool parameters must be a JSON object"),
         };
+        parsed.push((
+            external_name.to_owned(),
+            description,
+            parameters,
+            client_managed,
+        ));
+    }
+    let mut allocated_names = names;
+    let mut next_client_name = 1_u32;
+    let mut normalized = Vec::with_capacity(parsed.len());
+    for (external_name, description, parameters, client_managed) in parsed {
+        let internal_name = if client_managed {
+            loop {
+                let candidate = format!("{PI_CLIENT_TOOL_PREFIX}{next_client_name}");
+                next_client_name = next_client_name
+                    .checked_add(1)
+                    .context("Client Tool internal name counter overflowed")?;
+                if !allocated_names.contains(&candidate)
+                    && !PI_BUILTIN_TOOL_NAMES.contains(&candidate.as_str())
+                {
+                    allocated_names.insert(candidate.clone());
+                    break candidate;
+                }
+            }
+        } else {
+            external_name.clone()
+        };
         normalized.push(json!({
-            "name": name,
-            "label": name,
+            "name": internal_name,
+            "label": external_name,
+            "external_name": external_name,
+            "client_managed": client_managed,
             "description": description,
             "parameters": parameters
         }));
@@ -163,11 +200,18 @@ fn normalized_integration_tools(
     Ok(normalized)
 }
 
-fn integration_tool_names(context: Option<&IntegrationContextDto>) -> anyhow::Result<Vec<String>> {
+fn integration_tool_name_map(
+    context: Option<&IntegrationContextDto>,
+) -> anyhow::Result<BTreeMap<String, String>> {
     normalized_integration_tools(context).map(|tools| {
         tools
             .into_iter()
-            .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+            .filter_map(|tool| {
+                Some((
+                    tool.get("name")?.as_str()?.to_owned(),
+                    tool.get("external_name")?.as_str()?.to_owned(),
+                ))
+            })
             .collect()
     })
 }
@@ -990,9 +1034,7 @@ impl PersistentPiRpcProcess {
         let mut state = PiRunState::new(
             claim.run.id,
             self.native_session_id.clone(),
-            integration_tool_names(claim.integration_context.as_ref())?
-                .into_iter()
-                .collect(),
+            integration_tool_name_map(claim.integration_context.as_ref())?,
         );
         self.configure_run(claim, &mut state, started_at, event_tx)?;
 
@@ -1308,7 +1350,7 @@ struct PiRunState {
     tool_started: HashSet<String>,
     tool_ended: HashSet<String>,
     tool_outputs: BTreeMap<String, String>,
-    integration_tool_names: HashSet<String>,
+    integration_tool_names: BTreeMap<String, String>,
     integration_tool_requested: bool,
     retry_started: HashSet<u64>,
     retry_ended: HashSet<u64>,
@@ -1320,7 +1362,7 @@ impl PiRunState {
     fn new(
         run_id: uuid::Uuid,
         native_session_id: String,
-        integration_tool_names: HashSet<String>,
+        integration_tool_names: BTreeMap<String, String>,
     ) -> Self {
         Self {
             run_id,
@@ -1574,12 +1616,12 @@ impl PiRunState {
             return Ok(());
         }
         let args = value.get("args").cloned().unwrap_or_else(|| json!({}));
-        if self.integration_tool_names.contains(tool_name) {
+        if let Some(external_name) = self.integration_tool_names.get(tool_name).cloned() {
             self.integration_tool_requested = true;
             self.events.push(pi_integration_tool_request(
                 self.run_id,
                 tool_call_id,
-                tool_name,
+                &external_name,
                 args,
             ));
             return Ok(());
@@ -1605,7 +1647,7 @@ impl PiRunState {
             !self.tool_ended.contains(tool_call_id),
             "Pi tool update arrived after tool end"
         );
-        if self.integration_tool_names.contains(tool_name) {
+        if self.integration_tool_names.contains_key(tool_name) {
             return Ok(());
         }
         let output = pi_result_text(value.get("partialResult"));
@@ -1642,7 +1684,7 @@ impl PiRunState {
         if !self.tool_ended.insert(tool_call_id.to_owned()) {
             return Ok(());
         }
-        if self.integration_tool_names.contains(tool_name) {
+        if self.integration_tool_names.contains_key(tool_name) {
             return Ok(());
         }
         let output = pi_result_text(value.get("result"));
@@ -1866,7 +1908,7 @@ pub(super) fn pi_tool_allowlist_for_claim(claim: &ClaimRunResponse) -> anyhow::R
         .iter()
         .any(|tool| tool == "integration")
     {
-        for name in integration_tool_names(claim.integration_context.as_ref())? {
+        for name in integration_tool_name_map(claim.integration_context.as_ref())?.into_keys() {
             if !tools.contains(&name) {
                 tools.push(name);
             }
@@ -1939,6 +1981,7 @@ pub(super) fn pi_prompt_text(claim: &ClaimRunResponse) -> anyhow::Result<String>
             "message": prompt,
             "attachments": context.attachments,
             "tool_result": context.tool_result,
+            "tool_results": context.tool_results,
             "external_user": context.external_user
         });
         prompt.push_str("\n\n");

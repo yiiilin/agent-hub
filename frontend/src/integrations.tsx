@@ -3,6 +3,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 're
 import {
   Agent,
   api,
+  ClientToolDefinition,
   CreateIntegrationAppRequest,
   IntegrationApp,
   IntegrationAppOptions,
@@ -11,7 +12,7 @@ import {
   User
 } from './api/client';
 import { FormDialog } from './components/form-dialog';
-import { normalizeToolAllowlist, publicWidgetTools, ToolAllowlistPicker } from './components/tool-allowlist';
+import { normalizeToolAllowlist, publicWidgetTools, ToolAllowlistPicker, type BuiltInTool } from './components/tool-allowlist';
 import { useI18n } from './i18n';
 import type { TranslationKey } from './i18n';
 
@@ -30,6 +31,82 @@ function replaceName(template: string, name: string) {
 function appAgentNames(app: IntegrationApp, agents: Agent[]) {
   const byId = new Map(agents.map((agent) => [agent.id, agent.name]));
   return app.agent_ids.map((id) => byId.get(id) ?? id);
+}
+
+function includeIntegrationTool(tools: BuiltInTool[]) {
+  return [...new Set<BuiltInTool>([...tools, 'integration'])];
+}
+
+function ClientToolForm({
+  tool,
+  existingNames,
+  onClose,
+  onSave
+}: {
+  tool?: ClientToolDefinition;
+  existingNames: string[];
+  onClose: () => void;
+  onSave: (tool: ClientToolDefinition) => void;
+}) {
+  const { t } = useI18n();
+  const nameRef = useRef<HTMLInputElement>(null);
+  const [name, setName] = useState(tool?.name ?? '');
+  const [description, setDescription] = useState(tool?.description ?? '');
+  const [schema, setSchema] = useState(() => JSON.stringify(tool?.input_schema ?? {
+    type: 'object',
+    properties: {}
+  }, null, 2));
+  const [error, setError] = useState<TranslationKey | null>(null);
+  const formId = tool ? 'edit-client-tool-form' : 'create-client-tool-form';
+
+  function submit(event: FormEvent) {
+    event.preventDefault();
+    const normalizedName = name.trim();
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(normalizedName)
+      || (normalizedName !== tool?.name && existingNames.includes(normalizedName))) {
+      setError('clientToolNameInvalid');
+      return;
+    }
+    const normalizedDescription = description.trim();
+    if (!normalizedDescription) {
+      setError('clientToolDescriptionInvalid');
+      return;
+    }
+    let inputSchema: unknown;
+    try {
+      inputSchema = JSON.parse(schema);
+    } catch {
+      setError('clientToolSchemaInvalid');
+      return;
+    }
+    if (!inputSchema || typeof inputSchema !== 'object' || Array.isArray(inputSchema)
+      || (inputSchema as Record<string, unknown>).type !== 'object') {
+      setError('clientToolSchemaInvalid');
+      return;
+    }
+    onSave({
+      name: normalizedName,
+      description: normalizedDescription,
+      input_schema: inputSchema as Record<string, unknown>
+    });
+  }
+
+  const title = tool ? t('editClientTool') : t('createClientTool');
+  return <FormDialog
+    title={title}
+    eyebrow={t('clientTools')}
+    onClose={onClose}
+    initialFocusRef={nameRef}
+    className="integration-client-tool-dialog"
+    footer={<><button className="secondary" type="button" onClick={onClose}>{t('cancel')}</button><button className="primary" type="submit" form={formId}>{tool ? t('saveChanges') : t('createClientTool')}</button></>}
+  >
+    <form id={formId} className="stack" onSubmit={submit}>
+      <label>{t('clientToolName')}<input ref={nameRef} required maxLength={64} value={name} onChange={(event) => setName(event.target.value)} /></label>
+      <label>{t('description')}<textarea required rows={3} value={description} onChange={(event) => setDescription(event.target.value)} /></label>
+      <label>{t('clientToolInputSchema')}<textarea className="integration-client-tool-schema" required rows={10} spellCheck={false} value={schema} onChange={(event) => setSchema(event.target.value)} /></label>
+      {error && <div className="error" role="alert">{t(error)}</div>}
+    </form>
+  </FormDialog>;
 }
 
 function IntegrationAppForm({
@@ -66,6 +143,8 @@ function IntegrationAppForm({
   const [allowedOrigins, setAllowedOrigins] = useState(app?.allowed_origins?.length ? [...app.allowed_origins] : ['']);
   const [restrictTools, setRestrictTools] = useState(app?.tool_allowlist !== null && app?.tool_allowlist !== undefined);
   const [toolAllowlist, setToolAllowlist] = useState(() => normalizeToolAllowlist(app?.tool_allowlist));
+  const [clientTools, setClientTools] = useState<ClientToolDefinition[]>(app?.client_tool_definitions ?? []);
+  const [clientToolDialog, setClientToolDialog] = useState<{ originalName: string | null } | null>(null);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<TranslationKey | null>(null);
   const availableAgents = useMemo(() => agents.filter((agent) => agent.can_invoke), [agents]);
@@ -133,7 +212,12 @@ function IntegrationAppForm({
       widget_history_enabled: loginRequired && widgetHistoryEnabled,
       login_required: loginRequired,
       allowed_origins: loginRequired ? [] : normalizedOrigins,
-      tool_allowlist: restrictTools ? toolAllowlist : null
+      tool_allowlist: restrictTools
+        ? clientTools.length > 0
+          ? [...new Set([...toolAllowlist, 'integration'])]
+          : toolAllowlist
+        : null,
+      client_tool_definitions: loginRequired ? [] : clientTools
     };
     try {
       await onSubmit(isEditing ? common : {
@@ -151,7 +235,7 @@ function IntegrationAppForm({
 
   const title = isEditing ? t('editIntegrationApp') : t('createIntegrationApp');
   const formId = isEditing ? 'edit-integration-app-form' : 'create-integration-app-form';
-  return (
+  return <>
     <FormDialog
       title={title}
       eyebrow={t('integrationApps')}
@@ -199,6 +283,7 @@ function IntegrationAppForm({
         {!loginRequired && <>
           <fieldset className="integration-fieldset">
             <legend>{t('allowedOrigins')}</legend>
+            <p className="integration-origin-risk">{t('allowedOriginsHttpRisk')}</p>
             <div className="integration-uri-list">
               {allowedOrigins.map((origin, index) => <div className="integration-uri-row" key={index}>
                 <label>{t('allowedOriginLabel').replace('{index}', String(index + 1))}<input aria-label={t('allowedOriginLabel').replace('{index}', String(index + 1))} value={origin} placeholder="https://example.com" onChange={(event) => updateAllowedOrigin(index, event.target.value)} /></label>
@@ -207,14 +292,43 @@ function IntegrationAppForm({
             </div>
             <button className="secondary integration-add-uri" type="button" onClick={() => setAllowedOrigins((current) => [...current, ''])}><Plus size={16} /> {t('addAllowedOrigin')}</button>
           </fieldset>
+          <fieldset className="integration-fieldset integration-client-tools">
+            <legend>{t('clientTools')}</legend>
+            {clientTools.length === 0 && <span className="integration-client-tools-empty">{t('noClientTools')}</span>}
+            {clientTools.length > 0 && <div className="integration-client-tool-list" role="table" aria-label={t('clientToolList')}>
+              {clientTools.map((tool, index) => <div className="integration-client-tool-row" role="row" key={tool.name}>
+                <span role="cell"><code>{tool.name}</code><small>{tool.description}</small></span>
+                <span role="cell" className="integration-table-actions">
+                  <button className="icon-button" type="button" aria-label={replaceName(t('editClientToolAria'), tool.name)} title={replaceName(t('editClientToolAria'), tool.name)} onClick={() => setClientToolDialog({ originalName: tool.name })}><Pencil size={16} /></button>
+                  <button className="icon-button danger" type="button" aria-label={replaceName(t('deleteClientToolAria'), tool.name)} title={replaceName(t('deleteClientToolAria'), tool.name)} onClick={() => setClientTools((current) => current.filter((_, currentIndex) => currentIndex !== index))}><Trash2 size={16} /></button>
+                </span>
+              </div>)}
+            </div>}
+            <button className="secondary integration-add-uri" type="button" disabled={clientTools.length >= 128} onClick={() => setClientToolDialog({ originalName: null })}><Plus size={16} /> {t('createClientTool')}</button>
+          </fieldset>
         </>}
         <label className="check-row"><input type="checkbox" checked={restrictTools} onChange={(event) => setRestrictTools(event.target.checked)} /><span>{t('restrictAppTools')}</span></label>
-        {restrictTools && <ToolAllowlistPicker value={toolAllowlist} onChange={setToolAllowlist} disabled={pending} legend={t('toolAllowlist')} tools={loginRequired ? undefined : publicWidgetTools} />}
+        {restrictTools && <ToolAllowlistPicker value={toolAllowlist} onChange={(next) => setToolAllowlist(!loginRequired && clientTools.length > 0 ? includeIntegrationTool(next) : next)} disabled={pending} legend={t('toolAllowlist')} tools={loginRequired ? undefined : publicWidgetTools} />}
         {loginRequired && <label className="check-row"><input type="checkbox" checked={widgetHistoryEnabled} onChange={(event) => setWidgetHistoryEnabled(event.target.checked)} /><span>{t('widgetHistoryEnabled')}</span></label>}
         {error && <div className="error" role="alert">{t(error)}</div>}
       </form>
     </FormDialog>
-  );
+    {clientToolDialog && <ClientToolForm
+      key={clientToolDialog.originalName ?? 'new'}
+      tool={clientToolDialog.originalName === null
+        ? undefined
+        : clientTools.find((tool) => tool.name === clientToolDialog.originalName)}
+      existingNames={clientTools.map((tool) => tool.name)}
+      onClose={() => setClientToolDialog(null)}
+      onSave={(next) => {
+        setClientTools((current) => clientToolDialog.originalName === null
+          ? [...current, next]
+          : current.map((tool) => tool.name === clientToolDialog.originalName ? next : tool));
+        if (restrictTools) setToolAllowlist(includeIntegrationTool);
+        setClientToolDialog(null);
+      }}
+    />}
+  </>;
 }
 
 function SecretDialog({ result, onClose }: { result: IntegrationAppSecretResponse; onClose: () => void }) {

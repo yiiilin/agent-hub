@@ -58,6 +58,7 @@ export type ActivityEntry = {
   endedAt: number;
   summary: string | null;
   output: string | null;
+  status: string | null;
 };
 
 type TimelineEntry =
@@ -93,6 +94,17 @@ const activityKeys: Record<ActivityKind, TranslationKey> = {
   review: 'activityReview',
   wait: 'activityWait',
   retry: 'activityRetry'
+};
+
+const activityStatusKeys: Record<string, TranslationKey> = {
+  pending: 'clientToolPending',
+  success: 'clientToolSucceeded',
+  result: 'clientToolSucceeded',
+  error: 'clientToolFailed',
+  timeout: 'clientToolTimedOut',
+  timed_out: 'clientToolTimedOut',
+  unknown: 'clientToolUnknown',
+  cancelled: 'statusCancelled'
 };
 
 function formatActivityDuration(
@@ -194,19 +206,40 @@ function activityKind(itemType: string): ActivityKind | null {
 }
 
 function activityFromEvent(event: RunEvent): ActivityEntry | null {
-  if (event.event_type === 'tool_request' || event.event_type === 'tool_result') {
-    const itemId = payloadString(event.payload, 'tool_request_id') ?? payloadString(event.payload, 'source_id');
+  const clientToolEvent = event.event_type === 'tool_request'
+    || event.event_type === 'tool_result'
+    || event.event_type === 'client_tool_result'
+    || event.event_type === 'client_tool_timeout'
+    || event.event_type === 'client_tool_unknown'
+    || event.event_type === 'client_tool_cancelled';
+  if (clientToolEvent) {
+    const itemId = payloadString(event.payload, 'tool_call_id')
+      ?? payloadString(event.payload, 'tool_request_id')
+      ?? payloadString(event.payload, 'source_id');
+    const result = event.payload.result && typeof event.payload.result === 'object'
+      ? event.payload.result as Record<string, unknown>
+      : null;
+    const resultStatus = result && typeof result.status === 'string' ? result.status : null;
+    const status = payloadString(event.payload, 'status')
+      ?? resultStatus
+      ?? (event.event_type === 'tool_request' ? 'pending' : event.event_type.replace('client_tool_', ''));
+    const elapsedMs = payloadNumber(event.payload, 'elapsed_ms') ?? 0;
+    const endedAt = eventTimestamp(event.created_at);
+    const output = result
+      ? JSON.stringify(result, null, 2)
+      : payloadString(event.payload, 'message') ?? event.content;
     return {
       id: `activity-${event.run_id}-${itemId ?? event.seq}`,
       runId: event.run_id,
       itemId,
       kind: 'tool',
-      phase: 'completed',
+      phase: event.event_type === 'tool_request' ? 'started' : 'completed',
       sequence: event.seq,
-      occurredAt: eventTimestamp(event.created_at),
-      endedAt: eventTimestamp(event.created_at),
+      occurredAt: Math.max(0, endedAt - elapsedMs),
+      endedAt,
       summary: payloadString(event.payload, 'tool_name'),
-      output: null
+      output,
+      status
     };
   }
   if (event.event_type !== 'item') return null;
@@ -253,7 +286,8 @@ function activityFromEvent(event: RunEvent): ActivityEntry | null {
     occurredAt: Math.max(0, endedAt - duration),
     endedAt,
     summary,
-    output: payloadString(event.payload, 'output')
+    output: payloadString(event.payload, 'output'),
+    status: null
   };
 }
 
@@ -272,7 +306,8 @@ function mergeActivity(current: ActivityEntry, incoming: ActivityEntry): Activit
     endedAt: Math.max(current.endedAt, incoming.endedAt),
     sequence: Math.min(current.sequence, incoming.sequence),
     summary,
-    output
+    output,
+    status: incoming.status ?? current.status
   };
 }
 
@@ -322,7 +357,7 @@ function ActivityIcon({ kind }: { kind: ActivityKind }) {
 
 export function ChatActivityGroup({ activities, startedAt, endedAt }: { activities: ActivityEntry[]; startedAt?: number; endedAt?: number }) {
   const { locale, t } = useI18n();
-  return <details className="session-activity-events"><summary><span>{t('agentActivityDuration').replace('{duration}', formatActivityDuration(activities, locale, startedAt, endedAt))}</span><ChevronRight className="session-activity-chevron" size={16} aria-hidden="true" /></summary><div>{activities.map((activity) => <div className="session-activity-row" key={activity.id}><span className="session-activity-icon" aria-hidden="true"><ActivityIcon kind={activity.kind} /></span><div className="session-activity-content"><strong>{t(activityKeys[activity.kind])}</strong>{activity.summary && (activity.kind === 'command' ? <code>{activity.summary}</code> : <span className="session-activity-summary">{activity.summary}</span>)}{activity.output && <div className="session-activity-output"><span>{t('activityOutput')}</span><pre>{activity.output}</pre></div>}</div></div>)}</div></details>;
+  return <details className="session-activity-events"><summary><span>{t('agentActivityDuration').replace('{duration}', formatActivityDuration(activities, locale, startedAt, endedAt))}</span><ChevronRight className="session-activity-chevron" size={16} aria-hidden="true" /></summary><div>{activities.map((activity) => <div className="session-activity-row" key={activity.id}><span className="session-activity-icon" aria-hidden="true"><ActivityIcon kind={activity.kind} /></span><div className="session-activity-content"><span className="session-activity-heading"><strong>{t(activityKeys[activity.kind])}</strong>{activity.status && <small className={`session-activity-status status-${activity.status}`}>{t(activityStatusKeys[activity.status] ?? 'statusFailed')}</small>}{activity.kind === 'tool' && activity.status && activity.status !== 'pending' && <small className="session-activity-elapsed">{formatActivityDuration([activity], locale)}</small>}</span>{activity.summary && (activity.kind === 'command' ? <code>{activity.summary}</code> : <span className="session-activity-summary">{activity.summary}</span>)}{activity.output && <div className="session-activity-output"><span>{t('activityOutput')}</span><pre>{activity.output}</pre></div>}</div></div>)}</div></details>;
 }
 
 export function ChatMessageBubble({

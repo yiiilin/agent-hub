@@ -630,8 +630,15 @@ export type IntegrationApp = {
   login_required: boolean;
   allowed_origins: string[];
   tool_allowlist: string[] | null;
+  client_tool_definitions: ClientToolDefinition[];
   created_at: string;
   updated_at: string;
+};
+
+export type ClientToolDefinition = {
+  name: string;
+  description: string;
+  input_schema: Record<string, unknown>;
 };
 
 export type CreateIntegrationAppRequest = {
@@ -644,11 +651,12 @@ export type CreateIntegrationAppRequest = {
   login_required: boolean;
   allowed_origins: string[];
   tool_allowlist: string[] | null;
+  client_tool_definitions: ClientToolDefinition[];
 };
 
 export type UpdateIntegrationAppRequest = Pick<
   CreateIntegrationAppRequest,
-  'name' | 'redirect_uris' | 'agent_ids' | 'widget_history_enabled' | 'login_required' | 'allowed_origins' | 'tool_allowlist'
+  'name' | 'redirect_uris' | 'agent_ids' | 'widget_history_enabled' | 'login_required' | 'allowed_origins' | 'tool_allowlist' | 'client_tool_definitions'
 >;
 
 export type IntegrationAppSecretResponse = {
@@ -1239,9 +1247,12 @@ export const api = {
     if (!Number.isFinite(expiresIn)) throw new ApiError(500, 'request_failed');
     return { ...response, access_token: accessToken, expires_in: expiresIn };
   },
-  widgetAgent: (token: string, signal?: AbortSignal) => request<WidgetSession>('/api/widget/session', {
+  widgetAgent: (token: string, signal?: AbortSignal, embeddedOrigin?: string) => request<WidgetSession>('/api/widget/session', {
     signal,
-    headers: { 'X-Agent-Hub-Embed-Token': token }
+    headers: {
+      'X-Agent-Hub-Embed-Token': token,
+      ...(embeddedOrigin ? { 'X-Agent-Hub-Embedded-Origin': embeddedOrigin } : {})
+    }
   }),
   renewWidgetSession: (token: string, signal?: AbortSignal) =>
     request<WidgetCredential>('/api/widget/session/renew', {

@@ -812,6 +812,37 @@ pub struct ExternalUserContextDto {
     pub attributes: Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientToolDefinitionDto {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientToolErrorDto {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ClientToolResultDto {
+    Success { output: Value },
+    Error { error: ClientToolErrorDto },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientToolContinuationResultDto {
+    pub tool_call_id: Uuid,
+    pub tool_name: String,
+    pub result: ClientToolResultDto,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WidgetSessionDto {
     #[serde(flatten)]
@@ -829,11 +860,28 @@ pub struct WidgetAccessResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientAccessResponse {
+    pub access_token: String,
+    pub expires_at: DateTime<Utc>,
+    pub expires_in: i64,
+    pub client_instance_id: Uuid,
+    pub session_id: Option<Uuid>,
+    pub agent: WidgetAgentDto,
+    pub history_enabled: bool,
+    pub tool_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreatePublicWidgetAccessRequest {
     pub client_id: String,
     pub visitor_key: String,
+    pub client_instance_id: Uuid,
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
 }
+
+pub type CreateAnonymousClientAccessRequest = CreatePublicWidgetAccessRequest;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublicWidgetAccessResponse {
@@ -1389,6 +1437,8 @@ pub struct IntegrationAppDto {
     pub allowed_origins: Vec<String>,
     #[serde(default)]
     pub tool_allowlist: Option<Vec<String>>,
+    #[serde(default)]
+    pub client_tool_definitions: Vec<ClientToolDefinitionDto>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1411,14 +1461,19 @@ pub struct IntegrationSessionDto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntegrationToolRequestDto {
     pub id: Uuid,
-    pub session_id: Uuid,
+    pub session_id: Option<Uuid>,
+    pub hub_session_id: Uuid,
     pub run_id: Uuid,
+    pub position: i32,
     pub tool_name: String,
     pub arguments: Value,
     pub status: String,
+    pub claimed_by_client_instance_id: Option<Uuid>,
+    pub claimed_at: Option<DateTime<Utc>>,
     pub result_payload: Option<Value>,
     pub follow_up_run_id: Option<Uuid>,
     pub expires_at: DateTime<Utc>,
+    pub responded_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -1427,6 +1482,8 @@ pub struct IntegrationContextDto {
     pub tools: Value,
     pub attachments: Value,
     pub tool_result: Option<Value>,
+    #[serde(default)]
+    pub tool_results: Vec<ClientToolContinuationResultDto>,
     #[serde(default)]
     pub external_user: Option<ExternalUserContextDto>,
 }
@@ -1506,6 +1563,8 @@ pub struct CreateIntegrationAppRequest {
     pub allowed_origins: Vec<String>,
     #[serde(default)]
     pub tool_allowlist: Option<Vec<String>>,
+    #[serde(default)]
+    pub client_tool_definitions: Vec<ClientToolDefinitionDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1522,6 +1581,8 @@ pub struct UpdateIntegrationAppRequest {
     pub allowed_origins: Vec<String>,
     #[serde(default)]
     pub tool_allowlist: Option<Vec<String>>,
+    #[serde(default)]
+    pub client_tool_definitions: Vec<ClientToolDefinitionDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1622,7 +1683,7 @@ pub const AGENT_TOOL_NAMES: &[&str] = &[
     "integration",
 ];
 
-pub const PUBLIC_WIDGET_TOOL_NAMES: &[&str] = &["read", "grep", "find", "ls"];
+pub const PUBLIC_WIDGET_TOOL_NAMES: &[&str] = &["read", "grep", "find", "ls", "integration"];
 
 pub fn default_agent_tool_allowlist() -> Vec<String> {
     AGENT_TOOL_NAMES
@@ -1681,6 +1742,7 @@ pub struct CreateIntegrationSessionRequest {
 #[serde(deny_unknown_fields)]
 pub struct CreateWidgetAccessRequest {
     pub agent_id: Uuid,
+    pub client_instance_id: Uuid,
     pub external_user_id: String,
     pub tenant_id: String,
     #[serde(default)]
@@ -1691,7 +1753,11 @@ pub struct CreateWidgetAccessRequest {
     pub email: Option<String>,
     #[serde(default)]
     pub attributes: Value,
+    #[serde(default)]
+    pub client_tools: Vec<ClientToolDefinitionDto>,
 }
+
+pub type CreateClientAccessRequest = CreateWidgetAccessRequest;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1700,10 +1766,14 @@ pub struct RenewWidgetSessionRequest {
     pub profile: Option<WidgetUserProfileDto>,
 }
 
+pub type RenewClientAccessRequest = RenewWidgetSessionRequest;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateWidgetRunRequest {
     pub message: String,
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
     #[serde(default)]
     pub integration_session_id: Option<Uuid>,
     #[serde(default)]
@@ -1749,6 +1819,26 @@ pub struct SessionMessageAcceptanceDto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitToolResultRequest {
     pub result: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitClientToolResultRequest {
+    pub result: ClientToolResultDto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientToolClaimResponse {
+    pub status: String,
+    pub terminal: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<ClientToolResultDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitClientToolResultResponse {
+    pub run: Option<RunDto>,
+    pub tool_request: IntegrationToolRequestDto,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2056,7 +2146,8 @@ pub struct FinalizeToolRequestEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FinalizeToolRequestsRequest {
-    pub integration_session_id: Uuid,
+    #[serde(default)]
+    pub integration_session_id: Option<Uuid>,
     pub native_session_id: String,
     pub work_dir_ref: String,
     pub tool_requests: Vec<FinalizeToolRequestEvent>,
@@ -2591,6 +2682,7 @@ mod tests {
             login_required: true,
             allowed_origins: Vec::new(),
             tool_allowlist: None,
+            client_tool_definitions: Vec::new(),
             created_at: now,
             updated_at: now,
         };

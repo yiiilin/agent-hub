@@ -1,5 +1,10 @@
 FROM node:24-bookworm-slim AS frontend-builder
 WORKDIR /app
+COPY sdk/typescript/package.json sdk/typescript/package-lock.json* ./sdk/typescript/
+RUN cd sdk/typescript && npm ci
+COPY sdk/typescript ./sdk/typescript
+RUN cd sdk/typescript && npm run build
+WORKDIR /app/frontend
 COPY frontend/package.json frontend/package-lock.json* ./
 RUN npm ci
 COPY frontend .
@@ -21,6 +26,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && mkdir -p /var/lib/agent-hub \
     && chown -R agenthub:agenthub /var/lib/agent-hub
 COPY --from=backend-builder /app/target/release/agent-hub-backend /usr/local/bin/agent-hub-backend
-COPY --from=frontend-builder /app/dist /app/frontend/dist
+COPY --from=frontend-builder /app/frontend/dist /app/frontend/dist
 USER 10001:10001
 CMD ["agent-hub-backend"]

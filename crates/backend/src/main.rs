@@ -1,4 +1,4 @@
-#![recursion_limit = "512"]
+#![recursion_limit = "1024"]
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -47,7 +47,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Row, Transaction};
 use tokio::io::AsyncWriteExt;
 use tower_http::{
-    cors::CorsLayer,
+    cors::{AllowOrigin, CorsLayer},
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
@@ -74,6 +74,12 @@ const DEFAULT_SESSION_BUNDLE_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const DEFAULT_FRONTEND_DIST_DIR: &str = "frontend/dist";
 const SKILL_PACKAGE_UPLOAD_BODY_LIMIT: usize =
     MAX_SKILL_PACKAGE_EXPANDED_BYTES as usize + 2 * 1024 * 1024;
+const MAX_CLIENT_TOOL_COUNT: usize = 128;
+const MAX_CLIENT_TOOL_DEFINITIONS_BYTES: usize = 256_000;
+const MAX_CLIENT_TOOL_RESULT_BYTES: usize = 16_000;
+const EMBEDDED_ORIGIN_HEADER: &str = "x-agent-hub-embedded-origin";
+const CLIENT_ACCESS_TTL_SECONDS: i64 = 15 * 60;
+const CLIENT_TOOL_DEADLINE_MINUTES: i64 = 5;
 const TOOL_REQUEST_BATCH_FINGERPRINT_KEY: &str = "tool_request_batch_fingerprint";
 const SESSION_MESSAGE_PAGE_SQL: &str =
     "SELECT id, session_id, sequence, role, message_kind, content, payload,
@@ -121,26 +127,21 @@ const ACTIVE_RUNTIME_TOOL_REQUEST_AGENT_SQL: &str = "
     WHERE a.id = (SELECT r.agent_id FROM runs r WHERE r.id = $1)
       AND a.deleted_at IS NULL
     FOR UPDATE";
-const ACTIVE_RUNTIME_TOOL_REQUEST_SESSION_SQL: &str = "
-    SELECT s.id, s.tool_definitions
-    FROM integration_sessions s
-    WHERE s.id = $2
-      AND s.id = (SELECT r.integration_session_id FROM runs r WHERE r.id = $1)
-    FOR UPDATE";
 const ACTIVE_RUNTIME_TOOL_REQUEST_RUN_SQL: &str = "
     SELECT r.integration_session_id, r.hub_session_id, r.hub_turn_id,
-           r.status, r.native_session_id, r.work_dir_ref
+           r.status, r.native_session_id, r.work_dir_ref,
+           r.client_instance_id, r.client_tool_snapshot
     FROM runs r
     WHERE r.id = $1
       AND r.runtime_id = $2
-      AND r.integration_session_id = $3
-      AND r.session_ownership_generation = $4
+      AND r.session_ownership_generation = $3
       AND r.status IN ('running', 'waiting_tool')
     FOR UPDATE OF r";
 const INTEGRATION_TOOL_REQUEST_INSERT_SQL: &str = "
     INSERT INTO integration_tool_requests
-        (id, session_id, run_id, tool_name, arguments, status, expires_at)
-    VALUES ($1, $2, $3, $4, $5, 'pending', $6)";
+        (id, session_id, hub_session_id, run_id, position,
+         tool_name, arguments, status, expires_at)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)";
 
 #[derive(Clone)]
 struct AppState {
@@ -354,10 +355,15 @@ async fn main() -> anyhow::Result<()> {
 
 fn build_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
-        .allow_origin([
-            "http://localhost:5173".parse::<HeaderValue>().unwrap(),
-            "http://127.0.0.1:5173".parse::<HeaderValue>().unwrap(),
-        ])
+        .allow_origin(AllowOrigin::predicate(|origin, request| {
+            let path = request.uri.path();
+            path.starts_with("/api/client/")
+                || path.starts_with("/api/widget/")
+                || matches!(
+                    origin.to_str(),
+                    Ok("http://localhost:5173" | "http://127.0.0.1:5173")
+                )
+        }))
         .allow_methods([
             Method::GET,
             Method::POST,
@@ -371,6 +377,7 @@ fn build_router(state: AppState) -> Router {
             header::AUTHORIZATION,
             HeaderName::from_static("x-agent-hub-webhook-token"),
             HeaderName::from_static("x-agent-hub-embed-token"),
+            HeaderName::from_static(EMBEDDED_ORIGIN_HEADER),
         ])
         .allow_credentials(true);
 
@@ -572,6 +579,36 @@ fn build_router(state: AppState) -> Router {
         .route("/api/automations/webhook", post(trigger_automation_webhook))
         .route("/api/embed/sessions", post(create_embed_session))
         .route("/api/embed/exchange", post(exchange_embed_jwt))
+        .route("/api/client/access", post(create_client_access))
+        .route(
+            "/api/client/anonymous/access",
+            post(create_anonymous_client_access),
+        )
+        .route("/api/client/renew", post(renew_client_access))
+        .route("/api/client/session", get(get_widget_session))
+        .route("/api/client/sessions", get(list_widget_sessions))
+        .route(
+            "/api/client/sessions/{session_id}/messages",
+            get(list_widget_session_messages),
+        )
+        .route(
+            "/api/client/sessions/{session_id}/events",
+            get(list_widget_session_events),
+        )
+        .route(
+            "/api/client/sessions/{session_id}/events/stream",
+            get(stream_widget_session_events),
+        )
+        .route("/api/client/runs", post(create_widget_run))
+        .route("/api/client/runs/{run_id}/stop", post(stop_widget_run))
+        .route(
+            "/api/client/tool-calls/{tool_call_id}/claim",
+            post(claim_client_tool_call),
+        )
+        .route(
+            "/api/client/tool-calls/{tool_call_id}/result",
+            post(submit_client_tool_result),
+        )
         .route("/api/widget/access", post(create_widget_access))
         .route(
             "/api/widget/public/access",
@@ -993,16 +1030,28 @@ fn openapi_document() -> Value {
             "/api/runtime/runs/{run_id}/complete": { "post": { "summary": "Complete a generation-fenced Runtime Run", "security": [{ "runtimeBearer": [] }], "parameters": [id("run_id")], "requestBody": body("RuntimeCompleteRunRequest"), "responses": { "200": response("Run"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/embed/sessions": { "post": { "summary": "Create widget embed session", "requestBody": body("CreateEmbedSessionRequest"), "responses": { "200": response("TokenResponse"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/embed/exchange": { "post": { "summary": "Exchange embed JWT", "security": [], "requestBody": body("EmbedExchangeRequest"), "responses": { "200": response("TokenResponse"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
-            "/api/widget/access": { "post": { "summary": "Issue a short-lived Widget credential for one trusted external user", "security": [{ "integrationClientBasic": [] }], "requestBody": body("CreateWidgetAccessRequest"), "responses": { "200": response("WidgetAccessResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" } } } },
-            "/api/widget/public/access": { "post": { "summary": "Issue or renew an anonymous public Widget credential", "security": [], "requestBody": body("CreatePublicWidgetAccessRequest"), "responses": { "200": response("PublicWidgetAccessResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
-            "/api/widget/session": { "get": { "summary": "Get Widget credential metadata and Agent", "security": [{ "embedToken": [] }], "responses": { "200": response("WidgetSession"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
-            "/api/widget/session/renew": { "post": { "summary": "Rotate one external Widget credential in place", "security": [{ "embedToken": [] }], "requestBody": body("RenewWidgetSessionRequest"), "responses": { "200": response("WidgetTokenResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" } } } },
-            "/api/widget/sessions": { "get": { "summary": "List history enabled Sessions in the exact external Widget scope", "security": [{ "embedToken": [] }], "responses": { "200": list_response("WidgetHistorySession"), "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" } } } },
-            "/api/widget/sessions/{session_id}/messages": { "get": { "summary": "List one exact external Widget Session's messages", "security": [{ "embedToken": [] }], "parameters": [id("session_id"), { "name": "before_sequence", "in": "query", "required": false, "schema": { "type": "integer", "format": "int64", "minimum": 1 } }, { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "format": "int64", "minimum": 1, "maximum": 100 } }], "responses": { "200": list_response("HubSessionMessage"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
-            "/api/widget/sessions/{session_id}/events": { "get": { "summary": "List one exact external Widget Session's Run events", "security": [{ "embedToken": [] }], "parameters": [id("session_id")], "responses": { "200": list_response("RunEvent"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
-            "/api/widget/sessions/{session_id}/events/stream": { "get": { "summary": "Stream one exact external Widget Session's Run events", "security": [{ "embedToken": [] }], "parameters": [id("session_id")], "responses": { "200": { "description": "Server-sent event stream", "content": { "text/event-stream": { "schema": { "type": "string" } } } }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
-            "/api/widget/runs": { "post": { "summary": "Create widget run", "security": [{ "embedToken": [] }], "requestBody": body("CreateWidgetRunRequest"), "responses": { "200": response("Run"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" } } } },
-            "/api/widget/runs/{run_id}/stop": { "post": { "summary": "Stop the active Turn associated with this widget token", "security": [{ "embedToken": [] }], "parameters": [id("run_id")], "responses": { "200": response("Run"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
+            "/api/client/access": { "post": { "summary": "Issue or replace one authenticated Client Access Credential", "description": "Trusted backends authenticate with Basic credentials. Origin is optional; when present and the App has an Origin allowlist it must match one exact scheme://host[:port] entry.", "security": [{ "integrationClientBasic": [] }], "parameters": [{ "name": "Origin", "in": "header", "required": false, "description": "Optional exact browser Origin. A missing Origin is accepted for trusted backend calls.", "schema": { "type": "string", "format": "uri" } }], "requestBody": body("CreateClientAccessRequest"), "responses": { "200": response("ClientAccessResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" } } } },
+            "/api/client/anonymous/access": { "post": { "summary": "Issue or replace one anonymous Client Access Credential", "description": "Anonymous access always requires an exact HTTP(S) Origin configured on the App; wildcard, path, query, and fragment values are rejected.", "security": [], "parameters": [{ "name": "Origin", "in": "header", "required": true, "description": "Exact browser Origin matching the anonymous App allowlist.", "schema": { "type": "string", "format": "uri" } }], "requestBody": body("CreateAnonymousClientAccessRequest"), "responses": { "200": response("ClientAccessResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
+            "/api/client/renew": { "post": { "summary": "Rotate one Client Access Credential without changing its grant", "security": [{ "clientAccessBearer": [] }], "requestBody": body("RenewClientAccessRequest"), "responses": { "200": response("ClientAccessResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" } } } },
+            "/api/client/session": { "get": { "summary": "Get Client Access metadata and Agent", "security": [{ "clientAccessBearer": [] }], "responses": { "200": response("ClientSessionMetadata"), "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" } } } },
+            "/api/client/sessions": { "get": { "summary": "List history-enabled Sessions in this Client Access scope", "security": [{ "clientAccessBearer": [] }], "responses": { "200": list_response("ClientSessionSummary"), "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" } } } },
+            "/api/client/sessions/{session_id}/messages": { "get": { "summary": "Page messages from one exact Client Session", "security": [{ "clientAccessBearer": [] }], "parameters": [id("session_id"), { "name": "before_sequence", "in": "query", "required": false, "schema": { "type": "integer", "format": "int64", "minimum": 1 } }, { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "format": "int64", "minimum": 1, "maximum": 100 } }], "responses": { "200": list_response("HubSessionMessage"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
+            "/api/client/sessions/{session_id}/events": { "get": { "summary": "List typed events from one exact Client Session", "security": [{ "clientAccessBearer": [] }], "parameters": [id("session_id")], "responses": { "200": list_response("ClientSessionEvent"), "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
+            "/api/client/sessions/{session_id}/events/stream": { "get": { "summary": "Resume the typed event stream for one exact Client Session", "security": [{ "clientAccessBearer": [] }], "parameters": [id("session_id"), { "name": "after", "in": "query", "required": false, "schema": { "type": "integer", "format": "int64", "minimum": 0 } }], "responses": { "200": { "description": "SSE frames whose data is a ClientSessionEvent JSON object", "content": { "text/event-stream": { "schema": { "type": "string" } } } }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
+            "/api/client/runs": { "post": { "summary": "Send a message, creating a Session only for the first accepted message", "security": [{ "clientAccessBearer": [] }], "requestBody": body("CreateClientRunRequest"), "responses": { "200": response("Run"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
+            "/api/client/runs/{run_id}/stop": { "post": { "summary": "Stop an active Run in this Client Access scope", "security": [{ "clientAccessBearer": [] }], "parameters": [id("run_id")], "responses": { "200": response("Run"), "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
+            "/api/client/tool-calls/{tool_call_id}/claim": { "post": { "summary": "Atomically claim one Run-bound Client Tool call", "security": [{ "clientAccessBearer": [] }], "parameters": [id("tool_call_id")], "responses": { "200": response("ClientToolClaimResponse"), "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" }, "410": { "$ref": "#/components/responses/Gone" } } } },
+            "/api/client/tool-calls/{tool_call_id}/result": { "post": { "summary": "Submit one structured Client Tool result", "security": [{ "clientAccessBearer": [] }], "parameters": [id("tool_call_id")], "requestBody": body("SubmitClientToolResultRequest"), "responses": { "200": response("SubmitClientToolResultResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "description": "A different result was already accepted for this tool_call_id" }, "410": { "$ref": "#/components/responses/Gone" } } } },
+            "/api/widget/access": { "post": { "summary": "Issue a short-lived Widget credential for one trusted external user", "deprecated": true, "security": [{ "integrationClientBasic": [] }], "requestBody": body("CreateWidgetAccessRequest"), "responses": { "200": response("WidgetAccessResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" } } } },
+            "/api/widget/public/access": { "post": { "summary": "Issue or renew an anonymous public Widget credential", "deprecated": true, "security": [], "requestBody": body("CreatePublicWidgetAccessRequest"), "responses": { "200": response("PublicWidgetAccessResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
+            "/api/widget/session": { "get": { "summary": "Get Widget credential metadata and Agent", "deprecated": true, "security": [{ "embedToken": [] }], "responses": { "200": response("WidgetSession"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
+            "/api/widget/session/renew": { "post": { "summary": "Rotate one external Widget credential in place", "deprecated": true, "security": [{ "embedToken": [] }], "requestBody": body("RenewWidgetSessionRequest"), "responses": { "200": response("WidgetTokenResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" } } } },
+            "/api/widget/sessions": { "get": { "summary": "List history enabled Sessions in the exact external Widget scope", "deprecated": true, "security": [{ "embedToken": [] }], "responses": { "200": list_response("WidgetHistorySession"), "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" } } } },
+            "/api/widget/sessions/{session_id}/messages": { "get": { "summary": "List one exact external Widget Session's messages", "deprecated": true, "security": [{ "embedToken": [] }], "parameters": [id("session_id"), { "name": "before_sequence", "in": "query", "required": false, "schema": { "type": "integer", "format": "int64", "minimum": 1 } }, { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "format": "int64", "minimum": 1, "maximum": 100 } }], "responses": { "200": list_response("HubSessionMessage"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
+            "/api/widget/sessions/{session_id}/events": { "get": { "summary": "List one exact external Widget Session's Run events", "deprecated": true, "security": [{ "embedToken": [] }], "parameters": [id("session_id")], "responses": { "200": list_response("RunEvent"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
+            "/api/widget/sessions/{session_id}/events/stream": { "get": { "summary": "Stream one exact external Widget Session's Run events", "deprecated": true, "security": [{ "embedToken": [] }], "parameters": [id("session_id")], "responses": { "200": { "description": "Server-sent event stream", "content": { "text/event-stream": { "schema": { "type": "string" } } } }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
+            "/api/widget/runs": { "post": { "summary": "Create widget run", "deprecated": true, "security": [{ "embedToken": [] }], "requestBody": body("CreateWidgetRunRequest"), "responses": { "200": response("Run"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" } } } },
+            "/api/widget/runs/{run_id}/stop": { "post": { "summary": "Stop the active Turn associated with this widget token", "deprecated": true, "security": [{ "embedToken": [] }], "parameters": [id("run_id")], "responses": { "200": response("Run"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/oauth/authorize": { "get": { "summary": "Authorize Integration App for an existing external identity", "security": [{ "sessionCookie": [] }], "parameters": [{ "name": "client_id", "in": "query", "required": true, "schema": { "type": "string" } }, { "name": "redirect_uri", "in": "query", "required": true, "schema": { "type": "string", "format": "uri" } }, { "name": "state", "in": "query", "required": false, "schema": { "type": "string" } }, { "name": "scope", "in": "query", "required": false, "schema": { "type": "string" } }, { "name": "external_user_id", "in": "query", "required": true, "schema": { "type": "string" } }, { "name": "tenant_id", "in": "query", "required": true, "schema": { "type": "string" } }], "responses": { "303": { "description": "Redirect with authorization code" }, "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" } } } },
             "/api/oauth/token": { "post": { "summary": "Issue authorization_code or client_credentials access token", "security": [], "requestBody": { "required": true, "content": { "application/x-www-form-urlencoded": { "schema": { "$ref": "#/components/schemas/OAuthTokenRequest" } } } }, "responses": { "200": response("OAuthTokenResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" } } } },
             "/api/oauth/userinfo": { "get": { "summary": "Get scoped OAuth user information", "security": [{ "integrationBearer": [] }], "responses": { "200": response("OAuthUserInfo"), "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" } } } },
@@ -1025,6 +1074,7 @@ fn openapi_document() -> Value {
                 "runtimeEnrollmentBearer": { "type": "http", "scheme": "bearer", "bearerFormat": "One-time Runtime enrollment token (ahre_)" },
                 "runtimeBearer": { "type": "http", "scheme": "bearer", "bearerFormat": "Per-Runtime credential (ahrc_)" },
                 "modelProxyBearer": { "type": "http", "scheme": "bearer", "bearerFormat": "Run-scoped model proxy token (ahr_)" },
+                "clientAccessBearer": { "type": "http", "scheme": "bearer", "bearerFormat": "Opaque Client Access Credential (ahw_ or ahp_)" },
                 "integrationClientBasic": { "type": "http", "scheme": "basic", "description": "Integration App client_id and client_secret." },
                 "sessionCookie": { "type": "apiKey", "in": "cookie", "name": "agent_hub_session", "description": "HttpOnly browser session cookie issued by password or OIDC login." },
                 "embedToken": { "type": "apiKey", "in": "header", "name": "X-Agent-Hub-Embed-Token" },
@@ -1035,7 +1085,8 @@ fn openapi_document() -> Value {
                 "Unauthorized": { "description": "Missing or invalid credential", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
                 "Forbidden": { "description": "Insufficient permission", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
                 "Conflict": { "description": "Resource already exists", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
-                "NotFound": { "description": "Resource not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+                "NotFound": { "description": "Resource not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+                "Gone": { "description": "Resource reached a terminal state", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
             },
             "schemas": openapi_schemas()
         }
@@ -1158,6 +1209,12 @@ fn openapi_schemas() -> Value {
         "CreateHubSessionMessageRequest": { "type": "object", "required": ["content"], "properties": { "content": { "type": "string" }, "payload": {}, "delivery_mode": { "type": ["string", "null"] }, "client_message_key": { "type": ["string", "null"] }, "parent_run_id": { "anyOf": [uuid(), { "type": "null" }] } } },
         "SessionMessageAcceptance": { "type": "object", "required": ["message", "run"], "properties": { "message": { "$ref": "#/components/schemas/HubSessionMessage" }, "run": { "anyOf": [{ "$ref": "#/components/schemas/Run" }, { "type": "null" }] } } },
         "RunEvent": { "type": "object", "required": ["seq", "event_id", "run_id", "event_type", "payload", "created_at"], "properties": { "seq": { "type": "integer" }, "event_id": uuid(), "run_id": uuid(), "event_type": { "type": "string" }, "role": { "type": ["string", "null"] }, "content": { "type": ["string", "null"] }, "payload": {}, "created_at": { "type": "string", "format": "date-time" } } },
+        "ClientToolRequestEvent": { "allOf": [{ "$ref": "#/components/schemas/RunEvent" }, { "type": "object", "properties": { "event_type": { "type": "string", "const": "tool_request" }, "payload": { "type": "object", "additionalProperties": false, "required": ["tool_call_id", "tool_name", "arguments", "batch_id", "expires_at"], "properties": { "tool_call_id": uuid(), "tool_name": { "type": "string" }, "arguments": {}, "batch_id": uuid(), "expires_at": { "type": "string", "format": "date-time" } } } } }] },
+        "ClientToolResultEvent": { "allOf": [{ "$ref": "#/components/schemas/RunEvent" }, { "type": "object", "properties": { "event_type": { "type": "string", "const": "client_tool_result" }, "payload": { "type": "object", "additionalProperties": false, "required": ["tool_call_id", "tool_name", "result", "elapsed_ms"], "properties": { "tool_call_id": uuid(), "tool_name": { "type": "string" }, "result": { "$ref": "#/components/schemas/ClientToolResult" }, "elapsed_ms": { "type": "integer", "format": "int64", "minimum": 0 } } } } }] },
+        "ClientToolTimeoutEvent": { "allOf": [{ "$ref": "#/components/schemas/RunEvent" }, { "type": "object", "properties": { "event_type": { "type": "string", "const": "client_tool_timeout" }, "payload": { "type": "object", "additionalProperties": false, "required": ["tool_call_id", "tool_name", "status", "message"], "properties": { "tool_call_id": uuid(), "tool_name": { "type": "string" }, "status": { "type": "string", "const": "timed_out" }, "message": { "type": "string" } } } } }] },
+        "ClientToolErrorEvent": { "allOf": [{ "$ref": "#/components/schemas/RunEvent" }, { "type": "object", "properties": { "event_type": { "type": "string", "const": "client_tool_interrupted" }, "payload": { "type": "object", "additionalProperties": false, "required": ["tool_call_id", "tool_name", "status", "message"], "properties": { "tool_call_id": uuid(), "tool_name": { "type": "string" }, "status": { "type": "string", "enum": ["unknown", "cancelled"] }, "message": { "type": "string" } } } } }] },
+        "ClientGenericSessionEvent": { "allOf": [{ "$ref": "#/components/schemas/RunEvent" }, { "type": "object", "properties": { "event_type": { "type": "string", "not": { "enum": ["tool_request", "client_tool_result", "client_tool_timeout", "client_tool_interrupted"] } } } }] },
+        "ClientSessionEvent": { "oneOf": [{ "$ref": "#/components/schemas/ClientToolRequestEvent" }, { "$ref": "#/components/schemas/ClientToolResultEvent" }, { "$ref": "#/components/schemas/ClientToolTimeoutEvent" }, { "$ref": "#/components/schemas/ClientToolErrorEvent" }, { "$ref": "#/components/schemas/ClientGenericSessionEvent" }] },
         "Skill": { "type": "object", "required": ["id", "owner_id", "name", "description", "content", "revision", "content_checksum_sha256", "package", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": uuid(), "name": { "type": "string" }, "description": { "type": "string" }, "content": { "type": "string" }, "revision": { "type": "integer", "minimum": 1 }, "content_checksum_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "package": { "anyOf": [{ "$ref": "#/components/schemas/SkillPackage" }, { "type": "null" }] }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
         "SkillPackage": { "type": "object", "additionalProperties": false, "required": ["id", "format_version", "size_bytes", "checksum_sha256", "files"], "properties": { "id": uuid(), "format_version": { "type": "integer", "enum": [1] }, "size_bytes": { "type": "integer", "minimum": 1, "maximum": 268435456 }, "checksum_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "files": { "type": "array", "maxItems": 1024, "items": { "$ref": "#/components/schemas/SkillPackageFile" } } } },
         "SkillPackageFile": { "type": "object", "additionalProperties": false, "required": ["path", "size_bytes", "checksum_sha256", "executable"], "properties": { "path": { "type": "string" }, "size_bytes": { "type": "integer", "minimum": 0 }, "checksum_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "executable": { "type": "boolean" } } },
@@ -1200,7 +1257,7 @@ fn openapi_schemas() -> Value {
         "AgentExecutionSkill": { "type": "object", "additionalProperties": false, "required": ["source", "source_id", "name", "description", "content", "revision", "content_checksum_sha256", "package"], "properties": { "source": { "type": "string", "enum": ["managed"] }, "source_id": { "anyOf": [uuid(), { "type": "null" }] }, "name": { "type": "string" }, "description": { "type": "string" }, "content": { "type": "string" }, "revision": { "type": "integer", "minimum": 1 }, "content_checksum_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "package": { "anyOf": [{ "$ref": "#/components/schemas/SkillPackage" }, { "type": "null" }] } } },
         "AppendRunEventRequest": { "type": "object", "required": ["event_type", "role", "content", "payload", "waiting_tool"], "properties": { "event_type": { "type": "string" }, "role": { "type": ["string", "null"] }, "content": { "type": ["string", "null"] }, "payload": {}, "waiting_tool": { "anyOf": [{ "$ref": "#/components/schemas/WaitingToolRunTransition" }, { "type": "null" }] } } },
         "WaitingToolRunTransition": { "type": "object", "required": ["native_session_id", "work_dir_ref"], "properties": { "native_session_id": { "type": "string" }, "work_dir_ref": { "type": "string" } } },
-        "FinalizeToolRequestsRequest": { "type": "object", "required": ["integration_session_id", "native_session_id", "work_dir_ref", "tool_requests"], "properties": { "integration_session_id": uuid(), "native_session_id": { "type": "string" }, "work_dir_ref": { "type": "string" }, "tool_requests": { "type": "array", "items": { "type": "object" } } } },
+        "FinalizeToolRequestsRequest": { "type": "object", "required": ["native_session_id", "work_dir_ref", "tool_requests"], "properties": { "integration_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "native_session_id": { "type": "string" }, "work_dir_ref": { "type": "string" }, "tool_requests": { "type": "array", "items": { "type": "object" } } } },
         "CompleteRuntimeSessionCommandRequest": { "type": "object", "additionalProperties": false, "required": ["command", "outcome", "revision", "fingerprint"], "properties": { "command": { "type": "string", "enum": ["steer", "interrupt", "refresh_configuration"] }, "outcome": { "type": "string", "enum": ["applied", "turn_ended", "failed", "interrupted"] }, "revision": { "type": ["integer", "null"], "minimum": 1 }, "fingerprint": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" } } },
         "CompleteRuntimeSessionCommandResponse": { "type": "object", "additionalProperties": false, "required": ["command_id", "outcome"], "properties": { "command_id": uuid(), "outcome": { "type": "string", "enum": ["applied", "turn_ended", "failed", "interrupted"] } } },
         "CompleteRunRequest": { "type": "object", "required": ["status", "native_session_id", "work_dir_ref"], "properties": { "status": { "type": "string", "enum": ["completed", "failed", "waiting_tool", "interrupted"] }, "native_session_id": { "type": ["string", "null"] }, "work_dir_ref": { "type": ["string", "null"] } } },
@@ -1224,19 +1281,32 @@ fn openapi_schemas() -> Value {
         "TokenResponse": { "type": "object", "required": ["token"], "properties": { "token": { "type": "string" } } },
         "WidgetAgent": { "type": "object", "required": ["id", "name", "instructions"], "properties": { "id": uuid(), "name": { "type": "string" }, "instructions": { "type": "string" } } },
         "WidgetUserProfile": { "type": "object", "additionalProperties": false, "properties": { "username": { "type": ["string", "null"] }, "display_name": { "type": ["string", "null"] }, "email": { "type": ["string", "null"], "format": "email" }, "attributes": { "type": "object", "additionalProperties": true, "default": {} } } },
-        "CreateWidgetAccessRequest": { "type": "object", "additionalProperties": false, "required": ["agent_id", "external_user_id", "tenant_id"], "properties": { "agent_id": uuid(), "external_user_id": { "type": "string" }, "tenant_id": { "type": "string" }, "username": { "type": ["string", "null"] }, "display_name": { "type": ["string", "null"] }, "email": { "type": ["string", "null"], "format": "email" }, "attributes": { "type": "object", "additionalProperties": true, "default": {} } } },
+        "ClientToolDefinition": { "type": "object", "additionalProperties": false, "required": ["name", "description", "input_schema"], "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_-]+$" }, "description": { "type": "string" }, "input_schema": { "type": "object" } } },
+        "ClientToolError": { "type": "object", "additionalProperties": false, "required": ["code", "message", "retryable"], "properties": { "code": { "type": "string" }, "message": { "type": "string" }, "retryable": { "type": "boolean" } } },
+        "ClientToolResult": { "oneOf": [{ "type": "object", "additionalProperties": false, "required": ["status", "output"], "properties": { "status": { "type": "string", "const": "success" }, "output": {} } }, { "type": "object", "additionalProperties": false, "required": ["status", "error"], "properties": { "status": { "type": "string", "const": "error" }, "error": { "$ref": "#/components/schemas/ClientToolError" } } }] },
+        "ClientToolClaimResponse": { "type": "object", "additionalProperties": false, "required": ["status", "terminal"], "properties": { "status": { "type": "string", "enum": ["claimed", "completed", "timed_out", "unknown", "cancelled"] }, "terminal": { "type": "boolean" }, "result": { "anyOf": [{ "$ref": "#/components/schemas/ClientToolResult" }, { "type": "null" }] } } },
+        "SubmitClientToolResultRequest": { "type": "object", "additionalProperties": false, "required": ["result"], "properties": { "result": { "$ref": "#/components/schemas/ClientToolResult" } } },
+        "SubmitClientToolResultResponse": { "type": "object", "additionalProperties": false, "required": ["run", "tool_request"], "properties": { "run": { "anyOf": [{ "$ref": "#/components/schemas/Run" }, { "type": "null" }] }, "tool_request": { "type": "object" } } },
+        "CreateWidgetAccessRequest": { "type": "object", "additionalProperties": false, "required": ["agent_id", "client_instance_id", "external_user_id", "tenant_id"], "properties": { "agent_id": uuid(), "client_instance_id": uuid(), "external_user_id": { "type": "string" }, "tenant_id": { "type": "string" }, "username": { "type": ["string", "null"] }, "display_name": { "type": ["string", "null"] }, "email": { "type": ["string", "null"], "format": "email" }, "attributes": { "type": "object", "additionalProperties": true, "default": {} }, "client_tools": { "type": "array", "maxItems": 128, "items": { "$ref": "#/components/schemas/ClientToolDefinition" }, "default": [] } } },
+        "CreateClientAccessRequest": { "type": "object", "additionalProperties": false, "required": ["agent_id", "client_instance_id", "external_user_id", "tenant_id"], "properties": { "agent_id": uuid(), "client_instance_id": uuid(), "external_user_id": { "type": "string" }, "tenant_id": { "type": "string" }, "username": { "type": ["string", "null"] }, "display_name": { "type": ["string", "null"] }, "email": { "type": ["string", "null"], "format": "email" }, "attributes": { "type": "object", "additionalProperties": true, "default": {} }, "client_tools": { "type": "array", "maxItems": 128, "items": { "$ref": "#/components/schemas/ClientToolDefinition" }, "default": [] } } },
         "WidgetSession": { "type": "object", "required": ["id", "name", "instructions"], "properties": { "id": uuid(), "name": { "type": "string" }, "instructions": { "type": "string" }, "expires_at": { "type": "string", "format": "date-time" }, "history_enabled": { "type": "boolean" } } },
         "WidgetAccessResponse": { "type": "object", "additionalProperties": false, "required": ["token", "expires_at", "agent", "history_enabled"], "properties": { "token": { "type": "string" }, "expires_at": { "type": "string", "format": "date-time" }, "agent": { "$ref": "#/components/schemas/WidgetAgent" }, "history_enabled": { "type": "boolean" } } },
-        "CreatePublicWidgetAccessRequest": { "type": "object", "additionalProperties": false, "required": ["client_id", "visitor_key"], "properties": { "client_id": { "type": "string", "minLength": 1 }, "visitor_key": { "type": "string", "minLength": 16, "maxLength": 512 } } },
+        "ClientAccessResponse": { "type": "object", "additionalProperties": false, "required": ["access_token", "expires_at", "expires_in", "client_instance_id", "session_id", "agent", "history_enabled", "tool_names"], "properties": { "access_token": { "type": "string" }, "expires_at": { "type": "string", "format": "date-time" }, "expires_in": { "type": "integer", "minimum": 1 }, "client_instance_id": uuid(), "session_id": { "anyOf": [uuid(), { "type": "null" }] }, "agent": { "$ref": "#/components/schemas/WidgetAgent" }, "history_enabled": { "type": "boolean" }, "tool_names": { "type": "array", "uniqueItems": true, "items": { "type": "string" } } } },
+        "CreatePublicWidgetAccessRequest": { "type": "object", "additionalProperties": false, "required": ["client_id", "visitor_key", "client_instance_id"], "properties": { "client_id": { "type": "string", "minLength": 1 }, "visitor_key": { "type": "string", "minLength": 16, "maxLength": 512 }, "client_instance_id": uuid(), "session_id": { "anyOf": [uuid(), { "type": "null" }] } } },
+        "CreateAnonymousClientAccessRequest": { "type": "object", "additionalProperties": false, "required": ["client_id", "visitor_key", "client_instance_id"], "properties": { "client_id": { "type": "string", "minLength": 1 }, "visitor_key": { "type": "string", "minLength": 16, "maxLength": 512 }, "client_instance_id": uuid(), "session_id": { "anyOf": [uuid(), { "type": "null" }] } } },
         "PublicWidgetAccessResponse": { "type": "object", "additionalProperties": false, "required": ["token", "expires_at", "widget_session_id", "hub_session_id", "agent"], "properties": { "token": { "type": "string" }, "expires_at": { "type": "string", "format": "date-time" }, "widget_session_id": uuid(), "hub_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "agent": { "$ref": "#/components/schemas/WidgetAgent" } } },
         "RenewWidgetSessionRequest": { "type": "object", "additionalProperties": false, "properties": { "profile": { "anyOf": [{ "$ref": "#/components/schemas/WidgetUserProfile" }, { "type": "null" }] } } },
+        "RenewClientAccessRequest": { "type": "object", "additionalProperties": false, "properties": { "profile": { "anyOf": [{ "$ref": "#/components/schemas/WidgetUserProfile" }, { "type": "null" }] } } },
         "WidgetTokenResponse": { "type": "object", "additionalProperties": false, "required": ["token", "expires_at"], "properties": { "token": { "type": "string" }, "expires_at": { "type": "string", "format": "date-time" } } },
         "WidgetHistorySession": { "type": "object", "additionalProperties": false, "required": ["id", "hub_session_id", "created_at", "updated_at", "preview"], "properties": { "id": uuid(), "hub_session_id": uuid(), "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" }, "preview": { "type": ["string", "null"] } } },
-        "CreateWidgetRunRequest": { "type": "object", "additionalProperties": false, "required": ["message"], "properties": { "message": { "type": "string" }, "integration_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "hub_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "parent_run_id": { "anyOf": [uuid(), { "type": "null" }] }, "client_message_key": { "type": ["string", "null"] } } },
-        "IntegrationApp": { "type": "object", "additionalProperties": false, "required": ["id", "owner_id", "name", "client_id", "external_platform_id", "authentication_channel_id", "redirect_uris", "agent_ids", "widget_history_enabled", "login_required", "allowed_origins", "tool_allowlist", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": uuid(), "name": { "type": "string" }, "client_id": { "type": "string" }, "external_platform_id": uuid(), "authentication_channel_id": uuid(), "redirect_uris": { "type": "array", "items": { "type": "string", "format": "uri" } }, "agent_ids": { "type": "array", "items": uuid() }, "widget_history_enabled": { "type": "boolean" }, "login_required": { "type": "boolean", "default": true }, "allowed_origins": { "type": "array", "items": { "type": "string", "format": "uri" } }, "tool_allowlist": { "anyOf": [{ "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/components/schemas/AgentToolName" } }, { "type": "null" }] }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
+        "ClientSessionMetadata": { "type": "object", "additionalProperties": false, "required": ["id", "name", "instructions"], "properties": { "id": uuid(), "name": { "type": "string" }, "instructions": { "type": "string" }, "expires_at": { "type": "string", "format": "date-time" }, "history_enabled": { "type": "boolean" } } },
+        "ClientSessionSummary": { "type": "object", "additionalProperties": false, "required": ["id", "hub_session_id", "created_at", "updated_at", "preview"], "properties": { "id": uuid(), "hub_session_id": uuid(), "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" }, "preview": { "type": ["string", "null"] } } },
+        "CreateWidgetRunRequest": { "type": "object", "additionalProperties": false, "required": ["message"], "properties": { "message": { "type": "string" }, "session_id": { "anyOf": [uuid(), { "type": "null" }] }, "integration_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "hub_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "parent_run_id": { "anyOf": [uuid(), { "type": "null" }] }, "client_message_key": { "type": ["string", "null"] } } },
+        "CreateClientRunRequest": { "type": "object", "additionalProperties": false, "required": ["message"], "properties": { "message": { "type": "string" }, "session_id": { "anyOf": [uuid(), { "type": "null" }] }, "client_message_key": { "type": ["string", "null"] } } },
+        "IntegrationApp": { "type": "object", "additionalProperties": false, "required": ["id", "owner_id", "name", "client_id", "external_platform_id", "authentication_channel_id", "redirect_uris", "agent_ids", "widget_history_enabled", "login_required", "allowed_origins", "tool_allowlist", "client_tool_definitions", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": uuid(), "name": { "type": "string" }, "client_id": { "type": "string" }, "external_platform_id": uuid(), "authentication_channel_id": uuid(), "redirect_uris": { "type": "array", "items": { "type": "string", "format": "uri" } }, "agent_ids": { "type": "array", "items": uuid() }, "widget_history_enabled": { "type": "boolean" }, "login_required": { "type": "boolean", "default": true }, "allowed_origins": { "type": "array", "items": { "type": "string", "format": "uri" } }, "tool_allowlist": { "anyOf": [{ "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/components/schemas/AgentToolName" } }, { "type": "null" }] }, "client_tool_definitions": { "type": "array", "maxItems": 128, "items": { "$ref": "#/components/schemas/ClientToolDefinition" } }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
         "IntegrationAppSecretResponse": { "type": "object", "additionalProperties": false, "required": ["integration_app", "client_secret"], "properties": { "integration_app": { "$ref": "#/components/schemas/IntegrationApp" }, "client_secret": { "type": "string", "description": "Shown only in this create or rotate response." } } },
-        "CreateIntegrationAppRequest": { "type": "object", "additionalProperties": false, "required": ["name", "external_platform_id", "authentication_channel_id", "redirect_uris", "agent_ids"], "properties": { "name": { "type": "string" }, "external_platform_id": uuid(), "authentication_channel_id": uuid(), "redirect_uris": { "type": "array", "items": { "type": "string", "format": "uri" } }, "agent_ids": { "type": "array", "maxItems": 100, "uniqueItems": true, "items": uuid() }, "widget_history_enabled": { "type": "boolean", "default": false }, "login_required": { "type": "boolean", "default": true }, "allowed_origins": { "type": "array", "items": { "type": "string", "format": "uri" }, "default": [] }, "tool_allowlist": { "anyOf": [{ "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/components/schemas/AgentToolName" } }, { "type": "null" }], "default": null } } },
-        "UpdateIntegrationAppRequest": { "type": "object", "additionalProperties": false, "required": ["name", "redirect_uris", "agent_ids"], "properties": { "name": { "type": "string" }, "redirect_uris": { "type": "array", "items": { "type": "string", "format": "uri" } }, "agent_ids": { "type": "array", "maxItems": 100, "uniqueItems": true, "items": uuid() }, "widget_history_enabled": { "type": "boolean", "default": false }, "login_required": { "type": "boolean", "default": true }, "allowed_origins": { "type": "array", "items": { "type": "string", "format": "uri" }, "default": [] }, "tool_allowlist": { "anyOf": [{ "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/components/schemas/AgentToolName" } }, { "type": "null" }], "default": null } } },
+        "CreateIntegrationAppRequest": { "type": "object", "additionalProperties": false, "required": ["name", "external_platform_id", "authentication_channel_id", "redirect_uris", "agent_ids"], "properties": { "name": { "type": "string" }, "external_platform_id": uuid(), "authentication_channel_id": uuid(), "redirect_uris": { "type": "array", "items": { "type": "string", "format": "uri" } }, "agent_ids": { "type": "array", "maxItems": 100, "uniqueItems": true, "items": uuid() }, "widget_history_enabled": { "type": "boolean", "default": false }, "login_required": { "type": "boolean", "default": true }, "allowed_origins": { "type": "array", "items": { "type": "string", "format": "uri" }, "default": [] }, "tool_allowlist": { "anyOf": [{ "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/components/schemas/AgentToolName" } }, { "type": "null" }], "default": null }, "client_tool_definitions": { "type": "array", "maxItems": 128, "items": { "$ref": "#/components/schemas/ClientToolDefinition" }, "default": [] } } },
+        "UpdateIntegrationAppRequest": { "type": "object", "additionalProperties": false, "required": ["name", "redirect_uris", "agent_ids"], "properties": { "name": { "type": "string" }, "redirect_uris": { "type": "array", "items": { "type": "string", "format": "uri" } }, "agent_ids": { "type": "array", "maxItems": 100, "uniqueItems": true, "items": uuid() }, "widget_history_enabled": { "type": "boolean", "default": false }, "login_required": { "type": "boolean", "default": true }, "allowed_origins": { "type": "array", "items": { "type": "string", "format": "uri" }, "default": [] }, "tool_allowlist": { "anyOf": [{ "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/components/schemas/AgentToolName" } }, { "type": "null" }], "default": null }, "client_tool_definitions": { "type": "array", "maxItems": 128, "items": { "$ref": "#/components/schemas/ClientToolDefinition" }, "default": [] } } },
         "OAuthTokenRequest": { "oneOf": [
             { "type": "object", "additionalProperties": false, "required": ["grant_type", "client_id", "client_secret", "code", "redirect_uri"], "properties": { "grant_type": { "type": "string", "const": "authorization_code" }, "client_id": { "type": "string" }, "client_secret": { "type": "string" }, "code": { "type": "string" }, "redirect_uri": { "type": "string", "format": "uri" }, "scope": { "type": "string" } } },
             { "type": "object", "additionalProperties": false, "required": ["grant_type", "client_id", "client_secret", "scope"], "properties": { "grant_type": { "type": "string", "const": "client_credentials" }, "client_id": { "type": "string" }, "client_secret": { "type": "string" }, "scope": { "type": "string" } } }
@@ -1857,7 +1927,7 @@ async fn begin_user_erasure(
     .await?;
     sqlx::query(
         "UPDATE integration_tool_requests AS request
-         SET status = 'failed', responded_at = COALESCE(responded_at, now())
+         SET status = 'cancelled', responded_at = COALESCE(responded_at, now())
          FROM integration_sessions AS integration
          WHERE request.session_id = integration.id
            AND (integration.owner_id = $1 OR integration.agent_id = ANY($2))
@@ -4878,7 +4948,7 @@ async fn delete_agent(
             .await?;
         sqlx::query(
             "UPDATE integration_tool_requests AS requests
-             SET status = 'failed', responded_at = COALESCE(responded_at, now())
+             SET status = 'cancelled', responded_at = COALESCE(responded_at, now())
              FROM integration_sessions AS integration
              WHERE requests.session_id = integration.id
                AND integration.agent_id = $1
@@ -5158,6 +5228,7 @@ async fn create_integration_app(
         .as_deref()
         .map(normalize_agent_tool_allowlist)
         .transpose()?;
+    let client_tool_definitions = validate_client_tool_definitions(&req.client_tool_definitions)?;
     validate_public_widget_settings(
         req.login_required,
         req.widget_history_enabled,
@@ -5183,8 +5254,9 @@ async fn create_integration_app(
         "INSERT INTO oauth_apps
               (id, agent_id, owner_id, name, client_id, client_secret_hash,
               redirect_uris, external_platform_id, authentication_channel_id,
-              widget_history_enabled, login_required, allowed_origins, tool_allowlist)
-         VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+              widget_history_enabled, login_required, allowed_origins, tool_allowlist,
+              client_tool_definitions)
+         VALUES ($1, NULL, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
     )
     .bind(app_id)
     .bind(user.id)
@@ -5207,6 +5279,7 @@ async fn create_integration_app(
             .transpose()
             .map_err(|_| ApiError::internal("App tool policy could not be encoded"))?,
     )
+    .bind(client_tool_definitions)
     .execute(&mut *tx)
     .await?;
     replace_integration_app_agents_tx(&mut tx, app_id, &req.agent_ids).await?;
@@ -5231,6 +5304,7 @@ async fn update_integration_app(
         .as_deref()
         .map(normalize_agent_tool_allowlist)
         .transpose()?;
+    let client_tool_definitions = validate_client_tool_definitions(&req.client_tool_definitions)?;
     validate_public_widget_settings(
         req.login_required,
         req.widget_history_enabled,
@@ -5259,8 +5333,9 @@ async fn update_integration_app(
         "UPDATE oauth_apps
          SET name = $1, redirect_uris = $2, widget_history_enabled = $3,
              login_required = $4, allowed_origins = $5, tool_allowlist = $6,
+             client_tool_definitions = $7,
              updated_at = now()
-         WHERE id = $7 AND owner_id = $8",
+         WHERE id = $8 AND owner_id = $9",
     )
     .bind(req.name.trim())
     .bind(req.redirect_uris)
@@ -5277,6 +5352,7 @@ async fn update_integration_app(
             .transpose()
             .map_err(|_| ApiError::internal("App tool policy could not be encoded"))?,
     )
+    .bind(client_tool_definitions)
     .bind(app_id)
     .bind(user.id)
     .execute(&mut *tx)
@@ -7826,19 +7902,56 @@ async fn exchange_embed_jwt(
     Ok(Json(CreateEmbedSessionResponse { token }))
 }
 
+async fn create_client_access(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<CreateWidgetAccessRequest>,
+) -> Result<Json<ClientAccessResponse>, ApiError> {
+    let (access, _) = issue_authenticated_client_access(&state, &headers, req).await?;
+    Ok(Json(access))
+}
+
 async fn create_widget_access(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<CreateWidgetAccessRequest>,
 ) -> Result<Json<WidgetAccessResponse>, ApiError> {
+    let (access, _) = issue_authenticated_client_access(&state, &headers, req).await?;
+    Ok(Json(WidgetAccessResponse {
+        token: access.access_token,
+        expires_at: access.expires_at,
+        agent: access.agent,
+        history_enabled: access.history_enabled,
+    }))
+}
+
+async fn issue_authenticated_client_access(
+    state: &AppState,
+    headers: &HeaderMap,
+    req: CreateWidgetAccessRequest,
+) -> Result<(ClientAccessResponse, Uuid), ApiError> {
     let (client_id, client_secret) = widget_client_credentials(&headers)?;
-    let app = load_oauth_app_by_client_id(&state.pool, &client_id).await?;
+    if req.client_instance_id.is_nil() {
+        return Err(ApiError::bad_request(
+            "valid Client Instance id is required",
+        ));
+    }
+    let client_tool_definitions = validate_client_tool_definitions(&req.client_tools)?;
+    let requires_integration_tool = !req.client_tools.is_empty();
+    let tool_names = req
+        .client_tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect();
+    let mut tx = state.pool.begin().await?;
+    let app = load_oauth_app_by_client_id_tx(&mut tx, &client_id).await?;
     if !constant_time_eq(
         app.client_secret_hash.as_bytes(),
         sha256_hex(&client_secret).as_bytes(),
     ) {
         return Err(ApiError::unauthorized("invalid oauth client"));
     }
+    validate_client_request_origin(headers, &app.allowed_origins, false)?;
     let tenant_id = require_origin_tenant(Some(&req.tenant_id))?;
     let external_user_id = normalize_external_user_id(&req.external_user_id)?;
     let profile = normalize_widget_user_profile(WidgetUserProfileDto {
@@ -7847,7 +7960,6 @@ async fn create_widget_access(
         email: req.email,
         attributes: req.attributes,
     })?;
-    let mut tx = state.pool.begin().await?;
     require_integration_authentication_channel_tx(
         &mut tx,
         app.external_platform_id,
@@ -7856,21 +7968,24 @@ async fn create_widget_access(
     .await?;
     validate_oauth_agent_scopes_tx(&mut tx, &app, &[format!("agent:{}", req.agent_id)], None)
         .await?;
-    let agent_owner_id: Uuid = sqlx::query_scalar(
-        "SELECT agent.owner_id
+    let agent = sqlx::query(
+        "SELECT agent.id, agent.owner_id, agent.name, agent.instructions
          FROM integration_app_agents AS delegated
          JOIN agents AS agent ON agent.id = delegated.agent_id
          WHERE delegated.app_id = $1 AND delegated.agent_id = $2
            AND agent.deleted_at IS NULL
-         FOR UPDATE OF agent",
+           AND ($3::boolean = false OR agent.tool_allowlist ? 'integration')
+         FOR UPDATE OF agent, delegated",
     )
     .bind(app.id)
     .bind(req.agent_id)
+    .bind(requires_integration_tool)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(ApiError::forbidden(
         "oauth agent scope is not currently delegated",
     ))?;
+    let agent_owner_id: Uuid = agent.get("owner_id");
     lock_active_integration_agent_tx(&mut tx, req.agent_id, agent_owner_id).await?;
     let resolved = resolve_external_identity_tx(
         &mut tx,
@@ -7892,8 +8007,8 @@ async fn create_widget_access(
         attributes: profile.attributes,
     };
     let token = format!("ahw_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-    let expires_at = Utc::now() + ChronoDuration::minutes(15);
-    insert_widget_access_session_tx(
+    let expires_at = Utc::now() + ChronoDuration::seconds(CLIENT_ACCESS_TTL_SECONDS);
+    let credential_id = insert_widget_access_session_tx(
         &mut tx,
         WidgetAccessSessionInsert {
             oauth_app_id: app.id,
@@ -7901,46 +8016,89 @@ async fn create_widget_access(
             owner_id: resolved.user.id,
             external_identity_id: resolved.identity_id,
             external_user: &external_user,
+            client_instance_id: req.client_instance_id,
+            client_tool_definitions,
             token: &token,
             expires_at,
         },
     )
     .await?;
-    let agent = sqlx::query(
-        "SELECT id, name, instructions FROM agents WHERE id = $1 AND deleted_at IS NULL",
-    )
-    .bind(req.agent_id)
-    .fetch_one(&mut *tx)
-    .await?;
     tx.commit().await?;
-    Ok(Json(WidgetAccessResponse {
-        token,
-        expires_at,
-        agent: WidgetAgentDto {
-            id: agent.get("id"),
-            name: agent.get("name"),
-            instructions: agent.get("instructions"),
+    Ok((
+        ClientAccessResponse {
+            access_token: token,
+            expires_at,
+            expires_in: CLIENT_ACCESS_TTL_SECONDS,
+            client_instance_id: req.client_instance_id,
+            session_id: None,
+            agent: WidgetAgentDto {
+                id: agent.get("id"),
+                name: agent.get("name"),
+                instructions: agent.get("instructions"),
+            },
+            history_enabled: app.widget_history_enabled,
+            tool_names,
         },
-        history_enabled: app.widget_history_enabled,
-    }))
+        credential_id,
+    ))
+}
+
+async fn create_anonymous_client_access(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<CreatePublicWidgetAccessRequest>,
+) -> Result<Json<ClientAccessResponse>, ApiError> {
+    let (access, _) = issue_anonymous_client_access(&state, &headers, req).await?;
+    Ok(Json(access))
 }
 
 async fn create_public_widget_access(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<CreatePublicWidgetAccessRequest>,
 ) -> Result<Json<PublicWidgetAccessResponse>, ApiError> {
-    let app = load_public_widget_app_by_client_id(&state.pool, &req.client_id).await?;
+    let (access, widget_session_id) = issue_anonymous_client_access(&state, &headers, req).await?;
+    Ok(Json(PublicWidgetAccessResponse {
+        token: access.access_token,
+        expires_at: access.expires_at,
+        widget_session_id,
+        hub_session_id: access.session_id,
+        agent: access.agent,
+    }))
+}
+
+async fn issue_anonymous_client_access(
+    state: &AppState,
+    headers: &HeaderMap,
+    req: CreatePublicWidgetAccessRequest,
+) -> Result<(ClientAccessResponse, Uuid), ApiError> {
+    if req.client_instance_id.is_nil() {
+        return Err(ApiError::bad_request(
+            "valid Client Instance id is required",
+        ));
+    }
     let anonymous_key_hash = visitor_key_hash(&req.visitor_key)?;
     let mut tx = state.pool.begin().await?;
+    let app = load_public_widget_app_by_client_id_tx(&mut tx, &req.client_id).await?;
+    validate_client_request_origin(headers, &app.allowed_origins, true)?;
+    let client_tool_definitions = validate_client_tool_definitions(&app.client_tool_definitions)?;
+    let requires_integration_tool = !app.client_tool_definitions.is_empty();
+    let tool_names = app
+        .client_tool_definitions
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect();
     let agent = sqlx::query(
         "SELECT agent.id, agent.owner_id, agent.name, agent.instructions
          FROM integration_app_agents AS delegated
          JOIN agents AS agent ON agent.id = delegated.agent_id
          WHERE delegated.app_id = $1 AND agent.deleted_at IS NULL
+           AND ($2::boolean = false OR agent.tool_allowlist ? 'integration')
          ORDER BY agent.id
          LIMIT 1",
     )
     .bind(app.id)
+    .bind(requires_integration_tool)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(ApiError::not_found("public Widget Agent not found"))?;
@@ -7948,29 +8106,45 @@ async fn create_public_widget_access(
     let owner_id: Uuid = agent.get("owner_id");
     lock_active_integration_agent_tx(&mut tx, agent_id, owner_id).await?;
     let token = format!("ahp_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-    let expires_at = Utc::now() + ChronoDuration::minutes(15);
+    let expires_at = Utc::now() + ChronoDuration::seconds(CLIENT_ACCESS_TTL_SECONDS);
+    let recovered = sqlx::query(
+        "SELECT hub_session_id, last_run_id
+         FROM embed_sessions
+         WHERE oauth_app_id = $1 AND anonymous = true
+           AND anonymous_key_hash = $2 AND agent_id = $3 AND owner_id = $4
+           AND ($5::uuid IS NULL OR hub_session_id = $5)
+         ORDER BY (client_instance_id = $6) DESC, created_at DESC
+         LIMIT 1
+         FOR UPDATE",
+    )
+    .bind(app.id)
+    .bind(&anonymous_key_hash)
+    .bind(agent_id)
+    .bind(owner_id)
+    .bind(req.session_id)
+    .bind(req.client_instance_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if req.session_id.is_some() && recovered.is_none() {
+        return Err(ApiError::not_found("anonymous Client Session not found"));
+    }
+    let hub_session_id: Option<Uuid> = recovered.as_ref().and_then(|row| row.get("hub_session_id"));
+    let last_run_id: Option<Uuid> = recovered.as_ref().and_then(|row| row.get("last_run_id"));
     let (widget_session_id, hub_session_id): (Uuid, Option<Uuid>) = sqlx::query_as(
         "INSERT INTO embed_sessions
              (token_hash, agent_id, owner_id, oauth_app_id, expires_at,
-              anonymous, anonymous_key_hash)
-         VALUES ($1, $2, $3, $4, $5, true, $6)
-         ON CONFLICT (oauth_app_id, anonymous_key_hash) WHERE anonymous
+              anonymous, anonymous_key_hash, client_instance_id,
+              client_tool_definitions, hub_session_id, last_run_id)
+         VALUES ($1, $2, $3, $4, $5, true, $6, $7, $8, $9, $10)
+         ON CONFLICT (oauth_app_id, anonymous_key_hash, client_instance_id)
+             WHERE anonymous AND client_instance_id IS NOT NULL
          DO UPDATE SET token_hash = EXCLUDED.token_hash,
                        expires_at = EXCLUDED.expires_at,
                        agent_id = EXCLUDED.agent_id,
                        owner_id = EXCLUDED.owner_id,
-                       hub_session_id = CASE
-                           WHEN embed_sessions.agent_id = EXCLUDED.agent_id
-                            AND embed_sessions.owner_id = EXCLUDED.owner_id
-                           THEN embed_sessions.hub_session_id
-                           ELSE NULL
-                       END,
-                       last_run_id = CASE
-                           WHEN embed_sessions.agent_id = EXCLUDED.agent_id
-                            AND embed_sessions.owner_id = EXCLUDED.owner_id
-                           THEN embed_sessions.last_run_id
-                           ELSE NULL
-                       END
+                       client_tool_definitions = EXCLUDED.client_tool_definitions,
+                       hub_session_id = EXCLUDED.hub_session_id,
+                       last_run_id = EXCLUDED.last_run_id
          RETURNING id, hub_session_id",
     )
     .bind(sha256_hex(&token))
@@ -7978,31 +8152,41 @@ async fn create_public_widget_access(
     .bind(owner_id)
     .bind(app.id)
     .bind(expires_at)
-    .bind(anonymous_key_hash)
+    .bind(&anonymous_key_hash)
+    .bind(req.client_instance_id)
+    .bind(client_tool_definitions)
+    .bind(hub_session_id)
+    .bind(last_run_id)
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(Json(PublicWidgetAccessResponse {
-        token,
-        expires_at,
-        widget_session_id,
-        hub_session_id,
-        agent: WidgetAgentDto {
-            id: agent_id,
-            name: agent.get("name"),
-            instructions: agent.get("instructions"),
+    Ok((
+        ClientAccessResponse {
+            access_token: token,
+            expires_at,
+            expires_in: CLIENT_ACCESS_TTL_SECONDS,
+            client_instance_id: req.client_instance_id,
+            session_id: hub_session_id,
+            agent: WidgetAgentDto {
+                id: agent_id,
+                name: agent.get("name"),
+                instructions: agent.get("instructions"),
+            },
+            history_enabled: false,
+            tool_names,
         },
-    }))
+        widget_session_id,
+    ))
 }
 
 async fn get_widget_session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let token = embed_token_from_headers(&headers)
+    let token = client_access_token_from_headers(&headers)
         .ok_or(ApiError::unauthorized("missing embed session"))?;
     let mut tx = state.pool.begin().await?;
-    let credential = load_widget_credential_tx(&mut tx, &token).await?;
+    let credential = load_widget_credential_tx(&mut tx, &token, &headers).await?;
     let agent = sqlx::query(
         "SELECT id, name, instructions FROM agents WHERE id = $1 AND deleted_at IS NULL",
     )
@@ -8026,22 +8210,49 @@ async fn get_widget_session(
     Ok(Json(agent).into_response())
 }
 
+async fn renew_client_access(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<RenewWidgetSessionRequest>,
+) -> Result<Json<ClientAccessResponse>, ApiError> {
+    Ok(Json(rotate_client_access(&state, &headers, req).await?))
+}
+
 async fn renew_widget_session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<RenewWidgetSessionRequest>,
 ) -> Result<Json<WidgetTokenResponse>, ApiError> {
-    let token = embed_token_from_headers(&headers)
-        .filter(|token| token.starts_with("ahw_"))
+    let access = rotate_client_access(&state, &headers, req).await?;
+    Ok(Json(WidgetTokenResponse {
+        token: access.access_token,
+        expires_at: access.expires_at,
+    }))
+}
+
+async fn rotate_client_access(
+    state: &AppState,
+    headers: &HeaderMap,
+    req: RenewWidgetSessionRequest,
+) -> Result<ClientAccessResponse, ApiError> {
+    let token = client_access_token_from_headers(headers)
         .ok_or(ApiError::unauthorized("invalid Widget credential"))?;
     let mut tx = state.pool.begin().await?;
-    let credential = lock_widget_credential_tx(&mut tx, &token).await?;
-    if !credential.is_external() {
+    let credential = lock_widget_credential_tx(&mut tx, &token, headers).await?;
+    let client_instance_id = credential
+        .client_instance_id
+        .ok_or(ApiError::unauthorized("invalid Client Access Credential"))?;
+    if !credential.is_external() && !credential.is_anonymous() {
         return Err(ApiError::unauthorized("invalid Widget credential"));
     }
     if let Some(profile) = req.profile {
+        if credential.is_anonymous() {
+            return Err(ApiError::bad_request(
+                "anonymous Client Access has no trusted user profile",
+            ));
+        }
         let (client_id, client_secret) = widget_client_credentials(&headers)?;
-        let app = load_oauth_app_by_client_id(&state.pool, &client_id).await?;
+        let app = load_oauth_app_by_client_id_tx(&mut tx, &client_id).await?;
         if Some(app.id) != credential.oauth_app_id
             || !constant_time_eq(
                 app.client_secret_hash.as_bytes(),
@@ -8077,8 +8288,17 @@ async fn renew_widget_session(
             .execute(&mut *tx)
             .await?;
     }
-    let renewed_token = format!("ahw_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-    let expires_at = Utc::now() + ChronoDuration::minutes(15);
+    let prefix = if credential.is_anonymous() {
+        "ahp_"
+    } else {
+        "ahw_"
+    };
+    let renewed_token = format!(
+        "{prefix}{}{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    );
+    let expires_at = Utc::now() + ChronoDuration::seconds(CLIENT_ACCESS_TTL_SECONDS);
     sqlx::query(
         "UPDATE embed_sessions
          SET token_hash = $1, expires_at = $2
@@ -8090,21 +8310,44 @@ async fn renew_widget_session(
     .bind(sha256_hex(&token))
     .execute(&mut *tx)
     .await?;
+    let agent = sqlx::query(
+        "SELECT id, name, instructions FROM agents WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(credential.agent_id)
+    .fetch_one(&mut *tx)
+    .await?;
     tx.commit().await?;
-    Ok(Json(WidgetTokenResponse {
-        token: renewed_token,
+    Ok(ClientAccessResponse {
+        access_token: renewed_token,
         expires_at,
-    }))
+        expires_in: CLIENT_ACCESS_TTL_SECONDS,
+        client_instance_id,
+        session_id: credential
+            .is_anonymous()
+            .then_some(credential.hub_session_id)
+            .flatten(),
+        agent: WidgetAgentDto {
+            id: agent.get("id"),
+            name: agent.get("name"),
+            instructions: agent.get("instructions"),
+        },
+        history_enabled: credential.history_enabled,
+        tool_names: credential
+            .client_tool_definitions
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect(),
+    })
 }
 
 async fn list_widget_sessions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<WidgetHistorySessionDto>>, ApiError> {
-    let token = embed_token_from_headers(&headers)
+    let token = client_access_token_from_headers(&headers)
         .ok_or(ApiError::unauthorized("missing embed session"))?;
     let mut tx = state.pool.begin().await?;
-    let credential = load_widget_credential_tx(&mut tx, &token).await?;
+    let credential = load_widget_credential_tx(&mut tx, &token, &headers).await?;
     if !credential.history_enabled {
         return Err(ApiError::forbidden("Widget history is disabled"));
     }
@@ -8177,10 +8420,10 @@ async fn list_widget_session_messages(
     Query(query): Query<SessionMessageListQuery>,
 ) -> Result<Json<Vec<HubSessionMessageDto>>, ApiError> {
     let (before_sequence, limit) = query.validated()?;
-    let token = embed_token_from_headers(&headers)
+    let token = client_access_token_from_headers(&headers)
         .ok_or(ApiError::unauthorized("missing embed session"))?;
     let mut tx = state.pool.begin().await?;
-    let credential = load_widget_credential_tx(&mut tx, &token).await?;
+    let credential = load_widget_credential_tx(&mut tx, &token, &headers).await?;
     let (integration_session_id, hub_session_id) = widget_session_locator(&credential, session_id);
     let scoped = load_widget_scoped_session_tx(
         &mut tx,
@@ -8207,10 +8450,10 @@ async fn list_widget_session_events(
     Query(query): Query<EventStreamQuery>,
 ) -> Result<Json<Vec<RunEventDto>>, ApiError> {
     let after = widget_event_cursor(query.after)?;
-    let token = embed_token_from_headers(&headers)
+    let token = client_access_token_from_headers(&headers)
         .ok_or(ApiError::unauthorized("missing embed session"))?;
     let mut tx = state.pool.begin().await?;
-    let credential = load_widget_credential_tx(&mut tx, &token).await?;
+    let credential = load_widget_credential_tx(&mut tx, &token, &headers).await?;
     let (integration_session_id, hub_session_id) = widget_session_locator(&credential, session_id);
     let scoped = load_widget_scoped_session_tx(
         &mut tx,
@@ -8237,7 +8480,7 @@ async fn stream_widget_session_events(
     let stream_headers = headers.clone();
     let event_stream = stream! {
         loop {
-            let token = match embed_token_from_headers(&stream_headers) {
+            let token = match client_access_token_from_headers(&stream_headers) {
                 Some(token) => token,
                 None => {
                     yield Ok(Event::default().event("error").data("missing embed session"));
@@ -8252,7 +8495,7 @@ async fn stream_widget_session_events(
                 }
             };
             let loaded = async {
-                let credential = load_widget_credential_tx(&mut tx, &token).await?;
+                let credential = load_widget_credential_tx(&mut tx, &token, &stream_headers).await?;
                 let (integration_session_id, hub_session_id) =
                     widget_session_locator(&credential, session_id);
                 let scoped = load_widget_scoped_session_tx(
@@ -8299,21 +8542,18 @@ async fn create_widget_run(
     headers: HeaderMap,
     Json(req): Json<CreateWidgetRunRequest>,
 ) -> Result<Json<RunDto>, ApiError> {
-    let token = embed_token_from_headers(&headers)
+    let token = client_access_token_from_headers(&headers)
         .ok_or(ApiError::unauthorized("missing embed session"))?;
     let mut tx = state.pool.begin().await?;
-    let credential = lock_widget_credential_tx(&mut tx, &token).await?;
+    let credential = lock_widget_credential_tx(&mut tx, &token, &headers).await?;
     ensure_agent_has_configured_model_tx(&mut tx, credential.agent_id).await?;
     let client_message_key = normalize_client_message_key(req.client_message_key.as_deref())?;
+    let (requested_integration_session_id, requested_hub_session_id) =
+        widget_run_session_locator(&credential, &req)?;
 
     let (hub_session_id, integration_session_id, external_user_context) = if credential
         .is_anonymous()
     {
-        if req.integration_session_id.is_some() {
-            return Err(ApiError::bad_request(
-                "public Widget does not use Integration Sessions",
-            ));
-        }
         let retried_hub_session_id = if let Some(client_message_key) = client_message_key.as_deref()
         {
             sqlx::query_scalar::<_, Uuid>(
@@ -8338,17 +8578,14 @@ async fn create_widget_run(
         let hub_session_id = if let Some(hub_session_id) = retried_hub_session_id {
             hub_session_id
         } else if let Some(hub_session_id) = credential.hub_session_id {
-            if req
-                .hub_session_id
-                .is_some_and(|requested| requested != hub_session_id)
-            {
+            if requested_hub_session_id.is_some_and(|requested| requested != hub_session_id) {
                 return Err(ApiError::bad_request(
                     "public Widget credential is bound to another session",
                 ));
             }
             hub_session_id
         } else {
-            if req.hub_session_id.is_some() {
+            if requested_hub_session_id.is_some() {
                 return Err(ApiError::bad_request(
                     "public Widget has not started this session",
                 ));
@@ -8399,12 +8636,12 @@ async fn create_widget_run(
                 .map_err(|_| ApiError::internal("external Widget profile is invalid"))?;
 
         let (selected_hub_session_id, selected_integration_session_id) =
-            if req.integration_session_id.is_some() || req.hub_session_id.is_some() {
+            if requested_integration_session_id.is_some() || requested_hub_session_id.is_some() {
                 let selected = load_widget_scoped_session_tx(
                     &mut tx,
                     &credential,
-                    req.integration_session_id,
-                    req.hub_session_id,
+                    requested_integration_session_id,
+                    requested_hub_session_id,
                     true,
                 )
                 .await?;
@@ -8498,11 +8735,7 @@ async fn create_widget_run(
         let hub_session_id = credential
             .hub_session_id
             .ok_or(ApiError::unauthorized("invalid embed session"))?;
-        if req.integration_session_id.is_some()
-            || req
-                .hub_session_id
-                .is_some_and(|requested| requested != hub_session_id)
-        {
+        if requested_hub_session_id.is_some_and(|requested| requested != hub_session_id) {
             return Err(ApiError::bad_request(
                 "embed token is bound to another session",
             ));
@@ -8543,11 +8776,33 @@ async fn create_widget_run(
     let run = accepted
         .run
         .ok_or(ApiError::internal("widget message did not schedule a run"))?;
-    sqlx::query("UPDATE runs SET widget_session_id = $1 WHERE id = $2")
-        .bind(credential.id)
-        .bind(run.id)
-        .execute(&mut *tx)
-        .await?;
+    if accepted.message.delivery_mode != "steer" {
+        if let Some(client_instance_id) = credential.client_instance_id {
+            let client_tool_snapshot = serde_json::to_value(&credential.client_tool_definitions)
+                .map_err(|_| ApiError::internal("Client Tool Grant could not be encoded"))?;
+            sqlx::query(
+                "UPDATE runs
+                 SET client_instance_id = $1, client_tool_snapshot = $2
+                 WHERE id = $3 AND hub_message_id = $4 AND source = 'widget'
+                   AND client_instance_id IS NULL",
+            )
+            .bind(client_instance_id)
+            .bind(client_tool_snapshot)
+            .bind(run.id)
+            .bind(accepted.message.id)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    sqlx::query(
+        "UPDATE runs
+         SET widget_session_id = COALESCE(widget_session_id, $1)
+         WHERE id = $2",
+    )
+    .bind(credential.id)
+    .bind(run.id)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query("UPDATE embed_sessions SET last_run_id = $1 WHERE id = $2")
         .bind(run.id)
         .bind(credential.id)
@@ -8562,23 +8817,67 @@ async fn stop_widget_run(
     headers: HeaderMap,
     Path(run_id): Path<Uuid>,
 ) -> Result<Json<RunDto>, ApiError> {
-    let token = embed_token_from_headers(&headers)
+    let token = client_access_token_from_headers(&headers)
         .ok_or(ApiError::unauthorized("missing embed session"))?;
     let mut tx = state.pool.begin().await?;
-    let credential = lock_widget_credential_tx(&mut tx, &token).await?;
-    let hub_session_id: Uuid = sqlx::query_scalar(
-        "SELECT hub_session_id FROM runs
+    let credential = lock_widget_credential_tx(&mut tx, &token, &headers).await?;
+    let run = sqlx::query(
+        "SELECT id, agent_id, owner_id, integration_session_id, hub_session_id,
+                hub_turn_id, status, client_instance_id, client_tool_snapshot,
+                widget_session_id, external_user_context, model_subject_type,
+                model_subject_user_id, model_source_integration_app_id
+         FROM runs
          WHERE id = $1 AND agent_id = $2 AND owner_id = $3
-           AND widget_session_id = $4",
+           AND (($4::boolean = true AND source = 'widget')
+                OR ($4::boolean = false AND widget_session_id = $5))",
     )
     .bind(run_id)
     .bind(credential.agent_id)
     .bind(credential.owner_id)
+    .bind(credential.client_instance_id.is_some())
     .bind(credential.id)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(ApiError::not_found("run not found"))?;
-    let run = request_run_interrupt_tx(&mut tx, run_id, hub_session_id).await?;
+    let scoped = load_widget_scoped_session_tx(
+        &mut tx,
+        &credential,
+        run.get("integration_session_id"),
+        Some(run.get("hub_session_id")),
+        true,
+    )
+    .await?;
+    if run.get::<Option<Uuid>, _>("client_instance_id").is_some()
+        && run.get::<String, _>("status") == "waiting_tool"
+    {
+        let scope = ClientToolRunScope {
+            run_id,
+            agent_id: run.get("agent_id"),
+            owner_id: run.get("owner_id"),
+            integration_session_id: run.get("integration_session_id"),
+            hub_session_id: scoped.hub_session_id,
+            hub_turn_id: run.get("hub_turn_id"),
+            client_instance_id: run.get("client_instance_id"),
+            client_tool_snapshot: run.get("client_tool_snapshot"),
+            widget_session_id: run.get("widget_session_id"),
+            external_user_context: run.get("external_user_context"),
+            model_subject_type: run.get("model_subject_type"),
+            model_subject_user_id: run.get("model_subject_user_id"),
+            model_source_integration_app_id: run.get("model_source_integration_app_id"),
+        };
+        let run = fail_client_tool_batch_tx(
+            &mut tx,
+            &scope,
+            "cancelled",
+            "interrupted",
+            "client_tool_interrupted",
+            "Client Tool batch was stopped",
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(Json(run));
+    }
+    let run = request_run_interrupt_tx(&mut tx, run_id, scoped.hub_session_id).await?;
     tx.commit().await?;
     Ok(Json(run))
 }
@@ -9003,7 +9302,7 @@ async fn submit_integration_tool_result(
         tx.commit().await?;
         return Ok(Json(SubmitToolResultResponse { run, tool_request }));
     }
-    if tool_request.status == "expired" {
+    if tool_request.status == "timed_out" {
         return Err(ApiError::gone("tool request expired"));
     }
     if tool_request.status != "pending" {
@@ -9011,7 +9310,9 @@ async fn submit_integration_tool_result(
     }
     if tool_request.expires_at <= Utc::now() {
         sqlx::query(
-            "UPDATE integration_tool_requests SET status = 'expired' WHERE id = $1 AND status = 'pending'",
+            "UPDATE integration_tool_requests
+             SET status = 'timed_out', responded_at = now()
+             WHERE id = $1 AND status = 'pending'",
         )
         .bind(tool_request.id)
         .execute(&mut *tx)
@@ -9019,9 +9320,22 @@ async fn submit_integration_tool_result(
         tx.commit().await?;
         return Err(ApiError::gone("tool request expired"));
     }
+    let integration_session_id = tool_request.session_id.ok_or(ApiError::forbidden(
+        "tool request is not an Integration request",
+    ))?;
     let integration_session =
-        load_integration_session_tx(&mut tx, tool_request.session_id, &principal).await?;
+        load_integration_session_tx(&mut tx, integration_session_id, &principal).await?;
     let original_run = load_run_public_tx(&mut tx, tool_request.run_id).await?;
+    let client_managed: bool =
+        sqlx::query_scalar("SELECT client_instance_id IS NOT NULL FROM runs WHERE id = $1")
+            .bind(tool_request.run_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if client_managed {
+        return Err(ApiError::forbidden(
+            "Client Tool results require a Client Access Credential",
+        ));
+    }
     if original_run.hub_session_id != Some(integration_session.hub_session_id) {
         return Err(ApiError::conflict(
             "tool request run belongs to another session",
@@ -9073,7 +9387,7 @@ async fn submit_integration_tool_result(
             client_message_key: Some(format!("tool-result:{}", tool_request.id)),
             source: "integration:tool_result".into(),
             automation_id: None,
-            integration_session_id: Some(tool_request.session_id),
+            integration_session_id: tool_request.session_id,
             parent_run_id: Some(tool_request.run_id),
             continuation_turn_id: None,
             model_subject_type: model_attribution.subject_type.into(),
@@ -9110,6 +9424,585 @@ async fn submit_integration_tool_result(
         run,
         tool_request: load_tool_request(&state.pool, tool_request_id, &principal).await?,
     }))
+}
+
+#[derive(Debug)]
+struct ClientToolRunScope {
+    run_id: Uuid,
+    agent_id: Uuid,
+    owner_id: Uuid,
+    integration_session_id: Option<Uuid>,
+    hub_session_id: Uuid,
+    hub_turn_id: Uuid,
+    client_instance_id: Uuid,
+    client_tool_snapshot: Value,
+    widget_session_id: Option<Uuid>,
+    external_user_context: Option<Value>,
+    model_subject_type: String,
+    model_subject_user_id: Option<Uuid>,
+    model_source_integration_app_id: Option<Uuid>,
+}
+
+async fn claim_client_tool_call(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(tool_call_id): Path<Uuid>,
+) -> Result<Json<ClientToolClaimResponse>, ApiError> {
+    let token = client_access_token_from_headers(&headers)
+        .ok_or(ApiError::unauthorized("missing Client Access Credential"))?;
+    let mut tx = state.pool.begin().await?;
+    let credential = lock_widget_credential_tx(&mut tx, &token, &headers).await?;
+    let (scope, batch) = lock_client_tool_batch_tx(&mut tx, &credential, tool_call_id).await?;
+    let request = batch
+        .iter()
+        .find(|row| row.get::<Uuid, _>("id") == tool_call_id)
+        .ok_or(ApiError::not_found("Client Tool call not found"))?;
+    let status: String = request.get("status");
+    if request.get::<DateTime<Utc>, _>("expires_at") <= Utc::now()
+        && matches!(status.as_str(), "pending" | "claimed" | "unknown")
+    {
+        fail_client_tool_batch_tx(
+            &mut tx,
+            &scope,
+            "timed_out",
+            "failed",
+            "client_tool_timeout",
+            "Client Tool batch reached its deadline",
+        )
+        .await?;
+        tx.commit().await?;
+        return Err(ApiError::gone("Client Tool call timed out"));
+    }
+    let response = match status.as_str() {
+        "pending" => {
+            let updated = sqlx::query(
+                "UPDATE integration_tool_requests
+                 SET status = 'claimed', claimed_by_client_instance_id = $1,
+                     claimed_at = COALESCE(claimed_at, now())
+                 WHERE id = $2 AND run_id = $3 AND status = 'pending'
+                 RETURNING status",
+            )
+            .bind(scope.client_instance_id)
+            .bind(tool_call_id)
+            .bind(scope.run_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(ApiError::conflict("Client Tool call could not be claimed"))?;
+            ClientToolClaimResponse {
+                status: updated.get("status"),
+                terminal: false,
+                result: None,
+            }
+        }
+        "claimed" => {
+            if request.get::<Option<Uuid>, _>("claimed_by_client_instance_id")
+                != Some(scope.client_instance_id)
+            {
+                return Err(ApiError::forbidden(
+                    "Client Tool call belongs to another Client Instance",
+                ));
+            }
+            ClientToolClaimResponse {
+                status,
+                terminal: false,
+                result: None,
+            }
+        }
+        "completed" | "timed_out" | "unknown" | "cancelled" => ClientToolClaimResponse {
+            status,
+            terminal: true,
+            result: request
+                .get::<Option<Value>, _>("result_payload")
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|_| ApiError::internal("stored Client Tool result is invalid"))?,
+        },
+        _ => return Err(ApiError::internal("stored Client Tool status is invalid")),
+    };
+    tx.commit().await?;
+    Ok(Json(response))
+}
+
+async fn submit_client_tool_result(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(tool_call_id): Path<Uuid>,
+    Json(req): Json<SubmitClientToolResultRequest>,
+) -> Result<Json<SubmitClientToolResultResponse>, ApiError> {
+    let (result_payload, checksum) = validate_client_tool_result(&req.result)?;
+    let token = client_access_token_from_headers(&headers)
+        .ok_or(ApiError::unauthorized("missing Client Access Credential"))?;
+    let mut tx = state.pool.begin().await?;
+    let credential = lock_widget_credential_tx(&mut tx, &token, &headers).await?;
+    let (scope, batch) = lock_client_tool_batch_tx(&mut tx, &credential, tool_call_id).await?;
+    let request = batch
+        .iter()
+        .find(|row| row.get::<Uuid, _>("id") == tool_call_id)
+        .ok_or(ApiError::not_found("Client Tool call not found"))?;
+    let status: String = request.get("status");
+    if status == "completed" {
+        if request
+            .get::<Option<String>, _>("result_checksum_sha256")
+            .as_deref()
+            != Some(checksum.as_str())
+        {
+            return Err(ApiError::conflict(
+                "Client Tool result does not match the completed result",
+            ));
+        }
+        let follow_up_run_id: Option<Uuid> = request.get("follow_up_run_id");
+        let run = match follow_up_run_id {
+            Some(run_id) => Some(load_run_public_tx(&mut tx, run_id).await?),
+            None => None,
+        };
+        let tool_request = load_client_tool_request_tx(&mut tx, tool_call_id).await?;
+        tx.commit().await?;
+        return Ok(Json(SubmitClientToolResultResponse { run, tool_request }));
+    }
+    if matches!(status.as_str(), "timed_out" | "unknown" | "cancelled") {
+        return Err(ApiError::gone("Client Tool call is terminal"));
+    }
+    if request.get::<DateTime<Utc>, _>("expires_at") <= Utc::now() {
+        fail_client_tool_batch_tx(
+            &mut tx,
+            &scope,
+            "timed_out",
+            "failed",
+            "client_tool_timeout",
+            "Client Tool batch reached its deadline",
+        )
+        .await?;
+        tx.commit().await?;
+        return Err(ApiError::gone("Client Tool call timed out"));
+    }
+    if status != "claimed" {
+        return Err(ApiError::forbidden(
+            "Client Tool call must be claimed before execution",
+        ));
+    }
+    if request.get::<Option<Uuid>, _>("claimed_by_client_instance_id")
+        != Some(scope.client_instance_id)
+    {
+        return Err(ApiError::forbidden(
+            "Client Tool call belongs to another Client Instance",
+        ));
+    }
+
+    let elapsed_ms = Utc::now()
+        .signed_duration_since(request.get::<DateTime<Utc>, _>("created_at"))
+        .num_milliseconds()
+        .max(0);
+    let result_event = insert_run_event_tx(
+        &mut tx,
+        scope.run_id,
+        "client_tool_result".into(),
+        Some("tool".into()),
+        None,
+        json!({
+            "tool_call_id": tool_call_id,
+            "tool_name": request.get::<String, _>("tool_name"),
+            "result": result_payload.clone(),
+            "elapsed_ms": elapsed_ms,
+        }),
+    )
+    .await?;
+    let updated = sqlx::query(
+        "UPDATE integration_tool_requests
+         SET status = 'completed', result_payload = $1,
+             result_checksum_sha256 = $2, result_event_id = $3,
+             responded_at = now()
+         WHERE id = $4 AND run_id = $5 AND status = 'claimed'
+           AND claimed_by_client_instance_id = $6",
+    )
+    .bind(&result_payload)
+    .bind(&checksum)
+    .bind(result_event.event_id)
+    .bind(tool_call_id)
+    .bind(scope.run_id)
+    .bind(scope.client_instance_id)
+    .execute(&mut *tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(ApiError::conflict("Client Tool result was not accepted"));
+    }
+    let incomplete: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM integration_tool_requests
+         WHERE run_id = $1 AND status <> 'completed'",
+    )
+    .bind(scope.run_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let run = if incomplete == 0 {
+        Some(create_client_tool_continuation_tx(&mut tx, &scope).await?)
+    } else {
+        None
+    };
+    let tool_request = load_client_tool_request_tx(&mut tx, tool_call_id).await?;
+    tx.commit().await?;
+    Ok(Json(SubmitClientToolResultResponse { run, tool_request }))
+}
+
+fn validate_client_tool_result(result: &ClientToolResultDto) -> Result<(Value, String), ApiError> {
+    let value = serde_json::to_value(result)
+        .map_err(|_| ApiError::bad_request("Client Tool result must be JSON"))?;
+    let encoded = serde_json::to_vec(&value)
+        .map_err(|_| ApiError::bad_request("Client Tool result must be JSON"))?;
+    if encoded.len() > MAX_CLIENT_TOOL_RESULT_BYTES {
+        return Err(ApiError::bad_request("Client Tool result is too large"));
+    }
+    let checksum = sha256_hex(&canonical_json(&value));
+    Ok((value, checksum))
+}
+
+async fn lock_client_tool_batch_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    credential: &WidgetCredential,
+    tool_call_id: Uuid,
+) -> Result<(ClientToolRunScope, Vec<sqlx::postgres::PgRow>), ApiError> {
+    let client_instance_id = credential.client_instance_id.ok_or(ApiError::forbidden(
+        "legacy Widget credentials cannot execute Client Tools",
+    ))?;
+    let preview = sqlx::query(
+        "SELECT request.run_id, run.integration_session_id, run.hub_session_id
+         FROM integration_tool_requests AS request
+         JOIN runs AS run ON run.id = request.run_id
+         WHERE request.id = $1 AND run.agent_id = $2 AND run.owner_id = $3
+           AND run.client_instance_id IS NOT NULL",
+    )
+    .bind(tool_call_id)
+    .bind(credential.agent_id)
+    .bind(credential.owner_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ApiError::not_found("Client Tool call not found"))?;
+    let run_id: Uuid = preview.get("run_id");
+    let integration_session_id: Option<Uuid> = preview.get("integration_session_id");
+    let hub_session_id: Uuid = preview.get("hub_session_id");
+    load_widget_scoped_session_tx(
+        tx,
+        credential,
+        integration_session_id,
+        Some(hub_session_id),
+        true,
+    )
+    .await?;
+    let run = sqlx::query(
+        "SELECT id, agent_id, owner_id, integration_session_id, hub_session_id,
+                hub_turn_id, status, client_instance_id, client_tool_snapshot,
+                widget_session_id, external_user_context, model_subject_type,
+                model_subject_user_id, model_source_integration_app_id
+         FROM runs
+         WHERE id = $1 AND agent_id = $2 AND owner_id = $3
+           AND hub_session_id = $4 AND source = 'widget'
+           AND client_instance_id IS NOT NULL
+         FOR UPDATE",
+    )
+    .bind(run_id)
+    .bind(credential.agent_id)
+    .bind(credential.owner_id)
+    .bind(hub_session_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ApiError::not_found("Client Tool Run not found"))?;
+    let executor: Uuid = run.get("client_instance_id");
+    if executor != client_instance_id {
+        return Err(ApiError::forbidden(
+            "Client Tool Run belongs to another Client Instance",
+        ));
+    }
+    let batch = sqlx::query(
+        "SELECT id, session_id, hub_session_id, run_id, position, tool_name,
+                arguments, status, claimed_by_client_instance_id, claimed_at,
+                result_payload, result_checksum_sha256, result_event_id,
+                expires_at, responded_at, created_at, follow_up_run_id
+         FROM integration_tool_requests
+         WHERE run_id = $1 AND hub_session_id = $2
+         ORDER BY position
+         FOR UPDATE",
+    )
+    .bind(run_id)
+    .bind(hub_session_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let target = batch
+        .iter()
+        .find(|row| row.get::<Uuid, _>("id") == tool_call_id)
+        .ok_or(ApiError::not_found("Client Tool call not found"))?;
+    let tool_name: String = target.get("tool_name");
+    let snapshot: Value = run.get("client_tool_snapshot");
+    let registered = snapshot.as_array().is_some_and(|tools| {
+        tools
+            .iter()
+            .any(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name.as_str()))
+    });
+    if !registered {
+        return Err(ApiError::forbidden(
+            "Client Tool is not present in the Run snapshot",
+        ));
+    }
+    Ok((
+        ClientToolRunScope {
+            run_id,
+            agent_id: run.get("agent_id"),
+            owner_id: run.get("owner_id"),
+            integration_session_id,
+            hub_session_id,
+            hub_turn_id: run.get("hub_turn_id"),
+            client_instance_id: executor,
+            client_tool_snapshot: snapshot,
+            widget_session_id: run.get("widget_session_id"),
+            external_user_context: run.get("external_user_context"),
+            model_subject_type: run.get("model_subject_type"),
+            model_subject_user_id: run.get("model_subject_user_id"),
+            model_source_integration_app_id: run.get("model_source_integration_app_id"),
+        },
+        batch,
+    ))
+}
+
+async fn create_client_tool_continuation_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: &ClientToolRunScope,
+) -> Result<RunDto, ApiError> {
+    let rows = sqlx::query(
+        "SELECT id, tool_name, result_payload
+         FROM integration_tool_requests
+         WHERE run_id = $1 AND status = 'completed'
+         ORDER BY position",
+    )
+    .bind(scope.run_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let results = rows
+        .into_iter()
+        .map(|row| {
+            Ok(ClientToolContinuationResultDto {
+                tool_call_id: row.get("id"),
+                tool_name: row.get("tool_name"),
+                result: serde_json::from_value(row.get("result_payload"))
+                    .map_err(|_| ApiError::internal("stored Client Tool result is invalid"))?,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    let external_user_context = scope
+        .external_user_context
+        .clone()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| ApiError::internal("Run external user context is invalid"))?;
+    let parent_updated = sqlx::query(
+        "UPDATE runs
+         SET status = 'completed', updated_at = now()
+         WHERE id = $1 AND hub_session_id = $2 AND hub_turn_id = $3
+           AND status = 'waiting_tool'",
+    )
+    .bind(scope.run_id)
+    .bind(scope.hub_session_id)
+    .bind(scope.hub_turn_id)
+    .execute(&mut **tx)
+    .await?;
+    if parent_updated.rows_affected() != 1 {
+        return Err(ApiError::conflict(
+            "Client Tool parent Run is no longer waiting",
+        ));
+    }
+    insert_run_event_tx(
+        tx,
+        scope.run_id,
+        "status".into(),
+        None,
+        Some("completed".into()),
+        json!({ "status": "completed", "reason": "client_tool_batch_completed" }),
+    )
+    .await?;
+    let turn_updated = sqlx::query(
+        "UPDATE hub_session_turns
+         SET status = 'completed', ended_at = COALESCE(ended_at, now()),
+             updated_at = now()
+         WHERE id = $1 AND session_id = $2 AND status = 'waiting_tool'",
+    )
+    .bind(scope.hub_turn_id)
+    .bind(scope.hub_session_id)
+    .execute(&mut **tx)
+    .await?;
+    if turn_updated.rows_affected() != 1 {
+        return Err(ApiError::conflict(
+            "Client Tool parent Turn is no longer waiting",
+        ));
+    }
+    let session_updated = sqlx::query(
+        "UPDATE hub_sessions
+         SET active_turn_id = NULL, updated_at = now()
+         WHERE id = $1 AND (active_turn_id IS NULL OR active_turn_id = $2)",
+    )
+    .bind(scope.hub_session_id)
+    .bind(scope.hub_turn_id)
+    .execute(&mut **tx)
+    .await?;
+    if session_updated.rows_affected() != 1 {
+        return Err(ApiError::conflict(
+            "Client Tool Session changed while continuing",
+        ));
+    }
+    let accepted = accept_session_message_tx(
+        tx,
+        AcceptSessionMessage {
+            session_id: scope.hub_session_id,
+            agent_id: scope.agent_id,
+            owner_id: scope.owner_id,
+            content: "Client Tool batch completed".into(),
+            payload: json!({ "tool_results": results }),
+            role: "tool".into(),
+            message_kind: "tool_result".into(),
+            requested_delivery_mode: "next_turn".into(),
+            client_message_key: Some(format!("client-tool-batch:{}", scope.run_id)),
+            source: "integration:tool_result".into(),
+            automation_id: None,
+            integration_session_id: scope.integration_session_id,
+            parent_run_id: Some(scope.run_id),
+            continuation_turn_id: None,
+            model_subject_type: scope.model_subject_type.clone(),
+            model_subject_user_id: scope.model_subject_user_id,
+            model_source_integration_app_id: scope.model_source_integration_app_id,
+            external_user_context,
+        },
+    )
+    .await?;
+    let run = accepted.run.ok_or(ApiError::internal(
+        "Client Tool results did not schedule a continuation",
+    ))?;
+    let external_user_context = scope.external_user_context.clone();
+    let continuation_updated = sqlx::query(
+        "UPDATE runs
+         SET parent_run_id = $1, source = 'integration:tool_result',
+             integration_session_id = $2, client_instance_id = $3,
+             client_tool_snapshot = $4, widget_session_id = $5,
+             external_user_context = $6, model_subject_type = $7,
+             model_subject_user_id = $8,
+             model_source_integration_app_id = $9, updated_at = now()
+         WHERE id = $10 AND hub_session_id = $11 AND status = 'pending'",
+    )
+    .bind(scope.run_id)
+    .bind(scope.integration_session_id)
+    .bind(scope.client_instance_id)
+    .bind(&scope.client_tool_snapshot)
+    .bind(scope.widget_session_id)
+    .bind(external_user_context)
+    .bind(&scope.model_subject_type)
+    .bind(scope.model_subject_user_id)
+    .bind(scope.model_source_integration_app_id)
+    .bind(run.id)
+    .bind(scope.hub_session_id)
+    .execute(&mut **tx)
+    .await?;
+    if continuation_updated.rows_affected() != 1 {
+        return Err(ApiError::conflict(
+            "Client Tool continuation is no longer pending",
+        ));
+    }
+    sqlx::query(
+        "UPDATE integration_tool_requests
+         SET follow_up_run_id = $1
+         WHERE run_id = $2 AND status = 'completed'
+           AND follow_up_run_id IS NULL",
+    )
+    .bind(run.id)
+    .bind(scope.run_id)
+    .execute(&mut **tx)
+    .await?;
+    load_run_public_tx(tx, run.id).await
+}
+
+async fn fail_client_tool_batch_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    scope: &ClientToolRunScope,
+    request_status: &str,
+    run_status: &str,
+    event_type: &str,
+    message: &str,
+) -> Result<RunDto, ApiError> {
+    let requests = sqlx::query(
+        "UPDATE integration_tool_requests
+         SET status = $1, responded_at = COALESCE(responded_at, now())
+         WHERE run_id = $2 AND status IN ('pending', 'claimed', 'unknown')
+         RETURNING id, tool_name",
+    )
+    .bind(request_status)
+    .bind(scope.run_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    for request in requests {
+        insert_run_event_tx(
+            tx,
+            scope.run_id,
+            event_type.into(),
+            None,
+            Some(message.into()),
+            json!({
+                "tool_call_id": request.get::<Uuid, _>("id"),
+                "tool_name": request.get::<String, _>("tool_name"),
+                "status": request_status,
+                "message": message,
+            }),
+        )
+        .await?;
+    }
+    let updated = sqlx::query(
+        "UPDATE runs SET status = $1, updated_at = now()
+         WHERE id = $2 AND status = 'waiting_tool'",
+    )
+    .bind(run_status)
+    .bind(scope.run_id)
+    .execute(&mut **tx)
+    .await?;
+    if updated.rows_affected() == 1 {
+        insert_run_event_tx(
+            tx,
+            scope.run_id,
+            "status".into(),
+            None,
+            Some(run_status.into()),
+            json!({ "status": run_status, "reason": request_status }),
+        )
+        .await?;
+    }
+    sqlx::query(
+        "UPDATE hub_session_turns
+         SET status = $1, ended_at = COALESCE(ended_at, now()), updated_at = now()
+         WHERE id = $2 AND session_id = $3 AND status = 'waiting_tool'",
+    )
+    .bind(run_status)
+    .bind(scope.hub_turn_id)
+    .bind(scope.hub_session_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE hub_sessions
+         SET active_turn_id = NULL, updated_at = now()
+         WHERE id = $1 AND active_turn_id = $2",
+    )
+    .bind(scope.hub_session_id)
+    .bind(scope.hub_turn_id)
+    .execute(&mut **tx)
+    .await?;
+    load_run_public_tx(tx, scope.run_id).await
+}
+
+async fn load_client_tool_request_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    tool_call_id: Uuid,
+) -> Result<IntegrationToolRequestDto, ApiError> {
+    let row = sqlx::query(
+        "SELECT id, session_id, hub_session_id, run_id, position, tool_name,
+                arguments, status, claimed_by_client_instance_id, claimed_at,
+                result_payload, follow_up_run_id, expires_at, responded_at, created_at
+         FROM integration_tool_requests WHERE id = $1",
+    )
+    .bind(tool_call_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ApiError::not_found("Client Tool call not found"))?;
+    Ok(tool_request_from_row(row))
 }
 
 async fn runtime_register(
@@ -10937,7 +11830,12 @@ const RUNTIME_CLAIM_SESSION_ELIGIBILITY_SQL: &str = "(($2::bigint > 0
                AS ready(session_id, ownership_generation)
           WHERE ready.session_id = hs.id
             AND ready.ownership_generation = hs.ownership_generation
-        )))";
+        )))
+      AND NOT EXISTS (
+        SELECT 1 FROM runs AS waiting_tool_runs
+        WHERE waiting_tool_runs.hub_session_id = hs.id
+          AND waiting_tool_runs.status = 'waiting_tool'
+      )";
 
 fn runtime_claim_candidate_sql() -> String {
     format!(
@@ -13301,6 +14199,8 @@ struct WidgetAccessSessionInsert<'a> {
     owner_id: Uuid,
     external_identity_id: Uuid,
     external_user: &'a ExternalUserContextDto,
+    client_instance_id: Uuid,
+    client_tool_definitions: Value,
     token: &'a str,
     expires_at: DateTime<Utc>,
 }
@@ -13315,8 +14215,18 @@ async fn insert_widget_access_session_tx(
         "INSERT INTO embed_sessions
              (token_hash, agent_id, owner_id, oauth_app_id, expires_at,
               external_tenant_id, external_user_id, external_identity_id,
-              profile_snapshot)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+              profile_snapshot, client_instance_id, client_tool_definitions)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT (oauth_app_id, agent_id, external_identity_id, client_instance_id)
+             WHERE anonymous = false AND external_identity_id IS NOT NULL
+               AND client_instance_id IS NOT NULL
+         DO UPDATE SET token_hash = EXCLUDED.token_hash,
+                       expires_at = EXCLUDED.expires_at,
+                       owner_id = EXCLUDED.owner_id,
+                       external_tenant_id = EXCLUDED.external_tenant_id,
+                       external_user_id = EXCLUDED.external_user_id,
+                       profile_snapshot = EXCLUDED.profile_snapshot,
+                       client_tool_definitions = EXCLUDED.client_tool_definitions
          RETURNING id",
     )
     .bind(sha256_hex(session.token))
@@ -13328,6 +14238,8 @@ async fn insert_widget_access_session_tx(
     .bind(&session.external_user.external_user_id)
     .bind(session.external_identity_id)
     .bind(profile_snapshot)
+    .bind(session.client_instance_id)
+    .bind(session.client_tool_definitions)
     .fetch_one(&mut **tx)
     .await
     .map_err(Into::into)
@@ -13899,6 +14811,7 @@ async fn move_queued_steers_to_next_turn_tx(
                   model_source_integration_app_id,
                   automation_id, integration_session_id, parent_run_id,
                   widget_session_id, external_user_context,
+                  client_instance_id, client_tool_snapshot,
                   hub_session_id, hub_message_id, hub_turn_id,
                   session_ownership_generation)
              SELECT $1, agent_id, owner_id, 'pending', $2, source,
@@ -13906,6 +14819,7 @@ async fn move_queued_steers_to_next_turn_tx(
                     model_source_integration_app_id,
                     automation_id, integration_session_id, id,
                     widget_session_id, external_user_context,
+                    client_instance_id, client_tool_snapshot,
                     hub_session_id, $3, $4, $5
              FROM runs WHERE id = $6 AND hub_session_id = $7",
         )
@@ -13936,6 +14850,15 @@ async fn move_queued_steers_to_next_turn_tx(
              external_user_context = COALESCE(
                  next.external_user_context,
                  previous.external_user_context
+             ),
+             client_tool_snapshot = CASE
+                 WHEN next.client_instance_id IS NULL
+                 THEN previous.client_tool_snapshot
+                 ELSE next.client_tool_snapshot
+             END,
+             client_instance_id = COALESCE(
+                 next.client_instance_id,
+                 previous.client_instance_id
              ),
              updated_at = now()
          FROM runs AS previous
@@ -15111,6 +16034,7 @@ struct OAuthAppRecord {
     login_required: bool,
     allowed_origins: Vec<String>,
     tool_allowlist: Option<Vec<String>>,
+    client_tool_definitions: Vec<ClientToolDefinitionDto>,
 }
 
 #[derive(Debug)]
@@ -15129,6 +16053,9 @@ struct WidgetCredential {
     expires_at: DateTime<Utc>,
     history_enabled: bool,
     anonymous: bool,
+    client_instance_id: Option<Uuid>,
+    client_tool_definitions: Vec<ClientToolDefinitionDto>,
+    allowed_origins: Vec<String>,
 }
 
 impl WidgetCredential {
@@ -15169,11 +16096,42 @@ fn widget_session_locator(
     }
 }
 
+fn merge_client_session_id(
+    canonical: Option<Uuid>,
+    compatibility: Option<Uuid>,
+) -> Result<Option<Uuid>, ApiError> {
+    if canonical.is_some() && compatibility.is_some() && canonical != compatibility {
+        return Err(ApiError::bad_request("conflicting Client Session ids"));
+    }
+    Ok(canonical.or(compatibility))
+}
+
+fn widget_run_session_locator(
+    credential: &WidgetCredential,
+    request: &CreateWidgetRunRequest,
+) -> Result<(Option<Uuid>, Option<Uuid>), ApiError> {
+    if credential.is_external() {
+        Ok((
+            merge_client_session_id(request.session_id, request.integration_session_id)?,
+            request.hub_session_id,
+        ))
+    } else {
+        if request.integration_session_id.is_some() {
+            return Err(ApiError::bad_request(
+                "this Client does not use Integration Sessions",
+            ));
+        }
+        Ok((
+            None,
+            merge_client_session_id(request.session_id, request.hub_session_id)?,
+        ))
+    }
+}
+
 #[derive(Debug)]
 struct WidgetScopedSession {
     integration_session_id: Option<Uuid>,
     hub_session_id: Uuid,
-    widget_session_id: Uuid,
 }
 
 #[derive(Debug)]
@@ -15513,7 +16471,119 @@ async fn runtime_reaper_loop(pool: PgPool) {
         if let Err(error) = reap_stale_runtimes(&pool).await {
             warn!(error = %error.message, "runtime reaper failed");
         }
+        if let Err(error) = reap_expired_client_tool_batches(&pool).await {
+            warn!(error = %error.message, "Client Tool timeout reaper failed");
+        }
     }
+}
+
+async fn reap_expired_client_tool_batches(pool: &PgPool) -> Result<(), ApiError> {
+    let run_ids = sqlx::query_scalar::<_, Uuid>(
+        "SELECT DISTINCT request.run_id
+         FROM integration_tool_requests AS request
+         JOIN runs AS run ON run.id = request.run_id
+         WHERE run.client_instance_id IS NOT NULL
+           AND request.status IN ('pending', 'claimed', 'unknown')
+           AND request.expires_at <= now()
+         ORDER BY request.run_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    for run_id in run_ids {
+        fail_expired_client_tool_batch(pool, run_id).await?;
+    }
+    Ok(())
+}
+
+async fn fail_expired_client_tool_batch(pool: &PgPool, run_id: Uuid) -> Result<(), ApiError> {
+    let mut tx = pool.begin().await?;
+    let preview = sqlx::query(
+        "SELECT agent_id, hub_session_id FROM runs
+         WHERE id = $1 AND client_instance_id IS NOT NULL",
+    )
+    .bind(run_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(preview) = preview else {
+        tx.commit().await?;
+        return Ok(());
+    };
+    let agent_id: Uuid = preview.get("agent_id");
+    let hub_session_id: Uuid = preview.get("hub_session_id");
+    if sqlx::query_scalar::<_, Uuid>("SELECT id FROM agents WHERE id = $1 FOR UPDATE")
+        .bind(agent_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_none()
+    {
+        tx.commit().await?;
+        return Ok(());
+    }
+    if sqlx::query_scalar::<_, Uuid>("SELECT id FROM hub_sessions WHERE id = $1 FOR UPDATE")
+        .bind(hub_session_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_none()
+    {
+        tx.commit().await?;
+        return Ok(());
+    }
+    let run = sqlx::query(
+        "SELECT id, agent_id, owner_id, integration_session_id, hub_session_id,
+                hub_turn_id, status, client_instance_id, client_tool_snapshot,
+                widget_session_id, external_user_context, model_subject_type,
+                model_subject_user_id, model_source_integration_app_id
+         FROM runs
+         WHERE id = $1 AND hub_session_id = $2 AND client_instance_id IS NOT NULL
+         FOR UPDATE",
+    )
+    .bind(run_id)
+    .bind(hub_session_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(run) = run else {
+        tx.commit().await?;
+        return Ok(());
+    };
+    let expired = sqlx::query(
+        "SELECT id FROM integration_tool_requests
+         WHERE run_id = $1 AND status IN ('pending', 'claimed', 'unknown')
+           AND expires_at <= now()
+         ORDER BY position FOR UPDATE",
+    )
+    .bind(run_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    if expired.is_empty() {
+        tx.commit().await?;
+        return Ok(());
+    }
+    let scope = ClientToolRunScope {
+        run_id,
+        agent_id: run.get("agent_id"),
+        owner_id: run.get("owner_id"),
+        integration_session_id: run.get("integration_session_id"),
+        hub_session_id,
+        hub_turn_id: run.get("hub_turn_id"),
+        client_instance_id: run.get("client_instance_id"),
+        client_tool_snapshot: run.get("client_tool_snapshot"),
+        widget_session_id: run.get("widget_session_id"),
+        external_user_context: run.get("external_user_context"),
+        model_subject_type: run.get("model_subject_type"),
+        model_subject_user_id: run.get("model_subject_user_id"),
+        model_source_integration_app_id: run.get("model_source_integration_app_id"),
+    };
+    fail_client_tool_batch_tx(
+        &mut tx,
+        &scope,
+        "timed_out",
+        "failed",
+        "client_tool_timeout",
+        "Client Tool batch reached its deadline",
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 async fn fail_capability_mismatched_runs_for_runtime_tx(
@@ -16645,6 +17715,120 @@ fn normalize_allowed_origins(value: &[String]) -> Result<Vec<String>, ApiError> 
     Ok(origins.into_iter().collect())
 }
 
+fn request_origin(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    if headers.contains_key(EMBEDDED_ORIGIN_HEADER) {
+        if headers
+            .get("sec-fetch-site")
+            .and_then(|value| value.to_str().ok())
+            != Some("same-origin")
+        {
+            return Err(ApiError::forbidden(
+                "embedded request Origin is not allowed",
+            ));
+        }
+        let mut values = headers.get_all(EMBEDDED_ORIGIN_HEADER).iter();
+        let value = values
+            .next()
+            .ok_or(ApiError::forbidden("embedded request Origin is required"))?;
+        if values.next().is_some() {
+            return Err(ApiError::forbidden(
+                "embedded request Origin is not allowed",
+            ));
+        }
+        return parse_request_origin(value);
+    }
+    let mut values = headers.get_all(header::ORIGIN).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(ApiError::forbidden("request Origin is not allowed"));
+    }
+    parse_request_origin(value)
+}
+
+fn parse_request_origin(value: &HeaderValue) -> Result<Option<String>, ApiError> {
+    let raw = value
+        .to_str()
+        .map_err(|_| ApiError::forbidden("request Origin is not allowed"))?;
+    let url = Url::parse(raw).map_err(|_| ApiError::forbidden("request Origin is not allowed"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ApiError::forbidden("request Origin is not allowed"));
+    }
+    Ok(Some(url.origin().ascii_serialization()))
+}
+
+fn validate_client_request_origin(
+    headers: &HeaderMap,
+    allowed_origins: &[String],
+    required: bool,
+) -> Result<(), ApiError> {
+    let Some(origin) = request_origin(headers)? else {
+        return if required {
+            Err(ApiError::forbidden("request Origin is required"))
+        } else {
+            Ok(())
+        };
+    };
+    if allowed_origins.is_empty() || allowed_origins.iter().any(|allowed| allowed == &origin) {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden("request Origin is not allowed"))
+    }
+}
+
+fn validate_client_tool_definitions(
+    definitions: &[ClientToolDefinitionDto],
+) -> Result<Value, ApiError> {
+    if definitions.len() > MAX_CLIENT_TOOL_COUNT {
+        return Err(ApiError::bad_request("too many Client Tools"));
+    }
+    let mut names = BTreeSet::new();
+    for definition in definitions {
+        if definition.name.is_empty()
+            || definition.name.len() > 64
+            || !definition
+                .name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            || !names.insert(definition.name.as_str())
+        {
+            return Err(ApiError::bad_request(
+                "Client Tool names must be unique and contain only letters, digits, '_' or '-'",
+            ));
+        }
+        if definition.description.trim().is_empty() {
+            return Err(ApiError::bad_request("Client Tool description is required"));
+        }
+        let Some(schema) = definition.input_schema.as_object() else {
+            return Err(ApiError::bad_request(
+                "Client Tool input_schema must be a JSON object",
+            ));
+        };
+        if schema.get("type").and_then(Value::as_str) != Some("object") {
+            return Err(ApiError::bad_request(
+                "Client Tool input_schema type must be object",
+            ));
+        }
+    }
+    let encoded = serde_json::to_vec(definitions)
+        .map_err(|_| ApiError::bad_request("Client Tool definitions must be valid JSON"))?;
+    if encoded.len() > MAX_CLIENT_TOOL_DEFINITIONS_BYTES {
+        return Err(ApiError::bad_request(
+            "Client Tool definitions are too large",
+        ));
+    }
+    serde_json::to_value(definitions)
+        .map_err(|_| ApiError::internal("Client Tool definitions could not be encoded"))
+}
+
 fn validate_public_widget_settings(
     login_required: bool,
     widget_history_enabled: bool,
@@ -17095,7 +18279,7 @@ async fn load_integration_app(
     let row = sqlx::query(
         "SELECT id, owner_id, name, client_id, external_platform_id,
                 authentication_channel_id, redirect_uris, widget_history_enabled,
-                login_required, allowed_origins, tool_allowlist,
+                login_required, allowed_origins, tool_allowlist, client_tool_definitions,
                 created_at, updated_at
          FROM oauth_apps
          WHERE id = $1 AND owner_id = $2 AND deleted_at IS NULL",
@@ -17122,7 +18306,7 @@ async fn load_oauth_app_by_client_id(
     let row = sqlx::query(
         "SELECT id, owner_id, client_secret_hash, redirect_uris,
                 external_platform_id, authentication_channel_id, widget_history_enabled,
-                login_required, allowed_origins, tool_allowlist
+                login_required, allowed_origins, tool_allowlist, client_tool_definitions
          FROM oauth_apps
          WHERE client_id = $1 AND deleted_at IS NULL
            AND client_secret_hash IS NOT NULL",
@@ -17131,6 +18315,30 @@ async fn load_oauth_app_by_client_id(
     .fetch_optional(pool)
     .await?;
     let row = row.ok_or(ApiError::unauthorized("invalid oauth client"))?;
+    oauth_app_record_from_row(row)
+}
+
+async fn load_oauth_app_by_client_id_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    client_id: &str,
+) -> Result<OAuthAppRecord, ApiError> {
+    let row = sqlx::query(
+        "SELECT id, owner_id, client_secret_hash, redirect_uris,
+                external_platform_id, authentication_channel_id, widget_history_enabled,
+                login_required, allowed_origins, tool_allowlist, client_tool_definitions
+         FROM oauth_apps
+         WHERE client_id = $1 AND deleted_at IS NULL
+           AND client_secret_hash IS NOT NULL
+         FOR SHARE",
+    )
+    .bind(client_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let row = row.ok_or(ApiError::unauthorized("invalid oauth client"))?;
+    oauth_app_record_from_row(row)
+}
+
+fn oauth_app_record_from_row(row: sqlx::postgres::PgRow) -> Result<OAuthAppRecord, ApiError> {
     Ok(OAuthAppRecord {
         id: row.get("id"),
         owner_id: row.get("owner_id"),
@@ -17147,14 +18355,12 @@ async fn load_oauth_app_by_client_id(
             .map(serde_json::from_value)
             .transpose()
             .map_err(|_| ApiError::internal("stored App tool policy is invalid"))?,
+        client_tool_definitions: serde_json::from_value(row.get("client_tool_definitions"))
+            .map_err(|_| ApiError::internal("stored Client Tool definitions are invalid"))?,
     })
 }
 
-async fn load_public_widget_app_by_client_id(
-    pool: &PgPool,
-    client_id: &str,
-) -> Result<OAuthAppRecord, ApiError> {
-    let app = load_oauth_app_by_client_id(pool, client_id).await?;
+fn validate_public_widget_app_record(app: &OAuthAppRecord) -> Result<(), ApiError> {
     if app.login_required {
         return Err(ApiError::not_found("public Widget application not found"));
     }
@@ -17168,6 +18374,15 @@ async fn load_public_widget_app_by_client_id(
     }) {
         return Err(ApiError::conflict("public Widget tool policy is invalid"));
     }
+    Ok(())
+}
+
+async fn load_public_widget_app_by_client_id(
+    pool: &PgPool,
+    client_id: &str,
+) -> Result<OAuthAppRecord, ApiError> {
+    let app = load_oauth_app_by_client_id(pool, client_id).await?;
+    validate_public_widget_app_record(&app)?;
     let agent_count: i64 = sqlx::query_scalar(
         "SELECT count(*)
          FROM integration_app_agents AS delegated
@@ -17178,6 +18393,30 @@ async fn load_public_widget_app_by_client_id(
     .fetch_one(pool)
     .await?;
     if agent_count != 1 {
+        return Err(ApiError::conflict(
+            "public Widget must delegate exactly one active Agent",
+        ));
+    }
+    Ok(app)
+}
+
+async fn load_public_widget_app_by_client_id_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    client_id: &str,
+) -> Result<OAuthAppRecord, ApiError> {
+    let app = load_oauth_app_by_client_id_tx(tx, client_id).await?;
+    validate_public_widget_app_record(&app)?;
+    let delegated_agents = sqlx::query_scalar::<_, Uuid>(
+        "SELECT agent.id
+         FROM integration_app_agents AS delegated
+         JOIN agents AS agent ON agent.id = delegated.agent_id
+         WHERE delegated.app_id = $1 AND agent.deleted_at IS NULL
+         FOR SHARE OF delegated, agent",
+    )
+    .bind(app.id)
+    .fetch_all(&mut **tx)
+    .await?;
+    if delegated_agents.len() != 1 {
         return Err(ApiError::conflict(
             "public Widget must delegate exactly one active Agent",
         ));
@@ -17298,21 +18537,31 @@ async fn load_integration_context_for_run(
     tx: &mut Transaction<'_, Postgres>,
     run: &RunDto,
 ) -> Result<Option<IntegrationContextDto>, ApiError> {
-    let Some(session_id) = run.integration_session_id else {
-        return Ok(None);
-    };
-    let session = sqlx::query(
-        "SELECT integration.tool_definitions, runs.external_user_context
-         FROM integration_sessions AS integration
-         JOIN runs ON runs.id = $2
-          AND runs.integration_session_id = integration.id
-         WHERE integration.id = $1",
+    let run_context = sqlx::query(
+        "SELECT integration_session_id, external_user_context,
+                client_instance_id, client_tool_snapshot
+         FROM runs WHERE id = $1",
     )
-    .bind(session_id)
     .bind(run.id)
     .fetch_one(&mut **tx)
     .await?;
-    let external_user = session
+    let integration_session_id: Option<Uuid> = run_context.get("integration_session_id");
+    let client_instance_id: Option<Uuid> = run_context.get("client_instance_id");
+    if integration_session_id.is_none() && client_instance_id.is_none() {
+        return Ok(None);
+    }
+    let session_tools = if let Some(integration_session_id) = integration_session_id {
+        sqlx::query_scalar::<_, Value>(
+            "SELECT tool_definitions FROM integration_sessions WHERE id = $1",
+        )
+        .bind(integration_session_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(ApiError::internal("Run Integration Session is missing"))?
+    } else {
+        Value::Array(Vec::new())
+    };
+    let external_user = run_context
         .get::<Option<Value>, _>("external_user_context")
         .map(serde_json::from_value::<ExternalUserContextDto>)
         .transpose()
@@ -17337,29 +18586,55 @@ async fn load_integration_context_for_run(
             })
         })
         .collect::<Vec<_>>();
-    let tool_result = if run.source == "integration:tool_result" {
+    let (tool_result, tool_results) = if run.source == "integration:tool_result" {
         let parent_run_id = run
             .parent_run_id
             .ok_or(ApiError::internal("tool-result run parent is missing"))?;
-        sqlx::query(
-            "SELECT result_payload FROM integration_tool_requests
-             WHERE follow_up_run_id = $1 AND run_id = $2 AND session_id = $3
+        let hub_session_id = run
+            .hub_session_id
+            .ok_or(ApiError::internal("tool-result Run Session is missing"))?;
+        let result_rows = sqlx::query(
+            "SELECT id, tool_name, result_payload
+             FROM integration_tool_requests
+             WHERE follow_up_run_id = $1 AND run_id = $2 AND hub_session_id = $3
                AND status = 'completed'
-             ORDER BY responded_at DESC LIMIT 1",
+             ORDER BY position",
         )
         .bind(run.id)
         .bind(parent_run_id)
-        .bind(session_id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .and_then(|row| row.get("result_payload"))
+        .bind(hub_session_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        let tool_result = result_rows.last().and_then(|row| row.get("result_payload"));
+        let tool_results = if client_instance_id.is_some() {
+            result_rows
+                .into_iter()
+                .map(|row| {
+                    Ok(ClientToolContinuationResultDto {
+                        tool_call_id: row.get("id"),
+                        tool_name: row.get("tool_name"),
+                        result: serde_json::from_value(row.get("result_payload")).map_err(
+                            |_| ApiError::internal("stored Client Tool result is invalid"),
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>, ApiError>>()?
+        } else {
+            Vec::new()
+        };
+        (tool_result, tool_results)
     } else {
-        None
+        (None, Vec::new())
     };
     Ok(Some(IntegrationContextDto {
-        tools: session.get("tool_definitions"),
+        tools: if client_instance_id.is_some() {
+            run_context.get("client_tool_snapshot")
+        } else {
+            session_tools
+        },
         attachments: Value::Array(attachments),
         tool_result,
+        tool_results,
         external_user,
     }))
 }
@@ -17548,8 +18823,11 @@ async fn load_tool_request_for_update(
     principal: &IntegrationPrincipal,
 ) -> Result<IntegrationToolRequestDto, ApiError> {
     let row = sqlx::query(
-        "SELECT t.id, t.session_id, t.run_id, t.tool_name, t.arguments, t.status,
-                t.result_payload, t.follow_up_run_id, t.expires_at, t.created_at
+        "SELECT t.id, t.session_id, t.hub_session_id, t.run_id, t.position,
+                t.tool_name, t.arguments, t.status,
+                t.claimed_by_client_instance_id, t.claimed_at,
+                t.result_payload, t.follow_up_run_id, t.expires_at,
+                t.responded_at, t.created_at
          FROM integration_tool_requests t
          JOIN integration_sessions s ON s.id = t.session_id
          JOIN oauth_apps app ON app.id = s.oauth_app_id
@@ -17631,8 +18909,11 @@ async fn load_tool_request(
     principal: &IntegrationPrincipal,
 ) -> Result<IntegrationToolRequestDto, ApiError> {
     let row = sqlx::query(
-        "SELECT t.id, t.session_id, t.run_id, t.tool_name, t.arguments, t.status,
-                t.result_payload, t.follow_up_run_id, t.expires_at, t.created_at
+        "SELECT t.id, t.session_id, t.hub_session_id, t.run_id, t.position,
+                t.tool_name, t.arguments, t.status,
+                t.claimed_by_client_instance_id, t.claimed_at,
+                t.result_payload, t.follow_up_run_id, t.expires_at,
+                t.responded_at, t.created_at
          FROM integration_tool_requests t
          JOIN integration_sessions s ON s.id = t.session_id
          JOIN oauth_apps app ON app.id = s.oauth_app_id
@@ -17668,6 +18949,7 @@ async fn load_tool_request(
 
 struct RuntimeToolRequestRegistration {
     request_id: Uuid,
+    position: i32,
     tool_name: String,
     arguments: Value,
     event: FinalizeToolRequestEvent,
@@ -17676,9 +18958,6 @@ struct RuntimeToolRequestRegistration {
 fn parse_tool_request_batch(
     request: &FinalizeToolRequestsRequest,
 ) -> Result<Vec<RuntimeToolRequestRegistration>, ApiError> {
-    if request.integration_session_id.is_nil() {
-        return Err(ApiError::bad_request("integration session id is required"));
-    }
     if request.native_session_id.trim().is_empty() || request.work_dir_ref.trim().is_empty() {
         return Err(ApiError::bad_request(
             "tool request resume metadata is required",
@@ -17691,7 +18970,8 @@ fn parse_tool_request_batch(
     request
         .tool_requests
         .iter()
-        .map(|event| {
+        .enumerate()
+        .map(|(position, event)| {
             let tool_name = event
                 .payload
                 .get("tool_name")
@@ -17711,6 +18991,8 @@ fn parse_tool_request_batch(
             }
             Ok(RuntimeToolRequestRegistration {
                 request_id,
+                position: i32::try_from(position)
+                    .map_err(|_| ApiError::bad_request("tool request batch is too large"))?,
                 tool_name: tool_name.to_owned(),
                 arguments: event
                     .payload
@@ -17793,32 +19075,58 @@ async fn finalize_tool_request_batch_tx(
             "agent is deleted or run does not exist",
         ));
     }
-    let session = sqlx::query(ACTIVE_RUNTIME_TOOL_REQUEST_SESSION_SQL)
-        .bind(run_id)
-        .bind(request.integration_session_id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .ok_or(ApiError::forbidden(
-            "tool requests are only allowed for integration runs",
-        ))?;
-    let integration_session_id: Uuid = session.get("id");
-    let tools: Value = session.get("tool_definitions");
     let hub_session_id =
         lock_owned_session_for_run_tx(tx, run_id, runtime_id, ownership_generation).await?;
     let row = sqlx::query(ACTIVE_RUNTIME_TOOL_REQUEST_RUN_SQL)
         .bind(run_id)
         .bind(runtime_id)
-        .bind(integration_session_id)
         .bind(ownership_generation)
         .fetch_optional(&mut **tx)
         .await?;
     let row = row.ok_or(ApiError::forbidden("runtime does not own an active run"))?;
-    let locked_session_id: Uuid = row.get("integration_session_id");
+    let integration_session_id: Option<Uuid> = row.get("integration_session_id");
     let run_hub_session_id: Uuid = row.get("hub_session_id");
     let hub_turn_id: Uuid = row.get("hub_turn_id");
-    if locked_session_id != integration_session_id {
-        return Err(ApiError::forbidden("integration run session changed"));
+    let client_instance_id: Option<Uuid> = row.get("client_instance_id");
+    if integration_session_id != request.integration_session_id {
+        return Err(ApiError::forbidden(
+            "tool request batch session does not match its Run",
+        ));
     }
+    if integration_session_id.is_none() && client_instance_id.is_none() {
+        return Err(ApiError::forbidden(
+            "tool requests are only allowed for integration or Client Tool runs",
+        ));
+    }
+    let session_tools = if let Some(integration_session_id) = integration_session_id {
+        sqlx::query_scalar::<_, Value>(
+            "SELECT tool_definitions FROM integration_sessions
+             WHERE id = $1 FOR UPDATE",
+        )
+        .bind(integration_session_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(ApiError::forbidden("integration run session changed"))?
+    } else {
+        Value::Array(Vec::new())
+    };
+    let tools = if client_instance_id.is_some() {
+        let integration_enabled: bool = sqlx::query_scalar(
+            "SELECT tool_allowlist ? 'integration'
+             FROM agents WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(active_agent.expect("active Agent was checked above"))
+        .fetch_one(&mut **tx)
+        .await?;
+        if !integration_enabled {
+            return Err(ApiError::forbidden(
+                "Agent does not allow Client Tool execution",
+            ));
+        }
+        row.get::<Value, _>("client_tool_snapshot")
+    } else {
+        session_tools
+    };
     if run_hub_session_id != hub_session_id {
         return Err(ApiError::conflict(
             "tool request Run Session changed while finalizing",
@@ -17878,19 +19186,42 @@ async fn finalize_tool_request_batch_tx(
         status_payload,
     )
     .await?;
-    let expires_at = Utc::now() + ChronoDuration::minutes(30);
+    let expires_at = Utc::now()
+        + ChronoDuration::minutes(if client_instance_id.is_some() {
+            CLIENT_TOOL_DEADLINE_MINUTES
+        } else {
+            30
+        });
     for request in requests {
+        let event_payload = if client_instance_id.is_some() {
+            json!({
+                "tool_call_id": request.request_id,
+                "tool_name": request.tool_name,
+                "arguments": request.arguments,
+                "batch_id": run_id,
+                "expires_at": expires_at,
+            })
+        } else {
+            request.event.payload.clone()
+        };
         insert_run_event_tx(
             tx,
             run_id,
             "tool_request".into(),
             request.event.role.clone(),
             request.event.content.clone(),
-            request.event.payload.clone(),
+            event_payload,
         )
         .await?;
-        record_integration_tool_request(tx, run_id, integration_session_id, request, expires_at)
-            .await?;
+        record_integration_tool_request(
+            tx,
+            run_id,
+            integration_session_id,
+            hub_session_id,
+            request,
+            expires_at,
+        )
+        .await?;
     }
     // The execution engine completed the native Turn that produced the tool request. Close
     // the corresponding Hub Turn in the same transaction that makes the tool
@@ -17934,7 +19265,7 @@ async fn finalize_tool_request_batch_tx(
 async fn verify_tool_request_batch_replay(
     tx: &mut Transaction<'_, Postgres>,
     run_id: Uuid,
-    integration_session_id: Uuid,
+    integration_session_id: Option<Uuid>,
     requests: &[RuntimeToolRequestRegistration],
     fingerprint: &str,
 ) -> Result<(), ApiError> {
@@ -17960,9 +19291,9 @@ async fn verify_tool_request_batch_replay(
     }
 
     let stored_requests = sqlx::query(
-        "SELECT id, tool_name, arguments
+        "SELECT id, position, tool_name, arguments
          FROM integration_tool_requests
-         WHERE run_id = $1 AND session_id = $2",
+         WHERE run_id = $1 AND session_id IS NOT DISTINCT FROM $2",
     )
     .bind(run_id)
     .bind(integration_session_id)
@@ -17984,13 +19315,18 @@ async fn verify_tool_request_batch_replay(
     for request in requests {
         let request_matches = stored_requests.iter().filter(|row| {
             row.get::<Uuid, _>("id") == request.request_id
+                && row.get::<i32, _>("position") == request.position
                 && row.get::<String, _>("tool_name") == request.tool_name
                 && row.get::<Value, _>("arguments") == request.arguments
         });
         let event_matches = stored_events.iter().filter(|row| {
-            row.get::<Option<String>, _>("role") == request.event.role
-                && row.get::<Option<String>, _>("content") == request.event.content
-                && row.get::<Value, _>("payload") == request.event.payload
+            let payload = row.get::<Value, _>("payload");
+            payload
+                .get("tool_request_id")
+                .or_else(|| payload.get("tool_call_id"))
+                .and_then(Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok())
+                == Some(request.request_id)
         });
         if request_matches.count() != 1 || event_matches.count() != 1 {
             return Err(ApiError::conflict(
@@ -18004,14 +19340,17 @@ async fn verify_tool_request_batch_replay(
 async fn record_integration_tool_request(
     tx: &mut Transaction<'_, Postgres>,
     run_id: Uuid,
-    integration_session_id: Uuid,
+    integration_session_id: Option<Uuid>,
+    hub_session_id: Uuid,
     request: &RuntimeToolRequestRegistration,
     expires_at: DateTime<Utc>,
 ) -> Result<(), ApiError> {
     let inserted = sqlx::query(INTEGRATION_TOOL_REQUEST_INSERT_SQL)
         .bind(request.request_id)
         .bind(integration_session_id)
+        .bind(hub_session_id)
         .bind(run_id)
+        .bind(request.position)
         .bind(&request.tool_name)
         .bind(&request.arguments)
         .bind(expires_at)
@@ -18091,24 +19430,39 @@ async fn authorize_run_stream(
     headers: &HeaderMap,
     run_id: Uuid,
 ) -> Result<(), ApiError> {
-    if let Some(token) = embed_token_from_headers(headers) {
+    if let Some(token) = client_access_token_from_headers(headers) {
         let mut tx = state.pool.begin().await?;
-        let credential = load_widget_credential_tx(&mut tx, &token).await?;
-        let row: Option<(Uuid,)> = sqlx::query_as(
-            "SELECT id FROM runs
+        let credential = load_widget_credential_tx(&mut tx, &token, headers).await?;
+        let run = sqlx::query(
+            "SELECT integration_session_id, hub_session_id FROM runs
              WHERE id = $1 AND agent_id = $2 AND owner_id = $3
-               AND source = 'widget' AND widget_session_id = $4",
+               AND (($4::boolean = true AND source = 'widget')
+                    OR ($4::boolean = false AND widget_session_id = $5))",
         )
         .bind(run_id)
         .bind(credential.agent_id)
         .bind(credential.owner_id)
+        .bind(credential.client_instance_id.is_some())
         .bind(credential.id)
         .fetch_optional(&mut *tx)
-        .await?;
+        .await?
+        .ok_or(ApiError::forbidden("embed session cannot access run"))?;
+        if let Err(error) = load_widget_scoped_session_tx(
+            &mut tx,
+            &credential,
+            run.get("integration_session_id"),
+            Some(run.get("hub_session_id")),
+            false,
+        )
+        .await
+        {
+            if error.status == StatusCode::NOT_FOUND {
+                return Err(ApiError::forbidden("embed session cannot access run"));
+            }
+            return Err(error);
+        }
         tx.commit().await?;
-        return row
-            .map(|_| ())
-            .ok_or(ApiError::forbidden("embed session cannot access run"));
+        return Ok(());
     }
     let user = require_user(state, headers).await?;
     load_run_for_user(&state.pool, run_id, &user).await?;
@@ -18118,6 +19472,7 @@ async fn authorize_run_stream(
 async fn load_widget_credential_tx(
     tx: &mut Transaction<'_, Postgres>,
     token: &str,
+    headers: &HeaderMap,
 ) -> Result<WidgetCredential, ApiError> {
     let row = sqlx::query(
         "SELECT embed.id, embed.agent_id, agent.owner_id AS agent_owner_id,
@@ -18126,7 +19481,9 @@ async fn load_widget_credential_tx(
                 embed.external_user_id, embed.external_identity_id,
                 embed.profile_snapshot, embed.expires_at,
                 COALESCE(app.widget_history_enabled, false) AS history_enabled,
-                embed.anonymous
+                embed.anonymous, embed.client_instance_id,
+                embed.client_tool_definitions,
+                COALESCE(app.allowed_origins, '[]'::jsonb) AS allowed_origins
          FROM embed_sessions AS embed
          JOIN agents AS agent ON agent.id = embed.agent_id AND agent.deleted_at IS NULL
          JOIN users AS session_owner
@@ -18157,6 +19514,9 @@ async fn load_widget_credential_tx(
                               OR (agent.visibility = 'public_to'
                                   AND app.owner_id = ANY(agent.public_to)))
                    )
+                   AND (embed.client_instance_id IS NULL
+                        OR jsonb_array_length(embed.client_tool_definitions) = 0
+                        OR agent.tool_allowlist ? 'integration')
                    AND (
                        embed.external_identity_id IS NULL
                        OR EXISTS (
@@ -18175,8 +19535,18 @@ async fn load_widget_credential_tx(
     .bind(sha256_hex(token))
     .fetch_optional(&mut **tx)
     .await?;
-    row.map(widget_credential_from_row)
-        .ok_or(ApiError::unauthorized("invalid embed session"))
+    let credential = row
+        .map(widget_credential_from_row)
+        .transpose()?
+        .ok_or(ApiError::unauthorized("invalid embed session"))?;
+    if credential.client_instance_id.is_some() {
+        validate_client_request_origin(
+            headers,
+            &credential.allowed_origins,
+            credential.is_anonymous() || !credential.allowed_origins.is_empty(),
+        )?;
+    }
+    Ok(credential)
 }
 
 async fn load_widget_scoped_session_tx(
@@ -18215,7 +19585,6 @@ async fn load_widget_scoped_session_tx(
         return Ok(WidgetScopedSession {
             integration_session_id: None,
             hub_session_id: row.get("id"),
-            widget_session_id: credential.id,
         });
     }
     if !credential.is_external() {
@@ -18228,7 +19597,6 @@ async fn load_widget_scoped_session_tx(
         return Ok(WidgetScopedSession {
             integration_session_id: None,
             hub_session_id: credential.hub_session_id.expect("checked above"),
-            widget_session_id: credential.id,
         });
     }
     let (
@@ -18277,7 +19645,6 @@ async fn load_widget_scoped_session_tx(
     Ok(WidgetScopedSession {
         integration_session_id: Some(row.get("id")),
         hub_session_id: row.get("hub_session_id"),
-        widget_session_id: credential.id,
     })
 }
 
@@ -18286,10 +19653,10 @@ async fn authorize_widget_session(
     headers: &HeaderMap,
     session_id: Uuid,
 ) -> Result<(), ApiError> {
-    let token =
-        embed_token_from_headers(headers).ok_or(ApiError::unauthorized("missing embed session"))?;
+    let token = client_access_token_from_headers(headers)
+        .ok_or(ApiError::unauthorized("missing embed session"))?;
     let mut tx = state.pool.begin().await?;
-    let credential = load_widget_credential_tx(&mut tx, &token).await?;
+    let credential = load_widget_credential_tx(&mut tx, &token, headers).await?;
     let (integration_session_id, hub_session_id) = widget_session_locator(&credential, session_id);
     load_widget_scoped_session_tx(
         &mut tx,
@@ -18330,12 +19697,10 @@ async fn load_widget_session_events_after_tx(
                     event.role, event.content, event.payload, event.created_at
              FROM run_events AS event
              JOIN runs ON runs.id = event.run_id
-             WHERE runs.widget_session_id = $1
-               AND runs.hub_session_id = $2
-               AND event.seq > $3
+             WHERE runs.hub_session_id = $1
+               AND event.seq > $2
              ORDER BY event.seq ASC",
         )
-        .bind(session.widget_session_id)
         .bind(session.hub_session_id)
         .bind(after)
         .fetch_all(&mut **tx)
@@ -18347,6 +19712,7 @@ async fn load_widget_session_events_after_tx(
 async fn lock_widget_credential_tx(
     tx: &mut Transaction<'_, Postgres>,
     token: &str,
+    headers: &HeaderMap,
 ) -> Result<WidgetCredential, ApiError> {
     // Keep the shared Agent -> Widget credential lock order used by deletion paths.
     let preview = sqlx::query(
@@ -18371,7 +19737,7 @@ async fn lock_widget_credential_tx(
     .fetch_optional(&mut **tx)
     .await?
     .ok_or(ApiError::unauthorized("invalid embed session"))?;
-    let credential = load_widget_credential_tx(tx, token).await?;
+    let credential = load_widget_credential_tx(tx, token, headers).await?;
     if credential.agent_id != agent_id || credential.agent_owner_id != agent_owner_id {
         return Err(ApiError::internal(
             "Widget credential Agent changed while locking",
@@ -18380,8 +19746,8 @@ async fn lock_widget_credential_tx(
     Ok(credential)
 }
 
-fn widget_credential_from_row(row: sqlx::postgres::PgRow) -> WidgetCredential {
-    WidgetCredential {
+fn widget_credential_from_row(row: sqlx::postgres::PgRow) -> Result<WidgetCredential, ApiError> {
+    Ok(WidgetCredential {
         id: row.get("id"),
         agent_id: row.get("agent_id"),
         agent_owner_id: row.get("agent_owner_id"),
@@ -18396,7 +19762,12 @@ fn widget_credential_from_row(row: sqlx::postgres::PgRow) -> WidgetCredential {
         expires_at: row.get("expires_at"),
         history_enabled: row.get("history_enabled"),
         anonymous: row.get("anonymous"),
-    }
+        client_instance_id: row.get("client_instance_id"),
+        client_tool_definitions: serde_json::from_value(row.get("client_tool_definitions"))
+            .map_err(|_| ApiError::internal("stored Client Tool definitions are invalid"))?,
+        allowed_origins: serde_json::from_value(row.get("allowed_origins"))
+            .map_err(|_| ApiError::internal("stored Client Origin policy is invalid"))?,
+    })
 }
 
 async fn load_auth_policy(pool: &PgPool) -> Result<AuthPolicyDto, ApiError> {
@@ -19479,6 +20850,11 @@ fn integration_app_from_row(row: sqlx::postgres::PgRow, agent_ids: Vec<Uuid>) ->
             .map(serde_json::from_value)
             .transpose()
             .expect("Integration App tool policy is constrained"),
+        client_tool_definitions: serde_json::from_value(
+            row.try_get::<Value, _>("client_tool_definitions")
+                .unwrap_or_else(|_| json!([])),
+        )
+        .expect("Integration App Client Tool definitions are constrained"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
@@ -19504,13 +20880,20 @@ fn tool_request_from_row(row: sqlx::postgres::PgRow) -> IntegrationToolRequestDt
     IntegrationToolRequestDto {
         id: row.get("id"),
         session_id: row.get("session_id"),
+        hub_session_id: row.try_get("hub_session_id").unwrap_or_default(),
         run_id: row.get("run_id"),
+        position: row.try_get("position").unwrap_or_default(),
         tool_name: row.get("tool_name"),
         arguments: row.get("arguments"),
         status: row.get("status"),
+        claimed_by_client_instance_id: row
+            .try_get("claimed_by_client_instance_id")
+            .unwrap_or_default(),
+        claimed_at: row.try_get("claimed_at").unwrap_or_default(),
         result_payload: row.get("result_payload"),
         follow_up_run_id: row.get("follow_up_run_id"),
         expires_at: row.get("expires_at"),
+        responded_at: row.try_get("responded_at").unwrap_or_default(),
         created_at: row.get("created_at"),
     }
 }
@@ -19648,6 +21031,14 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 
 fn embed_token_from_headers(headers: &HeaderMap) -> Option<String> {
     scoped_token_from_headers(headers, "x-agent-hub-embed-token", "Embed ")
+}
+
+fn client_access_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    embed_token_from_headers(headers).or_else(|| {
+        bearer_token(headers).filter(|token| {
+            token.starts_with("ahe_") || token.starts_with("ahw_") || token.starts_with("ahp_")
+        })
+    })
 }
 
 fn webhook_token_from_headers(headers: &HeaderMap) -> Option<String> {
@@ -19936,6 +21327,268 @@ mod tests {
         }
     }
 
+    #[test]
+    fn client_tool_definitions_are_bounded_and_protocol_neutral() {
+        let valid = ClientToolDefinitionDto {
+            name: "open_panel".into(),
+            description: "Open one application panel".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "panel_id": { "type": "string" } },
+                "required": ["panel_id"]
+            }),
+        };
+        assert_eq!(
+            validate_client_tool_definitions(std::slice::from_ref(&valid)).unwrap(),
+            serde_json::to_value([&valid]).unwrap()
+        );
+
+        for invalid in [
+            ClientToolDefinitionDto {
+                name: "bad name".into(),
+                ..valid.clone()
+            },
+            ClientToolDefinitionDto {
+                description: " ".into(),
+                ..valid.clone()
+            },
+            ClientToolDefinitionDto {
+                input_schema: json!({ "type": "string" }),
+                ..valid.clone()
+            },
+        ] {
+            assert_eq!(
+                validate_client_tool_definitions(&[invalid])
+                    .unwrap_err()
+                    .status,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            validate_client_tool_definitions(&[valid.clone(), valid])
+                .unwrap_err()
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+
+        let document = openapi_document();
+        assert_eq!(
+            document["components"]["schemas"]["ClientToolDefinition"]["properties"]["input_schema"]
+                ["type"],
+            "object"
+        );
+        assert_eq!(
+            document["components"]["schemas"]["IntegrationApp"]["properties"]
+                ["client_tool_definitions"]["maxItems"],
+            128
+        );
+        for path in [
+            "/api/client/access",
+            "/api/client/anonymous/access",
+            "/api/client/renew",
+            "/api/client/tool-calls/{tool_call_id}/claim",
+            "/api/client/tool-calls/{tool_call_id}/result",
+        ] {
+            assert!(document["paths"].get(path).is_some(), "missing {path}");
+        }
+        assert_eq!(
+            document["paths"]["/api/client/renew"]["post"]["security"],
+            json!([{ "clientAccessBearer": [] }])
+        );
+        assert_eq!(
+            document["components"]["schemas"]["ClientAccessResponse"]["properties"]["expires_in"]
+                ["minimum"],
+            1
+        );
+        assert_eq!(
+            document["components"]["schemas"]["SubmitClientToolResultRequest"]["properties"]
+                ["result"]["$ref"],
+            "#/components/schemas/ClientToolResult"
+        );
+    }
+
+    #[test]
+    fn canonical_client_openapi_is_distinct_typed_and_documents_origin_policy() {
+        let document = openapi_document();
+        let schemas = &document["components"]["schemas"];
+
+        for schema_name in [
+            "CreateClientAccessRequest",
+            "CreateAnonymousClientAccessRequest",
+            "RenewClientAccessRequest",
+            "CreateClientRunRequest",
+            "ClientSessionMetadata",
+            "ClientSessionSummary",
+        ] {
+            assert_eq!(
+                schemas[schema_name]["type"], "object",
+                "invalid {schema_name}"
+            );
+            assert!(
+                schemas[schema_name].get("$ref").is_none(),
+                "aliased {schema_name}"
+            );
+        }
+        assert!(schemas["CreateClientRunRequest"]["properties"]
+            .get("integration_session_id")
+            .is_none());
+        assert!(schemas["CreateClientRunRequest"]["properties"]
+            .get("parent_run_id")
+            .is_none());
+        assert_eq!(
+            document["paths"]["/api/client/session"]["get"]["responses"]["200"]["content"]
+                ["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ClientSessionMetadata"
+        );
+        assert_eq!(
+            document["paths"]["/api/client/sessions"]["get"]["responses"]["200"]["content"]
+                ["application/json"]["schema"]["items"]["$ref"],
+            "#/components/schemas/ClientSessionSummary"
+        );
+
+        assert_eq!(
+            document["paths"]["/api/client/access"]["post"]["parameters"][0]["required"],
+            false
+        );
+        assert_eq!(
+            document["paths"]["/api/client/anonymous/access"]["post"]["parameters"][0]["required"],
+            true
+        );
+        assert_eq!(
+            document["paths"]["/api/client/sessions/{session_id}/events"]["get"]["responses"]
+                ["200"]["content"]["application/json"]["schema"]["items"]["$ref"],
+            "#/components/schemas/ClientSessionEvent"
+        );
+        assert_eq!(
+            schemas["ClientSessionEvent"]["oneOf"]
+                .as_array()
+                .unwrap()
+                .len(),
+            5
+        );
+        assert_eq!(
+            document["paths"]["/api/client/tool-calls/{tool_call_id}/result"]["post"]["responses"]
+                ["409"]["description"],
+            "A different result was already accepted for this tool_call_id"
+        );
+
+        for (path, item) in document["paths"].as_object().unwrap() {
+            if !path.starts_with("/api/widget/") {
+                continue;
+            }
+            for method in ["get", "post", "put", "patch", "delete"] {
+                if let Some(operation) = item.get(method) {
+                    assert_eq!(
+                        operation["deprecated"], true,
+                        "{method} {path} is not deprecated"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn client_request_origin_enforces_exact_optional_and_required_policies() {
+        let allowed = vec!["https://app.example.test".to_owned()];
+        let mut headers = HeaderMap::new();
+        assert!(validate_client_request_origin(&headers, &[], false).is_ok());
+        assert_eq!(
+            validate_client_request_origin(&headers, &allowed, true)
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://app.example.test"),
+        );
+        assert!(validate_client_request_origin(&headers, &allowed, true).is_ok());
+        assert!(validate_client_request_origin(&headers, &[], false).is_ok());
+
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://other.example.test"),
+        );
+        assert_eq!(
+            validate_client_request_origin(&headers, &allowed, true)
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://hub.example.test"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-agent-hub-embedded-origin"),
+            HeaderValue::from_static("https://app.example.test"),
+        );
+        headers.insert(
+            HeaderName::from_static("sec-fetch-site"),
+            HeaderValue::from_static("same-origin"),
+        );
+        assert!(validate_client_request_origin(&headers, &allowed, true).is_ok());
+
+        headers.insert(
+            HeaderName::from_static("sec-fetch-site"),
+            HeaderValue::from_static("cross-site"),
+        );
+        assert_eq!(
+            validate_client_request_origin(&headers, &allowed, true)
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_reflects_client_origins_without_opening_control_plane_routes() {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(20))
+            .connect_lazy("postgres://agent-hub:agent-hub@127.0.0.1:1/agent_hub")
+            .unwrap();
+        let app = build_router(test_state_with_pool(pool));
+        let client_preflight = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/api/client/renew")
+                    .header(header::ORIGIN, "https://app.example.test")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            client_preflight
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&HeaderValue::from_static("https://app.example.test"))
+        );
+
+        let control_preflight = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/api/agents")
+                    .header(header::ORIGIN, "https://app.example.test")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(control_preflight
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none());
+    }
+
     #[tokio::test]
     async fn frontend_files_and_spa_fallback_do_not_capture_unknown_api_routes() {
         let frontend = tempfile::tempdir().unwrap();
@@ -20183,6 +21836,7 @@ mod tests {
             "runtimeBearer",
             "modelProxyBearer",
             "integrationClientBasic",
+            "clientAccessBearer",
         ] {
             assert!(
                 document["components"]["securitySchemes"]
@@ -20217,6 +21871,15 @@ mod tests {
             "/api/sessions/{session_id}/messages",
             "/api/runs/{run_id}/stop",
             "/api/runs/{run_id}/events/stream",
+            "/api/client/session",
+            "/api/client/sessions",
+            "/api/client/sessions/{session_id}/messages",
+            "/api/client/sessions/{session_id}/events",
+            "/api/client/sessions/{session_id}/events/stream",
+            "/api/client/runs",
+            "/api/client/runs/{run_id}/stop",
+            "/api/client/tool-calls/{tool_call_id}/claim",
+            "/api/client/tool-calls/{tool_call_id}/result",
             "/api/widget/access",
             "/api/widget/public/access",
             "/api/widget/session",
@@ -20545,12 +22208,7 @@ mod tests {
         );
         assert_eq!(
             document["components"]["schemas"]["FinalizeToolRequestsRequest"]["required"],
-            json!([
-                "integration_session_id",
-                "native_session_id",
-                "work_dir_ref",
-                "tool_requests"
-            ])
+            json!(["native_session_id", "work_dir_ref", "tool_requests"])
         );
         assert_eq!(
             document["components"]["schemas"]["WaitingToolRunTransition"]["required"],
@@ -21139,6 +22797,22 @@ mod tests {
             webhook_token_from_headers(&headers).as_deref(),
             Some("webhook-secret")
         );
+
+        headers.clear();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer ahe_embed-secret"),
+        );
+        assert_eq!(
+            client_access_token_from_headers(&headers).as_deref(),
+            Some("ahe_embed-secret")
+        );
+
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer unrelated-secret"),
+        );
+        assert_eq!(client_access_token_from_headers(&headers), None);
     }
 
     #[test]
@@ -22994,6 +24668,7 @@ mod tests {
                 login_required: true,
                 allowed_origins: Vec::new(),
                 tool_allowlist: None,
+                client_tool_definitions: Vec::new(),
             }),
         )
         .await
@@ -23022,6 +24697,7 @@ mod tests {
                 login_required: true,
                 allowed_origins: Vec::new(),
                 tool_allowlist: None,
+                client_tool_definitions: Vec::new(),
             }),
         )
         .await
@@ -23165,6 +24841,7 @@ mod tests {
                 login_required: true,
                 allowed_origins: Vec::new(),
                 tool_allowlist: Some(vec!["read".into(), "grep".into()]),
+                client_tool_definitions: Vec::new(),
             }),
         )
         .await
@@ -23451,6 +25128,7 @@ mod tests {
                     .body(Body::from(
                         serde_json::to_vec(&json!({
                             "agent_id": agent_id,
+                            "client_instance_id": Uuid::new_v4(),
                             "tenant_id": "tenant-acme",
                             "external_user_id": "external-user-42",
                             "username": "external-user",
@@ -23542,6 +25220,7 @@ mod tests {
         platform_id: Uuid,
         client_id: String,
         client_secret: String,
+        client_instance_id: Uuid,
     }
 
     async fn widget_external_test_fixture(
@@ -23566,7 +25245,7 @@ mod tests {
             "INSERT INTO model_connections
                  (id, scope, name, base_url, api_type, allowed_model_ids,
                   api_key_ciphertext, api_key_nonce, created_by)
-             VALUES ($1, 'global', 'Widget Test Model', 'https://models.example.test',
+             VALUES ($1, 'global', $6, 'https://models.example.test',
                      'openai_responses', $2, $3, $4, $5)",
         )
         .bind(model_connection_id)
@@ -23574,6 +25253,7 @@ mod tests {
         .bind(vec![1_u8; 17])
         .bind(vec![2_u8; 12])
         .bind(owner.id)
+        .bind(format!("Widget Test Model {}", Uuid::new_v4().simple()))
         .execute(&pool)
         .await
         .unwrap();
@@ -23648,6 +25328,7 @@ mod tests {
             platform_id,
             client_id,
             client_secret,
+            client_instance_id: Uuid::new_v4(),
         }
     }
 
@@ -23692,12 +25373,57 @@ mod tests {
                     .body(Body::from(
                         serde_json::to_vec(&json!({
                             "agent_id": agent_id,
+                            "client_instance_id": fixture.client_instance_id,
                             "tenant_id": tenant_id,
                             "external_user_id": external_user_id,
                             "username": format!("{external_user_id}-name"),
                             "display_name": display_name,
                             "email": format!("{external_user_id}@example.com"),
                             "attributes": { "fixture_version": display_name }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn issue_client_access_for_instance(
+        fixture: &WidgetExternalTestFixture,
+        client_instance_id: Uuid,
+        tenant_id: &str,
+        external_user_id: &str,
+        client_tools: Value,
+    ) -> ClientAccessResponse {
+        let basic = STANDARD.encode(format!("{}:{}", fixture.client_id, fixture.client_secret));
+        let response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/client/access")
+                    .header(header::AUTHORIZATION, format!("Basic {basic}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "agent_id": fixture.agent_id,
+                            "client_instance_id": client_instance_id,
+                            "tenant_id": tenant_id,
+                            "external_user_id": external_user_id,
+                            "username": format!("{external_user_id}-name"),
+                            "display_name": "Canonical Client User",
+                            "email": format!("{external_user_id}@example.com"),
+                            "attributes": { "source": "canonical-client-test" },
+                            "client_tools": client_tools
                         }))
                         .unwrap(),
                     ))
@@ -23725,11 +25451,13 @@ mod tests {
                 axum::http::Request::builder()
                     .method(Method::POST)
                     .uri("/api/widget/public/access")
+                    .header(header::ORIGIN, "https://docs.example.test")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&json!({
                             "client_id": fixture.client_id,
-                            "visitor_key": visitor_key
+                            "visitor_key": visitor_key,
+                            "client_instance_id": fixture.client_instance_id
                         }))
                         .unwrap(),
                     ))
@@ -23744,6 +25472,40 @@ mod tests {
                 .unwrap(),
         )
         .unwrap()
+    }
+
+    async fn anonymous_client_access_response(
+        fixture: &WidgetExternalTestFixture,
+        visitor_key: &str,
+        client_instance_id: Uuid,
+        session_id: Option<Uuid>,
+        origin: Option<&str>,
+    ) -> Response {
+        let mut request = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/api/client/anonymous/access")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(origin) = origin {
+            request = request.header(header::ORIGIN, origin);
+        }
+        fixture
+            .router
+            .clone()
+            .oneshot(
+                request
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "client_id": fixture.client_id,
+                            "visitor_key": visitor_key,
+                            "client_instance_id": client_instance_id,
+                            "session_id": session_id
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
     }
 
     async fn create_widget_external_run(
@@ -23778,6 +25540,1749 @@ mod tests {
                 .unwrap(),
         )
         .unwrap()
+    }
+
+    async fn create_canonical_client_run(
+        fixture: &WidgetExternalTestFixture,
+        token: &str,
+        session_id: Option<Uuid>,
+        message: &str,
+    ) -> RunDto {
+        let response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/client/runs")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "message": message,
+                            "session_id": session_id,
+                            "client_message_key": format!("client-tool-{}", Uuid::new_v4())
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn test_client_tool_definitions(names: &[&str]) -> Value {
+        Value::Array(
+            names
+                .iter()
+                .map(|name| {
+                    json!({
+                        "name": name,
+                        "description": format!("Execute {name}"),
+                        "input_schema": { "type": "object" }
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    struct ClientToolRunTestFixture {
+        app: WidgetExternalTestFixture,
+        executor: ClientAccessResponse,
+        observer: ClientAccessResponse,
+        run: RunDto,
+        runtime_token: String,
+        tool_call_ids: Vec<Uuid>,
+    }
+
+    async fn bind_client_tool_test_run_to_runtime(
+        app: &WidgetExternalTestFixture,
+        run: &RunDto,
+    ) -> String {
+        let runtime_id = Uuid::new_v4();
+        let runtime_token = format!("ahrt_{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO runtimes
+                 (id, token_hash, hostname, labels, engine_version, capabilities,
+                  sandbox_mode, status)
+             VALUES ($1, $2, $3, '{}', 'test', '{\"model_proxy\":true}'::jsonb,
+                     'workspace-write', 'online')",
+        )
+        .bind(runtime_id)
+        .bind(sha256_hex(&runtime_token))
+        .bind(format!("client-tool-runtime-{}", Uuid::new_v4().simple()))
+        .execute(&app.state.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE agents SET runtime_id = $1 WHERE id = $2")
+            .bind(runtime_id)
+            .bind(app.agent_id)
+            .execute(&app.state.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET runtime_owner_id = $1, ownership_generation = 1,
+                 lifecycle_status = 'online', active_turn_id = $2
+             WHERE id = $3",
+        )
+        .bind(runtime_id)
+        .bind(run.hub_turn_id.unwrap())
+        .bind(run.hub_session_id.unwrap())
+        .execute(&app.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE hub_session_turns
+             SET status = 'running', ownership_generation = 1
+             WHERE id = $1 AND session_id = $2",
+        )
+        .bind(run.hub_turn_id.unwrap())
+        .bind(run.hub_session_id.unwrap())
+        .execute(&app.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE runs
+             SET runtime_id = $1, status = 'running', session_ownership_generation = 1
+             WHERE id = $2",
+        )
+        .bind(runtime_id)
+        .bind(run.id)
+        .execute(&app.state.pool)
+        .await
+        .unwrap();
+        runtime_token
+    }
+
+    async fn prepare_client_tool_run(
+        pool: PgPool,
+        tool_names: &[&str],
+    ) -> ClientToolRunTestFixture {
+        let app = widget_external_test_fixture(pool, true).await;
+        let definitions = test_client_tool_definitions(tool_names);
+        let executor = issue_client_access_for_instance(
+            &app,
+            Uuid::new_v4(),
+            "client-tool-tenant",
+            "client-tool-user",
+            definitions.clone(),
+        )
+        .await;
+        let observer = issue_client_access_for_instance(
+            &app,
+            Uuid::new_v4(),
+            "client-tool-tenant",
+            "client-tool-user",
+            definitions,
+        )
+        .await;
+        let run =
+            create_canonical_client_run(&app, &executor.access_token, None, "execute Client Tools")
+                .await;
+        let runtime_token = bind_client_tool_test_run_to_runtime(&app, &run).await;
+        ClientToolRunTestFixture {
+            app,
+            executor,
+            observer,
+            run,
+            runtime_token,
+            tool_call_ids: tool_names.iter().map(|_| Uuid::new_v4()).collect(),
+        }
+    }
+
+    async fn finalize_test_client_tool_batch(
+        fixture: &ClientToolRunTestFixture,
+        tool_names: &[&str],
+    ) -> Result<Json<RunDto>, ApiError> {
+        assert_eq!(fixture.tool_call_ids.len(), tool_names.len());
+        runtime_finalize_tool_requests(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(fixture.run.id),
+            runtime_write(FinalizeToolRequestsRequest {
+                integration_session_id: fixture.run.integration_session_id,
+                native_session_id: "client-tool-native-session".into(),
+                work_dir_ref: "client-tool-workdir".into(),
+                tool_requests: tool_names
+                    .iter()
+                    .enumerate()
+                    .map(|(position, tool_name)| FinalizeToolRequestEvent {
+                        role: Some("assistant".into()),
+                        content: Some(format!("{tool_name} requested")),
+                        payload: json!({
+                            "tool_request_id": fixture.tool_call_ids[position],
+                            "tool_name": tool_name,
+                            "arguments": { "position": position }
+                        }),
+                    })
+                    .collect(),
+            }),
+        )
+        .await
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn client_tool_run_freezes_grant_and_rejects_another_instance(pool: PgPool) {
+        let fixture = prepare_client_tool_run(pool, &["open_panel"]).await;
+        let original_binding: (Uuid, Value) = sqlx::query_as(
+            "SELECT client_instance_id, client_tool_snapshot FROM runs WHERE id = $1",
+        )
+        .bind(fixture.run.id)
+        .fetch_one(&fixture.app.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(original_binding.0, fixture.executor.client_instance_id);
+        assert_eq!(
+            original_binding.1,
+            test_client_tool_definitions(&["open_panel"])
+        );
+
+        let reauthorized = issue_client_access_for_instance(
+            &fixture.app,
+            fixture.executor.client_instance_id,
+            "client-tool-tenant",
+            "client-tool-user",
+            test_client_tool_definitions(&["select_row"]),
+        )
+        .await;
+        assert_ne!(reauthorized.access_token, fixture.executor.access_token);
+        let next_run = create_canonical_client_run(
+            &fixture.app,
+            &reauthorized.access_token,
+            None,
+            "use the latest grant",
+        )
+        .await;
+        let next_binding: (Uuid, Value) = sqlx::query_as(
+            "SELECT client_instance_id, client_tool_snapshot FROM runs WHERE id = $1",
+        )
+        .bind(next_run.id)
+        .fetch_one(&fixture.app.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(next_binding.0, reauthorized.client_instance_id);
+        assert_eq!(
+            next_binding.1,
+            test_client_tool_definitions(&["select_row"])
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Value>("SELECT client_tool_snapshot FROM runs WHERE id = $1",)
+                .bind(fixture.run.id)
+                .fetch_one(&fixture.app.state.pool)
+                .await
+                .unwrap(),
+            test_client_tool_definitions(&["open_panel"])
+        );
+
+        let changed_grant_error = finalize_test_client_tool_batch(&fixture, &["select_row"])
+            .await
+            .unwrap_err();
+        assert_eq!(changed_grant_error.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            finalize_test_client_tool_batch(&fixture, &["open_panel"])
+                .await
+                .unwrap()
+                .0
+                .status,
+            "waiting_tool"
+        );
+
+        let observer_claim = claim_client_tool_call(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.observer.access_token),
+            Path(fixture.tool_call_ids[0]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(observer_claim.status, StatusCode::FORBIDDEN);
+        let observer_result = submit_client_tool_result(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.observer.access_token),
+            Path(fixture.tool_call_ids[0]),
+            Json(SubmitClientToolResultRequest {
+                result: ClientToolResultDto::Success {
+                    output: json!({ "ignored": true }),
+                },
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(observer_result.status, StatusCode::FORBIDDEN);
+
+        for _ in 0..2 {
+            let claim = claim_client_tool_call(
+                State(fixture.app.state.clone()),
+                bearer_headers(&reauthorized.access_token),
+                Path(fixture.tool_call_ids[0]),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(claim.status, "claimed");
+            assert!(!claim.terminal);
+        }
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn client_tool_results_are_bounded_idempotent_and_continue_once_in_order(pool: PgPool) {
+        let fixture = prepare_client_tool_run(pool, &["first_action", "second_action"]).await;
+        let _ = finalize_test_client_tool_batch(&fixture, &["first_action", "second_action"])
+            .await
+            .unwrap();
+        let other_tab = issue_client_access_for_instance(
+            &fixture.app,
+            Uuid::new_v4(),
+            "client-tool-tenant",
+            "client-tool-user",
+            test_client_tool_definitions(&["other_tab_action"]),
+        )
+        .await;
+        let queued_during_tool_wait = create_canonical_client_run(
+            &fixture.app,
+            &other_tab.access_token,
+            fixture.run.integration_session_id,
+            "guide the waiting tool turn",
+        )
+        .await;
+        assert_eq!(queued_during_tool_wait.status, "pending");
+        let ownership_generation: i64 =
+            sqlx::query_scalar("SELECT ownership_generation FROM hub_sessions WHERE id = $1")
+                .bind(fixture.run.hub_session_id.unwrap())
+                .fetch_one(&fixture.app.state.pool)
+                .await
+                .unwrap();
+        let blocked_claim = runtime_claim_run(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            runtime_claim_request(
+                0,
+                vec![RuntimeOwnedSessionGenerationDto {
+                    session_id: fixture.run.hub_session_id.unwrap(),
+                    ownership_generation,
+                }],
+            ),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(blocked_claim.status(), StatusCode::NO_CONTENT);
+        let first_call = fixture.tool_call_ids[0];
+        let second_call = fixture.tool_call_ids[1];
+        let first_state = fixture.app.state.clone();
+        let second_state = fixture.app.state.clone();
+        let first_token = fixture.executor.access_token.clone();
+        let second_token = fixture.executor.access_token.clone();
+        let (claim_a, claim_b) = tokio::join!(
+            claim_client_tool_call(
+                State(first_state),
+                bearer_headers(&first_token),
+                Path(first_call),
+            ),
+            claim_client_tool_call(
+                State(second_state),
+                bearer_headers(&second_token),
+                Path(first_call),
+            )
+        );
+        for claim in [claim_a.unwrap().0, claim_b.unwrap().0] {
+            assert_eq!(claim.status, "claimed");
+            assert!(!claim.terminal);
+        }
+
+        let oversized = submit_client_tool_result(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(first_call),
+            Json(SubmitClientToolResultRequest {
+                result: ClientToolResultDto::Success {
+                    output: json!({ "content": "x".repeat(MAX_CLIENT_TOOL_RESULT_BYTES) }),
+                },
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(oversized.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM integration_tool_requests WHERE id = $1",
+            )
+            .bind(first_call)
+            .fetch_one(&fixture.app.state.pool)
+            .await
+            .unwrap(),
+            "claimed"
+        );
+
+        let first_result = ClientToolResultDto::Success {
+            output: json!({ "opened": true }),
+        };
+        let first_response = submit_client_tool_result(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(first_call),
+            Json(SubmitClientToolResultRequest {
+                result: first_result.clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(first_response.run.is_none());
+        let repeated_first = submit_client_tool_result(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(first_call),
+            Json(SubmitClientToolResultRequest {
+                result: first_result,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(repeated_first.run.is_none());
+        let divergent = submit_client_tool_result(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(first_call),
+            Json(SubmitClientToolResultRequest {
+                result: ClientToolResultDto::Success {
+                    output: json!({ "opened": false }),
+                },
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(divergent.status, StatusCode::CONFLICT);
+
+        let second_claim = claim_client_tool_call(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(second_call),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(second_claim.status, "claimed");
+        let second_result = ClientToolResultDto::Error {
+            error: ClientToolErrorDto {
+                code: "user_rejected".into(),
+                message: "The user rejected this action".into(),
+                retryable: false,
+            },
+        };
+        let completed = submit_client_tool_result(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(second_call),
+            Json(SubmitClientToolResultRequest {
+                result: second_result.clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let continuation = completed.run.unwrap();
+        assert_eq!(continuation.id, queued_during_tool_wait.id);
+        let continuation_binding: (String, Option<Uuid>, Option<Uuid>, Value, Option<Uuid>) =
+            sqlx::query_as(
+                "SELECT status, parent_run_id, client_instance_id,
+                        client_tool_snapshot, widget_session_id
+                 FROM runs WHERE id = $1",
+            )
+            .bind(continuation.id)
+            .fetch_one(&fixture.app.state.pool)
+            .await
+            .unwrap();
+        assert_eq!(continuation_binding.0, "pending");
+        assert_eq!(continuation_binding.1, Some(fixture.run.id));
+        assert_eq!(
+            continuation_binding.2,
+            Some(fixture.executor.client_instance_id)
+        );
+        assert_eq!(
+            continuation_binding.3,
+            test_client_tool_definitions(&["first_action", "second_action"])
+        );
+        let executor_credential_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM embed_sessions WHERE token_hash = $1")
+                .bind(sha256_hex(&fixture.executor.access_token))
+                .fetch_one(&fixture.app.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(continuation_binding.4, Some(executor_credential_id));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM runs WHERE id = $1")
+                .bind(fixture.run.id)
+                .fetch_one(&fixture.app.state.pool)
+                .await
+                .unwrap(),
+            "completed"
+        );
+        let repeated_second = submit_client_tool_result(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(second_call),
+            Json(SubmitClientToolResultRequest {
+                result: second_result,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(repeated_second.run.unwrap().id, continuation.id);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM runs
+                 WHERE parent_run_id = $1 AND source = 'integration:tool_result'",
+            )
+            .bind(fixture.run.id)
+            .fetch_one(&fixture.app.state.pool)
+            .await
+            .unwrap(),
+            1
+        );
+        let follow_up_ids: Vec<Option<Uuid>> = sqlx::query_scalar(
+            "SELECT follow_up_run_id FROM integration_tool_requests
+             WHERE run_id = $1 ORDER BY position",
+        )
+        .bind(fixture.run.id)
+        .fetch_all(&fixture.app.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            follow_up_ids,
+            vec![Some(continuation.id), Some(continuation.id)]
+        );
+        let payload: Value = sqlx::query_scalar(
+            "SELECT payload FROM hub_session_messages
+             WHERE session_id = $1 AND run_id = $2 AND message_kind = 'tool_result'",
+        )
+        .bind(fixture.run.hub_session_id.unwrap())
+        .bind(continuation.id)
+        .fetch_one(&fixture.app.state.pool)
+        .await
+        .unwrap();
+        let results = payload["tool_results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["tool_call_id"], json!(first_call));
+        assert_eq!(results[0]["tool_name"], "first_action");
+        assert_eq!(results[0]["result"]["status"], "success");
+        assert_eq!(results[1]["tool_call_id"], json!(second_call));
+        assert_eq!(results[1]["tool_name"], "second_action");
+        assert_eq!(results[1]["result"]["status"], "error");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn empty_client_grants_do_not_require_the_agent_integration_gate(pool: PgPool) {
+        let fixture = widget_external_test_fixture(pool, true).await;
+        sqlx::query(
+            "UPDATE agents SET tool_allowlist = tool_allowlist - 'integration' WHERE id = $1",
+        )
+        .bind(fixture.agent_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        let empty_access = issue_client_access_for_instance(
+            &fixture,
+            Uuid::new_v4(),
+            "empty-grant-tenant",
+            "empty-grant-user",
+            json!([]),
+        )
+        .await;
+        let list_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/client/sessions")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", empty_access.access_token),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+
+        let basic = STANDARD.encode(format!("{}:{}", fixture.client_id, fixture.client_secret));
+        let nonempty_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/client/access")
+                    .header(header::AUTHORIZATION, format!("Basic {basic}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "agent_id": fixture.agent_id,
+                            "client_instance_id": Uuid::new_v4(),
+                            "tenant_id": "nonempty-grant-tenant",
+                            "external_user_id": "nonempty-grant-user",
+                            "client_tools": test_client_tool_definitions(&["blocked_tool"])
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(nonempty_response.status(), StatusCode::FORBIDDEN);
+
+        let anonymous_origin = "https://anonymous-empty.example.test";
+        sqlx::query(
+            "UPDATE oauth_apps
+             SET login_required = false, widget_history_enabled = false,
+                 allowed_origins = $1, client_tool_definitions = '[]'::jsonb
+             WHERE id = $2",
+        )
+        .bind(json!([anonymous_origin]))
+        .bind(fixture.app_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let anonymous_response = anonymous_client_access_response(
+            &fixture,
+            &format!("visitor-key-{}", Uuid::new_v4().simple()),
+            Uuid::new_v4(),
+            None,
+            Some(anonymous_origin),
+        )
+        .await;
+        assert_eq!(anonymous_response.status(), StatusCode::OK);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn client_tool_timeout_stop_and_agent_gate_are_terminal_without_continuation(
+        pool: PgPool,
+    ) {
+        let timed_out = prepare_client_tool_run(pool.clone(), &["slow_action"]).await;
+        let _ = finalize_test_client_tool_batch(&timed_out, &["slow_action"])
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE integration_tool_requests
+             SET status = 'unknown', expires_at = now() - interval '1 second'
+             WHERE run_id = $1",
+        )
+        .bind(timed_out.run.id)
+        .execute(&timed_out.app.state.pool)
+        .await
+        .unwrap();
+        reap_expired_client_tool_batches(&timed_out.app.state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM runs WHERE id = $1")
+                .bind(timed_out.run.id)
+                .fetch_one(&timed_out.app.state.pool)
+                .await
+                .unwrap(),
+            "cancelled"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM integration_tool_requests WHERE id = $1",
+            )
+            .bind(timed_out.tool_call_ids[0])
+            .fetch_one(&timed_out.app.state.pool)
+            .await
+            .unwrap(),
+            "timed_out"
+        );
+        let timeout_claim = claim_client_tool_call(
+            State(timed_out.app.state.clone()),
+            bearer_headers(&timed_out.executor.access_token),
+            Path(timed_out.tool_call_ids[0]),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(timeout_claim.terminal);
+        assert_eq!(timeout_claim.status, "timed_out");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM runs WHERE parent_run_id = $1")
+                .bind(timed_out.run.id)
+                .fetch_one(&timed_out.app.state.pool)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let stopped = prepare_client_tool_run(pool.clone(), &["stop_action"]).await;
+        let _ = finalize_test_client_tool_batch(&stopped, &["stop_action"])
+            .await
+            .unwrap();
+        let stopped_run = stop_widget_run(
+            State(stopped.app.state.clone()),
+            bearer_headers(&stopped.executor.access_token),
+            Path(stopped.run.id),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(stopped_run.status, "interrupted");
+        let cancelled_claim = claim_client_tool_call(
+            State(stopped.app.state.clone()),
+            bearer_headers(&stopped.executor.access_token),
+            Path(stopped.tool_call_ids[0]),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(cancelled_claim.terminal);
+        assert_eq!(cancelled_claim.status, "cancelled");
+        let cancelled_result = submit_client_tool_result(
+            State(stopped.app.state.clone()),
+            bearer_headers(&stopped.executor.access_token),
+            Path(stopped.tool_call_ids[0]),
+            Json(SubmitClientToolResultRequest {
+                result: ClientToolResultDto::Success {
+                    output: json!({ "too_late": true }),
+                },
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(cancelled_result.status, StatusCode::GONE);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM runs WHERE parent_run_id = $1")
+                .bind(stopped.run.id)
+                .fetch_one(&stopped.app.state.pool)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let gated = prepare_client_tool_run(pool, &["gated_action"]).await;
+        sqlx::query(
+            "UPDATE agents SET tool_allowlist = tool_allowlist - 'integration' WHERE id = $1",
+        )
+        .bind(gated.app.agent_id)
+        .execute(&gated.app.state.pool)
+        .await
+        .unwrap();
+        let gated_error = finalize_test_client_tool_batch(&gated, &["gated_action"])
+            .await
+            .unwrap_err();
+        assert_eq!(gated_error.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM integration_tool_requests WHERE run_id = $1",
+            )
+            .bind(gated.run.id)
+            .fetch_one(&gated.app.state.pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM runs WHERE id = $1")
+                .bind(gated.run.id)
+                .fetch_one(&gated.app.state.pool)
+                .await
+                .unwrap(),
+            "running"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn anonymous_client_tool_continuation_resumes_native_session_with_run_snapshot(
+        pool: PgPool,
+    ) {
+        let app = widget_external_test_fixture(pool, false).await;
+        let origin = "http://anonymous-client-tool.example.test";
+        let definitions = test_client_tool_definitions(&["show_notice"]);
+        sqlx::query(
+            "UPDATE oauth_apps
+             SET login_required = false, widget_history_enabled = false,
+                 allowed_origins = $1, client_tool_definitions = $2
+             WHERE id = $3",
+        )
+        .bind(json!([origin]))
+        .bind(&definitions)
+        .bind(app.app_id)
+        .execute(&app.state.pool)
+        .await
+        .unwrap();
+        let access_response = anonymous_client_access_response(
+            &app,
+            &format!("visitor-key-{}", Uuid::new_v4().simple()),
+            Uuid::new_v4(),
+            None,
+            Some(origin),
+        )
+        .await;
+        assert_eq!(access_response.status(), StatusCode::OK);
+        let access: ClientAccessResponse = serde_json::from_slice(
+            &axum::body::to_bytes(access_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let run_response = app
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/client/runs")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", access.access_token),
+                    )
+                    .header(header::ORIGIN, origin)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"message":"show an anonymous notice","client_message_key":"anonymous-client-tool"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(run_response.status(), StatusCode::OK);
+        let run: RunDto = serde_json::from_slice(
+            &axum::body::to_bytes(run_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(run.integration_session_id.is_none());
+        let runtime_token = bind_client_tool_test_run_to_runtime(&app, &run).await;
+        let tool_call_id = Uuid::new_v4();
+        let fixture = ClientToolRunTestFixture {
+            app,
+            executor: access.clone(),
+            observer: access,
+            run,
+            runtime_token,
+            tool_call_ids: vec![tool_call_id],
+        };
+        let waiting = finalize_test_client_tool_batch(&fixture, &["show_notice"])
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(waiting.status, "waiting_tool");
+        assert!(sqlx::query_scalar::<_, Option<Uuid>>(
+            "SELECT session_id FROM integration_tool_requests WHERE id = $1",
+        )
+        .bind(tool_call_id)
+        .fetch_one(&fixture.app.state.pool)
+        .await
+        .unwrap()
+        .is_none());
+
+        let mut client_headers = bearer_headers(&fixture.executor.access_token);
+        client_headers.insert(header::ORIGIN, HeaderValue::from_static(origin));
+        let claim = claim_client_tool_call(
+            State(fixture.app.state.clone()),
+            client_headers.clone(),
+            Path(tool_call_id),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(claim.status, "claimed");
+        let submitted = submit_client_tool_result(
+            State(fixture.app.state.clone()),
+            client_headers.clone(),
+            Path(tool_call_id),
+            Json(SubmitClientToolResultRequest {
+                result: ClientToolResultDto::Success {
+                    output: json!({ "visible": true }),
+                },
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let continuation = submitted.run.unwrap();
+        assert!(continuation.integration_session_id.is_none());
+
+        let mut events_tx = fixture.app.state.pool.begin().await.unwrap();
+        let credential = load_widget_credential_tx(
+            &mut events_tx,
+            &fixture.executor.access_token,
+            &client_headers,
+        )
+        .await
+        .unwrap();
+        let scoped = load_widget_scoped_session_tx(
+            &mut events_tx,
+            &credential,
+            None,
+            continuation.hub_session_id,
+            false,
+        )
+        .await
+        .unwrap();
+        let events = load_widget_session_events_after_tx(&mut events_tx, &scoped, 0)
+            .await
+            .unwrap();
+        events_tx.commit().await.unwrap();
+        assert!(events.iter().any(|event| event.run_id == continuation.id));
+
+        let claimed = claim_runtime_run(&fixture.app.state, &fixture.runtime_token).await;
+        assert_eq!(claimed.run.id, continuation.id);
+        assert_eq!(
+            claimed.resume.unwrap().native_session_id,
+            "client-tool-native-session"
+        );
+        let context = claimed.integration_context.unwrap();
+        assert_eq!(context.tools, definitions);
+        assert_eq!(context.tool_results.len(), 1);
+        assert_eq!(context.tool_results[0].tool_call_id, tool_call_id);
+        assert_eq!(context.tool_results[0].tool_name, "show_notice");
+        assert_eq!(
+            context.tool_results[0].result,
+            ClientToolResultDto::Success {
+                output: json!({ "visible": true })
+            }
+        );
+        assert!(context.external_user.is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn canonical_client_access_rotates_one_instance_without_invalidating_other_tabs_or_runs(
+        pool: PgPool,
+    ) {
+        let fixture = widget_external_test_fixture(pool, true).await;
+        let allowed_origin = "http://client.example.test";
+        sqlx::query("UPDATE oauth_apps SET allowed_origins = $1 WHERE id = $2")
+            .bind(json!([allowed_origin]))
+            .bind(fixture.app_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        let first_instance = Uuid::new_v4();
+        let second_instance = Uuid::new_v4();
+        let first = issue_client_access_for_instance(
+            &fixture,
+            first_instance,
+            "tenant-client",
+            "client-user",
+            json!([{
+                "name": "open_panel",
+                "description": "Open one panel",
+                "input_schema": { "type": "object" }
+            }]),
+        )
+        .await;
+        assert_eq!(first.client_instance_id, first_instance);
+        assert_eq!(first.tool_names, vec!["open_panel"]);
+        assert_eq!(first.expires_in, CLIENT_ACCESS_TTL_SECONDS);
+        let credential_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM embed_sessions WHERE token_hash = $1")
+                .bind(sha256_hex(&first.access_token))
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+
+        let run_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/widget/runs")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", first.access_token),
+                    )
+                    .header(header::ORIGIN, allowed_origin)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"message":"keep this run","client_message_key":"client-run"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(run_response.status(), StatusCode::OK);
+        let run: RunDto = serde_json::from_slice(
+            &axum::body::to_bytes(run_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+
+        let reauthorized = issue_client_access_for_instance(
+            &fixture,
+            first_instance,
+            "tenant-client",
+            "client-user",
+            json!([{
+                "name": "select_row",
+                "description": "Select one row",
+                "input_schema": { "type": "object" }
+            }]),
+        )
+        .await;
+        assert_ne!(reauthorized.access_token, first.access_token);
+        assert_eq!(reauthorized.tool_names, vec!["select_row"]);
+        assert_eq!(
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM embed_sessions WHERE token_hash = $1")
+                .bind(sha256_hex(&reauthorized.access_token))
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap(),
+            credential_id
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Uuid>("SELECT widget_session_id FROM runs WHERE id = $1")
+                .bind(run.id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap(),
+            credential_id
+        );
+
+        let second = issue_client_access_for_instance(
+            &fixture,
+            second_instance,
+            "tenant-client",
+            "client-user",
+            json!([]),
+        )
+        .await;
+        let second_credential_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM embed_sessions WHERE token_hash = $1")
+                .bind(sha256_hex(&second.access_token))
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_ne!(second_credential_id, credential_id);
+
+        for origin in [None, Some("http://wrong.example.test")] {
+            let mut request = axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/api/client/renew")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", reauthorized.access_token),
+                )
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(origin) = origin {
+                request = request.header(header::ORIGIN, origin);
+            }
+            let response = fixture
+                .router
+                .clone()
+                .oneshot(request.body(Body::from("{}")).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+
+        let renewed_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/client/renew")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", reauthorized.access_token),
+                    )
+                    .header(header::ORIGIN, allowed_origin)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(renewed_response.status(), StatusCode::OK);
+        let renewed: ClientAccessResponse = serde_json::from_slice(
+            &axum::body::to_bytes(renewed_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(renewed.client_instance_id, first_instance);
+        assert_eq!(renewed.tool_names, vec!["select_row"]);
+
+        let replaced = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/widget/session")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", reauthorized.access_token),
+                    )
+                    .header(header::ORIGIN, allowed_origin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replaced.status(), StatusCode::UNAUTHORIZED);
+        for token in [&renewed.access_token, &second.access_token] {
+            let response = fixture
+                .router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/api/widget/session")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(header::ORIGIN, allowed_origin)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM embed_sessions
+                 WHERE oauth_app_id = $1 AND external_identity_id IS NOT NULL",
+            )
+            .bind(fixture.app_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            2
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn canonical_client_sessions_keep_two_turns_in_order_and_steer_without_rebinding(
+        pool: PgPool,
+    ) {
+        let fixture = widget_external_test_fixture(pool, true).await;
+        let first_instance_id = Uuid::new_v4();
+        let second_instance_id = Uuid::new_v4();
+        let first = issue_client_access_for_instance(
+            &fixture,
+            first_instance_id,
+            "tenant-session",
+            "session-user",
+            test_client_tool_definitions(&["first_tab_action"]),
+        )
+        .await;
+        let second = issue_client_access_for_instance(
+            &fixture,
+            second_instance_id,
+            "tenant-session",
+            "session-user",
+            test_client_tool_definitions(&["second_tab_action"]),
+        )
+        .await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM hub_sessions")
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let first_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/client/runs")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", first.access_token),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"message":"first message","client_message_key":"client-first"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_response.status(), StatusCode::OK);
+        let first_run: RunDto = serde_json::from_slice(
+            &axum::body::to_bytes(first_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let session_id = first_run.integration_session_id.unwrap();
+        let hub_session_id = first_run.hub_session_id.unwrap();
+        let turn_id = first_run.hub_turn_id.unwrap();
+        let first_credential_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM embed_sessions WHERE token_hash = $1")
+                .bind(sha256_hex(&first.access_token))
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        sqlx::query("UPDATE runs SET status = 'running' WHERE id = $1")
+            .bind(first_run.id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE hub_session_turns
+             SET status = 'running', native_turn_id = 'native-client-turn'
+             WHERE id = $1",
+        )
+        .bind(turn_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET active_turn_id = $1, lifecycle_status = 'online'
+             WHERE id = $2",
+        )
+        .bind(turn_id)
+        .bind(hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        let second_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/client/runs")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", second.access_token),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "message": "steer this turn",
+                            "session_id": session_id,
+                            "client_message_key": "client-steer"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second_response.status(), StatusCode::OK);
+        let second_run: RunDto = serde_json::from_slice(
+            &axum::body::to_bytes(second_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(second_run.id, first_run.id);
+        let steering_message = sqlx::query(
+            "SELECT sequence, delivery_mode, expected_native_turn_id
+             FROM hub_session_messages
+             WHERE session_id = $1 AND client_message_key = 'client-steer'",
+        )
+        .bind(hub_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(steering_message.get::<String, _>("delivery_mode"), "steer");
+        assert_eq!(
+            steering_message
+                .get::<Option<String>, _>("expected_native_turn_id")
+                .as_deref(),
+            Some("native-client-turn")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Uuid>("SELECT widget_session_id FROM runs WHERE id = $1")
+                .bind(first_run.id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap(),
+            first_credential_id
+        );
+        let run_tool_binding: (Uuid, Value) = sqlx::query_as(
+            "SELECT client_instance_id, client_tool_snapshot FROM runs WHERE id = $1",
+        )
+        .bind(first_run.id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(run_tool_binding.0, first_instance_id);
+        assert_eq!(
+            run_tool_binding.1,
+            test_client_tool_definitions(&["first_tab_action"])
+        );
+
+        let retry_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/client/runs")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", second.access_token),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "message": "steer this turn",
+                            "session_id": session_id,
+                            "client_message_key": "client-steer"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retry_response.status(), StatusCode::OK);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM hub_session_messages WHERE session_id = $1",
+            )
+            .bind(hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            2
+        );
+
+        let sessions_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/client/sessions")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", second.access_token),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sessions_response.status(), StatusCode::OK);
+        let sessions: Vec<WidgetHistorySessionDto> = serde_json::from_slice(
+            &axum::body::to_bytes(sessions_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, session_id);
+
+        let latest_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/api/client/sessions/{session_id}/messages?limit=1"
+                    ))
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", second.access_token),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(latest_response.status(), StatusCode::OK);
+        let latest: Vec<HubSessionMessageDto> = serde_json::from_slice(
+            &axum::body::to_bytes(latest_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].content.as_deref(), Some("steer this turn"));
+        let older_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/api/client/sessions/{session_id}/messages?before_sequence={}&limit=1",
+                        latest[0].sequence
+                    ))
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", second.access_token),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(older_response.status(), StatusCode::OK);
+        let older: Vec<HubSessionMessageDto> = serde_json::from_slice(
+            &axum::body::to_bytes(older_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(older[0].content.as_deref(), Some("first message"));
+
+        let other_identity = issue_client_access_for_instance(
+            &fixture,
+            Uuid::new_v4(),
+            "tenant-session",
+            "other-session-user",
+            json!([]),
+        )
+        .await;
+        let cross_identity_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/client/sessions/{session_id}/messages"))
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", other_identity.access_token),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cross_identity_response.status(), StatusCode::NOT_FOUND);
+
+        let first_event_sequence: i64 =
+            sqlx::query_scalar("SELECT min(seq) FROM run_events WHERE run_id = $1")
+                .bind(first_run.id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        let events_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/api/client/sessions/{session_id}/events?after={first_event_sequence}"
+                    ))
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", second.access_token),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(events_response.status(), StatusCode::OK);
+        let events: Vec<RunEventDto> = serde_json::from_slice(
+            &axum::body::to_bytes(events_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].content.as_deref(), Some("steer this turn"));
+
+        let stream_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/api/client/sessions/{session_id}/events/stream?after={first_event_sequence}"
+                    ))
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", second.access_token),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stream_response.status(), StatusCode::OK);
+        assert!(stream_response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream"));
+
+        let stop_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/client/runs/{}/stop", first_run.id))
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", second.access_token),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop_response.status(), StatusCode::OK);
+        assert!(sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+            "SELECT interrupt_requested_at FROM hub_session_turns WHERE id = $1",
+        )
+        .bind(turn_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap()
+        .is_some());
+
+        sqlx::query("UPDATE oauth_apps SET widget_history_enabled = false WHERE id = $1")
+            .bind(fixture.app_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        let hidden_list = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/client/sessions")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", second.access_token),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(hidden_list.status(), StatusCode::FORBIDDEN);
+        let exact_after_hide = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/client/sessions/{session_id}/messages"))
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", second.access_token),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact_after_hide.status(), StatusCode::OK);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn anonymous_client_access_requires_origin_and_keeps_tabs_independent(pool: PgPool) {
+        let fixture = widget_external_test_fixture(pool, false).await;
+        let allowed_origin = "http://public.example.test";
+        sqlx::query(
+            "UPDATE oauth_apps
+             SET login_required = false, allowed_origins = $1,
+                 client_tool_definitions = $2
+             WHERE id = $3",
+        )
+        .bind(json!([allowed_origin]))
+        .bind(json!([{
+            "name": "show_article",
+            "description": "Show one article",
+            "input_schema": { "type": "object" }
+        }]))
+        .bind(fixture.app_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let visitor_key = format!("anonymous-client-{}", Uuid::new_v4().simple());
+        let first_instance = Uuid::new_v4();
+        let second_instance = Uuid::new_v4();
+
+        for origin in [None, Some("http://wrong.example.test")] {
+            let response = anonymous_client_access_response(
+                &fixture,
+                &visitor_key,
+                first_instance,
+                None,
+                origin,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        let first_response = anonymous_client_access_response(
+            &fixture,
+            &visitor_key,
+            first_instance,
+            None,
+            Some(allowed_origin),
+        )
+        .await;
+        assert_eq!(first_response.status(), StatusCode::OK);
+        let first: ClientAccessResponse = serde_json::from_slice(
+            &axum::body::to_bytes(first_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first.client_instance_id, first_instance);
+        assert_eq!(first.tool_names, vec!["show_article"]);
+        assert!(first.session_id.is_none());
+
+        let run_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/widget/runs")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", first.access_token),
+                    )
+                    .header(header::ORIGIN, allowed_origin)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"message":"anonymous first message"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(run_response.status(), StatusCode::OK);
+        let run: RunDto = serde_json::from_slice(
+            &axum::body::to_bytes(run_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let session_id = run.hub_session_id.unwrap();
+
+        let second_response = anonymous_client_access_response(
+            &fixture,
+            &visitor_key,
+            second_instance,
+            Some(session_id),
+            Some(allowed_origin),
+        )
+        .await;
+        assert_eq!(second_response.status(), StatusCode::OK);
+        let second: ClientAccessResponse = serde_json::from_slice(
+            &axum::body::to_bytes(second_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(second.client_instance_id, second_instance);
+        assert_eq!(second.session_id, Some(session_id));
+        assert_ne!(second.access_token, first.access_token);
+        let observed_events = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/client/sessions/{session_id}/events"))
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", second.access_token),
+                    )
+                    .header(header::ORIGIN, allowed_origin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(observed_events.status(), StatusCode::OK);
+        let observed_events: Vec<RunEventDto> = serde_json::from_slice(
+            &axum::body::to_bytes(observed_events.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(observed_events.len(), 1);
+        assert_eq!(
+            observed_events[0].content.as_deref(),
+            Some("anonymous first message")
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM embed_sessions
+                 WHERE oauth_app_id = $1 AND anonymous_key_hash = $2",
+            )
+            .bind(fixture.app_id)
+            .bind(visitor_key_hash(&visitor_key).unwrap())
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            2
+        );
+
+        let invalid_recovery = anonymous_client_access_response(
+            &fixture,
+            &visitor_key,
+            Uuid::new_v4(),
+            Some(Uuid::new_v4()),
+            Some(allowed_origin),
+        )
+        .await;
+        assert_eq!(invalid_recovery.status(), StatusCode::NOT_FOUND);
+
+        let renewed_response = fixture
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/client/renew")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", first.access_token),
+                    )
+                    .header(header::ORIGIN, allowed_origin)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(renewed_response.status(), StatusCode::OK);
+        let renewed: ClientAccessResponse = serde_json::from_slice(
+            &axum::body::to_bytes(renewed_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(renewed.session_id, Some(session_id));
+
+        for token in [&renewed.access_token, &second.access_token] {
+            let response = fixture
+                .router
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!("/api/widget/sessions/{session_id}/messages"))
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(header::ORIGIN, allowed_origin)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -23816,6 +27321,7 @@ mod tests {
                 axum::http::Request::builder()
                     .uri("/api/widget/session")
                     .header("x-agent-hub-embed-token", &first.token)
+                    .header(header::ORIGIN, "https://docs.example.test")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -23831,6 +27337,7 @@ mod tests {
                     .method(Method::POST)
                     .uri("/api/widget/runs")
                     .header("x-agent-hub-embed-token", &rotated.token)
+                    .header(header::ORIGIN, "https://docs.example.test")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         r#"{"message":"public widget hello","client_message_key":"public-first"}"#,
@@ -23862,6 +27369,7 @@ mod tests {
                     .method(Method::POST)
                     .uri("/api/widget/runs")
                     .header("x-agent-hub-embed-token", &refreshed.token)
+                    .header(header::ORIGIN, "https://docs.example.test")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         r#"{"message":"public widget hello","client_message_key":"public-first"}"#,
@@ -23886,6 +27394,7 @@ mod tests {
                 axum::http::Request::builder()
                     .uri("/api/widget/sessions")
                     .header("x-agent-hub-embed-token", &refreshed.token)
+                    .header(header::ORIGIN, "https://docs.example.test")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -23900,6 +27409,7 @@ mod tests {
                 axum::http::Request::builder()
                     .uri(format!("/api/widget/sessions/{hub_session_id}/messages"))
                     .header("x-agent-hub-embed-token", &refreshed.token)
+                    .header(header::ORIGIN, "https://docs.example.test")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -25544,13 +29054,34 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        let model_connection_id = Uuid::new_v4();
+        let model_id = format!("widget-session-model-{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO model_connections
+                 (id, scope, name, base_url, api_type, allowed_model_ids,
+                  api_key_ciphertext, api_key_nonce, created_by)
+             VALUES ($1, 'global', 'Widget Session Model', 'https://models.example.test',
+                     'openai_responses', $2, $3, $4, $5)",
+        )
+        .bind(model_connection_id)
+        .bind(vec![model_id.clone()])
+        .bind(vec![1_u8; 17])
+        .bind(vec![2_u8; 12])
+        .bind(owner.id)
+        .execute(&pool)
+        .await
+        .unwrap();
         let agent_id = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO agents (id, owner_id, name, instructions, visibility)
-             VALUES ($1, $2, 'Widget Session Agent', 'test', 'private')",
+            "INSERT INTO agents
+                 (id, owner_id, name, instructions, visibility,
+                  model_connection_id, model_id)
+             VALUES ($1, $2, 'Widget Session Agent', 'test', 'private', $3, $4)",
         )
         .bind(agent_id)
         .bind(owner.id)
+        .bind(model_connection_id)
+        .bind(&model_id)
         .execute(&pool)
         .await
         .unwrap();
@@ -27875,6 +31406,7 @@ mod tests {
             widget_headers,
             Json(CreateWidgetRunRequest {
                 message: "widget joins the active console Turn".into(),
+                session_id: None,
                 integration_session_id: None,
                 hub_session_id: Some(fixture.hub_session_id),
                 parent_run_id: None,
@@ -27905,6 +31437,26 @@ mod tests {
                 .body(Body::empty())
                 .unwrap()
         };
+
+        let stream_request = |token: &str| {
+            axum::http::Request::builder()
+                .uri(format!("/api/runs/{}/events/stream", fixture.run_id))
+                .header("x-agent-hub-embed-token", token)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let forbidden_stream = app
+            .clone()
+            .oneshot(stream_request(&other_widget_token))
+            .await
+            .unwrap();
+        assert_eq!(forbidden_stream.status(), StatusCode::FORBIDDEN);
+        let own_stream = app
+            .clone()
+            .oneshot(stream_request(&widget_token))
+            .await
+            .unwrap();
+        assert_eq!(own_stream.status(), StatusCode::OK);
 
         let forbidden = app
             .clone()
@@ -38018,10 +41570,8 @@ mod tests {
     fn integration_tool_request_registration_rechecks_active_agent_and_runtime_ownership() {
         assert!(ACTIVE_RUNTIME_TOOL_REQUEST_AGENT_SQL.contains("a.deleted_at IS NULL"));
         assert!(ACTIVE_RUNTIME_TOOL_REQUEST_AGENT_SQL.contains("FOR UPDATE"));
-        assert!(ACTIVE_RUNTIME_TOOL_REQUEST_SESSION_SQL.contains("integration_sessions"));
-        assert!(ACTIVE_RUNTIME_TOOL_REQUEST_SESSION_SQL.contains("FOR UPDATE"));
         assert!(ACTIVE_RUNTIME_TOOL_REQUEST_RUN_SQL.contains("r.runtime_id = $2"));
-        assert!(ACTIVE_RUNTIME_TOOL_REQUEST_RUN_SQL.contains("r.integration_session_id = $3"));
+        assert!(ACTIVE_RUNTIME_TOOL_REQUEST_RUN_SQL.contains("r.session_ownership_generation = $3"));
         assert!(
             ACTIVE_RUNTIME_TOOL_REQUEST_RUN_SQL.contains("status IN ('running', 'waiting_tool')")
         );
@@ -38049,7 +41599,7 @@ mod tests {
             }),
         };
         let batch = FinalizeToolRequestsRequest {
-            integration_session_id: Uuid::new_v4(),
+            integration_session_id: Some(Uuid::new_v4()),
             native_session_id: "thread".into(),
             work_dir_ref: "workdir".into(),
             tool_requests: vec![event.clone(), event],
@@ -38236,7 +41786,7 @@ mod tests {
     async fn tool_request_batch_cannot_target_another_integration_session(pool: PgPool) {
         let fixture = integration_runtime_fixture(pool).await;
         let mut batch = tool_request_batch(&fixture, [fixture.tool_request_id]);
-        batch.integration_session_id = Uuid::new_v4();
+        batch.integration_session_id = Some(Uuid::new_v4());
 
         let result = runtime_finalize_tool_requests(
             State(fixture.state.clone()),
@@ -39724,6 +43274,7 @@ mod tests {
             widget_headers,
             Json(CreateWidgetRunRequest {
                 message: "must not continue".into(),
+                session_id: None,
                 integration_session_id: None,
                 hub_session_id: None,
                 parent_run_id: None,
@@ -42044,6 +45595,8 @@ mod tests {
     async fn integration_runtime_fixture(pool: PgPool) -> IntegrationRuntimeFixture {
         let owner_id = Uuid::new_v4();
         let agent_id = Uuid::new_v4();
+        let model_connection_id = Uuid::new_v4();
+        let model_id = format!("integration-model-{}", Uuid::new_v4().simple());
         let runtime_id = Uuid::new_v4();
         let other_runtime_id = Uuid::new_v4();
         let oauth_app_id = Uuid::new_v4();
@@ -42076,6 +45629,22 @@ mod tests {
         .bind(owner_id)
         .bind(format!("integration-owner-{unique}"))
         .bind(format!("integration-{unique}@example.com"))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO model_connections
+                 (id, scope, name, base_url, api_type, allowed_model_ids,
+                  api_key_ciphertext, api_key_nonce, created_by)
+             VALUES ($1, 'global', 'Integration Runtime Model',
+                     'https://models.example.test', 'openai_responses',
+                     $2, $3, $4, $5)",
+        )
+        .bind(model_connection_id)
+        .bind(vec![model_id.clone()])
+        .bind(vec![1_u8; 17])
+        .bind(vec![2_u8; 12])
+        .bind(owner_id)
         .execute(&pool)
         .await
         .unwrap();
@@ -42119,13 +45688,16 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO agents
-             (id, owner_id, name, instructions, visibility, model_policy, runtime_id)
+             (id, owner_id, name, instructions, visibility, model_policy, runtime_id,
+              model_connection_id, model_id)
              VALUES ($1, $2, 'Integration Test Agent', 'test', 'private',
-                     '{\"provider\":\"hub-proxy\"}'::jsonb, $3)",
+                     '{\"provider\":\"hub-proxy\"}'::jsonb, $3, $4, $5)",
         )
         .bind(agent_id)
         .bind(owner_id)
         .bind(runtime_id)
+        .bind(model_connection_id)
+        .bind(&model_id)
         .execute(&pool)
         .await
         .unwrap();
@@ -43659,6 +47231,7 @@ mod tests {
                 login_required: true,
                 allowed_origins: Vec::new(),
                 tool_allowlist: None,
+                client_tool_definitions: Vec::new(),
             }),
         )
         .await
@@ -44174,6 +47747,7 @@ mod tests {
                 login_required: true,
                 allowed_origins: Vec::new(),
                 tool_allowlist: None,
+                client_tool_definitions: Vec::new(),
             }),
         )
         .await
@@ -44486,7 +48060,7 @@ mod tests {
         request_ids: impl IntoIterator<Item = Uuid>,
     ) -> FinalizeToolRequestsRequest {
         FinalizeToolRequestsRequest {
-            integration_session_id: fixture.session_id,
+            integration_session_id: Some(fixture.session_id),
             native_session_id: "integration-test-session".into(),
             work_dir_ref: "integration-test-workdir".into(),
             tool_requests: request_ids

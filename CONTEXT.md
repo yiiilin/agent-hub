@@ -68,9 +68,57 @@ _Avoid_: Agent, External Platform, Authentication Channel
 A short-lived credential issued to an Integration App. It represents either the application itself or one authenticated Hub User, and its authority is limited by its Agent Scopes and the application's current Agent delegations.
 _Avoid_: API Key, browser Session, Runtime Credential
 
-**Widget Access Credential**:
-A 15-minute opaque `ahw_` credential that an Integration App backend obtains for one delegated Agent and one trusted External Identity. Renewal rotates only its token while preserving the stable credential record; it does not itself create or identify a conversation Session.
-_Avoid_: Integration App client secret, Application Token, Widget Session ID, permanent embed token
+**Client Access Credential**:
+A short-lived opaque credential that an Integration App backend obtains for one delegated Agent and one trusted External Identity so its browser client, including a Widget or headless SDK, can use that application's matching Sessions for the delegated Agent. Its random token remains a compact lookup secret: Hub stores the authorized Client Tool definitions as JSON on the existing persisted credential record rather than embedding schemas in the token or creating a separate tool-grant table. Hub restarts therefore do not invalidate it. It expires after 15 minutes; the SDK renews it before expiry through an atomic same-Client-Instance rotation that immediately supersedes the old token while leaving in-flight Runs intact and allowing their tool results to use the replacement token. V1 has no separate manual-revocation endpoint: expiry, rotation, and live application/user/Agent status checks invalidate access. It does not expose application authority and does not itself create or identify a conversation Session.
+_Avoid_: Widget Access Credential, Integration App client secret, Application Token, permanent frontend token, self-contained JWT, tool schemas embedded in a bearer token
+
+**Client Instance**:
+An independently authorized browser tab through which one external user participates in Sessions. Its ID is held in `sessionStorage`, survives a reload of that tab, and disappears when the tab closes; a new tab receives a different ID and may coexist for the same user. The IndexedDB execution journal is partitioned by this ID. Credential rotation supersedes only an earlier credential for the same Client Instance.
+_Avoid_: External Identity, Hub User, Session, globally exclusive login
+
+**Anonymous Client**:
+A browser-only consumer of a public Integration App with no trusted External Identity or application backend. Its browser-local visitor identity may recover one exact current Session, but it cannot discover conversation history across Sessions.
+_Avoid_: Hub User, External Identity, authenticated client, permanent anonymous account
+
+**Client Tool**:
+A structured capability defined by a trusted Integration App owner or backend as `{ name, description, input_schema }`, exposed to the Agent and executed by the application's client rather than by Hub or the Runtime. A name is unique within one Grant, contains only letters, digits, `_`, and `-`, and is at most 64 characters; one Grant contains at most 128 tools and at most 256 KB of serialized tool definitions, and every `input_schema` is an object-type JSON Schema. Client Tools are available only when the Agent permits its `integration` capability. Hub translates the protocol-neutral shape to an internally namespaced Execution Engine tool name so it cannot collide with built-in tools, while all Client API and SDK events retain the application's original name. Hub and its SDK do not impose a generic side-effect confirmation dialog: each application handler decides whether to use its own confirmation UI, and a refusal produces a terminal `user_rejected` Client Tool Result.
+_Avoid_: Pi built-in Tool, MCP Tool, Skill, arbitrary client command
+
+**Client Tool Grant**:
+The set of Client Tools authorized for one Client Instance. A trusted Integration App backend may submit complete tool definitions (`name`, `description`, and JSON Schema) when obtaining a Client Access Credential; Hub validates and freezes those definitions into the Grant. An Anonymous Client cannot submit tool definitions and receives only the Integration App's preconfigured Client Tool definitions stored as JSON on the existing Integration App record and managed through list/add/edit/delete forms. The Grant authorizes future Runs and is not a permanent property of Session history.
+_Avoid_: Agent tool policy, tools invented by the browser, Session Tool Set
+
+**Run Tool Snapshot**:
+The immutable Client Tool set captured from the initiating Client Instance's current Grant for one Run. Tool-result continuation Runs retain that snapshot even if the Client Instance is reauthorized later.
+_Avoid_: Live Client Tool Grant, Session Tool Set, mutable tool catalog
+
+**Run Tool Executor**:
+The Client Instance whose credential authorized a Run and which alone may submit results for that Run's Client Tool requests. Other Client Instances may observe the Run without executing its tools.
+_Avoid_: Session owner, Agent, every connected browser
+
+**Client Tool Invocation**:
+One immutable request to execute a Client Tool, identified by a stable `tool_call_id` and bound to its Run Tool Executor. It has at-most-once execution semantics: before calling an application handler, the SDK durably records the invocation and claims it from Hub; Hub confirmation is required before execution. Reconnect delivery to the same Client Instance may resend a cached result, but an invocation already recorded as executing with an unknown outcome is never run again automatically. A different Client Instance cannot claim, replay, or take over the invocation; external side effects must additionally use `tool_call_id` as an idempotency key at the application boundary. It has a five-minute hard deadline. An interruption or timeout fails the current Turn without model continuation or automatic retry, and SDK cancellation never implies that arbitrary application code was forcibly stopped. Repeating an identical result submission is idempotent, while a different result for the same `tool_call_id` conflicts. Invocation parameters, status, and result remain with Session history after credential expiry.
+_Avoid_: exactly-once claim, automatic retry, cross-device replay, argument-based deduplication
+
+**Client Tool Batch**:
+The ordered Client Tool Invocations emitted by one model response. The SDK executes them serially in model-output order, and Hub waits until every invocation has a terminal success or failure result before starting one model continuation for the batch.
+_Avoid_: parallel browser side effects, one continuation per tool result
+
+**Client Tool Result**:
+The persisted JSON outcome of one Client Tool Invocation. Success is `{ "status": "success", "output": <JsonValue> }`; failure is `{ "status": "error", "error": { "code": <string>, "message": <string>, "retryable": <boolean> } }`. The SDK converts thrown exceptions to the failure shape without transmitting JavaScript stacks, and neither Hub nor the SDK automatically retries an error result. Its UTF-8 JSON serialization is limited to 16,000 bytes; oversized results are rejected explicitly and never silently truncated.
+_Avoid_: unstructured exception text, browser stack trace, implicit retry
+
+**Browser SDK**:
+The first-version framework-neutral TypeScript client for browser applications, published as the ESM package `@agent-hub/client` from `sdk/typescript/` with TypeScript declarations and no React, Vue, Node-only, or other framework runtime dependency. One `AgentHubClient` lists Sessions and opens either an existing Session or a local draft that is created on Hub only by its first message; a Session object pages messages, subscribes to typed live events, and sends messages. Across different Sessions one credential may operate concurrently, while each Session has only one active Turn; `send()` during that Turn immediately steers it and retains its original Run Tool Executor and Snapshot. Session SSE reconnects from the last event sequence, and message retries reuse a stable `client_message_key`. Tool registration maps already-authorized names to handlers and cannot redefine their descriptions or schemas; a missing handler produces terminal `tool_handler_not_registered` for that invocation without preventing later invocations in the same batch. Authenticated and anonymous connection helpers share the same Session API. For authenticated use, the SDK creates its tab-scoped Client Instance ID first and passes it to an application-provided `authorize` callback; the application backend combines that ID with trusted user identity and complete tool definitions when requesting the credential from Hub, and its `client_secret` never reaches the browser. The SDK normally renews its 15-minute credential directly with Hub without changing the Grant; after a renewal `401` it invokes `authorize` once, and explicit `reauthorize()` obtains a replacement Grant without changing an in-flight Run Snapshot. The SDK owns Client Tool dispatch. Its at-most-once execution journal uses IndexedDB by default, is partitioned by Client Instance ID, and accepts a custom storage adapter for tests or application-managed storage; acknowledged terminal entries are removed after 24 hours, while unknown entries remain until Hub reports a terminal state. Client Access Credentials remain in page memory and are never persisted by the SDK: authenticated pages invoke `authorize` after reload, while anonymous pages use their persisted visitor key to obtain a fresh credential and recover only the current Session. Integration App backends use language-neutral HTTP APIs documented with complete request, response, security, vanilla TypeScript, and React examples; V1 does not ship separate React hooks or a CDN artifact. The package must pass `npm pack` verification but is not published by this task, and the current Widget consumes the same core SDK.
+_Avoid_: Node-only SDK, framework runtime dependency, client secret in browser, undocumented server exchange
+
+**Browser Origin Policy**:
+An optional per-Integration-App exact-Origin allowlist for authenticated Browser SDK and Widget requests. An authenticated Integration App may omit it to accept any Origin; an Anonymous Client application must configure at least one Origin and Hub permits only exact matches. Both HTTP and HTTPS origins are accepted in production even though documentation must explain bearer-token interception and mixed-content risks. Server-to-server credential issuance is not governed by browser CORS.
+_Avoid_: mandatory HTTPS enforcement, mandatory Origin configuration
+
+**Client API**:
+The canonical `/api/client/*` HTTP and SSE surface used by both the Browser SDK and Widget for credential renewal, Session history and messages, Run stop, Client Tool claim, and Client Tool Result submission. Existing `/api/widget/*` paths remain compatibility aliases but are not the primary documented contract. Session streams resume by event sequence; message delivery retries use `client_message_key`; identical Client Tool Result retries are idempotent and divergent retries conflict. Typed tool request, result, timeout, and error events remain separate from assistant text; the built-in Hub and Widget conversation views render them in message order as collapsible technical events with tool name, status, and elapsed time, while external clients control their own presentation.
+_Avoid_: Widget-only public contract, automatic message duplication, divergent result overwrite
 
 **External User Context**:
 The trusted external profile snapshot attached to one Widget Run by Hub after Integration App authentication. It carries the External Tenant and external user ID plus optional username, display name, email, and attributes to the Execution Engine; browser input alone cannot change it.

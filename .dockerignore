@@ -26,6 +26,10 @@ frontend/.vite-temp/
 frontend/coverage/
 qa/artifacts/
 
+sdk/typescript/node_modules/
+sdk/typescript/dist/
+sdk/typescript/*.tgz
+
 coverage/
 **/coverage/
 **/.cache/
