@@ -1,5 +1,11 @@
 import assert from 'node:assert/strict';
-import { ApiClient, loginAsAdmin, poll, waitForRunStatus } from '../../support/api.mjs';
+import {
+  ApiClient,
+  loginAsAdmin,
+  poll,
+  provisionLocalUser,
+  waitForRunStatus
+} from '../../support/api.mjs';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -234,15 +240,9 @@ export default async function sessionRunApiScenario(context) {
     assert.notEqual(turnStarted(isolatedEvents, 'isolated Pi Run events').payload.native_session_id,
       nativePiSessionId);
 
-    const memberClient = new ApiClient(context.baseURL);
-    const memberEmail = `${context.unique('qa-pi-session-member')
-      .toLowerCase()
-      .replace(/[^a-z0-9-]/g, '')}@example.com`;
-    const { data: registration } = await memberClient.post('/api/auth/register', {
-      email: memberEmail,
-      password: `${context.unique('PiSessionMember')}!Aa9`
-    });
-    assert.equal(registration.user.role, 'member');
+    const member = await provisionLocalUser(client, context, 'qa-pi-session-member');
+    const memberClient = member.client;
+    assert.equal(member.user.role, 'member');
     for (const sessionId of [initialRun.hub_session_id, isolatedRun.hub_session_id]) {
       await memberClient.get(`/api/sessions/${sessionId}`, { expectedStatus: 404 });
       await memberClient.get(`/api/sessions/${sessionId}/messages`, { expectedStatus: 404 });

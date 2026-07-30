@@ -4,7 +4,7 @@ import { createServer } from 'node:http';
 import { dirname, resolve } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { ApiClient } from '../support/api.mjs';
+import { ApiClient, qaSourceIp } from '../support/api.mjs';
 import { ComposeHarness } from '../support/compose.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -87,9 +87,14 @@ test('QA Compose allocates two isolated 24-bit network subnets', () => {
   });
 
   assert.equal(harness.environment.FRONTEND_PORT, '0');
+  assert.equal(harness.environment.COMPOSE_PROFILES, 'ldap');
   assert.match(harness.environment.HUB_NETWORK_SUBNET, /^10\.(?:1[2-9]\d|2[0-4]\d|25[0-5])\.\d{1,3}\.0\/24$/);
   assert.match(harness.environment.MODEL_NETWORK_SUBNET, /^10\.(?:1[2-9]\d|2[0-4]\d|25[0-5])\.\d{1,3}\.0\/24$/);
   assert.notEqual(harness.environment.HUB_NETWORK_SUBNET, harness.environment.MODEL_NETWORK_SUBNET);
+});
+
+test('QA login clients use the reserved benchmark network for isolated source IPs', () => {
+  assert.match(qaSourceIp(), /^198\.(?:18|19)\.\d{1,3}\.\d{1,3}$/);
 });
 
 test('fake model provider preserves Responses success, error, auth, and usage behavior', async (t) => {

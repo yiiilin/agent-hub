@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { ApiClient, loginAsAdmin, poll } from '../../support/api.mjs';
+import { ApiClient, loginAsAdmin, poll, provisionLocalUser } from '../../support/api.mjs';
 import { withBrowser } from '../../support/browser.mjs';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -264,7 +264,7 @@ async function waitForRuntimeRow(page, hostname) {
 async function cleanupMember(admin, member) {
   if (!member || member.erased) return;
   const response = await admin.post(`/api/admin/users/${member.id}/erase`, {
-    username: member.username
+    email: member.email
   }, { expectedStatus: [202, 404] });
   if (response.status === 202) {
     await poll(async () => {
@@ -302,18 +302,17 @@ export default async function runtimesBrowserScenario(scenarioContext) {
   let scenarioError = null;
 
   try {
-    const memberUsername = uniqueSlug(scenarioContext, 'qa-runtime-browser-member');
-    const memberEmail = `${memberUsername}@example.com`;
-    const memberPassword = `${scenarioContext.unique('Runtime member password')}!Aa9`;
-    const memberClient = new ApiClient(scenarioContext.baseURL);
-    const { data: registration } = await memberClient.post('/api/auth/register', {
-      email: memberEmail,
-      password: memberPassword
-    });
-    assert.equal(registration.user.role, 'member');
+    const memberAccount = await provisionLocalUser(
+      admin,
+      scenarioContext,
+      'qa-runtime-browser-member'
+    );
+    const memberClient = memberAccount.client;
+    const memberEmail = memberAccount.email;
+    const memberPassword = memberAccount.password;
+    assert.equal(memberAccount.user.role, 'member');
     member = {
-      id: registration.user.id,
-      username: registration.user.username,
+      id: memberAccount.user.id,
       email: memberEmail,
       password: memberPassword,
       erased: false

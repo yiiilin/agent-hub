@@ -2,25 +2,25 @@
 
 Type: `api`
 
-This scenario uses the real Compose backend, PostgreSQL, and Mock OIDC. It
-verifies password registration, session login/me/logout, disabled policy
-gates, required email verification, manual OIDC redirects and cookies, and a
-stable external-identity binding for repeated logins.
+This scenario uses the real Hub and PostgreSQL APIs. It verifies registration
+with Display Name, Local Password Session login/me/logout, current-user Display
+Name updates, registration and login-policy invariants, and hidden Super
+Administrator emergency password access. A syntactically valid unreachable
+LDAP configuration, including the Bind identity template, is saved only to
+exercise policy gates. Its draft-test request has an invalid template and must
+be rejected before any LDAP network access.
 
-It also verifies an explicitly expiring API key from one-time creation through
-Bearer authentication, in-place renewal, self-mutation rejection, password
-reset survival, and physical deletion. Administration coverage includes user
-detail and role changes, the last-Super-Administrator boundary, an
-administrator's inability to see or modify a Super Administrator, password
-reset session invalidation, and uniquely keyed External Platform and
-Authentication Channel create/list/update workflows. Platforms and channels
-have no delete API, so their unique records remain until the disposable QA
-database is removed.
+The Super Administrator creates an Administrator, which creates a distinct
+member account through `POST /api/admin/users`. Role visibility and mutation
+boundaries stay distinct. The member's email, Display Name, password, role, and
+email-confirmed permanent deletion are exercised, including Session
+invalidation after email/password changes and API key retention.
 
-The authentication policy is snapshotted before any change and is restored and
-read back in `finally`; restoration failure fails the scenario. Exact-username
-user erasure is the final functional mutation. The scenario performs only
-read-only history polling afterward, apart from the mandatory policy restore,
-and requires the erasure history to reach `completed`. API key plaintext is
-kept only in memory and is never written to logs, SQL output, README content,
-or artifacts.
+The Integration tail creates a trusted External Platform and Authentication
+Channel. `client_credentials` External Session creation rejects missing and
+invalid email, then binds a valid trusted email to the existing Hub user while
+retaining the optional external username profile field.
+
+Authentication policy and LDAP configuration are snapshotted and restored in
+`finally`. API key and OAuth credentials remain only in memory and are not
+written to artifacts.

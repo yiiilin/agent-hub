@@ -543,6 +543,13 @@ export function validateScenarioManifest(manifest, id, catalog) {
     errors.push(`${label}.timeout_ms must be an integer from 1000 to 600000`);
   }
   const covers = validateStringArray(manifest.covers, `${label}.covers`, errors, { nonEmpty: true });
+  if (manifest.blocked_prerequisite !== undefined) {
+    validateNonEmptyString(
+      manifest.blocked_prerequisite,
+      `${label}.blocked_prerequisite`,
+      errors
+    );
+  }
   const knownFeatures = new Set(catalog.features.map((feature) => feature.id));
   for (const featureId of covers) {
     if (!knownFeatures.has(featureId)) {
@@ -701,6 +708,7 @@ export function calculateCoverage(catalog, scenarios, canonicalOperations, canon
   const scenarioFeatureIds = new Set();
   const composeDomains = new Set();
   for (const scenario of scenarios) {
+    if (scenario.blockedPrerequisite) continue;
     const layer = scenario.type === 'api' ? 'qa-api' : 'qa-browser';
     for (const featureId of scenario.covers) {
       scenarioFeatureIds.add(featureId);
@@ -788,6 +796,7 @@ export function loadCoverageRepository(root = repoRoot, rootQa = qaRoot) {
         type: validated.type,
         timeoutMs: validated.timeout_ms,
         covers: validated.covers,
+        blockedPrerequisite: validated.blocked_prerequisite ?? null,
         entry: scenarioEntry
       };
     })
@@ -1217,7 +1226,8 @@ function qaDependencyModes() {
     { name: 'Chromium', mode: 'real', detail: 'Local Playwright-managed browser.' },
     { name: 'OpenAI Responses model provider', mode: 'emulated', detail: 'Deterministic local fake-model-provider.' },
     { name: 'S3-compatible bundle storage', mode: 'emulated', detail: 'Isolated MinIO service.' },
-    { name: 'OIDC provider', mode: 'mocked', detail: 'Built-in Mock OIDC flow.' }
+    { name: 'Local Password identity provider', mode: 'real', detail: 'Agent Hub database-backed authentication.' },
+    { name: 'LDAP Directory', mode: 'real', detail: 'Pinned OpenLDAP from the optional Compose ldap profile with real Plain, StartTLS, and LDAPS transports.' }
   ];
 }
 
@@ -1260,7 +1270,10 @@ async function main() {
   const repository = loadCoverageRepository();
   const allScenarios = discoverScenarios(repository);
   if (options.list) {
-    for (const scenario of allScenarios) console.log(`${scenario.id}\t${scenario.type}\t${scenario.name}`);
+    for (const scenario of allScenarios) {
+      const status = scenario.blockedPrerequisite ? '\tblocked prerequisite' : '';
+      console.log(`${scenario.id}\t${scenario.type}\t${scenario.name}${status}`);
+    }
     return;
   }
   const scenarios = selectScenarios(allScenarios, options);
@@ -1346,6 +1359,23 @@ async function main() {
     results = await executeScenarioQueue(scenarios, async (scenario) => {
       const artifactsDir = join(artifactsRoot, scenario.id);
       await mkdir(artifactsDir, { recursive: true });
+      if (scenario.blockedPrerequisite) {
+        const now = new Date().toISOString();
+        console.error(`[BLOCKED] ${scenario.id}: ${scenario.blockedPrerequisite}`);
+        return {
+          result: {
+            id: scenario.id,
+            name: scenario.name,
+            type: scenario.type,
+            covers: scenario.covers,
+            status: 'blocked',
+            duration_ms: 0,
+            started_at: now,
+            finished_at: now,
+            reason: scenario.blockedPrerequisite
+          }
+        };
+      }
       console.log(`\n[RUN ] ${scenario.id} (${scenario.type}) ${scenario.name}`);
       const startedAt = Date.now();
       const scenarioStartedAt = new Date(startedAt).toISOString();
@@ -1499,10 +1529,11 @@ async function main() {
     });
     const passed = results.filter((result) => result.status === 'passed').length;
     const failed = results.filter((result) => result.status === 'failed').length;
+    const blocked = results.filter((result) => result.status === 'blocked').length;
     const notRun = results.filter((result) => result.status === 'not_run').length;
-    console.log(`\nQA summary: ${passed} passed, ${failed} failed, ${notRun} not run`);
+    console.log(`\nQA summary: ${passed} passed, ${failed} failed, ${blocked} blocked, ${notRun} not run`);
     console.log(`Artifacts: ${artifactsRoot}`);
-    if (failed > 0 || qualityGateFailed || !sourceStable || environment.disposition === 'contaminated') {
+    if (failed > 0 || blocked > 0 || qualityGateFailed || !sourceStable || environment.disposition === 'contaminated') {
       process.exitCode = 1;
     }
   } finally {

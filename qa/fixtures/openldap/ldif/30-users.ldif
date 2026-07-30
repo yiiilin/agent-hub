@@ -1,0 +1,72 @@
+dn: ou=people,dc=example,dc=test
+objectClass: organizationalUnit
+ou: people
+
+dn: uid=qa.ldap@example.test,ou=people,dc=example,dc=test
+objectClass: inetOrgPerson
+uid: qa.ldap@example.test
+cn: QA LDAP User
+sn: User
+mail: qa.ldap@example.test
+displayName: QA LDAP User
+description: qa.ldap@example.test
+userPassword: qa-ldap-password
+
+dn: uid=qa\+filter*escape@example.test,ou=people,dc=example,dc=test
+objectClass: inetOrgPerson
+uid: qa+filter*escape@example.test
+cn: QA LDAP Escaping User
+sn: User
+mail: qa+filter*escape@example.test
+displayName: QA LDAP Escaping User
+description: qa+filter*escape@example.test
+userPassword: qa-ldap-escaping-password
+
+dn: uid=qa\+filter-decoy-escape@example.test,ou=people,dc=example,dc=test
+objectClass: inetOrgPerson
+uid: qa+filter-decoy-escape@example.test
+cn: QA LDAP Filter Wildcard Decoy
+sn: Decoy
+mail: qa+filter-decoy-escape@example.test
+displayName: QA LDAP Filter Wildcard Decoy
+description: qa+filter-decoy-escape@example.test
+userPassword: qa-ldap-filter-decoy-password
+
+dn: uid=mapped.login@example.test,ou=people,dc=example,dc=test
+objectClass: inetOrgPerson
+uid: mapped.login@example.test
+cn: Canonical LDAP User
+sn: User
+mail: canonical.user@example.test
+displayName: Canonical LDAP User
+description: mapped.login@example.test
+userPassword: mapped-ldap-password
+
+dn: uid=no-display@example.test,ou=people,dc=example,dc=test
+objectClass: inetOrgPerson
+uid: no-display@example.test
+cn: No Display Attribute
+sn: Attribute
+mail: no-display@example.test
+description: no-display@example.test
+userPassword: no-display-password
+
+dn: uid=duplicate@example.test,ou=people,dc=example,dc=test
+objectClass: inetOrgPerson
+uid: duplicate@example.test
+cn: Duplicate Result One
+sn: One
+mail: duplicate.one@example.test
+displayName: Duplicate Result One
+description: duplicate@example.test
+userPassword: duplicate-password
+
+dn: uid=duplicate-shadow@example.test,ou=people,dc=example,dc=test
+objectClass: inetOrgPerson
+uid: duplicate-shadow@example.test
+cn: Duplicate Result Two
+sn: Two
+mail: duplicate.two@example.test
+displayName: Duplicate Result Two
+description: duplicate@example.test
+userPassword: duplicate-shadow-password

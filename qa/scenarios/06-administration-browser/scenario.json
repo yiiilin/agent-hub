@@ -3,12 +3,16 @@
   "type": "browser",
   "timeout_ms": 180000,
   "covers": [
+    "AUTH-003",
     "ADM-001",
     "ADM-002",
     "ADM-003",
-    "ADM-004"
+    "ADM-004",
+    "ADM-005"
   ],
   "restores": [
-    "auth_policy"
+    "auth_policy",
+    "ldap_configuration",
+    "current_user_display_name"
   ]
 }

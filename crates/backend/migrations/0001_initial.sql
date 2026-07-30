@@ -851,10 +851,66 @@ CREATE TABLE public.auth_policy (
     singleton boolean DEFAULT true NOT NULL,
     password_registration_enabled boolean NOT NULL,
     password_login_enabled boolean NOT NULL,
-    email_verification_required boolean NOT NULL,
+    ldap_login_enabled boolean NOT NULL,
     updated_by uuid,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT auth_policy_singleton_check CHECK (singleton)
+);
+
+CREATE TABLE public.ldap_configuration (
+    singleton boolean DEFAULT true NOT NULL,
+    url text NOT NULL,
+    security_mode text NOT NULL,
+    base_dn text NOT NULL,
+    bind_identity_template text NOT NULL,
+    user_filter text NOT NULL,
+    email_attribute text NOT NULL,
+    display_name_attribute text NOT NULL,
+    allow_insecure boolean DEFAULT false NOT NULL,
+    skip_tls_verify boolean DEFAULT false NOT NULL,
+    updated_by uuid,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT ldap_configuration_singleton_check CHECK (singleton),
+    CONSTRAINT ldap_configuration_url_check CHECK (btrim(url) <> ''::text),
+    CONSTRAINT ldap_configuration_security_mode_check CHECK (
+        security_mode = ANY (ARRAY['ldaps'::text, 'starttls'::text, 'plain'::text])
+    ),
+    CONSTRAINT ldap_configuration_base_dn_check CHECK (btrim(base_dn) <> ''::text),
+    CONSTRAINT ldap_configuration_bind_identity_template_check CHECK (btrim(bind_identity_template) <> ''::text),
+    CONSTRAINT ldap_configuration_user_filter_check CHECK (btrim(user_filter) <> ''::text),
+    CONSTRAINT ldap_configuration_email_attribute_check CHECK (btrim(email_attribute) <> ''::text),
+    CONSTRAINT ldap_configuration_display_name_attribute_check CHECK (btrim(display_name_attribute) <> ''::text),
+    CONSTRAINT ldap_configuration_plain_requires_opt_in CHECK (
+        security_mode <> 'plain'::text OR allow_insecure
+    ),
+    CONSTRAINT ldap_configuration_skip_verify_requires_tls CHECK (
+        NOT skip_tls_verify OR security_mode = ANY (ARRAY['ldaps'::text, 'starttls'::text])
+    ),
+    CONSTRAINT ldap_configuration_scheme_matches_mode CHECK (
+        (security_mode = 'ldaps'::text AND lower(url) LIKE 'ldaps://%'::text)
+        OR
+        (security_mode = ANY (ARRAY['starttls'::text, 'plain'::text]) AND lower(url) LIKE 'ldap://%'::text)
+    )
+);
+
+CREATE TABLE public.login_email_failures (
+    normalized_email text NOT NULL,
+    failed_attempts integer DEFAULT 1 NOT NULL,
+    window_started_at timestamp with time zone NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT login_email_failures_email_check CHECK (
+        btrim(normalized_email) <> ''::text
+        AND normalized_email = lower(btrim(normalized_email))
+    ),
+    CONSTRAINT login_email_failures_attempts_check CHECK (failed_attempts > 0)
+);
+
+CREATE TABLE public.login_ip_attempts (
+    source_ip inet NOT NULL,
+    attempts integer DEFAULT 1 NOT NULL,
+    window_started_at timestamp with time zone NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT login_ip_attempts_attempts_check CHECK (attempts > 0)
 );
 
 CREATE TABLE public.authentication_channels (
@@ -1276,15 +1332,6 @@ CREATE TABLE public.oauth_authorization_codes (
     CONSTRAINT oauth_authorization_codes_tenant_nonempty CHECK ((btrim(tenant_id) <> ''::text))
 );
 
-CREATE TABLE public.oidc_login_states (
-    state text NOT NULL,
-    expires_at timestamp with time zone NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    email text,
-    subject text,
-    external_username text
-);
-
 CREATE TABLE public.run_events (
     seq bigint NOT NULL,
     event_id uuid NOT NULL,
@@ -1518,28 +1565,27 @@ CREATE TABLE public.user_erasure_bundle_objects (
 CREATE TABLE public.user_erasure_jobs (
     user_id uuid NOT NULL,
     requested_by uuid NOT NULL,
-    requested_username text NOT NULL,
+    requested_email text NOT NULL,
     attempts bigint DEFAULT 0 NOT NULL,
     last_error text,
     requested_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     target_role text NOT NULL,
     CONSTRAINT user_erasure_jobs_attempts_check CHECK ((attempts >= 0)),
-    CONSTRAINT user_erasure_jobs_requested_username_check CHECK ((btrim(requested_username) <> ''::text)),
+    CONSTRAINT user_erasure_jobs_requested_email_check CHECK ((btrim(requested_email) <> ''::text)),
     CONSTRAINT user_erasure_jobs_target_role_check CHECK ((target_role = ANY (ARRAY['member'::text, 'admin'::text, 'super_admin'::text])))
 );
 
 CREATE TABLE public.users (
     id uuid NOT NULL,
-    email text,
+    email text NOT NULL,
     password text,
     display_name text NOT NULL,
     role text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    username text NOT NULL,
-    email_verified boolean DEFAULT true NOT NULL,
     deletion_requested_at timestamp with time zone,
-    CONSTRAINT users_username_length CHECK (((char_length(username) >= 1) AND (char_length(username) <= 64)))
+    CONSTRAINT users_email_check CHECK ((btrim(email) <> ''::text)),
+    CONSTRAINT users_display_name_check CHECK ((btrim(display_name) <> ''::text))
 );
 
 ALTER TABLE ONLY public.run_events ALTER COLUMN seq SET DEFAULT nextval('public.run_events_seq_seq'::regclass);
@@ -1558,6 +1604,15 @@ ALTER TABLE ONLY public.api_keys
 
 ALTER TABLE ONLY public.auth_policy
     ADD CONSTRAINT auth_policy_pkey PRIMARY KEY (singleton);
+
+ALTER TABLE ONLY public.ldap_configuration
+    ADD CONSTRAINT ldap_configuration_pkey PRIMARY KEY (singleton);
+
+ALTER TABLE ONLY public.login_email_failures
+    ADD CONSTRAINT login_email_failures_pkey PRIMARY KEY (normalized_email);
+
+ALTER TABLE ONLY public.login_ip_attempts
+    ADD CONSTRAINT login_ip_attempts_pkey PRIMARY KEY (source_ip);
 
 ALTER TABLE ONLY public.authentication_channels
     ADD CONSTRAINT authentication_channels_id_platform_id_key UNIQUE (id, platform_id);
@@ -1670,9 +1725,6 @@ ALTER TABLE ONLY public.oauth_apps
 ALTER TABLE ONLY public.oauth_authorization_codes
     ADD CONSTRAINT oauth_authorization_codes_pkey PRIMARY KEY (code_hash);
 
-ALTER TABLE ONLY public.oidc_login_states
-    ADD CONSTRAINT oidc_login_states_pkey PRIMARY KEY (state);
-
 ALTER TABLE ONLY public.run_events
     ADD CONSTRAINT run_events_event_id_key UNIQUE (event_id);
 
@@ -1745,9 +1797,6 @@ ALTER TABLE ONLY public.user_erasure_jobs
 ALTER TABLE ONLY public.users
     ADD CONSTRAINT users_pkey PRIMARY KEY (id);
 
-ALTER TABLE ONLY public.users
-    ADD CONSTRAINT users_username_key UNIQUE (username);
-
 CREATE INDEX agent_skills_skill_idx ON public.agent_skills USING btree (skill_id);
 
 CREATE INDEX agents_model_selection_idx ON public.agents USING btree (model_connection_id, model_id) WHERE (model_connection_id IS NOT NULL);
@@ -1757,6 +1806,10 @@ CREATE INDEX agents_public_to_idx ON public.agents USING gin (public_to);
 CREATE INDEX agents_runtime_idx ON public.agents USING btree (runtime_id);
 
 CREATE INDEX api_keys_user_created_idx ON public.api_keys USING btree (user_id, created_at DESC);
+
+CREATE INDEX login_email_failures_window_idx ON public.login_email_failures USING btree (window_started_at);
+
+CREATE INDEX login_ip_attempts_window_idx ON public.login_ip_attempts USING btree (window_started_at);
 
 CREATE INDEX automations_agent_created_idx ON public.automations USING btree (agent_id, created_at DESC);
 
@@ -1872,7 +1925,7 @@ CREATE INDEX user_erasure_skill_objects_user_idx ON public.user_erasure_skill_ob
 
 CREATE INDEX user_erasure_jobs_requested_idx ON public.user_erasure_jobs USING btree (requested_at, user_id);
 
-CREATE UNIQUE INDEX users_email_normalized_key ON public.users USING btree (lower(btrim(email))) WHERE (email IS NOT NULL);
+CREATE UNIQUE INDEX users_email_normalized_key ON public.users USING btree (lower(btrim(email)));
 
 CREATE TRIGGER agents_model_selection_validate BEFORE INSERT OR UPDATE OF owner_id, model_connection_id, model_id, model_settings ON public.agents FOR EACH ROW EXECUTE FUNCTION public.validate_agent_model_selection();
 
@@ -1926,6 +1979,9 @@ ALTER TABLE ONLY public.api_keys
 
 ALTER TABLE ONLY public.auth_policy
     ADD CONSTRAINT auth_policy_updated_by_fkey FOREIGN KEY (updated_by) REFERENCES public.users(id) ON DELETE SET NULL;
+
+ALTER TABLE ONLY public.ldap_configuration
+    ADD CONSTRAINT ldap_configuration_updated_by_fkey FOREIGN KEY (updated_by) REFERENCES public.users(id) ON DELETE SET NULL;
 
 ALTER TABLE ONLY public.authentication_channels
     ADD CONSTRAINT authentication_channels_created_by_fkey FOREIGN KEY (created_by) REFERENCES public.users(id) ON DELETE SET NULL;
@@ -2206,5 +2262,5 @@ ALTER TABLE ONLY public.user_erasure_skill_objects
 -- Required control-plane singleton rows.
 INSERT INTO public.auth_policy
     (singleton, password_registration_enabled, password_login_enabled,
-     email_verification_required)
+     ldap_login_enabled)
 VALUES (true, true, true, false);

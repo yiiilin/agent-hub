@@ -6,15 +6,14 @@ async fn insert_user(pool: &PgPool, role: &str) -> Uuid {
     let id = Uuid::new_v4();
     let suffix = id.simple().to_string();
     sqlx::query(
-        "INSERT INTO users (id, email, password, display_name, role, username)
-         VALUES ($1, $2, $3, $4, $5, $6)",
+        "INSERT INTO users (id, email, password, display_name, role)
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(id)
     .bind(format!("{suffix}@example.test"))
     .bind("password-hash")
     .bind(format!("User {suffix}"))
     .bind(role)
-    .bind(format!("user-{suffix}"))
     .execute(pool)
     .await
     .unwrap();

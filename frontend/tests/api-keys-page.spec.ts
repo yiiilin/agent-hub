@@ -2,7 +2,6 @@ import { expect, test, type Page, type Route } from '@playwright/test';
 
 const user = {
   id: '10000000-0000-0000-0000-000000000001',
-  username: 'api-key-owner',
   email: 'api-key-owner@example.com',
   display_name: 'API key owner',
   role: 'member'

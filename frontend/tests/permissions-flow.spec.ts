@@ -1,10 +1,15 @@
 import { expect, test, type Page, type Route } from '@playwright/test';
 import type { Agent, AgentModelSettings } from '../src/api/client';
 
-async function signInWithMockOidc(page: import('@playwright/test').Page, email: string) {
+async function provisionAndSignInPasswordUser(page: import('@playwright/test').Page, email: string) {
+  const password = 'permissions-test-password';
+  expect((await page.request.post('/api/auth/login', { data: { email: 'admin@example.com', password: 'admin123' } })).ok()).toBeTruthy();
+  expect((await page.request.post('/api/admin/users', { data: { email, password, role: 'member' } })).ok()).toBeTruthy();
+  expect((await page.request.post('/api/auth/logout')).status()).toBe(204);
   await page.goto('/login');
   await page.getByLabel('Email').fill(email);
-  await page.getByRole('button', { name: 'Sign in with Mock OIDC' }).click();
+  await page.getByLabel('Password').fill(password);
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
   await expect(page.getByText(email)).toBeVisible();
 }
 
@@ -255,7 +260,7 @@ test('owner, admin, public, and public_to permissions stay isolated', async ({ b
   let publicAgentId: string | null = null;
   let sharedAgentId: string | null = null;
   try {
-    await signInWithMockOidc(memberPage, memberEmail);
+    await provisionAndSignInPasswordUser(memberPage, memberEmail);
     const privateResponse = await memberPage.request.post('/api/agents', {
       data: createAgentRequest(`Member Private ${Date.now()}`, 'Owner-only private controls.')
     });
@@ -281,7 +286,7 @@ test('owner, admin, public, and public_to permissions stay isolated', async ({ b
     await adminPage.getByRole('button', { name: 'Sign in', exact: true }).click();
     await expect(adminPage.getByText('admin@example.com')).toBeVisible();
 
-    await signInWithMockOidc(publicAdminPage, `public-admin-${Date.now()}@example.com`);
+    await provisionAndSignInPasswordUser(publicAdminPage, `public-admin-${Date.now()}@example.com`);
     const publicAdminUser = await (await publicAdminPage.request.get('/api/auth/me')).json() as { id: string };
     const promoteResponse = await adminPage.request.put(`/api/admin/users/${publicAdminUser.id}/role`, {
       data: { role: 'admin' }
@@ -384,7 +389,7 @@ test('owner, admin, public, and public_to permissions stay isolated', async ({ b
 
     outsiderContext = await browser.newContext({ baseURL });
     const outsiderPage = await outsiderContext.newPage();
-    await signInWithMockOidc(outsiderPage, `outsider-${Date.now()}@example.com`);
+    await provisionAndSignInPasswordUser(outsiderPage, `outsider-${Date.now()}@example.com`);
     expect((await outsiderPage.request.get(`/api/agents/${sharedAgentId}`)).status()).toBe(404);
     expect((await outsiderPage.request.get(`/api/agents/${memberPrivate.id}`)).status()).toBe(404);
     expect((await outsiderPage.request.get(`/api/agents/${publicAgentId}`)).ok()).toBeTruthy();

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { ApiClient, loginAsAdmin, provisionLocalUser } from '../../support/api.mjs';
 import { withBrowser } from '../../support/browser.mjs';
 
 const PLAYWRIGHT_MODULE = new URL('../../../frontend/node_modules/playwright/index.mjs', import.meta.url);
@@ -33,6 +34,14 @@ async function closeOrRedactSecret(page, secretDialog) {
 }
 
 export default async function apiKeysBrowserScenario(scenarioContext) {
+  const provisioningClient = new ApiClient(scenarioContext.baseURL);
+  await loginAsAdmin(provisioningClient);
+  const localUser = await provisionLocalUser(
+    provisioningClient,
+    scenarioContext,
+    'qa-api-key-local-user'
+  );
+
   await withBrowser(scenarioContext, {
     allowedHttpErrors: [
       { method: 'GET', pathname: '/api/auth/me', status: 401, times: 2 }
@@ -180,24 +189,16 @@ export default async function apiKeysBrowserScenario(scenarioContext) {
     await page.getByRole('button', { name: 'Sign in', exact: true }).waitFor();
     assert.equal((await request.get('/api/auth/me')).status(), 401, 'Logout must invalidate the browser session');
 
-    const oidcSuffix = scenarioContext.unique('oidc-user').replace(/[^a-z0-9]/gi, '').slice(-32).toLowerCase();
-    const oidcEmail = `api-key-oidc-${oidcSuffix}@example.com`;
-    await page.getByLabel('Email').fill(oidcEmail);
-    await page.getByRole('button', { name: 'Sign in with Mock OIDC' }).click();
-    await page.waitForURL((url) => url.pathname === '/agents');
-    await page.getByText(oidcEmail, { exact: true }).waitFor();
-    await page.getByText('Create Agent', { exact: true }).first().waitFor();
+    await page.getByLabel('Email').fill(localUser.email);
+    await page.getByLabel('Password').fill(localUser.password);
+    await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+    await assertSessionsFirst(page, localUser.email);
 
-    const firstWorkspaceDestination = page.locator('.nav-group').first().getByRole('button').first();
-    assert.equal((await firstWorkspaceDestination.innerText()).trim(), 'Sessions', 'Sessions must be the first workspace destination');
-    await firstWorkspaceDestination.click();
-    await assertSessionsFirst(page, oidcEmail);
-
-    const oidcSessionMe = await request.get('/api/auth/me');
-    assert.equal(oidcSessionMe.status(), 200, 'Mock OIDC browser session must authenticate /auth/me');
-    assert.equal((await oidcSessionMe.json()).email, oidcEmail, 'Mock OIDC must bind the requested unique user');
+    const localSessionMe = await request.get('/api/auth/me');
+    assert.equal(localSessionMe.status(), 200, 'Provisioned user browser session must authenticate /auth/me');
+    assert.equal((await localSessionMe.json()).id, localUser.user.id, 'Browser login must keep the provisioned user isolated');
     await page.setViewportSize({ width: 390, height: 844 });
-    await assertNoHorizontalOverflow(page, 'Mobile Sessions page after Mock OIDC login');
+    await assertNoHorizontalOverflow(page, 'Mobile Sessions page after provisioned user login');
 
     // Chromium reports these successful 204 fetches as aborted after the SPA moves on.
     const unexpectedBrowserErrors = browserErrors.filter((error) => !allowedNoContentAborts.has(error));

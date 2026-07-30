@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { ApiClient, loginAsAdmin, poll, waitForRunStatus } from '../../support/api.mjs';
+import {
+  ApiClient,
+  loginAsAdmin,
+  poll,
+  provisionLocalUser,
+  waitForRunStatus
+} from '../../support/api.mjs';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
@@ -10,33 +16,6 @@ function uniqueSlug(context, prefix) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-|-$/g, '');
-}
-
-async function manualRedirect(client, path) {
-  const headers = { accept: 'application/json' };
-  const cookie = client.cookieHeader();
-  if (cookie) headers.cookie = cookie;
-  const response = await fetch(new URL(path, client.baseURL), {
-    headers,
-    redirect: 'manual'
-  });
-  client.absorbCookies(response.headers);
-  assert.equal(response.status, 303, 'Mock OIDC must redirect');
-  const location = response.headers.get('location');
-  assert.equal(typeof location, 'string', 'Mock OIDC redirect must include a location');
-  return location;
-}
-
-async function oidcLogin(context, prefix) {
-  const slug = uniqueSlug(context, prefix);
-  const client = new ApiClient(context.baseURL);
-  const callback = await manualRedirect(
-    client,
-    `/api/auth/oidc/mock/start?email=${encodeURIComponent(`${slug}@example.com`)}&sub=${encodeURIComponent(slug)}`,
-  );
-  await manualRedirect(client, callback);
-  const { data: user } = await client.get('/api/auth/me');
-  return { client, user };
 }
 
 function updatePayload(agent, overrides = {}) {
@@ -122,9 +101,9 @@ async function waitForRuntimeRootRemoval(context, runRoot) {
 export default async function agentSkillMcpApiScenario(context) {
   const admin = new ApiClient(context.baseURL);
   await loginAsAdmin(admin);
-  const target = await oidcLogin(context, 'qa-agent-target');
-  const outsider = await oidcLogin(context, 'qa-agent-outsider');
-  const denied = await oidcLogin(context, 'qa-agent-denied');
+  const target = await provisionLocalUser(admin, context, 'qa-agent-target');
+  const outsider = await provisionLocalUser(admin, context, 'qa-agent-outsider');
+  const denied = await provisionLocalUser(admin, context, 'qa-agent-denied');
   const createdAgentIds = [];
   const createdSkillIds = [];
   let scenarioError;

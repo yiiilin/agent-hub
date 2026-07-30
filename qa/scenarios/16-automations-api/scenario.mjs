@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { ApiClient, loginAsAdmin, poll } from '../../support/api.mjs';
+import { ApiClient, loginAsAdmin, poll, provisionLocalUser } from '../../support/api.mjs';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const WEBHOOK_TOKEN_PATTERN = /^ahw_[A-Za-z0-9]+$/;
@@ -105,19 +105,20 @@ export default async function automationsApiScenario(context) {
   const superClient = new ApiClient(context.baseURL);
   await loginAsAdmin(superClient);
 
-  const ownerClient = new ApiClient(context.baseURL);
-  const ownerSlug = uniqueSlug(context, 'qa-automation-owner');
+  let ownerClient = null;
   let owner = null;
   const agentIds = [];
   let scenarioError = null;
   const cleanupErrors = [];
 
   try {
-    const { data: registration } = await ownerClient.post('/api/auth/register', {
-      email: `${ownerSlug}@example.com`,
-      password: `${context.unique('Automation owner password')}!Aa9`
-    });
-    owner = registration.user;
+    const ownerAccount = await provisionLocalUser(
+      superClient,
+      context,
+      'qa-automation-owner'
+    );
+    ownerClient = ownerAccount.client;
+    owner = ownerAccount.user;
     assert.equal(owner.role, 'member');
 
     const { data: primaryAgent } = await ownerClient.post('/api/agents', {
@@ -421,7 +422,7 @@ export default async function automationsApiScenario(context) {
     if (owner) {
       await cleanupResource(async () => {
         await superClient.post(`/api/admin/users/${owner.id}/erase`, {
-          username: owner.username
+          email: owner.email
         }, { expectedStatus: 202 });
         await poll(async () => {
           const { data: erasures } = await superClient.get('/api/admin/user-erasures');

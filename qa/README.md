@@ -3,8 +3,12 @@
 This directory contains unattended end-to-end scenarios that use an isolated
 Docker Compose environment. The environment runs the real Hub, Runtime, bundled
 Pi standalone, PostgreSQL, model gateway, and Chromium. It uses a deterministic
-fake model provider, Mock OIDC, and MinIO, so it does not call a real AI, OAuth,
-or S3 service.
+fake model provider and MinIO, so it does not call a real AI, external OAuth,
+or S3 service. Hub users authenticate with Local Password accounts provisioned
+through the public administrator API and the pinned OpenLDAP service enabled by
+the Compose `ldap` profile. The LDAP scenarios exercise real Plain, StartTLS,
+and LDAPS transports without an external directory, including a wildcard-decoy
+negative control for LDAP filter escaping.
 
 ## Coverage contract
 
@@ -56,14 +60,15 @@ Useful filters and diagnostics:
 ```
 
 `--type api` does not import Playwright or start Chromium. All selected
-scenarios share one freshly created Compose environment. Unless `--keep-env`
+scenarios share one freshly created Compose environment, including the pinned
+OpenLDAP service from the optional `ldap` profile. Unless `--keep-env`
 is set, the runner removes its containers, network, and volumes when it exits.
 Every executable run first gates the published TypeScript SDK with `npm test`,
 `npm run build`, and `npm pack --dry-run`; a gate failure makes the overall run
 fail even if selected scenarios pass.
 `--coverage` validates the catalog, manifests, evidence markers, OpenAPI
 operations, UI routes, required layers, and Compose domains entirely offline.
-It exits non-zero while planned scenario gaps remain.
+It exits non-zero while scenario gaps remain.
 
 Results are written under `qa/artifacts/<run-id>/`. Every run produces
 `summary.json`, `junit.xml`, `sdk-quality-gates.log`, and
@@ -104,6 +109,11 @@ context provides `baseURL`, `artifactsDir`, `compose`, and `unique(prefix)`.
 API scenarios should use `qa/support/api.mjs`. Browser scenarios should use
 `qa/support/browser.mjs`, which reuses the Playwright installation in
 `frontend/node_modules` and captures browser diagnostics.
+
+A planned real-boundary scenario may declare a non-empty
+`blocked_prerequisite`. The runner reports it as `blocked`, exits non-zero, and
+does not launch its worker. Blocked scenarios do not satisfy offline coverage;
+remove the field only when the prerequisite and executable oracle are real.
 
 Keep fixtures deterministic and local. A scenario must clean up resources it
 creates only when later scenarios could observe them; the entire database and

@@ -21,12 +21,42 @@ services:
     networks:
       - hub-network
 
+  openldap:
+    profiles: ["ldap"]
+    image: osixia/openldap:1.5.0@sha256:18742e9c449c9c1afe129d3f2f3ee15fb34cc43e5f940a20f3399728f41d7c28
+    hostname: openldap
+    command: ["--copy-service"]
+    labels: *development-labels
+    environment:
+      LDAP_ORGANISATION: Agent Hub QA
+      LDAP_DOMAIN: example.test
+      LDAP_BASE_DN: dc=example,dc=test
+      LDAP_ADMIN_PASSWORD: qa-openldap-admin
+      LDAP_CONFIG_PASSWORD: qa-openldap-config
+      LDAP_TLS: "true"
+      LDAP_TLS_CRT_FILENAME: ldap.crt
+      LDAP_TLS_KEY_FILENAME: ldap.key
+      LDAP_TLS_CA_CRT_FILENAME: ca.crt
+      LDAP_TLS_VERIFY_CLIENT: never
+    healthcheck:
+      test: ["CMD-SHELL", "LDAPTLS_REQCERT=never ldapsearch -x -LLL -H ldap://localhost:389 -ZZ -D 'uid=qa.ldap@example.test,ou=people,dc=example,dc=test' -w 'qa-ldap-password' -b 'ou=people,dc=example,dc=test' '(mail=qa.ldap@example.test)' 1.1 | grep -q '^dn:'"]
+      start_period: 60s
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - ./qa/fixtures/openldap/ldif:/container/service/slapd/assets/config/bootstrap/ldif/custom:ro
+      - ./qa/fixtures/openldap/certs:/container/service/slapd/assets/certs:ro
+    networks:
+      - hub-network
+
   model-gateway:
     labels: *development-labels
     build:
       context: .
       dockerfile: deploy/gateway.Dockerfile
     environment:
+      GODEBUG: ${MODEL_GATEWAY_GODEBUG:-http2client=0}
       MODEL_GATEWAY_AUTH_TOKEN: ${HUB_MODEL_GATEWAY_AUTH_TOKEN:-dev-model-gateway-auth-token}
       MODEL_GATEWAY_LISTEN_ADDR: 0.0.0.0:8090
       MODEL_GATEWAY_UPSTREAM_TIMEOUT: ${MODEL_GATEWAY_UPSTREAM_TIMEOUT:-300s}
@@ -48,7 +78,7 @@ services:
       EMBED_JWT_SECRET: ${EMBED_JWT_SECRET:-dev-embed-jwt-secret}
       EMBED_JWT_ISSUER: ${EMBED_JWT_ISSUER:-agent-hub-dev}
       EMBED_JWT_AUDIENCE: ${EMBED_JWT_AUDIENCE:-agent-hub-widget}
-      OIDC_MOCK_ENABLED: ${OIDC_MOCK_ENABLED:-true}
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-}
       SEED_DEV_USER: ${SEED_DEV_USER:-true}
       HUB_MODEL_SECRET_KEY: ${HUB_MODEL_SECRET_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}
       SEED_DEV_MODEL_CONNECTION: ${SEED_DEV_MODEL_CONNECTION:-true}

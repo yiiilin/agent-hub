@@ -11,8 +11,7 @@ pub const ATOMIC_WAITING_TOOL_BATCH_CAPABILITY: &str = "atomic_waiting_tool_batc
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserDto {
     pub id: Uuid,
-    pub username: String,
-    pub email: Option<String>,
+    pub email: String,
     pub display_name: String,
     pub role: String,
 }
@@ -20,9 +19,32 @@ pub struct UserDto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminUserDetailDto {
     pub user: UserDto,
-    pub email_verified: bool,
     pub has_password: bool,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AdminCreateUserRequest {
+    pub email: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AdminUpdateUserRequest {
+    pub email: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateCurrentUserRequest {
+    pub display_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -40,13 +62,13 @@ pub struct AdminSetUserRoleRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EraseUserRequest {
-    pub username: String,
+    pub email: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserErasureDto {
     pub user_id: Uuid,
-    pub username: Option<String>,
+    pub email: Option<String>,
     pub status: String,
     pub requested_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
@@ -57,7 +79,44 @@ pub struct UserErasureDto {
 pub struct AuthPolicyDto {
     pub password_registration_enabled: bool,
     pub password_login_enabled: bool,
-    pub email_verification_required: bool,
+    pub ldap_login_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LdapSecurityMode {
+    Ldaps,
+    Starttls,
+    Plain,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LdapConfigurationDto {
+    pub url: String,
+    pub security: LdapSecurityMode,
+    pub base_dn: String,
+    pub bind_identity_template: String,
+    pub user_filter: String,
+    pub email_attribute: String,
+    pub display_name_attribute: String,
+    pub allow_insecure: bool,
+    pub skip_tls_verify: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TestLdapConfigurationRequest {
+    pub configuration: LdapConfigurationDto,
+    pub email: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TestLdapConfigurationResponse {
+    pub email: String,
+    pub display_name: String,
+    pub duration_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1489,6 +1548,7 @@ pub struct IntegrationContextDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoginRequest {
     pub email: String,
     pub password: String,
@@ -1500,15 +1560,17 @@ pub struct LoginResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PasswordRegistrationRequest {
     pub email: String,
     pub password: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PasswordRegistrationResponse {
     pub user: UserDto,
-    pub verification_required: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1541,10 +1603,9 @@ pub struct CreateApiKeyResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthProvidersResponse {
-    pub oidc_mock: bool,
     pub password_registration_enabled: bool,
     pub password_login_enabled: bool,
-    pub email_verification_required: bool,
+    pub ldap_login_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1614,8 +1675,6 @@ pub struct OAuthExternalProfileDto {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OAuthUserInfoDto {
     pub sub: Uuid,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1734,6 +1793,12 @@ pub struct CreateIntegrationSessionRequest {
     pub external_user_id: String,
     #[serde(default)]
     pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
     pub tools: Value,
     pub metadata: Value,
 }
@@ -1749,8 +1814,7 @@ pub struct CreateWidgetAccessRequest {
     pub username: Option<String>,
     #[serde(default)]
     pub display_name: Option<String>,
-    #[serde(default)]
-    pub email: Option<String>,
+    pub email: String,
     #[serde(default)]
     pub attributes: Value,
     #[serde(default)]
@@ -2548,25 +2612,23 @@ mod tests {
 
     #[test]
     fn identity_and_auth_policy_contracts_serialize_stably() {
-        let user: UserDto = serde_json::from_value(json!({
+        let user_value = json!({
             "id": Uuid::nil(),
-            "username": "member",
-            "email": null,
+            "email": "member@example.com",
             "display_name": "Member",
             "role": "member"
-        }))
-        .unwrap();
-        assert_eq!(user.username, "member");
-        assert_eq!(user.email, None);
+        });
+        let user: UserDto = serde_json::from_value(user_value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(user).unwrap(), user_value);
 
         let request: EraseUserRequest = serde_json::from_value(json!({
-            "username": "member"
+            "email": "member@example.com"
         }))
         .unwrap();
-        assert_eq!(request.username, "member");
+        assert_eq!(request.email, "member@example.com");
         let erasure = UserErasureDto {
             user_id: Uuid::nil(),
-            username: Some("member".into()),
+            email: Some("member@example.com".into()),
             status: "pending".into(),
             requested_at: Utc::now(),
             completed_at: None,
@@ -2576,15 +2638,32 @@ mod tests {
         let policy = AuthPolicyDto {
             password_registration_enabled: true,
             password_login_enabled: false,
-            email_verification_required: true,
+            ldap_login_enabled: true,
         };
         assert_eq!(
             serde_json::to_value(policy).unwrap(),
             json!({
                 "password_registration_enabled": true,
                 "password_login_enabled": false,
-                "email_verification_required": true
+                "ldap_login_enabled": true
             })
+        );
+
+        let ldap_configuration: LdapConfigurationDto = serde_json::from_value(json!({
+            "url": "ldap://directory.example.com:389",
+            "security": "starttls",
+            "base_dn": "ou=people,dc=example,dc=com",
+            "bind_identity_template": "uid={email},ou=people,dc=example,dc=com",
+            "user_filter": "(mail={email})",
+            "email_attribute": "mail",
+            "display_name_attribute": "displayName",
+            "allow_insecure": false,
+            "skip_tls_verify": false
+        }))
+        .unwrap();
+        assert_eq!(
+            ldap_configuration.bind_identity_template,
+            "uid={email},ou=people,dc=example,dc=com"
         );
 
         let channel: AuthenticationChannelDto = serde_json::from_value(json!({
@@ -2738,7 +2817,6 @@ mod tests {
         let subject = Uuid::from_u128(20);
         let minimal = OAuthUserInfoDto {
             sub: subject,
-            username: None,
             name: None,
             email: None,
             external_profile: None,
@@ -2750,7 +2828,6 @@ mod tests {
 
         let full = OAuthUserInfoDto {
             sub: subject,
-            username: Some("member".into()),
             name: Some("Member".into()),
             email: Some("member@example.com".into()),
             external_profile: Some(OAuthExternalProfileDto {
@@ -2763,7 +2840,7 @@ mod tests {
             }),
         };
         let value = serde_json::to_value(full).unwrap();
-        assert_eq!(value["username"], "member");
+        assert!(value.get("username").is_none());
         assert_eq!(value["external_profile"]["tenant_id"], "tenant-1");
     }
 

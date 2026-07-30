@@ -58,6 +58,7 @@ async function installSessionApi(page: Page, options: {
   activeMessages?: Array<Record<string, unknown>>;
   activeStreamGate?: Promise<void>;
   activeStreamRefreshesSession?: boolean;
+  initialSessions?: ReturnType<typeof session>[];
   olderMessagePageGate?: Promise<void>;
 } = {}) {
   const active = session('active', activeAgentId, 'Active Agent', 'hub_native', { active_turn_id: 'turn-active' });
@@ -76,7 +77,7 @@ async function installSessionApi(page: Page, options: {
   });
   let newSessionStreamCount = 0;
   let externalStreamCount = 0;
-  let sessions = [active, external, historical, multiTurn];
+  let sessions = options.initialSessions ?? [active, external, historical, multiTurn];
   const messages: Record<string, Array<Record<string, unknown>>> = {
     active: options.activeMessages ?? [
       message('active', 1, 'user', 'Inspect the deployment.', { accepted_at: '2026-07-17T10:00:00.000Z' }),
@@ -123,7 +124,7 @@ async function installSessionApi(page: Page, options: {
     const url = new URL(request.url());
     const path = url.pathname;
     if (!path.startsWith('/api/')) return route.continue();
-    if (path === '/api/auth/me') return route.fulfill({ json: { id: ownerId, username: 'session-owner', email: 'session@example.com', display_name: 'Session owner', role: 'member' } });
+    if (path === '/api/auth/me') return route.fulfill({ json: { id: ownerId, email: 'session@example.com', display_name: 'Session owner', role: 'member' } });
     if (path === '/api/auth/logout' && request.method() === 'POST') return route.fulfill({ status: 204 });
     if (path === '/api/agents' && request.method() === 'GET') return route.fulfill({ json: agents });
     if (path === '/api/sessions' && request.method() === 'GET') return route.fulfill({ json: sessions });
@@ -238,6 +239,28 @@ async function installSessionApi(page: Page, options: {
     releaseDelayedCreate
   };
 }
+
+test('Session list orders conversations by creation time from newest to oldest', async ({ page }) => {
+  const oldest = session('oldest', activeAgentId, 'Oldest Session', 'hub_native', {
+    created_at: '2026-07-17T08:00:00.000Z',
+    updated_at: '2026-07-17T14:00:00.000Z'
+  });
+  const newest = session('newest', activeAgentId, 'Newest Session', 'hub_native', {
+    created_at: '2026-07-17T12:00:00.000Z',
+    updated_at: '2026-07-17T09:00:00.000Z'
+  });
+  const middle = session('middle', activeAgentId, 'Middle Session', 'hub_native', {
+    created_at: '2026-07-17T10:00:00.000Z',
+    updated_at: '2026-07-17T13:00:00.000Z'
+  });
+  await installSessionApi(page, { initialSessions: [oldest, newest, middle] });
+
+  await page.goto('/sessions');
+
+  const rows = page.getByRole('complementary', { name: 'Session list' })
+    .locator('.session-row strong');
+  await expect(rows).toHaveText(['Newest Session', 'Middle Session', 'Oldest Session']);
+});
 
 test('Session list uses platform-first and Agent-aware navigation for new Drafts', async ({ page }) => {
   const fixture = await installSessionApi(page);
@@ -675,7 +698,7 @@ test('new conversation follows SSE active and terminal Session state without rel
   await expect(thinking).toBeVisible();
   await expect(thinking.locator('span[aria-hidden="true"]').first()).toHaveCSS('animation-name', 'session-thinking-pulse');
   await expect(detail.getByRole('button', { name: 'Stop current run' })).toBeVisible();
-  await expect(detail.getByText('Guiding the current turn.', { exact: true })).toBeVisible();
+  await expect(detail.getByText('Guiding the current turn.', { exact: true })).toHaveCount(0);
   await expect(detail.getByRole('textbox', { name: 'Message' })).toHaveAttribute('placeholder', 'Guide the active turn...');
 
   await list.getByRole('combobox', { name: 'Agent' }).selectOption(activeAgentId);
@@ -794,7 +817,7 @@ test('conversation streams replies, folds readable activity, steers, stops, and 
   await detail.getByRole('textbox', { name: 'Message' }).fill('Guide the running turn now.');
   await detail.getByRole('button', { name: 'Send' }).click();
   expect(fixture.steerBody()).toEqual({ content: 'Guide the running turn now.' });
-  await expect(detail.locator('.session-bubble small').getByText('Guiding the current turn.')).toBeVisible();
+  await expect(detail.getByText('Guiding the current turn.', { exact: true })).toHaveCount(0);
   await detail.getByRole('button', { name: 'Stop current run' }).click();
   expect(fixture.stopCount()).toBe(1);
 

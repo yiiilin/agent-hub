@@ -12,8 +12,7 @@ function uniqueSlug(context, prefix) {
 }
 
 function uniqueEmail(context, prefix) {
-  const username = uniqueSlug(context, prefix);
-  return { email: `${username}@example.com`, username };
+  return `${uniqueSlug(context, prefix)}@example.com`;
 }
 
 function sqlLiteral(value) {
@@ -29,33 +28,6 @@ async function setPolicy(client, policy) {
   return data;
 }
 
-async function manualRedirect(client, path) {
-  const headers = { accept: 'application/json' };
-  const cookie = client.cookieHeader();
-  if (cookie) headers.cookie = cookie;
-  const response = await fetch(new URL(path, client.baseURL), {
-    headers,
-    redirect: 'manual'
-  });
-  client.absorbCookies(response.headers);
-  assert.equal(response.status, 303, 'Mock OIDC step must return a manual redirect');
-  const location = response.headers.get('location');
-  assert.equal(typeof location, 'string', 'Mock OIDC step must include a redirect location');
-  return location;
-}
-
-async function oidcLogin(context, email, subject) {
-  const client = new ApiClient(context.baseURL);
-  const callbackLocation = await manualRedirect(
-    client,
-    `/api/auth/oidc/mock/start?email=${encodeURIComponent(email)}&sub=${encodeURIComponent(subject)}`,
-  );
-  await manualRedirect(client, callbackLocation);
-  assert.ok(client.cookies.size > 0, 'Mock OIDC callback must set a session cookie');
-  const { data: user } = await client.get('/api/auth/me');
-  return { client, user };
-}
-
 function bearerOptions(token, expectedStatus) {
   return {
     headers: { authorization: `Bearer ${token}` },
@@ -63,308 +35,433 @@ function bearerOptions(token, expectedStatus) {
   };
 }
 
+async function oauthToken(baseURL, form, expectedStatus = 200) {
+  const response = await fetch(new URL('/api/oauth/token', baseURL), {
+    method: 'POST',
+    headers: {
+      accept: 'application/json',
+      'content-type': 'application/x-www-form-urlencoded'
+    },
+    body: new URLSearchParams(form)
+  });
+  assert.equal(response.status, expectedStatus, `OAuth token endpoint returned ${response.status}`);
+  const text = await response.text();
+  return text ? JSON.parse(text) : null;
+}
+
+async function restoreLdapConfiguration(context, client, snapshot) {
+  if (snapshot) {
+    const { data } = await client.request('/api/admin/ldap-config', {
+      method: 'PUT',
+      body: snapshot
+    });
+    assert.deepEqual(data, snapshot, 'LDAP configuration restore response must match snapshot');
+    return;
+  }
+  context.compose.psql('DELETE FROM ldap_configuration WHERE singleton = true');
+  assert.equal(
+    context.compose.psql('SELECT count(*) FROM ldap_configuration WHERE singleton = true'),
+    '0',
+    'Scenario-owned LDAP policy fixture must be removed'
+  );
+}
+
+async function runCleanupSteps(steps) {
+  const errors = [];
+  for (const [label, cleanup] of steps) {
+    try {
+      await cleanup();
+    } catch (error) {
+      errors.push(new Error(`${label}: ${error instanceof Error ? error.message : String(error)}`));
+    }
+  }
+  if (errors.length > 0) throw new AggregateError(errors, 'Identity administration cleanup failed');
+}
+
 export default async function identityAdministrationApiScenario(context) {
   const superClient = new ApiClient(context.baseURL);
   const { data: superAdmin } = await loginAsAdmin(superClient);
   const { data: policySnapshot } = await superClient.get('/api/admin/auth-policy');
-
+  const { data: ldapSnapshot } = await superClient.get('/api/admin/ldap-config');
   const activePolicy = {
     password_registration_enabled: true,
     password_login_enabled: true,
-    email_verification_required: false
+    ldap_login_enabled: false
   };
+  let integrationAgentId = null;
 
   try {
     await setPolicy(superClient, activePolicy);
-    const { data: activeProviders } = await superClient.get('/api/auth/providers');
-    assert.equal(activeProviders.password_registration_enabled, true);
-    assert.equal(activeProviders.password_login_enabled, true);
-    assert.equal(activeProviders.email_verification_required, false);
-    assert.equal(activeProviders.oidc_mock, true);
+    const { data: providers } = await superClient.get('/api/auth/providers');
+    assert.deepEqual(providers, activePolicy);
 
-    const memberIdentity = uniqueEmail(context, 'qa-api-member');
-    const memberPassword = `${context.unique('Member password')}!Aa9`;
-    const memberSession = new ApiClient(context.baseURL);
-    const { data: registration } = await memberSession.post('/api/auth/register', {
-      email: memberIdentity.email,
-      password: memberPassword
+    const registrationEmail = uniqueEmail(context, 'qa-registration-member');
+    const registrationPassword = `${context.unique('Registration password')}!Aa9`;
+    const registrationDisplayName = context.unique('Registered Display Name');
+    const registrationClient = new ApiClient(context.baseURL);
+    const { data: registration } = await registrationClient.post('/api/auth/register', {
+      email: registrationEmail,
+      password: registrationPassword,
+      display_name: registrationDisplayName
     });
-    assert.equal(registration.user.email, memberIdentity.email);
-    assert.equal(registration.user.username, memberIdentity.username);
-    assert.equal(registration.user.role, 'member');
-    assert.equal(registration.verification_required, false);
-    assert.equal((await memberSession.get('/api/auth/me')).data.id, registration.user.id);
+    assert.deepEqual(registration.user, {
+      id: registration.user.id,
+      email: registrationEmail,
+      display_name: registrationDisplayName,
+      role: 'member'
+    });
+    assert.match(registration.user.id, UUID_PATTERN);
+    assert.deepEqual((await superClient.get('/api/admin/auth-policy')).data, activePolicy);
 
-    await memberSession.post('/api/auth/logout', undefined, { expectedStatus: 204 });
-    await memberSession.get('/api/auth/me', { expectedStatus: 401 });
-    const { data: memberLogin } = await memberSession.post('/api/auth/login', {
-      email: memberIdentity.email,
-      password: memberPassword
+    const selfDisplayName = context.unique('Self-managed Display Name');
+    const { data: selfUpdated } = await registrationClient.request('/api/users/me', {
+      method: 'PATCH',
+      body: { display_name: selfDisplayName }
     });
-    assert.equal(memberLogin.user.id, registration.user.id);
-    assert.equal((await memberSession.get('/api/auth/me')).data.id, registration.user.id);
+    assert.equal(selfUpdated.display_name, selfDisplayName);
+    assert.equal(selfUpdated.email, registrationEmail);
 
-    await setPolicy(superClient, {
-      ...activePolicy,
-      password_registration_enabled: false
+    await registrationClient.post('/api/auth/logout', undefined, { expectedStatus: 204 });
+    await registrationClient.get('/api/auth/me', { expectedStatus: 401 });
+    const { data: registrationLogin } = await registrationClient.post('/api/auth/login', {
+      email: registrationEmail,
+      password: registrationPassword
     });
-    const blockedRegistration = uniqueEmail(context, 'qa-api-blocked-registration');
+    assert.equal(registrationLogin.user.id, registration.user.id);
+
+    const registrationDisabled = { ...activePolicy, password_registration_enabled: false };
+    await setPolicy(superClient, registrationDisabled);
     await new ApiClient(context.baseURL).post('/api/auth/register', {
-      email: blockedRegistration.email,
+      email: uniqueEmail(context, 'qa-registration-disabled'),
       password: `${context.unique('Blocked registration password')}!Aa9`
     }, { expectedStatus: 403 });
+    await superClient.request('/api/admin/auth-policy', {
+      method: 'PATCH',
+      body: {
+        password_registration_enabled: true,
+        password_login_enabled: false,
+        ldap_login_enabled: true
+      },
+      expectedStatus: 409
+    });
+    await superClient.request('/api/admin/auth-policy', {
+      method: 'PATCH',
+      body: {
+        password_registration_enabled: false,
+        password_login_enabled: false,
+        ldap_login_enabled: false
+      },
+      expectedStatus: 409
+    });
+    assert.deepEqual((await superClient.get('/api/admin/auth-policy')).data, registrationDisabled);
 
+    if (!ldapSnapshot) {
+      await superClient.request('/api/admin/auth-policy', {
+        method: 'PATCH',
+        body: {
+          password_registration_enabled: false,
+          password_login_enabled: true,
+          ldap_login_enabled: true
+        },
+        expectedStatus: 409
+      });
+    }
+    const policyOnlyLdapConfiguration = {
+      url: 'ldap://127.0.0.1:1',
+      security: 'plain',
+      base_dn: 'ou=people,dc=example,dc=test',
+      bind_identity_template: '{email}',
+      user_filter: '(mail={email})',
+      email_attribute: 'mail',
+      display_name_attribute: 'displayName',
+      allow_insecure: true,
+      skip_tls_verify: false
+    };
+    await superClient.request('/api/admin/ldap-config', {
+      method: 'PUT',
+      body: policyOnlyLdapConfiguration
+    });
+    await superClient.post('/api/admin/ldap-config/test', {
+      configuration: {
+        ...policyOnlyLdapConfiguration,
+        bind_identity_template: 'uid=missing-placeholder,ou=people,dc=example,dc=test'
+      },
+      email: superAdmin.email,
+      password: 'one-time-validation-only'
+    }, { expectedStatus: 400 });
     await setPolicy(superClient, {
-      ...activePolicy,
-      password_login_enabled: false
+      password_registration_enabled: false,
+      password_login_enabled: false,
+      ldap_login_enabled: true
     });
     await new ApiClient(context.baseURL).post('/api/auth/login', {
-      email: memberIdentity.email,
-      password: memberPassword
+      email: registrationEmail,
+      password: registrationPassword
     }, { expectedStatus: 403 });
-
-    await setPolicy(superClient, {
-      ...activePolicy,
-      email_verification_required: true
+    const emergencyClient = new ApiClient(context.baseURL);
+    const { data: emergencyLogin } = await emergencyClient.post('/api/auth/login', {
+      email: superAdmin.email,
+      password: 'admin123'
     });
-    const verificationIdentity = uniqueEmail(context, 'qa-api-verification');
-    const verificationClient = new ApiClient(context.baseURL);
-    const { data: verificationRegistration } = await verificationClient.post('/api/auth/register', {
-      email: verificationIdentity.email,
-      password: `${context.unique('Verification password')}!Aa9`
-    });
-    assert.equal(verificationRegistration.verification_required, true);
-    assert.equal(verificationRegistration.user.email, verificationIdentity.email);
-    assert.equal(verificationRegistration.user.username, verificationIdentity.username);
-    await verificationClient.get('/api/auth/me', { expectedStatus: 401 });
+    assert.equal(emergencyLogin.user.id, superAdmin.id);
+    assert.equal(emergencyLogin.user.role, 'super_admin');
     await setPolicy(superClient, activePolicy);
 
-    const oidcIdentity = uniqueEmail(context, 'qa-api-oidc');
-    const oidcSubject = context.unique('qa-api-oidc-subject');
-    const firstOidc = await oidcLogin(context, oidcIdentity.email, oidcSubject);
-    assert.equal(firstOidc.user.email, oidcIdentity.email);
-    const firstBinding = context.compose.psql(`
-      SELECT id || '|' || platform_id || '|' || authentication_channel_id
-      FROM external_identities
-      WHERE user_id = ${sqlLiteral(firstOidc.user.id)}
-        AND external_user_id = ${sqlLiteral(oidcSubject)}
-    `);
-    assert.match(firstBinding, new RegExp(`^${UUID_PATTERN.source.slice(1, -1)}\\|${UUID_PATTERN.source.slice(1, -1)}\\|${UUID_PATTERN.source.slice(1, -1)}$`));
-
-    const secondOidc = await oidcLogin(context, oidcIdentity.email, oidcSubject);
-    assert.equal(secondOidc.user.id, firstOidc.user.id);
-    const secondBinding = context.compose.psql(`
-      SELECT id || '|' || platform_id || '|' || authentication_channel_id
-      FROM external_identities
-      WHERE user_id = ${sqlLiteral(secondOidc.user.id)}
-        AND external_user_id = ${sqlLiteral(oidcSubject)}
-    `);
-    assert.equal(secondBinding, firstBinding, 'Repeated Mock OIDC login must keep one stable binding');
-
-    const platformKey = uniqueSlug(context, 'qa-api-platform');
-    const platformName = context.unique('QA API Platform');
-    const { data: platform } = await superClient.post('/api/admin/external-platforms', {
-      key: platformKey,
-      name: platformName
+    const administratorEmail = uniqueEmail(context, 'qa-created-administrator');
+    const administratorPassword = `${context.unique('Administrator password')}!Bb8`;
+    const { data: administratorDetail } = await superClient.post('/api/admin/users', {
+      email: administratorEmail,
+      display_name: context.unique('Created Administrator'),
+      password: administratorPassword,
+      role: 'admin'
     });
-    assert.match(platform.id, UUID_PATTERN);
-    assert.equal(platform.key, platformKey);
-    const { data: listedPlatforms } = await superClient.get('/api/admin/external-platforms');
-    assert.equal(listedPlatforms.find((item) => item.id === platform.id)?.key, platformKey);
+    assert.equal(administratorDetail.user.role, 'admin');
+    assert.equal(administratorDetail.has_password, true);
+    const administratorClient = new ApiClient(context.baseURL);
+    assert.equal((await administratorClient.post('/api/auth/login', {
+      email: administratorEmail,
+      password: administratorPassword
+    })).data.user.id, administratorDetail.user.id);
 
-    const updatedPlatformName = context.unique('QA API Platform Updated');
-    const { data: updatedPlatform } = await superClient.request(
-      `/api/admin/external-platforms/${platform.id}`,
-      { method: 'PATCH', body: { name: updatedPlatformName } }
-    );
-    assert.equal(updatedPlatform.id, platform.id);
-    assert.equal(updatedPlatform.key, platformKey);
-    assert.equal(updatedPlatform.name, updatedPlatformName);
-
-    const channelKey = uniqueSlug(context, 'qa-api-channel');
-    const channelName = context.unique('QA API Channel');
-    const { data: channel } = await superClient.post(
-      `/api/admin/external-platforms/${platform.id}/authentication-channels`,
-      { key: channelKey, name: channelName, enabled: false, trusted_email: false }
-    );
-    assert.match(channel.id, UUID_PATTERN);
-    assert.equal(channel.platform_id, platform.id);
-    assert.equal(channel.key, channelKey);
-    assert.equal(channel.enabled, false);
-    assert.equal(channel.trusted_email, false);
-    const { data: initialChannels } = await superClient.get(
-      `/api/admin/external-platforms/${platform.id}/authentication-channels`
-    );
-    const initialChannel = initialChannels.find((item) => item.id === channel.id);
-    assert.equal(initialChannel?.key, channelKey);
-    assert.equal(initialChannel?.enabled, false);
-    assert.equal(initialChannel?.trusted_email, false);
-
-    const updatedChannelName = context.unique('QA API Channel Updated');
-    const { data: updatedChannel } = await superClient.request(
-      `/api/admin/authentication-channels/${channel.id}`,
-      {
-        method: 'PATCH',
-        body: { name: updatedChannelName, enabled: true, trusted_email: true }
-      }
-    );
-    assert.equal(updatedChannel.id, channel.id);
-    assert.equal(updatedChannel.key, channelKey);
-    assert.equal(updatedChannel.name, updatedChannelName);
-    assert.equal(updatedChannel.enabled, true);
-    assert.equal(updatedChannel.trusted_email, true);
-    const { data: persistedChannels } = await superClient.get(
-      `/api/admin/external-platforms/${platform.id}/authentication-channels`
-    );
-    const persistedChannel = persistedChannels.find((item) => item.id === channel.id);
-    assert.equal(persistedChannel?.key, channelKey);
-    assert.equal(persistedChannel?.enabled, true);
-    assert.equal(persistedChannel?.trusted_email, true);
-
-    const keyName = context.unique('QA API Key');
-    const keyCreatedAfter = Date.now();
-    const { data: createdKey } = await memberSession.post('/api/auth/api-keys', {
-      name: keyName,
-      validity: { kind: 'days', days: 180 }
+    const managedEmail = uniqueEmail(context, 'qa-admin-created-member');
+    const managedPassword = `${context.unique('Managed member password')}!Cc7`;
+    const { data: managedDetail } = await administratorClient.post('/api/admin/users', {
+      email: managedEmail,
+      display_name: context.unique('Admin-created Member'),
+      password: managedPassword,
+      role: 'member'
     });
-    const apiKey = createdKey.api_key;
-    const token = createdKey.token;
-    assert.match(apiKey.id, UUID_PATTERN);
-    assert.equal(API_KEY_PATTERN.test(token), true, 'Created API key must have the expected format');
-    assert.equal(token.startsWith(apiKey.prefix), true, 'Created API key prefix must match its token');
-    const expirationDays = (new Date(apiKey.expires_at).getTime() - keyCreatedAfter) / 86_400_000;
-    assert.ok(expirationDays > 179.9 && expirationDays <= 180.1, 'API key must use the explicit 180-day validity');
-
-    const { data: keyList } = await memberSession.get('/api/auth/api-keys?page=1&page_size=100');
-    const listedKey = keyList.items.find((item) => item.id === apiKey.id);
-    assert.equal(listedKey?.prefix, apiKey.prefix);
-    assert.equal(Object.hasOwn(listedKey ?? {}, 'token'), false, 'API key list must not expose a token field');
-    assert.equal(JSON.stringify(keyList).includes(token), false, 'API key plaintext must not reappear in list responses');
+    assert.equal(managedDetail.user.role, 'member');
+    await administratorClient.post('/api/admin/users', {
+      email: uniqueEmail(context, 'qa-admin-forbidden-admin'),
+      role: 'admin'
+    }, { expectedStatus: 403 });
     assert.equal(
-      context.compose.psql(`SELECT count(*) FROM api_keys WHERE id = ${sqlLiteral(apiKey.id)} AND token_hash <> ''`),
-      '1'
+      (await administratorClient.get('/api/admin/users')).data.some(
+        (detail) => detail.user.id === superAdmin.id
+      ),
+      false
     );
-
-    const keyClient = new ApiClient(context.baseURL);
-    assert.equal((await keyClient.get('/api/auth/me', bearerOptions(token))).data.id, registration.user.id);
-    const laterExpiration = new Date(new Date(apiKey.expires_at).getTime() + 90 * 86_400_000).toISOString();
-    await keyClient.post(
-      `/api/auth/api-keys/${apiKey.id}/renew`,
-      { validity: { kind: 'date', expires_at: laterExpiration } },
-      bearerOptions(token, 404)
-    );
-    await keyClient.delete(`/api/auth/api-keys/${apiKey.id}`, bearerOptions(token, 404));
-
-    const { data: renewedKey } = await memberSession.post(
-      `/api/auth/api-keys/${apiKey.id}/renew`,
-      { validity: { kind: 'date', expires_at: laterExpiration } }
-    );
-    assert.equal(renewedKey.id, apiKey.id);
-    assert.equal(renewedKey.prefix, apiKey.prefix);
-    assert.equal(renewedKey.expires_at, laterExpiration);
-    assert.equal(Object.hasOwn(renewedKey, 'token'), false, 'Renewal must not return API key plaintext');
-    assert.equal((await keyClient.get('/api/auth/me', bearerOptions(token))).data.id, registration.user.id);
-
-    const { data: memberDetail } = await superClient.get(`/api/admin/users/${registration.user.id}`);
-    assert.equal(memberDetail.user.id, registration.user.id);
-    assert.equal(memberDetail.user.role, 'member');
-    assert.equal(memberDetail.has_password, true);
-
-    const { data: promoted } = await superClient.request(`/api/admin/users/${registration.user.id}/role`, {
+    await administratorClient.get(`/api/admin/users/${superAdmin.id}`, { expectedStatus: 404 });
+    await administratorClient.request(`/api/admin/users/${managedDetail.user.id}/role`, {
       method: 'PUT',
-      body: { role: 'admin' }
-    });
-    assert.equal(promoted.user.role, 'admin');
-
-    const adminClient = new ApiClient(context.baseURL);
-    const { data: promotedLogin } = await adminClient.post('/api/auth/login', {
-      email: memberIdentity.email,
-      password: memberPassword
-    });
-    assert.equal(promotedLogin.user.role, 'admin');
-    const { data: adminVisibleUsers } = await adminClient.get('/api/admin/users');
-    assert.equal(adminVisibleUsers.some((detail) => detail.user.id === superAdmin.id), false);
-    await adminClient.get(`/api/admin/users/${superAdmin.id}`, { expectedStatus: 404 });
-    await adminClient.request(`/api/admin/users/${superAdmin.id}/password`, {
-      method: 'PUT',
-      body: { password: `${context.unique('Forbidden super password')}!Aa9` },
-      expectedStatus: 404
-    });
-    await adminClient.request(`/api/admin/users/${superAdmin.id}/role`, {
-      method: 'PUT',
-      body: { role: 'member' },
+      body: { role: 'admin' },
       expectedStatus: 403
     });
 
+    const managedSession = new ApiClient(context.baseURL);
+    await managedSession.post('/api/auth/login', { email: managedEmail, password: managedPassword });
+    const managedSelfName = context.unique('Managed Self Display Name');
+    assert.equal((await managedSession.request('/api/users/me', {
+      method: 'PATCH',
+      body: { display_name: managedSelfName }
+    })).data.display_name, managedSelfName);
+
+    const { data: createdKey } = await managedSession.post('/api/auth/api-keys', {
+      name: context.unique('Managed retained API key'),
+      validity: { kind: 'days', days: 180 }
+    });
+    assert.match(createdKey.api_key.id, UUID_PATTERN);
+    assert.equal(API_KEY_PATTERN.test(createdKey.token), true);
+    const keyClient = new ApiClient(context.baseURL);
+    assert.equal(
+      (await keyClient.get('/api/auth/me', bearerOptions(createdKey.token))).data.id,
+      managedDetail.user.id
+    );
+
+    await superClient.request(`/api/admin/users/${managedDetail.user.id}`, {
+      method: 'PATCH',
+      body: { email: registrationEmail, display_name: managedSelfName },
+      expectedStatus: 409
+    });
+    assert.equal((await managedSession.get('/api/auth/me')).data.id, managedDetail.user.id);
+
+    const updatedManagedEmail = uniqueEmail(context, 'qa-updated-managed-member');
+    const updatedManagedDisplayName = context.unique('Updated Managed Display Name');
+    const { data: updatedManaged } = await superClient.request(
+      `/api/admin/users/${managedDetail.user.id}`,
+      {
+        method: 'PATCH',
+        body: { email: updatedManagedEmail, display_name: updatedManagedDisplayName }
+      }
+    );
+    assert.equal(updatedManaged.user.email, updatedManagedEmail);
+    assert.equal(updatedManaged.user.display_name, updatedManagedDisplayName);
+    await managedSession.get('/api/auth/me', { expectedStatus: 401 });
+    assert.equal(
+      (await keyClient.get('/api/auth/me', bearerOptions(createdKey.token))).data.id,
+      managedDetail.user.id,
+      'Email changes must retain API keys'
+    );
+    await new ApiClient(context.baseURL).post('/api/auth/login', {
+      email: managedEmail,
+      password: managedPassword
+    }, { expectedStatus: 401 });
+    const managedReplacementSession = new ApiClient(context.baseURL);
+    await managedReplacementSession.post('/api/auth/login', {
+      email: updatedManagedEmail,
+      password: managedPassword
+    });
+
+    const { data: promotedManaged } = await superClient.request(
+      `/api/admin/users/${managedDetail.user.id}/role`,
+      { method: 'PUT', body: { role: 'admin' } }
+    );
+    assert.equal(promotedManaged.user.role, 'admin');
     await superClient.request(`/api/admin/users/${superAdmin.id}/role`, {
       method: 'PUT',
       body: { role: 'admin' },
       expectedStatus: 409
     });
-    assert.equal((await superClient.get(`/api/admin/users/${superAdmin.id}`)).data.user.role, 'super_admin');
+    assert.equal(
+      (await superClient.get(`/api/admin/users/${superAdmin.id}`)).data.user.role,
+      'super_admin'
+    );
 
-    const { data: demoted } = await superClient.request(`/api/admin/users/${registration.user.id}/role`, {
-      method: 'PUT',
-      body: { role: 'member' }
-    });
-    assert.equal(demoted.user.role, 'member');
-
-    const replacementPassword = `${context.unique('Replacement password')}!Aa9`;
+    const replacementPassword = `${context.unique('Replacement managed password')}!Dd6`;
     const { data: passwordUpdated } = await superClient.request(
-      `/api/admin/users/${registration.user.id}/password`,
+      `/api/admin/users/${managedDetail.user.id}/password`,
       { method: 'PUT', body: { password: replacementPassword } }
     );
-    assert.equal(passwordUpdated.user.id, registration.user.id);
     assert.equal(passwordUpdated.has_password, true);
-    await memberSession.get('/api/auth/me', { expectedStatus: 401 });
-    await adminClient.get('/api/auth/me', { expectedStatus: 401 });
-    assert.equal((await keyClient.get('/api/auth/me', bearerOptions(token))).data.id, registration.user.id);
-    await new ApiClient(context.baseURL).post('/api/auth/login', {
-      email: memberIdentity.email,
-      password: memberPassword
-    }, { expectedStatus: 401 });
-
-    const replacementSession = new ApiClient(context.baseURL);
-    const { data: replacementLogin } = await replacementSession.post('/api/auth/login', {
-      email: memberIdentity.email,
-      password: replacementPassword
-    });
-    assert.equal(replacementLogin.user.id, registration.user.id);
-    await replacementSession.delete(`/api/auth/api-keys/${apiKey.id}`, { expectedStatus: 204 });
-    await keyClient.get('/api/auth/me', bearerOptions(token, 401));
-    const { data: keysAfterDelete } = await replacementSession.get('/api/auth/api-keys?page=1&page_size=100');
-    assert.equal(keysAfterDelete.items.some((item) => item.id === apiKey.id), false);
+    await managedReplacementSession.get('/api/auth/me', { expectedStatus: 401 });
     assert.equal(
-      context.compose.psql(`SELECT count(*) FROM api_keys WHERE id = ${sqlLiteral(apiKey.id)}`),
-      '0'
+      (await keyClient.get('/api/auth/me', bearerOptions(createdKey.token))).data.id,
+      managedDetail.user.id,
+      'Password changes must retain API keys'
+    );
+    await new ApiClient(context.baseURL).post('/api/auth/login', {
+      email: updatedManagedEmail,
+      password: managedPassword
+    }, { expectedStatus: 401 });
+    const replacementSession = new ApiClient(context.baseURL);
+    assert.equal((await replacementSession.post('/api/auth/login', {
+      email: updatedManagedEmail,
+      password: replacementPassword
+    })).data.user.id, managedDetail.user.id);
+    await replacementSession.delete(`/api/auth/api-keys/${createdKey.api_key.id}`, {
+      expectedStatus: 204
+    });
+    await keyClient.get('/api/auth/me', bearerOptions(createdKey.token, 401));
+
+    const platformKey = uniqueSlug(context, 'qa-trusted-email-platform');
+    const { data: platform } = await superClient.post('/api/admin/external-platforms', {
+      key: platformKey,
+      name: context.unique('QA Trusted Email Platform')
+    });
+    const { data: channel } = await superClient.post(
+      `/api/admin/external-platforms/${platform.id}/authentication-channels`,
+      {
+        key: uniqueSlug(context, 'qa-trusted-email-channel'),
+        name: context.unique('QA Trusted Email Channel'),
+        enabled: true,
+        trusted_email: true
+      }
+    );
+    const { data: integrationAgent } = await superClient.post('/api/agents', {
+      name: context.unique('QA Trusted Email Agent'),
+      instructions: 'Validate trusted email identity binding.',
+      visibility: 'private',
+      public_to: []
+    });
+    integrationAgentId = integrationAgent.id;
+    const { data: appSecret } = await superClient.post('/api/integration-apps', {
+      name: context.unique('QA Trusted Email App'),
+      external_platform_id: platform.id,
+      authentication_channel_id: channel.id,
+      redirect_uris: [new URL('/qa/trusted-email-callback', context.baseURL).href],
+      agent_ids: [integrationAgent.id]
+    });
+    const appToken = await oauthToken(context.baseURL, {
+      grant_type: 'client_credentials',
+      client_id: appSecret.integration_app.client_id,
+      client_secret: appSecret.client_secret,
+      scope: `agent:${integrationAgent.id}`
+    });
+    const externalUserId = uniqueSlug(context, 'qa-external-user');
+    const externalUsername = context.unique('External profile username');
+    const integrationBody = {
+      agent_id: integrationAgent.id,
+      external_user_id: externalUserId,
+      tenant_id: 'qa-trusted-email',
+      username: externalUsername,
+      display_name: context.unique('External Profile Display Name'),
+      tools: [],
+      metadata: { source: 'qa-trusted-email' }
+    };
+    await new ApiClient(context.baseURL).post(
+      '/api/integrations/sessions',
+      integrationBody,
+      bearerOptions(appToken.access_token, 400)
+    );
+    await new ApiClient(context.baseURL).post(
+      '/api/integrations/sessions',
+      { ...integrationBody, email: 'not-an-email' },
+      bearerOptions(appToken.access_token, 400)
+    );
+    const { data: integrationSession } = await new ApiClient(context.baseURL).post(
+      '/api/integrations/sessions',
+      { ...integrationBody, email: registrationEmail },
+      bearerOptions(appToken.access_token)
+    );
+    assert.match(integrationSession.external_identity_id, UUID_PATTERN);
+    assert.equal(
+      context.compose.psql(`
+        SELECT user_id || '|' || last_username
+        FROM external_identities
+        WHERE id = ${sqlLiteral(integrationSession.external_identity_id)}
+      `),
+      `${registration.user.id}|${externalUsername}`,
+      'Trusted Integration email must bind the existing Hub user while retaining external username profile data'
     );
 
     await superClient.post(
-      `/api/admin/users/${registration.user.id}/erase`,
-      { username: `${memberIdentity.username}-wrong` },
+      `/api/admin/users/${managedDetail.user.id}/erase`,
+      { email: `${updatedManagedEmail}.wrong` },
       { expectedStatus: 409 }
     );
     const { data: erasure } = await superClient.post(
-      `/api/admin/users/${registration.user.id}/erase`,
-      { username: memberIdentity.username },
+      `/api/admin/users/${managedDetail.user.id}/erase`,
+      { email: updatedManagedEmail },
       { expectedStatus: 202 }
     );
-    assert.equal(erasure.user_id, registration.user.id);
+    assert.equal(erasure.user_id, managedDetail.user.id);
+    if (erasure.email !== null) assert.equal(erasure.email, updatedManagedEmail);
     const completedErasure = await poll(async () => {
       const { data: history } = await superClient.get('/api/admin/user-erasures');
-      return history.find((item) => item.user_id === registration.user.id) ?? null;
+      return history.find((item) => item.user_id === managedDetail.user.id) ?? null;
     }, (item) => item?.status === 'completed', {
       timeoutMs: 45_000,
-      description: 'unique member erasure to complete'
+      description: 'email-confirmed managed user erasure to complete'
     });
-    assert.equal(completedErasure.user_id, registration.user.id);
-    assert.equal(completedErasure.status, 'completed');
+    assert.equal(completedErasure.email, null, 'Completed erasure history must not retain the email');
     assert.ok(completedErasure.completed_at);
-    await superClient.get(`/api/admin/users/${registration.user.id}`, { expectedStatus: 404 });
+    await superClient.get(`/api/admin/users/${managedDetail.user.id}`, { expectedStatus: 404 });
   } finally {
-    const restored = await setPolicy(superClient, policySnapshot);
-    assert.deepEqual(restored, policySnapshot);
-    const { data: persistedPolicy } = await superClient.get('/api/admin/auth-policy');
-    assert.deepEqual(persistedPolicy, policySnapshot);
+    const authRestores = ldapSnapshot
+      ? [
+          ['restore LDAP configuration', () => restoreLdapConfiguration(context, superClient, ldapSnapshot)],
+          ['restore authentication policy', () => setPolicy(superClient, policySnapshot)]
+        ]
+      : [
+          ['restore authentication policy', () => setPolicy(superClient, policySnapshot)],
+          ['remove scenario LDAP configuration', () => restoreLdapConfiguration(context, superClient, null)]
+        ];
+    await runCleanupSteps([
+      ...(integrationAgentId
+        ? [[
+            'delete trusted-email integration Agent',
+            () => superClient.delete(`/api/agents/${integrationAgentId}`, { expectedStatus: [204, 404] })
+          ]]
+        : []),
+      ...authRestores,
+      [
+        'verify restored authentication state',
+        async () => {
+          assert.deepEqual((await superClient.get('/api/admin/auth-policy')).data, policySnapshot);
+          assert.deepEqual((await superClient.get('/api/admin/ldap-config')).data, ldapSnapshot);
+        }
+      ]
+    ]);
   }
 }

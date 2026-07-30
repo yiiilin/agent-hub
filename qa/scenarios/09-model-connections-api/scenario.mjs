@@ -1,5 +1,11 @@
 import assert from 'node:assert/strict';
-import { ApiClient, loginAsAdmin, poll, waitForRunStatus } from '../../support/api.mjs';
+import {
+  ApiClient,
+  loginAsAdmin,
+  poll,
+  provisionLocalUser,
+  waitForRunStatus
+} from '../../support/api.mjs';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const PROVIDER_BASE_URL = 'http://fake-model-provider:8080';
@@ -79,30 +85,6 @@ function assertSecretAbsent(value, label) {
   assert.equal(serialized.includes('"api_key"'), false, `${label} must not expose an api_key field`);
 }
 
-async function manualRedirect(client, path) {
-  const headers = { accept: 'application/json' };
-  const cookie = client.cookieHeader();
-  if (cookie) headers.cookie = cookie;
-  const response = await fetch(new URL(path, client.baseURL), { headers, redirect: 'manual' });
-  client.absorbCookies(response.headers);
-  assert.equal(response.status, 303, 'Mock OIDC step must redirect');
-  const location = response.headers.get('location');
-  assert.equal(typeof location, 'string', 'Mock OIDC redirect must include a location');
-  return location;
-}
-
-async function oidcLogin(context, prefix) {
-  const subject = uniqueSlug(context, prefix);
-  const client = new ApiClient(context.baseURL);
-  const callback = await manualRedirect(
-    client,
-    `/api/auth/oidc/mock/start?email=${encodeURIComponent(`${subject}@example.com`)}&sub=${encodeURIComponent(subject)}`
-  );
-  await manualRedirect(client, callback);
-  const { data: user } = await client.get('/api/auth/me');
-  return { client, user };
-}
-
 async function waitForLedgerItems(client, path, filters, count) {
   return poll(async () => {
     const { data } = await client.get(ledgerPath(path, { ...filters, page_size: 100 }));
@@ -164,9 +146,9 @@ export default async function modelConnectionsApiScenario(context) {
   };
 
   try {
-    const administrator = await oidcLogin(context, 'qa-model-administrator');
-    const owner = await oidcLogin(context, 'qa-model-owner');
-    const outsider = await oidcLogin(context, 'qa-model-outsider');
+    const administrator = await provisionLocalUser(superClient, context, 'qa-model-administrator');
+    const owner = await provisionLocalUser(superClient, context, 'qa-model-owner');
+    const outsider = await provisionLocalUser(superClient, context, 'qa-model-outsider');
     promotedAdminId = administrator.user.id;
     const { data: promoted } = await superClient.request(
       `/api/admin/users/${administrator.user.id}/role`,

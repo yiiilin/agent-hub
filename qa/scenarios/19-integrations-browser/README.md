@@ -4,9 +4,10 @@ Type: `browser`
 
 Uses the real console, backend, PostgreSQL, and authenticated public APIs. The
 fixture Super Administrator creates a unique enabled, trusted External Platform
-and Authentication Channel, then promotes a unique Mock OIDC owner to
-Administrator. That owner starts with no Integration Apps and creates three
-scenario-owned Agents through the browser session.
+and Authentication Channel, then provisions a distinct Local Password
+Administrator through `POST /api/admin/users`. That owner starts with no
+Integration Apps and creates three scenario-owned Agents through its independent
+browser session.
 
 For IAP-001, the scenario verifies the empty state and table-first management
 surface, then creates an Integration App through the UI with the trusted origin,

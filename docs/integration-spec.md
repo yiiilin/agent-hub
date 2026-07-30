@@ -14,12 +14,12 @@
 2. 应用管理者可关联自己当前 `can_invoke` 的多个 Agent；关联即向应用委托该 Agent 权限。
 3. 应用支持 OAuth `client_credentials` 和 `authorization_code` grant。Application Token 只能访问 `/api/integrations/*`、`/api/oauth/userinfo` 和允许的 Client Access Credential 签发入口，不能进入 Hub 控制面。
 4. Agent scope 固定为 `agent:<uuid>`，请求的 scope 必须合法、已关联且在每次使用时仍然有效；Agent scope 没有默认值。
-5. `authorization_code` token 代表登录 Hub User；`client_credentials` token 代表应用。两者创建的 External Session 都固定保存自己的 External Platform、Tenant 和 External Identity origin。
+5. `authorization_code` token 代表已绑定的 Hub User；`client_credentials` token 代表应用。后者创建 External Session 时必须提交可信合法邮箱以及可选展示名和 external username，用于关联或创建 Hub User；前者复用 Token 已绑定用户，不重复要求邮箱。两者创建的 External Session 都固定保存自己的 External Platform、Tenant 和 External Identity origin。
 6. 解除 Agent 关联、应用管理者失去 `can_invoke`、用户失去 Agent 权限或 Agent 被删除时，已签发凭证不能发起新的 Agent 操作。
 
 ### Client Access Credential
 
-7. 有后端的应用在用户登录授权时，以 `client_id`/`client_secret`、可信外部用户资料、明确的 `agent_id`、浏览器提供的 `client_instance_id` 和完整 Client Tool 定义向 Hub 申请 Client Access Credential。`client_secret` 永不进入浏览器。
+7. 有后端的应用在用户登录授权时，以 `client_id`/`client_secret`、包含必填合法邮箱的可信外部用户资料、明确的 `agent_id`、浏览器提供的 `client_instance_id` 和完整 Client Tool 定义向 Hub 申请 Client Access Credential。external username 与展示名可选，`client_secret` 永不进入浏览器。
 8. Client Access Credential 是 15 分钟有效的随机 opaque Token。Hub 只保存其 hash，并在现有 credential 记录的 JSON 字段中保存工具定义；Token 不使用 JWT，也不携带工具 Schema。Hub 重启不使其失效。
 9. Credential 固定绑定 Integration App、Agent、External Platform、External Tenant、External Identity、Hub User 和一个 Client Instance，但不绑定单个 Session。一张有效凭证可同时操作其完整 scope 下的多个 Session。
 10. Client Instance 以浏览器标签页为单位。SDK 用 `sessionStorage` 保存其随机 ID，使当前标签页刷新后保持不变；并用 `BroadcastChannel` 探测 `window.open` 克隆出的仍在使用的 ID，为新 JS realm 重新生成 ID。同一标签页中的多个 SDK Client 共享该 ID，新标签页获得独立 ID 和独立凭证。相同 Client Instance 的续期或重新授权原子替换旧 Token，不影响其他标签页。
@@ -82,6 +82,7 @@
 
 - 管理台 Integration App 表单可维护匿名 Client Tool 定义；普通成员不能启用匿名访问，匿名应用缺少 Agent、Origin 或合法工具定义时保存失败。
 - 应用后端可为可信外部用户和 Client Instance 签发带动态工具集合的 Credential；浏览器无法使用 `client_secret` 或自行扩大工具集合。
+- 认证 Client Access 和 `client_credentials` External Session 缺少合法邮箱时失败；`authorization_code` 继续使用其已绑定 Hub User，匿名应用不创建 Hub User。
 - 同一用户两个标签页获得不同 Client Instance 和 Token，可并发访问同一 Session；一个标签页续期不使另一个失效。
 - 一张 Credential 可访问 scope 匹配的多个 Session；不同 App、Agent、Platform、Tenant、Identity 或匿名 visitor 不能越权。
 - 首条消息前不创建 Session；消息不确定重试不会双写；活动 Turn 中的下一条消息立即 steer 而不创建并行 Turn。
@@ -94,7 +95,7 @@
 
 ## 测试计划
 
-- Rust 单元与数据库测试：工具定义校验、Credential scope/轮换、Client Instance 隔离、Origin 策略、Run Snapshot、claim 状态机、批量结果、幂等冲突、超时和历史保留。
+- Rust 单元与数据库测试：可信邮箱要求与绑定、工具定义校验、Credential scope/轮换、Client Instance 隔离、Origin 策略、Run Snapshot、claim 状态机、批量结果、幂等冲突、超时和历史保留。
 - Runtime/Pi：隐藏名称映射、多工具批次、结构化成功/失败结果、单 continuation、旧 Snapshot 和 Native Session 延续。
 - SDK：认证/匿名初始化、内存 Token、标签页 ID、IndexedDB journal、发送幂等、SSE 续传、续期 fallback、串行工具、缺失 handler、断线和清理。
 - Browser：Integration App Client Tool CRUD、认证与匿名 Widget、两个标签页、history on/off、两轮对话、Client Tool 技术事件、desktop 和 390px、console/network diagnostics。

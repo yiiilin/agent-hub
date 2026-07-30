@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { ApiClient, loginAsAdmin, poll } from '../../support/api.mjs';
+import { ApiClient, loginAsAdmin, poll, provisionLocalUser } from '../../support/api.mjs';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
@@ -63,24 +63,6 @@ async function manualRedirect(client, path, expectedStatus = 303) {
   client.absorbCookies(response.headers);
   assert.equal(response.status, expectedStatus, `Manual redirect returned ${response.status}`);
   return response.headers.get('location');
-}
-
-async function bindMockIdentity(client, email, subject) {
-  const callback = await manualRedirect(
-    client,
-    `/api/auth/oidc/mock/start?email=${encodeURIComponent(email)}&sub=${encodeURIComponent(subject)}`
-  );
-  assert.equal(typeof callback, 'string', 'Mock OIDC start must return a callback');
-  await manualRedirect(client, callback);
-  return (await client.get('/api/auth/me')).data;
-}
-
-async function oidcLogin(context, prefix) {
-  const subject = uniqueSlug(context, prefix);
-  const email = `${subject}@example.com`;
-  const client = new ApiClient(context.baseURL);
-  const user = await bindMockIdentity(client, email, subject);
-  return { client, user, email, subject };
 }
 
 function authorizationPath({ clientId, redirectUri, externalUserId, tenantId, scope, state }) {
@@ -246,7 +228,6 @@ export default async function integrationsOauthApiScenario(context) {
   const { data: owner } = await loginAsAdmin(ownerClient);
   const externalUserId = uniqueSlug(context, 'qa-integration-owner');
   const tenantId = 'default';
-  await bindMockIdentity(ownerClient, owner.email, externalUserId);
 
   const agentIds = [];
   let primaryAgent = null;
@@ -263,15 +244,19 @@ export default async function integrationsOauthApiScenario(context) {
   const cleanupErrors = [];
 
   try {
-    const { data: options } = await ownerClient.get('/api/integration-app-options');
-    const mockPlatform = options.external_platforms.find((platform) => (
-      platform.key.toLowerCase().includes('mock') || platform.name.toLowerCase().includes('mock')
-    ));
-    assert.ok(mockPlatform, 'Mock OIDC platform must be available');
-    const mockChannel = options.authentication_channels.find((channel) => (
-      channel.platform_id === mockPlatform.id && channel.enabled && channel.trusted_email
-    ));
-    assert.ok(mockChannel, 'Mock OIDC trusted channel must be available');
+    const { data: trustedPlatform } = await ownerClient.post('/api/admin/external-platforms', {
+      key: uniqueSlug(context, 'qa-integration-platform'),
+      name: context.unique('QA Integration Platform')
+    });
+    const { data: trustedChannel } = await ownerClient.post(
+      `/api/admin/external-platforms/${trustedPlatform.id}/authentication-channels`,
+      {
+        key: uniqueSlug(context, 'qa-integration-channel'),
+        name: context.unique('QA Integration Trusted Channel'),
+        enabled: true,
+        trusted_email: true
+      }
+    );
 
     const modelFixture = await createComposeModelFixture(ownerClient, context);
     modelConnectionId = modelFixture.connectionId;
@@ -299,8 +284,8 @@ export default async function integrationsOauthApiScenario(context) {
     const appName = context.unique('QA Integration OAuth App');
     const { data: createdSecret } = await ownerClient.post('/api/integration-apps', {
       name: appName,
-      external_platform_id: mockPlatform.id,
-      authentication_channel_id: mockChannel.id,
+      external_platform_id: trustedPlatform.id,
+      authentication_channel_id: trustedChannel.id,
       redirect_uris: [redirectUri, secondRedirectUri],
       agent_ids: [primaryAgent.id, secondaryAgent.id]
     });
@@ -318,10 +303,10 @@ export default async function integrationsOauthApiScenario(context) {
     assert.equal(JSON.stringify(listedApps).includes(initialSecret), false);
     const { data: fetchedApp } = await ownerClient.get(`/api/integration-apps/${app.id}`);
     assert.equal(Object.hasOwn(fetchedApp, 'client_secret'), false);
-    assert.equal(fetchedApp.external_platform_id, mockPlatform.id);
-    assert.equal(fetchedApp.authentication_channel_id, mockChannel.id);
+    assert.equal(fetchedApp.external_platform_id, trustedPlatform.id);
+    assert.equal(fetchedApp.authentication_channel_id, trustedChannel.id);
 
-    const outsider = await oidcLogin(context, 'qa-integration-outsider');
+    const outsider = await provisionLocalUser(ownerClient, context, 'qa-integration-outsider');
     assert.equal((await outsider.client.get('/api/integration-apps')).data.some((item) => item.id === app.id), false);
     await outsider.client.get(`/api/integration-apps/${app.id}`, { expectedStatus: 404 });
 
@@ -349,8 +334,8 @@ export default async function integrationsOauthApiScenario(context) {
         agent_ids: [primaryAgent.id, secondaryAgent.id]
       }
     });
-    assert.equal(editedApp.external_platform_id, mockPlatform.id);
-    assert.equal(editedApp.authentication_channel_id, mockChannel.id);
+    assert.equal(editedApp.external_platform_id, trustedPlatform.id);
+    assert.equal(editedApp.authentication_channel_id, trustedChannel.id);
     assert.deepEqual(editedApp.redirect_uris, [secondRedirectUri, redirectUri]);
 
     const bothAgentScope = `agent:${primaryAgent.id} agent:${secondaryAgent.id}`;
@@ -402,6 +387,38 @@ export default async function integrationsOauthApiScenario(context) {
     await integrationClient.get('/api/oauth/userinfo', bearerOptions(appAccessToken, 403));
     await integrationClient.get('/api/auth/me', bearerOptions(appAccessToken, 401));
     await integrationClient.get('/api/agents', bearerOptions(appAccessToken, 401));
+
+    const externalUsername = context.unique('QA external profile username');
+    const primarySessionBody = {
+      agent_id: primaryAgent.id,
+      external_user_id: externalUserId,
+      tenant_id: tenantId,
+      username: externalUsername,
+      display_name: owner.display_name,
+      tools: [{ name: 'echo', description: 'Echo integration input', parameters: { type: 'object' } }],
+      metadata: { source: 'qa', scenario: 'oauth-tool-continuation' }
+    };
+    await integrationClient.post(
+      '/api/integrations/sessions',
+      primarySessionBody,
+      bearerOptions(appAccessToken, 400)
+    );
+    await integrationClient.post(
+      '/api/integrations/sessions',
+      { ...primarySessionBody, email: 'invalid-email' },
+      bearerOptions(appAccessToken, 400)
+    );
+    const { data: primarySession } = await integrationClient.post(
+      '/api/integrations/sessions',
+      { ...primarySessionBody, email: owner.email },
+      bearerOptions(appAccessToken)
+    );
+    assertUuid(primarySession.id, 'Primary Integration Session id');
+    assert.equal(primarySession.hub_session_id !== primarySession.id, true);
+    assert.equal(primarySession.platform_id, trustedPlatform.id);
+    assert.equal(primarySession.tenant_id, tenantId);
+    assert.equal(primarySession.external_user_id, externalUserId);
+    assert.deepEqual(primarySession.metadata, primarySessionBody.metadata);
 
     const fullScope = `profile email external_profile agent:${primaryAgent.id}`;
     const codeParameters = {
@@ -456,10 +473,35 @@ export default async function integrationsOauthApiScenario(context) {
     );
     assert.equal(userinfo.sub, owner.id);
     assert.equal(userinfo.email, owner.email);
-    assert.equal(typeof userinfo.username, 'string');
-    assert.equal(userinfo.external_profile.platform_id, mockPlatform.id);
+    assert.equal(Object.hasOwn(userinfo, 'username'), false, 'Hub profile must not expose username');
+    assert.equal(userinfo.external_profile.platform_id, trustedPlatform.id);
     assert.equal(userinfo.external_profile.tenant_id, tenantId);
     assert.equal(userinfo.external_profile.external_user_id, externalUserId);
+    assert.equal(userinfo.external_profile.username, externalUsername);
+
+    const profileScope = `profile agent:${primaryAgent.id}`;
+    const profileCode = await authorize(ownerClient, {
+      ...codeParameters,
+      scope: profileScope,
+      state: context.unique('oauth-profile-state')
+    });
+    const { access_token: profileToken } = await oauthToken(context.baseURL, {
+      grant_type: 'authorization_code',
+      client_id: app.client_id,
+      client_secret: rotatedSecret,
+      code: profileCode,
+      redirect_uri: redirectUri,
+      scope: profileScope
+    });
+    const { data: profileUserinfo } = await integrationClient.get(
+      '/api/oauth/userinfo',
+      bearerOptions(profileToken)
+    );
+    assert.equal(profileUserinfo.sub, owner.id);
+    assert.equal(profileUserinfo.name, owner.display_name);
+    assert.equal(Object.hasOwn(profileUserinfo, 'username'), false);
+    assert.equal(Object.hasOwn(profileUserinfo, 'email'), false);
+    assert.equal(Object.hasOwn(profileUserinfo, 'external_profile'), false);
 
     const minimalScope = `agent:${primaryAgent.id}`;
     const minimalCode = await authorize(ownerClient, {
@@ -484,13 +526,6 @@ export default async function integrationsOauthApiScenario(context) {
     assert.equal(Object.hasOwn(minimalUserinfo, 'email'), false);
     assert.equal(Object.hasOwn(minimalUserinfo, 'external_profile'), false);
 
-    const primarySessionBody = {
-      agent_id: primaryAgent.id,
-      external_user_id: externalUserId,
-      tenant_id: tenantId,
-      tools: [{ name: 'echo', description: 'Echo integration input', parameters: { type: 'object' } }],
-      metadata: { source: 'qa', scenario: 'oauth-tool-continuation' }
-    };
     const missingTenantBody = { ...primarySessionBody };
     delete missingTenantBody.tenant_id;
     await integrationClient.post(
@@ -506,22 +541,31 @@ export default async function integrationsOauthApiScenario(context) {
       ...primarySessionBody,
       tenant_id: context.unique('wrong-tenant')
     }, bearerOptions(userAccessToken, 403));
-    const { data: primarySession } = await integrationClient.post(
-      '/api/integrations/sessions',
-      primarySessionBody,
-      bearerOptions(userAccessToken)
+    assert.equal(
+      (await integrationClient.get(
+        `/api/integrations/sessions/${primarySession.id}`,
+        bearerOptions(userAccessToken)
+      )).data.id,
+      primarySession.id,
+      'Authorization-code identity must reuse the trusted-email binding'
     );
-    assertUuid(primarySession.id, 'Primary Integration Session id');
-    assert.equal(primarySession.hub_session_id !== primarySession.id, true);
-    assert.equal(primarySession.platform_id, mockPlatform.id);
-    assert.equal(primarySession.tenant_id, tenantId);
-    assert.equal(primarySession.external_user_id, externalUserId);
-    assert.deepEqual(primarySession.metadata, primarySessionBody.metadata);
 
     const appOrigins = [
-      { external_user_id: context.unique('origin-user-x'), tenant_id: context.unique('tenant-a') },
-      { external_user_id: context.unique('origin-user-x'), tenant_id: context.unique('tenant-b') },
-      { external_user_id: context.unique('origin-user-y'), tenant_id: context.unique('tenant-a') }
+      {
+        external_user_id: context.unique('origin-user-x'),
+        tenant_id: context.unique('tenant-a'),
+        email: `${uniqueSlug(context, 'origin-user-x-a')}@example.com`
+      },
+      {
+        external_user_id: context.unique('origin-user-x'),
+        tenant_id: context.unique('tenant-b'),
+        email: `${uniqueSlug(context, 'origin-user-x-b')}@example.com`
+      },
+      {
+        external_user_id: context.unique('origin-user-y'),
+        tenant_id: context.unique('tenant-a'),
+        email: `${uniqueSlug(context, 'origin-user-y-a')}@example.com`
+      }
     ];
     const appSessions = [];
     for (const origin of appOrigins) {
@@ -531,7 +575,7 @@ export default async function integrationsOauthApiScenario(context) {
         tools: [],
         metadata: { source: 'qa-origin-isolation' }
       }, bearerOptions(appAccessToken));
-      assert.equal(session.platform_id, mockPlatform.id);
+      assert.equal(session.platform_id, trustedPlatform.id);
       assert.equal(session.external_user_id, origin.external_user_id);
       assert.equal(session.tenant_id, origin.tenant_id);
       appSessions.push(session);
@@ -583,6 +627,7 @@ export default async function integrationsOauthApiScenario(context) {
       agent_id: primaryAgent.id,
       external_user_id: appOrigins[0].external_user_id,
       tenant_id: appOrigins[0].tenant_id,
+      email: appOrigins[0].email,
       tools: [],
       metadata: { source: 'qa-cross-platform' }
     }, bearerOptions(customToken));
@@ -774,6 +819,7 @@ export default async function integrationsOauthApiScenario(context) {
       agent_id: secondaryAgent.id,
       external_user_id: context.unique('serialized-external-user'),
       tenant_id: context.unique('serialized-tenant'),
+      email: `${uniqueSlug(context, 'serialized-external-user')}@example.com`,
       tools: [],
       metadata: { source: 'qa-concurrency' }
     }, bearerOptions(appAccessToken));

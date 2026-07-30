@@ -315,8 +315,6 @@ test('Integration App OAuth API runs messages, attachments, and tool results', a
 
     const externalUserId = 'integration-e2e-admin';
     const tenantId = 'default';
-    await page.goto(`/api/auth/oidc/mock/start?email=${encodeURIComponent('admin@example.com')}&sub=${encodeURIComponent(externalUserId)}`);
-    await expect(page.getByText('admin@example.com')).toBeVisible();
 
     await page.goto('/agents');
     const agentName = `Integration Agent ${Date.now()}`;

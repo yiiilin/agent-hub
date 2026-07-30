@@ -5,7 +5,7 @@ use std::{
     convert::Infallible,
     env,
     io::Read,
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path as FsPath, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -25,7 +25,9 @@ use async_stream::stream;
 use async_trait::async_trait;
 use axum::{
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Form, Multipart, Path, Query, State},
+    extract::{
+        ConnectInfo, DefaultBodyLimit, Form, FromRequestParts, Multipart, Path, Query, State,
+    },
     http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -41,6 +43,10 @@ use base64::{
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Timelike, Utc};
 use futures_util::{Stream, StreamExt};
 use hmac::{Hmac, Mac};
+use ipnet::IpNet;
+use ldap3::{
+    dn_escape, ldap_escape, result::LdapError, LdapConnAsync, LdapConnSettings, Scope, SearchEntry,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Number, Value};
 use sha2::{Digest, Sha256};
@@ -150,7 +156,7 @@ struct AppState {
     embed_jwt_secret: String,
     embed_jwt_issuer: String,
     embed_jwt_audience: String,
-    oidc_mock_enabled: bool,
+    trusted_proxy_cidrs: Option<Vec<IpNet>>,
     model_secret_cipher: ModelSecretCipher,
     model_proxy_http: reqwest::Client,
     model_gateway_url: String,
@@ -160,6 +166,27 @@ struct AppState {
     session_bundle_max_bytes: u64,
     auth_providers: Vec<Arc<dyn AuthProvider>>,
     session_issuer: Arc<dyn SessionIssuer>,
+}
+
+struct MaybeConnectInfo(Option<SocketAddr>);
+
+impl<S> FromRequestParts<S> for MaybeConnectInfo
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(
+            parts
+                .extensions
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|connect_info| connect_info.0),
+        ))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -243,12 +270,6 @@ async fn main() -> anyhow::Result<()> {
         .connect(&database_url)
         .await?;
     sqlx::migrate!("./migrations").run(&pool).await?;
-    let oidc_mock_enabled = env::var("OIDC_MOCK_ENABLED")
-        .map(|value| value == "true")
-        .unwrap_or(false);
-    if oidc_mock_enabled {
-        ensure_mock_oidc_channel(&pool).await?;
-    }
     if env::var("SEED_DEV_USER")
         .map(|value| value == "true")
         .unwrap_or(false)
@@ -278,10 +299,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?;
     }
-    if oidc_mock_enabled {
-        if let Ok(token) = env::var("DEV_RUNTIME_ENROLLMENT_TOKEN") {
-            ensure_dev_runtime_enrollment_token(&pool, &token).await?;
-        }
+    if let Ok(token) = env::var("DEV_RUNTIME_ENROLLMENT_TOKEN") {
+        ensure_dev_runtime_enrollment_token(&pool, &token).await?;
     }
 
     let model_proxy_timeout = model_proxy_timeout_from_env()?;
@@ -299,20 +318,11 @@ async fn main() -> anyhow::Result<()> {
         session_cookie_secure: env::var("SESSION_COOKIE_SECURE")
             .map(|v| v == "true")
             .unwrap_or(false),
-        embed_jwt_secret: env::var("EMBED_JWT_SECRET").unwrap_or_else(|_| {
-            if env::var("OIDC_MOCK_ENABLED")
-                .map(|v| v == "true")
-                .unwrap_or(false)
-            {
-                "dev-embed-jwt-secret".into()
-            } else {
-                panic!("EMBED_JWT_SECRET is required outside mock auth mode")
-            }
-        }),
+        embed_jwt_secret: env::var("EMBED_JWT_SECRET").context("EMBED_JWT_SECRET is required")?,
         embed_jwt_issuer: env::var("EMBED_JWT_ISSUER").unwrap_or_else(|_| "agent-hub-dev".into()),
         embed_jwt_audience: env::var("EMBED_JWT_AUDIENCE")
             .unwrap_or_else(|_| "agent-hub-widget".into()),
-        oidc_mock_enabled,
+        trusted_proxy_cidrs: trusted_proxy_cidrs_from_env()?,
         model_secret_cipher,
         model_proxy_http,
         model_gateway_url,
@@ -349,7 +359,11 @@ async fn main() -> anyhow::Result<()> {
     let app = build_router(state);
     info!("backend listening on {bind_addr}");
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -387,11 +401,19 @@ fn build_router(state: AppState) -> Router {
         .route("/openapi.json", get(openapi))
         .route("/api/auth/register", post(register_password_user))
         .route("/api/auth/login", post(login))
+        .route("/api/auth/ldap/login", post(ldap_login))
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/me", get(me))
+        .route("/api/users/me", axum::routing::patch(update_current_user))
         .route("/api/users", get(list_users))
-        .route("/api/admin/users", get(list_admin_users))
-        .route("/api/admin/users/{user_id}", get(get_admin_user))
+        .route(
+            "/api/admin/users",
+            get(list_admin_users).post(create_admin_user),
+        )
+        .route(
+            "/api/admin/users/{user_id}",
+            get(get_admin_user).patch(update_admin_user),
+        )
         .route(
             "/api/admin/users/{user_id}/password",
             put(set_admin_user_password),
@@ -404,6 +426,11 @@ fn build_router(state: AppState) -> Router {
             "/api/admin/auth-policy",
             get(get_auth_policy).patch(update_auth_policy),
         )
+        .route(
+            "/api/admin/ldap-config",
+            get(get_ldap_configuration).put(update_ldap_configuration),
+        )
+        .route("/api/admin/ldap-config/test", post(test_ldap_configuration))
         .route(
             "/api/admin/external-platforms",
             get(list_external_platforms).post(create_external_platform),
@@ -420,8 +447,6 @@ fn build_router(state: AppState) -> Router {
             "/api/admin/authentication-channels/{channel_id}",
             axum::routing::patch(update_authentication_channel),
         )
-        .route("/api/auth/oidc/mock/start", get(oidc_mock_start))
-        .route("/api/auth/oidc/mock/callback", get(oidc_mock_callback))
         .route(
             "/api/auth/api-keys",
             get(list_api_keys).post(create_api_key),
@@ -831,24 +856,37 @@ fn openapi_document() -> Value {
         },
         "servers": [{ "url": "/", "description": "This Agent Hub deployment" }],
         "paths": {
-            "/api/auth/login": { "post": { "summary": "Sign in with password", "security": [], "requestBody": body("LoginRequest"), "responses": { "200": response("LoginResponse"), "401": { "$ref": "#/components/responses/Unauthorized" } } } },
-            "/api/auth/register": { "post": { "summary": "Register with password", "security": [], "requestBody": body("PasswordRegistrationRequest"), "responses": { "200": response("PasswordRegistrationResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
+            "/api/auth/login": { "post": { "summary": "Sign in with password", "security": [], "requestBody": body("LoginRequest"), "responses": { "200": response("LoginResponse"), "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "429": { "$ref": "#/components/responses/TooManyRequests" } } } },
+            "/api/auth/ldap/login": { "post": { "summary": "Sign in with the global LDAP Directory", "security": [], "requestBody": body("LoginRequest"), "responses": { "200": response("LoginResponse"), "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "429": { "$ref": "#/components/responses/TooManyRequests" }, "503": { "$ref": "#/components/responses/ServiceUnavailable" } } } },
+            "/api/auth/register": { "post": { "summary": "Register with password", "security": [], "requestBody": body("PasswordRegistrationRequest"), "responses": { "200": response("PasswordRegistrationResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "403": { "$ref": "#/components/responses/Forbidden" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/auth/logout": { "post": { "summary": "Clear browser session", "security": [], "responses": { "204": no_content() } } },
             "/api/auth/me": { "get": { "summary": "Get current user", "responses": { "200": response("User"), "401": { "$ref": "#/components/responses/Unauthorized" } } } },
+            "/api/users/me": { "patch": { "summary": "Update the current user's Display Name", "requestBody": body("UpdateCurrentUserRequest"), "responses": { "200": response("User"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" } } } },
             "/api/auth/providers": { "get": { "summary": "List enabled login providers", "security": [], "responses": { "200": response("AuthProvidersResponse") } } },
             "/api/admin/auth-policy": {
                 "get": { "summary": "Get authentication policy", "responses": { "200": response("AuthPolicy"), "403": { "$ref": "#/components/responses/Forbidden" } } },
                 "patch": { "summary": "Update authentication policy", "requestBody": body("AuthPolicy"), "responses": { "200": response("AuthPolicy"), "403": { "$ref": "#/components/responses/Forbidden" } } }
             },
-            "/api/admin/users": { "get": { "summary": "List Hub users", "responses": { "200": list_response("AdminUserDetail"), "403": { "$ref": "#/components/responses/Forbidden" } } } },
-            "/api/admin/users/{user_id}": { "get": { "summary": "Get Hub user details", "parameters": [id("user_id")], "responses": { "200": response("AdminUserDetail"), "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
+            "/api/admin/ldap-config": {
+                "get": { "summary": "Get the optional global LDAP configuration", "responses": { "200": response("NullableLdapConfiguration"), "403": { "$ref": "#/components/responses/Forbidden" } } },
+                "put": { "summary": "Save the global LDAP configuration", "requestBody": body("LdapConfiguration"), "responses": { "200": response("LdapConfiguration"), "400": { "$ref": "#/components/responses/BadRequest" }, "403": { "$ref": "#/components/responses/Forbidden" } } }
+            },
+            "/api/admin/ldap-config/test": { "post": { "summary": "Test an unsaved LDAP configuration with one-time credentials", "requestBody": body("TestLdapConfigurationRequest"), "responses": { "200": response("TestLdapConfigurationResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "403": { "$ref": "#/components/responses/Forbidden" }, "429": { "$ref": "#/components/responses/TooManyRequests" }, "503": { "$ref": "#/components/responses/ServiceUnavailable" } } } },
+            "/api/admin/users": {
+                "get": { "summary": "List Hub users", "responses": { "200": list_response("AdminUserDetail"), "403": { "$ref": "#/components/responses/Forbidden" } } },
+                "post": { "summary": "Create a Hub user", "requestBody": body("AdminCreateUserRequest"), "responses": { "200": response("AdminUserDetail"), "400": { "$ref": "#/components/responses/BadRequest" }, "403": { "$ref": "#/components/responses/Forbidden" }, "409": { "$ref": "#/components/responses/Conflict" } } }
+            },
+            "/api/admin/users/{user_id}": {
+                "get": { "summary": "Get Hub user details", "parameters": [id("user_id")], "responses": { "200": response("AdminUserDetail"), "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" } } },
+                "patch": { "summary": "Update a Hub user's Email and Display Name", "parameters": [id("user_id")], "requestBody": body("AdminUpdateUserRequest"), "responses": { "200": response("AdminUserDetail"), "400": { "$ref": "#/components/responses/BadRequest" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } }
+            },
             "/api/admin/users/{user_id}/password": { "put": { "summary": "Set Hub user password and invalidate browser sessions", "parameters": [id("user_id")], "requestBody": body("AdminSetUserPasswordRequest"), "responses": { "200": response("AdminUserDetail"), "400": { "$ref": "#/components/responses/BadRequest" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/admin/users/{user_id}/role": { "put": { "summary": "Change a Hub user role as a Super Administrator", "parameters": [id("user_id")], "requestBody": body("AdminSetUserRoleRequest"), "responses": { "200": response("AdminUserDetail"), "400": { "$ref": "#/components/responses/BadRequest" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/admin/user-erasures": {
                 "get": { "summary": "List pending and completed Hub User erasures", "responses": { "200": list_response("UserErasure"), "403": { "$ref": "#/components/responses/Forbidden" } } }
             },
             "/api/admin/users/{user_id}/erase": {
-                "post": { "summary": "Irreversibly erase a Hub User after exact Username confirmation", "parameters": [id("user_id")], "requestBody": body("EraseUserRequest"), "responses": { "202": response("UserErasure"), "400": { "$ref": "#/components/responses/BadRequest" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } }
+                "post": { "summary": "Irreversibly erase a Hub User after exact Email confirmation", "parameters": [id("user_id")], "requestBody": body("EraseUserRequest"), "responses": { "202": response("UserErasure"), "400": { "$ref": "#/components/responses/BadRequest" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } }
             },
             "/api/admin/external-platforms": {
                 "get": { "summary": "List external platforms", "responses": { "200": list_response("ExternalPlatform"), "403": { "$ref": "#/components/responses/Forbidden" } } },
@@ -864,8 +902,6 @@ fn openapi_document() -> Value {
             "/api/admin/authentication-channels/{channel_id}": {
                 "patch": { "summary": "Update authentication channel", "parameters": [id("channel_id")], "requestBody": body("UpdateAuthenticationChannelRequest"), "responses": { "200": response("AuthenticationChannel"), "400": { "$ref": "#/components/responses/BadRequest" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" } } }
             },
-            "/api/auth/oidc/mock/start": { "get": { "summary": "Start mock OIDC login", "security": [], "parameters": [{ "name": "email", "in": "query", "required": false, "schema": { "type": "string", "format": "email" } }, { "name": "sub", "in": "query", "required": false, "schema": { "type": "string" } }], "responses": { "303": { "description": "Redirect to mock callback" }, "400": { "$ref": "#/components/responses/BadRequest" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
-            "/api/auth/oidc/mock/callback": { "get": { "summary": "Complete mock OIDC login", "security": [], "parameters": [{ "name": "state", "in": "query", "required": true, "schema": { "type": "string" } }], "responses": { "303": { "description": "Set session cookie and redirect to Sessions" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/auth/api-keys": {
                 "get": { "summary": "List API keys", "parameters": [
                     { "name": "page", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "default": 1 } },
@@ -1076,7 +1112,7 @@ fn openapi_document() -> Value {
                 "modelProxyBearer": { "type": "http", "scheme": "bearer", "bearerFormat": "Run-scoped model proxy token (ahr_)" },
                 "clientAccessBearer": { "type": "http", "scheme": "bearer", "bearerFormat": "Opaque Client Access Credential (ahw_ or ahp_)" },
                 "integrationClientBasic": { "type": "http", "scheme": "basic", "description": "Integration App client_id and client_secret." },
-                "sessionCookie": { "type": "apiKey", "in": "cookie", "name": "agent_hub_session", "description": "HttpOnly browser session cookie issued by password or OIDC login." },
+                "sessionCookie": { "type": "apiKey", "in": "cookie", "name": "agent_hub_session", "description": "HttpOnly browser session cookie issued by password or LDAP login." },
                 "embedToken": { "type": "apiKey", "in": "header", "name": "X-Agent-Hub-Embed-Token" },
                 "webhookToken": { "type": "apiKey", "in": "header", "name": "X-Agent-Hub-Webhook-Token" }
             },
@@ -1087,6 +1123,8 @@ fn openapi_document() -> Value {
                 "Conflict": { "description": "Resource already exists", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
                 "NotFound": { "description": "Resource not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
                 "Gone": { "description": "Resource reached a terminal state", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+                ,"TooManyRequests": { "description": "Login rate limit exceeded", "headers": { "Retry-After": { "schema": { "type": "integer", "minimum": 1 } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+                ,"ServiceUnavailable": { "description": "Authentication dependency is temporarily unavailable", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
             },
             "schemas": openapi_schemas()
         }
@@ -1122,18 +1160,25 @@ fn openapi_schemas() -> Value {
     let date = || json!({ "type": ["string", "null"], "format": "date-time" });
     json!({
         "Error": { "type": "object", "required": ["error"], "properties": { "error": { "type": "string" } } },
-        "User": { "type": "object", "required": ["id", "username", "email", "display_name", "role"], "properties": { "id": uuid(), "username": { "type": "string" }, "email": { "type": ["string", "null"], "format": "email" }, "display_name": { "type": "string" }, "role": { "type": "string" } } },
-        "AdminUserDetail": { "type": "object", "additionalProperties": false, "required": ["user", "email_verified", "has_password", "created_at"], "properties": { "user": { "$ref": "#/components/schemas/User" }, "email_verified": { "type": "boolean" }, "has_password": { "type": "boolean" }, "created_at": { "type": "string", "format": "date-time" } } },
+        "User": { "type": "object", "required": ["id", "email", "display_name", "role"], "properties": { "id": uuid(), "email": { "type": "string", "format": "email" }, "display_name": { "type": "string" }, "role": { "type": "string" } } },
+        "AdminUserDetail": { "type": "object", "additionalProperties": false, "required": ["user", "has_password", "created_at"], "properties": { "user": { "$ref": "#/components/schemas/User" }, "has_password": { "type": "boolean" }, "created_at": { "type": "string", "format": "date-time" } } },
+        "AdminCreateUserRequest": { "type": "object", "additionalProperties": false, "required": ["email", "role"], "properties": { "email": { "type": "string", "format": "email" }, "display_name": { "type": ["string", "null"] }, "password": { "type": ["string", "null"], "format": "password", "minLength": 8, "maxLength": 1024 }, "role": { "type": "string", "enum": ["member", "admin", "super_admin"] } } },
+        "AdminUpdateUserRequest": { "type": "object", "additionalProperties": false, "required": ["email", "display_name"], "properties": { "email": { "type": "string", "format": "email" }, "display_name": { "type": "string" } } },
+        "UpdateCurrentUserRequest": { "type": "object", "additionalProperties": false, "required": ["display_name"], "properties": { "display_name": { "type": "string" } } },
         "AdminSetUserPasswordRequest": { "type": "object", "additionalProperties": false, "required": ["password"], "properties": { "password": { "type": "string", "format": "password", "minLength": 8, "maxLength": 1024 } } },
         "AdminSetUserRoleRequest": { "type": "object", "additionalProperties": false, "required": ["role"], "properties": { "role": { "type": "string", "enum": ["member", "admin", "super_admin"] } } },
         "LoginRequest": { "type": "object", "required": ["email", "password"], "properties": { "email": { "type": "string", "format": "email" }, "password": { "type": "string", "format": "password" } } },
         "LoginResponse": { "type": "object", "required": ["user"], "properties": { "user": { "$ref": "#/components/schemas/User" } } },
-        "PasswordRegistrationRequest": { "type": "object", "required": ["email", "password"], "properties": { "email": { "type": "string", "format": "email" }, "password": { "type": "string", "format": "password" } } },
-        "PasswordRegistrationResponse": { "type": "object", "required": ["user", "verification_required"], "properties": { "user": { "$ref": "#/components/schemas/User" }, "verification_required": { "type": "boolean" } } },
-        "AuthProvidersResponse": { "type": "object", "required": ["oidc_mock", "password_registration_enabled", "password_login_enabled", "email_verification_required"], "properties": { "oidc_mock": { "type": "boolean" }, "password_registration_enabled": { "type": "boolean" }, "password_login_enabled": { "type": "boolean" }, "email_verification_required": { "type": "boolean" } } },
-        "AuthPolicy": { "type": "object", "additionalProperties": false, "required": ["password_registration_enabled", "password_login_enabled", "email_verification_required"], "properties": { "password_registration_enabled": { "type": "boolean" }, "password_login_enabled": { "type": "boolean" }, "email_verification_required": { "type": "boolean" } } },
-        "EraseUserRequest": { "type": "object", "additionalProperties": false, "required": ["username"], "properties": { "username": { "type": "string" } } },
-        "UserErasure": { "type": "object", "additionalProperties": false, "required": ["user_id", "username", "status", "requested_at", "completed_at"], "properties": { "user_id": uuid(), "username": { "type": ["string", "null"] }, "status": { "type": "string", "enum": ["pending", "completed"] }, "requested_at": { "type": "string", "format": "date-time" }, "completed_at": date() } },
+        "PasswordRegistrationRequest": { "type": "object", "additionalProperties": false, "required": ["email", "password"], "properties": { "email": { "type": "string", "format": "email" }, "password": { "type": "string", "format": "password" }, "display_name": { "type": ["string", "null"] } } },
+        "PasswordRegistrationResponse": { "type": "object", "required": ["user"], "properties": { "user": { "$ref": "#/components/schemas/User" } } },
+        "AuthProvidersResponse": { "type": "object", "required": ["password_registration_enabled", "password_login_enabled", "ldap_login_enabled"], "properties": { "password_registration_enabled": { "type": "boolean" }, "password_login_enabled": { "type": "boolean" }, "ldap_login_enabled": { "type": "boolean" } } },
+        "AuthPolicy": { "type": "object", "additionalProperties": false, "required": ["password_registration_enabled", "password_login_enabled", "ldap_login_enabled"], "properties": { "password_registration_enabled": { "type": "boolean" }, "password_login_enabled": { "type": "boolean" }, "ldap_login_enabled": { "type": "boolean" } } },
+        "LdapConfiguration": { "type": "object", "additionalProperties": false, "required": ["url", "security", "base_dn", "bind_identity_template", "user_filter", "email_attribute", "display_name_attribute", "allow_insecure", "skip_tls_verify"], "properties": { "url": { "type": "string", "format": "uri" }, "security": { "type": "string", "enum": ["ldaps", "starttls", "plain"] }, "base_dn": { "type": "string" }, "bind_identity_template": { "type": "string", "default": "{email}", "description": "Bind identity template containing exactly one {email}; the substituted value is escaped as an LDAP DN attribute value." }, "user_filter": { "type": "string", "default": "(userPrincipalName={email})" }, "email_attribute": { "type": "string", "default": "mail" }, "display_name_attribute": { "type": "string", "default": "displayName" }, "allow_insecure": { "type": "boolean", "default": false }, "skip_tls_verify": { "type": "boolean", "default": false } } },
+        "NullableLdapConfiguration": { "anyOf": [{ "$ref": "#/components/schemas/LdapConfiguration" }, { "type": "null" }] },
+        "TestLdapConfigurationRequest": { "type": "object", "additionalProperties": false, "required": ["configuration", "email", "password"], "properties": { "configuration": { "$ref": "#/components/schemas/LdapConfiguration" }, "email": { "type": "string", "format": "email" }, "password": { "type": "string", "format": "password" } } },
+        "TestLdapConfigurationResponse": { "type": "object", "additionalProperties": false, "required": ["email", "display_name", "duration_ms"], "properties": { "email": { "type": "string", "format": "email" }, "display_name": { "type": "string" }, "duration_ms": { "type": "integer", "format": "int64", "minimum": 0 } } },
+        "EraseUserRequest": { "type": "object", "additionalProperties": false, "required": ["email"], "properties": { "email": { "type": "string", "format": "email" } } },
+        "UserErasure": { "type": "object", "additionalProperties": false, "required": ["user_id", "email", "status", "requested_at", "completed_at"], "properties": { "user_id": uuid(), "email": { "type": ["string", "null"], "format": "email" }, "status": { "type": "string", "enum": ["pending", "completed"] }, "requested_at": { "type": "string", "format": "date-time" }, "completed_at": date() } },
         "ExternalPlatform": { "type": "object", "required": ["id", "key", "name"], "properties": { "id": uuid(), "key": { "type": "string" }, "name": { "type": "string" } } },
         "IntegrationAppOptions": { "type": "object", "additionalProperties": false, "required": ["external_platforms", "authentication_channels"], "properties": { "external_platforms": { "type": "array", "items": { "$ref": "#/components/schemas/ExternalPlatform" } }, "authentication_channels": { "type": "array", "items": { "$ref": "#/components/schemas/AuthenticationChannel" } } } },
         "CreateExternalPlatformRequest": { "type": "object", "additionalProperties": false, "required": ["key", "name"], "properties": { "key": { "type": "string" }, "name": { "type": "string" } } },
@@ -1287,8 +1332,8 @@ fn openapi_schemas() -> Value {
         "ClientToolClaimResponse": { "type": "object", "additionalProperties": false, "required": ["status", "terminal"], "properties": { "status": { "type": "string", "enum": ["claimed", "completed", "timed_out", "unknown", "cancelled"] }, "terminal": { "type": "boolean" }, "result": { "anyOf": [{ "$ref": "#/components/schemas/ClientToolResult" }, { "type": "null" }] } } },
         "SubmitClientToolResultRequest": { "type": "object", "additionalProperties": false, "required": ["result"], "properties": { "result": { "$ref": "#/components/schemas/ClientToolResult" } } },
         "SubmitClientToolResultResponse": { "type": "object", "additionalProperties": false, "required": ["run", "tool_request"], "properties": { "run": { "anyOf": [{ "$ref": "#/components/schemas/Run" }, { "type": "null" }] }, "tool_request": { "type": "object" } } },
-        "CreateWidgetAccessRequest": { "type": "object", "additionalProperties": false, "required": ["agent_id", "client_instance_id", "external_user_id", "tenant_id"], "properties": { "agent_id": uuid(), "client_instance_id": uuid(), "external_user_id": { "type": "string" }, "tenant_id": { "type": "string" }, "username": { "type": ["string", "null"] }, "display_name": { "type": ["string", "null"] }, "email": { "type": ["string", "null"], "format": "email" }, "attributes": { "type": "object", "additionalProperties": true, "default": {} }, "client_tools": { "type": "array", "maxItems": 128, "items": { "$ref": "#/components/schemas/ClientToolDefinition" }, "default": [] } } },
-        "CreateClientAccessRequest": { "type": "object", "additionalProperties": false, "required": ["agent_id", "client_instance_id", "external_user_id", "tenant_id"], "properties": { "agent_id": uuid(), "client_instance_id": uuid(), "external_user_id": { "type": "string" }, "tenant_id": { "type": "string" }, "username": { "type": ["string", "null"] }, "display_name": { "type": ["string", "null"] }, "email": { "type": ["string", "null"], "format": "email" }, "attributes": { "type": "object", "additionalProperties": true, "default": {} }, "client_tools": { "type": "array", "maxItems": 128, "items": { "$ref": "#/components/schemas/ClientToolDefinition" }, "default": [] } } },
+        "CreateWidgetAccessRequest": { "type": "object", "additionalProperties": false, "required": ["agent_id", "client_instance_id", "external_user_id", "tenant_id", "email"], "properties": { "agent_id": uuid(), "client_instance_id": uuid(), "external_user_id": { "type": "string" }, "tenant_id": { "type": "string" }, "username": { "type": ["string", "null"] }, "display_name": { "type": ["string", "null"] }, "email": { "type": "string", "format": "email" }, "attributes": { "type": "object", "additionalProperties": true, "default": {} }, "client_tools": { "type": "array", "maxItems": 128, "items": { "$ref": "#/components/schemas/ClientToolDefinition" }, "default": [] } } },
+        "CreateClientAccessRequest": { "type": "object", "additionalProperties": false, "required": ["agent_id", "client_instance_id", "external_user_id", "tenant_id", "email"], "properties": { "agent_id": uuid(), "client_instance_id": uuid(), "external_user_id": { "type": "string" }, "tenant_id": { "type": "string" }, "username": { "type": ["string", "null"] }, "display_name": { "type": ["string", "null"] }, "email": { "type": "string", "format": "email" }, "attributes": { "type": "object", "additionalProperties": true, "default": {} }, "client_tools": { "type": "array", "maxItems": 128, "items": { "$ref": "#/components/schemas/ClientToolDefinition" }, "default": [] } } },
         "WidgetSession": { "type": "object", "required": ["id", "name", "instructions"], "properties": { "id": uuid(), "name": { "type": "string" }, "instructions": { "type": "string" }, "expires_at": { "type": "string", "format": "date-time" }, "history_enabled": { "type": "boolean" } } },
         "WidgetAccessResponse": { "type": "object", "additionalProperties": false, "required": ["token", "expires_at", "agent", "history_enabled"], "properties": { "token": { "type": "string" }, "expires_at": { "type": "string", "format": "date-time" }, "agent": { "$ref": "#/components/schemas/WidgetAgent" }, "history_enabled": { "type": "boolean" } } },
         "ClientAccessResponse": { "type": "object", "additionalProperties": false, "required": ["access_token", "expires_at", "expires_in", "client_instance_id", "session_id", "agent", "history_enabled", "tool_names"], "properties": { "access_token": { "type": "string" }, "expires_at": { "type": "string", "format": "date-time" }, "expires_in": { "type": "integer", "minimum": 1 }, "client_instance_id": uuid(), "session_id": { "anyOf": [uuid(), { "type": "null" }] }, "agent": { "$ref": "#/components/schemas/WidgetAgent" }, "history_enabled": { "type": "boolean" }, "tool_names": { "type": "array", "uniqueItems": true, "items": { "type": "string" } } } },
@@ -1313,8 +1358,8 @@ fn openapi_schemas() -> Value {
         ] },
         "OAuthTokenResponse": { "type": "object", "required": ["access_token", "token_type", "expires_in", "scope"], "properties": { "access_token": { "type": "string" }, "token_type": { "type": "string", "const": "Bearer" }, "expires_in": { "type": "integer" }, "scope": { "type": "string" } } },
         "OAuthExternalProfile": { "type": "object", "additionalProperties": false, "required": ["platform_id", "tenant_id", "external_identity_id", "external_user_id"], "properties": { "platform_id": uuid(), "tenant_id": { "type": "string" }, "external_identity_id": uuid(), "external_user_id": { "type": "string" }, "username": { "type": "string" }, "email": { "type": "string", "format": "email" } } },
-        "OAuthUserInfo": { "type": "object", "additionalProperties": false, "required": ["sub"], "properties": { "sub": uuid(), "username": { "type": "string" }, "name": { "type": "string" }, "email": { "type": "string", "format": "email" }, "external_profile": { "$ref": "#/components/schemas/OAuthExternalProfile" } } },
-        "CreateIntegrationSessionRequest": { "type": "object", "required": ["agent_id", "external_user_id", "tenant_id", "tools", "metadata"], "properties": { "agent_id": uuid(), "external_user_id": { "type": "string" }, "tenant_id": { "type": "string" }, "tools": {}, "metadata": {} } },
+        "OAuthUserInfo": { "type": "object", "additionalProperties": false, "required": ["sub"], "properties": { "sub": uuid(), "name": { "type": "string" }, "email": { "type": "string", "format": "email" }, "external_profile": { "$ref": "#/components/schemas/OAuthExternalProfile" } } },
+        "CreateIntegrationSessionRequest": { "type": "object", "required": ["agent_id", "external_user_id", "tools", "metadata"], "properties": { "agent_id": uuid(), "external_user_id": { "type": "string" }, "tenant_id": { "type": ["string", "null"] }, "username": { "type": ["string", "null"] }, "display_name": { "type": ["string", "null"] }, "email": { "type": ["string", "null"], "format": "email", "description": "Required for client_credentials; ignored for authorization_code." }, "tools": {}, "metadata": {} } },
         "IntegrationSession": { "type": "object", "required": ["id", "hub_session_id", "agent_id", "owner_id", "platform_id", "tenant_id", "external_identity_id", "external_user_id", "tool_definitions", "metadata", "created_at"], "properties": { "id": uuid(), "hub_session_id": uuid(), "agent_id": uuid(), "owner_id": uuid(), "platform_id": uuid(), "tenant_id": { "type": "string" }, "external_identity_id": uuid(), "external_user_id": { "type": "string" }, "tool_definitions": {}, "metadata": {}, "created_at": { "type": "string", "format": "date-time" } } },
         "IntegrationMessageRequest": { "type": "object", "required": ["content", "attachments"], "properties": { "content": { "type": "string" }, "attachments": {}, "client_message_key": { "type": ["string", "null"] } } },
         "IntegrationMessageResponse": { "type": "object", "required": ["run", "message"], "properties": { "run": { "$ref": "#/components/schemas/Run" }, "message": { "$ref": "#/components/schemas/HubSessionMessage" } } },
@@ -1350,22 +1395,93 @@ async fn readiness_response(pool: &PgPool, timeout: Duration) -> Response {
 
 async fn login(
     State(state): State<Arc<AppState>>,
+    MaybeConnectInfo(peer_address): MaybeConnectInfo,
+    headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    if !load_auth_policy(&state.pool).await?.password_login_enabled {
-        return Err(ApiError::forbidden("password login is disabled"));
+    let source_ip = login_source_ip(
+        &headers,
+        peer_address.map(|address| address.ip()),
+        state.trusted_proxy_cidrs.as_deref(),
+    );
+    record_ip_login_attempt(&state.pool, source_ip).await?;
+    let rate_email = login_rate_email(&req.email);
+    if let Some(email) = rate_email.as_deref() {
+        reserve_email_login_attempt(&state.pool, email).await?;
     }
-    let principal = authenticate_with_providers(
+    let principal = match authenticate_with_providers(
         &state,
         AuthCredential::Password {
             email: req.email,
             password: req.password,
         },
     )
-    .await?;
+    .await
+    {
+        Ok(principal) => principal,
+        Err(error) => return Err(error),
+    };
     let AuthPrincipal::User { user, .. } = principal else {
         return Err(ApiError::unauthorized("invalid credentials"));
     };
+    if let Some(email) = rate_email.as_deref() {
+        clear_email_login_failures(&state.pool, email).await?;
+    }
+    let headers = state.session_issuer.issue(&state, user.id).await?;
+    Ok((headers, Json(LoginResponse { user })))
+}
+
+async fn ldap_login(
+    State(state): State<Arc<AppState>>,
+    MaybeConnectInfo(peer_address): MaybeConnectInfo,
+    headers: HeaderMap,
+    Json(req): Json<LoginRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    let request_id = Uuid::new_v4();
+    let started_at = Instant::now();
+    let source_ip = login_source_ip(
+        &headers,
+        peer_address.map(|address| address.ip()),
+        state.trusted_proxy_cidrs.as_deref(),
+    );
+    record_ip_login_attempt(&state.pool, source_ip).await?;
+    let rate_email = login_rate_email(&req.email);
+    if let Some(email) = rate_email.as_deref() {
+        reserve_email_login_attempt(&state.pool, email).await?;
+    }
+    if !load_auth_policy(&state.pool).await?.ldap_login_enabled {
+        return Err(ApiError::forbidden("LDAP login is disabled"));
+    }
+    let configuration =
+        load_ldap_configuration(&state.pool)
+            .await?
+            .ok_or(ApiError::service_unavailable(
+                "LDAP service is temporarily unavailable",
+            ))?;
+    let identity = match query_ldap_directory(&configuration, &req.email, &req.password).await {
+        Ok(identity) => identity,
+        Err(error) => {
+            warn!(
+                request_id = %request_id,
+                stage = error.stage,
+                category = error.category,
+                duration_ms = started_at.elapsed().as_millis(),
+                "LDAP login failed"
+            );
+            return Err(error.for_login());
+        }
+    };
+    let user = resolve_ldap_user(&state.pool, &identity).await?;
+    if let Some(email) = rate_email.as_deref() {
+        clear_email_login_failures(&state.pool, email).await?;
+    }
+    info!(
+        request_id = %request_id,
+        stage = "complete",
+        category = "success",
+        duration_ms = started_at.elapsed().as_millis(),
+        "LDAP login completed"
+    );
     let headers = state.session_issuer.issue(&state, user.id).await?;
     Ok((headers, Json(LoginResponse { user })))
 }
@@ -1386,26 +1502,15 @@ async fn register_password_user(
     }
     let password =
         password_hash(&req.password).map_err(|_| ApiError::internal("password hashing failed"))?;
-    let user = create_hub_user(
+    let user = create_password_registration_user(
         &state.pool,
-        Some(&email),
-        None,
+        &email,
+        req.display_name.as_deref(),
         Some(&password),
-        !policy.email_verification_required,
     )
     .await?;
-    let headers = if policy.email_verification_required {
-        HeaderMap::new()
-    } else {
-        state.session_issuer.issue(&state, user.id).await?
-    };
-    Ok((
-        headers,
-        Json(PasswordRegistrationResponse {
-            user,
-            verification_required: policy.email_verification_required,
-        }),
-    ))
+    let headers = state.session_issuer.issue(&state, user.id).await?;
+    Ok((headers, Json(PasswordRegistrationResponse { user })))
 }
 
 async fn logout(
@@ -1433,17 +1538,37 @@ async fn me(
     Ok(Json(require_user(&state, &headers).await?))
 }
 
+async fn update_current_user(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<UpdateCurrentUserRequest>,
+) -> Result<Json<UserDto>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    let display_name = normalize_display_name(Some(&req.display_name), &user.email)?;
+    let row = sqlx::query(
+        "UPDATE users SET display_name = $1
+         WHERE id = $2 AND deletion_requested_at IS NULL
+         RETURNING id, email, display_name, role",
+    )
+    .bind(display_name)
+    .bind(user.id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(ApiError::unauthorized("user account is unavailable"))?;
+    Ok(Json(user_from_row(row)))
+}
+
 async fn list_users(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<UserDto>>, ApiError> {
     let user = require_user(&state, &headers).await?;
     let rows = sqlx::query(
-        "SELECT id, username, email, display_name, role
+        "SELECT id, email, display_name, role
          FROM users
          WHERE deletion_requested_at IS NULL
            AND (role <> 'super_admin' OR $1 = 'super_admin' OR id = $2)
-         ORDER BY display_name, username",
+         ORDER BY display_name, email",
     )
     .bind(&user.role)
     .bind(user.id)
@@ -1458,7 +1583,7 @@ async fn list_admin_users(
 ) -> Result<Json<Vec<AdminUserDetailDto>>, ApiError> {
     let administrator = require_administrator(&state, &headers).await?;
     let rows = sqlx::query(
-        "SELECT id, username, email, display_name, role, email_verified,
+        "SELECT id, email, display_name, role,
                 password IS NOT NULL AS has_password, created_at
          FROM users
          WHERE deletion_requested_at IS NULL
@@ -1473,6 +1598,83 @@ async fn list_admin_users(
     ))
 }
 
+async fn create_admin_user(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<AdminCreateUserRequest>,
+) -> Result<Json<AdminUserDetailDto>, ApiError> {
+    let administrator = require_administrator(&state, &headers).await?;
+    let email = normalize_email(&req.email)?;
+    let display_name = normalize_display_name(req.display_name.as_deref(), &email)?;
+    let role = validate_user_role(&req.role)?;
+    if administrator.role != "super_admin" && role != "member" {
+        return Err(ApiError::forbidden(
+            "only a Super Administrator can create administrator accounts",
+        ));
+    }
+    let password = match req.password.as_deref() {
+        Some(password) => {
+            if !(8..=1024).contains(&password.len()) {
+                return Err(ApiError::bad_request(
+                    "password must be between 8 and 1024 bytes",
+                ));
+            }
+            Some(
+                password_hash(password)
+                    .map_err(|_| ApiError::internal("password hashing failed"))?,
+            )
+        }
+        None => None,
+    };
+
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('agent-hub-user-create', 0))")
+        .execute(&mut *tx)
+        .await?;
+    let actor_role: Option<String> = sqlx::query_scalar(
+        "SELECT role FROM users
+         WHERE id = $1 AND role IN ('admin', 'super_admin')
+           AND deletion_requested_at IS NULL
+         FOR UPDATE",
+    )
+    .bind(administrator.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let actor_role =
+        actor_role.ok_or(ApiError::forbidden("administrator permission is required"))?;
+    if actor_role != "super_admin" && role != "member" {
+        return Err(ApiError::forbidden(
+            "only a Super Administrator can create administrator accounts",
+        ));
+    }
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM users WHERE lower(btrim(email)) = lower(btrim($1))
+         )",
+    )
+    .bind(&email)
+    .fetch_one(&mut *tx)
+    .await?;
+    if exists {
+        return Err(ApiError::conflict("email already exists"));
+    }
+    let row = sqlx::query(
+        "INSERT INTO users (id, email, password, display_name, role)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id, email, display_name, role,
+                   password IS NOT NULL AS has_password, created_at",
+    )
+    .bind(Uuid::new_v4())
+    .bind(email)
+    .bind(password)
+    .bind(display_name)
+    .bind(role)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Json(admin_user_detail_from_row(row)))
+}
+
 async fn get_admin_user(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1482,6 +1684,66 @@ async fn get_admin_user(
     Ok(Json(
         load_admin_user(&state.pool, user_id, &administrator.role).await?,
     ))
+}
+
+async fn update_admin_user(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(user_id): Path<Uuid>,
+    Json(req): Json<AdminUpdateUserRequest>,
+) -> Result<Json<AdminUserDetailDto>, ApiError> {
+    let administrator = require_administrator(&state, &headers).await?;
+    let email = normalize_email(&req.email)?;
+    let display_name = normalize_display_name(Some(&req.display_name), &email)?;
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('agent-hub-user-create', 0))")
+        .execute(&mut *tx)
+        .await?;
+    let administrator_role = require_administrator_role_tx(&mut tx, administrator.id).await?;
+    let target = sqlx::query(
+        "SELECT email, role FROM users
+         WHERE id = $1 AND deletion_requested_at IS NULL
+           AND ($2 = 'super_admin' OR role <> 'super_admin')
+         FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(&administrator_role)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::not_found("user not found"))?;
+    let existing_email: String = target.get("email");
+    let conflict: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM users
+             WHERE id <> $1 AND lower(btrim(email)) = lower(btrim($2))
+         )",
+    )
+    .bind(user_id)
+    .bind(&email)
+    .fetch_one(&mut *tx)
+    .await?;
+    if conflict {
+        return Err(ApiError::conflict("email already exists"));
+    }
+    let row = sqlx::query(
+        "UPDATE users SET email = $1, display_name = $2
+         WHERE id = $3
+         RETURNING id, email, display_name, role,
+                   password IS NOT NULL AS has_password, created_at",
+    )
+    .bind(&email)
+    .bind(display_name)
+    .bind(user_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if existing_email != email {
+        sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(Json(admin_user_detail_from_row(row)))
 }
 
 async fn set_admin_user_password(
@@ -1499,17 +1761,18 @@ async fn set_admin_user_password(
     let password =
         password_hash(&req.password).map_err(|_| ApiError::internal("password hashing failed"))?;
     let mut tx = state.pool.begin().await?;
+    let administrator_role = require_administrator_role_tx(&mut tx, administrator.id).await?;
     let row = sqlx::query(
         "UPDATE users
          SET password = $1
          WHERE id = $2 AND deletion_requested_at IS NULL
            AND ($3 = 'super_admin' OR role <> 'super_admin')
-         RETURNING id, username, email, display_name, role, email_verified,
+         RETURNING id, email, display_name, role,
                    password IS NOT NULL AS has_password, created_at",
     )
     .bind(password)
     .bind(user_id)
-    .bind(&administrator.role)
+    .bind(&administrator_role)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(ApiError::not_found("user not found"))?;
@@ -1584,7 +1847,7 @@ async fn set_admin_user_role(
     let row = sqlx::query(
         "UPDATE users SET role = $1
          WHERE id = $2
-         RETURNING id, username, email, display_name, role, email_verified,
+         RETURNING id, email, display_name, role,
                    password IS NOT NULL AS has_password, created_at",
     )
     .bind(role)
@@ -1601,7 +1864,7 @@ async fn load_admin_user(
     administrator_role: &str,
 ) -> Result<AdminUserDetailDto, ApiError> {
     let row = sqlx::query(
-        "SELECT id, username, email, display_name, role, email_verified,
+        "SELECT id, email, display_name, role,
                 password IS NOT NULL AS has_password, created_at
          FROM users
          WHERE id = $1 AND deletion_requested_at IS NULL
@@ -1621,7 +1884,7 @@ async fn list_user_erasures(
 ) -> Result<Json<Vec<UserErasureDto>>, ApiError> {
     let administrator = require_administrator(&state, &headers).await?;
     let rows = sqlx::query(
-        "SELECT user_id, requested_username, requested_at
+        "SELECT user_id, requested_email, requested_at
          FROM user_erasure_jobs
          WHERE $1 = 'super_admin' OR target_role <> 'super_admin'
          ORDER BY requested_at DESC, user_id",
@@ -1633,7 +1896,7 @@ async fn list_user_erasures(
         .into_iter()
         .map(|row| UserErasureDto {
             user_id: row.get("user_id"),
-            username: Some(row.get("requested_username")),
+            email: Some(row.get("requested_email")),
             status: "pending".into(),
             requested_at: row.get("requested_at"),
             completed_at: None,
@@ -1652,7 +1915,7 @@ async fn list_user_erasures(
         let erased_at = row.get("erased_at");
         UserErasureDto {
             user_id: row.get("erased_user_id"),
-            username: None,
+            email: None,
             status: "completed".into(),
             requested_at: erased_at,
             completed_at: Some(erased_at),
@@ -1669,7 +1932,7 @@ async fn erase_user(
     Json(req): Json<EraseUserRequest>,
 ) -> Result<(StatusCode, Json<UserErasureDto>), ApiError> {
     let administrator = require_administrator(&state, &headers).await?;
-    begin_user_erasure(&state.pool, administrator.id, user_id, &req.username).await?;
+    begin_user_erasure(&state.pool, administrator.id, user_id, &req.email).await?;
     if let Err(error) = process_user_erasure_job(&state, user_id).await {
         warn!(user_id = %user_id, error = %error.message, "user erasure remains pending");
     }
@@ -1683,7 +1946,7 @@ async fn begin_user_erasure(
     pool: &PgPool,
     administrator_id: Uuid,
     user_id: Uuid,
-    confirmed_username: &str,
+    confirmed_email: &str,
 ) -> Result<(), ApiError> {
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('agent-hub-user-create', 0))")
@@ -1699,7 +1962,7 @@ async fn begin_user_erasure(
     .await?
     .ok_or(ApiError::forbidden("administrator permission is required"))?;
     let user = sqlx::query(
-        "SELECT username, role, deletion_requested_at
+        "SELECT email, role, deletion_requested_at
          FROM users WHERE id = $1 FOR UPDATE",
     )
     .bind(user_id)
@@ -1721,14 +1984,14 @@ async fn begin_user_erasure(
             Err(ApiError::not_found("user not found"))
         };
     };
-    let username: String = user.get("username");
+    let email: String = user.get("email");
     let target_role: String = user.get("role");
     if administrator_role != "super_admin" && target_role == "super_admin" {
         return Err(ApiError::not_found("user not found"));
     }
-    if username != confirmed_username {
+    if email != confirmed_email.trim() {
         return Err(ApiError::conflict(
-            "username confirmation does not match exactly",
+            "email confirmation does not match exactly",
         ));
     }
     if user
@@ -1775,13 +2038,13 @@ async fn begin_user_erasure(
 
     sqlx::query(
         "INSERT INTO user_erasure_jobs
-             (user_id, requested_by, requested_username, target_role)
+             (user_id, requested_by, requested_email, target_role)
          VALUES ($1, $2, $3, $4)
          ON CONFLICT (user_id) DO NOTHING",
     )
     .bind(user_id)
     .bind(administrator_id)
-    .bind(&username)
+    .bind(&email)
     .bind(&target_role)
     .execute(&mut *tx)
     .await?;
@@ -1999,7 +2262,7 @@ async fn begin_user_erasure(
              last_checkpoint_attempt_id = NULL,
              last_checkpoint_ownership_generation = NULL,
              last_checkpoint_disposition = NULL,
-             last_checkpoint_has_queued_work = NULL, updated_at = now()
+             last_checkpoint_has_queued_work = NULL
          WHERE owner_id = $1 OR agent_id = ANY($2)",
     )
     .bind(user_id)
@@ -2035,7 +2298,7 @@ async fn load_user_erasure(
     user_id: Uuid,
 ) -> Result<Option<UserErasureDto>, ApiError> {
     if let Some(row) = sqlx::query(
-        "SELECT requested_username, requested_at
+        "SELECT requested_email, requested_at
          FROM user_erasure_jobs WHERE user_id = $1",
     )
     .bind(user_id)
@@ -2044,7 +2307,7 @@ async fn load_user_erasure(
     {
         return Ok(Some(UserErasureDto {
             user_id,
-            username: Some(row.get("requested_username")),
+            email: Some(row.get("requested_email")),
             status: "pending".into(),
             requested_at: row.get("requested_at"),
             completed_at: None,
@@ -2058,7 +2321,7 @@ async fn load_user_erasure(
     .await?
     .map(|erased_at| UserErasureDto {
         user_id,
-        username: None,
+        email: None,
         status: "completed".into(),
         requested_at: erased_at,
         completed_at: Some(erased_at),
@@ -2390,10 +2653,9 @@ async fn auth_providers(
 ) -> Result<Json<AuthProvidersResponse>, ApiError> {
     let policy = load_auth_policy(&state.pool).await?;
     Ok(Json(AuthProvidersResponse {
-        oidc_mock: state.oidc_mock_enabled,
         password_registration_enabled: policy.password_registration_enabled,
         password_login_enabled: policy.password_login_enabled,
-        email_verification_required: policy.email_verification_required,
+        ldap_login_enabled: policy.ldap_login_enabled,
     }))
 }
 
@@ -2411,24 +2673,162 @@ async fn update_auth_policy(
     Json(policy): Json<AuthPolicyDto>,
 ) -> Result<Json<AuthPolicyDto>, ApiError> {
     let user = require_administrator(&state, &headers).await?;
+    if policy.password_registration_enabled && !policy.password_login_enabled {
+        return Err(ApiError::conflict(
+            "password registration requires password login",
+        ));
+    }
+    if !policy.password_login_enabled && !policy.ldap_login_enabled {
+        return Err(ApiError::conflict(
+            "at least one ordinary login method must remain enabled",
+        ));
+    }
+    let mut tx = state.pool.begin().await?;
+    require_administrator_role_tx(&mut tx, user.id).await?;
+    let current = sqlx::query(
+        "SELECT password_login_enabled, ldap_login_enabled
+         FROM auth_policy WHERE singleton = true FOR UPDATE",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if policy.ldap_login_enabled {
+        let configured: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM ldap_configuration WHERE singleton = true)",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if !configured {
+            return Err(ApiError::conflict(
+                "LDAP must be configured before LDAP login is enabled",
+            ));
+        }
+    }
+    let disables_login_method = (current.get::<bool, _>("password_login_enabled")
+        && !policy.password_login_enabled)
+        || (current.get::<bool, _>("ldap_login_enabled") && !policy.ldap_login_enabled);
+    if disables_login_method {
+        let emergency_access_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM users
+                 WHERE role = 'super_admin' AND password IS NOT NULL
+                   AND deletion_requested_at IS NULL
+             )",
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if !emergency_access_exists {
+            return Err(ApiError::conflict(
+                "a Super Administrator with a local password is required",
+            ));
+        }
+    }
     let row = sqlx::query(
         "UPDATE auth_policy
          SET password_registration_enabled = $1,
              password_login_enabled = $2,
-             email_verification_required = $3,
+             ldap_login_enabled = $3,
              updated_by = $4,
              updated_at = now()
          WHERE singleton = true
          RETURNING password_registration_enabled, password_login_enabled,
-                   email_verification_required",
+                   ldap_login_enabled",
     )
     .bind(policy.password_registration_enabled)
     .bind(policy.password_login_enabled)
-    .bind(policy.email_verification_required)
+    .bind(policy.ldap_login_enabled)
     .bind(user.id)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(Json(auth_policy_from_row(row)))
+}
+
+async fn get_ldap_configuration(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Option<LdapConfigurationDto>>, ApiError> {
+    require_administrator(&state, &headers).await?;
+    Ok(Json(load_ldap_configuration(&state.pool).await?))
+}
+
+async fn update_ldap_configuration(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(configuration): Json<LdapConfigurationDto>,
+) -> Result<Json<LdapConfigurationDto>, ApiError> {
+    let administrator = require_administrator(&state, &headers).await?;
+    let configuration = validate_ldap_configuration(configuration)?;
+    let mut tx = state.pool.begin().await?;
+    require_administrator_role_tx(&mut tx, administrator.id).await?;
+    sqlx::query(
+        "INSERT INTO ldap_configuration
+             (singleton, url, security_mode, base_dn, bind_identity_template, user_filter,
+              email_attribute, display_name_attribute, allow_insecure,
+              skip_tls_verify, updated_by, updated_at)
+         VALUES (true, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+         ON CONFLICT (singleton) DO UPDATE
+         SET url = EXCLUDED.url,
+             security_mode = EXCLUDED.security_mode,
+             base_dn = EXCLUDED.base_dn,
+             bind_identity_template = EXCLUDED.bind_identity_template,
+             user_filter = EXCLUDED.user_filter,
+             email_attribute = EXCLUDED.email_attribute,
+             display_name_attribute = EXCLUDED.display_name_attribute,
+             allow_insecure = EXCLUDED.allow_insecure,
+             skip_tls_verify = EXCLUDED.skip_tls_verify,
+             updated_by = EXCLUDED.updated_by,
+             updated_at = now()",
+    )
+    .bind(&configuration.url)
+    .bind(ldap_security_mode_name(configuration.security))
+    .bind(&configuration.base_dn)
+    .bind(&configuration.bind_identity_template)
+    .bind(&configuration.user_filter)
+    .bind(&configuration.email_attribute)
+    .bind(&configuration.display_name_attribute)
+    .bind(configuration.allow_insecure)
+    .bind(configuration.skip_tls_verify)
+    .bind(administrator.id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Json(configuration))
+}
+
+async fn test_ldap_configuration(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<TestLdapConfigurationRequest>,
+) -> Result<Json<TestLdapConfigurationResponse>, ApiError> {
+    require_administrator(&state, &headers).await?;
+    let configuration = validate_ldap_configuration(req.configuration)?;
+    let rate_email =
+        login_rate_email(&req.email).ok_or(ApiError::bad_request("valid email is required"))?;
+    reserve_email_login_attempt(&state.pool, &rate_email).await?;
+    let request_id = Uuid::new_v4();
+    let started_at = Instant::now();
+    let identity = match query_ldap_directory(&configuration, &req.email, &req.password).await {
+        Ok(identity) => identity,
+        Err(error) => {
+            warn!(
+                request_id = %request_id,
+                stage = error.stage,
+                category = error.category,
+                duration_ms = started_at.elapsed().as_millis(),
+                "LDAP configuration test failed"
+            );
+            return Err(error.for_administrator());
+        }
+    };
+    clear_email_login_failures(&state.pool, &rate_email).await?;
+    let display_name = identity
+        .display_name
+        .unwrap_or_else(|| email_local_part(&identity.email).to_owned());
+    Ok(Json(TestLdapConfigurationResponse {
+        email: identity.email,
+        display_name,
+        duration_ms: started_at.elapsed().as_millis().min(i64::MAX as u128) as i64,
+    }))
 }
 
 async fn list_external_platforms(
@@ -2567,97 +2967,6 @@ async fn update_authentication_channel(
     row.map(authentication_channel_from_row)
         .map(Json)
         .ok_or_else(|| ApiError::not_found("authentication channel not found"))
-}
-
-#[derive(Debug, Deserialize)]
-struct OidcMockCallbackQuery {
-    state: String,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct OidcMockStartQuery {
-    email: Option<String>,
-    sub: Option<String>,
-    username: Option<String>,
-}
-
-async fn oidc_mock_start(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<OidcMockStartQuery>,
-) -> Result<Redirect, ApiError> {
-    if !state.oidc_mock_enabled {
-        return Err(ApiError::not_found("oidc mock is disabled"));
-    }
-    require_enabled_authentication_channel(&state.pool, "oidc-mock", "default").await?;
-    let (email, subject) = validate_mock_oidc_identity(
-        query.email.as_deref().unwrap_or("mock-oidc@example.com"),
-        query.sub.as_deref().unwrap_or("mock-user"),
-    )?;
-    let external_username = validate_external_username(query.username.as_deref())?;
-    let state_token = Uuid::new_v4().to_string();
-    let expires_at = Utc::now() + ChronoDuration::minutes(10);
-    // mock 身份与一次性 state 同时落库，callback 查询参数不能覆盖已选择的身份。
-    sqlx::query(
-        "INSERT INTO oidc_login_states
-             (state, expires_at, email, subject, external_username)
-         VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(&state_token)
-    .bind(expires_at)
-    .bind(email)
-    .bind(subject)
-    .bind(external_username)
-    .execute(&state.pool)
-    .await?;
-    let mut params = url::form_urlencoded::Serializer::new(String::new());
-    params.append_pair("state", &state_token);
-    Ok(Redirect::to(&format!(
-        "/api/auth/oidc/mock/callback?{}",
-        params.finish()
-    )))
-}
-
-async fn oidc_mock_callback(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<OidcMockCallbackQuery>,
-) -> Result<impl IntoResponse, ApiError> {
-    if !state.oidc_mock_enabled {
-        return Err(ApiError::not_found("oidc mock is disabled"));
-    }
-    let deleted = sqlx::query(
-        "DELETE FROM oidc_login_states
-         WHERE state = $1 AND expires_at > now()
-         RETURNING email, subject, external_username",
-    )
-    .bind(&query.state)
-    .fetch_optional(&state.pool)
-    .await?;
-    if deleted.is_none() {
-        return Err(ApiError::unauthorized("invalid oidc state"));
-    }
-
-    let deleted = deleted.ok_or(ApiError::unauthorized("invalid oidc state"))?;
-    let email: Option<String> = deleted.get("email");
-    let subject: Option<String> = deleted.get("subject");
-    let external_username: Option<String> = deleted.get("external_username");
-    let (email, subject) = match (email, subject) {
-        (Some(email), Some(subject)) => (email, subject),
-        _ => return Err(ApiError::unauthorized("invalid oidc state")),
-    };
-    let (platform_id, channel_id) =
-        require_enabled_authentication_channel(&state.pool, "oidc-mock", "default").await?;
-    let user = resolve_external_identity(
-        &state.pool,
-        platform_id,
-        channel_id,
-        "default",
-        &subject,
-        Some(&email),
-        external_username.as_deref(),
-    )
-    .await?;
-    let headers = state.session_issuer.issue(&state, user.id).await?;
-    Ok((headers, Redirect::to("/sessions")))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -4849,8 +5158,7 @@ async fn update_agent(
              SET configuration_refresh_revision = GREATEST(
                      sessions.configuration_refresh_revision,
                      agents.execution_config_revision
-                 ),
-                 updated_at = now()
+                 )
              FROM agents
              WHERE sessions.agent_id = agents.id
                AND agents.id = $1
@@ -5058,7 +5366,7 @@ async fn delete_agent(
                  last_checkpoint_attempt_id = NULL,
                  last_checkpoint_ownership_generation = NULL,
                  last_checkpoint_disposition = NULL,
-                 last_checkpoint_has_queued_work = NULL, updated_at = now()
+                 last_checkpoint_has_queued_work = NULL
              WHERE agent_id = $1",
         )
         .bind(agent_id)
@@ -5859,7 +6167,7 @@ async fn list_hub_sessions(
                 current_bundle_created_at, created_at, updated_at
          FROM hub_sessions
          WHERE owner_id = $1
-         ORDER BY updated_at DESC, id DESC",
+         ORDER BY created_at DESC, id DESC",
     )
     .bind(user.id)
     .fetch_all(&state.pool)
@@ -6235,8 +6543,7 @@ async fn drain_runtime(
              last_checkpoint_attempt_id = NULL,
              last_checkpoint_ownership_generation = NULL,
              last_checkpoint_disposition = NULL,
-             last_checkpoint_has_queued_work = NULL,
-             updated_at = now()
+             last_checkpoint_has_queued_work = NULL
          WHERE sessions.runtime_owner_id = $1
            AND NOT EXISTS (
              SELECT 1 FROM runs
@@ -6597,8 +6904,7 @@ async fn force_delete_runtime(
                  saving_history_checkpoint = NULL,
                  saving_ownership_generation = NULL,
                  saving_reason = NULL,
-                 saving_checkpoint_attempt_id = NULL,
-                 updated_at = now()
+                 saving_checkpoint_attempt_id = NULL
              WHERE id = $1 AND runtime_owner_id = $3",
         )
         .bind(session_id)
@@ -6961,8 +7267,7 @@ async fn publish_skill_configuration_change_tx(
          SET configuration_refresh_revision = GREATEST(
                  sessions.configuration_refresh_revision,
                  agents.execution_config_revision
-             ),
-             updated_at = now()
+             )
          FROM agents
          WHERE sessions.agent_id = agents.id
            AND agents.id = ANY($1)
@@ -7471,11 +7776,10 @@ async fn delete_skills_for_user(
         .await?;
         sqlx::query(
             "UPDATE hub_sessions AS sessions
-             SET configuration_refresh_revision = GREATEST(
-                     sessions.configuration_refresh_revision,
-                     agents.execution_config_revision
-                 ),
-                 updated_at = now()
+                 SET configuration_refresh_revision = GREATEST(
+                         sessions.configuration_refresh_revision,
+                         agents.execution_config_revision
+                     )
              FROM agents
              WHERE sessions.agent_id = agents.id
                AND agents.id = ANY($1)
@@ -7930,7 +8234,7 @@ async fn issue_authenticated_client_access(
     headers: &HeaderMap,
     req: CreateWidgetAccessRequest,
 ) -> Result<(ClientAccessResponse, Uuid), ApiError> {
-    let (client_id, client_secret) = widget_client_credentials(&headers)?;
+    let (client_id, client_secret) = widget_client_credentials(headers)?;
     if req.client_instance_id.is_nil() {
         return Err(ApiError::bad_request(
             "valid Client Instance id is required",
@@ -7957,7 +8261,7 @@ async fn issue_authenticated_client_access(
     let profile = normalize_widget_user_profile(WidgetUserProfileDto {
         username: req.username,
         display_name: req.display_name,
-        email: req.email,
+        email: Some(req.email),
         attributes: req.attributes,
     })?;
     require_integration_authentication_channel_tx(
@@ -8251,7 +8555,7 @@ async fn rotate_client_access(
                 "anonymous Client Access has no trusted user profile",
             ));
         }
-        let (client_id, client_secret) = widget_client_credentials(&headers)?;
+        let (client_id, client_secret) = widget_client_credentials(headers)?;
         let app = load_oauth_app_by_client_id_tx(&mut tx, &client_id).await?;
         if Some(app.id) != credential.oauth_app_id
             || !constant_time_eq(
@@ -8938,16 +9242,28 @@ async fn create_integration_session(
             identity_id,
         }
     } else {
-        resolve_external_identity_tx(
+        let email = req
+            .email
+            .as_deref()
+            .ok_or(ApiError::bad_request("trusted email is required"))?;
+        let profile = normalize_widget_user_profile(WidgetUserProfileDto {
+            username: req.username.clone(),
+            display_name: req.display_name.clone(),
+            email: Some(email.to_owned()),
+            attributes: json!({}),
+        })?;
+        let resolved = resolve_external_identity_tx(
             &mut tx,
             principal.external_platform_id,
             principal.authentication_channel_id,
             &tenant_id,
             &external_user_id,
-            None,
-            None,
+            profile.email.as_deref(),
+            profile.username.as_deref(),
         )
-        .await?
+        .await?;
+        update_external_identity_widget_profile_tx(&mut tx, resolved.identity_id, &profile).await?;
+        resolved
     };
     let hub_session_id = Uuid::new_v4();
     sqlx::query(
@@ -9832,7 +10148,7 @@ async fn create_client_tool_continuation_tx(
     }
     let session_updated = sqlx::query(
         "UPDATE hub_sessions
-         SET active_turn_id = NULL, updated_at = now()
+         SET active_turn_id = NULL
          WHERE id = $1 AND (active_turn_id IS NULL OR active_turn_id = $2)",
     )
     .bind(scope.hub_session_id)
@@ -9978,7 +10294,7 @@ async fn fail_client_tool_batch_tx(
     .await?;
     sqlx::query(
         "UPDATE hub_sessions
-         SET active_turn_id = NULL, updated_at = now()
+         SET active_turn_id = NULL
          WHERE id = $1 AND active_turn_id = $2",
     )
     .bind(scope.hub_session_id)
@@ -10289,8 +10605,7 @@ async fn runtime_heartbeat(
                  last_checkpoint_has_queued_work = CASE
                      WHEN $1 = 'saving' AND lifecycle_status <> 'saving' THEN NULL
                      ELSE last_checkpoint_has_queued_work
-                 END,
-                 updated_at = now()
+                 END
              WHERE id = $2 AND runtime_owner_id = $3
                AND ownership_generation = $4
                AND (
@@ -10726,8 +11041,7 @@ async fn runtime_release_session(
              saving_history_checkpoint = NULL,
              saving_ownership_generation = NULL,
              saving_reason = NULL,
-             saving_checkpoint_attempt_id = NULL,
-             updated_at = now()
+             saving_checkpoint_attempt_id = NULL
          WHERE id = $1 AND runtime_owner_id = $2 AND ownership_generation = $3",
     )
     .bind(session_id)
@@ -10829,7 +11143,7 @@ async fn runtime_begin_session_checkpoint(
         {
             sqlx::query(
                 "UPDATE hub_sessions
-                 SET saving_reason = $1, updated_at = now()
+                 SET saving_reason = $1
                  WHERE id = $2",
             )
             .bind(&effective_reason)
@@ -10864,8 +11178,7 @@ async fn runtime_begin_session_checkpoint(
                  last_checkpoint_attempt_id = NULL,
                  last_checkpoint_ownership_generation = NULL,
                  last_checkpoint_disposition = NULL,
-                 last_checkpoint_has_queued_work = NULL,
-                 updated_at = now()
+                 last_checkpoint_has_queued_work = NULL
              WHERE id = $5",
         )
         .bind(history_checkpoint)
@@ -10969,7 +11282,7 @@ async fn runtime_fail_session_checkpoint(
     if runtime_status == "draining" && reason != "drain" {
         sqlx::query(
             "UPDATE hub_sessions
-             SET saving_reason = 'drain', updated_at = now()
+             SET saving_reason = 'drain'
              WHERE id = $1",
         )
         .bind(session_id)
@@ -10992,8 +11305,7 @@ async fn runtime_fail_session_checkpoint(
                  last_checkpoint_attempt_id = $1,
                  last_checkpoint_ownership_generation = $2,
                  last_checkpoint_disposition = 'resume',
-                 last_checkpoint_has_queued_work = $3,
-                 updated_at = now()
+                 last_checkpoint_has_queued_work = $3
              WHERE id = $4",
         )
         .bind(req.checkpoint_attempt_id)
@@ -11522,7 +11834,7 @@ async fn commit_and_finalize_session_bundle(
             "UPDATE hub_sessions
              SET lifecycle_status = 'online', saving_history_checkpoint = NULL,
                  saving_ownership_generation = NULL, saving_reason = NULL,
-                 saving_checkpoint_attempt_id = NULL, updated_at = now()
+                 saving_checkpoint_attempt_id = NULL
              WHERE id = $1 AND runtime_owner_id = $2 AND ownership_generation = $3",
         )
         .bind(session_id)
@@ -11544,8 +11856,7 @@ async fn commit_and_finalize_session_bundle(
              SET runtime_owner_id = NULL,
                  lifecycle_status = CASE WHEN $4 THEN 'waiting_for_runtime' ELSE 'offline' END,
                  saving_history_checkpoint = NULL, saving_ownership_generation = NULL,
-                 saving_reason = NULL, saving_checkpoint_attempt_id = NULL,
-                 updated_at = now()
+                 saving_reason = NULL, saving_checkpoint_attempt_id = NULL
              WHERE id = $1 AND runtime_owner_id = $2 AND ownership_generation = $3",
         )
         .bind(session_id)
@@ -11750,8 +12061,7 @@ async fn commit_session_bundle_metadata_tx(
              current_bundle_producing_engine_version = $7,
              current_bundle_created_at = $8,
              current_bundle_runtime_id = $10,
-             current_bundle_checkpoint_attempt_id = $11,
-             updated_at = now()
+             current_bundle_checkpoint_attempt_id = $11
          WHERE id = $9
            AND runtime_owner_id = $10
            AND ownership_generation = $6
@@ -11835,6 +12145,15 @@ const RUNTIME_CLAIM_SESSION_ELIGIBILITY_SQL: &str = "(($2::bigint > 0
         SELECT 1 FROM runs AS waiting_tool_runs
         WHERE waiting_tool_runs.hub_session_id = hs.id
           AND waiting_tool_runs.status = 'waiting_tool'
+          AND EXISTS (
+            SELECT 1 FROM integration_tool_requests AS pending_tool_requests
+            WHERE pending_tool_requests.run_id = waiting_tool_runs.id
+              AND pending_tool_requests.status = 'pending'
+          )
+          AND NOT (
+            r.source = 'integration:tool_result'
+            AND r.parent_run_id = waiting_tool_runs.id
+          )
       )";
 
 fn runtime_claim_candidate_sql() -> String {
@@ -12021,8 +12340,7 @@ async fn runtime_claim_run(
              lifecycle_status = CASE
                  WHEN runtime_owner_id = $1 THEN lifecycle_status
                  ELSE 'restoring'
-             END,
-             updated_at = now()
+             END
          WHERE id = $2
            AND (runtime_owner_id IS NULL OR runtime_owner_id = $1)
          RETURNING ownership_generation",
@@ -12465,7 +12783,7 @@ async fn runtime_begin_turn(
         }
         let session_updated = sqlx::query(
             "UPDATE hub_sessions
-             SET configuration_fingerprint = $1, updated_at = now()
+             SET configuration_fingerprint = $1
              WHERE id = $2 AND runtime_owner_id = $3 AND ownership_generation = $4
                AND active_turn_id IS NULL",
         )
@@ -12634,8 +12952,7 @@ async fn runtime_complete_session_command(
                          configuration_applied_revision,
                          $1
                      ),
-                     configuration_fingerprint = $2,
-                     updated_at = now()
+                     configuration_fingerprint = $2
                  WHERE id = $3 AND runtime_owner_id = $4
                    AND ownership_generation = $5
                    AND configuration_refresh_revision = $1",
@@ -13151,8 +13468,7 @@ async fn runtime_complete_run(
              last_checkpoint_has_queued_work = CASE
                  WHEN runtimes.status = 'draining' THEN NULL
                  ELSE last_checkpoint_has_queued_work
-             END,
-             updated_at = now()
+             END
          FROM runtimes
          WHERE sessions.id = $1
            AND sessions.runtime_owner_id = runtimes.id
@@ -14641,12 +14957,15 @@ async fn accept_session_message_tx(
         .await?;
     }
 
+    let refresh_session_activity = request.role == "user" && request.message_kind == "message";
     sqlx::query(
         "UPDATE hub_sessions
-         SET history_checkpoint = $1, updated_at = now()
-         WHERE id = $2",
+         SET history_checkpoint = $1,
+             updated_at = CASE WHEN $2 THEN now() ELSE updated_at END
+         WHERE id = $3",
     )
     .bind(message.sequence)
+    .bind(refresh_session_activity)
     .bind(request.session_id)
     .execute(&mut **tx)
     .await?;
@@ -15738,7 +16057,7 @@ async fn insert_run_event_for_active_runtime(
         let session = sqlx::query(
             "UPDATE hub_sessions
              SET native_session_id = $1, active_turn_id = $2,
-                 lifecycle_status = 'online', updated_at = now()
+                 lifecycle_status = 'online'
              WHERE id = $3 AND runtime_owner_id = $4 AND ownership_generation = $5
                AND (native_session_id IS NULL OR native_session_id = $1)
                AND (active_turn_id IS NULL OR active_turn_id = $2)",
@@ -15780,7 +16099,19 @@ async fn insert_run_event_for_active_runtime(
         .execute(&mut **tx)
         .await?;
     }
-    insert_run_event_tx(tx, run_id, event_type, role, content, payload).await
+    let refresh_session_activity = event_type == "message"
+        && role.as_deref() == Some("assistant")
+        && content
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+    let event = insert_run_event_tx(tx, run_id, event_type, role, content, payload).await?;
+    if refresh_session_activity {
+        sqlx::query("UPDATE hub_sessions SET updated_at = now() WHERE id = $1")
+            .bind(session_id)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(event)
 }
 
 async fn lock_owned_session_for_run_tx(
@@ -15886,11 +16217,8 @@ impl AuthProvider for PasswordAuthProvider {
             return Ok(None);
         };
         let policy = load_auth_policy(&state.pool).await?;
-        if !policy.password_login_enabled {
-            return Err(ApiError::forbidden("password login is disabled"));
-        }
         let row = sqlx::query(
-            "SELECT id, username, email, display_name, role, password, email_verified
+            "SELECT id, email, display_name, role, password
              FROM users
              WHERE lower(btrim(email)) = lower(btrim($1))
                AND deletion_requested_at IS NULL",
@@ -15908,8 +16236,9 @@ impl AuthProvider for PasswordAuthProvider {
         if !verify_password(&stored_password, password) {
             return Err(ApiError::unauthorized("invalid credentials"));
         }
-        if policy.email_verification_required && !row.get::<bool, _>("email_verified") {
-            return Err(ApiError::forbidden("email verification is required"));
+        let role: String = row.get("role");
+        if !policy.password_login_enabled && role != "super_admin" {
+            return Err(ApiError::forbidden("password login is disabled"));
         }
         let user_id: Uuid = row.get("id");
         if password_needs_upgrade(&stored_password) {
@@ -15927,10 +16256,9 @@ impl AuthProvider for PasswordAuthProvider {
         Ok(Some(AuthPrincipal::User {
             user: UserDto {
                 id: user_id,
-                username: row.get("username"),
                 email: row.get("email"),
                 display_name: row.get("display_name"),
-                role: row.get("role"),
+                role,
             },
             _provider: "password",
             api_key_id: None,
@@ -16209,6 +16537,22 @@ async fn require_administrator(state: &AppState, headers: &HeaderMap) -> Result<
     Ok(user)
 }
 
+async fn require_administrator_role_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+) -> Result<String, ApiError> {
+    sqlx::query_scalar(
+        "SELECT role FROM users
+         WHERE id = $1 AND role IN ('admin', 'super_admin')
+           AND deletion_requested_at IS NULL
+         FOR UPDATE",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ApiError::forbidden("administrator permission is required"))
+}
+
 async fn require_user_with_api_key_id(
     state: &AppState,
     headers: &HeaderMap,
@@ -16350,7 +16694,7 @@ async fn lock_active_integration_agent_tx(
 
 async fn load_user_by_session(pool: &PgPool, token: &str) -> Result<UserDto, ApiError> {
     let row = sqlx::query(
-        "SELECT u.id, u.username, u.email, u.display_name, u.role
+        "SELECT u.id, u.email, u.display_name, u.role
          FROM sessions s
          JOIN users u ON u.id = s.user_id
          WHERE s.token_hash = $1 AND s.expires_at > now()
@@ -16365,7 +16709,7 @@ async fn load_user_by_session(pool: &PgPool, token: &str) -> Result<UserDto, Api
 
 async fn load_active_user(pool: &PgPool, user_id: Uuid) -> Result<UserDto, ApiError> {
     let row = sqlx::query(
-        "SELECT id, username, email, display_name, role
+        "SELECT id, email, display_name, role
          FROM users WHERE id = $1 AND deletion_requested_at IS NULL",
     )
     .bind(user_id)
@@ -16380,7 +16724,7 @@ async fn load_active_user_tx(
     user_id: Uuid,
 ) -> Result<UserDto, ApiError> {
     let row = sqlx::query(
-        "SELECT id, username, email, display_name, role
+        "SELECT id, email, display_name, role
          FROM users WHERE id = $1 AND deletion_requested_at IS NULL",
     )
     .bind(user_id)
@@ -16417,7 +16761,7 @@ async fn load_user_and_key_id_by_api_key(
     let api_key_id: Uuid = row.get("id");
     let user_id: Uuid = row.get("user_id");
     let row = sqlx::query(
-        "SELECT id, username, email, display_name, role
+        "SELECT id, email, display_name, role
          FROM users WHERE id = $1 AND deletion_requested_at IS NULL",
     )
     .bind(user_id)
@@ -18072,9 +18416,8 @@ fn project_oauth_userinfo(
     }
     OAuthUserInfoDto {
         sub: user.id,
-        username: profile.then(|| user.username.clone()),
         name: profile.then(|| user.display_name.clone()),
-        email: email.then(|| user.email.clone()).flatten(),
+        email: email.then(|| user.email.clone()),
         external_profile: scopes.contains("external_profile").then_some(external),
     }
 }
@@ -19244,7 +19587,7 @@ async fn finalize_tool_request_batch_tx(
     }
     let session_updated = sqlx::query(
         "UPDATE hub_sessions
-         SET active_turn_id = NULL, updated_at = now()
+         SET active_turn_id = NULL
          WHERE id = $1 AND runtime_owner_id = $2 AND ownership_generation = $3
            AND (active_turn_id IS NULL OR active_turn_id = $4)",
     )
@@ -19773,12 +20116,421 @@ fn widget_credential_from_row(row: sqlx::postgres::PgRow) -> Result<WidgetCreden
 async fn load_auth_policy(pool: &PgPool) -> Result<AuthPolicyDto, ApiError> {
     let row = sqlx::query(
         "SELECT password_registration_enabled, password_login_enabled,
-                email_verification_required
+                ldap_login_enabled
          FROM auth_policy WHERE singleton = true",
     )
     .fetch_one(pool)
     .await?;
     Ok(auth_policy_from_row(row))
+}
+
+#[derive(Debug)]
+struct LdapDirectoryIdentity {
+    email: String,
+    display_name: Option<String>,
+}
+
+#[derive(Debug)]
+struct LdapDirectoryFailure {
+    stage: &'static str,
+    category: &'static str,
+    diagnostic: &'static str,
+    unavailable: bool,
+}
+
+impl LdapDirectoryFailure {
+    fn invalid(stage: &'static str, category: &'static str, diagnostic: &'static str) -> Self {
+        Self {
+            stage,
+            category,
+            diagnostic,
+            unavailable: false,
+        }
+    }
+
+    fn unavailable(stage: &'static str, category: &'static str, diagnostic: &'static str) -> Self {
+        Self {
+            stage,
+            category,
+            diagnostic,
+            unavailable: true,
+        }
+    }
+
+    fn for_login(self) -> ApiError {
+        if self.unavailable {
+            ApiError::service_unavailable("LDAP service is temporarily unavailable")
+        } else {
+            ApiError::unauthorized("invalid email or password")
+        }
+    }
+
+    fn for_administrator(self) -> ApiError {
+        let message = format!("LDAP {} failed: {}", self.stage, self.diagnostic);
+        if self.unavailable {
+            ApiError::service_unavailable(message)
+        } else {
+            ApiError::bad_request(message)
+        }
+    }
+}
+
+async fn load_ldap_configuration(pool: &PgPool) -> Result<Option<LdapConfigurationDto>, ApiError> {
+    let row = sqlx::query(
+        "SELECT url, security_mode, base_dn, bind_identity_template, user_filter, email_attribute,
+                display_name_attribute, allow_insecure, skip_tls_verify
+         FROM ldap_configuration WHERE singleton = true",
+    )
+    .fetch_optional(pool)
+    .await?;
+    row.map(ldap_configuration_from_row).transpose()
+}
+
+fn ldap_configuration_from_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<LdapConfigurationDto, ApiError> {
+    let security = match row.get::<String, _>("security_mode").as_str() {
+        "ldaps" => LdapSecurityMode::Ldaps,
+        "starttls" => LdapSecurityMode::Starttls,
+        "plain" => LdapSecurityMode::Plain,
+        _ => return Err(ApiError::internal("stored LDAP security mode is invalid")),
+    };
+    Ok(LdapConfigurationDto {
+        url: row.get("url"),
+        security,
+        base_dn: row.get("base_dn"),
+        bind_identity_template: row.get("bind_identity_template"),
+        user_filter: row.get("user_filter"),
+        email_attribute: row.get("email_attribute"),
+        display_name_attribute: row.get("display_name_attribute"),
+        allow_insecure: row.get("allow_insecure"),
+        skip_tls_verify: row.get("skip_tls_verify"),
+    })
+}
+
+fn ldap_security_mode_name(mode: LdapSecurityMode) -> &'static str {
+    match mode {
+        LdapSecurityMode::Ldaps => "ldaps",
+        LdapSecurityMode::Starttls => "starttls",
+        LdapSecurityMode::Plain => "plain",
+    }
+}
+
+fn validate_ldap_configuration(
+    mut configuration: LdapConfigurationDto,
+) -> Result<LdapConfigurationDto, ApiError> {
+    configuration.url = configuration.url.trim().to_owned();
+    configuration.base_dn = configuration.base_dn.trim().to_owned();
+    configuration.bind_identity_template = configuration.bind_identity_template.trim().to_owned();
+    configuration.user_filter = configuration.user_filter.trim().to_owned();
+    configuration.email_attribute = configuration.email_attribute.trim().to_owned();
+    configuration.display_name_attribute = configuration.display_name_attribute.trim().to_owned();
+    let url =
+        Url::parse(&configuration.url).map_err(|_| ApiError::bad_request("LDAP URL is invalid"))?;
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !(url.path().is_empty() || url.path() == "/")
+    {
+        return Err(ApiError::bad_request(
+            "LDAP URL must contain only a server address without credentials",
+        ));
+    }
+    let expected_scheme = match configuration.security {
+        LdapSecurityMode::Ldaps => "ldaps",
+        LdapSecurityMode::Starttls | LdapSecurityMode::Plain => "ldap",
+    };
+    if url.scheme() != expected_scheme {
+        return Err(ApiError::bad_request(
+            "LDAP URL scheme does not match the security mode",
+        ));
+    }
+    if configuration.security == LdapSecurityMode::Plain && !configuration.allow_insecure {
+        return Err(ApiError::bad_request(
+            "plain LDAP requires explicit insecure transport approval",
+        ));
+    }
+    if configuration.security == LdapSecurityMode::Plain && configuration.skip_tls_verify {
+        return Err(ApiError::bad_request(
+            "TLS verification can only be skipped for TLS connections",
+        ));
+    }
+    if configuration.base_dn.is_empty()
+        || configuration.base_dn.len() > 4096
+        || configuration.base_dn.chars().any(char::is_control)
+    {
+        return Err(ApiError::bad_request("valid LDAP Base DN is required"));
+    }
+    if configuration.bind_identity_template.len() > 4096
+        || configuration
+            .bind_identity_template
+            .matches("{email}")
+            .count()
+            != 1
+        || configuration
+            .bind_identity_template
+            .chars()
+            .any(char::is_control)
+    {
+        return Err(ApiError::bad_request(
+            "LDAP Bind identity template must contain exactly one {email} placeholder",
+        ));
+    }
+    if configuration.user_filter.len() > 4096
+        || configuration.user_filter.matches("{email}").count() != 1
+        || configuration.user_filter.chars().any(char::is_control)
+    {
+        return Err(ApiError::bad_request(
+            "LDAP user filter must contain exactly one {email} placeholder",
+        ));
+    }
+    validate_ldap_attribute_name(&configuration.email_attribute, "email attribute")?;
+    validate_ldap_attribute_name(
+        &configuration.display_name_attribute,
+        "display name attribute",
+    )?;
+    Ok(configuration)
+}
+
+fn validate_ldap_attribute_name(value: &str, field: &str) -> Result<(), ApiError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '.' | '_')
+        })
+    {
+        return Err(ApiError::bad_request(format!(
+            "valid LDAP {field} is required"
+        )));
+    }
+    Ok(())
+}
+
+async fn query_ldap_directory(
+    configuration: &LdapConfigurationDto,
+    email: &str,
+    password: &str,
+) -> Result<LdapDirectoryIdentity, LdapDirectoryFailure> {
+    match tokio::time::timeout(
+        Duration::from_secs(10),
+        query_ldap_directory_once(configuration, email, password),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(LdapDirectoryFailure::unavailable(
+            "timeout",
+            "deadline_exceeded",
+            "the ten-second LDAP deadline was exceeded",
+        )),
+    }
+}
+
+async fn query_ldap_directory_once(
+    configuration: &LdapConfigurationDto,
+    email: &str,
+    password: &str,
+) -> Result<LdapDirectoryIdentity, LdapDirectoryFailure> {
+    let bind_email = normalize_email(email).map_err(|_| {
+        LdapDirectoryFailure::invalid("bind", "invalid_credentials", "email is invalid")
+    })?;
+    if password.is_empty() {
+        return Err(LdapDirectoryFailure::invalid(
+            "bind",
+            "invalid_credentials",
+            "password is empty",
+        ));
+    }
+    let settings = LdapConnSettings::new()
+        .set_conn_timeout(Duration::from_secs(5))
+        .set_starttls(configuration.security == LdapSecurityMode::Starttls)
+        .set_no_tls_verify(configuration.skip_tls_verify);
+    let (connection, mut ldap) = LdapConnAsync::with_settings(settings, &configuration.url)
+        .await
+        .map_err(|_| {
+            LdapDirectoryFailure::unavailable(
+                "connect",
+                "connection_failed",
+                "connection or TLS negotiation failed",
+            )
+        })?;
+    ldap3::drive!(connection);
+    ldap.with_timeout(Duration::from_secs(5));
+    let bind_identity = ldap_bind_identity(&configuration.bind_identity_template, &bind_email);
+    let bind_result = ldap
+        .simple_bind(&bind_identity, password)
+        .await
+        .map_err(|error| classify_ldap_bind_error(&error))?;
+    bind_result
+        .success()
+        .map_err(|error| classify_ldap_bind_error(&error))?;
+
+    let filter = ldap_user_filter(&configuration.user_filter, &bind_email);
+    let search = ldap
+        .search(
+            &configuration.base_dn,
+            Scope::Subtree,
+            &filter,
+            vec![
+                configuration.email_attribute.as_str(),
+                configuration.display_name_attribute.as_str(),
+            ],
+        )
+        .await
+        .map_err(|_| {
+            LdapDirectoryFailure::unavailable("search", "search_failed", "directory search failed")
+        })?;
+    let (entries, _) = search.success().map_err(|_| {
+        LdapDirectoryFailure::unavailable(
+            "search",
+            "search_failed",
+            "directory search was rejected",
+        )
+    })?;
+    let _ = ldap.unbind().await;
+    if entries.len() != 1 {
+        return Err(LdapDirectoryFailure::invalid(
+            "search",
+            "result_cardinality",
+            "directory search did not return exactly one entry",
+        ));
+    }
+    let entry = SearchEntry::construct(entries.into_iter().next().expect("one LDAP entry"));
+    let email_values = ldap_attribute_values(&entry, &configuration.email_attribute)
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if email_values.len() != 1 {
+        return Err(LdapDirectoryFailure::invalid(
+            "mapping",
+            "email_attribute",
+            "email attribute must contain exactly one value",
+        ));
+    }
+    let authoritative_email = normalize_email(email_values[0]).map_err(|_| {
+        LdapDirectoryFailure::invalid(
+            "mapping",
+            "email_attribute",
+            "email attribute is not a valid email address",
+        )
+    })?;
+    let display_name = ldap_attribute_values(&entry, &configuration.display_name_attribute)
+        .and_then(|values| {
+            values
+                .iter()
+                .map(|value| value.trim())
+                .find(|value| !value.is_empty())
+        })
+        .map(|value| normalize_display_name(Some(value), &authoritative_email))
+        .transpose()
+        .map_err(|_| {
+            LdapDirectoryFailure::invalid(
+                "mapping",
+                "display_name_attribute",
+                "display name attribute is invalid",
+            )
+        })?;
+    Ok(LdapDirectoryIdentity {
+        email: authoritative_email,
+        display_name,
+    })
+}
+
+fn ldap_user_filter(template: &str, email: &str) -> String {
+    let escaped_email = ldap_escape(email);
+    template.replacen("{email}", escaped_email.as_ref(), 1)
+}
+
+fn ldap_bind_identity(template: &str, email: &str) -> String {
+    let escaped_email = dn_escape(email);
+    template.replacen("{email}", escaped_email.as_ref(), 1)
+}
+
+fn classify_ldap_bind_error(error: &LdapError) -> LdapDirectoryFailure {
+    if matches!(error, LdapError::LdapResult { result } if matches!(result.rc, 32 | 34 | 49)) {
+        LdapDirectoryFailure::invalid(
+            "bind",
+            "invalid_credentials",
+            "directory rejected the credentials",
+        )
+    } else {
+        LdapDirectoryFailure::unavailable("bind", "bind_failed", "LDAP Bind failed")
+    }
+}
+
+fn ldap_attribute_values<'a>(entry: &'a SearchEntry, name: &str) -> Option<&'a Vec<String>> {
+    entry
+        .attrs
+        .iter()
+        .find(|(attribute, _)| attribute.eq_ignore_ascii_case(name))
+        .map(|(_, values)| values)
+}
+
+async fn resolve_ldap_user(
+    pool: &PgPool,
+    identity: &LdapDirectoryIdentity,
+) -> Result<UserDto, ApiError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('agent-hub-user-create', 0))")
+        .execute(&mut *tx)
+        .await?;
+    let row = sqlx::query(
+        "SELECT id, email, display_name, role, deletion_requested_at
+         FROM users WHERE lower(btrim(email)) = lower(btrim($1))
+         FOR UPDATE",
+    )
+    .bind(&identity.email)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let user = match row {
+        Some(row)
+            if row
+                .get::<Option<DateTime<Utc>>, _>("deletion_requested_at")
+                .is_some() =>
+        {
+            return Err(ApiError::unauthorized("invalid email or password"));
+        }
+        Some(row) => {
+            if let Some(display_name) = identity.display_name.as_deref() {
+                let row = sqlx::query(
+                    "UPDATE users SET display_name = $1 WHERE id = $2
+                     RETURNING id, email, display_name, role",
+                )
+                .bind(display_name)
+                .bind(row.get::<Uuid, _>("id"))
+                .fetch_one(&mut *tx)
+                .await?;
+                user_from_row(row)
+            } else {
+                user_from_row(row)
+            }
+        }
+        None => {
+            create_hub_user_in_locked_tx(
+                &mut tx,
+                &identity.email,
+                identity.display_name.as_deref(),
+                None,
+            )
+            .await?
+        }
+    };
+    tx.commit().await?;
+    Ok(user)
+}
+
+fn email_local_part(email: &str) -> &str {
+    email
+        .split_once('@')
+        .map(|(local, _)| local)
+        .unwrap_or(email)
 }
 
 async fn require_external_platform(pool: &PgPool, platform_id: Uuid) -> Result<(), ApiError> {
@@ -19793,54 +20545,6 @@ async fn require_external_platform(pool: &PgPool, platform_id: Uuid) -> Result<(
     Ok(())
 }
 
-async fn ensure_mock_oidc_channel(pool: &PgPool) -> anyhow::Result<()> {
-    let mut tx = pool.begin().await?;
-    sqlx::query(
-        "INSERT INTO external_platforms (id, key, name)
-         VALUES ($1, 'oidc-mock', 'Mock OIDC')
-         ON CONFLICT (key) DO NOTHING",
-    )
-    .bind(Uuid::new_v4())
-    .execute(&mut *tx)
-    .await?;
-    let platform_id: Uuid =
-        sqlx::query_scalar("SELECT id FROM external_platforms WHERE key = 'oidc-mock'")
-            .fetch_one(&mut *tx)
-            .await?;
-    sqlx::query(
-        "INSERT INTO authentication_channels
-             (id, platform_id, key, name, enabled, trusted_email)
-         VALUES ($1, $2, 'default', 'Default', true, true)
-         ON CONFLICT (platform_id, key) DO NOTHING",
-    )
-    .bind(Uuid::new_v4())
-    .bind(platform_id)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(())
-}
-
-async fn require_enabled_authentication_channel(
-    pool: &PgPool,
-    platform_key: &str,
-    channel_key: &str,
-) -> Result<(Uuid, Uuid), ApiError> {
-    let row = sqlx::query(
-        "SELECT p.id AS platform_id, c.id AS channel_id
-         FROM external_platforms p
-         JOIN authentication_channels c ON c.platform_id = p.id
-         WHERE p.key = $1 AND c.key = $2
-           AND c.enabled = true AND c.trusted_email = true",
-    )
-    .bind(platform_key)
-    .bind(channel_key)
-    .fetch_optional(pool)
-    .await?;
-    row.map(|row| (row.get("platform_id"), row.get("channel_id")))
-        .ok_or_else(|| ApiError::forbidden("authentication channel is unavailable"))
-}
-
 fn validate_external_username(value: Option<&str>) -> Result<Option<String>, ApiError> {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
@@ -19851,6 +20555,12 @@ fn validate_external_username(value: Option<&str>) -> Result<Option<String>, Api
     Ok(Some(value.to_owned()))
 }
 
+struct ResolvedExternalIdentity {
+    user: UserDto,
+    identity_id: Uuid,
+}
+
+#[cfg(test)]
 async fn resolve_external_identity(
     pool: &PgPool,
     platform_id: Uuid,
@@ -19873,11 +20583,6 @@ async fn resolve_external_identity(
     .await?;
     tx.commit().await?;
     Ok(resolved.user)
-}
-
-struct ResolvedExternalIdentity {
-    user: UserDto,
-    identity_id: Uuid,
 }
 
 async fn resolve_external_identity_tx(
@@ -19918,7 +20623,7 @@ async fn resolve_external_identity_tx(
     }
 
     let existing = sqlx::query(
-        "SELECT i.id AS identity_id, u.id, u.username, u.email, u.display_name, u.role,
+        "SELECT i.id AS identity_id, u.id, u.email, u.display_name, u.role,
                 u.deletion_requested_at
          FROM external_identities i
          JOIN users u ON u.id = i.user_id
@@ -19961,7 +20666,7 @@ async fn resolve_external_identity_tx(
 
     let matched_user = if let Some(email) = email.as_deref() {
         let row = sqlx::query(
-            "SELECT id, username, email, display_name, role, deletion_requested_at
+            "SELECT id, email, display_name, role, deletion_requested_at
              FROM users
              WHERE lower(btrim(email)) = lower(btrim($1))
              FOR UPDATE",
@@ -19977,13 +20682,7 @@ async fn resolve_external_identity_tx(
             {
                 return Err(ApiError::forbidden("user account is unavailable"));
             }
-            Some(row) => {
-                sqlx::query("UPDATE users SET email_verified = true WHERE id = $1")
-                    .bind(row.get::<Uuid, _>("id"))
-                    .execute(&mut **tx)
-                    .await?;
-                Some(user_from_row(row))
-            }
+            Some(row) => Some(user_from_row(row)),
             None => None,
         }
     } else {
@@ -19992,14 +20691,10 @@ async fn resolve_external_identity_tx(
     let user = match matched_user {
         Some(user) => user,
         None => {
-            create_hub_user_in_locked_tx(
-                tx,
-                email.as_deref(),
-                external_username.as_deref(),
-                None,
-                true,
-            )
-            .await?
+            let email = email
+                .as_deref()
+                .ok_or(ApiError::bad_request("trusted email is required"))?;
+            create_hub_user_in_locked_tx(tx, email, None, None).await?
         }
     };
     let identity_id = Uuid::new_v4();
@@ -20048,123 +20743,136 @@ async fn update_external_identity_widget_profile_tx(
     Ok(())
 }
 
-async fn create_hub_user(
+async fn create_password_registration_user(
     pool: &PgPool,
-    email: Option<&str>,
-    external_username: Option<&str>,
+    email: &str,
+    display_name: Option<&str>,
     password: Option<&str>,
-    email_verified: bool,
 ) -> Result<UserDto, ApiError> {
+    let email = normalize_email(email)?;
+    let display_name = normalize_display_name(display_name, &email)?;
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('agent-hub-user-create', 0))")
         .execute(&mut *tx)
         .await?;
-    if let Some(email) = email {
-        let email_exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS (
-                 SELECT 1 FROM users WHERE lower(btrim(email)) = lower(btrim($1))
-             )",
-        )
-        .bind(email)
-        .fetch_one(&mut *tx)
-        .await?;
-        if email_exists {
-            return Err(ApiError::conflict("email already exists"));
-        }
+    let registration_enabled: bool = sqlx::query_scalar(
+        "SELECT password_registration_enabled
+         FROM auth_policy WHERE singleton = true FOR UPDATE",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if !registration_enabled {
+        return Err(ApiError::forbidden("password registration is disabled"));
     }
-    let user =
-        create_hub_user_in_locked_tx(&mut tx, email, external_username, password, email_verified)
-            .await?;
+    let email_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM users WHERE lower(btrim(email)) = lower(btrim($1))
+         )",
+    )
+    .bind(&email)
+    .fetch_one(&mut *tx)
+    .await?;
+    if email_exists {
+        return Err(ApiError::conflict("email already exists"));
+    }
+    let user = create_hub_user_in_locked_tx(&mut tx, &email, Some(&display_name), password).await?;
+    tx.commit().await?;
+    Ok(user)
+}
+
+#[cfg(test)]
+async fn create_hub_user(
+    pool: &PgPool,
+    email: Option<&str>,
+    display_name: Option<&str>,
+    password: Option<&str>,
+    _test_identity_is_trusted: bool,
+) -> Result<UserDto, ApiError> {
+    let email = email.ok_or(ApiError::bad_request("trusted email is required"))?;
+    let email = normalize_email(email)?;
+    let display_name = normalize_display_name(display_name, &email)?;
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('agent-hub-user-create', 0))")
+        .execute(&mut *tx)
+        .await?;
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM users WHERE lower(btrim(email)) = lower(btrim($1))
+         )",
+    )
+    .bind(&email)
+    .fetch_one(&mut *tx)
+    .await?;
+    if exists {
+        return Err(ApiError::conflict("email already exists"));
+    }
+    let user = create_hub_user_in_locked_tx(&mut tx, &email, Some(&display_name), password).await?;
     tx.commit().await?;
     Ok(user)
 }
 
 async fn create_hub_user_in_locked_tx(
     tx: &mut Transaction<'_, Postgres>,
-    email: Option<&str>,
-    username_source: Option<&str>,
+    email: &str,
+    display_name: Option<&str>,
     password: Option<&str>,
-    email_verified: bool,
 ) -> Result<UserDto, ApiError> {
+    let email = normalize_email(email)?;
+    let display_name = normalize_display_name(display_name, &email)?;
     let user_id = Uuid::new_v4();
-    let username_base = username_base(username_source, email);
-    let username = allocate_username(tx, &username_base, user_id).await?;
     let first_user: bool = sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM users)")
         .fetch_one(&mut **tx)
         .await?;
     let role = if first_user { "super_admin" } else { "member" };
     sqlx::query(
-        "INSERT INTO users
-             (id, username, email, password, email_verified, display_name, role)
-         VALUES ($1, $2, $3, $4, $5, $2, $6)",
+        "INSERT INTO users (id, email, password, display_name, role)
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(user_id)
-    .bind(&username)
-    .bind(email)
+    .bind(&email)
     .bind(password)
-    .bind(email_verified)
+    .bind(&display_name)
     .bind(role)
     .execute(&mut **tx)
     .await?;
+    if first_user {
+        sqlx::query(
+            "UPDATE auth_policy
+             SET password_registration_enabled = false, updated_at = now()
+             WHERE singleton = true",
+        )
+        .execute(&mut **tx)
+        .await?;
+    }
     Ok(UserDto {
         id: user_id,
-        username: username.clone(),
-        email: email.map(str::to_owned),
-        display_name: username,
+        email,
+        display_name,
         role: role.to_owned(),
     })
 }
 
-async fn allocate_username(
-    tx: &mut Transaction<'_, Postgres>,
-    base: &str,
-    user_id: Uuid,
-) -> Result<String, ApiError> {
-    let compact_id = user_id.simple().to_string();
-    let candidates = [
-        base.to_owned(),
-        format!("{}-{}", &base[..base.len().min(48)], &compact_id[..8]),
-        format!("{}-{}", &base[..base.len().min(48)], &compact_id[..12]),
-        format!("{}-{compact_id}", &base[..base.len().min(31)]),
-    ];
-    for candidate in candidates {
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE username = $1)")
-                .bind(&candidate)
-                .fetch_one(&mut **tx)
-                .await?;
-        if !exists {
-            return Ok(candidate);
-        }
+fn normalize_display_name(value: Option<&str>, email: &str) -> Result<String, ApiError> {
+    let fallback = email
+        .split_once('@')
+        .map(|(local, _)| local)
+        .unwrap_or(email);
+    let display_name = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback);
+    if display_name.len() > 128 || display_name.chars().any(char::is_control) {
+        return Err(ApiError::bad_request("valid display name is required"));
     }
-    Err(ApiError::conflict("username allocation conflict"))
+    Ok(display_name.to_owned())
 }
 
-fn username_base(external_username: Option<&str>, email: Option<&str>) -> String {
-    let source = external_username
-        .filter(|value| !value.trim().is_empty())
-        .map(str::trim)
-        .or_else(|| email.and_then(|value| value.split_once('@').map(|(local, _)| local.trim())))
-        .unwrap_or("user");
-    let mut username = String::new();
-    let mut separator = false;
-    for character in source.chars().flat_map(char::to_lowercase) {
-        if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
-            username.push(character);
-            separator = false;
-        } else if !separator && !username.is_empty() {
-            username.push('-');
-            separator = true;
-        }
-        if username.len() >= 48 {
-            break;
-        }
-    }
-    let username = username.trim_matches(['.', '_', '-']);
-    if username.is_empty() {
-        "user".into()
-    } else {
-        username.to_owned()
+fn validate_user_role(value: &str) -> Result<&'static str, ApiError> {
+    match value.trim() {
+        "member" => Ok("member"),
+        "admin" => Ok("admin"),
+        "super_admin" => Ok("super_admin"),
+        _ => Err(ApiError::bad_request("unsupported user role")),
     }
 }
 
@@ -20179,6 +20887,167 @@ fn normalize_email(email: &str) -> Result<String, ApiError> {
         return Err(ApiError::bad_request("valid email is required"));
     }
     Ok(email)
+}
+
+fn login_rate_email(email: &str) -> Option<String> {
+    let email = email.trim().to_ascii_lowercase();
+    (!email.is_empty() && email.len() <= 254 && !email.chars().any(char::is_whitespace))
+        .then_some(email)
+}
+
+fn login_source_ip(
+    headers: &HeaderMap,
+    peer_ip: Option<IpAddr>,
+    trusted_proxy_cidrs: Option<&[IpNet]>,
+) -> IpAddr {
+    let trust_forwarded = match trusted_proxy_cidrs {
+        None => true,
+        Some(cidrs) => peer_ip.is_some_and(|ip| cidrs.iter().any(|cidr| cidr.contains(&ip))),
+    };
+    if trust_forwarded {
+        if let Some(ip) = forwarded_client_ip(headers) {
+            return ip;
+        }
+    }
+    peer_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+}
+
+fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    headers
+        .get(header::FORWARDED)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_forwarded_header)
+        .or_else(|| {
+            headers
+                .get("x-forwarded-for")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(',').next())
+                .and_then(parse_forwarded_ip)
+        })
+}
+
+fn parse_forwarded_header(value: &str) -> Option<IpAddr> {
+    value
+        .split(',')
+        .next()?
+        .split(';')
+        .filter_map(|part| part.trim().split_once('='))
+        .find(|(name, _)| name.eq_ignore_ascii_case("for"))
+        .and_then(|(_, value)| parse_forwarded_ip(value))
+}
+
+fn parse_forwarded_ip(value: &str) -> Option<IpAddr> {
+    let value = value.trim().trim_matches('"');
+    if value.eq_ignore_ascii_case("unknown") || value.starts_with('_') {
+        return None;
+    }
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    if let Ok(address) = value.parse::<SocketAddr>() {
+        return Some(address.ip());
+    }
+    if let Some(rest) = value.strip_prefix('[') {
+        let end = rest.find(']')?;
+        return rest[..end].parse().ok();
+    }
+    None
+}
+
+async fn record_ip_login_attempt(pool: &PgPool, source_ip: IpAddr) -> Result<(), ApiError> {
+    cleanup_expired_login_throttles(pool).await?;
+    let row = sqlx::query(
+        "INSERT INTO login_ip_attempts
+             (source_ip, attempts, window_started_at, updated_at)
+         VALUES ($1::inet, 1, now(), now())
+         ON CONFLICT (source_ip) DO UPDATE
+         SET attempts = CASE
+                 WHEN login_ip_attempts.window_started_at <= now() - interval '5 minutes'
+                 THEN 1 ELSE login_ip_attempts.attempts + 1 END,
+             window_started_at = CASE
+                 WHEN login_ip_attempts.window_started_at <= now() - interval '5 minutes'
+                 THEN now() ELSE login_ip_attempts.window_started_at END,
+             updated_at = now()
+         RETURNING attempts, window_started_at",
+    )
+    .bind(source_ip.to_string())
+    .fetch_one(pool)
+    .await?;
+    let attempts: i32 = row.get("attempts");
+    if attempts > 20 {
+        return Err(ApiError::too_many_requests(
+            "too many login attempts",
+            retry_after_seconds(row.get("window_started_at")),
+        ));
+    }
+    Ok(())
+}
+
+async fn reserve_email_login_attempt(pool: &PgPool, email: &str) -> Result<(), ApiError> {
+    cleanup_expired_login_throttles(pool).await?;
+    // Reserve before credential verification so concurrent requests cannot all pass the limit check.
+    let row = sqlx::query(
+        "INSERT INTO login_email_failures
+             (normalized_email, failed_attempts, window_started_at, updated_at)
+         VALUES ($1, 1, now(), now())
+         ON CONFLICT (normalized_email) DO UPDATE
+         SET failed_attempts = CASE
+                 WHEN login_email_failures.window_started_at <= now() - interval '5 minutes'
+                 THEN 1 ELSE LEAST(login_email_failures.failed_attempts, 3) + 1 END,
+             window_started_at = CASE
+                 WHEN login_email_failures.window_started_at <= now() - interval '5 minutes'
+                 THEN now() ELSE login_email_failures.window_started_at END,
+             updated_at = now()
+         RETURNING failed_attempts, window_started_at",
+    )
+    .bind(email)
+    .fetch_one(pool)
+    .await?;
+    if row.get::<i32, _>("failed_attempts") > 3 {
+        return Err(ApiError::too_many_requests(
+            "too many failed login attempts",
+            retry_after_seconds(row.get("window_started_at")),
+        ));
+    }
+    Ok(())
+}
+
+async fn clear_email_login_failures(pool: &PgPool, email: &str) -> Result<(), ApiError> {
+    sqlx::query("DELETE FROM login_email_failures WHERE normalized_email = $1")
+        .bind(email.trim().to_ascii_lowercase())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn cleanup_expired_login_throttles(pool: &PgPool) -> Result<(), ApiError> {
+    sqlx::query(
+        "DELETE FROM login_email_failures
+         WHERE ctid IN (
+             SELECT ctid FROM login_email_failures
+             WHERE window_started_at <= now() - interval '1 hour'
+             ORDER BY window_started_at LIMIT 100
+         )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "DELETE FROM login_ip_attempts
+         WHERE ctid IN (
+             SELECT ctid FROM login_ip_attempts
+             WHERE window_started_at <= now() - interval '1 hour'
+             ORDER BY window_started_at LIMIT 100
+         )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn retry_after_seconds(window_started_at: DateTime<Utc>) -> u64 {
+    (window_started_at + ChronoDuration::minutes(5) - Utc::now())
+        .num_seconds()
+        .max(1) as u64
 }
 
 fn validate_identity_key(value: &str, field: &str) -> Result<String, ApiError> {
@@ -20204,6 +21073,27 @@ fn validate_identity_name(value: &str, field: &str) -> Result<String, ApiError> 
 
 fn model_proxy_timeout_from_env() -> anyhow::Result<Duration> {
     parse_model_proxy_timeout(env::var("HUB_MODEL_PROXY_TIMEOUT_SECS").ok().as_deref())
+}
+
+fn trusted_proxy_cidrs_from_env() -> anyhow::Result<Option<Vec<IpNet>>> {
+    parse_trusted_proxy_cidrs(env::var("TRUSTED_PROXY_CIDRS").ok().as_deref())
+}
+
+fn parse_trusted_proxy_cidrs(value: Option<&str>) -> anyhow::Result<Option<Vec<IpNet>>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let cidrs = value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<IpNet>()
+                .with_context(|| format!("invalid TRUSTED_PROXY_CIDRS entry: {value}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(cidrs))
 }
 
 fn model_gateway_config_from_env() -> anyhow::Result<(String, Arc<Zeroizing<String>>)> {
@@ -20497,23 +21387,6 @@ fn password_needs_upgrade(stored: &str) -> bool {
     !stored.starts_with("$argon2id$")
 }
 
-fn validate_mock_oidc_identity(email: &str, subject: &str) -> Result<(String, String), ApiError> {
-    let email = email.trim().to_ascii_lowercase();
-    let subject = subject.trim().to_owned();
-    let valid_email = email.len() <= 254
-        && !email.chars().any(char::is_whitespace)
-        && email
-            .split_once('@')
-            .is_some_and(|(local, domain)| !local.is_empty() && domain.contains('.'));
-    if !valid_email {
-        return Err(ApiError::bad_request("valid mock oidc email is required"));
-    }
-    if subject.is_empty() || subject.len() > 128 || subject.chars().any(char::is_control) {
-        return Err(ApiError::bad_request("valid mock oidc subject is required"));
-    }
-    Ok((email, subject))
-}
-
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
@@ -20528,13 +21401,19 @@ async fn seed_dev_user(pool: &PgPool) -> anyhow::Result<()> {
     let user_id = Uuid::new_v4();
     let password = password_hash("admin123")?;
     sqlx::query(
-        "INSERT INTO users
-             (id, username, email, password, email_verified, display_name, role)
-         VALUES ($1, 'admin', 'admin@example.com', $2, true, 'Admin', 'super_admin')
+        "INSERT INTO users (id, email, password, display_name, role)
+         VALUES ($1, 'admin@example.com', $2, 'Admin', 'super_admin')
          ON CONFLICT DO NOTHING",
     )
     .bind(user_id)
     .bind(password)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "UPDATE auth_policy
+         SET password_registration_enabled = false, updated_at = now()
+         WHERE singleton = true",
+    )
     .execute(pool)
     .await?;
     Ok(())
@@ -20632,7 +21511,6 @@ async fn ensure_dev_runtime_enrollment_token(pool: &PgPool, token: &str) -> anyh
 fn user_from_row(row: sqlx::postgres::PgRow) -> UserDto {
     UserDto {
         id: row.get("id"),
-        username: row.get("username"),
         email: row.get("email"),
         display_name: row.get("display_name"),
         role: row.get("role"),
@@ -20643,12 +21521,10 @@ fn admin_user_detail_from_row(row: sqlx::postgres::PgRow) -> AdminUserDetailDto 
     AdminUserDetailDto {
         user: UserDto {
             id: row.get("id"),
-            username: row.get("username"),
             email: row.get("email"),
             display_name: row.get("display_name"),
             role: row.get("role"),
         },
-        email_verified: row.get("email_verified"),
         has_password: row.get("has_password"),
         created_at: row.get("created_at"),
     }
@@ -20658,7 +21534,7 @@ fn auth_policy_from_row(row: sqlx::postgres::PgRow) -> AuthPolicyDto {
     AuthPolicyDto {
         password_registration_enabled: row.get("password_registration_enabled"),
         password_login_enabled: row.get("password_login_enabled"),
-        email_verification_required: row.get("email_verification_required"),
+        ldap_login_enabled: row.get("ldap_login_enabled"),
     }
 }
 
@@ -21077,6 +21953,7 @@ fn cookie_header(token: &str, secure: bool) -> Result<HeaderValue, ApiError> {
 struct ApiError {
     status: StatusCode,
     message: String,
+    retry_after_seconds: Option<u64>,
 }
 
 impl ApiError {
@@ -21084,6 +21961,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
+            retry_after_seconds: None,
         }
     }
 
@@ -21091,6 +21969,7 @@ impl ApiError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             message: message.into(),
+            retry_after_seconds: None,
         }
     }
 
@@ -21098,6 +21977,7 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             message: message.into(),
+            retry_after_seconds: None,
         }
     }
 
@@ -21105,6 +21985,7 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             message: message.into(),
+            retry_after_seconds: None,
         }
     }
 
@@ -21112,6 +21993,7 @@ impl ApiError {
         Self {
             status: StatusCode::GONE,
             message: message.into(),
+            retry_after_seconds: None,
         }
     }
 
@@ -21119,6 +22001,7 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             message: message.into(),
+            retry_after_seconds: None,
         }
     }
 
@@ -21126,6 +22009,7 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
+            retry_after_seconds: None,
         }
     }
 
@@ -21133,6 +22017,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_GATEWAY,
             message: message.into(),
+            retry_after_seconds: None,
         }
     }
 
@@ -21140,6 +22025,7 @@ impl ApiError {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: message.into(),
+            retry_after_seconds: None,
         }
     }
 
@@ -21147,13 +22033,28 @@ impl ApiError {
         Self {
             status: StatusCode::GATEWAY_TIMEOUT,
             message: message.into(),
+            retry_after_seconds: None,
+        }
+    }
+
+    fn too_many_requests(message: impl Into<String>, retry_after_seconds: u64) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: message.into(),
+            retry_after_seconds: Some(retry_after_seconds),
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        (self.status, Json(json!({ "error": self.message }))).into_response()
+        let mut response = (self.status, Json(json!({ "error": self.message }))).into_response();
+        if let Some(retry_after_seconds) = self.retry_after_seconds {
+            if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }
 
@@ -21848,11 +22749,16 @@ mod tests {
         for path in [
             "/api/auth/register",
             "/api/auth/login",
+            "/api/auth/ldap/login",
             "/api/auth/logout",
             "/api/auth/me",
+            "/api/users/me",
             "/api/auth/providers",
-            "/api/auth/oidc/mock/start",
-            "/api/auth/oidc/mock/callback",
+            "/api/admin/auth-policy",
+            "/api/admin/ldap-config",
+            "/api/admin/ldap-config/test",
+            "/api/admin/users",
+            "/api/admin/users/{user_id}",
             "/api/auth/api-keys/{api_key_id}/renew",
             "/api/model-connections",
             "/api/model-connections/options",
@@ -22178,17 +23084,11 @@ mod tests {
         );
         assert_eq!(
             document["components"]["schemas"]["EraseUserRequest"]["required"],
-            json!(["username"])
+            json!(["email"])
         );
         assert_eq!(
             document["components"]["schemas"]["UserErasure"]["required"],
-            json!([
-                "user_id",
-                "username",
-                "status",
-                "requested_at",
-                "completed_at"
-            ])
+            json!(["user_id", "email", "status", "requested_at", "completed_at"])
         );
         assert!(
             document["components"]["schemas"]["CompleteRunRequest"]["properties"]["status"]["enum"]
@@ -22421,8 +23321,8 @@ mod tests {
                 "/api/admin/external-platforms/{platform_id}",
                 &["patch"][..],
             ),
-            ("/api/admin/users", &["get"][..]),
-            ("/api/admin/users/{user_id}", &["get"][..]),
+            ("/api/admin/users", &["get", "post"][..]),
+            ("/api/admin/users/{user_id}", &["get", "patch"][..]),
             ("/api/admin/users/{user_id}/password", &["put"][..]),
             ("/api/admin/users/{user_id}/role", &["put"][..]),
             ("/api/skills", &["get", "post", "delete"][..]),
@@ -22583,18 +23483,23 @@ mod tests {
         for path in [
             "/api/auth/register",
             "/api/auth/login",
+            "/api/auth/ldap/login",
             "/api/auth/logout",
             "/api/auth/me",
+            "/api/users/me",
             "/api/auth/providers",
-            "/api/auth/oidc/mock/start",
-            "/api/auth/oidc/mock/callback",
             "/api/auth/api-keys",
             "/api/auth/api-keys/{api_key_id}",
             "/api/auth/api-keys/{api_key_id}/renew",
             "/api/admin/auth-policy",
+            "/api/admin/ldap-config",
+            "/api/admin/ldap-config/test",
             "/api/admin/users",
             "/api/admin/users/{user_id}",
             "/api/admin/users/{user_id}/password",
+            "/api/admin/users/{user_id}/role",
+            "/api/admin/users/{user_id}/erase",
+            "/api/admin/user-erasures",
             "/api/admin/external-platforms",
             "/api/admin/external-platforms/{platform_id}",
             "/api/admin/external-platforms/{platform_id}/authentication-channels",
@@ -22607,12 +23512,34 @@ mod tests {
         }
         assert_eq!(
             document["components"]["schemas"]["User"]["properties"]["email"]["type"],
-            json!(["string", "null"])
+            json!("string")
         );
         assert!(document["components"]["schemas"]["User"]["required"]
             .as_array()
             .unwrap()
-            .contains(&json!("username")));
+            .contains(&json!("email")));
+        assert!(document["components"]["schemas"]["User"]["properties"]
+            .get("username")
+            .is_none());
+        assert!(document["paths"].get("/api/auth/oidc/mock/start").is_none());
+        assert!(document["paths"]
+            .get("/api/auth/oidc/mock/callback")
+            .is_none());
+        assert!(
+            document["components"]["schemas"]["AuthProvidersResponse"]["properties"]
+                .get("oidc_mock")
+                .is_none()
+        );
+        assert!(
+            document["components"]["schemas"]["AuthProvidersResponse"]["properties"]
+                .get("email_verification_required")
+                .is_none()
+        );
+        for path in ["/api/auth/register", "/api/auth/login"] {
+            assert!(document["paths"][path]["post"]["responses"]
+                .get("403")
+                .is_some());
+        }
 
         let now = Utc::now();
         let run = RunDto {
@@ -23092,13 +24019,116 @@ mod tests {
     }
 
     #[test]
-    fn mock_oidc_identity_is_controlled_and_validated() {
+    fn ldap_configuration_and_forwarded_source_are_validated() {
+        let configuration = LdapConfigurationDto {
+            url: "ldap://directory.example:389".into(),
+            security: LdapSecurityMode::Starttls,
+            base_dn: "OU=People,DC=example,DC=com".into(),
+            bind_identity_template: "uid={email},OU=People,DC=example,DC=com".into(),
+            user_filter: "(userPrincipalName={email})".into(),
+            email_attribute: "mail".into(),
+            display_name_attribute: "displayName".into(),
+            allow_insecure: false,
+            skip_tls_verify: false,
+        };
+        assert!(validate_ldap_configuration(configuration.clone()).is_ok());
+        assert!(validate_ldap_configuration(LdapConfigurationDto {
+            bind_identity_template: "uid=missing,OU=People,DC=example,DC=com".into(),
+            ..configuration.clone()
+        })
+        .is_err());
+        assert!(validate_ldap_configuration(LdapConfigurationDto {
+            bind_identity_template: "uid={email},CN={email},DC=example,DC=com".into(),
+            ..configuration.clone()
+        })
+        .is_err());
+        assert!(validate_ldap_configuration(LdapConfigurationDto {
+            security: LdapSecurityMode::Plain,
+            ..configuration
+        })
+        .is_err());
         assert_eq!(
-            validate_mock_oidc_identity(" Member@Example.com ", " member-1 ").unwrap(),
-            ("member@example.com".into(), "member-1".into())
+            ldap_bind_identity(
+                "uid={email},OU=People,DC=example,DC=com",
+                "special+user@example.com",
+            ),
+            r"uid=special\2buser@example.com,OU=People,DC=example,DC=com"
         );
-        assert!(validate_mock_oidc_identity("not-an-email", "member").is_err());
-        assert!(validate_mock_oidc_identity("member@example.com", "\n").is_err());
+        assert_eq!(
+            ldap_user_filter(
+                "(userPrincipalName={email})",
+                "special*(user)\\name@example.com",
+            ),
+            r"(userPrincipalName=special\2a\28user\29\5cname@example.com)"
+        );
+        let invalid = LdapDirectoryFailure::invalid(
+            "search",
+            "result_cardinality",
+            "directory search did not return exactly one entry",
+        )
+        .for_login();
+        assert_eq!(invalid.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(invalid.message, "invalid email or password");
+        let unavailable =
+            LdapDirectoryFailure::unavailable("connect", "connection_failed", "connection failed")
+                .for_login();
+        assert_eq!(unavailable.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            unavailable.message,
+            "LDAP service is temporarily unavailable"
+        );
+        for rc in [32, 34, 49] {
+            let error = LdapError::LdapResult {
+                result: ldap3::result::LdapResult {
+                    rc,
+                    matched: String::new(),
+                    text: String::new(),
+                    refs: Vec::new(),
+                    ctrls: Vec::new(),
+                },
+            };
+            let classified = classify_ldap_bind_error(&error);
+            assert!(!classified.unavailable);
+            assert_eq!(classified.category, "invalid_credentials");
+        }
+        assert_eq!(
+            parse_forwarded_header("for=192.0.2.10;proto=https"),
+            Some("192.0.2.10".parse().unwrap())
+        );
+        assert_eq!(
+            parse_forwarded_header("for=\"[2001:db8::1]:443\""),
+            Some("2001:db8::1".parse().unwrap())
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::FORWARDED,
+            HeaderValue::from_static("for=198.51.100.10;proto=https"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-forwarded-for"),
+            HeaderValue::from_static("198.51.100.11, 10.0.0.1"),
+        );
+        let peer: IpAddr = "192.0.2.20".parse().unwrap();
+        assert_eq!(
+            login_source_ip(&headers, Some(peer), None),
+            "198.51.100.10".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            login_source_ip(
+                &headers,
+                Some(peer),
+                Some(&["192.0.2.0/24".parse().unwrap()]),
+            ),
+            "198.51.100.10".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            login_source_ip(
+                &headers,
+                Some(peer),
+                Some(&["203.0.113.0/24".parse().unwrap()]),
+            ),
+            peer
+        );
     }
 
     #[test]
@@ -23159,8 +24189,7 @@ mod tests {
 
         let user = UserDto {
             id: Uuid::new_v4(),
-            username: "hub-user".into(),
-            email: Some("hub@example.com".into()),
+            email: "hub@example.com".into(),
             display_name: "Hub User".into(),
             role: "member".into(),
         };
@@ -23178,7 +24207,6 @@ mod tests {
             external.clone(),
         );
         assert_eq!(external_only.sub, user.id);
-        assert_eq!(external_only.username, None);
         assert_eq!(external_only.email, None);
         assert_eq!(external_only.external_profile.unwrap().email, None);
 
@@ -23191,7 +24219,6 @@ mod tests {
             &user,
             external,
         );
-        assert_eq!(full.username.as_deref(), Some("hub-user"));
         assert_eq!(full.name.as_deref(), Some("Hub User"));
         assert_eq!(full.email.as_deref(), Some("hub@example.com"));
         assert_eq!(
@@ -23275,6 +24302,22 @@ mod tests {
         assert!(parse_model_proxy_timeout(Some("0")).is_err());
         assert!(parse_model_proxy_timeout(Some("901")).is_err());
         assert!(parse_model_proxy_timeout(Some("forever")).is_err());
+    }
+
+    #[test]
+    fn trusted_proxy_cidr_configuration_treats_empty_as_unconfigured() {
+        assert_eq!(parse_trusted_proxy_cidrs(None).unwrap(), None);
+        assert_eq!(parse_trusted_proxy_cidrs(Some("   ")).unwrap(), None);
+        assert_eq!(
+            parse_trusted_proxy_cidrs(Some("192.0.2.0/24, 2001:db8::/32"))
+                .unwrap()
+                .unwrap(),
+            vec![
+                "192.0.2.0/24".parse::<IpNet>().unwrap(),
+                "2001:db8::/32".parse::<IpNet>().unwrap(),
+            ]
+        );
+        assert!(parse_trusted_proxy_cidrs(Some("not-a-cidr")).is_err());
     }
 
     #[test]
@@ -28193,7 +29236,7 @@ mod tests {
             .unwrap()
             .0;
         assert_eq!(userinfo.sub, user.id);
-        assert_eq!(userinfo.username.as_deref(), Some("authorize-profile"));
+        assert_eq!(userinfo.name.as_deref(), Some("authorize-profile"));
         assert!(userinfo.email.is_none());
         assert!(userinfo.external_profile.unwrap().email.is_none());
 
@@ -28239,6 +29282,24 @@ mod tests {
         )
         .await
         .unwrap();
+        let model_connection_id = Uuid::new_v4();
+        let model_id = format!("client-credentials-model-{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO model_connections
+                 (id, scope, name, base_url, api_type, allowed_model_ids,
+                  api_key_ciphertext, api_key_nonce, created_by)
+             VALUES ($1, 'global', 'Client Credentials Model',
+                     'https://models.example.test', 'openai_responses',
+                     $2, $3, $4, $5)",
+        )
+        .bind(model_connection_id)
+        .bind(vec![model_id.clone()])
+        .bind(vec![1_u8; 17])
+        .bind(vec![2_u8; 12])
+        .bind(owner.id)
+        .execute(&pool)
+        .await
+        .unwrap();
         let agent_id = Uuid::new_v4();
         let platform_id = Uuid::new_v4();
         let channel_id = Uuid::new_v4();
@@ -28247,11 +29308,15 @@ mod tests {
         let token = "aho_client_credentials_multi_identity";
         let foreign_token = "aho_client_credentials_foreign_app";
         sqlx::query(
-            "INSERT INTO agents (id, owner_id, name, instructions, visibility)
-             VALUES ($1, $2, 'Client Credentials Agent', 'test', 'private')",
+            "INSERT INTO agents
+                 (id, owner_id, name, instructions, visibility,
+                  model_connection_id, model_id)
+             VALUES ($1, $2, 'Client Credentials Agent', 'test', 'private', $3, $4)",
         )
         .bind(agent_id)
         .bind(owner.id)
+        .bind(model_connection_id)
+        .bind(&model_id)
         .execute(&pool)
         .await
         .unwrap();
@@ -28366,10 +29431,30 @@ mod tests {
         assert_eq!(app_principal.subject_user_id, None);
         assert_eq!(app_principal.origin_tenant_id, None);
         assert_eq!(app_principal.origin_external_identity_id, None);
+        for email in [None, Some("not-an-email")] {
+            let error = create_integration_session(
+                State(state.clone()),
+                bearer_headers(&app_token),
+                Json(CreateIntegrationSessionRequest {
+                    agent_id,
+                    external_user_id: format!("invalid-email-{}", Uuid::new_v4().simple()),
+                    tenant_id: Some("tenant-invalid".into()),
+                    username: None,
+                    display_name: None,
+                    email: email.map(str::to_owned),
+                    tools: json!([]),
+                    metadata: json!({}),
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        }
         let mut created = Vec::new();
-        for (tenant_id, external_user_id) in [
-            ("tenant-one", "external-one"),
-            ("tenant-two", "external-two"),
+        for (tenant_id, external_user_id, email) in [
+            ("tenant-one", "external-one", "shared@example.com"),
+            ("tenant-two", "external-two", "external-two@example.com"),
+            ("tenant-three", "external-three", "shared@example.com"),
         ] {
             created.push(
                 create_integration_session(
@@ -28379,6 +29464,9 @@ mod tests {
                         agent_id,
                         external_user_id: external_user_id.into(),
                         tenant_id: Some(tenant_id.into()),
+                        username: Some(format!("{external_user_id}-name")),
+                        display_name: Some(format!("{external_user_id} Display")),
+                        email: Some(email.into()),
                         tools: json!([]),
                         metadata: json!({}),
                     }),
@@ -28393,8 +29481,14 @@ mod tests {
             created[1].external_identity_id
         );
         assert_ne!(created[0].owner_id, created[1].owner_id);
+        assert_ne!(
+            created[0].external_identity_id,
+            created[2].external_identity_id
+        );
+        assert_eq!(created[0].owner_id, created[2].owner_id);
         assert_eq!(created[0].tenant_id, "tenant-one");
         assert_eq!(created[1].tenant_id, "tenant-two");
+        assert_eq!(created[2].tenant_id, "tenant-three");
         for session in &created {
             let loaded = get_integration_session(
                 State(state.clone()),
@@ -28796,6 +29890,89 @@ mod tests {
                 .await
                 .unwrap(),
             1
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn hub_session_list_orders_by_creation_time(pool: PgPool) {
+        let owner = create_hub_user(
+            &pool,
+            Some("session-order-owner@example.com"),
+            None,
+            Some("password-hash"),
+            true,
+        )
+        .await
+        .unwrap();
+        let session_token = "session-order-owner-token";
+        sqlx::query(
+            "INSERT INTO sessions (token_hash, user_id, expires_at)
+             VALUES ($1, $2, now() + interval '1 hour')",
+        )
+        .bind(sha256_hex(session_token))
+        .bind(owner.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let agent_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO agents (id, owner_id, name, instructions, visibility)
+             VALUES ($1, $2, 'Session Order Agent', 'test', 'private')",
+        )
+        .bind(agent_id)
+        .bind(owner.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let oldest_id = Uuid::new_v4();
+        let middle_id = Uuid::new_v4();
+        let newest_id = Uuid::new_v4();
+        for (id, created_at, updated_at) in [
+            (oldest_id, "2026-07-17T08:00:00Z", "2026-07-17T14:00:00Z"),
+            (newest_id, "2026-07-17T12:00:00Z", "2026-07-17T09:00:00Z"),
+            (middle_id, "2026-07-17T10:00:00Z", "2026-07-17T13:00:00Z"),
+        ] {
+            sqlx::query(
+                "INSERT INTO hub_sessions
+                     (id, owner_id, agent_id, origin_kind, lifecycle_status,
+                      created_at, updated_at)
+                 VALUES ($1, $2, $3, 'hub_native', 'offline', $4, $5)",
+            )
+            .bind(id)
+            .bind(owner.id)
+            .bind(agent_id)
+            .bind(created_at.parse::<DateTime<Utc>>().unwrap())
+            .bind(updated_at.parse::<DateTime<Utc>>().unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let app = build_router(test_state_with_browser_session_auth(pool));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/sessions")
+                    .header(header::COOKIE, format!("agent_hub_session={session_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let sessions: Vec<HubSessionDto> = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            sessions
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            vec![newest_id, middle_id, oldest_id]
         );
     }
 
@@ -30432,6 +31609,114 @@ mod tests {
             runtime_claim_run_state(&fixture.state.pool, next_run_id).await,
             ("pending".into(), None, None)
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn session_updated_at_tracks_only_conversation_input_and_output(pool: PgPool) {
+        let fixture = integration_runtime_fixture(pool).await;
+        let baseline = "2026-07-17T08:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        sqlx::query("UPDATE hub_sessions SET updated_at = $1 WHERE id = $2")
+            .bind(baseline)
+            .bind(fixture.hub_session_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+
+        let _ = runtime_append_event(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(fixture.run_id),
+            runtime_write_generation(
+                1,
+                AppendRunEventRequest {
+                    event_type: "reasoning".into(),
+                    role: Some("assistant".into()),
+                    content: Some("technical progress".into()),
+                    payload: json!({ "source": "pi" }),
+                    waiting_tool: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let after_technical_event: DateTime<Utc> =
+            sqlx::query_scalar("SELECT updated_at FROM hub_sessions WHERE id = $1")
+                .bind(fixture.hub_session_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(after_technical_event, baseline);
+
+        let _ = runtime_append_event(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(fixture.run_id),
+            runtime_write_generation(
+                1,
+                AppendRunEventRequest {
+                    event_type: "message".into(),
+                    role: Some("assistant".into()),
+                    content: Some("final assistant output".into()),
+                    payload: json!({ "source": "pi", "stop_reason": "stop" }),
+                    waiting_tool: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let after_output: DateTime<Utc> =
+            sqlx::query_scalar("SELECT updated_at FROM hub_sessions WHERE id = $1")
+                .bind(fixture.hub_session_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert!(after_output > baseline);
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let _ = runtime_complete_run(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(fixture.run_id),
+            runtime_write_generation(
+                1,
+                CompleteRunRequest {
+                    status: "completed".into(),
+                    native_session_id: Some("activity-native-session".into()),
+                    work_dir_ref: Some("activity-workdir".into()),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let after_completion: DateTime<Utc> =
+            sqlx::query_scalar("SELECT updated_at FROM hub_sessions WHERE id = $1")
+                .bind(fixture.hub_session_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(after_completion, after_output);
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let _ = create_integration_message(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.integration_token),
+            Path(fixture.session_id),
+            Json(CreateIntegrationMessageRequest {
+                content: "new user input".into(),
+                attachments: json!([]),
+                client_message_key: Some("activity-user-input".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        let after_input: DateTime<Utc> =
+            sqlx::query_scalar("SELECT updated_at FROM hub_sessions WHERE id = $1")
+                .bind(fixture.hub_session_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert!(after_input > after_completion);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -33290,8 +34575,8 @@ mod tests {
         let member_token = create_user_session_with_role(&pool, "member").await;
         let admin_token = create_user_session_with_role(&pool, "admin").await;
         let state = Arc::new(test_state_with_browser_session_auth(pool));
-        let (super_id, super_username): (Uuid, String) = sqlx::query_as(
-            "SELECT users.id, users.username
+        let (super_id, super_email): (Uuid, String) = sqlx::query_as(
+            "SELECT users.id, users.email
              FROM sessions JOIN users ON users.id = sessions.user_id
              WHERE sessions.token_hash = $1",
         )
@@ -33311,7 +34596,7 @@ mod tests {
             session_headers(&admin_token),
             Path(super_id),
             Json(EraseUserRequest {
-                username: super_username.clone(),
+                email: super_email.clone(),
             }),
         )
         .await
@@ -33321,9 +34606,7 @@ mod tests {
             State(state.clone()),
             session_headers(&super_token),
             Path(super_id),
-            Json(EraseUserRequest {
-                username: super_username,
-            }),
+            Json(EraseUserRequest { email: super_email }),
         )
         .await
         .unwrap_err();
@@ -33452,8 +34735,8 @@ mod tests {
     ) {
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
         let claimed = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-        let (target_id, target_username, target_email): (Uuid, String, String) = sqlx::query_as(
-            "SELECT users.id, users.username, users.email
+        let (target_id, target_email): (Uuid, String) = sqlx::query_as(
+            "SELECT users.id, users.email
              FROM users
              JOIN hub_sessions ON hub_sessions.owner_id = users.id
              WHERE hub_sessions.id = $1",
@@ -33495,7 +34778,7 @@ mod tests {
             session_headers(&member_token),
             Path(target_id),
             Json(EraseUserRequest {
-                username: target_username.clone(),
+                email: target_email.clone(),
             }),
         )
         .await
@@ -33506,19 +34789,19 @@ mod tests {
             session_headers(&admin_token),
             Path(target_id),
             Json(EraseUserRequest {
-                username: "wrong-user".into(),
+                email: "wrong@example.com".into(),
             }),
         )
         .await
         .unwrap_err();
         assert_eq!(admin_confirmation.status, StatusCode::CONFLICT);
-        for confirmation in ["wrong-user".to_owned(), target_username.to_uppercase()] {
+        for confirmation in ["wrong@example.com".to_owned(), target_email.to_uppercase()] {
             let error = erase_user(
                 State(state.clone()),
                 session_headers(&super_token),
                 Path(target_id),
                 Json(EraseUserRequest {
-                    username: confirmation,
+                    email: confirmation,
                 }),
             )
             .await
@@ -33532,7 +34815,7 @@ mod tests {
                 session_headers(&super_token),
                 Path(target_id),
                 Json(EraseUserRequest {
-                    username: target_username.clone(),
+                    email: target_email.clone(),
                 }),
             )
             .await
@@ -33626,10 +34909,10 @@ mod tests {
         .await
         .unwrap();
         let suffix = &target_id.simple().to_string()[..8];
-        let target_username = format!("erase-{suffix}");
+        let target_display_name = format!("erase-{suffix}");
         let target_email = format!("erase-{suffix}@example.com");
-        sqlx::query("UPDATE users SET username = $1, email = $2 WHERE id = $3")
-            .bind(&target_username)
+        sqlx::query("UPDATE users SET display_name = $1, email = $2 WHERE id = $3")
+            .bind(&target_display_name)
             .bind(&target_email)
             .bind(target_id)
             .execute(&fixture.state.pool)
@@ -33754,7 +35037,7 @@ mod tests {
             session_headers(&super_token),
             Path(target_id),
             Json(EraseUserRequest {
-                username: target_username.clone(),
+                email: target_email.clone(),
             }),
         )
         .await
@@ -33895,14 +35178,14 @@ mod tests {
         let replacement = create_hub_user(
             &fixture.state.pool,
             Some(&target_email),
-            Some(&target_username),
+            Some(&target_display_name),
             Some("replacement-password"),
             true,
         )
         .await
         .unwrap();
-        assert_eq!(replacement.username, target_username);
-        assert_eq!(replacement.email.as_deref(), Some(target_email.as_str()));
+        assert_eq!(replacement.display_name, target_display_name);
+        assert_eq!(replacement.email, target_email);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -37402,11 +38685,10 @@ mod tests {
         let foreign_unique = Uuid::new_v4().simple().to_string();
         sqlx::query(
             "INSERT INTO users
-                 (id, username, email, password, email_verified, display_name, role)
-             VALUES ($1, $2, $3, 'unused', true, 'Deletion Impact Foreign Owner', 'member')",
+                 (id, email, password, display_name, role)
+             VALUES ($1, $2, 'unused', 'Deletion Impact Foreign Owner', 'member')",
         )
         .bind(foreign_owner_id)
-        .bind(format!("deletion-impact-{foreign_unique}"))
         .bind(format!("deletion-impact-{foreign_unique}@example.com"))
         .execute(&fixture.state.pool)
         .await
@@ -38081,12 +39363,11 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn identity_schema_enforces_username_and_optional_credentials(pool: PgPool) {
+    async fn identity_schema_enforces_required_email_and_optional_password(pool: PgPool) {
         let password = password_hash("existing-password").unwrap();
         sqlx::query(
-            "INSERT INTO users
-                 (id, username, email, password, email_verified, display_name, role)
-             VALUES ($1, 'existing', 'Existing@Example.com', $2, true, 'Existing', 'member')",
+            "INSERT INTO users (id, email, password, display_name, role)
+             VALUES ($1, 'Existing@Example.com', $2, 'Existing', 'member')",
         )
         .bind(Uuid::new_v4())
         .bind(&password)
@@ -38094,9 +39375,8 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO users
-                 (id, username, email, password, email_verified, display_name, role)
-             VALUES ($1, 'external', NULL, NULL, true, 'External', 'member')",
+            "INSERT INTO users (id, email, password, display_name, role)
+             VALUES ($1, 'external@example.com', NULL, 'External', 'member')",
         )
         .bind(Uuid::new_v4())
         .execute(&pool)
@@ -38104,26 +39384,24 @@ mod tests {
         .unwrap();
 
         let stored: Option<String> =
-            sqlx::query_scalar("SELECT password FROM users WHERE username = 'existing'")
+            sqlx::query_scalar("SELECT password FROM users WHERE email = 'Existing@Example.com'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
         assert_eq!(stored.as_deref(), Some(password.as_str()));
 
-        let duplicate_username = sqlx::query(
-            "INSERT INTO users
-                 (id, username, email, password, email_verified, display_name, role)
-             VALUES ($1, 'existing', 'different@example.com', NULL, true, 'Duplicate', 'member')",
+        let missing_email = sqlx::query(
+            "INSERT INTO users (id, email, display_name, role)
+             VALUES ($1, NULL, 'Missing', 'member')",
         )
         .bind(Uuid::new_v4())
         .execute(&pool)
         .await;
-        assert!(duplicate_username.is_err());
+        assert!(missing_email.is_err());
 
         let duplicate_normalized_email = sqlx::query(
-            "INSERT INTO users
-                 (id, username, email, password, email_verified, display_name, role)
-             VALUES ($1, 'other', ' existing@example.com ', NULL, true, 'Other', 'member')",
+            "INSERT INTO users (id, email, password, display_name, role)
+             VALUES ($1, ' existing@example.com ', NULL, 'Other', 'member')",
         )
         .bind(Uuid::new_v4())
         .execute(&pool)
@@ -38150,16 +39428,17 @@ mod tests {
             .await
             .unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["user"]["username"], "first.user");
         assert_eq!(body["user"]["email"], "first.user@example.com");
+        assert_eq!(body["user"]["display_name"], "first.user");
         assert_eq!(body["user"]["role"], "super_admin");
-        assert_eq!(body["verification_required"], false);
+        assert!(body.get("verification_required").is_none());
 
-        let stored: (String, Option<String>) =
-            sqlx::query_as("SELECT role, password FROM users WHERE username = 'first.user'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let stored: (String, Option<String>) = sqlx::query_as(
+            "SELECT role, password FROM users WHERE email = 'first.user@example.com'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(stored.0, "super_admin");
         let stored_password = stored.1.unwrap();
         assert!(stored_password.starts_with("$argon2id$"));
@@ -38177,7 +39456,7 @@ mod tests {
             ))
             .unwrap();
         let duplicate = app.oneshot(duplicate).await.unwrap();
-        assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+        assert_eq!(duplicate.status(), StatusCode::FORBIDDEN);
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users")
                 .fetch_one(&pool)
@@ -38186,7 +39465,7 @@ mod tests {
             1
         );
         let unchanged: Option<String> =
-            sqlx::query_scalar("SELECT password FROM users WHERE username = 'first.user'")
+            sqlx::query_scalar("SELECT password FROM users WHERE email = 'first.user@example.com'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -38194,22 +39473,30 @@ mod tests {
             unchanged.as_deref().unwrap(),
             "correct horse battery staple"
         ));
+        assert!(!sqlx::query_scalar::<_, bool>(
+            "SELECT password_registration_enabled FROM auth_policy WHERE singleton = true",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap());
     }
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn identity_password_policies_are_independent_and_null_password_is_safe(pool: PgPool) {
         let password = password_hash("existing password").unwrap();
+        let emergency_password = password_hash("emergency password").unwrap();
         sqlx::query(
-            "INSERT INTO users
-                 (id, username, email, password, email_verified, display_name, role)
-             VALUES ($1, 'existing', 'existing@example.com', $2, true, 'Existing', 'member'),
-                    ($3, 'external-only', 'external-only@example.com', NULL, true,
-                     'External Only', 'member')",
+            "INSERT INTO users (id, email, password, display_name, role)
+             VALUES ($1, 'existing@example.com', $2, 'Existing', 'member'),
+                    ($3, 'external-only@example.com', NULL, 'External Only', 'member'),
+                    ($4, 'emergency@example.com', $5, 'Emergency', 'super_admin')",
         )
         .bind(Uuid::new_v4())
         .bind(password)
         .bind(Uuid::new_v4())
+        .bind(Uuid::new_v4())
+        .bind(emergency_password)
         .execute(&pool)
         .await
         .unwrap();
@@ -38255,8 +39542,7 @@ mod tests {
 
         sqlx::query(
             "UPDATE auth_policy
-             SET password_login_enabled = false,
-                 email_verification_required = true
+             SET password_login_enabled = false, ldap_login_enabled = true
              WHERE singleton = true",
         )
         .execute(&pool)
@@ -38266,19 +39552,27 @@ mod tests {
             app.clone().oneshot(login_request()).await.unwrap().status(),
             StatusCode::FORBIDDEN
         );
-
-        sqlx::query("UPDATE auth_policy SET password_login_enabled = true WHERE singleton = true")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE users SET email_verified = false WHERE username = 'existing'")
-            .execute(&pool)
-            .await
+        let emergency_login = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/api/auth/login")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"email":"emergency@example.com","password":"emergency password"}"#,
+            ))
             .unwrap();
         assert_eq!(
-            app.clone().oneshot(login_request()).await.unwrap().status(),
-            StatusCode::FORBIDDEN
+            app.clone().oneshot(emergency_login).await.unwrap().status(),
+            StatusCode::OK
         );
+
+        sqlx::query(
+            "UPDATE auth_policy
+             SET password_login_enabled = true, ldap_login_enabled = false
+             WHERE singleton = true",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let no_password = axum::http::Request::builder()
             .method(Method::POST)
@@ -38305,17 +39599,183 @@ mod tests {
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["password_registration_enabled"], false);
         assert_eq!(body["password_login_enabled"], true);
-        assert_eq!(body["email_verification_required"], true);
+        assert_eq!(body["ldap_login_enabled"], false);
     }
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn identity_trusted_external_login_binds_stably_and_derives_username(pool: PgPool) {
+    async fn concurrent_email_login_failures_enforce_the_fourth_attempt(pool: PgPool) {
+        let email = "concurrent-limit@example.com";
+        let password = password_hash("correct password").unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, email, password, display_name, role)
+             VALUES ($1, $2, $3, 'Concurrent Limit User', 'member')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(email)
+        .bind(password)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let app = build_router({
+            let mut state = test_state_with_pool(pool.clone());
+            state.auth_providers = vec![Arc::new(PasswordAuthProvider)];
+            state
+        });
+        let login_request = |password: &'static str| {
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri("/api/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"email":"{email}","password":"{password}"}}"#
+                )))
+                .unwrap()
+        };
+        let responses = futures_util::future::join_all(
+            (0..4).map(|_| app.clone().oneshot(login_request("wrong password"))),
+        )
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| response.status() == StatusCode::UNAUTHORIZED)
+                .count(),
+            3
+        );
+        let limited = responses
+            .iter()
+            .filter(|response| response.status() == StatusCode::TOO_MANY_REQUESTS)
+            .collect::<Vec<_>>();
+        assert_eq!(limited.len(), 1);
+        assert!(limited[0].headers().get(header::RETRY_AFTER).is_some());
+
+        let correct_while_limited = app
+            .clone()
+            .oneshot(login_request("correct password"))
+            .await
+            .unwrap();
+        assert_eq!(
+            correct_while_limited.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        let persisted: i32 = sqlx::query_scalar(
+            "SELECT failed_attempts FROM login_email_failures
+             WHERE normalized_email = $1",
+        )
+        .bind(email)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(persisted, 4);
+
+        sqlx::query(
+            "UPDATE login_email_failures
+             SET window_started_at = now() - interval '6 minutes'
+             WHERE normalized_email = $1",
+        )
+        .bind(email)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            app.oneshot(login_request("correct password"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM login_email_failures WHERE normalized_email = $1"
+            )
+            .bind(email)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn login_throttles_persist_reset_expire_and_limit_concurrent_ips(pool: PgPool) {
+        let email = "persistent-limit@example.com";
+        for _ in 0..3 {
+            reserve_email_login_attempt(&pool, email).await.unwrap();
+        }
+        let restarted =
+            postgres_test_pool_with_application_name(&pool, "login-throttle-restart").await;
+        let limited = reserve_email_login_attempt(&restarted, email)
+            .await
+            .unwrap_err();
+        assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(limited.retry_after_seconds.is_some_and(|value| value > 0));
+        clear_email_login_failures(&restarted, email).await.unwrap();
+        reserve_email_login_attempt(&pool, email).await.unwrap();
+        clear_email_login_failures(&pool, email).await.unwrap();
+
+        reserve_email_login_attempt(&pool, email).await.unwrap();
+        sqlx::query(
+            "UPDATE login_email_failures
+             SET window_started_at = now() - interval '61 minutes'
+             WHERE normalized_email = $1",
+        )
+        .bind(email)
+        .execute(&pool)
+        .await
+        .unwrap();
+        cleanup_expired_login_throttles(&pool).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM login_email_failures WHERE normalized_email = $1",
+            )
+            .bind(email)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+
+        let source_ip: IpAddr = "198.51.100.25".parse().unwrap();
+        let attempts = futures_util::future::join_all(
+            (0..21).map(|_| record_ip_login_attempt(&pool, source_ip)),
+        )
+        .await;
+        assert_eq!(attempts.iter().filter(|result| result.is_ok()).count(), 20);
+        let limited = attempts
+            .into_iter()
+            .filter_map(Result::err)
+            .collect::<Vec<_>>();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(limited[0]
+            .retry_after_seconds
+            .is_some_and(|value| value > 0));
+        assert_eq!(
+            sqlx::query_scalar::<_, i32>(
+                "SELECT attempts FROM login_ip_attempts WHERE source_ip = $1::inet",
+            )
+            .bind(source_ip.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            21
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn identity_trusted_external_login_binds_stably_by_email(pool: PgPool) {
         let platform_id = Uuid::new_v4();
         let channel_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO external_platforms (id, key, name)
-             VALUES ($1, 'oidc-mock', 'Mock OIDC')",
+             VALUES ($1, 'trusted-test', 'Trusted Test')",
         )
         .bind(platform_id)
         .execute(&pool)
@@ -38331,29 +39791,20 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let app = build_router(test_state_with_pool(pool.clone()));
-
-        let first = complete_mock_oidc_login(
-            app.clone(),
-            "external-one@example.com",
+        let first = resolve_external_identity(
+            &pool,
+            platform_id,
+            channel_id,
+            "default",
             "identity-1",
+            Some("external-one@example.com"),
             Some("External User"),
         )
-        .await;
-        assert_eq!(first.status(), StatusCode::SEE_OTHER);
-        let first_user: (Uuid, String, String, Option<String>) = sqlx::query_as(
-            "SELECT u.id, u.username, u.role, u.password
-             FROM users u
-             JOIN external_identities i ON i.user_id = u.id
-             WHERE i.platform_id = $1 AND i.external_user_id = 'identity-1'",
-        )
-        .bind(platform_id)
-        .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(first_user.1, "external-user");
-        assert_eq!(first_user.2, "super_admin");
-        assert_eq!(first_user.3, None);
+        assert_eq!(first.email, "external-one@example.com");
+        assert_eq!(first.display_name, "external-one");
+        assert_eq!(first.role, "super_admin");
 
         let password = password_hash("bound password").unwrap();
         let bound_user = create_hub_user(
@@ -38365,23 +39816,18 @@ mod tests {
         )
         .await
         .unwrap();
-        let bound = complete_mock_oidc_login(
-            app.clone(),
-            " BOUND@EXAMPLE.COM ",
+        let bound = resolve_external_identity(
+            &pool,
+            platform_id,
+            channel_id,
+            "default",
             "identity-2",
+            Some(" BOUND@EXAMPLE.COM "),
             Some("Different External Name"),
         )
-        .await;
-        assert_eq!(bound.status(), StatusCode::SEE_OTHER);
-        let bound_identity_user: Uuid = sqlx::query_scalar(
-            "SELECT user_id FROM external_identities
-             WHERE platform_id = $1 AND external_user_id = 'identity-2'",
-        )
-        .bind(platform_id)
-        .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(bound_identity_user, bound_user.id);
+        assert_eq!(bound.id, bound_user.id);
         let bound_password: Option<String> =
             sqlx::query_scalar("SELECT password FROM users WHERE id = $1")
                 .bind(bound_user.id)
@@ -38389,75 +39835,33 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(bound_password.as_deref(), Some(password.as_str()));
-        assert!(
-            sqlx::query_scalar::<_, bool>("SELECT email_verified FROM users WHERE id = $1")
-                .bind(bound_user.id)
-                .fetch_one(&pool)
-                .await
-                .unwrap()
-        );
-
-        let changed = complete_mock_oidc_login(
-            app.clone(),
-            "bound@example.com",
+        let changed = resolve_external_identity(
+            &pool,
+            platform_id,
+            channel_id,
+            "default",
             "identity-1",
+            Some("changed@example.com"),
             Some("Renamed Externally"),
         )
-        .await;
-        assert_eq!(changed.status(), StatusCode::SEE_OTHER);
-        let stable_user: Uuid = sqlx::query_scalar(
-            "SELECT user_id FROM external_identities
-             WHERE platform_id = $1 AND external_user_id = 'identity-1'",
-        )
-        .bind(platform_id)
-        .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(stable_user, first_user.0);
-        assert_eq!(
-            sqlx::query_scalar::<_, String>("SELECT username FROM users WHERE id = $1")
-                .bind(first_user.0)
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
-            "external-user"
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, Option<String>>("SELECT email FROM users WHERE id = $1")
-                .bind(first_user.0)
-                .fetch_one(&pool)
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("external-one@example.com")
-        );
+        assert_eq!(changed.id, first.id);
+        assert_eq!(changed.email, "external-one@example.com");
 
-        let collision = complete_mock_oidc_login(
-            app,
-            "external-three@example.com",
+        let collision = resolve_external_identity(
+            &pool,
+            platform_id,
+            channel_id,
+            "default",
             "identity-3",
+            Some("external-three@example.com"),
             Some("External User"),
         )
-        .await;
-        assert_eq!(collision.status(), StatusCode::SEE_OTHER);
-        let collision_user: (Uuid, String) = sqlx::query_as(
-            "SELECT u.id, u.username
-             FROM users u
-             JOIN external_identities i ON i.user_id = u.id
-             WHERE i.platform_id = $1 AND i.external_user_id = 'identity-3'",
-        )
-        .bind(platform_id)
-        .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(
-            collision_user.1,
-            format!(
-                "external-user-{}",
-                &collision_user.0.simple().to_string()[..8]
-            )
-        );
-        assert!(!collision_user.1.contains("identity-3"));
+        assert_ne!(collision.id, first.id);
+        assert_eq!(collision.email, "external-three@example.com");
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -38519,6 +39923,45 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn ldap_identity_resolution_fences_deleting_users_with_a_generic_error(pool: PgPool) {
+        let user = create_hub_user(
+            &pool,
+            Some("deleting-ldap@example.com"),
+            Some("Deleting LDAP User"),
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE users SET deletion_requested_at = now() WHERE id = $1")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = resolve_ldap_user(
+            &pool,
+            &LdapDirectoryIdentity {
+                email: user.email.clone(),
+                display_name: Some("Directory Name".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(error.message, "invalid email or password");
+        assert!(sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+            "SELECT deletion_requested_at FROM users WHERE id = $1",
+        )
+        .bind(user.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .is_some());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn identity_concurrent_external_login_creates_one_stable_binding(pool: PgPool) {
         let platform_id = Uuid::new_v4();
         let channel_id = Uuid::new_v4();
@@ -38560,7 +40003,7 @@ mod tests {
         let first = first.unwrap();
         let second = second.unwrap();
         assert_eq!(first.id, second.id);
-        assert_eq!(first.username, second.username);
+        assert_eq!(first.email, second.email);
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM external_identities
@@ -38608,7 +40051,7 @@ mod tests {
             channel_id,
             "tenant-a",
             "same-user",
-            None,
+            Some("tenant-a@example.com"),
             Some("Tenant A User"),
         )
         .await
@@ -38619,7 +40062,7 @@ mod tests {
             channel_id,
             "tenant-b",
             "same-user",
-            None,
+            Some("tenant-b@example.com"),
             Some("Tenant B User"),
         )
         .await
@@ -38738,7 +40181,7 @@ mod tests {
         let channel_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO external_platforms (id, key, name)
-             VALUES ($1, 'oidc-mock', 'Mock OIDC')",
+             VALUES ($1, 'disabled-test', 'Disabled Test')",
         )
         .bind(platform_id)
         .execute(&pool)
@@ -38754,15 +40197,19 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let app = build_router(test_state_with_pool(pool.clone()));
-        let oidc_start = || {
-            axum::http::Request::builder()
-                .uri("/api/auth/oidc/mock/start")
-                .body(Body::empty())
-                .unwrap()
-        };
         assert_eq!(
-            app.clone().oneshot(oidc_start()).await.unwrap().status(),
+            resolve_external_identity(
+                &pool,
+                platform_id,
+                channel_id,
+                "default",
+                "disabled-user",
+                Some("disabled@example.com"),
+                None,
+            )
+            .await
+            .unwrap_err()
+            .status,
             StatusCode::FORBIDDEN
         );
 
@@ -38776,7 +40223,18 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            app.oneshot(oidc_start()).await.unwrap().status(),
+            resolve_external_identity(
+                &pool,
+                platform_id,
+                channel_id,
+                "default",
+                "untrusted-user",
+                Some("untrusted@example.com"),
+                None,
+            )
+            .await
+            .unwrap_err()
+            .status,
             StatusCode::FORBIDDEN
         );
         assert_eq!(
@@ -38790,13 +40248,7 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn identity_verification_required_registration_issues_no_session(pool: PgPool) {
-        sqlx::query(
-            "UPDATE auth_policy SET email_verification_required = true WHERE singleton = true",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+    async fn identity_registration_issues_session_without_verification_fields(pool: PgPool) {
         let app = build_router(test_state_with_pool(pool.clone()));
         let request = axum::http::Request::builder()
             .method(Method::POST)
@@ -38808,57 +40260,36 @@ mod tests {
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(response.headers().get(header::SET_COOKIE).is_none());
+        assert!(response.headers().get(header::SET_COOKIE).is_some());
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["verification_required"], true);
+        assert!(body.get("verification_required").is_none());
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sessions")
                 .fetch_one(&pool)
                 .await
                 .unwrap(),
-            0
+            1
         );
-        assert!(!sqlx::query_scalar::<_, bool>(
-            "SELECT email_verified FROM users WHERE email = 'verify@example.com'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap());
+        assert_eq!(body["user"]["email"], "verify@example.com");
     }
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn identity_email_less_user_loads_through_session_api(pool: PgPool) {
-        let user = create_hub_user(&pool, None, Some("External Only"), None, true)
+    async fn identity_email_less_user_creation_is_rejected(pool: PgPool) {
+        let error = create_hub_user(&pool, None, Some("External Only"), None, true)
             .await
-            .unwrap();
-        let token = "email-less-session";
-        sqlx::query(
-            "INSERT INTO sessions (token_hash, user_id, expires_at)
-             VALUES ($1, $2, now() + interval '1 hour')",
-        )
-        .bind(sha256_hex(token))
-        .bind(user.id)
-        .execute(&pool)
-        .await
-        .unwrap();
-        let app = build_router(test_state_with_browser_session_auth(pool));
-        let request = axum::http::Request::builder()
-            .uri("/api/auth/me")
-            .header(header::COOKIE, format!("agent_hub_session={token}"))
-            .body(Body::empty())
-            .unwrap();
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["username"], "external-only");
-        assert_eq!(body["email"], Value::Null);
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -38892,7 +40323,8 @@ mod tests {
             .await
             .unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["user"]["username"], "admin");
+        assert_eq!(body["user"]["email"], "admin@example.com");
+        assert_eq!(body["user"]["display_name"], "Admin");
         assert_eq!(body["user"]["role"], "super_admin");
     }
 
@@ -39029,13 +40461,89 @@ mod tests {
             StatusCode::OK
         );
 
+        for payload in [
+            r#"{"password_registration_enabled":true,"password_login_enabled":false,"ldap_login_enabled":true}"#,
+            r#"{"password_registration_enabled":false,"password_login_enabled":false,"ldap_login_enabled":false}"#,
+            r#"{"password_registration_enabled":false,"password_login_enabled":true,"ldap_login_enabled":true}"#,
+        ] {
+            let request = axum::http::Request::builder()
+                .method(Method::PATCH)
+                .uri("/api/admin/auth-policy")
+                .header(header::COOKIE, format!("agent_hub_session={super_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::CONFLICT
+            );
+        }
+
+        let configure_ldap = axum::http::Request::builder()
+            .method(Method::PUT)
+            .uri("/api/admin/ldap-config")
+            .header(header::COOKIE, format!("agent_hub_session={super_token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"url":"ldap://directory.example:389","security":"plain","base_dn":"dc=example,dc=com","bind_identity_template":"{email}","user_filter":"(mail={email})","email_attribute":"mail","display_name_attribute":"displayName","allow_insecure":true,"skip_tls_verify":false}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(configure_ldap).await.unwrap().status(),
+            StatusCode::OK
+        );
+        sqlx::query("UPDATE users SET password = NULL WHERE id = $1")
+            .bind(super_admin.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let disable_without_emergency = axum::http::Request::builder()
+            .method(Method::PATCH)
+            .uri("/api/admin/auth-policy")
+            .header(header::COOKIE, format!("agent_hub_session={super_token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"password_registration_enabled":false,"password_login_enabled":false,"ldap_login_enabled":true}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(disable_without_emergency)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        sqlx::query("UPDATE users SET password = 'emergency-password-hash' WHERE id = $1")
+            .bind(super_admin.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let disable_with_emergency = axum::http::Request::builder()
+            .method(Method::PATCH)
+            .uri("/api/admin/auth-policy")
+            .header(header::COOKIE, format!("agent_hub_session={super_token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"password_registration_enabled":false,"password_login_enabled":false,"ldap_login_enabled":true}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(disable_with_emergency)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
         let patch_policy = axum::http::Request::builder()
             .method(Method::PATCH)
             .uri("/api/admin/auth-policy")
             .header(header::COOKIE, format!("agent_hub_session={super_token}"))
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(
-                r#"{"password_registration_enabled":false,"password_login_enabled":true,"email_verification_required":true}"#,
+                r#"{"password_registration_enabled":false,"password_login_enabled":true,"ldap_login_enabled":false}"#,
             ))
             .unwrap();
         let response = app.clone().oneshot(patch_policy).await.unwrap();
@@ -39046,7 +40554,7 @@ mod tests {
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["password_registration_enabled"], false);
         assert_eq!(body["password_login_enabled"], true);
-        assert_eq!(body["email_verification_required"], true);
+        assert_eq!(body["ldap_login_enabled"], false);
 
         let create_platform = axum::http::Request::builder()
             .method(Method::POST)
@@ -39117,25 +40625,6 @@ mod tests {
             .unwrap();
         let channel: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(channel["enabled"], false);
-
-        ensure_mock_oidc_channel(&pool).await.unwrap();
-        sqlx::query(
-            "UPDATE authentication_channels c SET enabled = false
-             FROM external_platforms p
-             WHERE c.platform_id = p.id AND p.key = 'oidc-mock' AND c.key = 'default'",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        ensure_mock_oidc_channel(&pool).await.unwrap();
-        assert!(!sqlx::query_scalar::<_, bool>(
-            "SELECT c.enabled FROM authentication_channels c
-                 JOIN external_platforms p ON p.id = c.platform_id
-                 WHERE p.key = 'oidc-mock' AND c.key = 'default'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap());
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -39150,9 +40639,15 @@ mod tests {
         )
         .await
         .unwrap();
-        let target = create_hub_user(&pool, None, Some("External Password Target"), None, true)
-            .await
-            .unwrap();
+        let target = create_hub_user(
+            &pool,
+            Some("external-password-target@example.com"),
+            Some("External Password Target"),
+            None,
+            true,
+        )
+        .await
+        .unwrap();
         let admin_token = "admin-users-session";
         for token in [admin_token, "target-session-one", "target-session-two"] {
             sqlx::query(
@@ -39255,6 +40750,51 @@ mod tests {
         )
         .unwrap();
         assert!(!detail.has_password);
+
+        let updated = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::PATCH)
+                    .uri(format!("/api/admin/users/{}", target.id))
+                    .header(header::COOKIE, format!("agent_hub_session={admin_token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"email":"updated-target@example.com","display_name":"Updated Target"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), StatusCode::OK);
+        let updated: AdminUserDetailDto = serde_json::from_slice(
+            &axum::body::to_bytes(updated.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(updated.user.email, "updated-target@example.com");
+        assert_eq!(updated.user.display_name, "Updated Target");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sessions WHERE user_id = $1")
+                .bind(target.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(load_user_by_api_key(&pool, &api_key).await.is_ok());
+        for token in ["target-session-three", "target-session-four"] {
+            sqlx::query(
+                "INSERT INTO sessions (token_hash, user_id, expires_at)
+                 VALUES ($1, $2, now() + interval '1 hour')",
+            )
+            .bind(sha256_hex(token))
+            .bind(target.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
 
         let changed = app
             .oneshot(
@@ -39380,8 +40920,8 @@ mod tests {
         let runtime_id = Uuid::new_v4();
         let session_token = "runtime-list-session";
         sqlx::query(
-            "INSERT INTO users (id, username, email, password, display_name, role)
-             VALUES ($1, 'runtime-list', 'runtime-list@example.com', 'unused',
+            "INSERT INTO users (id, email, password, display_name, role)
+             VALUES ($1, 'runtime-list@example.com', 'unused',
                      'Runtime List', 'member')",
         )
         .bind(user_id)
@@ -39540,8 +41080,8 @@ mod tests {
             (other_id, "page-other@example.com"),
         ] {
             sqlx::query(
-                "INSERT INTO users (id, username, email, password, display_name, role)
-                 VALUES ($1, split_part($2, '@', 1), $2, 'x', 'Test', 'member')",
+                "INSERT INTO users (id, email, password, display_name, role)
+                 VALUES ($1, $2, 'x', 'Test', 'member')",
             )
             .bind(id)
             .bind(email)
@@ -39768,8 +41308,8 @@ mod tests {
             (other_id, "other@example.com"),
         ] {
             sqlx::query(
-                "INSERT INTO users (id, username, email, password, display_name, role)
-                 VALUES ($1, split_part($2, '@', 1), $2, 'x', 'Test', 'member')",
+                "INSERT INTO users (id, email, password, display_name, role)
+                 VALUES ($1, $2, 'x', 'Test', 'member')",
             )
             .bind(id)
             .bind(email)
@@ -39875,8 +41415,8 @@ mod tests {
             (foreign_id, "foreign-key-owner@example.com"),
         ] {
             sqlx::query(
-                "INSERT INTO users (id, username, email, password, display_name, role)
-                 VALUES ($1, split_part($2, '@', 1), $2, 'x', 'Test', 'member')",
+                "INSERT INTO users (id, email, password, display_name, role)
+                 VALUES ($1, $2, 'x', 'Test', 'member')",
             )
             .bind(id)
             .bind(email)
@@ -42336,6 +43876,26 @@ mod tests {
             tool_request_follow_up_run(&fixture.state.pool, second_request_id).await,
             Some(second_claim.run.id)
         );
+
+        let next_message = create_integration_message(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.integration_token),
+            Path(fixture.session_id),
+            Json(CreateIntegrationMessageRequest {
+                content: "continue after tool results".into(),
+                attachments: json!([]),
+                client_message_key: Some("after-tool-results".into()),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(next_message.run.source, "integration:message");
+        assert_eq!(next_message.run.parent_run_id, Some(second_claim.run.id));
+
+        let next_claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        assert_eq!(next_claim.run.id, next_message.run.id);
+        assert_eq!(next_claim.run.source, "integration:message");
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -42420,11 +43980,10 @@ mod tests {
         let skill_id = Uuid::new_v4();
         let unique = Uuid::new_v4().simple().to_string();
         sqlx::query(
-            "INSERT INTO users (id, username, email, password, display_name, role)
-             VALUES ($1, $2, $3, 'unused', 'Delete Agent Owner', 'member')",
+            "INSERT INTO users (id, email, password, display_name, role)
+             VALUES ($1, $2, 'unused', 'Delete Agent Owner', 'member')",
         )
         .bind(owner_id)
-        .bind(format!("delete-agent-{unique}"))
         .bind(format!("delete-agent-{unique}@example.com"))
         .execute(&pool)
         .await
@@ -42735,11 +44294,10 @@ mod tests {
         ] {
             sqlx::query(
                 "INSERT INTO users
-                     (id, username, email, password, display_name, role)
-                 VALUES ($1, $2, $3, 'unused', $4, $5)",
+                     (id, email, password, display_name, role)
+                 VALUES ($1, $2, 'unused', $3, $4)",
             )
             .bind(id)
-            .bind(format!("delete-auth-{label}-{unique}"))
             .bind(format!("delete-auth-{label}-{unique}@example.com"))
             .bind(label)
             .bind(role)
@@ -43296,11 +44854,10 @@ mod tests {
         let unique = Uuid::new_v4().simple().to_string();
         let object_key = format!("sessions/{session_id}/bundles/1-test.tar.zst");
         sqlx::query(
-            "INSERT INTO users (id, username, email, password, display_name, role)
-             VALUES ($1, $2, $3, 'unused', 'Bundle cleanup owner', 'member')",
+            "INSERT INTO users (id, email, password, display_name, role)
+             VALUES ($1, $2, 'unused', 'Bundle cleanup owner', 'member')",
         )
         .bind(owner_id)
-        .bind(format!("bundle-delete-{unique}"))
         .bind(format!("bundle-delete-{unique}@example.com"))
         .execute(&pool)
         .await
@@ -43909,12 +45466,12 @@ mod tests {
         let unique = Uuid::new_v4().simple().to_string();
         for (id, label) in [(owner_id, "owner"), (foreign_id, "foreign")] {
             sqlx::query(
-                "INSERT INTO users (id, username, email, password, display_name, role)
-                 VALUES ($1, $2, $3, 'unused', $2, 'member')",
+                "INSERT INTO users (id, email, password, display_name, role)
+                 VALUES ($1, $2, 'unused', $3, 'member')",
             )
             .bind(id)
-            .bind(format!("automation-history-{label}-{unique}"))
             .bind(format!("automation-history-{label}-{unique}@example.com"))
+            .bind(format!("automation-history-{label}-{unique}"))
             .execute(&pool)
             .await
             .unwrap();
@@ -44707,11 +46264,10 @@ mod tests {
         let admin_id = Uuid::new_v4();
         let session_token = format!("ahs_{}", Uuid::new_v4().simple());
         sqlx::query(
-            "INSERT INTO users (id, username, email, password, display_name, role)
-             VALUES ($1, $2, $3, 'unused', 'Runtime Admin', 'super_admin')",
+            "INSERT INTO users (id, email, password, display_name, role)
+             VALUES ($1, $2, 'unused', 'Runtime Admin', 'super_admin')",
         )
         .bind(admin_id)
-        .bind(format!("runtime-admin-{}", Uuid::new_v4().simple()))
         .bind(format!(
             "runtime-admin-{}@example.com",
             Uuid::new_v4().simple()
@@ -44880,11 +46436,10 @@ mod tests {
         let runtime_id = Uuid::new_v4();
         let session_token = format!("ahs_{}", Uuid::new_v4().simple());
         sqlx::query(
-            "INSERT INTO users (id, username, email, password, display_name, role)
-             VALUES ($1, $2, $3, 'unused', 'Runtime Admin', 'super_admin')",
+            "INSERT INTO users (id, email, password, display_name, role)
+             VALUES ($1, $2, 'unused', 'Runtime Admin', 'super_admin')",
         )
         .bind(admin_id)
-        .bind(format!("rotation-admin-{}", Uuid::new_v4().simple()))
         .bind(format!(
             "rotation-admin-{}@example.com",
             Uuid::new_v4().simple()
@@ -45147,8 +46702,7 @@ mod tests {
     fn test_user(id: Uuid, role: &str) -> UserDto {
         UserDto {
             id,
-            username: format!("user-{id}"),
-            email: Some(format!("{id}@example.com")),
+            email: format!("{id}@example.com"),
             display_name: "Test User".into(),
             role: role.into(),
         }
@@ -45318,11 +46872,10 @@ mod tests {
         let unique = Uuid::new_v4().simple().to_string();
 
         sqlx::query(
-            "INSERT INTO users (id, username, email, password, display_name, role)
-             VALUES ($1, $2, $3, 'unused', 'Runtime Claim Test Owner', 'member')",
+            "INSERT INTO users (id, email, password, display_name, role)
+             VALUES ($1, $2, 'unused', 'Runtime Claim Test Owner', 'member')",
         )
         .bind(owner_id)
-        .bind(format!("runtime-claim-{unique}"))
         .bind(format!("runtime-claim-{unique}@example.com"))
         .execute(&pool)
         .await
@@ -45464,11 +47017,10 @@ mod tests {
         let unique = Uuid::new_v4().simple().to_string();
 
         sqlx::query(
-            "INSERT INTO users (id, username, email, password, display_name, role)
-             VALUES ($1, $2, $3, 'unused', 'Scheduler Archive Test Owner', 'member')",
+            "INSERT INTO users (id, email, password, display_name, role)
+             VALUES ($1, $2, 'unused', 'Scheduler Archive Test Owner', 'member')",
         )
         .bind(owner_id)
-        .bind(format!("scheduler-archive-{unique}"))
         .bind(format!("scheduler-archive-{unique}@example.com"))
         .execute(&pool)
         .await
@@ -45524,11 +47076,10 @@ mod tests {
         let unique = Uuid::new_v4().simple().to_string();
         for (id, label) in [(owner_id, "owner"), (foreign_id, "foreign")] {
             sqlx::query(
-                "INSERT INTO users (id, username, email, password, display_name, role)
-                 VALUES ($1, $2, $3, 'unused', $4, 'member')",
+                "INSERT INTO users (id, email, password, display_name, role)
+                 VALUES ($1, $2, 'unused', $3, 'member')",
             )
             .bind(id)
-            .bind(format!("automation-update-{label}-{unique}"))
             .bind(format!("automation-update-{label}-{unique}@example.com"))
             .bind(label)
             .execute(&pool)
@@ -45623,11 +47174,10 @@ mod tests {
 
         sqlx::query(
             "INSERT INTO users
-                 (id, username, email, password, email_verified, display_name, role)
-             VALUES ($1, $2, $3, 'unused', true, 'Integration Test Owner', 'member')",
+                 (id, email, password, display_name, role)
+             VALUES ($1, $2, 'unused', 'Integration Test Owner', 'member')",
         )
         .bind(owner_id)
-        .bind(format!("integration-owner-{unique}"))
         .bind(format!("integration-{unique}@example.com"))
         .execute(&pool)
         .await
@@ -45650,11 +47200,11 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO users
-                 (id, username, email, password, email_verified, display_name, role)
-             VALUES ($1, $2, NULL, NULL, true, 'External Integration User', 'member')",
+                 (id, email, password, display_name, role)
+             VALUES ($1, $2, NULL, 'External Integration User', 'member')",
         )
         .bind(external_owner_id)
-        .bind(format!("external-integration-{unique}"))
+        .bind(format!("external-integration-{unique}@example.com"))
         .execute(&pool)
         .await
         .unwrap();
@@ -47885,7 +49435,7 @@ mod tests {
             embed_jwt_secret: "test-embed-jwt-secret".into(),
             embed_jwt_issuer: "agent-hub-test".into(),
             embed_jwt_audience: "agent-hub-widget".into(),
-            oidc_mock_enabled: true,
+            trusted_proxy_cidrs: None,
             model_secret_cipher: ModelSecretCipher::from_env_value(Some(
                 &base64::engine::general_purpose::STANDARD.encode([42_u8; 32]),
             ))
@@ -48004,38 +49554,6 @@ mod tests {
             HeaderValue::from_str(&format!("agent_hub_session={token}")).unwrap(),
         );
         headers
-    }
-
-    async fn complete_mock_oidc_login(
-        app: Router,
-        email: &str,
-        subject: &str,
-        username: Option<&str>,
-    ) -> Response {
-        let mut query = url::form_urlencoded::Serializer::new(String::new());
-        query.append_pair("email", email);
-        query.append_pair("sub", subject);
-        if let Some(username) = username {
-            query.append_pair("username", username);
-        }
-        let start = axum::http::Request::builder()
-            .uri(format!("/api/auth/oidc/mock/start?{}", query.finish()))
-            .body(Body::empty())
-            .unwrap();
-        let start = app.clone().oneshot(start).await.unwrap();
-        assert_eq!(start.status(), StatusCode::SEE_OTHER);
-        let callback = start
-            .headers()
-            .get(header::LOCATION)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_owned();
-        let callback = axum::http::Request::builder()
-            .uri(callback)
-            .body(Body::empty())
-            .unwrap();
-        app.oneshot(callback).await.unwrap()
     }
 
     fn tool_request_event(tool_request_id: Uuid) -> AppendRunEventRequest {
@@ -48241,11 +49759,10 @@ mod tests {
         let unique = Uuid::new_v4().simple().to_string();
         sqlx::query(
             "INSERT INTO users
-                 (id, username, email, password, email_verified, display_name, role)
-             VALUES ($1, $2, $3, 'unused', true, 'Task 6 User', $4)",
+                 (id, email, password, display_name, role)
+             VALUES ($1, $2, 'unused', 'Task 6 User', $3)",
         )
         .bind(user_id)
-        .bind(format!("task6-admin-{unique}"))
         .bind(format!("task6-admin-{unique}@example.com"))
         .bind(role)
         .execute(pool)
@@ -48614,7 +50131,7 @@ mod tests {
             embed_jwt_secret: "test-embed-jwt-secret".into(),
             embed_jwt_issuer: "agent-hub-test".into(),
             embed_jwt_audience: "agent-hub-widget".into(),
-            oidc_mock_enabled: true,
+            trusted_proxy_cidrs: None,
             model_secret_cipher: ModelSecretCipher::from_env_value(Some(
                 &base64::engine::general_purpose::STANDARD.encode([42_u8; 32]),
             ))

@@ -13,7 +13,6 @@ const now = '2026-07-17T08:00:00.000Z';
 
 const currentUser = {
   id: ownerId,
-  username: 'integration-owner',
   email: 'integration-owner@example.com',
   display_name: 'Integration owner',
   role: 'member'

@@ -18,7 +18,7 @@ Agent Hub V1 的每项功能必须能追溯到自动化证据。QA 不要求把�
 | 层级 | 主要职责 |
 | --- | --- |
 | Rust | 纯逻辑、序列化、数据库约束、协议状态机、并发与安全边界 |
-| API QA | 真实 PostgreSQL、Hub、Runtime、Pi standalone 与 model gateway，以及 fake model provider、Mock OIDC 和 MinIO 边界替代的契约与负路径 |
+| API QA | 真实 PostgreSQL、Hub、Runtime、Pi standalone、model gateway 与按需 OpenLDAP，以及 fake model provider 和 MinIO 边界替代的契约与负路径 |
 | Browser QA | 真实前端与后端关键工作流、交互状态、desktop/390px、i18n、console/network |
 
 覆盖完成必须同时满足：
@@ -34,7 +34,7 @@ Agent Hub V1 的每项功能必须能追溯到自动化证据。QA 不要求把�
 ## 功能域
 
 - Platform bootstrap、health/readiness、OpenAPI 和导航。
-- Password、Mock OIDC、browser session、API Key 和 Embed JWT 认证。
+- Password、单一全局 LDAP、browser session、API Key 和 Embed JWT 认证。
 - Administration 用户、角色、认证策略、External Platform 和 Authentication Channel。
 - Agent 生命周期、visibility、Runtime 约束、Markdown、Subagent Definition 和历史只读。
 - Hub-managed Skill、Agent 绑定、批量删除、refresh fencing 和 MCP secret。
@@ -61,7 +61,7 @@ Agent Hub V1 的每项功能必须能追溯到自动化证据。QA 不要求把�
 
 ## 测试环境
 
-全部场景运行真实 Hub、Runtime、内嵌 Pi standalone、PostgreSQL 和 model gateway；外部边界使用本地 fake model provider、Mock OIDC 和 MinIO，不访问真实 AI、OAuth、S3 或 GitHub 服务。不得为测试新增绕过生产认证或授权的后门。
+全部场景运行真实 Hub、Runtime、内嵌 Pi standalone、PostgreSQL 和 model gateway；LDAP 场景通过可选 Compose profile 运行真实 OpenLDAP，其他外部边界使用本地 fake model provider 和 MinIO，不访问真实 AI、外部 LDAP、OAuth、S3 或 GitHub 服务。不得为测试新增绕过生产认证或授权的后门。
 
 每次可执行场景运行都先执行 TypeScript SDK 的 `npm test`、`npm run build` 和 `npm pack --dry-run`。任一 SDK 门禁失败都使整次 QA 失败，但仍可继续收集所选场景的独立证据。
 

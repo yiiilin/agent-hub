@@ -23,6 +23,20 @@ function signEmbedJwt(agentId: string, ownerId: string, overrides: Record<string
   return `${header}.${payload}.${signature}`;
 }
 
+async function provisionAndSignInPasswordUser(page: import('@playwright/test').Page, email: string) {
+  const password = 'browser-test-password';
+  expect((await page.request.post('/api/auth/login', { data: { email: 'admin@example.com', password: 'admin123' } })).ok()).toBeTruthy();
+  expect((await page.request.post('/api/admin/users', {
+    data: { email, password, role: 'member' }
+  })).ok()).toBeTruthy();
+  expect((await page.request.post('/api/auth/logout')).status()).toBe(204);
+  await page.goto('/login');
+  await page.getByLabel('Email').fill(email);
+  await page.getByLabel('Password').fill(password);
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await expect(page.getByText(email)).toBeVisible();
+}
+
 test('API keys can be created with validity, renewed in place, and deleted', async ({ page, baseURL }) => {
   await page.goto('/login');
   await page.getByLabel('Email').fill('admin@example.com');
@@ -95,10 +109,7 @@ test('API keys can be created with validity, renewed in place, and deleted', asy
 
 test('API key mutations are serialized across create and key rows', async ({ page }) => {
   const email = `api-key-lock-${Date.now()}@example.com`;
-  await page.goto('/login');
-  await page.getByLabel('Email').fill(email);
-  await page.getByRole('button', { name: 'Sign in with Mock OIDC' }).click();
-  await expect(page.getByText(email)).toBeVisible();
+  await provisionAndSignInPasswordUser(page, email);
   const names = [`Lock A ${Date.now()}`, `Lock B ${Date.now()}`];
   for (const name of names) await page.request.post('/api/auth/api-keys', { data: { name } });
   await page.goto('/api-keys');
@@ -270,10 +281,7 @@ test('API key modals, pagination, cross-tab deletion fallback, and mobile layout
   const browserErrors: string[] = [];
   const stamp = Date.now();
   const email = `api-key-page-${stamp}@example.com`;
-  await page.goto('/login');
-  await page.getByLabel('Email').fill(email);
-  await page.getByRole('button', { name: 'Sign in with Mock OIDC' }).click();
-  await expect(page.getByText(email)).toBeVisible();
+  await provisionAndSignInPasswordUser(page, email);
   page.on('pageerror', (error) => browserErrors.push(`pageerror: ${error.message}`));
   page.on('console', (message) => { if (message.type() === 'error') browserErrors.push(`console: ${message.text()}`); });
   page.on('response', (response) => { if (response.status() >= 500) browserErrors.push(`${response.status()} ${response.url()}`); });
@@ -327,13 +335,12 @@ test('API key modals, pagination, cross-tab deletion fallback, and mobile layout
   }
 });
 
-test('Mock OIDC signs into the console', async ({ page }) => {
-  const email = `mock-${Date.now()}@example.com`;
+test('Local Password signs into the console', async ({ page }) => {
   await page.goto('/login');
-  await page.getByLabel('Email').fill(email);
-  await page.getByRole('button', { name: 'Sign in with Mock OIDC' }).click();
-
-  await expect(page.getByText(email)).toBeVisible();
+  await page.getByLabel('Email').fill('admin@example.com');
+  await page.getByLabel('Password').fill('admin123');
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await expect(page.getByText('admin@example.com')).toBeVisible();
   await expect(page).toHaveURL(/\/sessions$/);
   await expect(page.getByRole('heading', { name: 'Sessions', exact: true, level: 1 })).toBeVisible();
 });
@@ -489,6 +496,17 @@ test('Auth boundary checks reject polluted or unauthorized embed flows', async (
   });
   expect(publicCreated.ok()).toBeTruthy();
   const publicAgent = await publicCreated.json();
+  const memberEmail = `embed-boundary-${Date.now()}@example.com`;
+  const memberPassword = 'embed-boundary-password';
+  const memberCreated = await api.post('/api/admin/users', {
+    data: { email: memberEmail, password: memberPassword, role: 'member' }
+  });
+  expect(memberCreated.ok()).toBeTruthy();
+  const memberDetail = await memberCreated.json() as { user: { id: string } };
+  const member = await request.newContext({ baseURL });
+  expect((await member.post('/api/auth/login', {
+    data: { email: memberEmail, password: memberPassword }
+  })).ok()).toBeTruthy();
 
   const wrongOwner = await api.post('/api/embed/exchange', {
     data: { jwt: signEmbedJwt(agent.id, randomUUID()) }
@@ -555,60 +573,13 @@ test('Auth boundary checks reject polluted or unauthorized embed flows', async (
     headers: { 'X-Agent-Hub-Embed-Token': isolatedToken }
   });
   expect(crossSessionStream.status()).toBe(403);
+  expect((await member.post('/api/embed/sessions', { data: { agent_id: publicAgent.id } })).status()).toBe(404);
 
-  const oidc = await request.newContext({ baseURL });
-  const controlledEmail = `controlled-${Date.now()}@example.com`;
-  const controlledUsername = controlledEmail.split('@')[0];
-  const start = await oidc.get(`/api/auth/oidc/mock/start?email=${encodeURIComponent(controlledEmail)}&sub=${encodeURIComponent(controlledUsername)}`, { maxRedirects: 0 });
-  expect(start.status()).toBeGreaterThanOrEqual(300);
-  expect(start.status()).toBeLessThan(400);
-  const location = start.headers().location;
-  expect(location).toBeTruthy();
-  const callback = await oidc.get(`${location!}&email=admin%40example.com&sub=forged-admin`, { maxRedirects: 0 });
-  expect(callback.status()).toBeGreaterThanOrEqual(300);
-  expect(callback.status()).toBeLessThan(400);
-  const me = await oidc.get('/api/auth/me');
-  expect(me.ok()).toBeTruthy();
-  const controlledUser = await me.json();
-  expect(controlledUser.email).toBe(controlledEmail);
-  expect(controlledUser.display_name).toBe(controlledUsername);
-  expect((await oidc.get(location!, { maxRedirects: 0 })).status()).toBe(401);
-
-  const adminOidc = await request.newContext({ baseURL });
-  const adminStart = await adminOidc.get('/api/auth/oidc/mock/start?email=admin%40example.com&sub=admin-reuse', { maxRedirects: 0 });
-  const adminLocation = adminStart.headers().location;
-  expect(adminLocation).toBeTruthy();
-  const adminCallback = await adminOidc.get(adminLocation!, { maxRedirects: 0 });
-  expect(adminCallback.status()).toBe(303);
-  const adminMe = await adminOidc.get('/api/auth/me');
-  expect(adminMe.ok()).toBeTruthy();
-  expect((await adminMe.json()).email).toBe('admin@example.com');
-
-  const concurrentEmail = `concurrent-${Date.now()}@example.com`;
-  const concurrentSubject = concurrentEmail.split('@')[0];
-  const concurrentA = await request.newContext({ baseURL });
-  const concurrentB = await request.newContext({ baseURL });
-  const [startA, startB] = await Promise.all([
-    concurrentA.get(`/api/auth/oidc/mock/start?email=${encodeURIComponent(concurrentEmail)}&sub=${encodeURIComponent(`${concurrentSubject}-a`)}`, { maxRedirects: 0 }),
-    concurrentB.get(`/api/auth/oidc/mock/start?email=${encodeURIComponent(concurrentEmail)}&sub=${encodeURIComponent(`${concurrentSubject}-b`)}`, { maxRedirects: 0 })
-  ]);
-  const [callbackA, callbackB] = await Promise.all([
-    concurrentA.get(startA.headers().location!, { maxRedirects: 0 }),
-    concurrentB.get(startB.headers().location!, { maxRedirects: 0 })
-  ]);
-  expect(callbackA.status()).toBeGreaterThanOrEqual(300);
-  expect(callbackA.status()).toBeLessThan(400);
-  expect(callbackB.status()).toBeGreaterThanOrEqual(300);
-  expect(callbackB.status()).toBeLessThan(400);
-  expect((await (await concurrentA.get('/api/auth/me')).json()).email).toBe(concurrentEmail);
-  expect((await (await concurrentB.get('/api/auth/me')).json()).email).toBe(concurrentEmail);
-  const publicEmbed = await oidc.post('/api/embed/sessions', { data: { agent_id: publicAgent.id } });
-  expect(publicEmbed.status()).toBe(404);
   await api.delete(`/api/agents/${agent.id}`);
   await api.delete(`/api/agents/${publicAgent.id}`);
+  expect((await api.post(`/api/admin/users/${memberDetail.user.id}/erase`, {
+    data: { email: memberEmail }
+  })).status()).toBe(202);
+  await member.dispose();
   await api.dispose();
-  await oidc.dispose();
-  await adminOidc.dispose();
-  await concurrentA.dispose();
-  await concurrentB.dispose();
 });

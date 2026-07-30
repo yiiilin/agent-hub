@@ -45,7 +45,6 @@ type AgentFixture = {
 
 const currentUser = {
   id: '10000000-0000-0000-0000-000000000001',
-  username: 'agents-page-tester',
   email: 'agents-page@example.com',
   display_name: 'Agents page tester',
   role: 'admin'
@@ -454,7 +453,7 @@ async function installDetailApi(page: Page, options: DetailApiOptions = {}) {
     }
     if (path === '/api/runtimes') return route.fulfill({ json: runtimes });
     if (path === '/api/skills') return route.fulfill({ json: detailSkills });
-    if (path === '/api/users') return route.fulfill({ json: options.users ?? [currentUser, { ...currentUser, id: agent.public_to[0] ?? 'other', username: 'other', email: 'other@example.com', display_name: 'Other user' }] });
+    if (path === '/api/users') return route.fulfill({ json: options.users ?? [currentUser, { ...currentUser, id: agent.public_to[0] ?? 'other', email: 'other@example.com', display_name: 'Other user' }] });
     if (/^\/api\/runs\/[^/]+\/events$/.test(path)) return route.fulfill({ json: [{ seq: 1, run_id: path.split('/')[3], event_type: 'message', role: 'assistant', content: 'Console result', payload: {}, created_at: '2026-07-11T05:00:01.000Z' }] });
     if (/^\/api\/runs\/[^/]+\/events\/stream$/.test(path)) return route.fulfill({ contentType: 'text/event-stream', body: '' });
     return route.fulfill({ status: 404, json: { error: `Unhandled route ${request.method()} ${path}` } });

@@ -531,8 +531,16 @@ test('edits automations, protects webhook tokens, and localizes the operations w
 
     const foreign = await request.newContext({ baseURL });
     try {
-      const oidc = await foreign.get(`/api/auth/oidc/mock/start?email=foreign-${suffix}%40example.com&sub=foreign-${suffix}`);
-      expect(oidc.ok()).toBeTruthy();
+      const foreignEmail = `foreign-${suffix}@example.com`;
+      const foreignPassword = 'foreign-password';
+      const createdUser = await page.request.post('/api/admin/users', { data: {
+        email: foreignEmail, password: foreignPassword, role: 'member'
+      } });
+      expect(createdUser.ok()).toBeTruthy();
+      const login = await foreign.post('/api/auth/login', { data: {
+        email: foreignEmail, password: foreignPassword
+      } });
+      expect(login.ok()).toBeTruthy();
       const foreignUpdate = await foreign.patch(`/api/automations/${created.id}`, { data: {
         name: 'Foreign', trigger_type: 'manual', prompt: 'Foreign', schedule: null, enabled: true
       } });

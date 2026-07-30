@@ -687,7 +687,7 @@ function UsageTab({ currentUser, connections }: { currentUser: User; connections
       <label>{mt('usageRange')}<select value={range} onChange={(event) => setRange(event.target.value as UsageRange)}><option value="today">{mt('rangeToday')}</option><option value="yesterday">{mt('rangeYesterday')}</option><option value="7days">{mt('range7Days')}</option><option value="30days">{mt('range30Days')}</option><option value="90days">{mt('range90Days')}</option><option value="all">{mt('rangeAll')}</option></select></label>
       <label>{mt('filterByModel')}<select value={modelId} onChange={(event) => setModelId(event.target.value)}><option value="">{mt('allModels')}</option>{connections.map((connection) => <option key={connection.id} value={connection.id}>{connection.name}</option>)}</select></label>
       <label>{mt('filterByAgent')}<select value={agentId} onChange={(event) => setAgentId(event.target.value)}><option value="">{mt('allAgents')}</option>{agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select></label>
-      <label>{mt('filterByUser')}<select value={userId} onChange={(event) => setUserId(event.target.value)}><option value="">{mt('allUsers')}</option>{users.map((user) => <option key={user.id} value={user.id}>{user.display_name || user.username}</option>)}</select></label>
+      <label>{mt('filterByUser')}<select value={userId} onChange={(event) => setUserId(event.target.value)}><option value="">{mt('allUsers')}</option>{users.map((user) => <option key={user.id} value={user.id}>{user.display_name}</option>)}</select></label>
     </section>
     <UsageSummary key={`summary-${queryKey}`} query={query} />
     <UsageLedger key={`usage-${queryKey}`} query={query} />

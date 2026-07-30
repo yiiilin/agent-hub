@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { ApiClient, loginAsAdmin } from '../../support/api.mjs';
+import { ApiClient, loginAsAdmin, poll, provisionLocalUser } from '../../support/api.mjs';
 import { withBrowser } from '../../support/browser.mjs';
 
 function uniqueSlug(context, prefix) {
@@ -15,6 +15,7 @@ async function assertVisible(locator, description) {
 }
 
 async function assertNoHorizontalOverflow(page, label) {
+  await page.waitForTimeout(100);
   const overflow = await page.evaluate(() => (
     document.documentElement.scrollWidth - document.documentElement.clientWidth
   ));
@@ -27,8 +28,36 @@ async function restorePolicy(client, snapshot) {
     body: snapshot
   });
   assert.deepEqual(restored, snapshot, 'Authentication policy restore response must match snapshot');
-  const { data: persisted } = await client.get('/api/admin/auth-policy');
-  assert.deepEqual(persisted, snapshot, 'Authentication policy restore must persist');
+  assert.deepEqual(
+    (await client.get('/api/admin/auth-policy')).data,
+    snapshot,
+    'Authentication policy restore must persist'
+  );
+}
+
+async function restoreLdapConfiguration(context, client, snapshot) {
+  if (snapshot) {
+    const { data: restored } = await client.request('/api/admin/ldap-config', {
+      method: 'PUT',
+      body: snapshot
+    });
+    assert.deepEqual(restored, snapshot, 'LDAP configuration restore must match snapshot');
+  } else {
+    context.compose.psql('DELETE FROM ldap_configuration WHERE singleton = true');
+  }
+  assert.deepEqual((await client.get('/api/admin/ldap-config')).data, snapshot);
+}
+
+async function runCleanupSteps(steps) {
+  const errors = [];
+  for (const [label, cleanup] of steps) {
+    try {
+      await cleanup();
+    } catch (error) {
+      errors.push(new Error(`${label}: ${error instanceof Error ? error.message : String(error)}`));
+    }
+  }
+  if (errors.length > 0) throw new AggregateError(errors, 'Administration browser cleanup failed');
 }
 
 export default async function administrationBrowserScenario(context) {
@@ -36,268 +65,344 @@ export default async function administrationBrowserScenario(context) {
   const { data: superAdmin } = await loginAsAdmin(adminClient);
   assert.equal(superAdmin.role, 'super_admin');
   const { data: policySnapshot } = await adminClient.get('/api/admin/auth-policy');
-
-  const memberUsername = uniqueSlug(context, 'qa-browser-member');
-  const memberEmail = `${memberUsername}@example.com`;
-  const memberPassword = `${context.unique('Member password')}!Aa9`;
-  const replacementPassword = `${context.unique('Replacement password')}!Bb8`;
-  const memberClient = new ApiClient(context.baseURL);
-  const { data: registration } = await memberClient.post('/api/auth/register', {
-    email: memberEmail,
-    password: memberPassword
-  });
-  assert.equal(registration.user.username, memberUsername);
-  assert.equal(registration.user.email, memberEmail);
-  assert.equal(registration.user.role, 'member');
-  assert.equal(registration.verification_required, false);
-  assert.equal((await memberClient.get('/api/auth/me')).data.id, registration.user.id);
+  const { data: ldapSnapshot } = await adminClient.get('/api/admin/ldap-config');
+  const independentMember = await provisionLocalUser(
+    adminClient,
+    context,
+    'qa-administration-independent-member'
+  );
+  const profileDisplayName = context.unique('QA Browser Super Administrator');
+  let createdUserId = null;
+  let createdUserEmail = null;
 
   try {
     await withBrowser(context, {
       allowedHttpErrors: [
-        { method: 'GET', pathname: '/api/auth/me', status: 401, times: 1 }
+        { method: 'GET', pathname: '/api/auth/me', status: 401, times: 1 },
+        { method: 'POST', pathname: '/api/admin/ldap-config/test', status: 503, times: 1 },
+        { method: 'POST', pathname: '/api/admin/users', status: 409, times: 1 }
       ]
     }, async ({ page, browserErrors }) => {
+      await page.route('**/api/admin/ldap-config/test', (route) => route.fulfill({
+        status: 503,
+        contentType: 'application/json',
+        body: JSON.stringify({ error: 'LDAP connect failed: connection could not be established' })
+      }));
+
       await page.goto('/login', { waitUntil: 'domcontentloaded' });
       await page.getByLabel('Email').fill('admin@example.com');
       await page.getByLabel('Password').fill('admin123');
       await page.getByRole('button', { name: 'Sign in', exact: true }).click();
       await assertVisible(page.getByText('admin@example.com', { exact: true }), 'Signed-in Super Administrator');
 
+      await page.getByTitle('Edit profile').click();
+      const profileDialog = page.getByRole('dialog', { name: 'Edit profile' });
+      await profileDialog.getByLabel('Display Name').fill(profileDisplayName);
+      const profileResponse = page.waitForResponse((response) => (
+        response.request().method() === 'PATCH'
+        && new URL(response.url()).pathname === '/api/users/me'
+      ));
+      await profileDialog.getByRole('button', { name: 'Save changes' }).click();
+      assert.equal((await profileResponse).ok(), true, 'Current-user Display Name update must succeed');
+      await assertVisible(page.getByText(profileDisplayName, { exact: true }), 'Updated current-user Display Name');
+
       await page.goto('/administration', { waitUntil: 'domcontentloaded' });
       await assertVisible(page.getByRole('heading', { name: 'Administration', level: 1 }), 'Administration title');
       const tablist = page.getByRole('tablist', { name: 'Administration' });
       assert.equal(await tablist.getByRole('tab').count(), 3, 'Administration must expose three tabs');
-
-      const authenticationTab = tablist.getByRole('tab', { name: 'Authentication', exact: true });
-      assert.equal(await authenticationTab.getAttribute('aria-selected'), 'true');
       await assertVisible(page.getByRole('heading', { name: 'Authentication policy' }), 'Authentication policy');
-      const policyInputs = [
-        ['Password registration', 'password_registration_enabled'],
-        ['Password login', 'password_login_enabled'],
-        ['Email verification', 'email_verification_required']
-      ];
-      for (const [label, key] of policyInputs) {
-        assert.equal(await page.getByLabel(label, { exact: true }).isChecked(), policySnapshot[key]);
+      assert.equal(
+        await page.getByLabel('Password registration', { exact: true }).isChecked(),
+        policySnapshot.password_registration_enabled
+      );
+      assert.equal(
+        await page.getByLabel('Local Password login', { exact: true }).isChecked(),
+        policySnapshot.password_login_enabled
+      );
+      assert.equal(
+        await page.getByLabel('LDAP login', { exact: true }).isChecked(),
+        policySnapshot.ldap_login_enabled
+      );
+
+      const ldapLogin = page.getByLabel('LDAP login', { exact: true });
+      if (!ldapSnapshot) {
+        assert.equal(await ldapLogin.isDisabled(), true, 'LDAP login must be disabled until configuration is saved');
       }
-      const emailVerification = page.getByLabel('Email verification', { exact: true });
-      await emailVerification.setChecked(!policySnapshot.email_verification_required);
-      const policySaveResponse = page.waitForResponse((response) => (
+      await page.getByLabel('LDAP URL').fill('ldap://127.0.0.1:1');
+      await page.getByLabel('Connection security').selectOption('plain');
+      await page.getByLabel('Base DN').fill('ou=people,dc=example,dc=test');
+      await page.getByLabel('Bind identity template').fill(
+        'uid={email},ou=people,dc=example,dc=test'
+      );
+      await page.getByLabel('User filter').fill('(mail={email})');
+      await page.getByLabel('Email attribute').fill('mail');
+      await page.getByLabel('Display Name attribute').fill('displayName');
+      await assertVisible(
+        page.getByText(/sends credentials without transport encryption/),
+        'Persistent Plain LDAP warning'
+      );
+      const saveLdap = page.getByRole('button', { name: 'Save LDAP configuration' });
+      assert.equal(await saveLdap.isDisabled(), true, 'Plain LDAP save must require explicit insecure opt-in');
+      await page.getByLabel('Allow insecure plain LDAP').check();
+      const ldapSaveResponse = page.waitForResponse((response) => (
+        response.request().method() === 'PUT'
+        && new URL(response.url()).pathname === '/api/admin/ldap-config'
+      ));
+      await saveLdap.click();
+      assert.equal((await ldapSaveResponse).ok(), true, 'LDAP configuration save must succeed');
+      await assertVisible(page.getByText('LDAP configuration saved.', { exact: true }), 'LDAP save notice');
+      assert.equal(await ldapLogin.isEnabled(), true, 'Saved LDAP configuration must enable policy control');
+
+      const runLdapTest = page.getByRole('button', { name: 'Run test' });
+      assert.equal(await runLdapTest.isDisabled(), true, 'LDAP draft test requires one-time credentials');
+      await page.getByLabel('Test email').fill('directory-user@example.com');
+      await page.getByLabel('Test password').fill('one-time-directory-password');
+      const ldapTestResponse = page.waitForResponse((response) => (
+        response.request().method() === 'POST'
+        && new URL(response.url()).pathname === '/api/admin/ldap-config/test'
+      ));
+      await runLdapTest.click();
+      assert.equal((await ldapTestResponse).status(), 503, 'UI error path must receive a classified LDAP outage');
+      await assertVisible(page.getByRole('alert').filter({ hasText: 'LDAP test failed.' }), 'LDAP test error');
+      await assertVisible(
+        page.getByText('LDAP connect failed: connection could not be established', { exact: true }),
+        'Sanitized LDAP test diagnostic'
+      );
+      assert.equal(await page.getByText('one-time-directory-password', { exact: true }).count(), 0);
+      assert.equal(await page.getByLabel('Test email').inputValue(), '');
+      assert.equal(await page.getByLabel('Test password').inputValue(), '');
+
+      await page.getByLabel('Password registration', { exact: true }).check();
+      await ldapLogin.check();
+      await assertVisible(page.getByText(/does not verify email/), 'Registration risk warning');
+      const policyResponse = page.waitForResponse((response) => (
         response.request().method() === 'PATCH'
         && new URL(response.url()).pathname === '/api/admin/auth-policy'
       ));
       await page.getByRole('button', { name: 'Save authentication policy' }).click();
-      assert.equal((await policySaveResponse).ok(), true, 'Authentication policy save must succeed');
-      await assertVisible(page.getByText('Authentication policy saved.', { exact: true }), 'Policy save notice');
-      const { data: changedPolicy } = await adminClient.get('/api/admin/auth-policy');
-      assert.deepEqual(changedPolicy, {
-        ...policySnapshot,
-        email_verification_required: !policySnapshot.email_verification_required
+      assert.equal((await policyResponse).ok(), true, 'Authentication policy save must succeed');
+      assert.deepEqual((await adminClient.get('/api/admin/auth-policy')).data, {
+        password_registration_enabled: true,
+        password_login_enabled: true,
+        ldap_login_enabled: true
       });
-      await assertNoHorizontalOverflow(page, 'Administration desktop policy');
+      await assertNoHorizontalOverflow(page, 'Administration desktop authentication');
 
       const platformKey = uniqueSlug(context, 'qa-browser-platform');
       const platformName = context.unique('QA Browser Platform');
-      const updatedPlatformName = context.unique('QA Browser Platform Updated');
-      const channelKey = uniqueSlug(context, 'qa-browser-channel');
-      const channelName = context.unique('QA Browser Channel');
-      const updatedChannelName = context.unique('QA Browser Channel Updated');
-
       const platformsTab = tablist.getByRole('tab', { name: 'External platforms', exact: true });
       await platformsTab.click();
-      assert.equal(await platformsTab.getAttribute('aria-selected'), 'true');
       const platformsTable = page.getByRole('table', { name: 'External platforms' });
-      await assertVisible(platformsTable, 'External platforms table');
       await page.getByRole('button', { name: 'Add platform', exact: true }).click();
-      const createPlatformDialog = page.getByRole('dialog', { name: 'Add platform' });
-      await assertVisible(createPlatformDialog, 'Add platform dialog');
-      await createPlatformDialog.getByLabel('Platform key').fill(platformKey);
-      await createPlatformDialog.getByLabel('Platform name').fill(platformName);
-      const platformCreateResponse = page.waitForResponse((response) => (
+      const platformDialog = page.getByRole('dialog', { name: 'Add platform' });
+      await platformDialog.getByLabel('Platform key').fill(platformKey);
+      await platformDialog.getByLabel('Platform name').fill(platformName);
+      const platformResponse = page.waitForResponse((response) => (
         response.request().method() === 'POST'
         && new URL(response.url()).pathname === '/api/admin/external-platforms'
       ));
-      await createPlatformDialog.getByRole('button', { name: 'Add platform', exact: true }).click();
-      const createdPlatformResponse = await platformCreateResponse;
+      await platformDialog.getByRole('button', { name: 'Add platform', exact: true }).click();
+      const createdPlatformResponse = await platformResponse;
       assert.equal(createdPlatformResponse.ok(), true, 'External Platform create must succeed');
       const createdPlatform = await createdPlatformResponse.json();
-      assert.equal(createdPlatform.key, platformKey);
-      const platformRow = platformsTable.locator('tbody tr').filter({ hasText: platformKey }).first();
+      const platformRow = platformsTable.getByRole('row').filter({ hasText: platformKey });
       await assertVisible(platformRow, 'Created External Platform row');
-      assert.ok((await platformRow.textContent()).includes(platformName));
-
       await platformRow.getByRole('button', { name: `Edit external platform: ${platformName}` }).click();
       const editPlatformDialog = page.getByRole('dialog', { name: 'Edit external platform' });
-      await assertVisible(editPlatformDialog, 'Edit platform dialog');
-      const immutablePlatformKey = editPlatformDialog.getByLabel('Platform key');
-      assert.equal(await immutablePlatformKey.isDisabled(), true, 'Platform key must be immutable');
-      assert.equal(await immutablePlatformKey.inputValue(), platformKey);
-      await editPlatformDialog.getByLabel('Platform name').fill(updatedPlatformName);
-
-      const newChannelEnabled = editPlatformDialog.getByLabel('Enable new channel');
-      const newChannelTrusted = editPlatformDialog.getByLabel('Trust email for new channel');
-      assert.equal(await newChannelEnabled.isChecked(), true);
-      assert.equal(await newChannelTrusted.isChecked(), true);
-      await editPlatformDialog.getByLabel('Channel key').last().fill(channelKey);
-      await editPlatformDialog.getByLabel('New channel name').fill(channelName);
-      const channelCreateResponse = page.waitForResponse((response) => (
+      assert.equal(await editPlatformDialog.getByLabel('Platform key').isDisabled(), true);
+      await editPlatformDialog.getByLabel('Channel key').last().fill(
+        uniqueSlug(context, 'qa-browser-channel')
+      );
+      await editPlatformDialog.getByLabel('New channel name').fill(
+        context.unique('QA Browser Trusted Channel')
+      );
+      assert.equal(await editPlatformDialog.getByLabel('Enable new channel').isChecked(), true);
+      assert.equal(await editPlatformDialog.getByLabel('Trust email for new channel').isChecked(), true);
+      const channelResponse = page.waitForResponse((response) => (
         response.request().method() === 'POST'
         && new URL(response.url()).pathname
           === `/api/admin/external-platforms/${createdPlatform.id}/authentication-channels`
       ));
       await editPlatformDialog.getByRole('button', { name: 'Add channel' }).click();
-      const createdChannelResponse = await channelCreateResponse;
-      assert.equal(createdChannelResponse.ok(), true, 'Authentication Channel create must succeed');
-      const createdChannel = await createdChannelResponse.json();
-      assert.equal(createdChannel.key, channelKey);
+      const createdChannel = await (await channelResponse).json();
       assert.equal(createdChannel.enabled, true);
       assert.equal(createdChannel.trusted_email, true);
-      const channelPicker = editPlatformDialog.locator('.administration-channel-picker button')
-        .filter({ hasText: channelKey }).first();
-      await assertVisible(channelPicker, 'Created Authentication Channel');
-
-      const immutableChannelKey = editPlatformDialog.getByLabel('Channel key').first();
-      assert.equal(await immutableChannelKey.isDisabled(), true, 'Channel key must be immutable');
-      assert.equal(await immutableChannelKey.inputValue(), channelKey);
-      await editPlatformDialog.getByLabel('Channel name', { exact: true }).fill(updatedChannelName);
-      const channelEnabled = editPlatformDialog.getByLabel('Channel enabled');
-      const channelTrusted = editPlatformDialog.getByLabel('Trusted email');
-      assert.equal(await channelEnabled.isChecked(), true);
-      assert.equal(await channelTrusted.isChecked(), true);
-      await channelEnabled.uncheck();
-      await channelTrusted.uncheck();
-      const channelUpdateResponse = page.waitForResponse((response) => (
-        response.request().method() === 'PATCH'
-        && new URL(response.url()).pathname === `/api/admin/authentication-channels/${createdChannel.id}`
-      ));
-      await editPlatformDialog.getByRole('button', { name: 'Save channel' }).click();
-      assert.equal((await channelUpdateResponse).ok(), true, 'Authentication Channel update must succeed');
-      const { data: persistedChannels } = await adminClient.get(
-        `/api/admin/external-platforms/${createdPlatform.id}/authentication-channels`
-      );
-      const persistedChannel = persistedChannels.find((channel) => channel.id === createdChannel.id);
-      assert.equal(persistedChannel?.name, updatedChannelName);
-      assert.equal(persistedChannel?.enabled, false);
-      assert.equal(persistedChannel?.trusted_email, false);
-
-      const platformUpdateResponse = page.waitForResponse((response) => (
-        response.request().method() === 'PATCH'
-        && new URL(response.url()).pathname === `/api/admin/external-platforms/${createdPlatform.id}`
-      ));
-      await editPlatformDialog.getByRole('button', { name: 'Save changes' }).click();
-      assert.equal((await platformUpdateResponse).ok(), true, 'External Platform update must succeed');
-      await assertVisible(platformRow, 'Updated External Platform row');
-      assert.ok((await platformRow.textContent()).includes(updatedPlatformName));
+      await editPlatformDialog.getByRole('button', { name: 'Cancel' }).click();
       await assertNoHorizontalOverflow(page, 'Administration desktop platforms');
-
-      const { data: promotedMember } = await adminClient.request(
-        `/api/admin/users/${registration.user.id}/role`,
-        { method: 'PUT', body: { role: 'admin' } }
-      );
-      assert.equal(promotedMember.user.role, 'admin');
-      await adminClient.request(`/api/admin/users/${superAdmin.id}/role`, {
-        method: 'PUT',
-        body: { role: 'admin' },
-        expectedStatus: 409
-      });
-      assert.equal(
-        (await adminClient.get(`/api/admin/users/${superAdmin.id}`)).data.user.role,
-        'super_admin',
-        'The last Super Administrator must remain protected'
-      );
 
       const usersTab = tablist.getByRole('tab', { name: 'User management', exact: true });
       await usersTab.click();
-      assert.equal(await usersTab.getAttribute('aria-selected'), 'true');
       const usersTable = page.getByRole('table', { name: 'User management' });
-      await assertVisible(usersTable, 'User management table');
-      const currentUserIdentity = page.locator('.administration-user-identity > strong')
-        .filter({ hasText: superAdmin.username });
-      const memberIdentity = page.locator('.administration-user-identity > strong')
-        .filter({ hasText: memberUsername });
-      const currentUserRow = usersTable.locator('tbody tr').filter({ has: currentUserIdentity }).first();
-      const memberRow = usersTable.locator('tbody tr').filter({ has: memberIdentity }).first();
+      const currentUserRow = usersTable.getByRole('row').filter({ hasText: superAdmin.email });
       await assertVisible(currentUserRow, 'Current Super Administrator row');
-      await assertVisible(memberRow, 'Registered member row');
       assert.equal(
-        await currentUserRow.getByRole('button', { name: `Delete user: ${superAdmin.username}` }).isDisabled(),
+        await currentUserRow.getByRole('button', { name: `Delete user: ${superAdmin.email}` }).isDisabled(),
         true,
-        'Current Super Administrator delete action must be protected'
+        'Current user deletion must remain disabled'
       );
-      await assertVisible(currentUserRow.getByText('super_admin', { exact: true }), 'Super Administrator role');
-      await assertVisible(memberRow.getByText('admin', { exact: true }), 'API-updated member role');
 
-      const userDetailResponse = page.waitForResponse((response) => (
-        response.request().method() === 'GET'
-        && new URL(response.url()).pathname === `/api/admin/users/${registration.user.id}`
+      await page.getByRole('button', { name: 'Create user' }).click();
+      const duplicateDialog = page.getByRole('dialog', { name: 'Create user' });
+      await duplicateDialog.getByLabel('Email').fill(superAdmin.email);
+      await duplicateDialog.getByRole('button', { name: 'Create user' }).click();
+      await assertVisible(duplicateDialog.getByRole('alert'), 'Duplicate-email create error');
+      await duplicateDialog.getByRole('button', { name: 'Cancel' }).click();
+
+      const targetEmail = `${uniqueSlug(context, 'qa-browser-managed-user')}@example.com`;
+      const targetDisplayName = context.unique('QA Browser Managed User');
+      const targetPassword = `${context.unique('Browser managed password')}!Aa9`;
+      const replacementPassword = `${context.unique('Browser replacement password')}!Bb8`;
+      await page.getByRole('button', { name: 'Create user' }).click();
+      const createDialog = page.getByRole('dialog', { name: 'Create user' });
+      await createDialog.getByLabel('Email').fill(targetEmail);
+      await createDialog.getByLabel('Display Name (optional)').fill(targetDisplayName);
+      await createDialog.getByLabel('Password (optional)').fill('short');
+      assert.equal(
+        await createDialog.getByRole('button', { name: 'Create user' }).isDisabled(),
+        true,
+        'Short password must keep user creation disabled'
+      );
+      await createDialog.getByLabel('Password (optional)').fill(targetPassword);
+      const createResponse = page.waitForResponse((response) => (
+        response.request().method() === 'POST'
+        && new URL(response.url()).pathname === '/api/admin/users'
       ));
-      await memberRow.getByRole('button', { name: `User information: ${memberUsername}` }).click();
-      assert.equal((await userDetailResponse).ok(), true, 'User detail request must succeed');
-      const detailsDialog = page.getByRole('dialog', { name: 'User information' });
-      await assertVisible(detailsDialog, 'User details dialog');
-      const detailsText = await detailsDialog.textContent();
-      assert.ok(detailsText.includes(memberUsername));
-      assert.ok(detailsText.includes(memberEmail));
-      assert.ok(detailsText.includes('admin'));
-      await detailsDialog.locator('.modal-actions').getByRole('button', { name: 'Close' }).click();
+      await createDialog.getByRole('button', { name: 'Create user' }).click();
+      const createdResponse = await createResponse;
+      assert.equal(createdResponse.ok(), true, 'User creation must succeed');
+      const createdDetail = await createdResponse.json();
+      createdUserId = createdDetail.user.id;
+      createdUserEmail = targetEmail;
+      let targetRow = usersTable.getByRole('row').filter({ hasText: targetEmail });
+      await assertVisible(targetRow, 'Created user row');
 
-      await memberRow.getByRole('button', { name: `Set user password: ${memberUsername}` }).click();
+      const targetSession = new ApiClient(context.baseURL);
+      await targetSession.post('/api/auth/login', { email: targetEmail, password: targetPassword });
+      await targetRow.getByRole('button', { name: `User information: ${targetEmail}` }).click();
+      const detailsDialog = page.getByRole('dialog', { name: 'User information' });
+      await assertVisible(detailsDialog.getByText(targetDisplayName, { exact: true }), 'User detail Display Name');
+      await detailsDialog.getByRole('button', { name: 'Close' }).last().click();
+
+      const updatedEmail = `${uniqueSlug(context, 'qa-browser-updated-user')}@example.com`;
+      const updatedDisplayName = context.unique('QA Browser Updated User');
+      await targetRow.getByRole('button', { name: `Edit user: ${targetEmail}` }).click();
+      const editDialog = page.getByRole('dialog', { name: 'Edit user' });
+      await editDialog.getByLabel('Email').fill(updatedEmail);
+      await editDialog.getByLabel('Display Name').fill(updatedDisplayName);
+      await assertVisible(
+        editDialog.getByText(/signs this user out of every browser session/),
+        'Email-change Session warning'
+      );
+      const editResponse = page.waitForResponse((response) => (
+        response.request().method() === 'PATCH'
+        && new URL(response.url()).pathname === `/api/admin/users/${createdUserId}`
+      ));
+      await editDialog.getByRole('button', { name: 'Save changes' }).click();
+      assert.equal((await editResponse).ok(), true, 'Email and Display Name update must succeed');
+      createdUserEmail = updatedEmail;
+      await targetSession.get('/api/auth/me', { expectedStatus: 401 });
+      assert.equal((await independentMember.client.get('/api/auth/me')).data.id, independentMember.user.id);
+      targetRow = usersTable.getByRole('row').filter({ hasText: updatedEmail });
+      await assertVisible(targetRow, 'Updated user row');
+
+      const passwordSession = new ApiClient(context.baseURL);
+      await passwordSession.post('/api/auth/login', { email: updatedEmail, password: targetPassword });
+      await targetRow.getByRole('button', { name: `Set user password: ${updatedEmail}` }).click();
       const passwordDialog = page.getByRole('dialog', { name: 'Set user password' });
-      await assertVisible(passwordDialog, 'Set user password dialog');
       await passwordDialog.getByLabel('Password').fill(replacementPassword);
-      const passwordUpdateResponse = page.waitForResponse((response) => (
+      const passwordResponse = page.waitForResponse((response) => (
         response.request().method() === 'PUT'
-        && new URL(response.url()).pathname === `/api/admin/users/${registration.user.id}/password`
+        && new URL(response.url()).pathname === `/api/admin/users/${createdUserId}/password`
       ));
       await passwordDialog.getByRole('button', { name: 'Save changes' }).click();
-      assert.equal((await passwordUpdateResponse).ok(), true, 'User password update must succeed');
-      await assertVisible(page.getByText('Changes saved', { exact: true }), 'Password update notice');
-      await memberClient.get('/api/auth/me', { expectedStatus: 401 });
+      assert.equal((await passwordResponse).ok(), true, 'Password update must succeed');
+      await passwordSession.get('/api/auth/me', { expectedStatus: 401 });
       const replacementSession = new ApiClient(context.baseURL);
       assert.equal((await replacementSession.post('/api/auth/login', {
-        email: memberEmail,
+        email: updatedEmail,
         password: replacementPassword
-      })).data.user.id, registration.user.id);
+      })).data.user.id, createdUserId);
+
+      await targetRow.getByRole('button', { name: `Change user role: ${updatedEmail}` }).click();
+      const roleDialog = page.getByRole('dialog', { name: 'Change user role' });
+      await roleDialog.getByLabel('Role').selectOption('admin');
+      const roleResponse = page.waitForResponse((response) => (
+        response.request().method() === 'PUT'
+        && new URL(response.url()).pathname === `/api/admin/users/${createdUserId}/role`
+      ));
+      await roleDialog.getByRole('button', { name: 'Save changes' }).click();
+      assert.equal((await roleResponse).ok(), true, 'Role update must succeed');
+      await assertVisible(targetRow.getByText('Administrator', { exact: true }), 'Updated Administrator role');
       await assertNoHorizontalOverflow(page, 'Administration desktop users');
 
       await page.setViewportSize({ width: 390, height: 844 });
       await page.getByLabel('Language').selectOption('zh-CN');
       await assertVisible(page.getByRole('heading', { name: '管理', level: 1 }), 'Chinese Administration title');
       const chineseUsersTable = page.getByRole('table', { name: '用户管理' });
-      await assertVisible(chineseUsersTable, 'Chinese User management table');
+      targetRow = chineseUsersTable.getByRole('row').filter({ hasText: updatedEmail });
+      await assertVisible(targetRow, 'Chinese managed user row');
       await assertNoHorizontalOverflow(page, 'Administration 390px users');
-      await page.getByRole('tab', { name: '外部平台', exact: true }).click();
-      await assertVisible(page.getByRole('table', { name: '外部平台' }), 'Chinese External platforms table');
-      await assertNoHorizontalOverflow(page, 'Administration 390px platforms');
-      await page.getByRole('tab', { name: '用户管理', exact: true }).click();
-      await assertVisible(chineseUsersTable, 'Chinese User management table after tab switch');
 
-      const mobileMemberRow = chineseUsersTable.locator('tbody tr').filter({ has: memberIdentity }).first();
-      await mobileMemberRow.getByRole('button', { name: `删除用户: ${memberUsername}` }).click();
+      await targetRow.getByRole('button', { name: `删除用户: ${updatedEmail}` }).click();
       const eraseDialog = page.getByRole('dialog', { name: '删除用户' });
-      await assertVisible(eraseDialog, 'Delete user dialog');
       const eraseAction = eraseDialog.getByRole('button', { name: '删除用户', exact: true });
-      await eraseDialog.getByLabel('确认用户名').fill(`${memberUsername}-wrong`);
-      assert.equal(await eraseAction.isDisabled(), true, 'Inexact username must not enable deletion');
-      await eraseDialog.getByLabel('确认用户名').fill(memberUsername);
-      assert.equal(await eraseAction.isEnabled(), true, 'Exact username must enable deletion');
-      const erasureResponse = page.waitForResponse((response) => (
+      await eraseDialog.getByLabel('确认邮箱').fill(`${updatedEmail}.wrong`);
+      assert.equal(await eraseAction.isDisabled(), true, 'Inexact email must not enable deletion');
+      await eraseDialog.getByLabel('确认邮箱').fill(updatedEmail);
+      assert.equal(await eraseAction.isEnabled(), true, 'Exact email must enable deletion');
+      const eraseResponse = page.waitForResponse((response) => (
         response.request().method() === 'POST'
-        && new URL(response.url()).pathname === `/api/admin/users/${registration.user.id}/erase`
+        && new URL(response.url()).pathname === `/api/admin/users/${createdUserId}/erase`
       ));
       await eraseAction.click();
-      const acceptedErasureResponse = await erasureResponse;
-      assert.equal(acceptedErasureResponse.status(), 202, 'User erasure must be accepted');
-      const erasure = await acceptedErasureResponse.json();
-      assert.equal(erasure.user_id, registration.user.id);
-      await mobileMemberRow.waitFor({ state: 'detached' });
-      const historyIdentity = erasure.username ?? erasure.user_id;
-      const erasureEntry = page.locator('.erasure-history > div').filter({ hasText: historyIdentity }).first();
-      await assertVisible(erasureEntry, 'User erasure history entry');
-      await assertNoHorizontalOverflow(page, 'Administration 390px erasure history');
+      const acceptedErasure = await eraseResponse;
+      assert.equal(acceptedErasure.status(), 202, 'User deletion must be accepted');
+      await targetRow.waitFor({ state: 'detached' });
+      await assertVisible(
+        page.locator('.erasure-history > div').filter({ hasText: createdUserId }),
+        'PII-free deletion history'
+      );
+
+      await page.getByRole('tab', { name: '认证', exact: true }).click();
+      await assertVisible(page.getByText(/明文 LDAP 会在无传输加密时发送凭据/), 'Chinese Plain LDAP warning');
+      await assertNoHorizontalOverflow(page, 'Administration 390px authentication');
+      await page.getByRole('tab', { name: '外部平台', exact: true }).click();
+      await assertVisible(page.getByRole('table', { name: '外部平台' }), 'Chinese External Platform table');
+      await assertNoHorizontalOverflow(page, 'Administration 390px platforms');
       assert.deepEqual(browserErrors, [], 'Browser diagnostics must remain empty');
     });
+
+    if (createdUserId) {
+      await poll(async () => {
+        const { data: erasures } = await adminClient.get('/api/admin/user-erasures');
+        return erasures.find((erasure) => erasure.user_id === createdUserId) ?? null;
+      }, (erasure) => erasure?.status === 'completed', {
+        timeoutMs: 45_000,
+        description: `browser-managed user ${createdUserEmail} deletion to complete`
+      });
+    }
   } finally {
-    await restorePolicy(adminClient, policySnapshot);
+    const authRestores = ldapSnapshot
+      ? [
+          ['restore LDAP configuration', () => restoreLdapConfiguration(context, adminClient, ldapSnapshot)],
+          ['restore authentication policy', () => restorePolicy(adminClient, policySnapshot)]
+        ]
+      : [
+          ['restore authentication policy', () => restorePolicy(adminClient, policySnapshot)],
+          ['remove scenario LDAP configuration', () => restoreLdapConfiguration(context, adminClient, null)]
+        ];
+    await runCleanupSteps([
+      ...authRestores,
+      [
+        'restore current-user Display Name',
+        async () => {
+          const { data: restoredProfile } = await adminClient.request('/api/users/me', {
+            method: 'PATCH',
+            body: { display_name: superAdmin.display_name }
+          });
+          assert.equal(restoredProfile.display_name, superAdmin.display_name);
+        }
+      ]
+    ]);
   }
 }

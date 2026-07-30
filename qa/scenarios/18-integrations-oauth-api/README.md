@@ -8,6 +8,11 @@ External Sessions, attachments, ordered events, SSE, tool result continuation,
 concurrent message serialization, stopping, and immediate delegation
 revocation.
 
+The authenticated `client_credentials` path requires a trusted email before it
+creates the External Identity. OAuth userinfo never exposes a Hub username;
+the optional external username appears only inside `external_profile` when that
+scope was granted.
+
 The concurrency check registers a scenario-owned Runtime but never heartbeats
 it. Binding one Agent to that Runtime keeps the accepted Run pending long
 enough for two simultaneous messages to exercise the Session lock. The Run is

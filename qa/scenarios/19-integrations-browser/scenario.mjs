@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { ApiClient, loginAsAdmin } from '../../support/api.mjs';
+import { ApiClient, loginAsAdmin, provisionLocalUser } from '../../support/api.mjs';
 import { withBrowser } from '../../support/browser.mjs';
 
 function uniqueSlug(context, prefix) {
@@ -143,6 +143,12 @@ export default async function integrationsBrowserScenario(scenarioContext) {
     { key: channelKey, name: channelName, enabled: true, trusted_email: true }
   );
   assert.equal(channel.enabled && channel.trusted_email, true, 'Fixture channel must be enabled and trusted');
+  const ownerAccount = await provisionLocalUser(
+    adminClient,
+    scenarioContext,
+    'qa-integrations-owner',
+    { role: 'admin' }
+  );
 
   const createdAgentIds = [];
   let scenarioFailure;
@@ -152,21 +158,15 @@ export default async function integrationsBrowserScenario(scenarioContext) {
         { method: 'GET', pathname: '/api/auth/me', status: 401, times: 1 }
       ]
     }, async ({ page, context, request, browserErrors }) => {
-      const ownerSlug = uniqueSlug(scenarioContext, 'qa-integrations-owner');
-      const ownerEmail = `${ownerSlug}@example.com`;
       await page.goto('/login', { waitUntil: 'domcontentloaded' });
-      await page.getByLabel('Email').fill(ownerEmail);
-      await page.getByRole('button', { name: 'Sign in with Mock OIDC' }).click();
+      await page.getByLabel('Email').fill(ownerAccount.email);
+      await page.getByLabel('Password').fill(ownerAccount.password);
+      await page.getByRole('button', { name: 'Sign in', exact: true }).click();
       await page.waitForURL((url) => url.pathname === '/sessions');
-      await page.getByText(ownerEmail, { exact: true }).waitFor();
+      await page.getByText(ownerAccount.email, { exact: true }).waitFor();
 
       const owner = await responseJson(await request.get('/api/auth/me'), 'Read Integration App owner');
-      assert.equal(owner.email, ownerEmail);
-      const { data: promotedOwner } = await adminClient.request(
-        `/api/admin/users/${owner.id}/role`,
-        { method: 'PUT', body: { role: 'admin' } }
-      );
-      assert.equal(promotedOwner.user.role, 'admin', 'Integration App owner must be promoted to administrator');
+      assert.equal(owner.id, ownerAccount.user.id);
       const browserOwner = await responseJson(
         await request.get('/api/auth/me'),
         'Read promoted Integration App owner'

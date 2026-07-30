@@ -2,7 +2,6 @@ import { expect, test, type Page, type Route } from '@playwright/test';
 
 const currentUser = {
   id: '10000000-0000-0000-0000-000000000001',
-  username: 'shared-surfaces',
   email: 'shared-surfaces@example.com',
   display_name: 'Shared surfaces tester',
   role: 'admin'

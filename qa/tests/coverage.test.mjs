@@ -543,6 +543,35 @@ test('manifest rejects unknown feature IDs', (t) => {
   );
 });
 
+test('blocked prerequisites are explicit and do not count as executable coverage', (t) => {
+  const root = fixtureRepository(t);
+  const catalog = validateCatalog(minimalCatalog(), root);
+  assert.throws(
+    () => validateScenarioManifest({
+      ...scenario('blocked', 'api'),
+      blocked_prerequisite: '   '
+    }, 'blocked', catalog),
+    /blocked_prerequisite must be a non-empty string/
+  );
+  const validated = validateScenarioManifest({
+    ...scenario('blocked', 'api'),
+    blocked_prerequisite: 'Requires a real directory fixture.'
+  }, 'blocked', catalog);
+  assert.equal(validated.blocked_prerequisite, 'Requires a real directory fixture.');
+
+  const report = calculateCoverage(catalog, [{
+    ...scenario('blocked', 'api'),
+    blockedPrerequisite: validated.blocked_prerequisite
+  }], ['GET /api/example'], ['/example']);
+  assert.equal(report.complete, false);
+  assert.deepEqual(report.gaps.missing_required_layers, [{
+    feature_id: 'EX-001',
+    domain: 'example',
+    missing_layers: ['qa-api', 'qa-browser']
+  }]);
+  assert.deepEqual(report.gaps.uncovered_compose_domains, ['example']);
+});
+
 test('coverage reports a missing required layer', (t) => {
   const root = fixtureRepository(t);
   const catalog = validateCatalog(minimalCatalog(), root);
@@ -817,7 +846,7 @@ test('source fingerprint detects subsequent changes to a dirty gateway file', (t
   assert.notEqual(first.working_tree_fingerprint, second.working_tree_fingerprint);
 });
 
-test('--coverage reports every current feature without invoking Docker', (t) => {
+test('--coverage includes real LDAP API and browser evidence without invoking Docker', (t) => {
   const root = mkdtempSync(join(tmpdir(), 'agent-hub-coverage-command-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const bin = join(root, 'bin');
@@ -835,8 +864,8 @@ test('--coverage reports every current feature without invoking Docker', (t) => 
   assert.equal(readFileSync(join(repoRoot, 'qa', 'runner.mjs'), 'utf8').includes("./support/browser.mjs"), false);
   const overall = result.stdout.match(/Overall repository coverage: (\d+)\/(\d+) fully covered/);
   assert.ok(overall, result.stdout);
-  assert.equal(Number(overall[1]), 81);
-  assert.equal(Number(overall[2]), 81);
+  assert.equal(Number(overall[1]), 85);
+  assert.equal(Number(overall[2]), 85);
   assert.match(result.stdout, /Coverage validation passed\./);
   assert.equal(result.stdout.includes('Unmapped OpenAPI operations'), false);
   assert.equal(result.stdout.includes('Unmapped UI routes'), false);

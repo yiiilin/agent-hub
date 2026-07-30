@@ -64,6 +64,8 @@ Content-Type: application/json
 
 `client_secret` 只能存在于可信后端或 secret manager，永不进入浏览器 bundle、HTML、日志、URL 或浏览器请求体。
 
+认证授权中的 `email` 必填，并且必须来自应用后端已经认证的用户资料；`username` 和 `display_name` 只是可选外部资料。Hub 使用可信邮箱关联或创建 Hub User，因此后端不得允许浏览器任意替换该值。
+
 ### 完整请求
 
 以下值都是占位示例，不是有效凭证：

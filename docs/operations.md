@@ -42,7 +42,7 @@ Session 配置原子物化成功后，Runtime 对空闲 Pi 调用原生 `reload_
 
 ## 生产 Compose
 
-根目录 `compose.yml` 是默认生产编排。它启动 PostgreSQL、私有 MinIO、Hub 和无状态 Model Gateway；Hub backend 镜像同时包含并直接托管 React/Vite 静态资源，不需要独立 frontend 或 Nginx 容器。生产配置不启用 Mock OIDC、开发用户、开发 Model Connection、fake provider 或 fake Pi RPC。先以 `.env.example` 为清单配置 `.env` 并执行 `chmod 600 .env`；关键值为空时 Compose 会在创建容器前拒绝启动。`.env` 已同时被 Git 和 Docker build context 排除。
+根目录 `compose.yml` 是默认生产编排。它启动 PostgreSQL、私有 MinIO、Hub 和无状态 Model Gateway；Hub backend 镜像同时包含并直接托管 React/Vite 静态资源，不需要独立 frontend 或 Nginx 容器。Hub 不包含 Mock OIDC，生产配置也不启用开发用户、开发 Model Connection、fake provider 或 fake Pi RPC。先以 `.env.example` 为清单配置 `.env` 并执行 `chmod 600 .env`；关键值为空时 Compose 会在创建容器前拒绝启动。`.env` 已同时被 Git 和 Docker build context 排除。
 
 至少需要设置：
 
@@ -77,7 +77,7 @@ Pi Session state 和暂存文件，不得当作无状态缓存删除。
 
 ## 开发 Compose
 
-`compose.dev.yml` 保留 Mock OIDC、开发种子和 fake model provider，只用于本地开发及自动化测试；Runtime 仍执行镜像内真实 Pi standalone。确定性的 `deploy/fake-pi-rpc.sh` 只用于协议级测试。开发环境同样由 backend 直接提供构建后的前端资源：
+`compose.dev.yml` 保留开发种子和 fake model provider，只用于本地开发及自动化测试；Runtime 仍执行镜像内真实 Pi standalone。确定性的 `deploy/fake-pi-rpc.sh` 只用于协议级测试。开发环境同样由 backend 直接提供构建后的前端资源：
 
 ```bash
 docker compose -p agent-hub-dev -f compose.dev.yml up -d --build
@@ -100,6 +100,18 @@ E2E_COMPOSE_PROJECT=agent-hub-dev npm --prefix frontend run test:e2e
 | `bundle-store-data` | `/data` | Compose 内置 MinIO 中的 Session Bundle 与 Skill Package 对象 |
 
 不要在 Runtime 尚有 Session 时删除 `runtime-data`。其中可能有尚未成功写入 Session Bundle 的最新 Workspace 状态。
+
+## LDAP 登录与代理来源
+
+LDAP 配置由 `admin` 或 `super_admin` 在“管理 -> 认证”写入数据库，不通过环境变量保存 Bind 账号或密码。Hub 只支持一个 LDAP URL，并使用配置的 Bind 身份模板将登录邮箱映射成目录接受的 Bind 名称；AD/UPN 通常使用 `{email}`，固定 DN 目录可使用 `uid={email},ou=people,dc=example,dc=test`。生产部署必须确保 Hub 网络能够访问该目录地址。LDAPS 与 StartTLS 默认执行证书和 hostname 校验；纯明文与跳过证书验证都需要在管理台显式开启，并持续展示风险警告。
+
+开发与 QA 使用可选 `ldap` profile 启动真实 OpenLDAP；普通开发启动不承担该服务开销：
+
+```bash
+docker compose -p agent-hub-dev -f compose.dev.yml --profile ldap up -d --build
+```
+
+默认情况下 Hub 信任请求中的 `Forwarded` / `X-Forwarded-For` 作为登录限流来源，这意味着可直连 Hub 的客户端能够伪造 IP。生产环境应设置 `TRUSTED_PROXY_CIDRS` 为实际反向代理网段；配置后，只有 TCP 来源属于这些网段时才采用转发头，否则按 TCP 来源 IP 限流。
 
 ## Runtime 注册和凭据
 

@@ -1,4 +1,10 @@
+import { randomBytes } from 'node:crypto';
 import { redactSecrets } from './secrets.mjs';
+
+export function qaSourceIp() {
+  const bytes = randomBytes(3);
+  return `198.${18 + (bytes[0] & 1)}.${bytes[1]}.${(bytes[2] % 254) + 1}`;
+}
 
 function expectedStatusMatches(status, expectedStatus) {
   if (expectedStatus === undefined) return status >= 200 && status < 300;
@@ -7,9 +13,10 @@ function expectedStatusMatches(status, expectedStatus) {
 }
 
 export class ApiClient {
-  constructor(baseURL) {
+  constructor(baseURL, { sourceIp = qaSourceIp() } = {}) {
     this.baseURL = new URL(baseURL);
     this.cookies = new Map();
+    this.sourceIp = sourceIp;
   }
 
   absorbCookies(headers) {
@@ -33,6 +40,15 @@ export class ApiClient {
 
   async request(path, { method = 'GET', body, headers = {}, expectedStatus, signal } = {}) {
     const requestHeaders = { accept: 'application/json', ...headers };
+    const pathname = new URL(path, this.baseURL).pathname;
+    const suppliedHeaders = new Set(Object.keys(requestHeaders).map((name) => name.toLowerCase()));
+    if (
+      ['/api/auth/login', '/api/auth/ldap/login'].includes(pathname)
+      && !suppliedHeaders.has('forwarded')
+      && !suppliedHeaders.has('x-forwarded-for')
+    ) {
+      requestHeaders['x-forwarded-for'] = this.sourceIp;
+    }
     const cookie = this.cookieHeader();
     if (cookie) requestHeaders.cookie = cookie;
     let requestBody;
@@ -84,6 +100,27 @@ export async function loginAsAdmin(client) {
     password: 'admin123'
   });
   return client.get('/api/auth/me');
+}
+
+export async function provisionLocalUser(adminClient, context, prefix, {
+  role = 'member',
+  displayName = context.unique('QA local user')
+} = {}) {
+  const slug = context.unique(prefix)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '');
+  const email = `${slug}@example.com`;
+  const password = `${context.unique('QA local password')}!Aa9`;
+  const { data: detail } = await adminClient.post('/api/admin/users', {
+    email,
+    display_name: displayName,
+    password,
+    role
+  });
+  const client = new ApiClient(context.baseURL);
+  const { data: login } = await client.post('/api/auth/login', { email, password });
+  return { client, user: login.user, detail, email, password };
 }
 
 export async function poll(check, accept, {

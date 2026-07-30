@@ -81,6 +81,11 @@ function eventTimestamp(value: string) {
   return Number.isFinite(timestamp) ? timestamp : 0;
 }
 
+function newestSessionFirst(left: HubSession, right: HubSession) {
+  return eventTimestamp(right.created_at) - eventTimestamp(left.created_at)
+    || right.id.localeCompare(left.id);
+}
+
 const activityKeys: Record<ActivityKind, TranslationKey> = {
   reasoning: 'activityReasoning',
   command: 'activityCommand',
@@ -363,7 +368,6 @@ export function ChatActivityGroup({ activities, startedAt, endedAt }: { activiti
 export function ChatMessageBubble({
   agentName,
   content,
-  guidance,
   role,
   state,
   stateLabel,
@@ -371,21 +375,20 @@ export function ChatMessageBubble({
 }: {
   agentName: string | null;
   content: string;
-  guidance?: string;
   role: string;
   state?: string;
   stateLabel?: string;
   streaming?: boolean;
 }) {
   const { t } = useI18n();
+  const visibleState = state && state !== 'delivered' && state !== 'queued' ? state : undefined;
   return <article className={`session-bubble role-${role}`}>
     {role !== 'user' && <span className="session-message-avatar" aria-hidden="true"><Bot size={17} /></span>}
     <div className="session-message-body">
-      <header>{role !== 'user' && <strong>{role === 'assistant' ? agentName ?? t('assistant') : role}</strong>}{state && state !== 'delivered' && <span className={`message-state ${state}`}>{stateLabel}</span>}</header>
+      <header>{role !== 'user' && <strong>{role === 'assistant' ? agentName ?? t('assistant') : role}</strong>}{visibleState && <span className={`message-state ${visibleState}`}>{stateLabel}</span>}</header>
       {role === 'assistant'
         ? <div className="session-message-text session-message-markdown"><Suspense fallback={<span className="session-message-markdown-loading">{content}</span>}><ChatMarkdown content={content} streaming={streaming} /></Suspense></div>
         : <div className="session-message-text">{content}</div>}
-      {guidance && <small>{guidance}</small>}
     </div>
   </article>;
 }
@@ -769,7 +772,7 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
       const searchMatches = !query || [session.agent_name, session.id, session.lifecycle_status, platformName]
         .join(' ').toLocaleLowerCase(locale).includes(query);
       return platformMatches && agentMatches && searchMatches;
-    });
+    }).sort(newestSessionFirst);
   }, [locale, platformFilter, search, selectedAgentId, sessions, t]);
 
   useEffect(() => {
@@ -1021,7 +1024,6 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
                 : <ChatMessageBubble
                   agentName={conversationAgentName}
                   content={entry.content}
-                  guidance={entry.kind === 'message' && entry.mode === 'steer' ? t('guidingCurrentTurn') : undefined}
                   key={entry.id}
                   role={entry.role}
                   state={entry.kind === 'message' ? entry.state : undefined}
@@ -1039,7 +1041,7 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
               event.preventDefault();
               event.currentTarget.form?.requestSubmit();
             }} placeholder={selectedSession?.active_turn_id ? t('guideCurrentTurnPlaceholder') : t('messagePlaceholder')} /></label>
-            <div>{selectedSession?.active_turn_id && <span>{t('guidingCurrentTurn')}</span>}<span className="session-composer-actions">{selectedSession?.active_turn_id && activeRunId && <button type="button" className="icon-button session-stop-button" aria-label={t('stopCurrentRun')} title={t('stopCurrentRun')} disabled={stopping || stopRequestedRunId === activeRunId} onClick={stopCurrentRun}><Square size={14} /></button>}<button type="submit" className="icon-button session-send-button" aria-label={sending ? t('sending') : t('send')} title={t('send')} disabled={sending || !draft.trim()}><ArrowUp size={18} /></button></span></div>
+            <div><span className="session-composer-actions">{selectedSession?.active_turn_id && activeRunId && <button type="button" className="icon-button session-stop-button" aria-label={t('stopCurrentRun')} title={t('stopCurrentRun')} disabled={stopping || stopRequestedRunId === activeRunId} onClick={stopCurrentRun}><Square size={14} /></button>}<button type="submit" className="icon-button session-send-button" aria-label={sending ? t('sending') : t('send')} title={t('send')} disabled={sending || !draft.trim()}><ArrowUp size={18} /></button></span></div>
           </form>}
         </>}
       </section>

@@ -7,6 +7,7 @@ import {
   redactSecrets,
   sanitizeArtifactTree
 } from './secrets.mjs';
+import { qaSourceIp } from './api.mjs';
 
 const PLAYWRIGHT_MODULE = new URL('../../frontend/node_modules/playwright/index.mjs', import.meta.url);
 const FAILURE_MASK_SELECTOR = [
@@ -53,7 +54,8 @@ export async function withBrowser(scenarioContext, options, run) {
   const context = await browser.newContext({
     baseURL: scenarioContext.baseURL,
     locale: 'en-US',
-    viewport: { width: 1280, height: 800 }
+    viewport: { width: 1280, height: 800 },
+    extraHTTPHeaders: { 'x-forwarded-for': qaSourceIp() }
   });
   const startTracing = context.tracing.start.bind(context.tracing);
   // Scenarios may pause and restart tracing; never allow pixel screenshots into trace.zip.

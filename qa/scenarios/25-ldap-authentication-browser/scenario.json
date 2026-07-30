@@ -1,0 +1,6 @@
+{
+  "name": "Real LDAP login and emergency Local Password browser lifecycle",
+  "type": "browser",
+  "timeout_ms": 180000,
+  "covers": ["AUTH-002", "AUTH-006", "SYS-004"]
+}

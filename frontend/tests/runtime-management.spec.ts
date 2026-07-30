@@ -2,7 +2,6 @@ import { expect, test, type Page } from '@playwright/test';
 
 const superAdmin = {
   id: 'admin-1',
-  username: 'admin',
   email: 'admin@example.com',
   display_name: 'Admin',
   role: 'super_admin'
@@ -78,7 +77,7 @@ async function mockBase(
 }
 
 async function mountRuntimePage(page: Page) {
-  await page.route('**/api/auth/providers', (route) => route.fulfill({ json: { oidc_mock: false } }));
+  await page.route('**/api/auth/providers', (route) => route.fulfill({ json: { password_registration_enabled: false, password_login_enabled: true, ldap_login_enabled: false } }));
   await page.goto('/runtimes');
   await expect(page.locator('.runtime-workspace')).toBeVisible();
 }

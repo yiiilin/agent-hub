@@ -226,7 +226,13 @@ button:disabled, input:disabled {
 }
 
 .account-row, .language-control { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
-.account-row span { overflow: hidden; text-overflow: ellipsis; }
+.account-profile { min-width: 0; flex: 1 1 auto; display: flex; align-items: center; gap: 8px; border: 0; border-radius: var(--radius-small); padding: 5px 6px; background: transparent; color: var(--text-secondary); text-align: left; cursor: pointer; }
+.account-profile:hover { background: rgb(0 0 0 / 5%); color: var(--text-primary); }
+.account-profile > svg { flex: 0 0 auto; }
+.account-profile > span { min-width: 0; display: grid; gap: 1px; }
+.account-profile strong, .account-profile small { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-profile strong { color: inherit; font-size: 12px; }
+.account-profile small { font-size: 10px; font-weight: 500; }
 .language-control { position: relative; }
 .language-control select { min-width: 0; height: 34px; padding: 6px 8px; color: var(--text-primary); background: rgb(255 255 255 / 72%); border-color: var(--border-regular); }
 
@@ -356,6 +362,97 @@ button:disabled, input:disabled {
 .login-actions .secondary {
   width: 100%;
   margin: 0;
+}
+
+.login-methods {
+  width: 100%;
+}
+
+.login-methods button {
+  min-width: 0;
+  flex: 1 1 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+}
+
+.login-method-label,
+.login-emergency {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.login-method-label {
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.login-method-label > span {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border-radius: var(--radius-small);
+  background: var(--surface-tertiary);
+  color: var(--accent);
+}
+
+.login-emergency {
+  align-items: flex-start;
+  border-left: 3px solid var(--warning);
+  padding: 10px 11px;
+  background: #fff8e7;
+  color: #6f541b;
+}
+
+.login-emergency > svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.login-emergency > div,
+.login-state {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.login-emergency span,
+.login-state {
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.login-state {
+  color: var(--text-secondary);
+}
+
+.login-state.error {
+  color: var(--danger);
+}
+
+.login-state .secondary {
+  width: fit-content;
+  margin: 4px 0 0;
+}
+
+.login-mode-switch {
+  justify-self: center;
+  min-height: 32px;
+}
+
+.profile-dialog {
+  width: min(100%, 480px);
+}
+
+.profile-form {
+  display: grid;
+  gap: 12px;
 }
 
 .stack {

@@ -1,7 +1,7 @@
-import { Activity, BookOpen, Bot, BrainCircuit, Check, CirclePause, Clock, Copy, ExternalLink, KeyRound, Languages, LogOut, Menu, Monitor, Plug, Plus, RotateCcw, Save, Search, Send, Settings, ShieldAlert, Sparkles, Trash2, Workflow, X } from 'lucide-react';
+import { Activity, BookOpen, Bot, BrainCircuit, Building2, Check, CirclePause, Clock, Copy, ExternalLink, KeyRound, Languages, LockKeyhole, LogOut, Menu, Monitor, Plug, Plus, RotateCcw, Save, Search, Send, Settings, ShieldAlert, Sparkles, Trash2, UserRound, Workflow, X } from 'lucide-react';
 import React, { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { Agent, api, ApiError, ApiKey, ApiKeyValidity, Automation, HubSession, Run, RunEvent, Runtime, RuntimeEnrollmentToken, User } from './api/client';
+import { Agent, api, ApiError, ApiKey, ApiKeyValidity, AuthProviders, Automation, HubSession, Run, RunEvent, Runtime, RuntimeEnrollmentToken, User } from './api/client';
 import { I18nProvider, useI18n } from './i18n';
 import type { TranslationKey } from './i18n';
 import { FormDialog } from './components/form-dialog';
@@ -104,7 +104,7 @@ function App() {
   if (!user || route.name === 'login') return <LoginPage onLogin={setUser} />;
 
   return (
-    <Shell user={user}>
+    <Shell user={user} onUserUpdated={setUser}>
       {route.name === 'agents' && <AgentsPage currentUser={user} navigate={navigate} />}
       {route.name === 'sessions' && <SessionsPage currentUserId={user.id} />}
       {route.name === 'integrations' && <IntegrationAppsPage currentUser={user} />}
@@ -123,10 +123,11 @@ function App() {
   );
 }
 
-function Shell({ user, children }: { user: User | null; children: React.ReactNode }) {
+function Shell({ user, children, onUserUpdated }: { user: User | null; children: React.ReactNode; onUserUpdated?: (user: User) => void }) {
   const { language, setLanguage, t } = useI18n();
   const currentRoute = parseRoute().name;
   const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
+  const [profileOpen, setProfileOpen] = useState(false);
   const current = (name: Route['name']) => currentRoute === name || (name === 'skills' && currentRoute === 'skill') ? 'page' as const : undefined;
 
   useEffect(() => setMobileNavigationOpen(false), [currentRoute]);
@@ -182,48 +183,133 @@ function Shell({ user, children }: { user: User | null; children: React.ReactNod
         {mobileNavigationOpen && <button className="navigation-backdrop" type="button" aria-label={t('close')} onClick={() => setMobileNavigationOpen(false)} />}
         <div className="sidebar-footer">
           <label className="language-control"><Languages size={16} /><span className="sr-only">{t('language')}</span><select aria-label={t('language')} value={language} onChange={(event) => setLanguage(event.target.value as 'en' | 'zh-CN')}><option value="en">{t('english')}</option><option value="zh-CN">{t('chinese')}</option></select></label>
-          <div className="account-row">{user && <span>{user.email ?? user.username}</span>}{user && <button className="icon-button" title={t('logout')} aria-label={t('logout')} onClick={logout}><LogOut size={17} /></button>}</div>
+          <div className="account-row">{user && <button className="account-profile" type="button" title={t('editProfile')} onClick={() => setProfileOpen(true)}><UserRound size={17} /><span><strong>{user.display_name}</strong><small>{user.email}</small></span></button>}{user && <button className="icon-button" title={t('logout')} aria-label={t('logout')} onClick={logout}><LogOut size={17} /></button>}</div>
         </div>
       </aside>
       <main className="main">{children}</main>
+      {profileOpen && user && <ProfileDialog user={user} onClose={() => setProfileOpen(false)} onSaved={(updated) => { onUserUpdated?.(updated); setProfileOpen(false); }} />}
     </div>
   );
 }
+
+function ProfileDialog({ user, onClose, onSaved }: { user: User; onClose: () => void; onSaved: (user: User) => void }) {
+  const { t } = useI18n();
+  const [displayName, setDisplayName] = useState(user.display_name);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(false);
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    if (busy || !displayName.trim()) return;
+    setBusy(true);
+    setError(false);
+    try {
+      onSaved(await api.updateCurrentUser(displayName));
+    } catch {
+      setError(true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <FormDialog
+    title={t('editProfile')}
+    eyebrow={user.email}
+    onClose={onClose}
+    busy={busy}
+    className="profile-dialog"
+    footer={<>
+      <button className="secondary" type="button" disabled={busy} onClick={onClose}>{t('cancel')}</button>
+      <button className="primary" type="submit" form="profile-form" disabled={busy || !displayName.trim()}><Save size={16} /> {busy ? t('saving') : t('saveChanges')}</button>
+    </>}
+  >
+    <form id="profile-form" className="profile-form" onSubmit={submit}>
+      <label>{t('displayName')}<input autoFocus required maxLength={128} value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></label>
+      {error && <div className="error" role="alert">{t('profileUpdateFailed')}</div>}
+    </form>
+  </FormDialog>;
+}
+
+type LoginMethod = 'password' | 'ldap';
 
 function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
   const { language, setLanguage, t } = useI18n();
   const [email, setEmail] = useState('admin@example.com');
   const [password, setPassword] = useState('admin123');
-  const [oidcMockEnabled, setOidcMockEnabled] = useState(false);
+  const [displayName, setDisplayName] = useState('');
+  const [providers, setProviders] = useState<AuthProviders | null>(null);
+  const [providersLoading, setProvidersLoading] = useState(true);
+  const [providersError, setProvidersError] = useState(false);
+  const [providersReload, setProvidersReload] = useState(0);
+  const [method, setMethod] = useState<LoginMethod>('password');
+  const [registering, setRegistering] = useState(false);
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<TranslationKey | null>(null);
+  const emergencyPassword = new URLSearchParams(window.location.search).get('method') === 'password';
 
   useEffect(() => {
-    api.authProviders().then((providers) => setOidcMockEnabled(providers.oidc_mock)).catch(() => setOidcMockEnabled(false));
-  }, []);
+    let active = true;
+    setProvidersLoading(true);
+    setProvidersError(false);
+    api.authProviders()
+      .then((response) => {
+        if (!active) return;
+        setProviders(response);
+        if (!emergencyPassword) setMethod(response.password_login_enabled ? 'password' : 'ldap');
+      })
+      .catch(() => { if (active) setProvidersError(true); })
+      .finally(() => { if (active) setProvidersLoading(false); });
+    return () => { active = false; };
+  }, [emergencyPassword, providersReload]);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
+    if (busy || (!emergencyPassword && !providers)) return;
+    setBusy(true);
     setError(null);
     try {
-      const response = await api.login(email, password);
+      const response = registering
+        ? await api.register(email, password, displayName)
+        : method === 'ldap' && !emergencyPassword
+          ? await api.ldapLogin(email, password)
+          : await api.login(email, password);
       onLogin(response.user);
       navigate('/sessions');
-    } catch (err) {
-      setError('loginFailed');
+    } catch {
+      setError(registering ? 'registrationFailed' : method === 'ldap' && !emergencyPassword ? 'ldapLoginFailed' : 'loginFailed');
+    } finally {
+      setBusy(false);
     }
   }
+
+  const ordinaryMethodAvailable = Boolean(providers?.password_login_enabled || providers?.ldap_login_enabled);
+  const showForm = emergencyPassword || (!providersLoading && !providersError && ordinaryMethodAvailable);
+  const passwordLabel = method === 'ldap' && !emergencyPassword ? t('directoryPassword') : t('password');
 
   return (
     <div className="login-screen">
       <form className="login-panel" onSubmit={submit}>
-        <div className="login-heading"><div className="login-brand"><span className="brand-mark"><Workflow size={19} /></span><h1>Agent Hub</h1></div><select aria-label={t('language')} value={language} onChange={(event) => setLanguage(event.target.value as 'en' | 'zh-CN')}><option value="en">English</option><option value="zh-CN">简体中文</option></select></div>
-        <label>{t('email')}<input aria-label={t('email')} value={email} onChange={(event) => setEmail(event.target.value)} /></label>
-        <label>{t('password')}<input aria-label={t('password')} type="password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
-        {error && <div className="error">{t(error)}</div>}
-        <div className="login-actions">
-          <button className="primary" type="submit">{t('signIn')}</button>
-          {oidcMockEnabled && <button className="secondary" type="button" onClick={() => { const params = new URLSearchParams({ email, sub: `mock:${email}` }); window.location.href = `/api/auth/oidc/mock/start?${params}`; }}>{t('signInOidc')}</button>}
-        </div>
+        <div className="login-heading"><div className="login-brand"><span className="brand-mark"><Workflow size={19} /></span><h1>Agent Hub</h1></div><select aria-label={t('language')} value={language} disabled={busy} onChange={(event) => setLanguage(event.target.value as 'en' | 'zh-CN')}><option value="en">{t('english')}</option><option value="zh-CN">{t('chinese')}</option></select></div>
+        {emergencyPassword && <div className="login-emergency" role="status"><ShieldAlert size={18} /><div><strong>{t('emergencyPasswordLogin')}</strong><span>{t('emergencyPasswordHelp')}</span></div></div>}
+        {!emergencyPassword && providersLoading && <div className="login-state" role="status">{t('loadingSignInMethods')}</div>}
+        {!emergencyPassword && providersError && <div className="login-state error" role="alert"><span>{t('signInMethodsFailed')}</span><button className="secondary" type="button" onClick={() => setProvidersReload((value) => value + 1)}>{t('retry')}</button></div>}
+        {!emergencyPassword && !providersLoading && !providersError && !ordinaryMethodAvailable && <div className="login-state" role="alert">{t('noSignInMethods')}</div>}
+        {showForm && <>
+          {!emergencyPassword && !registering && providers && providers.password_login_enabled && providers.ldap_login_enabled && <div className="login-methods segmented-control" role="group" aria-label={t('signInMethod')}>
+            <button type="button" aria-pressed={method === 'password'} disabled={busy} onClick={() => { setMethod('password'); setError(null); }}><LockKeyhole size={16} /> {t('localPassword')}</button>
+            <button type="button" aria-pressed={method === 'ldap'} disabled={busy} onClick={() => { setMethod('ldap'); setError(null); }}><Building2 size={16} /> {t('ldapDirectory')}</button>
+          </div>}
+          {!emergencyPassword && !registering && providers && providers.password_login_enabled !== providers.ldap_login_enabled && <div className="login-method-label"><span>{method === 'ldap' ? <Building2 size={16} /> : <LockKeyhole size={16} />}</span>{method === 'ldap' ? t('ldapDirectory') : t('localPassword')}</div>}
+          {registering && <div className="login-method-label"><span><UserRound size={16} /></span>{t('createAccount')}</div>}
+          <label>{t('email')}<input aria-label={t('email')} type="email" autoComplete="username" required disabled={busy} value={email} onChange={(event) => setEmail(event.target.value)} /></label>
+          {registering && <label>{t('displayNameOptional')}<input aria-label={t('displayNameOptional')} autoComplete="name" maxLength={128} disabled={busy} value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></label>}
+          <label>{passwordLabel}<input aria-label={passwordLabel} type="password" autoComplete={registering ? 'new-password' : 'current-password'} minLength={method === 'ldap' && !emergencyPassword && !registering ? 1 : 8} maxLength={1024} required disabled={busy} value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+          {error && <div className="error" role="alert">{t(error)}</div>}
+          <div className="login-actions">
+            <button className="primary" type="submit" disabled={busy}>{busy ? t(registering ? 'creating' : 'signingIn') : t(registering ? 'createAccount' : 'signIn')}</button>
+            {!emergencyPassword && providers?.password_registration_enabled && <button className="text-button login-mode-switch" type="button" disabled={busy} onClick={() => { setRegistering((value) => !value); setError(null); }}>{t(registering ? 'backToSignIn' : 'createAccountInstead')}</button>}
+          </div>
+        </>}
       </form>
     </div>
   );

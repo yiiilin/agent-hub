@@ -1,0 +1,6 @@
+{
+  "name": "Real LDAP transport, mapping, throttling, and Session persistence API",
+  "type": "api",
+  "timeout_ms": 240000,
+  "covers": ["AUTH-003", "AUTH-006", "AUTH-007"]
+}

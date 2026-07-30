@@ -2,15 +2,13 @@ export type UserRole = 'member' | 'admin' | 'super_admin';
 
 export type User = {
   id: string;
-  username: string;
-  email: string | null;
+  email: string;
   display_name: string;
   role: UserRole;
 };
 
 export type AdminUserDetail = {
   user: User;
-  email_verified: boolean;
   has_password: boolean;
   created_at: string;
 };
@@ -21,6 +19,18 @@ export type AdminSetUserPasswordRequest = {
 
 export type AdminSetUserRoleRequest = {
   role: UserRole;
+};
+
+export type AdminCreateUserRequest = {
+  email: string;
+  display_name?: string;
+  password?: string;
+  role: UserRole;
+};
+
+export type AdminUpdateUserRequest = {
+  email: string;
+  display_name: string;
 };
 
 export type ReasoningEffort =
@@ -364,7 +374,29 @@ export type SessionMessageAcceptance = {
 export type AuthPolicy = {
   password_registration_enabled: boolean;
   password_login_enabled: boolean;
-  email_verification_required: boolean;
+  ldap_login_enabled: boolean;
+};
+
+export type AuthProviders = AuthPolicy;
+
+export type LdapSecurityMode = 'ldaps' | 'starttls' | 'plain';
+
+export type LdapConfiguration = {
+  url: string;
+  security: LdapSecurityMode;
+  base_dn: string;
+  bind_identity_template: string;
+  user_filter: string;
+  email_attribute: string;
+  display_name_attribute: string;
+  allow_insecure: boolean;
+  skip_tls_verify: boolean;
+};
+
+export type LdapTestResult = {
+  email: string;
+  display_name: string;
+  duration_ms: number;
 };
 
 export type ExternalPlatform = {
@@ -391,7 +423,7 @@ export type IntegrationAppOptions = {
 
 export type UserErasure = {
   user_id: string;
-  username: string | null;
+  email: string | null;
   status: string;
   requested_at: string;
   completed_at: string | null;
@@ -686,7 +718,6 @@ export type OAuthExternalProfile = {
 
 export type OAuthUserInfo = {
   sub: string;
-  username?: string;
   name?: string;
   email?: string;
   external_profile?: OAuthExternalProfile;
@@ -696,6 +727,9 @@ export type CreateIntegrationSessionRequest = {
   agent_id: string;
   external_user_id: string;
   tenant_id?: string | null;
+  username?: string | null;
+  display_name?: string | null;
+  email?: string | null;
   tools: unknown;
   metadata: unknown;
 };
@@ -737,7 +771,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     const code = body?.error === 'MCP redacted secret cannot be saved without an existing value'
       ? 'mcp_redacted_secret_missing'
       : 'request_failed';
-    throw new ApiError(response.status, code);
+    throw new ApiError(response.status, code, typeof body?.error === 'string' ? body.error : null);
   }
   if (response.status === 204) {
     return undefined as T;
@@ -761,8 +795,12 @@ function sessionMessagePagePath(path: string, query: SessionMessagePageQuery) {
 }
 
 export class ApiError extends Error {
-  constructor(public readonly status: number, public readonly code: 'request_failed' | 'mcp_redacted_secret_missing') {
-    super('Request failed');
+  constructor(
+    public readonly status: number,
+    public readonly code: 'request_failed' | 'mcp_redacted_secret_missing',
+    public readonly detail: string | null = null
+  ) {
+    super(detail ?? 'Request failed');
     this.name = 'ApiError';
   }
 }
@@ -867,14 +905,29 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ email, password })
     }),
+  ldapLogin: (email: string, password: string) =>
+    request<{ user: User }>('/api/auth/ldap/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, password })
+    }),
+  register: (email: string, password: string, displayName?: string) =>
+    request<{ user: User }>('/api/auth/register', {
+      method: 'POST',
+      body: JSON.stringify({
+        email,
+        password,
+        ...(displayName?.trim() ? { display_name: displayName } : {})
+      })
+    }),
   me: () => request<User>('/api/auth/me'),
+  updateCurrentUser: (displayName: string, signal?: AbortSignal) =>
+    request<User>('/api/users/me', {
+      method: 'PATCH',
+      body: JSON.stringify({ display_name: displayName }),
+      signal
+    }),
   users: (signal?: AbortSignal) => request<User[]>('/api/users', { signal }),
-  authProviders: () => request<{
-    oidc_mock: boolean;
-    password_registration_enabled: boolean;
-    password_login_enabled: boolean;
-    email_verification_required: boolean;
-  }>('/api/auth/providers'),
+  authProviders: () => request<AuthProviders>('/api/auth/providers'),
   authPolicy: (signal?: AbortSignal) => request<AuthPolicy>('/api/admin/auth-policy', { signal }),
   updateAuthPolicy: (policy: AuthPolicy, signal?: AbortSignal) =>
     request<AuthPolicy>('/api/admin/auth-policy', {
@@ -882,6 +935,24 @@ export const api = {
       body: JSON.stringify(policy),
       signal
     }),
+  ldapConfiguration: (signal?: AbortSignal) =>
+    request<LdapConfiguration | null>('/api/admin/ldap-config', { signal }),
+  updateLdapConfiguration: (configuration: LdapConfiguration, signal?: AbortSignal) =>
+    request<LdapConfiguration>('/api/admin/ldap-config', {
+      method: 'PUT',
+      body: JSON.stringify(configuration),
+      signal
+    }),
+  testLdapConfiguration: (
+    configuration: LdapConfiguration,
+    email: string,
+    password: string,
+    signal?: AbortSignal
+  ) => request<LdapTestResult>('/api/admin/ldap-config/test', {
+    method: 'POST',
+    body: JSON.stringify({ configuration, email, password }),
+    signal
+  }),
   externalPlatforms: (signal?: AbortSignal) =>
     request<ExternalPlatform[]>('/api/admin/external-platforms', { signal }),
   createExternalPlatform: (key: string, name: string, signal?: AbortSignal) =>
@@ -920,8 +991,20 @@ export const api = {
     request<UserErasure[]>('/api/admin/user-erasures', { signal }),
   adminUsers: (signal?: AbortSignal) =>
     request<AdminUserDetail[]>('/api/admin/users', { signal }),
+  createAdminUser: (user: AdminCreateUserRequest, signal?: AbortSignal) =>
+    request<AdminUserDetail>('/api/admin/users', {
+      method: 'POST',
+      body: JSON.stringify(user),
+      signal
+    }),
   adminUser: (userId: string, signal?: AbortSignal) =>
     request<AdminUserDetail>(`/api/admin/users/${userId}`, { signal }),
+  updateAdminUser: (userId: string, user: AdminUpdateUserRequest, signal?: AbortSignal) =>
+    request<AdminUserDetail>(`/api/admin/users/${userId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(user),
+      signal
+    }),
   setAdminUserPassword: (userId: string, password: string, signal?: AbortSignal) =>
     request<AdminUserDetail>(`/api/admin/users/${userId}/password`, {
       method: 'PUT',
@@ -934,10 +1017,10 @@ export const api = {
       body: JSON.stringify({ role } satisfies AdminSetUserRoleRequest),
       signal
     }),
-  eraseUser: (userId: string, username: string, signal?: AbortSignal) =>
+  eraseUser: (userId: string, email: string, signal?: AbortSignal) =>
     request<UserErasure>(`/api/admin/users/${userId}/erase`, {
       method: 'POST',
-      body: JSON.stringify({ username }),
+      body: JSON.stringify({ email }),
       signal
     }),
   logout: () => request<void>('/api/auth/logout', { method: 'POST' }),

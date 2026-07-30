@@ -44,8 +44,20 @@ const agents = [{
   created_at: now, updated_at: now
 }];
 
+async function provisionAndSignInPasswordUser(page: Page, email: string) {
+  const password = 'skills-test-password';
+  expect((await page.request.post('/api/auth/login', { data: { email: 'admin@example.com', password: 'admin123' } })).ok()).toBeTruthy();
+  expect((await page.request.post('/api/admin/users', { data: { email, password, role: 'member' } })).ok()).toBeTruthy();
+  expect((await page.request.post('/api/auth/logout')).status()).toBe(204);
+  await page.goto('/login');
+  await page.getByLabel('Email').fill(email);
+  await page.getByLabel('Password').fill(password);
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await expect(page.getByText(email)).toBeVisible();
+}
+
 async function mockSession(page: Page) {
-  await page.route('**/api/auth/me', (route) => route.fulfill({ json: { id: ownerId, username: 'skills-fixture', email: 'skills-fixture@example.com', display_name: 'Skills Fixture', role: 'member' } }));
+  await page.route('**/api/auth/me', (route) => route.fulfill({ json: { id: ownerId, email: 'skills-fixture@example.com', display_name: 'Skills Fixture', role: 'member' } }));
 }
 
 async function mockSkills(page: Page, options: { failSkills?: boolean; failAgents?: boolean; createGate?: Promise<void> } = {}) {
@@ -371,10 +383,7 @@ test('dirty skill logout confirms before mutating the real session', async ({ pa
   const email = `${prefix}@example.com`;
   let cleanupUser = false;
   try {
-    await page.goto('/login');
-    await page.getByLabel('Email').fill(email);
-    await page.getByRole('button', { name: 'Sign in with Mock OIDC' }).click();
-    await expect(page.getByText(email)).toBeVisible();
+    await provisionAndSignInPasswordUser(page, email);
     cleanupUser = true;
     const created = await page.request.post('/api/skills', { data: { name: `${prefix}-name`, description: 'Original', content: 'Original content' } });
     expect(created.ok()).toBeTruthy();
@@ -446,10 +455,7 @@ test('Skills Chromium real CRUD remains owner-scoped', async ({ page }) => {
   const email = `${prefix}@example.com`;
   let cleanupUser = false;
   try {
-    await page.goto('/login');
-    await page.getByLabel('Email').fill(email);
-    await page.getByRole('button', { name: 'Sign in with Mock OIDC' }).click();
-    await expect(page.getByText(email)).toBeVisible();
+    await provisionAndSignInPasswordUser(page, email);
     cleanupUser = true;
     await page.goto('/skills');
     await page.getByRole('button', { name: 'Create skill' }).click();
@@ -490,13 +496,17 @@ test('skills and managed assignments enforce the real owner boundary', async ({ 
   const outsiderEmail = `skills-outsider-${suffix}@example.com`;
   const owner = await request.newContext({ baseURL });
   const outsider = await request.newContext({ baseURL });
+  const administrator = await request.newContext({ baseURL });
   let ownerCreated = false;
   let outsiderCreated = false;
   try {
-    expect((await owner.get(`/api/auth/oidc/mock/start?email=${encodeURIComponent(ownerEmail)}&sub=skills-owner-${suffix}`)).ok()).toBeTruthy();
+    expect((await administrator.post('/api/auth/login', { data: { email: 'admin@example.com', password: 'admin123' } })).ok()).toBeTruthy();
+    expect((await administrator.post('/api/admin/users', { data: { email: ownerEmail, password: 'skills-test-password', role: 'member' } })).ok()).toBeTruthy();
     ownerCreated = true;
-    expect((await outsider.get(`/api/auth/oidc/mock/start?email=${encodeURIComponent(outsiderEmail)}&sub=skills-outsider-${suffix}`)).ok()).toBeTruthy();
+    expect((await administrator.post('/api/admin/users', { data: { email: outsiderEmail, password: 'skills-test-password', role: 'member' } })).ok()).toBeTruthy();
     outsiderCreated = true;
+    expect((await owner.post('/api/auth/login', { data: { email: ownerEmail, password: 'skills-test-password' } })).ok()).toBeTruthy();
+    expect((await outsider.post('/api/auth/login', { data: { email: outsiderEmail, password: 'skills-test-password' } })).ok()).toBeTruthy();
 
     const skillResponse = await owner.post('/api/skills', { data: { name: `Owner skill ${suffix}`, description: 'Owner only', content: 'Owner content' } });
     expect(skillResponse.ok()).toBeTruthy();
@@ -538,6 +548,7 @@ test('skills and managed assignments enforce the real owner boundary', async ({ 
   } finally {
     await owner.dispose();
     await outsider.dispose();
+    await administrator.dispose();
     if (ownerCreated) {
       const deleted = runSql(`DELETE FROM users WHERE email = '${ownerEmail}' RETURNING email;`);
       expect(deleted.split('\n')).toContain(ownerEmail);

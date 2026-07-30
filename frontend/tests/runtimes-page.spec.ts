@@ -288,7 +288,7 @@ test('desktop keeps navigation fixed and runtime panes independently scrollable'
 });
 
 test('Super Administrator enrolls, rotates, drains, and deletes Runtime nodes with affected Session feedback', async ({ page }) => {
-  const admin = { ...user, username: 'admin', role: 'super_admin' };
+  const admin = { ...user, email: 'admin@example.com', role: 'super_admin' };
   let runtimes = [
     runtime('runtime-a', 'alpha-runner', 'online', { credential_rotation_requested_at: null }),
     runtime('runtime-b', 'beta-runner', 'draining', { credential_rotation_requested_at: null })

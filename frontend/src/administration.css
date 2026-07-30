@@ -74,6 +74,141 @@
   max-width: 820px;
 }
 
+.administration-page .administration-ldap {
+  max-width: 940px;
+  border-top: 1px solid #d5dee9;
+  padding-top: 22px;
+}
+
+.administration-ldap-form,
+.administration-ldap-test-form {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.administration-form-wide {
+  grid-column: 1 / -1;
+}
+
+.administration-ldap-flags {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 22px;
+}
+
+.administration-persistent-warning {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 13px;
+  border-left: 3px solid #b7791f;
+  padding: 9px 11px;
+  background: #fff8e7;
+  color: #684d16;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.administration-persistent-warning > svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.administration-ldap-form .administration-persistent-warning {
+  margin-top: 0;
+}
+
+.administration-field-help {
+  min-width: 0;
+  margin: 8px 0 0;
+  color: #68768a;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.administration-ldap-form .admin-save {
+  margin-top: 2px;
+}
+
+.administration-ldap-test {
+  min-width: 0;
+  display: grid;
+  gap: 12px;
+  margin-top: 22px;
+  border-top: 1px solid #dce4ec;
+  padding-top: 18px;
+}
+
+.administration-subsection-heading {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+}
+
+.administration-subsection-heading > svg {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: #24706d;
+}
+
+.administration-subsection-heading h3,
+.administration-subsection-heading p {
+  margin: 0;
+}
+
+.administration-subsection-heading h3 {
+  color: #263245;
+  font-size: 14px;
+}
+
+.administration-subsection-heading p {
+  margin-top: 4px;
+  color: #68768a;
+  font-size: 12px;
+}
+
+.administration-ldap-test-form {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  align-items: end;
+}
+
+.administration-ldap-test-form button {
+  min-height: 39px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin: 0;
+}
+
+.administration-ldap-result {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid #b9ddcf;
+  padding: 11px 12px;
+  background: #eef9f4;
+  color: #315c4d;
+}
+
+.administration-ldap-result > div {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 14px;
+}
+
+.administration-ldap-result span {
+  overflow-wrap: anywhere;
+}
+
 .administration-list-section > header {
   min-height: 52px;
   align-items: center;
@@ -169,7 +304,7 @@
 }
 
 .administration-users-table th:nth-child(4) {
-  width: 132px;
+  width: 204px;
 }
 
 .administration-user-identity {
@@ -397,8 +532,18 @@
   .administration-platform-fields,
   .administration-channel-form,
   .administration-new-channel-form,
-  .administration-user-details {
+  .administration-user-details,
+  .administration-ldap-form,
+  .administration-ldap-test-form {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .administration-form-wide {
+    grid-column: auto;
+  }
+
+  .administration-ldap-test-form button {
+    width: 100%;
   }
 
   .administration-channel-form > button,

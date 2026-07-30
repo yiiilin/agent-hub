@@ -36,6 +36,7 @@ export class ComposeHarness {
       DEV_MODEL_PROVIDER_BASE_URL: 'http://fake-model-provider:8080',
       DEV_MODEL_PROVIDER_MODEL_IDS: 'hub-proxy-smoke,hub-proxy-smoke-fast',
       DEV_MODEL_PROVIDER_API_KEY: 'dev-model-provider-api-key',
+      COMPOSE_PROFILES: 'ldap',
       HUB_NETWORK_SUBNET: hubNetworkSubnet,
       MODEL_NETWORK_SUBNET: modelNetworkSubnet
     };

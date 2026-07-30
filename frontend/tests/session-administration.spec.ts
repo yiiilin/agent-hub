@@ -2,13 +2,12 @@ import { expect, test, type Page, type Route } from '@playwright/test';
 
 const superAdmin = {
   id: 'user-admin',
-  username: 'admin',
   email: 'admin@example.com',
   display_name: 'Admin',
   role: 'super_admin'
 };
 
-const member = { ...superAdmin, id: 'user-member', username: 'member', role: 'member' };
+const member = { ...superAdmin, id: 'user-member', email: 'member@example.com', role: 'member' };
 
 function session(id: string, agentName: string, lifecycleStatus: string, overrides: Record<string, unknown> = {}) {
   return {
@@ -58,7 +57,7 @@ async function routeMe(page: Page, user = superAdmin) {
   await page.route('**/api/auth/me', (route) => route.fulfill({ json: user }));
 }
 
-test('Session history exposes queued work, explicit stop, recovery failure, and Historical Session read-only state', async ({ page }) => {
+test('Session history hides internal queue state and exposes stop, recovery failure, and Historical Session read-only state', async ({ page }) => {
   const active = session('active', 'Release agent', 'online', { active_turn_id: 'turn-active' });
   const saving = session('saving', 'Checkpoint agent', 'saving');
   const failed = session('failed', 'Recovery agent', 'recovery_failed', { recovery_error: 'native session could not resume' });
@@ -86,7 +85,7 @@ test('Session history exposes queued work, explicit stop, recovery failure, and 
     can_invoke: true
   })) }));
   await page.route('**/api/sessions', (route) => route.fulfill({ json: sessions }));
-  await page.route(/\/api\/sessions\/[^/]+\/messages$/, (route) => {
+  await page.route(/\/api\/sessions\/[^/]+\/messages(?:\?.*)?$/, (route) => {
     const id = new URL(route.request().url()).pathname.split('/')[3];
     return route.fulfill({ json: messages[id] ?? [] });
   });
@@ -106,7 +105,7 @@ test('Session history exposes queued work, explicit stop, recovery failure, and 
   const detail = page.getByRole('region', { name: 'Session details' });
   await expect(detail.getByText('Inspect the rollout.')).toBeVisible();
   await expect(detail.getByText('Check the Linux runtime first.')).toBeVisible();
-  await expect(detail.getByText('queued', { exact: true })).toBeVisible();
+  await expect(detail.getByText('queued', { exact: true })).toHaveCount(0);
   await detail.getByRole('button', { name: 'Stop current run' }).click();
   await expect(detail.getByText('Stop requested. Completed actions are retained.')).toBeVisible();
   expect(stopRequests).toBe(1);
@@ -155,13 +154,13 @@ async function mockAdministration(page: Page, user = superAdmin) {
   let policy = {
     password_registration_enabled: true,
     password_login_enabled: true,
-    email_verification_required: false
+    ldap_login_enabled: false
   };
   let platforms = [{ id: 'platform-1', key: 'github', name: 'GitHub' }];
   let channels = [{ id: 'channel-1', platform_id: 'platform-1', key: 'oauth', name: 'OAuth', enabled: true, trusted_email: true }];
   const users = [
-    { user: superAdmin, email_verified: true, has_password: true, created_at: '2026-07-10T08:00:00.000Z' },
-    { user: { id: 'user-2', username: 'alice', email: 'alice@example.com', display_name: 'Alice', role: 'member' }, email_verified: true, has_password: false, created_at: '2026-07-11T08:00:00.000Z' }
+    { user: superAdmin, has_password: true, created_at: '2026-07-10T08:00:00.000Z' },
+    { user: { id: 'user-2', email: 'alice@example.com', display_name: 'Alice', role: 'member' }, has_password: false, created_at: '2026-07-11T08:00:00.000Z' }
   ];
   const erasures: unknown[] = [];
   const bodies: Record<string, unknown[]> = {};
@@ -180,6 +179,7 @@ async function mockAdministration(page: Page, user = superAdmin) {
     if (route.request().method() === 'PATCH') policy = await record(route, 'policy') as typeof policy;
     return route.fulfill({ json: policy });
   });
+  await page.route('**/api/admin/ldap-config', (route) => route.fulfill({ json: null }));
   await page.route('**/api/admin/external-platforms', async (route) => {
     if (route.request().method() === 'POST') {
       const body = await record(route, 'platform') as { key: string; name: string };
@@ -203,7 +203,7 @@ async function mockAdministration(page: Page, user = superAdmin) {
   });
   await page.route('**/api/admin/users/user-2/erase', async (route) => {
     const body = await record(route, 'erasure');
-    const result = { user_id: 'user-2', username: 'alice', status: 'completed', requested_at: '2026-07-15T10:00:00.000Z', completed_at: '2026-07-15T10:00:00.000Z' };
+    const result = { user_id: 'user-2', email: 'alice@example.com', status: 'completed', requested_at: '2026-07-15T10:00:00.000Z', completed_at: '2026-07-15T10:00:00.000Z' };
     erasures.unshift(result);
     return route.fulfill({ status: 202, json: result });
   });
@@ -217,7 +217,7 @@ test('Super Administrator manages identity policy, trusted channels, and user er
 
   await page.getByLabel('Password registration').uncheck();
   await page.getByRole('button', { name: 'Save authentication policy' }).click();
-  expect(bodies.policy).toEqual([{ password_registration_enabled: false, password_login_enabled: true, email_verification_required: false }]);
+  expect(bodies.policy).toEqual([{ password_registration_enabled: false, password_login_enabled: true, ldap_login_enabled: false }]);
 
   await page.getByRole('tab', { name: 'External platforms' }).click();
   await page.getByRole('button', { name: 'Add platform' }).click();
@@ -235,16 +235,16 @@ test('Super Administrator manages identity policy, trusted channels, and user er
   await editPlatformDialog.getByRole('button', { name: 'Cancel', exact: true }).click();
 
   await page.getByRole('tab', { name: 'User management' }).click();
-  const alice = page.getByRole('row', { name: /alice/ });
-  await alice.getByRole('button', { name: 'Delete user: alice' }).click();
+  const alice = page.getByRole('row', { name: /alice@example.com/ });
+  await alice.getByRole('button', { name: 'Delete user: alice@example.com' }).click();
   const deleteUserDialog = page.getByRole('dialog', { name: 'Delete user' });
-  await deleteUserDialog.getByLabel('Confirm username').fill('alice');
+  await deleteUserDialog.getByLabel('Confirm email').fill('alice@example.com');
   await deleteUserDialog.getByRole('button', { name: 'Delete user' }).click();
-  expect(bodies.erasure).toEqual([{ username: 'alice' }]);
+  expect(bodies.erasure).toEqual([{ email: 'alice@example.com' }]);
   await expect(page.getByText('completed', { exact: true })).toBeVisible();
 });
 
-test('Administration navigation is Super Administrator-only', async ({ page }) => {
+test('Administration navigation is administrator-only', async ({ page }) => {
   await routeMe(page, member);
   await page.route('**/api/agents', (route) => route.fulfill({ json: [] }));
   await page.route('**/api/runtimes', (route) => route.fulfill({ json: [] }));

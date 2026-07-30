@@ -45,8 +45,12 @@ A uniquely identified account, workspace, organization, or tenant within one Ext
 _Avoid_: External Platform, Integration App, Hub owner
 
 **Hub User**:
-The Agent Hub identity that owns user-scoped sessions, credentials, and stored workspace data. Agent ownership and session-user ownership are distinct relationships.
+The Agent Hub identity that owns user-scoped sessions, credentials, and stored workspace data. It has an immutable internal ID, one current globally unique email used for Hub login and trusted email binding, and a non-unique Display Name.
 _Avoid_: Agent owner when referring to the user participating in a session
+
+**Display Name**:
+The non-unique, user-facing name of one Hub User. It is profile data rather than a login identifier and may be changed without changing the Hub User's identity.
+_Avoid_: Email, external username, user ID
 
 **Super Administrator**:
 The Hub User with unrestricted platform-wide authority, including authority over Administrators, other Super Administrators, and their protected accounts and personally owned resources. The first Hub User created in an empty Agent Hub becomes its initial Super Administrator.
@@ -57,8 +61,24 @@ A Hub User that may manage system-wide resources and every non-Super-Administrat
 _Avoid_: Super Administrator, Agent owner, read-only auditor
 
 **Authentication Channel**:
-An administrator-approved source through which a person authenticates as a Hub User. An enabled external Authentication Channel is trusted to assert the email identity used to bind that channel to a Hub User.
-_Avoid_: Untrusted email input, Integration App, Session Origin
+An administrator-approved identity source belonging to one External Platform and used by Integration Apps to bind trusted External Identities to Hub Users. It is not a Hub console login method.
+_Avoid_: LDAP Directory, Local Password Login, Integration App, Session Origin
+
+**Hub Login Method**:
+One of the two ways a person may authenticate to the Hub console: Local Password Login or the single global LDAP Directory. Integration App Authentication Channels are not Hub Login Methods.
+_Avoid_: Authentication Channel, Application Token, Client Access Credential
+
+**Local Password Login**:
+A Hub Login Method that verifies a password stored for a Hub User's email. A Super Administrator with a local password retains a separate emergency path even when ordinary Local Password Login is disabled.
+_Avoid_: LDAP Login, password registration, API Key
+
+**Password Registration**:
+The public creation of a Hub User with an email and local password. It is enabled for an empty Hub, turns off after the first Hub User is created, and may later be explicitly reopened by an Administrator despite the documented email pre-registration risk.
+_Avoid_: Local Password Login, administrator-provisioned account, LDAP Login
+
+**LDAP Directory**:
+The single administrator-configured directory against which Hub Users may authenticate with their email and LDAP password. Agent Hub maps the submitted email through one Bind identity template, uses the directory-returned email as the Hub identity, and deliberately keeps no permanent LDAP user identifier or historical email alias.
+_Avoid_: Authentication Channel, External Platform, LDAP user database
 
 **Integration App**:
 An application registered under one External Platform and Authentication Channel that may be delegated access to multiple Agents. It is the common integration boundary for OAuth clients, external Session APIs, and embedded Widgets.
@@ -131,10 +151,6 @@ _Avoid_: Cross-application history, Hub console Session list, permanent browser 
 **Agent Scope**:
 An OAuth permission named `agent:<uuid>` that authorizes an Application Token to use one currently delegated Agent. It never changes a Session's immutable Agent binding or Session Origin.
 _Avoid_: Agent visibility, Application ownership, Session Origin
-
-**Username**:
-The globally unique, human-facing identifier assigned to one Hub User. Its initial value may reflect an External Identity, but later external profile changes do not alter it; only an explicit Hub User action can rename it.
-_Avoid_: Display name, email, external username, user ID
 
 **Agent Execution Configuration**:
 The current versioned instructions, associated Skills, model and reasoning choices, sandbox and approval policies, and MCP or tool access that an Agent supplies to a new Turn. It excludes user credentials and Session-owned state.

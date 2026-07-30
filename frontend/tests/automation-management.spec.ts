@@ -4,7 +4,6 @@ const automationTestBaseURL = process.env.AUTOMATION_TEST_BASE_URL;
 
 const owner = {
   id: '10000000-0000-4000-8000-000000000001',
-  username: 'automation-owner',
   email: 'automation-owner@example.com',
   display_name: 'Automation owner',
   role: 'member'

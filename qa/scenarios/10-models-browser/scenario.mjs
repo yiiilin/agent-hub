@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { ApiClient, loginAsAdmin, poll } from '../../support/api.mjs';
+import { ApiClient, loginAsAdmin, poll, provisionLocalUser } from '../../support/api.mjs';
 import { withBrowser } from '../../support/browser.mjs';
 
 const LEDGER_PATHS = [
@@ -510,24 +510,24 @@ export default async function modelsBrowserScenario(scenarioContext) {
   assert.ok(providerKey, 'The QA backend must expose its fake-provider key to the scenario process');
   assertConnectionDto(seedGlobal, providerKey, 'Seed Global connection');
 
-  const memberSlug = uniqueSlug(scenarioContext, 'qa-model-member');
-  const memberEmail = `${memberSlug}@example.com`;
-  const memberPassword = `${scenarioContext.unique('Model member password')}!Aa9`;
-  const memberClient = new ApiClient(scenarioContext.baseURL);
-  await memberClient.post('/api/auth/register', { email: memberEmail, password: memberPassword });
+  const memberAccount = await provisionLocalUser(
+    superClient,
+    scenarioContext,
+    'qa-model-member'
+  );
+  const memberClient = memberAccount.client;
+  const memberEmail = memberAccount.email;
+  const memberPassword = memberAccount.password;
 
-  const adminSlug = uniqueSlug(scenarioContext, 'qa-model-admin');
-  const adminEmail = `${adminSlug}@example.com`;
-  const adminPassword = `${scenarioContext.unique('Model admin password')}!Bb8`;
-  const adminClient = new ApiClient(scenarioContext.baseURL);
-  const { data: adminRegistration } = await adminClient.post('/api/auth/register', {
-    email: adminEmail,
-    password: adminPassword
-  });
-  await superClient.request(`/api/admin/users/${adminRegistration.user.id}/role`, {
-    method: 'PUT',
-    body: { role: 'admin' }
-  });
+  const adminAccount = await provisionLocalUser(
+    superClient,
+    scenarioContext,
+    'qa-model-admin',
+    { role: 'admin' }
+  );
+  const adminClient = adminAccount.client;
+  const adminEmail = adminAccount.email;
+  const adminPassword = adminAccount.password;
 
   let personalConnectionId = null;
   let globalConnectionId = null;
@@ -998,7 +998,7 @@ export default async function modelsBrowserScenario(scenarioContext) {
     ));
   }
   await cleanup('restore Administrator role', () => superClient.request(
-    `/api/admin/users/${adminRegistration.user.id}/role`,
+    `/api/admin/users/${adminAccount.user.id}/role`,
     { method: 'PUT', body: { role: 'member' } }
   ));
   await cleanup('restore System Default model selection', async () => {

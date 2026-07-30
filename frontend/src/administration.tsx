@@ -1,23 +1,33 @@
 import {
+  AlertTriangle,
+  BadgePlus,
+  Building2,
   Eye,
+  FlaskConical,
   KeyRound,
   Pencil,
   Plus,
   Save,
   Settings,
+  Shield,
   ShieldCheck,
   UserX,
-  Users
+  Users,
+  X
 } from 'lucide-react';
 import { FormEvent, KeyboardEvent, useEffect, useState } from 'react';
 import {
+  ApiError,
   api,
   type AdminUserDetail,
   type AuthenticationChannel,
   type AuthPolicy,
   type ExternalPlatform,
+  type LdapConfiguration,
+  type LdapTestResult,
   type User,
-  type UserErasure
+  type UserErasure,
+  type UserRole
 } from './api/client';
 import { FormDialog } from './components/form-dialog';
 import { useI18n } from './i18n';
@@ -26,12 +36,26 @@ import './administration.css';
 const emptyPolicy: AuthPolicy = {
   password_registration_enabled: false,
   password_login_enabled: false,
-  email_verification_required: false
+  ldap_login_enabled: false
+};
+
+const emptyLdapConfiguration: LdapConfiguration = {
+  url: '',
+  security: 'starttls',
+  base_dn: '',
+  bind_identity_template: '{email}',
+  user_filter: '(userPrincipalName={email})',
+  email_attribute: 'mail',
+  display_name_attribute: 'displayName',
+  allow_insecure: false,
+  skip_tls_verify: false
 };
 
 type AdministrationTab = 'authentication' | 'platforms' | 'users';
 type PlatformDialogState = { mode: 'create' } | { mode: 'edit'; platform: ExternalPlatform };
-type UserDialogState = { kind: 'details' | 'password' | 'erase'; detail: AdminUserDetail };
+type UserDialogState =
+  | { kind: 'create' }
+  | { kind: 'details' | 'edit' | 'password' | 'role' | 'erase'; detail: AdminUserDetail };
 
 function Feedback({ error, notice }: { error: boolean; notice: string }) {
   const { t } = useI18n();
@@ -44,17 +68,29 @@ function Feedback({ error, notice }: { error: boolean; notice: string }) {
 function AuthenticationTab() {
   const { t } = useI18n();
   const [policy, setPolicy] = useState<AuthPolicy>(emptyPolicy);
+  const [ldapConfiguration, setLdapConfiguration] = useState<LdapConfiguration>(emptyLdapConfiguration);
+  const [ldapConfigured, setLdapConfigured] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
-  const [saving, setSaving] = useState(false);
+  const [policySaving, setPolicySaving] = useState(false);
+  const [configurationSaving, setConfigurationSaving] = useState(false);
+  const [testEmail, setTestEmail] = useState('');
+  const [testPassword, setTestPassword] = useState('');
+  const [testBusy, setTestBusy] = useState(false);
+  const [testError, setTestError] = useState<string | null>(null);
+  const [testResult, setTestResult] = useState<LdapTestResult | null>(null);
   const [actionError, setActionError] = useState(false);
   const [notice, setNotice] = useState('');
 
   useEffect(() => {
     const controller = new AbortController();
-    api.authPolicy(controller.signal)
-      .then((response) => {
-        setPolicy(response);
+    Promise.all([api.authPolicy(controller.signal), api.ldapConfiguration(controller.signal)])
+      .then(([loadedPolicy, loadedConfiguration]) => {
+        setPolicy(loadedPolicy);
+        if (loadedConfiguration) {
+          setLdapConfiguration(loadedConfiguration);
+          setLdapConfigured(true);
+        }
         setLoadError(false);
       })
       .catch(() => { if (!controller.signal.aborted) setLoadError(true); })
@@ -63,8 +99,8 @@ function AuthenticationTab() {
   }, []);
 
   async function savePolicy() {
-    if (saving) return;
-    setSaving(true);
+    if (policySaving) return;
+    setPolicySaving(true);
     setActionError(false);
     setNotice('');
     try {
@@ -73,7 +109,70 @@ function AuthenticationTab() {
     } catch {
       setActionError(true);
     } finally {
-      setSaving(false);
+      setPolicySaving(false);
+    }
+  }
+
+  function updateLdap<K extends keyof LdapConfiguration>(key: K, value: LdapConfiguration[K]) {
+    setLdapConfiguration((current) => ({ ...current, [key]: value }));
+    setTestResult(null);
+    setTestError(null);
+  }
+
+  function updateSecurity(security: LdapConfiguration['security']) {
+    setLdapConfiguration((current) => ({
+      ...current,
+      security,
+      allow_insecure: security === 'plain' ? current.allow_insecure : false,
+      skip_tls_verify: security === 'plain' ? false : current.skip_tls_verify
+    }));
+    setTestResult(null);
+    setTestError(null);
+  }
+
+  const configurationComplete = Boolean(
+    ldapConfiguration.url.trim()
+    && ldapConfiguration.base_dn.trim()
+    && ldapConfiguration.bind_identity_template.trim()
+    && ldapConfiguration.user_filter.trim()
+    && ldapConfiguration.email_attribute.trim()
+    && ldapConfiguration.display_name_attribute.trim()
+    && (ldapConfiguration.security !== 'plain' || ldapConfiguration.allow_insecure)
+  );
+
+  async function saveConfiguration(event: FormEvent) {
+    event.preventDefault();
+    if (configurationSaving || !configurationComplete) return;
+    setConfigurationSaving(true);
+    setActionError(false);
+    setNotice('');
+    try {
+      setLdapConfiguration(await api.updateLdapConfiguration(ldapConfiguration));
+      setLdapConfigured(true);
+      setNotice(t('ldapConfigurationSaved'));
+    } catch {
+      setActionError(true);
+    } finally {
+      setConfigurationSaving(false);
+    }
+  }
+
+  async function testConfiguration(event: FormEvent) {
+    event.preventDefault();
+    if (testBusy || !configurationComplete || !testEmail.trim() || !testPassword) return;
+    const credentialEmail = testEmail;
+    const credentialPassword = testPassword;
+    setTestBusy(true);
+    setTestError(null);
+    setTestResult(null);
+    try {
+      setTestResult(await api.testLdapConfiguration(ldapConfiguration, credentialEmail, credentialPassword));
+    } catch (caught) {
+      setTestError(caught instanceof ApiError ? (caught.detail ?? '') : '');
+    } finally {
+      setTestEmail('');
+      setTestPassword('');
+      setTestBusy(false);
     }
   }
 
@@ -85,11 +184,42 @@ function AuthenticationTab() {
     <section className="admin-section administration-policy" aria-labelledby="auth-policy-title">
       <header><ShieldCheck size={18} /><div><h2 id="auth-policy-title">{t('authenticationPolicy')}</h2><p>{t('authenticationPolicyHelp')}</p></div></header>
       <div className="admin-toggle-list">
-        <label><input type="checkbox" checked={policy.password_registration_enabled} onChange={(event) => setPolicy((current) => ({ ...current, password_registration_enabled: event.target.checked }))} /> {t('passwordRegistration')}</label>
-        <label><input type="checkbox" checked={policy.password_login_enabled} onChange={(event) => setPolicy((current) => ({ ...current, password_login_enabled: event.target.checked }))} /> {t('passwordLogin')}</label>
-        <label><input type="checkbox" checked={policy.email_verification_required} onChange={(event) => setPolicy((current) => ({ ...current, email_verification_required: event.target.checked }))} /> {t('emailVerification')}</label>
+        <label><input type="checkbox" checked={policy.password_registration_enabled} disabled={!policy.password_login_enabled} onChange={(event) => setPolicy((current) => ({ ...current, password_registration_enabled: event.target.checked }))} /> {t('passwordRegistration')}</label>
+        <label><input type="checkbox" checked={policy.password_login_enabled} disabled={!policy.ldap_login_enabled} onChange={(event) => setPolicy((current) => ({ ...current, password_login_enabled: event.target.checked, password_registration_enabled: event.target.checked ? current.password_registration_enabled : false }))} /> {t('passwordLogin')}</label>
+        <label><input type="checkbox" checked={policy.ldap_login_enabled} disabled={!ldapConfigured || !policy.password_login_enabled} onChange={(event) => setPolicy((current) => ({ ...current, ldap_login_enabled: event.target.checked }))} /> {t('ldapLogin')}</label>
       </div>
-      <button type="button" className="primary admin-save" disabled={saving} onClick={savePolicy}><Save size={15} /> {saving ? t('saving') : t('saveAuthenticationPolicy')}</button>
+      {policy.password_registration_enabled && <div className="administration-persistent-warning" role="note"><AlertTriangle size={17} /><span>{t('passwordRegistrationRisk')}</span></div>}
+      {!ldapConfigured && <p className="administration-field-help">{t('configureLdapBeforeEnabling')}</p>}
+      <button type="button" className="primary admin-save" disabled={policySaving} onClick={savePolicy}><Save size={15} /> {policySaving ? t('saving') : t('saveAuthenticationPolicy')}</button>
+    </section>
+    <section className="admin-section administration-ldap" aria-labelledby="ldap-configuration-title">
+      <header><Building2 size={18} /><div><h2 id="ldap-configuration-title">{t('ldapConfiguration')}</h2><p>{t('ldapConfigurationHelp')}</p></div></header>
+      <form className="administration-ldap-form" onSubmit={saveConfiguration}>
+        <label className="administration-form-wide">{t('ldapUrl')}<input type="url" required value={ldapConfiguration.url} placeholder={t(ldapConfiguration.security === 'ldaps' ? 'ldapSecureUrlPlaceholder' : 'ldapUrlPlaceholder')} onChange={(event) => updateLdap('url', event.target.value)} /></label>
+        <label>{t('ldapSecurity')}<select value={ldapConfiguration.security} onChange={(event) => updateSecurity(event.target.value as LdapConfiguration['security'])}><option value="ldaps">{t('ldapSecurityLdaps')}</option><option value="starttls">{t('ldapSecurityStarttls')}</option><option value="plain">{t('ldapSecurityPlain')}</option></select></label>
+        <label>{t('ldapBaseDn')}<input required value={ldapConfiguration.base_dn} onChange={(event) => updateLdap('base_dn', event.target.value)} /></label>
+        <label className="administration-form-wide">{t('ldapBindIdentityTemplate')}<input required value={ldapConfiguration.bind_identity_template} onChange={(event) => updateLdap('bind_identity_template', event.target.value)} /><span className="administration-field-help">{t('ldapBindIdentityTemplateHelp')}</span></label>
+        <label className="administration-form-wide">{t('ldapUserFilter')}<input required value={ldapConfiguration.user_filter} onChange={(event) => updateLdap('user_filter', event.target.value)} /></label>
+        <label>{t('ldapEmailAttribute')}<input required value={ldapConfiguration.email_attribute} onChange={(event) => updateLdap('email_attribute', event.target.value)} /></label>
+        <label>{t('ldapDisplayNameAttribute')}<input required value={ldapConfiguration.display_name_attribute} onChange={(event) => updateLdap('display_name_attribute', event.target.value)} /></label>
+        <div className="administration-ldap-flags administration-form-wide">
+          <label className="admin-checkbox"><input type="checkbox" checked={ldapConfiguration.allow_insecure} disabled={ldapConfiguration.security !== 'plain'} onChange={(event) => updateLdap('allow_insecure', event.target.checked)} /> {t('ldapAllowInsecure')}</label>
+          <label className="admin-checkbox"><input type="checkbox" checked={ldapConfiguration.skip_tls_verify} disabled={ldapConfiguration.security === 'plain'} onChange={(event) => updateLdap('skip_tls_verify', event.target.checked)} /> {t('ldapSkipTlsVerify')}</label>
+        </div>
+        {ldapConfiguration.security === 'plain' && <div className="administration-persistent-warning administration-form-wide" role="alert"><AlertTriangle size={17} /><span>{t('ldapPlainWarning')}</span></div>}
+        {ldapConfiguration.skip_tls_verify && <div className="administration-persistent-warning administration-form-wide" role="alert"><AlertTriangle size={17} /><span>{t('ldapSkipTlsWarning')}</span></div>}
+        <button className="primary admin-save administration-form-wide" disabled={configurationSaving || !configurationComplete}><Save size={15} /> {configurationSaving ? t('saving') : t('saveLdapConfiguration')}</button>
+      </form>
+      <div className="administration-ldap-test">
+        <div className="administration-subsection-heading"><FlaskConical size={17} /><div><h3>{t('testLdapConfiguration')}</h3><p>{t('testLdapConfigurationHelp')}</p></div></div>
+        <form className="administration-ldap-test-form" onSubmit={testConfiguration}>
+          <label>{t('testEmail')}<input type="email" autoComplete="off" required disabled={testBusy} value={testEmail} onChange={(event) => setTestEmail(event.target.value)} /></label>
+          <label>{t('testPassword')}<input type="password" autoComplete="new-password" required disabled={testBusy} value={testPassword} onChange={(event) => setTestPassword(event.target.value)} /></label>
+          <button className="secondary" disabled={testBusy || !configurationComplete || !testEmail.trim() || !testPassword}><FlaskConical size={15} /> {testBusy ? t('testing') : t('runLdapTest')}</button>
+        </form>
+        {testError !== null && <div className="admin-alert error" role="alert"><strong>{t('ldapTestFailed')}</strong>{testError && <div>{testError}</div>}</div>}
+        {testResult && <div className="administration-ldap-result" role="status"><div><strong>{t('ldapTestSucceeded')}</strong><span>{testResult.email}</span><span>{testResult.display_name}</span><span>{testResult.duration_ms} {t('milliseconds')}</span></div><button className="icon-button" type="button" aria-label={t('clearTestResult')} title={t('clearTestResult')} onClick={() => setTestResult(null)}><X size={16} /></button></div>}
+      </div>
     </section>
   </div>;
 }
@@ -309,17 +439,173 @@ function UserDetailsDialog({ detail, onClose }: { detail: AdminUserDetail; onClo
   }, [detail.user.id]);
 
   const current = loaded ?? detail;
-  return <FormDialog title={t('userInformation')} eyebrow={detail.user.username} onClose={onClose} footer={<button className="primary" type="button" onClick={onClose}>{t('close')}</button>}>
+  return <FormDialog title={t('userInformation')} eyebrow={detail.user.email} onClose={onClose} footer={<button className="primary" type="button" onClick={onClose}>{t('close')}</button>}>
     {!loaded && !error && <p className="runtime-muted" role="status">{t('loading')}</p>}
     {error && <div className="admin-alert error" role="alert">{t('administrationLoadFailed')}</div>}
     {!error && <dl className="administration-user-details">
-      <div><dt>{t('name')}</dt><dd>{current.user.display_name}</dd></div>
-      <div><dt>{t('email')}</dt><dd>{current.user.email ?? t('unavailable')}</dd></div>
-      <div><dt>{t('userRole')}</dt><dd>{current.user.role}</dd></div>
-      <div><dt>{t('emailVerification')}</dt><dd>{current.email_verified ? t('enabled') : t('disabled')}</dd></div>
+      <div><dt>{t('displayName')}</dt><dd>{current.user.display_name}</dd></div>
+      <div><dt>{t('email')}</dt><dd>{current.user.email}</dd></div>
+      <div><dt>{t('userRole')}</dt><dd>{userRoleLabel(current.user.role, t)}</dd></div>
       <div><dt>{t('password')}</dt><dd>{current.has_password ? t('enabled') : t('disabled')}</dd></div>
       <div><dt>{t('created')}</dt><dd>{new Date(current.created_at).toLocaleString(locale)}</dd></div>
     </dl>}
+  </FormDialog>;
+}
+
+function userRoleLabel(role: UserRole, t: ReturnType<typeof useI18n>['t']) {
+  if (role === 'super_admin') return t('roleSuperAdministrator');
+  if (role === 'admin') return t('roleAdministrator');
+  return t('roleMember');
+}
+
+function UserCreateDialog({
+  currentUser,
+  onClose,
+  onSaved
+}: {
+  currentUser: User;
+  onClose: () => void;
+  onSaved: (detail: AdminUserDetail) => void;
+}) {
+  const { t } = useI18n();
+  const [email, setEmail] = useState('');
+  const [displayName, setDisplayName] = useState('');
+  const [password, setPassword] = useState('');
+  const [role, setRole] = useState<UserRole>('member');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(false);
+  const isSuperAdministrator = currentUser.role === 'super_admin';
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    if (busy || !email.trim() || (password && password.length < 8)) return;
+    setBusy(true);
+    setError(false);
+    try {
+      onSaved(await api.createAdminUser({
+        email,
+        role: isSuperAdministrator ? role : 'member',
+        ...(displayName.trim() ? { display_name: displayName } : {}),
+        ...(password ? { password } : {})
+      }));
+    } catch {
+      setError(true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <FormDialog
+    title={t('createUser')}
+    onClose={onClose}
+    busy={busy}
+    footer={<>
+      <button className="secondary" type="button" disabled={busy} onClick={onClose}>{t('cancel')}</button>
+      <button className="primary" type="submit" form="administration-create-user-form" disabled={busy || !email.trim() || Boolean(password && password.length < 8)}><BadgePlus size={16} /> {busy ? t('creating') : t('createUser')}</button>
+    </>}
+  >
+    <form id="administration-create-user-form" className="administration-dialog-form" onSubmit={submit}>
+      <label>{t('email')}<input type="email" autoFocus required value={email} onChange={(event) => setEmail(event.target.value)} /></label>
+      <label>{t('displayNameOptional')}<input maxLength={128} value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></label>
+      <label>{t('passwordOptional')}<input type="password" minLength={8} maxLength={1024} value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+      <label>{t('userRole')}<select value={isSuperAdministrator ? role : 'member'} disabled={!isSuperAdministrator} onChange={(event) => setRole(event.target.value as UserRole)}><option value="member">{t('roleMember')}</option>{isSuperAdministrator && <><option value="admin">{t('roleAdministrator')}</option><option value="super_admin">{t('roleSuperAdministrator')}</option></>}</select></label>
+      {!password && <p className="administration-field-help">{t('passwordlessUserHelp')}</p>}
+      {error && <div className="admin-alert error" role="alert">{t('administrationActionFailed')}</div>}
+    </form>
+  </FormDialog>;
+}
+
+function UserEditDialog({
+  detail,
+  onClose,
+  onSaved
+}: {
+  detail: AdminUserDetail;
+  onClose: () => void;
+  onSaved: (detail: AdminUserDetail) => void;
+}) {
+  const { t } = useI18n();
+  const [email, setEmail] = useState(detail.user.email);
+  const [displayName, setDisplayName] = useState(detail.user.display_name);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(false);
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    if (busy || !email.trim() || !displayName.trim()) return;
+    setBusy(true);
+    setError(false);
+    try {
+      onSaved(await api.updateAdminUser(detail.user.id, { email, display_name: displayName }));
+    } catch {
+      setError(true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <FormDialog
+    title={t('editUser')}
+    eyebrow={detail.user.email}
+    onClose={onClose}
+    busy={busy}
+    footer={<>
+      <button className="secondary" type="button" disabled={busy} onClick={onClose}>{t('cancel')}</button>
+      <button className="primary" type="submit" form="administration-edit-user-form" disabled={busy || !email.trim() || !displayName.trim()}><Save size={16} /> {busy ? t('saving') : t('saveChanges')}</button>
+    </>}
+  >
+    <form id="administration-edit-user-form" className="administration-dialog-form" onSubmit={submit}>
+      <label>{t('email')}<input type="email" required value={email} onChange={(event) => setEmail(event.target.value)} /></label>
+      <label>{t('displayName')}<input required maxLength={128} value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></label>
+      {email.trim() !== detail.user.email && <p className="administration-field-help">{t('emailChangeSessionWarning')}</p>}
+      {error && <div className="admin-alert error" role="alert">{t('administrationActionFailed')}</div>}
+    </form>
+  </FormDialog>;
+}
+
+function UserRoleDialog({
+  detail,
+  onClose,
+  onSaved
+}: {
+  detail: AdminUserDetail;
+  onClose: () => void;
+  onSaved: (detail: AdminUserDetail) => void;
+}) {
+  const { t } = useI18n();
+  const [role, setRole] = useState<UserRole>(detail.user.role);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(false);
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    if (busy || role === detail.user.role) return;
+    setBusy(true);
+    setError(false);
+    try {
+      onSaved(await api.setAdminUserRole(detail.user.id, role));
+    } catch {
+      setError(true);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <FormDialog
+    title={t('changeUserRole')}
+    eyebrow={detail.user.email}
+    onClose={onClose}
+    busy={busy}
+    footer={<>
+      <button className="secondary" type="button" disabled={busy} onClick={onClose}>{t('cancel')}</button>
+      <button className="primary" type="submit" form="administration-role-form" disabled={busy || role === detail.user.role}><Shield size={16} /> {busy ? t('saving') : t('saveChanges')}</button>
+    </>}
+  >
+    <form id="administration-role-form" className="administration-dialog-form" onSubmit={submit}>
+      <label>{t('userRole')}<select value={role} onChange={(event) => setRole(event.target.value as UserRole)}><option value="member">{t('roleMember')}</option><option value="admin">{t('roleAdministrator')}</option><option value="super_admin">{t('roleSuperAdministrator')}</option></select></label>
+      <p className="administration-field-help">{t('roleChangeHelp')}</p>
+      {error && <div className="admin-alert error" role="alert">{t('administrationActionFailed')}</div>}
+    </form>
   </FormDialog>;
 }
 
@@ -353,7 +639,7 @@ function UserPasswordDialog({
 
   return <FormDialog
     title={t('setUserPassword')}
-    eyebrow={detail.user.username}
+    eyebrow={detail.user.email}
     onClose={onClose}
     busy={busy}
     footer={<>
@@ -381,7 +667,7 @@ function UserEraseDialog({
   const [confirmation, setConfirmation] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(false);
-  const confirmed = confirmation === detail.user.username;
+  const confirmed = confirmation === detail.user.email;
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -389,7 +675,7 @@ function UserEraseDialog({
     setBusy(true);
     setError(false);
     try {
-      onErased(await api.eraseUser(detail.user.id, detail.user.username));
+      onErased(await api.eraseUser(detail.user.id, detail.user.email));
     } catch {
       setError(true);
     } finally {
@@ -399,7 +685,7 @@ function UserEraseDialog({
 
   return <FormDialog
     title={t('eraseUser')}
-    eyebrow={detail.user.username}
+    eyebrow={detail.user.email}
     onClose={onClose}
     busy={busy}
     footer={<>
@@ -409,7 +695,7 @@ function UserEraseDialog({
   >
     <form id="administration-erasure-form" className="administration-dialog-form" onSubmit={submit}>
       <p className="administration-erasure-warning">{t('userErasureHelp')}</p>
-      <label>{t('confirmUsername')}<input value={confirmation} placeholder={detail.user.username} onChange={(event) => setConfirmation(event.target.value)} /></label>
+      <label>{t('confirmEmail')}<input type="email" value={confirmation} placeholder={detail.user.email} onChange={(event) => setConfirmation(event.target.value)} /></label>
       {error && <div className="admin-alert error" role="alert">{t('administrationActionFailed')}</div>}
     </form>
   </FormDialog>;
@@ -437,9 +723,15 @@ function UsersTab({ currentUser }: { currentUser: User }) {
     return () => controller.abort();
   }, []);
 
-  function passwordSaved(updated: AdminUserDetail) {
+  function userSaved(updated: AdminUserDetail) {
     setUsers((current) => current.map((item) => item.user.id === updated.user.id ? updated : item));
     setNotice(t('changesSaved'));
+    setDialog(null);
+  }
+
+  function userCreated(created: AdminUserDetail) {
+    setUsers((current) => [...current, created]);
+    setNotice(t('userCreated'));
     setDialog(null);
   }
 
@@ -456,30 +748,35 @@ function UsersTab({ currentUser }: { currentUser: User }) {
   return <div className="administration-tab-content">
     <Feedback error={false} notice={notice} />
     <section className="admin-section administration-list-section" aria-labelledby="user-management-title">
-      <header><Users size={18} /><div><h2 id="user-management-title">{t('userManagement')}</h2><p>{t('userManagementHelp')}</p></div></header>
+      <header><Users size={18} /><div><h2 id="user-management-title">{t('userManagement')}</h2><p>{t('userManagementHelp')}</p></div><button className="primary administration-header-action" type="button" onClick={() => setDialog({ kind: 'create' })}><Plus size={16} /> {t('createUser')}</button></header>
       <div className="administration-table-wrap">
         <table className="administration-table administration-users-table" aria-label={t('userManagement')}>
-          <thead><tr><th>{t('name')}</th><th>{t('email')}</th><th>{t('userRole')}</th><th>{t('actions')}</th></tr></thead>
+          <thead><tr><th>{t('displayName')}</th><th>{t('email')}</th><th>{t('userRole')}</th><th>{t('actions')}</th></tr></thead>
           <tbody>{users.length === 0 ? <tr><td colSpan={4}>{t('noUsers')}</td></tr> : users.map((detail) => {
             const user = detail.user;
             const isCurrent = user.id === currentUser.id;
             return <tr key={user.id}>
-              <td><span className="administration-user-identity"><strong>{user.username}</strong><small>{user.display_name}</small></span></td>
-              <td>{user.email ?? t('unavailable')}</td>
-              <td><span className="status">{user.role}</span></td>
+              <td><span className="administration-user-identity"><strong>{user.display_name}</strong>{isCurrent && <small>{t('currentUser')}</small>}</span></td>
+              <td>{user.email}</td>
+              <td><span className="status">{userRoleLabel(user.role, t)}</span></td>
               <td><div className="administration-table-actions">
-                <button className="icon-button administration-table-action" type="button" aria-label={`${t('userInformation')}: ${user.username}`} title={t('userInformation')} onClick={() => setDialog({ kind: 'details', detail })}><Eye size={16} /></button>
-                <button className="icon-button administration-table-action" type="button" aria-label={`${t('setUserPassword')}: ${user.username}`} title={t('setUserPassword')} onClick={() => setDialog({ kind: 'password', detail })}><KeyRound size={16} /></button>
-                <button className="icon-button administration-table-action danger" type="button" disabled={isCurrent} aria-label={`${t('eraseUser')}: ${user.username}`} title={isCurrent ? t('cannotDeleteCurrentUser') : t('eraseUser')} onClick={() => { if (!isCurrent) setDialog({ kind: 'erase', detail }); }}><UserX size={16} /></button>
+                <button className="icon-button administration-table-action" type="button" aria-label={`${t('userInformation')}: ${user.email}`} title={t('userInformation')} onClick={() => setDialog({ kind: 'details', detail })}><Eye size={16} /></button>
+                <button className="icon-button administration-table-action" type="button" aria-label={`${t('editUser')}: ${user.email}`} title={t('editUser')} onClick={() => setDialog({ kind: 'edit', detail })}><Pencil size={16} /></button>
+                <button className="icon-button administration-table-action" type="button" aria-label={`${t('setUserPassword')}: ${user.email}`} title={t('setUserPassword')} onClick={() => setDialog({ kind: 'password', detail })}><KeyRound size={16} /></button>
+                {currentUser.role === 'super_admin' && <button className="icon-button administration-table-action" type="button" aria-label={`${t('changeUserRole')}: ${user.email}`} title={t('changeUserRole')} onClick={() => setDialog({ kind: 'role', detail })}><Shield size={16} /></button>}
+                <button className="icon-button administration-table-action danger" type="button" disabled={isCurrent} aria-label={`${t('eraseUser')}: ${user.email}`} title={isCurrent ? t('cannotDeleteCurrentUser') : t('eraseUser')} onClick={() => { if (!isCurrent) setDialog({ kind: 'erase', detail }); }}><UserX size={16} /></button>
               </div></td>
             </tr>;
           })}</tbody>
         </table>
       </div>
-      {erasures.length > 0 && <div className="erasure-history"><h3>{t('erasureHistory')}</h3>{erasures.map((erasure) => <div key={erasure.user_id}><code>{erasure.username ?? erasure.user_id}</code><span className={`status ${erasure.status}`}>{erasure.status}</span><time>{new Date(erasure.completed_at ?? erasure.requested_at).toLocaleString(locale)}</time></div>)}</div>}
+      {erasures.length > 0 && <div className="erasure-history"><h3>{t('erasureHistory')}</h3>{erasures.map((erasure) => <div key={erasure.user_id}><code>{erasure.email ?? erasure.user_id}</code><span className={`status ${erasure.status}`}>{erasure.status === 'pending' ? t('statusPending') : erasure.status === 'completed' ? t('statusCompleted') : erasure.status}</span><time>{new Date(erasure.completed_at ?? erasure.requested_at).toLocaleString(locale)}</time></div>)}</div>}
     </section>
+    {dialog?.kind === 'create' && <UserCreateDialog currentUser={currentUser} onClose={() => setDialog(null)} onSaved={userCreated} />}
     {dialog?.kind === 'details' && <UserDetailsDialog detail={dialog.detail} onClose={() => setDialog(null)} />}
-    {dialog?.kind === 'password' && <UserPasswordDialog detail={dialog.detail} onClose={() => setDialog(null)} onSaved={passwordSaved} />}
+    {dialog?.kind === 'edit' && <UserEditDialog detail={dialog.detail} onClose={() => setDialog(null)} onSaved={userSaved} />}
+    {dialog?.kind === 'password' && <UserPasswordDialog detail={dialog.detail} onClose={() => setDialog(null)} onSaved={userSaved} />}
+    {dialog?.kind === 'role' && <UserRoleDialog detail={dialog.detail} onClose={() => setDialog(null)} onSaved={userSaved} />}
     {dialog?.kind === 'erase' && <UserEraseDialog detail={dialog.detail} onClose={() => setDialog(null)} onErased={erased} />}
   </div>;
 }

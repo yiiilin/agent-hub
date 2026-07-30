@@ -4,8 +4,9 @@ Type: `browser`
 
 This scenario directly asserts the AUTH-002 password session lifecycle through
 the real login UI, authenticated `/auth/me`, Sessions-first navigation, logout,
-and post-logout rejection. It then directly asserts AUTH-003 through the real
-Mock OIDC UI with a unique email and verifies the resulting Sessions-first user.
+and post-logout rejection. The seeded Super Administrator provisions a distinct
+Local Password member through `POST /api/admin/users`; the browser then signs in
+as that account and verifies its independent Sessions-first identity.
 
 For AUTH-004 it creates a uniquely named 180-day API key through the UI, checks
 that the one-time credential is confined to the creation dialog, verifies that
