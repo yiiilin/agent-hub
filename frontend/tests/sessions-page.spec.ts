@@ -56,6 +56,8 @@ function message(sessionId: string, sequence: number, role: string, content: str
 
 async function installSessionApi(page: Page, options: {
   activeMessages?: Array<Record<string, unknown>>;
+  activeEvents?: Array<Record<string, unknown>>;
+  activeStreamEvents?: Array<Record<string, unknown>>;
   activeStreamGate?: Promise<void>;
   activeStreamRefreshesSession?: boolean;
   initialSessions?: ReturnType<typeof session>[];
@@ -148,6 +150,13 @@ async function installSessionApi(page: Page, options: {
     if (path === '/api/sessions/new-session' && request.method() === 'GET') {
       return route.fulfill({ json: created });
     }
+    const sessionMatch = path.match(/^\/api\/sessions\/([^/]+)$/);
+    if (sessionMatch && request.method() === 'GET') {
+      const selected = sessions.find((item) => item.id === sessionMatch[1]);
+      return selected
+        ? route.fulfill({ json: selected })
+        : route.fulfill({ status: 404, json: { error: 'Session not found' } });
+    }
     const messageMatch = path.match(/^\/api\/sessions\/([^/]+)\/messages$/);
     if (messageMatch && request.method() === 'GET') {
       const beforeValue = url.searchParams.get('before_sequence');
@@ -173,7 +182,8 @@ async function installSessionApi(page: Page, options: {
         externalStreamCount += 1;
         const activity = { seq: 1, run_id: 'run-external', event_type: 'item', role: null, content: null, payload: { item_id: 'external-reasoning', item_type: 'reasoning', phase: 'completed', summary: ['Handled by the external platform.'] }, created_at: '2026-07-17T10:00:02.000Z' };
         const reply = { seq: 2, run_id: 'run-external', event_type: 'message', role: 'assistant', content: 'External live response.', payload: {}, created_at: '2026-07-17T10:00:03.000Z' };
-        return route.fulfill({ contentType: 'text/event-stream', body: `event: run_event\ndata: ${JSON.stringify(activity)}\n\nevent: run_event\ndata: ${JSON.stringify(reply)}\n\n` });
+        const completed = { seq: 3, run_id: 'run-external', event_type: 'status', role: null, content: 'completed', payload: { status: 'completed' }, created_at: '2026-07-17T10:00:04.000Z' };
+        return route.fulfill({ contentType: 'text/event-stream', body: [activity, reply, completed].map((event) => `event: run_event\ndata: ${JSON.stringify(event)}\n\n`).join('') });
       }
       if (streamMatch[1] === 'run-second-persisted') {
         messages['multi-turn'][1] = {
@@ -195,6 +205,12 @@ async function installSessionApi(page: Page, options: {
         return route.fulfill({ contentType: 'text/event-stream', body: `event: run_event\ndata: ${JSON.stringify(completed)}\n\n` });
       }
       if (streamMatch[1] !== 'run-active') return route.fulfill({ contentType: 'text/event-stream', body: '' });
+      if (options.activeStreamEvents !== undefined) {
+        return route.fulfill({
+          contentType: 'text/event-stream',
+          body: options.activeStreamEvents.map((event) => `event: run_event\ndata: ${JSON.stringify(event)}\n\n`).join('')
+        });
+      }
       await options.activeStreamGate;
       if (options.activeStreamRefreshesSession) {
         const turnStarted = { seq: 6, run_id: 'run-active', event_type: 'turn_started', role: null, content: null, payload: { native_turn_id: 'native-turn-active' }, created_at: '2026-07-17T10:00:05.000Z' };
@@ -214,7 +230,7 @@ async function installSessionApi(page: Page, options: {
           { seq: 1, run_id: 'run-second-persisted', event_type: 'message', role: 'assistant', content: 'Second persisted answer.', payload: {}, created_at: '2026-07-17T09:01:03.000Z' }
         ]
       };
-      return route.fulfill({ json: eventsMatch[1] === 'run-active' ? [
+      return route.fulfill({ json: eventsMatch[1] === 'run-active' ? options.activeEvents ?? [
         { seq: 1, run_id: 'run-active', event_type: 'status', role: null, content: null, payload: { status: 'running' }, created_at: '2026-07-17T10:00:01.000Z' },
         { seq: 2, run_id: 'run-active', event_type: 'item', role: null, content: null, payload: { item_id: 'reasoning-1', item_type: 'reasoning', phase: 'started', summary: [] }, created_at: '2026-07-17T10:00:01.000Z' },
         { seq: 3, run_id: 'run-active', event_type: 'item', role: null, content: null, payload: { item_id: 'reasoning-1', item_type: 'reasoning', phase: 'completed', summary: ['Checked the deployment state.'] }, created_at: '2026-07-17T10:00:02.000Z' },
@@ -779,6 +795,59 @@ test('External Session is view-only in Hub while live history continues streamin
   expect(fixture.externalStreamCount()).toBeGreaterThan(0);
 });
 
+test('processing time is split by visible replies while tool work stays in the surrounding segment', async ({ page }) => {
+  await installSessionApi(page, {
+    activeMessages: [
+      message('active', 1, 'user', 'Complete the staged task.', { accepted_at: '2026-07-17T10:00:00.000Z' }),
+      message('active', 2, 'assistant', 'I have finished the first stage.', { accepted_at: '2026-07-17T10:00:04.000Z' }),
+      message('active', 3, 'assistant', 'The full task is complete.', { accepted_at: '2026-07-17T10:00:11.000Z' })
+    ],
+    activeEvents: [
+      { seq: 1, run_id: 'run-active', event_type: 'status', role: null, content: 'running', payload: { status: 'running' }, created_at: '2026-07-17T10:00:00.100Z' },
+      { seq: 2, run_id: 'run-active', event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'reasoning-one', item_type: 'reasoning', phase: 'completed', summary: ['Prepared the first stage.'] }, created_at: '2026-07-17T10:00:03.000Z' },
+      { seq: 3, run_id: 'run-active', event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'tool-one', item_type: 'dynamicToolCall', phase: 'started', tool: 'inspect_state' }, created_at: '2026-07-17T10:00:05.000Z' },
+      { seq: 4, run_id: 'run-active', event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'tool-one', item_type: 'dynamicToolCall', phase: 'completed', tool: 'inspect_state', output: 'ready' }, created_at: '2026-07-17T10:00:08.000Z' },
+      { seq: 5, run_id: 'run-active', event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'reasoning-two', item_type: 'reasoning', phase: 'completed', summary: ['Prepared the final answer.'] }, created_at: '2026-07-17T10:00:10.000Z' },
+      { seq: 6, run_id: 'run-active', event_type: 'status', role: null, content: 'completed', payload: { status: 'completed' }, created_at: '2026-07-17T10:00:12.000Z' }
+    ],
+    activeStreamEvents: []
+  });
+  await page.goto('/sessions');
+
+  const groups = page.getByRole('region', { name: 'Session details' }).locator('details.session-activity-events');
+  await expect(groups).toHaveCount(2);
+  await expect(groups.nth(0).locator('summary')).toContainText('Worked for 4 sec');
+  await expect(groups.nth(1).locator('summary')).toContainText('Worked for 7 sec');
+  await groups.nth(1).locator('summary').click();
+  await expect(groups.nth(1)).toContainText('Used tool');
+  await expect(groups.nth(1)).toContainText('inspect_state');
+  await expect(groups.nth(1)).toContainText('Prepared the final answer.');
+});
+
+test('an unfinished processing segment keeps increasing without a duplicate thinking bubble', async ({ page }) => {
+  const startedAt = Date.now() - 250;
+  await installSessionApi(page, {
+    activeMessages: [
+      message('active', 1, 'user', 'Keep processing.', { accepted_at: new Date(startedAt).toISOString() })
+    ],
+    activeEvents: [
+      { seq: 1, run_id: 'run-active', event_type: 'status', role: null, content: 'running', payload: { status: 'running' }, created_at: new Date(startedAt + 20).toISOString() },
+      { seq: 2, run_id: 'run-active', event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'reasoning-live', item_type: 'reasoning', phase: 'started' }, created_at: new Date(startedAt + 50).toISOString() }
+    ],
+    activeStreamEvents: []
+  });
+  await page.goto('/sessions');
+
+  const detail = page.getByRole('region', { name: 'Session details' });
+  const summary = detail.locator('details.session-activity-events summary');
+  await expect(summary).toContainText('Worked for');
+  const first = Number.parseFloat((await summary.textContent())?.match(/[\d.]+/)?.[0] ?? '0');
+  await page.waitForTimeout(1_200);
+  const second = Number.parseFloat((await summary.textContent())?.match(/[\d.]+/)?.[0] ?? '0');
+  expect(second).toBeGreaterThan(first);
+  await expect(detail.locator('.session-thinking')).toHaveCount(0);
+});
+
 test('conversation streams replies, folds readable activity, steers, stops, and keeps history read-only', async ({ page }) => {
   const fixture = await installSessionApi(page);
   await page.goto('/sessions');
@@ -787,15 +856,16 @@ test('conversation streams replies, folds readable activity, steers, stops, and 
   await expect(detail.getByText('Inspect the deployment.', { exact: true })).toBeVisible();
   await expect(detail.getByText('Live assistant response.', { exact: true })).toBeVisible();
   const timeline = detail.locator('.session-transcript > *');
-  await expect(timeline).toHaveCount(4);
+  await expect(timeline).toHaveCount(5);
   await expect(timeline.nth(0)).toContainText('Inspect the deployment.');
   await expect(timeline.nth(1)).toHaveClass(/session-activity-events/);
   await expect(timeline.nth(2)).toContainText('The deployment is running.');
   await expect(timeline.nth(3)).toContainText('Live assistant response.');
+  await expect(timeline.nth(4)).toHaveClass(/session-thinking/);
 
   const activity = detail.locator('details.session-activity-events').first();
   await expect(activity).not.toHaveAttribute('open', '');
-  await expect(activity.locator('summary')).toContainText('Worked for 3.5 sec');
+  await expect(activity.locator('summary')).toContainText('Worked for 4 sec');
   await expect(activity.locator('.session-activity-chevron')).toHaveCSS('transform', 'none');
   await activity.locator('summary').click();
   await expect(activity).toHaveAttribute('open', '');

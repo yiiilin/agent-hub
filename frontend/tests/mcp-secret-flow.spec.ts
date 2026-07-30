@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { dirname } from 'node:path';
 import { expect, test } from '@playwright/test';
+import { selectLocalPasswordLogin } from './authentication-helpers';
 import { composeArgs } from './e2e-compose';
 
 function runtimeMcpSecretProbe(workDirRef: string, secret: string) {
@@ -48,6 +49,7 @@ function runtimeSessionRootExists(workDirRef: string) {
 
 test('MCP secrets are redacted in the console and excluded from Pi runtime materialization', async ({ page }) => {
   await page.goto('/login');
+  await selectLocalPasswordLogin(page);
   await page.getByLabel('Email').fill('admin@example.com');
   await page.getByLabel('Password').fill('admin123');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();

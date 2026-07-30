@@ -17,6 +17,7 @@
 5. 禁止同时关闭普通 Local Password Login 和 LDAP Login。停用任一登录方式前，至少一个有效 `super_admin` 必须已设置本地密码。
 6. 普通 Local Password Login 关闭后，`member` 与 `admin` 不能使用本地密码；已设置密码的 `super_admin` 仍可通过 `/login?method=password` 的隐藏紧急入口登录。常规登录页不展示密码按钮。
 7. LDAP 关闭或配置改变不注销已有 browser Session；目录账号被停用也不会主动撤销现有 Session。现有 Session 继续到退出、管理员清除或七天到期，下一次 LDAP 登录由目录拒绝。
+8. 常规登录页将 LDAP 登录显示为“域账号”；只要 LDAP Login 已开启，就默认选中域账号，本地密码仍可由用户主动切换。
 
 ## LDAP 配置
 

@@ -95,7 +95,8 @@ export default async function ldapAuthenticationBrowserScenario(context) {
     }, async ({ page, request, browserErrors }) => {
       const allowedNoContentAborts = new Set();
       await page.goto('/login', { waitUntil: 'domcontentloaded' });
-      await page.getByRole('button', { name: 'LDAP Directory', exact: true }).click();
+      await assertVisible(page.getByRole('button', { name: 'Domain Account', exact: true }), 'Default Domain Account login method');
+      assert.equal(await page.getByRole('button', { name: 'Domain Account', exact: true }).getAttribute('aria-pressed'), 'true');
       await page.getByLabel('Email').fill(LDAP_USER.email);
       await page.getByLabel('Directory password').fill('wrong-directory-password');
       const rejectedLogin = page.waitForResponse((response) => (
@@ -139,7 +140,7 @@ export default async function ldapAuthenticationBrowserScenario(context) {
       allowedNoContentAborts.add(`requestfailed: POST ${logoutResponse.url()}: net::ERR_ABORTED`);
       await assertVisible(page.getByRole('button', { name: 'Sign in', exact: true }), 'Login after LDAP logout');
       assert.equal(
-        await page.getByRole('button', { name: 'LDAP Directory', exact: true }).count(),
+        await page.getByRole('button', { name: 'Domain Account', exact: true }).count(),
         0,
         'Disabled LDAP must not remain a selectable ordinary login method'
       );
@@ -152,7 +153,7 @@ export default async function ldapAuthenticationBrowserScenario(context) {
       await page.setViewportSize({ width: 390, height: 844 });
       await page.goto('/login', { waitUntil: 'domcontentloaded' });
       await page.getByLabel('Language').selectOption('zh-CN');
-      await assertVisible(page.getByText('LDAP 目录', { exact: true }), 'Chinese LDAP-only login method');
+      await assertVisible(page.getByText('域账号', { exact: true }), 'Chinese LDAP-only login method');
       assert.equal(await page.getByText('本地密码', { exact: true }).count(), 0);
       await assertNoHorizontalOverflow(page, 'Chinese 390px LDAP-only login');
 

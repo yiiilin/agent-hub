@@ -55,8 +55,9 @@ test('provider methods route Local Password, LDAP, and registration to their exa
   await page.goto('/login');
 
   const methods = page.getByRole('group', { name: 'Sign-in method' });
-  await expect(methods.getByRole('button', { name: 'Local Password' })).toHaveAttribute('aria-pressed', 'true');
-  await expect(methods.getByRole('button', { name: 'LDAP Directory' })).toHaveAttribute('aria-pressed', 'false');
+  await expect(methods.getByRole('button', { name: 'Local Password' })).toHaveAttribute('aria-pressed', 'false');
+  await expect(methods.getByRole('button', { name: 'Domain Account' })).toHaveAttribute('aria-pressed', 'true');
+  await methods.getByRole('button', { name: 'Local Password' }).click();
   await page.getByLabel('Email').fill('local@example.com');
   await page.getByLabel('Password').fill('local-password');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -70,7 +71,7 @@ test('provider methods route Local Password, LDAP, and registration to their exa
     ldap_login_enabled: true
   });
   await ldapPage.goto('/login');
-  await ldapPage.getByRole('button', { name: 'LDAP Directory' }).click();
+  await expect(ldapPage.getByRole('button', { name: 'Domain Account' })).toHaveAttribute('aria-pressed', 'true');
   await expect(ldapPage.getByLabel('Password', { exact: true })).toHaveCount(0);
   await expect(ldapPage.getByLabel('Directory password')).toHaveAttribute('minlength', '1');
   await ldapPage.getByLabel('Email').fill('directory@example.com');
@@ -100,14 +101,14 @@ test('ordinary disabled password stays hidden while the emergency query exposes 
     ldap_login_enabled: true
   });
   await page.goto('/login');
-  await expect(page.getByText('LDAP Directory', { exact: true })).toBeVisible();
+  await expect(page.getByText('Domain Account', { exact: true })).toBeVisible();
   await expect(page.getByText('Local Password', { exact: true })).toHaveCount(0);
   await expect(page.getByLabel('Password', { exact: true })).toHaveCount(0);
   await expect(page.getByLabel('Directory password')).toBeVisible();
 
   await page.goto('/login?method=password');
   await expect(page.getByText('Emergency password access', { exact: true })).toBeVisible();
-  await expect(page.getByText('LDAP Directory', { exact: true })).toHaveCount(0);
+  await expect(page.getByText('Domain Account', { exact: true })).toHaveCount(0);
   await expect(page.getByLabel('Password')).toBeVisible();
   await page.getByLabel('Email').fill('admin@example.com');
   await page.getByLabel('Password').fill('admin-password');
@@ -176,7 +177,7 @@ test('profile editing and Chinese mobile login stay localized without overflow o
   await page.goto('/login');
   await expect(page.getByRole('group', { name: '登录方式' })).toBeVisible();
   await expect(page.getByRole('button', { name: '本地密码' })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'LDAP 目录' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '域账号' })).toHaveAttribute('aria-pressed', 'true');
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
 
   let profileBody: unknown;

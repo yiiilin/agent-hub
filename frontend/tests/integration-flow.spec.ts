@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { expect, request, test, type APIRequestContext, type Page } from '@playwright/test';
 import type { Agent } from '../src/api/client';
 import { composeArgs } from './e2e-compose';
+import { selectLocalPasswordLogin } from './authentication-helpers';
 
 function assertUuid(value: string, label: string) {
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value)) {
@@ -308,6 +309,7 @@ test('Integration App OAuth API runs messages, attachments, and tool results', a
   let hasPrimaryError = false;
   try {
     await page.goto('/login');
+    await selectLocalPasswordLogin(page);
     await page.getByLabel('Email').fill('admin@example.com');
     await page.getByLabel('Password').fill('admin123');
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();

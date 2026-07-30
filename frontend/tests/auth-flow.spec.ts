@@ -1,5 +1,6 @@
 import { createHmac, randomUUID } from 'node:crypto';
 import { expect, request, test } from '@playwright/test';
+import { selectLocalPasswordLogin } from './authentication-helpers';
 
 test.use({ trace: 'off', screenshot: 'off', video: 'off' });
 
@@ -31,6 +32,7 @@ async function provisionAndSignInPasswordUser(page: import('@playwright/test').P
   })).ok()).toBeTruthy();
   expect((await page.request.post('/api/auth/logout')).status()).toBe(204);
   await page.goto('/login');
+  await selectLocalPasswordLogin(page);
   await page.getByLabel('Email').fill(email);
   await page.getByLabel('Password').fill(password);
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -39,6 +41,7 @@ async function provisionAndSignInPasswordUser(page: import('@playwright/test').P
 
 test('API keys can be created with validity, renewed in place, and deleted', async ({ page, baseURL }) => {
   await page.goto('/login');
+  await selectLocalPasswordLogin(page);
   await page.getByLabel('Email').fill('admin@example.com');
   await page.getByLabel('Password').fill('admin123');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -337,6 +340,7 @@ test('API key modals, pagination, cross-tab deletion fallback, and mobile layout
 
 test('Local Password signs into the console', async ({ page }) => {
   await page.goto('/login');
+  await selectLocalPasswordLogin(page);
   await page.getByLabel('Email').fill('admin@example.com');
   await page.getByLabel('Password').fill('admin123');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -347,6 +351,7 @@ test('Local Password signs into the console', async ({ page }) => {
 
 test('Embed JWT exchanges into a widget session through postMessage', async ({ page }) => {
   await page.goto('/login');
+  await selectLocalPasswordLogin(page);
   await page.getByLabel('Email').fill('admin@example.com');
   await page.getByLabel('Password').fill('admin123');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();

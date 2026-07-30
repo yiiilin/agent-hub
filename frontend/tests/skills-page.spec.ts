@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { expect, request, test, type Page } from '@playwright/test';
 import type { Agent, AgentModelSettings } from '../src/api/client';
 import { composeArgs, e2eComposeProject } from './e2e-compose';
+import { selectLocalPasswordLogin } from './authentication-helpers';
 
 const ownerId = '10000000-0000-4000-8000-000000000001';
 const alphaId = '20000000-0000-4000-8000-000000000001';
@@ -50,6 +51,7 @@ async function provisionAndSignInPasswordUser(page: Page, email: string) {
   expect((await page.request.post('/api/admin/users', { data: { email, password, role: 'member' } })).ok()).toBeTruthy();
   expect((await page.request.post('/api/auth/logout')).status()).toBe(204);
   await page.goto('/login');
+  await selectLocalPasswordLogin(page);
   await page.getByLabel('Email').fill(email);
   await page.getByLabel('Password').fill(password);
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();

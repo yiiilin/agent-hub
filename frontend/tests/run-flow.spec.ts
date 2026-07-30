@@ -1,6 +1,7 @@
 import { execFileSync, spawn } from 'node:child_process';
 import { dirname } from 'node:path';
 import { expect, request, test, type APIRequestContext, type Page, type Route } from '@playwright/test';
+import { selectLocalPasswordLogin } from './authentication-helpers';
 
 function composeArgs() {
   const project = process.env.E2E_COMPOSE_PROJECT?.trim() || 'agent-hub-dev';
@@ -134,7 +135,7 @@ test('widget matches the platform chat interaction and event presentation', asyn
   await expect(page.getByText('Hello from the agent.', { exact: true })).toBeVisible();
   await expect(page.getByText('assistant: Hello from the agent.', { exact: true })).toHaveCount(0);
   const activity = page.locator('.session-activity-events');
-  await expect(activity).toContainText('Worked for 3 sec');
+  await expect(activity).toContainText('Worked for 2 sec');
   await activity.locator('summary').click();
   await expect(activity).toContainText('Retrying model request');
   await expect(activity).toContainText('1/3 · 2000 ms');
@@ -1684,6 +1685,7 @@ test('runtime page shows the effective sandbox and deterministic downgrade reaso
     runtimeId = (await registration.json() as { runtime_id: string }).runtime_id;
 
     await page.goto('/login');
+    await selectLocalPasswordLogin(page);
     await page.getByLabel('Email').fill('admin@example.com');
     await page.getByLabel('Password').fill('admin123');
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -1705,6 +1707,7 @@ test('runtime page shows the effective sandbox and deterministic downgrade reaso
 test('runtime rotates its persisted credential without re-registering and resumes execution', async ({ page }) => {
   let agentId: string | null = null;
   await page.goto('/login');
+  await selectLocalPasswordLogin(page);
   await page.getByLabel('Email').fill('admin@example.com');
   await page.getByLabel('Password').fill('admin123');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -1771,6 +1774,7 @@ test(consoleRunTestTitle, async ({ page, context, baseURL }) => {
   let widget: import('@playwright/test').Page | null = null;
   try {
   await page.goto('/login');
+  await selectLocalPasswordLogin(page);
   await page.getByLabel('Email').fill('admin@example.com');
   await page.getByLabel('Password').fill('admin123');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -2155,6 +2159,7 @@ test(consoleRunTestTitle, async ({ page, context, baseURL }) => {
 
 test('archiving an agent wins queued manual triggers and serializes with Automation creation', async ({ page }) => {
   await page.goto('/login');
+  await selectLocalPasswordLogin(page);
   await page.getByLabel('Email').fill('admin@example.com');
   await page.getByLabel('Password').fill('admin123');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -2364,6 +2369,7 @@ test('archiving an agent wins against a registered runtime claim and fails the p
   let claimResponsePromise: Promise<import('@playwright/test').APIResponse> | null = null;
   try {
     await page.goto('/login');
+    await selectLocalPasswordLogin(page);
     await page.getByLabel('Email').fill('admin@example.com');
     await page.getByLabel('Password').fill('admin123');
     await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -2544,6 +2550,7 @@ test('archiving an agent wins against a registered runtime claim and fails the p
 
 test('archive queued before a due scheduler leaves zero scheduled runs', async ({ page }) => {
   await page.goto('/login');
+  await selectLocalPasswordLogin(page);
   await page.getByLabel('Email').fill('admin@example.com');
   await page.getByLabel('Password').fill('admin123');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -2647,6 +2654,7 @@ test('archive queued before a due scheduler leaves zero scheduled runs', async (
 
 test('a due scheduler queued before archive creates exactly one run before archival', async ({ page }) => {
   await page.goto('/login');
+  await selectLocalPasswordLogin(page);
   await page.getByLabel('Email').fill('admin@example.com');
   await page.getByLabel('Password').fill('admin123');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();

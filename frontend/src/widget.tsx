@@ -17,6 +17,7 @@ import {
   ChatActivityGroup,
   ChatMessageBubble,
   ChatThinkingBubble,
+  activityGroupProcessingWindow,
   mergeRunEvents,
   projectActivities,
   resizeComposer,
@@ -51,6 +52,7 @@ type MessageTimelineEntry = {
   role: string;
   content: string;
   occurredAt: number;
+  outputEndedAt?: number;
   sequence: number;
   streaming?: boolean;
   state?: string;
@@ -640,6 +642,7 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
         role: 'assistant',
         content: deltas.map((event) => event.content).join(''),
         occurredAt: eventTimestamp(deltas[0]?.created_at),
+        outputEndedAt: eventTimestamp(deltas.at(-1)?.created_at),
         sequence: (deltas[0]?.seq ?? 0) * 1000 + 1,
         streaming: true
       });
@@ -682,8 +685,11 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
 
   const lastUserRunId = [...timeline].reverse().find((entry) => entry.kind === 'message' && entry.role === 'user')?.runId ?? null;
   const lastRunTerminal = lastUserRunId ? events.some((event) => event.run_id === lastUserRunId && isTerminalEvent(event)) : false;
-  const lastRunHasAssistant = lastUserRunId ? timeline.some((entry) => entry.kind === 'message' && entry.runId === lastUserRunId && entry.role === 'assistant') : false;
-  const showThinking = !streamError && (runPending || Boolean(lastUserRunId && !lastRunTerminal && !lastRunHasAssistant));
+  const activeRunInProgress = !streamError && (runPending || Boolean(lastUserRunId && !lastRunTerminal));
+  const activeRunLastTimelineItem = lastUserRunId
+    ? [...timeline].reverse().find((entry) => entry.runId === lastUserRunId)
+    : undefined;
+  const showThinking = activeRunInProgress && activeRunLastTimelineItem?.kind !== 'activity-group';
 
   useLayoutEffect(() => {
     const scroll = chatScrollRef.current;
@@ -747,10 +753,11 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
       {error && <div className="session-banner error" role="alert">{error}</div>}
       <div className="session-transcript widget-transcript" aria-live="polite" aria-busy={transcriptLoading || olderMessagesLoading}>
         {transcriptLoading && timeline.length === 0 && <div className="widget-transcript-state">{t('loadingMessages')}</div>}
-        {timeline.map((entry) => {
+        {timeline.map((entry, index) => {
           if (entry.kind === 'activity-group') {
-            const window = runWindows.get(entry.runId);
-            return <ChatActivityGroup activities={entry.activities} endedAt={window?.endedAt} key={entry.id} startedAt={window?.startedAt} />;
+            const active = activeRunInProgress && entry.runId === lastUserRunId;
+            const window = activityGroupProcessingWindow(timeline, index, runWindows.get(entry.runId), active);
+            return <ChatActivityGroup active={active && window.endedAt === undefined} activities={entry.activities} endedAt={window.endedAt} key={entry.id} startedAt={window.startedAt} />;
           }
           return <ChatMessageBubble agentName={agent?.name ?? null} content={entry.content} key={entry.id} role={entry.role} state={entry.state} streaming={entry.streaming} />;
         })}

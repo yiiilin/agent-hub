@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { selectLocalPasswordLogin } from './authentication-helpers';
 
 function collectBrowserErrors(page: import('@playwright/test').Page) {
   const errors: string[] = [];
@@ -22,6 +23,7 @@ function largeOpenApiDocument(count = 90) {
 
 async function login(page: import('@playwright/test').Page) {
   await page.goto('/login');
+  await selectLocalPasswordLogin(page);
   await page.getByLabel('Email').fill('admin@example.com');
   await page.getByLabel('Password').fill('admin123');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();

@@ -1,5 +1,6 @@
 import { expect, test, type Page, type Route } from '@playwright/test';
 import type { Agent, AgentModelSettings } from '../src/api/client';
+import { selectLocalPasswordLogin } from './authentication-helpers';
 
 async function provisionAndSignInPasswordUser(page: import('@playwright/test').Page, email: string) {
   const password = 'permissions-test-password';
@@ -7,6 +8,7 @@ async function provisionAndSignInPasswordUser(page: import('@playwright/test').P
   expect((await page.request.post('/api/admin/users', { data: { email, password, role: 'member' } })).ok()).toBeTruthy();
   expect((await page.request.post('/api/auth/logout')).status()).toBe(204);
   await page.goto('/login');
+  await selectLocalPasswordLogin(page);
   await page.getByLabel('Email').fill(email);
   await page.getByLabel('Password').fill(password);
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -281,6 +283,7 @@ test('owner, admin, public, and public_to permissions stay isolated', async ({ b
     memberPrivateId = memberPrivate.id;
 
     await adminPage.goto('/login');
+    await selectLocalPasswordLogin(adminPage);
     await adminPage.getByLabel('Email').fill('admin@example.com');
     await adminPage.getByLabel('Password').fill('admin123');
     await adminPage.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -413,6 +416,7 @@ test('owner, admin, public, and public_to permissions stay isolated', async ({ b
 
 test('agent navigation ignores a stale detail response', async ({ page }) => {
   await page.goto('/login');
+  await selectLocalPasswordLogin(page);
   await page.getByLabel('Email').fill('admin@example.com');
   await page.getByLabel('Password').fill('admin123');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -575,6 +579,7 @@ test('agent initial load failure is handled and recovers on retry', async ({ pag
 
 test('agent route change hides stale controls and runs while the next agent loads', async ({ page }) => {
   await page.goto('/login');
+  await selectLocalPasswordLogin(page);
   await page.getByLabel('Email').fill('admin@example.com');
   await page.getByLabel('Password').fill('admin123');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();

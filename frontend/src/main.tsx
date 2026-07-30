@@ -255,7 +255,7 @@ function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
       .then((response) => {
         if (!active) return;
         setProviders(response);
-        if (!emergencyPassword) setMethod(response.password_login_enabled ? 'password' : 'ldap');
+        if (!emergencyPassword) setMethod(response.ldap_login_enabled ? 'ldap' : 'password');
       })
       .catch(() => { if (active) setProvidersError(true); })
       .finally(() => { if (active) setProvidersLoading(false); });

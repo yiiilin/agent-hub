@@ -1,5 +1,6 @@
 import { expect, request, test } from '@playwright/test';
 import type { AgentModelSettings } from '../src/api/client';
+import { selectLocalPasswordLogin } from './authentication-helpers';
 
 const automaticModelSettings: AgentModelSettings = {
   reasoning_effort: 'default',
@@ -425,6 +426,7 @@ test('edits automations, protects webhook tokens, and localizes the operations w
   const serverErrors: string[] = [];
   let fixture: OwnedAgentFixture | null = null;
   await page.goto('/login');
+  await selectLocalPasswordLogin(page);
   await page.getByLabel('Email').fill('admin@example.com');
   await page.getByLabel('Password').fill('admin123');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
@@ -677,6 +679,7 @@ test('agent visibility uses localized labels and a visible fallback', async ({ p
 
 test('login and automation status messages retranslate after language changes', async ({ page }) => {
   await page.goto('/login');
+  await selectLocalPasswordLogin(page);
   await page.getByLabel('Password').fill('incorrect-password');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();
   await expect(page.getByText('Unable to sign in. Check your credentials and retry.')).toBeVisible();

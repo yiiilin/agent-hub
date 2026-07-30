@@ -62,8 +62,8 @@ export type ActivityEntry = {
 };
 
 type TimelineEntry =
-  | { kind: 'message'; id: string; sequence: number; occurredAt: number; runId: string | null; role: string; content: string; state?: string; mode?: string }
-  | { kind: 'live'; id: string; sequence: number; occurredAt: number; role: string; content: string }
+  | { kind: 'message'; id: string; sequence: number; occurredAt: number; outputEndedAt?: number; runId: string | null; role: string; content: string; state?: string; mode?: string }
+  | { kind: 'live'; id: string; sequence: number; occurredAt: number; outputEndedAt?: number; runId: string; role: string; content: string }
   | { kind: 'activity'; id: string; sequence: number; occurredAt: number; activity: ActivityEntry };
 
 type TimelineItem = Exclude<TimelineEntry, { kind: 'activity' }>
@@ -170,6 +170,50 @@ export function runProcessingWindow(events: RunEvent[], acceptedAt?: number) {
     startedAt: starts.length > 0 ? Math.min(...starts) : undefined,
     endedAt: terminalEnds.length > 0 ? Math.min(...terminalEnds) : undefined
   };
+}
+
+type ProcessingTimelineItem = {
+  kind: string;
+  runId: string | null;
+  role?: string;
+  occurredAt?: number;
+  outputEndedAt?: number;
+  activities?: ActivityEntry[];
+};
+
+export function activityGroupProcessingWindow(
+  timeline: readonly ProcessingTimelineItem[],
+  index: number,
+  runWindow: { startedAt?: number; endedAt?: number } | undefined,
+  active: boolean
+) {
+  const group = timeline[index];
+  const activities = group?.activities ?? [];
+  const activityStartedAt = activities.length > 0
+    ? Math.min(...activities.map((activity) => activity.occurredAt))
+    : undefined;
+  const activityEndedAt = activities.length > 0
+    ? Math.max(...activities.map((activity) => activity.endedAt))
+    : undefined;
+  let startedAt = runWindow?.startedAt ?? activityStartedAt;
+  for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+    const candidate = timeline[cursor];
+    if (candidate.runId !== group?.runId || (candidate.role !== 'user' && candidate.role !== 'assistant')) continue;
+    startedAt = candidate.outputEndedAt ?? candidate.occurredAt ?? startedAt;
+    break;
+  }
+
+  let endedAt: number | undefined;
+  for (let cursor = index + 1; cursor < timeline.length; cursor += 1) {
+    const candidate = timeline[cursor];
+    if (candidate.runId !== group?.runId || candidate.role !== 'assistant') continue;
+    endedAt = candidate.occurredAt;
+    break;
+  }
+  endedAt ??= runWindow?.endedAt;
+  if (endedAt === undefined && !active) endedAt = activityEndedAt;
+  if (startedAt !== undefined && endedAt !== undefined) endedAt = Math.max(startedAt, endedAt);
+  return { startedAt, endedAt };
 }
 
 function payloadNumber(payload: Record<string, unknown>, key: string) {
@@ -360,9 +404,17 @@ function ActivityIcon({ kind }: { kind: ActivityKind }) {
   return <Minimize2 size={15} />;
 }
 
-export function ChatActivityGroup({ activities, startedAt, endedAt }: { activities: ActivityEntry[]; startedAt?: number; endedAt?: number }) {
+export function ChatActivityGroup({ activities, startedAt, endedAt, active = false }: { activities: ActivityEntry[]; startedAt?: number; endedAt?: number; active?: boolean }) {
   const { locale, t } = useI18n();
-  return <details className="session-activity-events"><summary><span>{t('agentActivityDuration').replace('{duration}', formatActivityDuration(activities, locale, startedAt, endedAt))}</span><ChevronRight className="session-activity-chevron" size={16} aria-hidden="true" /></summary><div>{activities.map((activity) => <div className="session-activity-row" key={activity.id}><span className="session-activity-icon" aria-hidden="true"><ActivityIcon kind={activity.kind} /></span><div className="session-activity-content"><span className="session-activity-heading"><strong>{t(activityKeys[activity.kind])}</strong>{activity.status && <small className={`session-activity-status status-${activity.status}`}>{t(activityStatusKeys[activity.status] ?? 'statusFailed')}</small>}{activity.kind === 'tool' && activity.status && activity.status !== 'pending' && <small className="session-activity-elapsed">{formatActivityDuration([activity], locale)}</small>}</span>{activity.summary && (activity.kind === 'command' ? <code>{activity.summary}</code> : <span className="session-activity-summary">{activity.summary}</span>)}{activity.output && <div className="session-activity-output"><span>{t('activityOutput')}</span><pre>{activity.output}</pre></div>}</div></div>)}</div></details>;
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!active) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [active, startedAt]);
+  const durationEndedAt = active ? now : endedAt;
+  return <details className="session-activity-events"><summary><span>{t('agentActivityDuration').replace('{duration}', formatActivityDuration(activities, locale, startedAt, durationEndedAt))}</span><ChevronRight className="session-activity-chevron" size={16} aria-hidden="true" /></summary><div>{activities.map((activity) => <div className="session-activity-row" key={activity.id}><span className="session-activity-icon" aria-hidden="true"><ActivityIcon kind={activity.kind} /></span><div className="session-activity-content"><span className="session-activity-heading"><strong>{t(activityKeys[activity.kind])}</strong>{activity.status && <small className={`session-activity-status status-${activity.status}`}>{t(activityStatusKeys[activity.status] ?? 'statusFailed')}</small>}{activity.kind === 'tool' && activity.status && activity.status !== 'pending' && <small className="session-activity-elapsed">{formatActivityDuration([activity], locale)}</small>}</span>{activity.summary && (activity.kind === 'command' ? <code>{activity.summary}</code> : <span className="session-activity-summary">{activity.summary}</span>)}{activity.output && <div className="session-activity-output"><span>{t('activityOutput')}</span><pre>{activity.output}</pre></div>}</div></div>)}</div></details>;
 }
 
 export function ChatMessageBubble({
@@ -588,19 +640,14 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
     const status = event.content ?? payloadString(event.payload, 'status');
     return status !== null && terminalRunStatuses.has(status);
   });
-  const activeRunHasAssistantMessage = activeRunId !== null && (
-    sessionMessages.some((message) => message.run_id === activeRunId && message.role === 'assistant' && Boolean(message.content))
-    || activeRunEvents.some((event) => event.event_type === 'message' && event.role === 'assistant' && Boolean(event.content))
-  );
   const activeRunStarted = activeRunEvents.some((event) => {
     if (event.event_type === 'turn_started') return true;
     if (event.event_type !== 'status') return false;
     const status = event.content ?? payloadString(event.payload, 'status');
     return status !== null && ['pending', 'running', 'waiting_tool'].includes(status);
   });
-  const showThinking = activeRunId !== null
+  const activeRunInProgress = activeRunId !== null
     && !activeRunTerminal
-    && !activeRunHasAssistantMessage
     && (Boolean(selectedSession?.active_turn_id)
       || activeRunStarted
       || Boolean(activeRunUserMessage && ['queued', 'deferred', 'delivering'].includes(activeRunUserMessage.delivery_state)));
@@ -799,7 +846,7 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
     for (const event of sessionEvents) {
       const messageKey = `${event.run_id}:${event.role ?? 'assistant'}:${event.content ?? ''}`;
       if (event.event_type === 'message' && event.content && !messageContents.has(messageKey)) {
-        entries.push({ kind: 'live', id: `event-message-${event.run_id}-${event.seq}`, sequence: event.seq * 1000 + 1, occurredAt: eventTimestamp(event.created_at), role: event.role ?? 'assistant', content: event.content });
+        entries.push({ kind: 'live', id: `event-message-${event.run_id}-${event.seq}`, sequence: event.seq * 1000 + 1, occurredAt: eventTimestamp(event.created_at), runId: event.run_id, role: event.role ?? 'assistant', content: event.content });
         messageContents.add(messageKey);
       }
     }
@@ -834,6 +881,10 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
       return items;
     }, []);
   }, [timeline]);
+  const activeRunLastTimelineItem = activeRunId
+    ? [...timelineItems].reverse().find((entry) => entry.runId === activeRunId)
+    : undefined;
+  const showThinking = activeRunInProgress && activeRunLastTimelineItem?.kind !== 'activity-group';
 
   useLayoutEffect(() => {
     const scroll = chatScrollRef.current;
@@ -1014,21 +1065,27 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
               {!conversationDraft && messagesLoading && <div className="operation-state" role="status">{t('loadingMessages')}</div>}
               {!conversationDraft && !messagesLoading && messagesError && <div className="operation-state error" role="alert">{t('messagesLoadFailed')}</div>}
               {!conversationDraft && !messagesLoading && !messagesError && timelineItems.length === 0 && <div className="operation-state">{t('noMessages')}</div>}
-              {!conversationDraft && timelineItems.map((entry) => entry.kind === 'activity-group'
-                ? <ChatActivityGroup
-                  activities={entry.activities}
-                  endedAt={runProcessingWindows.get(entry.runId)?.endedAt}
-                  key={entry.id}
-                  startedAt={runProcessingWindows.get(entry.runId)?.startedAt}
-                />
-                : <ChatMessageBubble
+              {!conversationDraft && timelineItems.map((entry, index) => {
+                if (entry.kind === 'activity-group') {
+                  const active = activeRunInProgress && entry.runId === activeRunId;
+                  const window = activityGroupProcessingWindow(timelineItems, index, runProcessingWindows.get(entry.runId), active);
+                  return <ChatActivityGroup
+                    active={active && window.endedAt === undefined}
+                    activities={entry.activities}
+                    endedAt={window.endedAt}
+                    key={entry.id}
+                    startedAt={window.startedAt}
+                  />;
+                }
+                return <ChatMessageBubble
                   agentName={conversationAgentName}
                   content={entry.content}
                   key={entry.id}
                   role={entry.role}
                   state={entry.kind === 'message' ? entry.state : undefined}
                   stateLabel={entry.kind === 'message' && entry.state ? deliveryLabel(entry.state) : undefined}
-                />)}
+                />;
+              })}
               {!conversationDraft && showThinking && <ChatThinkingBubble />}
             </div>
           </div>
