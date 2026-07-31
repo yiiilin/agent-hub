@@ -28,7 +28,7 @@ test('root opens Sessions and places it first in workspace navigation', async ({
   const workspace = page.getByRole('navigation', { name: 'Primary navigation' });
   await expect(workspace.getByRole('button')).toHaveText([
     'Sessions', 'Agents', 'Integration Apps', 'Automations', 'Skills',
-    'Models', 'API Keys', 'Runtimes', 'Administration', 'API Docs'
+    'Models', 'API Keys', 'Runtimes', 'Administration', 'Usage Guide', 'API Docs'
   ]);
   await expect(workspace.getByRole('button', { name: 'Sessions' })).toHaveAttribute('aria-current', 'page');
 });

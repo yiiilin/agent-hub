@@ -864,8 +864,8 @@ test('--coverage includes real LDAP API and browser evidence without invoking Do
   assert.equal(readFileSync(join(repoRoot, 'qa', 'runner.mjs'), 'utf8').includes("./support/browser.mjs"), false);
   const overall = result.stdout.match(/Overall repository coverage: (\d+)\/(\d+) fully covered/);
   assert.ok(overall, result.stdout);
-  assert.equal(Number(overall[1]), 85);
-  assert.equal(Number(overall[2]), 85);
+  assert.equal(Number(overall[1]), 86);
+  assert.equal(Number(overall[2]), 86);
   assert.match(result.stdout, /Coverage validation passed\./);
   assert.equal(result.stdout.includes('Unmapped OpenAPI operations'), false);
   assert.equal(result.stdout.includes('Unmapped UI routes'), false);

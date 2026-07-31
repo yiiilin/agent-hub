@@ -1,4 +1,4 @@
-import { Activity, BookOpen, Bot, BrainCircuit, Building2, Check, CirclePause, Clock, Copy, ExternalLink, KeyRound, Languages, LockKeyhole, LogOut, Menu, Monitor, Plug, Plus, RotateCcw, Save, Search, Send, Settings, ShieldAlert, Sparkles, Trash2, UserRound, Workflow, X } from 'lucide-react';
+import { Activity, BookOpen, BookOpenCheck, Bot, BrainCircuit, Building2, Check, CirclePause, Clock, Copy, ExternalLink, KeyRound, Languages, LockKeyhole, LogOut, Menu, Monitor, Plug, Plus, RotateCcw, Save, Search, Send, Settings, ShieldAlert, Sparkles, Trash2, UserRound, Workflow, X } from 'lucide-react';
 import React, { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Agent, api, ApiError, ApiKey, ApiKeyValidity, AuthProviders, Automation, HubSession, Run, RunEvent, Runtime, RuntimeEnrollmentToken, User } from './api/client';
@@ -16,9 +16,10 @@ import { RuntimesPage as RuntimesWorkspacePage } from './runtimes';
 import { ModelsPage } from './models';
 import { clearConversationDrafts } from './session-drafts';
 import { WidgetApp } from './widget';
+import { UsageDocsPage } from './usage-docs';
 import './styles.css';
 
-type Route = { name: 'login' } | { name: 'agents' } | { name: 'agent'; agentId: string } | { name: 'sessions' } | { name: 'integrations' } | { name: 'skills' } | { name: 'skill'; skillId: string } | { name: 'models' } | { name: 'apiKeys' } | { name: 'docs' } | { name: 'automations' } | { name: 'runtimes' } | { name: 'administration' } | { name: 'widget'; token?: string; appClientId?: string } | { name: 'notFound' };
+type Route = { name: 'login' } | { name: 'agents' } | { name: 'agent'; agentId: string } | { name: 'sessions' } | { name: 'integrations' } | { name: 'skills' } | { name: 'skill'; skillId: string } | { name: 'models' } | { name: 'apiKeys' } | { name: 'guide' } | { name: 'docs' } | { name: 'automations' } | { name: 'runtimes' } | { name: 'administration' } | { name: 'widget'; token?: string; appClientId?: string } | { name: 'notFound' };
 
 function parseRoute(): Route {
   const path = window.location.pathname;
@@ -42,6 +43,8 @@ function parseRoute(): Route {
   if (path.startsWith('/sessions')) return { name: 'sessions' };
   if (path === '/integrations' || path === '/integrations/') return { name: 'integrations' };
   if (path.startsWith('/integrations/')) return { name: 'notFound' };
+  if (path === '/guide' || path === '/guide/') return { name: 'guide' };
+  if (path.startsWith('/guide/')) return { name: 'notFound' };
   if (path.startsWith('/docs')) return { name: 'docs' };
   if (path.startsWith('/automations')) return { name: 'automations' };
   if (path.startsWith('/runtimes')) return { name: 'runtimes' };
@@ -114,6 +117,7 @@ function App() {
       {route.name === 'skill' && <SkillDetailPage key={route.skillId} skillId={route.skillId} navigate={navigate} setNavigationBlocker={setNavigationBlocker} />}
       {route.name === 'apiKeys' && <ApiKeysPage />}
       {route.name === 'models' && <ModelsPage currentUser={user} />}
+      {route.name === 'guide' && <UsageDocsPage />}
       {route.name === 'docs' && <ApiDocsPage />}
       {route.name === 'automations' && <AutomationsWorkspacePage RunConsole={RunConsole} />}
       {route.name === 'runtimes' && <RuntimesWorkspacePage user={user} />}
@@ -177,6 +181,7 @@ function Shell({ user, children, onUserUpdated }: { user: User | null; children:
           <div className="nav-group"><span>{t('system')}</span>
             <button className="nav-button" aria-current={current('runtimes')} onClick={() => goTo('/runtimes')}><Monitor size={18} /> {t('runtimes')}</button>
             {(user?.role === 'admin' || user?.role === 'super_admin') && <button className="nav-button" aria-current={current('administration')} onClick={() => goTo('/administration')}><Settings size={18} /> {t('administration')}</button>}
+            <button className="nav-button" aria-current={current('guide')} onClick={() => goTo('/guide')}><BookOpenCheck size={18} /> {t('usageGuide')}</button>
             <button className="nav-button" aria-current={current('docs')} onClick={() => goTo('/docs')}><BookOpen size={18} /> {t('apiDocs')}</button>
           </div>
         </nav>

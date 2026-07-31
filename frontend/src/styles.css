@@ -1424,6 +1424,125 @@ textarea {
 .method-patch { color: #a16207; }
 .method-delete { color: #b91c1c; }
 
+.usage-docs-page {
+  max-width: 980px;
+}
+
+.usage-docs-page .docs-section {
+  min-width: 0;
+}
+
+.usage-docs-page h3 {
+  margin: 24px 0 8px;
+  font-size: 17px;
+}
+
+.usage-mode-table {
+  margin-top: 18px;
+  border-top: 1px solid #d9e2ef;
+}
+
+.usage-mode-row {
+  display: grid;
+  grid-template-columns: minmax(150px, .7fr) minmax(190px, 1fr) minmax(240px, 1.35fr);
+  gap: 18px;
+  align-items: start;
+  border-bottom: 1px solid #e5eaf1;
+  padding: 14px 0;
+  color: #445168;
+}
+
+.usage-mode-row strong {
+  color: #172033;
+}
+
+.usage-mode-header {
+  padding-block: 9px;
+  color: #69758a;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.usage-steps,
+.usage-checklist {
+  display: grid;
+  gap: 10px;
+  margin: 14px 0 0;
+  padding-left: 24px;
+  color: #445168;
+}
+
+.usage-callout {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  margin-top: 18px;
+  border-left: 3px solid #2d7a62;
+  padding: 11px 14px;
+  background: #f1f8f5;
+  color: #245444;
+}
+
+.usage-callout p,
+.usage-note {
+  margin: 0;
+}
+
+.usage-code-example {
+  min-width: 0;
+  margin-top: 12px;
+  overflow: hidden;
+  border: 1px solid #273445;
+  border-radius: 6px;
+  background: #111827;
+}
+
+.usage-code-toolbar {
+  min-height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid #334155;
+  padding: 5px 7px 5px 14px;
+  color: #b8c4d6;
+  font: 600 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.usage-code-toolbar .icon-button {
+  width: 28px;
+  height: 28px;
+  border-color: transparent;
+  color: #dbe7f5;
+  background: transparent;
+}
+
+.usage-code-toolbar .icon-button:hover {
+  background: #27364a;
+}
+
+.usage-code-example pre {
+  max-width: 100%;
+  margin: 0;
+  overflow: auto;
+  padding: 16px;
+  color: #edf3fa;
+  font: 13px/1.62 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  tab-size: 2;
+}
+
+.usage-code-example code {
+  white-space: pre;
+}
+
+.usage-note {
+  margin-top: 12px;
+  color: #5c687b;
+  font-size: 13px;
+}
+
 .empty {
   min-height: 420px;
   display: grid;
@@ -1906,6 +2025,11 @@ textarea {
   .endpoint-row > span:last-child {
     grid-column: 2;
   }
+
+  .usage-mode-row {
+    grid-template-columns: minmax(130px, .65fr) minmax(170px, 1fr) minmax(210px, 1.2fr);
+    gap: 14px;
+  }
 }
 
 @media (max-width: 480px) {
@@ -2003,6 +2127,10 @@ textarea {
   .api-key-list-header { display: none; }
   .api-key-row { grid-template-columns: minmax(0, 1fr); gap: 7px; padding: 14px 12px; }
   .api-key-row .button-row { justify-content: flex-start; }
+  .usage-docs-page .docs-header h1 { font-size: 27px; }
+  .usage-mode-header { display: none; }
+  .usage-mode-row { grid-template-columns: minmax(0, 1fr); gap: 5px; padding: 14px 0; }
+  .usage-code-example pre { padding: 14px; font-size: 12px; }
   .pagination { justify-content: space-between; gap: 8px; padding: 12px 10px; }
   .pagination .secondary { min-width: 0; padding-inline: 9px; }
   .modal-backdrop { padding: 10px; }
