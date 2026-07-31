@@ -53,10 +53,17 @@ Session 配置原子物化成功后，Runtime 对空闲 Pi 调用原生 `reload_
 | Model Gateway | `ghcr.io/yiiilin/agent-hub-gateway:0.1.0` |
 
 Release workflow 先对完整 Git 历史执行凭据扫描，再在 GitHub runner 本地构建候选镜像。
-候选镜像的 config 和每个最终 image layer 均通过 Gitleaks 脱敏扫描后，workflow 才登录
-GHCR 并推送同一个本地镜像。扫描报告、Buildx cache 和 build record 均不上传；任何扫描
-发现都会在登录 registry 前终止该镜像任务。创建 release tag 前仍需在本地对待推送历史
-执行同一份 `.gitleaks.toml`，因为远端 workflow 无法撤回已经推送的 Git 对象。
+候选镜像的 config、每个最终 image layer 和二进制文件的可打印字符串均通过 Gitleaks
+脱敏扫描后，workflow 才登录 GHCR 并推送同一个本地镜像。扫描报告、Buildx cache 和
+build record 均不上传；任何扫描发现都会在登录 registry 前终止该镜像任务。创建 release
+tag 前仍需在本地对待推送历史执行同一份 `.gitleaks.toml`，因为远端 workflow 无法撤回
+已经推送的 Git 对象。
+
+固定 Pi `0.81.1` 的 compiled binary 会被 Gitleaks `8.28.0` 的通用规则命中 6 个源码
+表达式。`scripts/scan-image-secrets.sh` 不按规则或整个文件放行，而是同时固定命中数量与
+排序后 `RuleID`/完整 `Match` 集合的 SHA-256；原始命中只存在于 runner 的 `0700` 临时
+目录。Pi、Gitleaks 或编译输出发生变化时，基线不再匹配并阻断发布，必须人工复核全部
+脱敏命中后才能更新该摘要。
 
 `AGENT_HUB_IMAGE_REGISTRY` 和 `AGENT_HUB_IMAGE_TAG` 可统一覆盖 registry 与版本。生产升级时只修改一次版本值，三张镜像必须保持相同 Agent Hub 版本。若 Package 不是公开可读，先使用仅具备 `read:packages` 权限的部署凭证登录，且不要把凭证写入 `.env`、Compose 或 shell history：
 
