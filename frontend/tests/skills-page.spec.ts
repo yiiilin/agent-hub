@@ -19,7 +19,7 @@ const automaticModelSettings: AgentModelSettings = {
   auto_compact_token_limit: null,
   reasoning_summary_support: 'auto',
   service_tier: null,
-  request_max_retries: null,
+  provider_request_timeout_ms: null,
   stream_max_retries: null,
   stream_idle_timeout_ms: null,
   request_settings: { protocol: 'openai_responses' }

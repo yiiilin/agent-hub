@@ -83,7 +83,7 @@ export type AgentModelSettings = {
   auto_compact_token_limit: number | null;
   reasoning_summary_support: ModelReasoningSummarySupport;
   service_tier: string | null;
-  request_max_retries: number | null;
+  provider_request_timeout_ms: number | null;
   stream_max_retries: number | null;
   stream_idle_timeout_ms: number | null;
   request_settings: ModelRequestSettings;
@@ -97,7 +97,7 @@ export type AgentModelSettingsOverride = Partial<{
   auto_compact_token_limit: number | null;
   reasoning_summary_support: ModelReasoningSummarySupport | null;
   service_tier: string | null;
-  request_max_retries: number | null;
+  provider_request_timeout_ms: number | null;
   stream_max_retries: number | null;
   stream_idle_timeout_ms: number | null;
   request_settings: ModelRequestSettings | null;

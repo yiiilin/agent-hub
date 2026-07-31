@@ -552,6 +552,15 @@ export class ClientSession {
             signal: combinedSignal(this.#disposeController.signal, options.signal),
         });
     }
+    async events(options = {}) {
+        this.#assertUsable();
+        if (this.#id === null)
+            return [];
+        return this.#operations.events(this.#id, {
+            ...options,
+            signal: combinedSignal(this.#disposeController.signal, options.signal),
+        });
+    }
     async send(content, options = {}) {
         this.#assertUsable();
         const pending = this.#sendQueue.then(() => this.#operations.send(this, content, {
@@ -692,6 +701,7 @@ export class AgentHubClient {
         this.#requestRetryDelayMs = options.requestRetryDelayMs ?? DEFAULT_REQUEST_RETRY_DELAY_MS;
         this.#sessionOperations = {
             messages: (sessionId, requestOptions) => this.#messages(sessionId, requestOptions),
+            events: (sessionId, requestOptions) => this.#events(sessionId, requestOptions),
             send: (session, content, requestOptions) => this.#send(session, content, requestOptions),
             stop: (runId, signal) => this.stop(runId, signal),
             openStream: (sessionId, after, signal) => this.#openStream(sessionId, after, signal),
@@ -1017,6 +1027,19 @@ export class AgentHubClient {
         const items = rawItems;
         const minimum = items.reduce((current, item) => (typeof item.sequence === "number" && (current === null || item.sequence < current) ? item.sequence : current), null);
         return { items, nextBeforeSequence: items.length === limit ? minimum : null };
+    }
+    async #events(sessionId, options) {
+        const after = options.after ?? 0;
+        if (!Number.isInteger(after) || after < 0)
+            throw new Error("event cursor must be a non-negative integer");
+        const value = await this.#requestJson(pathWithQuery(`${PATHS.sessions}/${encodeURIComponent(sessionId)}/events`, { after: after > 0 ? after : undefined }), {}, { signal: options.signal });
+        if (!Array.isArray(value)) {
+            throw new AgentHubError(500, "invalid_response", "Agent Hub returned an invalid event list");
+        }
+        return value.map((event) => normalizeEvent({
+            event: "session_event",
+            data: JSON.stringify(event),
+        }, after));
     }
     async #send(session, content, options) {
         const normalized = content.trim();

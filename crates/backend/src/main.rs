@@ -1207,8 +1207,8 @@ fn openapi_schemas() -> Value {
             { "type": "object", "additionalProperties": false, "required": ["protocol"], "properties": { "protocol": { "type": "string", "enum": ["openai_chat_completions"] }, "temperature": { "type": ["number", "null"], "minimum": 0, "maximum": 2 }, "top_p": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }, "max_completion_tokens": { "type": ["integer", "null"], "minimum": 1, "maximum": 4294967295_u64 } } },
             { "type": "object", "additionalProperties": false, "required": ["protocol"], "properties": { "protocol": { "type": "string", "enum": ["anthropic_messages"] }, "temperature": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }, "top_p": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }, "max_tokens": { "type": ["integer", "null"], "minimum": 1, "maximum": 4294967295_u64 } }, "not": { "required": ["temperature", "top_p"], "properties": { "temperature": { "type": "number" }, "top_p": { "type": "number" } } } }
         ], "discriminator": { "propertyName": "protocol" } },
-        "AgentModelSettings": { "type": "object", "additionalProperties": false, "required": ["reasoning_effort", "reasoning_summary", "verbosity", "context_window_tokens", "auto_compact_token_limit", "reasoning_summary_support", "service_tier", "request_max_retries", "stream_max_retries", "stream_idle_timeout_ms", "request_settings"], "properties": { "reasoning_effort": { "$ref": "#/components/schemas/ReasoningEffort" }, "reasoning_summary": { "$ref": "#/components/schemas/ModelReasoningSummary" }, "verbosity": { "$ref": "#/components/schemas/ModelVerbosity" }, "context_window_tokens": { "type": ["integer", "null"], "format": "int64", "minimum": 1 }, "auto_compact_token_limit": { "type": ["integer", "null"], "format": "int64", "minimum": 1 }, "reasoning_summary_support": { "$ref": "#/components/schemas/ModelReasoningSummarySupport" }, "service_tier": { "type": ["string", "null"], "minLength": 1, "maxLength": 64 }, "request_max_retries": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 }, "stream_max_retries": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 }, "stream_idle_timeout_ms": { "type": ["integer", "null"], "format": "int64", "minimum": 1 }, "request_settings": { "$ref": "#/components/schemas/ModelRequestSettings" } } },
-        "AgentModelSettingsOverride": { "type": "object", "additionalProperties": false, "properties": { "reasoning_effort": { "anyOf": [{ "$ref": "#/components/schemas/ReasoningEffort" }, { "type": "null" }] }, "reasoning_summary": { "anyOf": [{ "$ref": "#/components/schemas/ModelReasoningSummary" }, { "type": "null" }] }, "verbosity": { "anyOf": [{ "$ref": "#/components/schemas/ModelVerbosity" }, { "type": "null" }] }, "context_window_tokens": { "type": ["integer", "null"], "minimum": 1 }, "auto_compact_token_limit": { "type": ["integer", "null"], "minimum": 1 }, "reasoning_summary_support": { "anyOf": [{ "$ref": "#/components/schemas/ModelReasoningSummarySupport" }, { "type": "null" }] }, "service_tier": { "type": ["string", "null"], "minLength": 1, "maxLength": 64 }, "request_max_retries": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 }, "stream_max_retries": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 }, "stream_idle_timeout_ms": { "type": ["integer", "null"], "minimum": 1 }, "request_settings": { "anyOf": [{ "$ref": "#/components/schemas/ModelRequestSettings" }, { "type": "null" }] } } },
+        "AgentModelSettings": { "type": "object", "additionalProperties": false, "required": ["reasoning_effort", "reasoning_summary", "verbosity", "context_window_tokens", "auto_compact_token_limit", "reasoning_summary_support", "service_tier", "provider_request_timeout_ms", "stream_max_retries", "stream_idle_timeout_ms", "request_settings"], "properties": { "reasoning_effort": { "$ref": "#/components/schemas/ReasoningEffort" }, "reasoning_summary": { "$ref": "#/components/schemas/ModelReasoningSummary" }, "verbosity": { "$ref": "#/components/schemas/ModelVerbosity" }, "context_window_tokens": { "type": ["integer", "null"], "format": "int64", "minimum": 1 }, "auto_compact_token_limit": { "type": ["integer", "null"], "format": "int64", "minimum": 1 }, "reasoning_summary_support": { "$ref": "#/components/schemas/ModelReasoningSummarySupport" }, "service_tier": { "type": ["string", "null"], "minLength": 1, "maxLength": 64 }, "provider_request_timeout_ms": { "type": ["integer", "null"], "format": "int64", "minimum": 1 }, "stream_max_retries": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 }, "stream_idle_timeout_ms": { "type": ["integer", "null"], "format": "int64", "minimum": 1 }, "request_settings": { "$ref": "#/components/schemas/ModelRequestSettings" } } },
+        "AgentModelSettingsOverride": { "type": "object", "additionalProperties": false, "properties": { "reasoning_effort": { "anyOf": [{ "$ref": "#/components/schemas/ReasoningEffort" }, { "type": "null" }] }, "reasoning_summary": { "anyOf": [{ "$ref": "#/components/schemas/ModelReasoningSummary" }, { "type": "null" }] }, "verbosity": { "anyOf": [{ "$ref": "#/components/schemas/ModelVerbosity" }, { "type": "null" }] }, "context_window_tokens": { "type": ["integer", "null"], "minimum": 1 }, "auto_compact_token_limit": { "type": ["integer", "null"], "minimum": 1 }, "reasoning_summary_support": { "anyOf": [{ "$ref": "#/components/schemas/ModelReasoningSummarySupport" }, { "type": "null" }] }, "service_tier": { "type": ["string", "null"], "minLength": 1, "maxLength": 64 }, "provider_request_timeout_ms": { "type": ["integer", "null"], "minimum": 1 }, "stream_max_retries": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 }, "stream_idle_timeout_ms": { "type": ["integer", "null"], "minimum": 1 }, "request_settings": { "anyOf": [{ "$ref": "#/components/schemas/ModelRequestSettings" }, { "type": "null" }] } } },
         "ModelSelection": { "type": "object", "additionalProperties": false, "required": ["connection_id", "model_id"], "properties": { "connection_id": uuid(), "model_id": { "type": "string", "minLength": 1, "maxLength": 255 } } },
         "RunModelBinding": { "type": "object", "additionalProperties": false, "required": ["id", "run_id", "binding_key", "model_connection_id", "connection_name_snapshot", "connection_scope_snapshot", "model_id", "api_type", "model_settings"], "properties": { "id": uuid(), "run_id": uuid(), "binding_key": { "type": "string" }, "model_connection_id": uuid(), "connection_name_snapshot": { "type": "string" }, "connection_scope_snapshot": { "$ref": "#/components/schemas/ModelConnectionScope" }, "model_id": { "type": "string" }, "api_type": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" } } },
         "ModelConnection": { "type": "object", "additionalProperties": false, "required": ["id", "owner_id", "scope", "name", "base_url", "api_type", "allowed_model_ids", "status", "has_api_key", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": { "anyOf": [uuid(), { "type": "null" }] }, "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "name": { "type": "string" }, "base_url": { "type": "string", "format": "uri" }, "api_type": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "allowed_model_ids": { "type": "array", "minItems": 1, "maxItems": 256, "items": { "type": "string", "minLength": 1, "maxLength": 255 } }, "status": { "$ref": "#/components/schemas/ModelConnectionStatus" }, "has_api_key": { "type": "boolean" }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
@@ -3939,6 +3939,10 @@ fn validate_agent_model_settings(
     for (name, value) in [
         ("context window", settings.context_window_tokens),
         ("automatic compact limit", settings.auto_compact_token_limit),
+        (
+            "provider request timeout",
+            settings.provider_request_timeout_ms,
+        ),
         ("stream idle timeout", settings.stream_idle_timeout_ms),
     ] {
         if value.is_some_and(|value| value == 0 || value > max_database_integer) {
@@ -3956,11 +3960,7 @@ fn validate_agent_model_settings(
             "Agent Model Settings automatic compact limit cannot exceed the context window",
         ));
     }
-    if settings
-        .request_max_retries
-        .is_some_and(|value| value > 100)
-        || settings.stream_max_retries.is_some_and(|value| value > 100)
-    {
+    if settings.stream_max_retries.is_some_and(|value| value > 100) {
         return Err(ApiError::bad_request(
             "Agent Model Settings retry counts must be between 0 and 100",
         ));
@@ -5377,7 +5377,7 @@ async fn delete_agent(
              SET instructions = '', visibility = 'private', public_to = '{}',
                  runtime_id = NULL, model_policy = '{}'::jsonb,
                  model_connection_id = NULL, model_id = NULL,
-                 model_settings = '{\"reasoning_effort\":\"default\",\"reasoning_summary\":\"default\",\"verbosity\":\"default\",\"context_window_tokens\":null,\"auto_compact_token_limit\":null,\"reasoning_summary_support\":\"auto\",\"service_tier\":null,\"request_max_retries\":null,\"stream_max_retries\":null,\"stream_idle_timeout_ms\":null,\"request_settings\":{\"protocol\":\"openai_responses\"}}'::jsonb,
+                 model_settings = '{\"reasoning_effort\":\"default\",\"reasoning_summary\":\"default\",\"verbosity\":\"default\",\"context_window_tokens\":null,\"auto_compact_token_limit\":null,\"reasoning_summary_support\":\"auto\",\"service_tier\":null,\"provider_request_timeout_ms\":null,\"stream_max_retries\":null,\"stream_idle_timeout_ms\":null,\"request_settings\":{\"protocol\":\"openai_responses\"}}'::jsonb,
                  sandbox_policy = '{}'::jsonb, mcp_allowlist = '[]'::jsonb,
                  execution_config_revision = execution_config_revision + 1,
                  deleted_at = now(), updated_at = now()
@@ -17202,8 +17202,8 @@ fn effective_subagent_model_settings(
     );
     apply_optional_model_setting_override(&mut effective.service_tier, &overrides.service_tier);
     apply_optional_model_setting_override(
-        &mut effective.request_max_retries,
-        &overrides.request_max_retries,
+        &mut effective.provider_request_timeout_ms,
+        &overrides.provider_request_timeout_ms,
     );
     apply_optional_model_setting_override(
         &mut effective.stream_max_retries,
@@ -22882,8 +22882,8 @@ mod tests {
         let parameters = &document["components"]["schemas"]["AgentModelSettings"];
         assert_eq!(parameters["additionalProperties"], false);
         assert_eq!(
-            parameters["properties"]["request_max_retries"]["maximum"],
-            100
+            parameters["properties"]["provider_request_timeout_ms"]["minimum"],
+            1
         );
         assert_eq!(
             parameters["properties"]["stream_idle_timeout_ms"]["minimum"],
@@ -41760,7 +41760,7 @@ mod tests {
                  (id, agent_id, name, description, developer_instructions,
                   model_settings_override)
              VALUES ($1, $2, 'reviewer', 'Reviews output', 'Review carefully.',
-                     '{\"reasoning_effort\":\"high\",\"request_max_retries\":2}'::jsonb)",
+                     '{\"reasoning_effort\":\"high\",\"provider_request_timeout_ms\":120000}'::jsonb)",
         )
         .bind(Uuid::new_v4())
         .bind(fixture.agent_id)
@@ -41792,8 +41792,11 @@ mod tests {
             reviewer.model_settings.reasoning_effort,
             ReasoningEffort::High
         );
-        assert_eq!(main.model_settings.request_max_retries, None);
-        assert_eq!(reviewer.model_settings.request_max_retries, Some(2));
+        assert_eq!(main.model_settings.provider_request_timeout_ms, None);
+        assert_eq!(
+            reviewer.model_settings.provider_request_timeout_ms,
+            Some(120_000)
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM run_model_bindings WHERE run_id = $1",

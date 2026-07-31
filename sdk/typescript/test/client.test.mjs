@@ -363,6 +363,37 @@ test("concurrent sends on one draft create one Session and then steer that Sessi
   await assert.rejects(draft.send("after dispose"), /Session is disposed/);
 });
 
+test("Session events reads persisted events through the current credential", async () => {
+  const requests = [];
+  const client = await connect({
+    baseUrl: "https://hub.example",
+    sessionStorage: new MemoryStorage(),
+    storage: new MemoryToolJournalStorage(),
+    authorize: async () => credential("event-list-token"),
+    fetch: async (input, init = {}) => {
+      requests.push({ url: String(input), headers: new Headers(init.headers) });
+      return json([{
+        seq: 4,
+        event_id: "event-4",
+        run_id: "run-4",
+        event_type: "status",
+        content: "failed",
+        payload: { error_code: "engine_turn_timeout", timeout_seconds: 3600 },
+        created_at: "2026-07-30T08:00:00.000Z",
+      }]);
+    },
+  });
+
+  const events = await client.existing("session-history").events({ after: 3 });
+  const request = new URL(requests[0].url);
+  assert.equal(request.pathname, "/api/client/sessions/session-history/events");
+  assert.equal(request.searchParams.get("after"), "3");
+  assert.equal(requests[0].headers.get("Authorization"), "Bearer event-list-token");
+  assert.deepEqual(events.map((event) => [event.type, event.sequence, event.runId]), [["event", 4, "run-4"]]);
+  assert.equal(events[0].raw.payload.error_code, "engine_turn_timeout");
+  client.dispose();
+});
+
 test("Session SSE reconnects from the last cursor and emits typed events", async () => {
   const streamRequests = [];
   let streamCount = 0;

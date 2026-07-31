@@ -136,6 +136,8 @@ Runtime 被普通或强制删除后，原 Runtime identity 和 credential 永久
 
 每个在线 Session 位于 `RUNTIME_WORK_ROOT/sessions/<session-id>/`，包含独立的 `workspace/`、作为隔离 Pi `HOME` 的 `engine-state/`、本地 `supervisor/` 元数据和 `staging/`。`engine-state/.pi/agent/` 是 Hub 可重建配置，`engine-state/sessions/` 是 Pi native JSONL，`engine-state/skill-exec/` 是该 Session 私有的 Skill Package 执行副本、catalog 和调用临时目录。不同 Session 不共享 Workspace、Pi HOME、解包目录或 JSONL。
 
+`RUNTIME_ENGINE_TIMEOUT_SECS` 是单个 Pi Turn 的整轮硬截止，Compose 默认 `3600` 秒。计时不会因模型重试、流式输出或工具调用重置；到期后当前 Pi 子进程和 Run 会停止，Session 与 Workspace 保留，控制台和 Widget 会从持久 Run 事件显示超时错误。
+
 Runtime 仅在 `RUNTIME_WORK_ROOT/skill-package-cache/` 共享按归档 SHA-256 命名的压缩缓存。该目录为 `0700`，缓存文件为 `0600`；每次命中仍校验大小和 checksum，损坏项原子重新下载。缓存不是权威数据，当前没有应用内 GC；部署需监控该目录容量，离线清理时应先停止 Runtime，且不要删除 Session 私有目录来代替清缓存。
 
 Session 空闲 15 分钟后，Runtime 默认停止其 Pi RPC 进程并生成一个 `tar.zst` Session Bundle。Bundle 只包含：

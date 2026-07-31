@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashSet, VecDeque},
-    env, fs,
+    env, fmt, fs,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -52,6 +52,29 @@ const PI_BUILTIN_TOOL_NAMES: &[&str] = &[
     "bash",
     "skill_exec",
 ];
+
+#[derive(Debug)]
+pub(super) struct PiRpcTimeout {
+    timeout: Duration,
+}
+
+impl PiRpcTimeout {
+    pub(super) fn timeout_seconds(&self) -> u64 {
+        self.timeout.as_secs()
+    }
+}
+
+impl fmt::Display for PiRpcTimeout {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Pi RPC process timed out after {:?}",
+            self.timeout
+        )
+    }
+}
+
+impl std::error::Error for PiRpcTimeout {}
 const PI_INTEGRATION_EXTENSION_SOURCE: &str = r#"import { readFileSync } from "node:fs";
 
 const definitions = JSON.parse(
@@ -1295,7 +1318,10 @@ impl PersistentPiRpcProcess {
         }
         if started_at.elapsed() > self.timeout {
             terminate_child_process_tree(child);
-            anyhow::bail!("Pi RPC process timed out after {:?}", self.timeout);
+            return Err(PiRpcTimeout {
+                timeout: self.timeout,
+            }
+            .into());
         }
         Ok(None)
     }

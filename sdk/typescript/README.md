@@ -104,7 +104,7 @@ const session = client.currentSession() ?? client.draft();
 - `reauthorize()`、`stop()`、`dispose()`
 - `clientInstanceId`、`authorizedToolNames`、`agent`、`historyEnabled`、`isAnonymous`
 
-`ClientSession` 提供 `id`、`isDraft`、`messages()`、`messagePage()`、`send()`、`stop()`、`subscribe()` 和 `dispose()`。`subscribe()` 返回 `SessionSubscription`，可调用 `dispose()` 或 `unsubscribe()`，并可等待其 `closed` Promise。
+`ClientSession` 提供 `id`、`isDraft`、`messages()`、`messagePage()`、`events()`、`send()`、`stop()`、`subscribe()` 和 `dispose()`。`events()` 读取当前 Session 的持久事件，`subscribe()` 继续接收后续事件并返回 `SessionSubscription`；订阅可调用 `dispose()` 或 `unsubscribe()`，也可等待其 `closed` Promise。
 
 包还导出 `ClientCredential`、`SessionEvent`、`ToolHandlerContext`、`ToolResult` 等 public types；以 [`src/index.ts`](./src/index.ts) 为完整导出清单。
 

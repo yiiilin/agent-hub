@@ -509,14 +509,14 @@ BEGIN
            'reasoning_effort', 'reasoning_summary', 'verbosity',
            'context_window_tokens', 'auto_compact_token_limit',
            'reasoning_summary_support', 'service_tier',
-           'request_max_retries', 'stream_max_retries',
+           'provider_request_timeout_ms', 'stream_max_retries',
            'stream_idle_timeout_ms', 'request_settings'
        ]
        OR settings - ARRAY[
            'reasoning_effort', 'reasoning_summary', 'verbosity',
            'context_window_tokens', 'auto_compact_token_limit',
            'reasoning_summary_support', 'service_tier',
-           'request_max_retries', 'stream_max_retries',
+           'provider_request_timeout_ms', 'stream_max_retries',
            'stream_idle_timeout_ms', 'request_settings'
        ] <> '{}'::jsonb THEN
         RETURN false;
@@ -553,7 +553,7 @@ BEGIN
            )
        )
        AND public.jsonb_optional_number_in_range(
-               settings, 'request_max_retries', 0, 100, true
+               settings, 'provider_request_timeout_ms', 1, 9223372036854775807, true
            )
        AND public.jsonb_optional_number_in_range(
                settings, 'stream_max_retries', 0, 100, true
@@ -575,7 +575,7 @@ BEGIN
            'reasoning_effort', 'reasoning_summary', 'verbosity',
            'context_window_tokens', 'auto_compact_token_limit',
            'reasoning_summary_support', 'service_tier',
-           'request_max_retries', 'stream_max_retries',
+           'provider_request_timeout_ms', 'stream_max_retries',
            'stream_idle_timeout_ms', 'request_settings'
        ] <> '{}'::jsonb THEN
         RETURN false;
@@ -623,7 +623,7 @@ BEGIN
            )
        )
        AND public.jsonb_optional_number_in_range(
-               settings, 'request_max_retries', 0, 100, true
+               settings, 'provider_request_timeout_ms', 1, 9223372036854775807, true
            )
        AND public.jsonb_optional_number_in_range(
                settings, 'stream_max_retries', 0, 100, true
@@ -823,7 +823,7 @@ CREATE TABLE public.agents (
         "auto_compact_token_limit":null,
         "reasoning_summary_support":"auto",
         "service_tier":null,
-        "request_max_retries":null,
+        "provider_request_timeout_ms":null,
         "stream_max_retries":null,
         "stream_idle_timeout_ms":null,
         "request_settings":{"protocol":"openai_responses"}

@@ -511,7 +511,7 @@ pub struct AgentModelSettings {
     pub auto_compact_token_limit: Option<u64>,
     pub reasoning_summary_support: ModelReasoningSummarySupport,
     pub service_tier: Option<String>,
-    pub request_max_retries: Option<u32>,
+    pub provider_request_timeout_ms: Option<u64>,
     pub stream_max_retries: Option<u32>,
     pub stream_idle_timeout_ms: Option<u64>,
     pub request_settings: ModelRequestSettings,
@@ -527,7 +527,7 @@ impl Default for AgentModelSettings {
             auto_compact_token_limit: None,
             reasoning_summary_support: ModelReasoningSummarySupport::Auto,
             service_tier: None,
-            request_max_retries: None,
+            provider_request_timeout_ms: None,
             stream_max_retries: None,
             stream_idle_timeout_ms: None,
             request_settings: ModelRequestSettings::default(),
@@ -597,7 +597,7 @@ pub struct AgentModelSettingsOverride {
     #[serde(skip_serializing_if = "ModelSettingOverride::is_inherit")]
     pub service_tier: ModelSettingOverride<String>,
     #[serde(skip_serializing_if = "ModelSettingOverride::is_inherit")]
-    pub request_max_retries: ModelSettingOverride<u32>,
+    pub provider_request_timeout_ms: ModelSettingOverride<u64>,
     #[serde(skip_serializing_if = "ModelSettingOverride::is_inherit")]
     pub stream_max_retries: ModelSettingOverride<u32>,
     #[serde(skip_serializing_if = "ModelSettingOverride::is_inherit")]
@@ -2402,7 +2402,7 @@ mod tests {
             "auto_compact_token_limit": 160000,
             "reasoning_summary_support": "supported",
             "service_tier": "priority",
-            "request_max_retries": 7,
+            "provider_request_timeout_ms": 300000,
             "stream_max_retries": 9,
             "stream_idle_timeout_ms": 420000,
             "request_settings": {
@@ -2414,6 +2414,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(settings.reasoning_effort, ReasoningEffort::High);
+        assert_eq!(settings.provider_request_timeout_ms, Some(300000));
         assert_eq!(
             settings.request_settings.protocol(),
             ModelUpstreamProtocol::OpenaiChatCompletions

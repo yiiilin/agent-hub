@@ -23,6 +23,7 @@ session-root/
   engine-state/              # Pi 的隔离 HOME
     .pi/agent/AGENTS.md      # Hub 生成的 Agent 指令
     .pi/agent/models.json    # 只指向 Runtime loopback proxy
+    .pi/agent/settings.json  # Hub 生成的 Pi 请求超时、流空闲和 agent-level 重试配置
     .pi/agent/skills/        # 当前 Session 的 Hub/本地 Skill 快照
     sessions/                # Pi JSONL native session state
     skill-exec/              # 当前 Session 的 Package 执行副本、catalog 和临时目录
@@ -74,6 +75,15 @@ Pi `models.json` 为每个 Run 的 `main` binding 创建一个 provider：
 - `context_window_tokens`、可表示的 output limit 和 reasoning map 由 Pi model
   config 使用；`temperature`、`top_p` 和 protocol-specific output settings
   仍由 Hub gateway 根据 binding 合并，不能在 Pi 侧重写。
+- `provider_request_timeout_ms` 写入 `retry.provider.timeoutMs`，
+  `stream_idle_timeout_ms` 写入 `httpIdleTimeoutMs`，`stream_max_retries` 写入
+  `retry.maxRetries`；未设置的可选值省略，`retry.provider.maxRetries` 始终为 `0`。
+
+每个 Pi Turn 从 Runtime 开始执行该轮时计时，模型请求、Pi 重试、流式输出和工具
+调用共享同一个硬截止。默认 `3600` 秒，可通过 `RUNTIME_ENGINE_TIMEOUT_SECS` 调整；
+到期后 Runtime 终止当前 Pi 进程并将 Run 标记为失败，但保留 Hub Session、Workspace
+和已完成的副作用。Runtime 持久化 `engine_turn_timeout` 状态事件，Hub 会话页和 Widget
+在刷新后仍显示本轮因超时停止。
 
 ## 工具策略
 

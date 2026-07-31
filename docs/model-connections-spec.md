@@ -77,9 +77,9 @@ Base URL 不包含 `/v1`，可以包含业务路径。Global 和 Personal URL �
 | `auto_compact_token_limit` | `null` | Run binding | 正整数，不大于 context window |
 | `reasoning_summary_support` | `auto` | Run binding/provider capability | `auto`、`supported`、`unsupported` |
 | `service_tier` | `null` | provider request | trim 后 1 到 64 字符 |
-| `request_max_retries` | `null` | Engine provider client | `0..100` |
-| `stream_max_retries` | `null` | Engine provider client | `0..100` |
-| `stream_idle_timeout_ms` | `null` | Engine provider client | 正整数毫秒 |
+| `provider_request_timeout_ms` | `null` | Pi provider/SDK 单次请求 | 正整数毫秒 |
+| `stream_max_retries` | `null` | Pi agent-level retry | `0..100` |
+| `stream_idle_timeout_ms` | `null` | Pi HTTP 流空闲检测 | 正整数毫秒 |
 
 `request_settings` 是与有效 API Type 一致的 tagged object：
 
@@ -95,6 +95,7 @@ Subagent 使用 `model_settings_override`：
 - 有具体值时覆盖 Agent。有效优先级逐字段为：Subagent override、Agent value、Execution Engine/provider 自动行为。
 - 未显式选择另一 pair 时，请求设置按字段继承且协议相同。显式选择不同 API Type 时，缺失的 `request_settings` 使用新 API Type 的全自动对象，不能继承不兼容协议字段。
 - Runtime 只把当前 driver 支持的执行字段写入受控 Pi 配置；协议专属 request settings 只进入 Hub 到 Gateway 的 envelope。
+- Runtime 将上述可靠性字段分别映射到 Pi `retry.provider.timeoutMs`、`retry.maxRetries` 和 `httpIdleTimeoutMs`。`retry.provider.maxRetries` 始终固定为 `0`，避免 provider SDK 重试与 Pi agent-level 重试叠加。
 
 ## 引用、删除和生效边界
 

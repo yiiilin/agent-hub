@@ -657,6 +657,40 @@ test('a terminal Run refreshes a queued user message to its durable delivery sta
   await expect(detail.getByText('queued', { exact: true })).toHaveCount(0);
 });
 
+test('a persisted Pi Turn timeout is shown once before and after Session reload', async ({ page }) => {
+  const timeout = {
+    seq: 6,
+    run_id: 'run-active',
+    event_type: 'status',
+    role: null,
+    content: 'failed',
+    payload: { status: 'failed', error_code: 'engine_turn_timeout', timeout_seconds: 3600 },
+    created_at: '2026-07-17T10:00:05.000Z'
+  };
+  const terminal = {
+    seq: 7,
+    run_id: 'run-active',
+    event_type: 'status',
+    role: null,
+    content: 'failed',
+    payload: { status: 'failed' },
+    created_at: '2026-07-17T10:00:06.000Z'
+  };
+  await installSessionApi(page, { activeEvents: [timeout, terminal], activeStreamEvents: [] });
+
+  await page.goto('/sessions');
+  const detail = page.getByRole('region', { name: 'Session details' });
+  await expect(detail.getByRole('alert')).toHaveText('This turn exceeded 60 minutes and was stopped.');
+  await expect(detail.getByRole('alert')).toHaveCount(1);
+
+  await page.reload();
+  await expect(detail.getByRole('alert')).toHaveText('This turn exceeded 60 minutes and was stopped.');
+  await expect(detail.getByRole('alert')).toHaveCount(1);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(detail.getByRole('alert')).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0);
+});
+
 test('reloading a two-turn Session keeps every assistant answer', async ({ page }) => {
   await installSessionApi(page);
   await page.goto('/sessions');

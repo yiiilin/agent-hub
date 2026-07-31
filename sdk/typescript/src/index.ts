@@ -18,6 +18,7 @@ export type {
   ClientToolDefinition,
   CommonClientOptions,
   ErrorSessionEvent,
+  EventListOptions,
   GenericSessionEvent,
   JsonPrimitive,
   JsonValue,

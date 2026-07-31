@@ -187,8 +187,9 @@ test('widget shows a visible error when a run fails without an assistant message
       native_session_id: null, work_dir_ref: null, source: 'widget', created_at: '2026-07-24T10:00:00.000Z', updated_at: '2026-07-24T10:00:00.000Z'
     } });
     if (path === `/api/client/sessions/${sessionId}/events/stream`) {
-      const failed = { seq: 1, run_id: runId, event_type: 'status', role: null, content: 'failed', payload: { status: 'failed' }, created_at: '2026-07-24T10:00:01.000Z' };
-      return route.fulfill({ contentType: 'text/event-stream', body: `event: run_event\ndata: ${JSON.stringify(failed)}\n\n` });
+      const timeout = { seq: 1, run_id: runId, event_type: 'status', role: null, content: 'failed', payload: { status: 'failed', error_code: 'engine_turn_timeout', timeout_seconds: 3600 }, created_at: '2026-07-24T10:00:01.000Z' };
+      const terminal = { seq: 2, run_id: runId, event_type: 'status', role: null, content: 'failed', payload: { status: 'failed' }, created_at: '2026-07-24T10:00:02.000Z' };
+      return route.fulfill({ contentType: 'text/event-stream', body: [timeout, terminal].map((event) => `event: run_event\ndata: ${JSON.stringify(event)}\n\n`).join('') });
     }
     return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });
   });
@@ -198,7 +199,11 @@ test('widget shows a visible error when a run fails without an assistant message
   const composer = page.getByRole('textbox', { name: 'Message' });
   await composer.fill('Trigger failure');
   await composer.press('Enter');
-  await expect(page.getByRole('alert')).toHaveText('The request could not be completed. Retry.');
+  await expect(page.getByRole('alert')).toHaveText('This turn exceeded 60 minutes and was stopped.');
+  await expect(page.getByRole('alert')).toHaveCount(1);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.getByRole('alert')).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0);
   await expect(page.locator('.session-thinking')).toHaveCount(0);
 });
 
@@ -593,7 +598,8 @@ test('widget restores its exact external session and draft without listing disab
     }
     if (path === `/api/client/sessions/${integrationSessionId}/events`) return route.fulfill({ json: [
       { seq: 1, run_id: runId, event_type: 'message', role: 'assistant', content: 'Restored assistant reply', payload: {}, created_at: new Date().toISOString() },
-      { seq: 2, run_id: runId, event_type: 'status', role: null, content: 'completed', payload: { status: 'completed' }, created_at: new Date().toISOString() }
+      { seq: 2, run_id: runId, event_type: 'status', role: null, content: 'failed', payload: { status: 'failed', error_code: 'engine_turn_timeout', timeout_seconds: 3600 }, created_at: new Date().toISOString() },
+      { seq: 3, run_id: runId, event_type: 'status', role: null, content: 'failed', payload: { status: 'failed' }, created_at: new Date().toISOString() }
     ] });
     if (path === `/api/client/sessions/${integrationSessionId}/events/stream`) return route.fulfill({ contentType: 'text/event-stream', body: '' });
     return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });
@@ -602,12 +608,16 @@ test('widget restores its exact external session and draft without listing disab
   await page.goto('/widget#token=ahw_restored');
   await expect(page.getByRole('heading', { name: 'Restored Widget Agent' })).toBeVisible();
   await expect(page.getByText('Restored assistant reply', { exact: true })).toBeVisible();
+  await expect(page.getByRole('alert')).toHaveText('This turn exceeded 60 minutes and was stopped.');
+  await expect(page.getByRole('alert')).toHaveCount(1);
   await expect(page.getByRole('textbox', { name: 'Message' })).toHaveValue('Draft restored after refresh');
   await expect(page.getByRole('button', { name: 'History' })).toHaveCount(0);
   expect(historyListRequests).toBe(0);
 
   await page.goto('/widget?refresh=1#token=ahw_restored_after_reload');
   await expect(page.getByText('Restored assistant reply', { exact: true })).toBeVisible();
+  await expect(page.getByRole('alert')).toHaveText('This turn exceeded 60 minutes and was stopped.');
+  await expect(page.getByRole('alert')).toHaveCount(1);
   await expect(page.getByRole('textbox', { name: 'Message' })).toHaveValue('Draft restored after refresh');
   expect(messageRequests).toBeGreaterThanOrEqual(2);
   expect(historyListRequests).toBe(0);

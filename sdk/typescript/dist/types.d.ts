@@ -75,6 +75,10 @@ export interface MessagePage {
     items: SessionMessage[];
     nextBeforeSequence: number | null;
 }
+export interface EventListOptions {
+    after?: number;
+    signal?: AbortSignal;
+}
 export interface Run {
     id: string;
     status: string;

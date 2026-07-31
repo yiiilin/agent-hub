@@ -82,6 +82,11 @@ export interface MessagePage {
   nextBeforeSequence: number | null;
 }
 
+export interface EventListOptions {
+  after?: number;
+  signal?: AbortSignal;
+}
+
 export interface Run {
   id: string;
   status: string;

@@ -27,7 +27,7 @@
 - Run binding 的 effective `request_settings` 进入 envelope，且 tagged `protocol` 必须与 binding API Type 相同。Responses 没有覆盖字段；Chat 可覆盖 `temperature`、`top_p`、`max_completion_tokens`；Anthropic 可覆盖 `temperature` 或 `top_p` 以及 `max_tokens`。
 - Pi 产生的 Responses 请求体按既有链路传输。Hub 只验证请求中的 Model ID，OpenAI Responses fast path 保持原始 body bytes；Chat 和 Anthropic 路径在验证可表示性后转换，并只合并非 `null` 的协议专属覆盖。
 - 转换无法无损表达的 Responses 字段、历史项、工具或采样冲突必须在上游调用前以 `unsupported_protocol_feature` 返回；Gateway 不静默丢弃字段。跨协议历史只接受严格白名单中的 message、function call/result、reasoning、refusal 与其可移植内容字段；例如 item `id`、`status`、`phase`、未知 item 字段和 `output_text.annotations`/`logprobs` 一律拒绝。除 binding `request_settings` 外，Hub 和 Gateway 不向请求体注入采样、输出限制、`tool_choice` 或 `parallel_tool_calls`。
-- `request_max_retries`、`stream_max_retries` 和 `stream_idle_timeout_ms` 属于该 binding 的 Execution Engine provider 客户端行为。Gateway 继续不重试、不 fallback；一次到达 Gateway 的请求只产生一次上游调用。
+- `provider_request_timeout_ms`、`stream_max_retries` 和 `stream_idle_timeout_ms` 属于该 binding 的 Pi 执行行为，分别映射到 `retry.provider.timeoutMs`、`retry.maxRetries` 和 `httpIdleTimeoutMs`；`retry.provider.maxRetries` 固定为 `0`。Gateway 继续不重试、不 fallback；一次到达 Gateway 的请求只产生一次上游调用。
 
 ## Run Binding 授权边界
 

@@ -1,6 +1,7 @@
-import type { AgentHubClientOptions, AnonymousClientOptions, ClientAgent, ErrorSessionEvent, MessagePage, MessagePageOptions, Run, SendOptions, SendResult, SessionEventListener, SessionListOptions, SessionMessage, SessionSummary, SubscribeOptions, ToolHandler, ToolHandlers, ToolRequestEvent, ToolTimeoutEvent } from "./types.js";
+import type { AgentHubClientOptions, AnonymousClientOptions, ClientAgent, ErrorSessionEvent, EventListOptions, MessagePage, MessagePageOptions, Run, SendOptions, SendResult, SessionEvent, SessionEventListener, SessionListOptions, SessionMessage, SessionSummary, SubscribeOptions, ToolHandler, ToolHandlers, ToolRequestEvent, ToolTimeoutEvent } from "./types.js";
 interface SessionOperations {
     messages(sessionId: string, options: MessagePageOptions): Promise<MessagePage>;
+    events(sessionId: string, options: EventListOptions): Promise<SessionEvent[]>;
     send(session: ClientSession, content: string, options: SendOptions): Promise<SendResult>;
     stop(runId: string, signal?: AbortSignal): Promise<Run>;
     openStream(sessionId: string, after: number, signal: AbortSignal): Promise<Response>;
@@ -24,6 +25,7 @@ export declare class ClientSession {
     get isDraft(): boolean;
     messages(options?: MessagePageOptions): Promise<SessionMessage[]>;
     messagePage(options?: MessagePageOptions): Promise<MessagePage>;
+    events(options?: EventListOptions): Promise<SessionEvent[]>;
     send(content: string, options?: SendOptions): Promise<SendResult>;
     stop(runId: string, signal?: AbortSignal): Promise<Run>;
     subscribe(listener: SessionEventListener, options?: SubscribeOptions): SessionSubscription;

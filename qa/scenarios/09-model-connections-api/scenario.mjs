@@ -23,7 +23,7 @@ const AUTOMATIC_MODEL_SETTINGS = {
   auto_compact_token_limit: null,
   reasoning_summary_support: 'auto',
   service_tier: null,
-  request_max_retries: null,
+  provider_request_timeout_ms: null,
   stream_max_retries: null,
   stream_idle_timeout_ms: null,
   request_settings: { protocol: 'openai_responses' }
@@ -365,7 +365,7 @@ export default async function modelConnectionsApiScenario(context) {
       auto_compact_token_limit: 96_000,
       reasoning_summary_support: 'supported',
       service_tier: 'flex',
-      request_max_retries: 1,
+      provider_request_timeout_ms: 180_000,
       stream_max_retries: 3,
       stream_idle_timeout_ms: 300_000
     });
@@ -389,7 +389,7 @@ export default async function modelConnectionsApiScenario(context) {
         model_selection: selection(responseConnection),
         model_settings_override: {
           reasoning_effort: 'high',
-          request_max_retries: 2
+          provider_request_timeout_ms: 120_000
         }
       }]
     });
@@ -399,7 +399,7 @@ export default async function modelConnectionsApiScenario(context) {
     assert.deepEqual(responseAgent.subagents[0].model_settings_override, {});
     assert.deepEqual(responseAgent.subagents[1].model_settings_override, {
       reasoning_effort: 'high',
-      request_max_retries: 2
+      provider_request_timeout_ms: 120_000
     });
 
     await owner.client.post('/api/agents', {
@@ -420,14 +420,14 @@ export default async function modelConnectionsApiScenario(context) {
     const bindingRows = context.compose.psql(`
       SELECT binding_key || '|' || model_connection_id::text || '|' || model_id || '|' ||
              (model_settings->>'reasoning_effort') || '|' ||
-             COALESCE(model_settings->>'request_max_retries', '<null>')
+             COALESCE(model_settings->>'provider_request_timeout_ms', '<null>')
       FROM run_model_bindings
       WHERE run_id = ${sqlLiteral(responseRun.id)}
       ORDER BY binding_key
     `).split('\n');
     assert.deepEqual(bindingRows, [
-      `main|${responseConnection.id}|${SUCCESS_MODEL_ID}|medium|1`,
-      `reviewer|${responseConnection.id}|${SUCCESS_MODEL_ID}|high|2`
+      `main|${responseConnection.id}|${SUCCESS_MODEL_ID}|medium|180000`,
+      `reviewer|${responseConnection.id}|${SUCCESS_MODEL_ID}|high|120000`
     ]);
 
     const chatSettings = modelSettings('openai_chat_completions', {

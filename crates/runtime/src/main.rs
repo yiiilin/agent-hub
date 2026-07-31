@@ -43,7 +43,7 @@ use walkdir::WalkDir;
 mod pi_driver;
 mod session_bundle;
 
-const DEFAULT_ENGINE_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_ENGINE_TIMEOUT: Duration = Duration::from_secs(3600);
 const DEFAULT_MODEL_PROXY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(900);
 const CHECKPOINT_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -84,6 +84,44 @@ struct EngineRunResult {
     final_status: String,
     native_session_id: Option<String>,
     native_turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeRunFailure {
+    Generic,
+    EngineTurnTimeout { timeout_seconds: u64 },
+}
+
+impl RuntimeRunFailure {
+    fn from_error(error: &anyhow::Error) -> Self {
+        error
+            .downcast_ref::<pi_driver::PiRpcTimeout>()
+            .map(|timeout| Self::EngineTurnTimeout {
+                timeout_seconds: timeout.timeout_seconds(),
+            })
+            .unwrap_or(Self::Generic)
+    }
+
+    fn event(self) -> AppendRunEventRequest {
+        let payload = match self {
+            Self::Generic => json!({
+                "status": "failed",
+                "error": "runtime execution failed"
+            }),
+            Self::EngineTurnTimeout { timeout_seconds } => json!({
+                "status": "failed",
+                "error_code": "engine_turn_timeout",
+                "timeout_seconds": timeout_seconds
+            }),
+        };
+        AppendRunEventRequest {
+            event_type: "status".into(),
+            role: None,
+            content: Some("failed".into()),
+            payload,
+            waiting_tool: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1103,12 +1141,13 @@ async fn run_claim_worker(
             .is_some()
     });
     if let Err(error) = result {
+        let failure = RuntimeRunFailure::from_error(&error);
         if let Some(session_id) = session_id {
             manager.cancel_session(session_id, error.to_string());
         }
         warn!(run_id = %run_id, error = %error, "run execution failed");
         if let Some(ownership_generation) = ownership_generation {
-            match client.fail_run(run_id, ownership_generation).await {
+            match client.fail_run(run_id, ownership_generation, failure).await {
                 Ok(()) if bundle_recovery_failed => {
                     if let Some(session_id) = session_id {
                         manager.forget_fenced_session(session_id);
@@ -1704,19 +1743,14 @@ impl HubClient {
         Ok(())
     }
 
-    async fn fail_run(&self, run_id: Uuid, ownership_generation: i64) -> anyhow::Result<()> {
+    async fn fail_run(
+        &self,
+        run_id: Uuid,
+        ownership_generation: i64,
+        failure: RuntimeRunFailure,
+    ) -> anyhow::Result<()> {
         let _ = self
-            .append_event(
-                run_id,
-                ownership_generation,
-                AppendRunEventRequest {
-                    event_type: "status".into(),
-                    role: None,
-                    content: Some("failed".into()),
-                    payload: json!({ "error": "runtime execution failed" }),
-                    waiting_tool: None,
-                },
-            )
+            .append_event(run_id, ownership_generation, failure.event())
             .await;
         self.complete_run(
             run_id,
@@ -5414,7 +5448,11 @@ async fn fail_interrupted_restoring_runs(
     let mut failed = 0;
     for interrupted in manager.interrupted_restoring_runs() {
         match client
-            .fail_run(interrupted.run_id, interrupted.ownership_generation)
+            .fail_run(
+                interrupted.run_id,
+                interrupted.ownership_generation,
+                RuntimeRunFailure::Generic,
+            )
             .await
         {
             Ok(()) => {
@@ -6442,6 +6480,13 @@ async fn synchronize_pi_execution_configuration(
                 let models_json = render_pi_models_json(configuration, model_base_url)?;
                 write_private_file(&stage_agent_dir.join("models.json"), models_json.as_bytes())
                     .context("stage per-Session Pi models config")?;
+                let settings_json =
+                    render_pi_settings_json(&model_binding(configuration, "main")?.model_settings)?;
+                write_private_file(
+                    &stage_agent_dir.join("settings.json"),
+                    settings_json.as_bytes(),
+                )
+                .context("stage per-Session Pi settings")?;
             }
             PiModelConfigurationMaterialization::PreserveExisting => {
                 let _ = validated_pi_execution_materialization(&agent_dir, &skill_exec_dir)?;
@@ -6455,6 +6500,12 @@ async fn synchronize_pi_execution_configuration(
                 );
                 write_private_file(&stage_agent_dir.join("models.json"), models_json.as_bytes())
                     .context("preserve per-Session Pi models config")?;
+                let settings_json = render_pi_settings_json(&configuration.model_settings)?;
+                write_private_file(
+                    &stage_agent_dir.join("settings.json"),
+                    settings_json.as_bytes(),
+                )
+                .context("stage refreshed per-Session Pi settings")?;
             }
         }
 
@@ -6485,7 +6536,7 @@ async fn synchronize_pi_execution_configuration(
             &stage_skill_exec_dir,
         )?;
         let marker = PiExecutionMaterializationMarker {
-            format_version: 2,
+            format_version: 3,
             configuration_fingerprint: configuration_fingerprint.to_owned(),
             materialization_sha256,
             owned_skill_directories,
@@ -6580,6 +6631,22 @@ fn render_pi_models_json(
     .context("serialize Pi models config")
 }
 
+fn render_pi_settings_json(settings: &AgentModelSettings) -> anyhow::Result<String> {
+    let mut provider = serde_json::Map::from_iter([("maxRetries".into(), json!(0))]);
+    if let Some(timeout_ms) = settings.provider_request_timeout_ms {
+        provider.insert("timeoutMs".into(), json!(timeout_ms));
+    }
+    let mut retry = serde_json::Map::from_iter([("provider".into(), Value::Object(provider))]);
+    if let Some(max_retries) = settings.stream_max_retries {
+        retry.insert("maxRetries".into(), json!(max_retries));
+    }
+    let mut rendered = serde_json::Map::from_iter([("retry".into(), Value::Object(retry))]);
+    if let Some(timeout_ms) = settings.stream_idle_timeout_ms {
+        rendered.insert("httpIdleTimeoutMs".into(), json!(timeout_ms));
+    }
+    serde_json::to_string_pretty(&Value::Object(rendered)).context("serialize Pi settings config")
+}
+
 fn pi_model_provider_name(binding_id: Uuid) -> String {
     format!("agent-hub-{}", binding_id.simple())
 }
@@ -6652,10 +6719,15 @@ fn pi_execution_materialization_sha256(
     skill_dirs: &[String],
     skill_exec_dir: &Path,
 ) -> anyhow::Result<String> {
-    let mut paths = ["AGENTS.md", "models.json", "skills-manifest.json"]
-        .into_iter()
-        .map(|path| (format!("pi-agent/{path}"), agent_dir.join(path)))
-        .collect::<Vec<_>>();
+    let mut paths = [
+        "AGENTS.md",
+        "models.json",
+        "settings.json",
+        "skills-manifest.json",
+    ]
+    .into_iter()
+    .map(|path| (format!("pi-agent/{path}"), agent_dir.join(path)))
+    .collect::<Vec<_>>();
     for directory in skill_dirs {
         paths.extend(
             WalkDir::new(agent_dir.join("skills").join(directory))
@@ -6800,6 +6872,7 @@ fn pi_materialization_is_current(
         || !private_file_permissions_are_valid(&marker_path)
         || !private_file_permissions_are_valid(&agent_dir.join("AGENTS.md"))
         || !private_file_permissions_are_valid(&agent_dir.join("models.json"))
+        || !private_file_permissions_are_valid(&agent_dir.join("settings.json"))
         || !private_file_permissions_are_valid(&agent_dir.join("skills-manifest.json"))
         || desired
             .owned_skill_directories
@@ -6826,7 +6899,7 @@ fn validated_pi_execution_materialization(
     )
     .context("parse current Pi execution configuration marker")?;
     anyhow::ensure!(
-        (marker.format_version == 2
+        (marker.format_version == 3
             && pi_materialization_is_current(agent_dir, skill_exec_dir, &marker))
             || legacy_pi_materialization_is_current(agent_dir, &marker),
         "current per-Session Pi configuration materialization is invalid"
@@ -6865,6 +6938,7 @@ fn commit_pi_execution_materialization(
         [
             "AGENTS.md",
             "models.json",
+            "settings.json",
             "skills-manifest.json",
             PI_MATERIALIZATION_MARKER_FILE,
         ]
@@ -6909,7 +6983,12 @@ fn commit_pi_execution_materialization(
                 .with_context(|| format!("install managed Pi Skill directory {directory}"))?;
             installed.push(target);
         }
-        for filename in ["AGENTS.md", "models.json", "skills-manifest.json"] {
+        for filename in [
+            "AGENTS.md",
+            "models.json",
+            "settings.json",
+            "skills-manifest.json",
+        ] {
             let target = agent_dir.join(filename);
             stdfs::rename(stage_agent_dir.join(filename), &target)
                 .with_context(|| format!("install Pi {filename}"))?;
@@ -8255,6 +8334,10 @@ mod tests {
         let mut refreshed = claim.execution_configuration.clone();
         refreshed.revision += 1;
         refreshed.instructions = "upgraded guidance".into();
+        refreshed.model_settings.provider_request_timeout_ms = Some(240_000);
+        refreshed.model_settings.stream_max_retries = Some(2);
+        refreshed.model_settings.stream_idle_timeout_ms = Some(90_000);
+        refreshed.model_bindings[0].model_settings = refreshed.model_settings.clone();
         let fingerprint = execution_configuration_fingerprint(&refreshed).unwrap();
         synchronize_pi_execution_configuration(
             &paths,
@@ -8269,7 +8352,14 @@ mod tests {
 
         let upgraded: PiExecutionMaterializationMarker =
             serde_json::from_slice(&fs::read(&marker_path).await.unwrap()).unwrap();
-        assert_eq!(upgraded.format_version, 2);
+        assert_eq!(upgraded.format_version, 3);
+        let settings: Value =
+            serde_json::from_slice(&fs::read(agent_dir.join("settings.json")).await.unwrap())
+                .unwrap();
+        assert_eq!(settings["retry"]["provider"]["timeoutMs"], 240_000);
+        assert_eq!(settings["retry"]["provider"]["maxRetries"], 0);
+        assert_eq!(settings["retry"]["maxRetries"], 2);
+        assert_eq!(settings["httpIdleTimeoutMs"], 90_000);
         assert!(paths
             .engine_state
             .join(SKILL_EXEC_DIRECTORY)
@@ -11097,6 +11187,11 @@ mod tests {
     }
 
     #[test]
+    fn engine_turn_timeout_defaults_to_one_hour() {
+        assert_eq!(DEFAULT_ENGINE_TIMEOUT, Duration::from_secs(3600));
+    }
+
+    #[test]
     fn pi_models_json_uses_the_local_gateway_and_preserves_ultra_intent() {
         let mut claim = test_claim();
         let binding = claim
@@ -11108,6 +11203,9 @@ mod tests {
         binding.model_settings = AgentModelSettings {
             reasoning_effort: ReasoningEffort::Ultra,
             context_window_tokens: Some(200_000),
+            provider_request_timeout_ms: Some(600_000),
+            stream_max_retries: Some(4),
+            stream_idle_timeout_ms: Some(120_000),
             request_settings: ModelRequestSettings::OpenaiChatCompletions {
                 temperature: None,
                 top_p: None,
@@ -11143,6 +11241,22 @@ mod tests {
         assert_eq!(pi_thinking_level(ReasoningEffort::Ultra), Some("max"));
         assert_eq!(pi_thinking_level(ReasoningEffort::Default), None);
         assert_eq!(pi_thinking_level(ReasoningEffort::None), Some("off"));
+
+        let settings: Value =
+            serde_json::from_str(&render_pi_settings_json(&binding.model_settings).unwrap())
+                .unwrap();
+        assert_eq!(settings["retry"]["provider"]["timeoutMs"], 600_000);
+        assert_eq!(settings["retry"]["provider"]["maxRetries"], 0);
+        assert_eq!(settings["retry"]["maxRetries"], 4);
+        assert_eq!(settings["httpIdleTimeoutMs"], 120_000);
+
+        let automatic: Value =
+            serde_json::from_str(&render_pi_settings_json(&AgentModelSettings::default()).unwrap())
+                .unwrap();
+        assert_eq!(automatic["retry"]["provider"]["maxRetries"], 0);
+        assert!(automatic["retry"].get("maxRetries").is_none());
+        assert!(automatic["retry"]["provider"].get("timeoutMs").is_none());
+        assert!(automatic.get("httpIdleTimeoutMs").is_none());
     }
 
     #[tokio::test]
@@ -11211,6 +11325,9 @@ mod tests {
         ));
         assert!(private_file_permissions_are_valid(
             &agent_dir.join("models.json")
+        ));
+        assert!(private_file_permissions_are_valid(
+            &agent_dir.join("settings.json")
         ));
         assert!(private_file_permissions_are_valid(
             &agent_dir.join(PI_MATERIALIZATION_MARKER_FILE)
@@ -11724,8 +11841,21 @@ mod tests {
         )
         .unwrap();
 
-        let error = format!("{:#}", process.execute(&claim, None).unwrap_err());
-        assert!(error.contains("Pi RPC process timed out"));
+        let error = process.execute(&claim, None).unwrap_err();
+        let timeout = error
+            .downcast_ref::<pi_driver::PiRpcTimeout>()
+            .expect("timeout must keep its typed classification");
+        assert_eq!(timeout.timeout_seconds(), 1);
+        let failure = RuntimeRunFailure::from_error(&error);
+        assert_eq!(
+            failure,
+            RuntimeRunFailure::EngineTurnTimeout { timeout_seconds: 1 }
+        );
+        let event = failure.event();
+        assert_eq!(event.content.as_deref(), Some("failed"));
+        assert_eq!(event.payload["status"], "failed");
+        assert_eq!(event.payload["error_code"], "engine_turn_timeout");
+        assert_eq!(event.payload["timeout_seconds"], 1);
         drop(process);
         assert_process_group_reaped_or_clean_up(&pid_file);
     }

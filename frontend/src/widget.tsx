@@ -16,13 +16,16 @@ import { useI18n } from './i18n';
 import {
   ChatActivityGroup,
   ChatMessageBubble,
+  ChatRunFailure,
   ChatThinkingBubble,
   activityGroupProcessingWindow,
   mergeRunEvents,
   projectActivities,
+  projectRunFailures,
   resizeComposer,
   runProcessingWindow,
-  type ActivityEntry
+  type ActivityEntry,
+  type RunFailureEntry
 } from './sessions';
 
 const terminalStatuses = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
@@ -67,7 +70,16 @@ type ActivityTimelineEntry = {
   activity: ActivityEntry;
 };
 
-type TimelineItem = MessageTimelineEntry | {
+type FailureTimelineEntry = {
+  kind: 'failure';
+  id: string;
+  runId: string;
+  occurredAt: number;
+  sequence: number;
+  failure: RunFailureEntry;
+};
+
+type TimelineItem = MessageTimelineEntry | FailureTimelineEntry | {
   kind: 'activity-group';
   id: string;
   runId: string;
@@ -253,9 +265,16 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
     const generation = ++messageLoadGenerationRef.current;
     if (initial) setTranscriptLoading(true);
     try {
-      const page = await session.messagePage({ limit: historyPageSize });
+      const [page, loadedEvents] = await Promise.all([
+        session.messagePage({ limit: historyPageSize }),
+        initial ? session.events() : Promise.resolve([])
+      ]);
       if (!mountedRef.current || generation !== messageLoadGenerationRef.current || session !== sessionRef.current) return;
       setMessages(page.items.sort((left, right) => left.sequence - right.sequence));
+      setEvents((current) => mergeRunEvents(current, loadedEvents.flatMap((event) => {
+        const runEvent = rawRunEvent(event);
+        return runEvent ? [runEvent] : [];
+      })));
       setHasOlderMessages(page.nextBeforeSequence !== null);
       const acceptedKeys = new Set(page.items.flatMap((message) => message.client_message_key ? [message.client_message_key] : []));
       setOptimisticMessages((current) => current.filter((message) => !acceptedKeys.has(message.clientMessageKey)));
@@ -293,10 +312,6 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
         setError(null);
         setEvents((current) => mergeRunEvents(current, [runEvent]));
         postWidgetMessage('agent-hub:run-event', { runId: runEvent.run_id, event: runEvent });
-        const status = runEvent.event_type === 'status'
-          ? runEvent.content ?? (typeof runEvent.payload.status === 'string' ? runEvent.payload.status : null)
-          : null;
-        if (status === 'failed') setError(t('genericError'));
         if (runEvent.event_type === 'message' || isTerminalEvent(runEvent)) {
           scheduleMessageRefresh(session);
           if (isTerminalEvent(runEvent)) void refreshHistory();
@@ -581,7 +596,7 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
   }, [requestOlderMessages]);
 
   const timeline = useMemo(() => {
-    const entries: Array<MessageTimelineEntry | ActivityTimelineEntry> = messages
+    const entries: Array<MessageTimelineEntry | ActivityTimelineEntry | FailureTimelineEntry> = messages
       .filter((message) => Boolean(message.content) && (message.role === 'user' || message.role === 'assistant'))
       .map((message) => ({
         kind: 'message' as const,
@@ -657,9 +672,19 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
         activity
       });
     }
+    for (const failure of projectRunFailures(events)) {
+      entries.push({
+        kind: 'failure',
+        id: failure.id,
+        runId: failure.runId,
+        occurredAt: failure.occurredAt,
+        sequence: failure.sequence * 1000 + 3,
+        failure
+      });
+    }
     entries.sort((left, right) => left.occurredAt - right.occurredAt || left.sequence - right.sequence);
     return entries.reduce<TimelineItem[]>((items, entry) => {
-      if (entry.kind === 'message') {
+      if (entry.kind !== 'activity') {
         items.push(entry);
         return items;
       }
@@ -759,6 +784,7 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
             const window = activityGroupProcessingWindow(timeline, index, runWindows.get(entry.runId), active);
             return <ChatActivityGroup active={active && window.endedAt === undefined} activities={entry.activities} endedAt={window.endedAt} key={entry.id} startedAt={window.startedAt} />;
           }
+          if (entry.kind === 'failure') return <ChatRunFailure failure={entry.failure} key={entry.id} />;
           return <ChatMessageBubble agentName={agent?.name ?? null} content={entry.content} key={entry.id} role={entry.role} state={entry.state} streaming={entry.streaming} />;
         })}
         {showThinking && <ChatThinkingBubble />}

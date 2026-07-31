@@ -61,9 +61,19 @@ export type ActivityEntry = {
   status: string | null;
 };
 
+export type RunFailureEntry = {
+  id: string;
+  runId: string;
+  occurredAt: number;
+  sequence: number;
+  errorCode: string | null;
+  timeoutSeconds: number | null;
+};
+
 type TimelineEntry =
   | { kind: 'message'; id: string; sequence: number; occurredAt: number; outputEndedAt?: number; runId: string | null; role: string; content: string; state?: string; mode?: string }
   | { kind: 'live'; id: string; sequence: number; occurredAt: number; outputEndedAt?: number; runId: string; role: string; content: string }
+  | { kind: 'failure'; id: string; sequence: number; occurredAt: number; runId: string; failure: RunFailureEntry }
   | { kind: 'activity'; id: string; sequence: number; occurredAt: number; activity: ActivityEntry };
 
 type TimelineItem = Exclude<TimelineEntry, { kind: 'activity' }>
@@ -218,6 +228,28 @@ export function activityGroupProcessingWindow(
 
 function payloadNumber(payload: Record<string, unknown>, key: string) {
   return typeof payload[key] === 'number' && Number.isFinite(payload[key]) ? payload[key] as number : null;
+}
+
+export function projectRunFailures(events: RunEvent[]) {
+  const failures = new Map<string, RunFailureEntry>();
+  for (const event of events) {
+    if (event.event_type !== 'status') continue;
+    const status = event.content ?? payloadString(event.payload, 'status');
+    if (status !== 'failed') continue;
+    const candidate: RunFailureEntry = {
+      id: `run-failure-${event.run_id}`,
+      runId: event.run_id,
+      occurredAt: eventTimestamp(event.created_at),
+      sequence: event.seq,
+      errorCode: payloadString(event.payload, 'error_code'),
+      timeoutSeconds: payloadNumber(event.payload, 'timeout_seconds')
+    };
+    const current = failures.get(event.run_id);
+    if (!current || (!current.errorCode && candidate.errorCode)) failures.set(event.run_id, candidate);
+  }
+  return [...failures.values()].sort((left, right) => (
+    left.occurredAt - right.occurredAt || left.sequence - right.sequence
+  ));
 }
 
 function payloadTextList(payload: Record<string, unknown>, key: string) {
@@ -458,6 +490,17 @@ export function ChatThinkingBubble() {
       </div>
     </div>
   </article>;
+}
+
+export function ChatRunFailure({ failure }: { failure: RunFailureEntry }) {
+  const { t } = useI18n();
+  const message = failure.errorCode === 'engine_turn_timeout'
+    ? t('turnTimeoutStopped').replace(
+        '{minutes}',
+        String(Math.max(1, Math.ceil((failure.timeoutSeconds ?? 3600) / 60)))
+      )
+    : t('genericError');
+  return <div className="session-banner error session-run-failure" role="alert">{message}</div>;
 }
 
 function eventRefreshesSession(event: RunEvent) {
@@ -859,6 +902,16 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
         activity
       });
     }
+    for (const failure of projectRunFailures(sessionEvents)) {
+      entries.push({
+        kind: 'failure',
+        id: failure.id,
+        sequence: failure.sequence * 1000 + 3,
+        occurredAt: failure.occurredAt,
+        runId: failure.runId,
+        failure
+      });
+    }
     return entries.sort((left, right) => left.occurredAt - right.occurredAt || left.sequence - right.sequence);
   }, [sessionEvents, sessionMessages]);
   const timelineItems = useMemo(() => {
@@ -1077,6 +1130,7 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
                     startedAt={window.startedAt}
                   />;
                 }
+                if (entry.kind === 'failure') return <ChatRunFailure failure={entry.failure} key={entry.id} />;
                 return <ChatMessageBubble
                   agentName={conversationAgentName}
                   content={entry.content}

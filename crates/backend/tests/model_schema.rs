@@ -281,7 +281,7 @@ async fn agent_model_settings_and_run_bindings_are_typed_and_immutable(pool: PgP
         "auto_compact_token_limit": 160000,
         "reasoning_summary_support": "supported",
         "service_tier": "priority",
-        "request_max_retries": 7,
+        "provider_request_timeout_ms": 300000,
         "stream_max_retries": 9,
         "stream_idle_timeout_ms": 420000,
         "request_settings": { "protocol": "openai_responses" }
@@ -303,7 +303,7 @@ async fn agent_model_settings_and_run_bindings_are_typed_and_immutable(pool: PgP
 
     let invalid_settings = sqlx::query(
         "UPDATE agents
-         SET model_settings = jsonb_set(model_settings, '{request_max_retries}', '101')
+         SET model_settings = jsonb_set(model_settings, '{provider_request_timeout_ms}', '0')
          WHERE id = $1",
     )
     .bind(agent_id)
@@ -363,9 +363,9 @@ async fn agent_model_settings_and_run_bindings_are_typed_and_immutable(pool: PgP
     .await
     .unwrap();
 
-    for (binding_key, retries) in [("main", 7), ("reviewer", 2)] {
+    for (binding_key, timeout_ms) in [("main", 300_000), ("reviewer", 120_000)] {
         let mut binding_settings = settings.clone();
-        binding_settings["request_max_retries"] = json!(retries);
+        binding_settings["provider_request_timeout_ms"] = json!(timeout_ms);
         sqlx::query(
             "INSERT INTO run_model_bindings
                  (id, run_id, binding_key, model_connection_id,

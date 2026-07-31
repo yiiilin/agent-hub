@@ -16,7 +16,7 @@ type AgentFixture = {
     auto_compact_token_limit: number | null;
     reasoning_summary_support: 'auto' | 'supported' | 'unsupported';
     service_tier: string | null;
-    request_max_retries: number | null;
+    provider_request_timeout_ms: number | null;
     stream_max_retries: number | null;
     stream_idle_timeout_ms: number | null;
     request_settings: { protocol: 'openai_responses' } | { protocol: 'openai_chat_completions'; temperature: number | null; top_p: number | null; max_completion_tokens: number | null } | { protocol: 'anthropic_messages'; temperature: number | null; top_p: number | null; max_tokens: number | null };
@@ -86,7 +86,7 @@ const modelOptions = {
 const automaticModelSettings: AgentFixture['model_settings'] = {
   reasoning_effort: 'default', reasoning_summary: 'default', verbosity: 'default',
   context_window_tokens: null, auto_compact_token_limit: null, reasoning_summary_support: 'auto',
-  service_tier: null, request_max_retries: null, stream_max_retries: null, stream_idle_timeout_ms: null,
+  service_tier: null, provider_request_timeout_ms: null, stream_max_retries: null, stream_idle_timeout_ms: null,
   request_settings: { protocol: 'openai_responses' }
 };
 
@@ -525,15 +525,25 @@ test('models panel edits the Agent default, reasoning, and Subagent definitions'
   await dialog.getByLabel('Model override').selectOption(`${personalModelId}\ngpt-personal`);
   await dialog.getByLabel('Reasoning effort Setting source').selectOption('override');
   await dialog.locator('label').filter({ hasText: 'Reasoning effort' }).locator('select').nth(1).selectOption('ultra');
+  await expect(dialog.getByLabel('Provider request timeout (ms) Setting source')).toBeVisible();
   await dialog.getByRole('button', { name: 'Save changes' }).click();
 
   await panel.getByLabel('Model API Connection and model').selectOption(`${personalModelId}\ngpt-personal`);
   await panel.getByLabel('Reasoning effort').selectOption('max');
+  await expect(panel.getByLabel('Request max retries')).toHaveCount(0);
+  await panel.getByLabel('Provider request timeout (ms)').fill('180000');
+  await panel.getByLabel('Stream max retries').fill('4');
+  await panel.getByLabel('Stream idle timeout (ms)').fill('120000');
   await panel.getByRole('button', { name: 'Save agent' }).click();
   await expect.poll(() => patches.length).toBe(1);
   expect(patches[0]).toMatchObject({
     model_selection: { connection_id: personalModelId, model_id: 'gpt-personal' },
-    model_settings: expect.objectContaining({ reasoning_effort: 'max' }),
+    model_settings: expect.objectContaining({
+      reasoning_effort: 'max',
+      provider_request_timeout_ms: 180000,
+      stream_max_retries: 4,
+      stream_idle_timeout_ms: 120000
+    }),
     subagents: [{
       name: 'reviewer',
       developer_instructions: 'Review the diff and identify release blockers.',

@@ -114,7 +114,7 @@ const automaticAgentModelSettings: AgentModelSettings = {
   auto_compact_token_limit: null,
   reasoning_summary_support: 'auto',
   service_tier: null,
-  request_max_retries: null,
+  provider_request_timeout_ms: null,
   stream_max_retries: null,
   stream_idle_timeout_ms: null,
   request_settings: { protocol: 'openai_responses' }
@@ -209,7 +209,7 @@ function AgentModelSettingsFields({
       <label>{t('autoCompactTokenLimit')}<input disabled={disabled} type="number" min={1} max={settings.context_window_tokens ?? undefined} step={1} value={settings.auto_compact_token_limit ?? ''} placeholder={t('modelParameterAutomatic')} onChange={(event) => update('auto_compact_token_limit', optionalNumber(event.target.value))} />{source(settings.auto_compact_token_limit)}</label>
     </div></fieldset>
     <fieldset><legend>{t('modelParameterReliabilityGroup')}</legend><div className="agent-model-setting-grid">
-      <label>{t('requestMaxRetries')}<input disabled={disabled} type="number" min={0} max={100} step={1} value={settings.request_max_retries ?? ''} placeholder={t('modelParameterAutomatic')} onChange={(event) => update('request_max_retries', optionalNumber(event.target.value))} />{source(settings.request_max_retries)}</label>
+      <label>{t('providerRequestTimeoutMs')}<input disabled={disabled} type="number" min={1} step={1} value={settings.provider_request_timeout_ms ?? ''} placeholder={t('modelParameterAutomatic')} onChange={(event) => update('provider_request_timeout_ms', optionalNumber(event.target.value))} />{source(settings.provider_request_timeout_ms)}</label>
       <label>{t('streamMaxRetries')}<input disabled={disabled} type="number" min={0} max={100} step={1} value={settings.stream_max_retries ?? ''} placeholder={t('modelParameterAutomatic')} onChange={(event) => update('stream_max_retries', optionalNumber(event.target.value))} />{source(settings.stream_max_retries)}</label>
       <label>{t('streamIdleTimeoutMs')}<input disabled={disabled} type="number" min={1} step={1} value={settings.stream_idle_timeout_ms ?? ''} placeholder={t('modelParameterAutomatic')} onChange={(event) => update('stream_idle_timeout_ms', optionalNumber(event.target.value))} />{source(settings.stream_idle_timeout_ms)}</label>
     </div></fieldset>
@@ -305,7 +305,7 @@ function SubagentModelSettingsFields({
       {numberField('auto_compact_token_limit', t('autoCompactTokenLimit'), 1)}
     </div></fieldset>
     <fieldset><legend>{t('modelParameterReliabilityGroup')}</legend><div className="agent-model-setting-grid">
-      {numberField('request_max_retries', t('requestMaxRetries'), 0, 100)}
+      {numberField('provider_request_timeout_ms', t('providerRequestTimeoutMs'), 1)}
       {numberField('stream_max_retries', t('streamMaxRetries'), 0, 100)}
       {numberField('stream_idle_timeout_ms', t('streamIdleTimeoutMs'), 1)}
     </div></fieldset>

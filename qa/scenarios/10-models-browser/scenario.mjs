@@ -32,7 +32,7 @@ const DETAILED_MODEL_SETTINGS = {
   auto_compact_token_limit: 96_000,
   reasoning_summary_support: 'supported',
   service_tier: 'flex',
-  request_max_retries: 3,
+  provider_request_timeout_ms: 180_000,
   stream_max_retries: 5,
   stream_idle_timeout_ms: 300_000,
   request_settings: CHAT_REQUEST_SETTINGS
@@ -45,7 +45,7 @@ const AUTOMATIC_RESPONSES_SETTINGS = {
   auto_compact_token_limit: null,
   reasoning_summary_support: 'auto',
   service_tier: null,
-  request_max_retries: null,
+  provider_request_timeout_ms: null,
   stream_max_retries: null,
   stream_idle_timeout_ms: null,
   request_settings: { protocol: GLOBAL_API_TYPE }
@@ -318,7 +318,7 @@ async function fillDetailedModelSettings(container) {
   await container.getByLabel('Service tier').fill(DETAILED_MODEL_SETTINGS.service_tier);
   await container.getByLabel('Context window tokens').fill(String(DETAILED_MODEL_SETTINGS.context_window_tokens));
   await container.getByLabel('Auto-compact token limit').fill(String(DETAILED_MODEL_SETTINGS.auto_compact_token_limit));
-  await container.getByLabel('Request max retries').fill(String(DETAILED_MODEL_SETTINGS.request_max_retries));
+  await container.getByLabel('Provider request timeout (ms)').fill(String(DETAILED_MODEL_SETTINGS.provider_request_timeout_ms));
   await container.getByLabel('Stream max retries').fill(String(DETAILED_MODEL_SETTINGS.stream_max_retries));
   await container.getByLabel('Stream idle timeout (ms)').fill(String(DETAILED_MODEL_SETTINGS.stream_idle_timeout_ms));
   const requestGroup = requestSettingsGroup(container, PERSONAL_API_TYPE);
@@ -353,7 +353,7 @@ async function assertDetailedModelSettings(container) {
     ['Service tier', DETAILED_MODEL_SETTINGS.service_tier],
     ['Context window tokens', DETAILED_MODEL_SETTINGS.context_window_tokens],
     ['Auto-compact token limit', DETAILED_MODEL_SETTINGS.auto_compact_token_limit],
-    ['Request max retries', DETAILED_MODEL_SETTINGS.request_max_retries],
+    ['Provider request timeout (ms)', DETAILED_MODEL_SETTINGS.provider_request_timeout_ms],
     ['Stream max retries', DETAILED_MODEL_SETTINGS.stream_max_retries],
     ['Stream idle timeout (ms)', DETAILED_MODEL_SETTINGS.stream_idle_timeout_ms]
   ];

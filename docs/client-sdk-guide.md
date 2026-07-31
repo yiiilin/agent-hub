@@ -215,8 +215,11 @@ if (client.historyEnabled) {
   const sessions = await client.sessions.list({ limit: 20 });
   if (sessions[0]) {
     existingSession = client.sessions.existing(sessions[0].id);
-    const messages = await existingSession.messages({ limit: 50 });
-    console.log(messages);
+    const [messages, events] = await Promise.all([
+      existingSession.messages({ limit: 50 }),
+      existingSession.events(),
+    ]);
+    console.log(messages, events);
   }
 }
 
