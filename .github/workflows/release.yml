@@ -101,6 +101,18 @@ jobs:
           chmod 0755 "$install_dir/gitleaks"
           echo "$install_dir" >> "$GITHUB_PATH"
 
+      - name: Scan build metadata for credentials
+        shell: bash
+        run: |
+          mapfile -t git_configs < <(find .git -type f -name config -print)
+          for config in "${git_configs[@]}"; do
+            gitleaks dir "$config" \
+              --config .gitleaks.toml \
+              --redact=100 \
+              --no-banner \
+              --log-level error
+          done
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
