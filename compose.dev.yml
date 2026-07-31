@@ -21,6 +21,17 @@ services:
     networks:
       - hub-network
 
+  openldap-certs:
+    profiles: ["ldap"]
+    image: osixia/openldap:1.5.0@sha256:18742e9c449c9c1afe129d3f2f3ee15fb34cc43e5f940a20f3399728f41d7c28
+    labels: *development-labels
+    restart: "no"
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["/scripts/generate-certs.sh /certs"]
+    volumes:
+      - ./qa/fixtures/openldap/generate-certs.sh:/scripts/generate-certs.sh:ro
+      - openldap-certs:/certs
+
   openldap:
     profiles: ["ldap"]
     image: osixia/openldap:1.5.0@sha256:18742e9c449c9c1afe129d3f2f3ee15fb34cc43e5f940a20f3399728f41d7c28
@@ -46,7 +57,10 @@ services:
       retries: 30
     volumes:
       - ./qa/fixtures/openldap/ldif:/container/service/slapd/assets/config/bootstrap/ldif/custom:ro
-      - ./qa/fixtures/openldap/certs:/container/service/slapd/assets/certs:ro
+      - openldap-certs:/container/service/slapd/assets/certs:ro
+    depends_on:
+      openldap-certs:
+        condition: service_completed_successfully
     networks:
       - hub-network
 
@@ -228,3 +242,4 @@ volumes:
   hub-data:
   runtime-data:
   bundle-store-data:
+  openldap-certs:

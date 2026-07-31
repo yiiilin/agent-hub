@@ -8,3 +8,11 @@
 /.env
 /runtime-data/
 .gstack/
+
+# Local state and credentials must never be committed.
+*.dump
+*.key
+*.pem
+*.p12
+*.pfx
+runtime-credential.json

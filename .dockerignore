@@ -13,6 +13,13 @@
 .env
 .env.*
 
+*.dump
+*.key
+*.pem
+*.p12
+*.pfx
+runtime-credential.json
+
 target/
 runtime-data/
 postgres-data/
