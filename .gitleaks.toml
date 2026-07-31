@@ -1,0 +1,11 @@
+title = "Agent Hub secret scanning"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+  [[rules.allowlists]]
+description = "Pi model-data manifests contain only verified SHA-256 checksums"
+paths = ['''^third_party/pi-model-data/v0\.81\.1/\.manifest\.json$''']

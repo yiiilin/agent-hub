@@ -44,6 +44,20 @@ Session 配置原子物化成功后，Runtime 对空闲 Pi 调用原生 `reload_
 
 根目录 `compose.yml` 是默认生产编排。它启动 PostgreSQL、私有 MinIO、Hub 和无状态 Model Gateway；Hub backend 镜像同时包含并直接托管 React/Vite 静态资源，不需要独立 frontend 或 Nginx 容器。Hub 不包含 Mock OIDC，生产配置也不启用开发用户、开发 Model Connection、fake provider 或 fake Pi RPC。先以 `.env.example` 为清单配置 `.env` 并执行 `chmod 600 .env`；关键值为空时 Compose 会在创建容器前拒绝启动。`.env` 已同时被 Git 和 Docker build context 排除。
 
+正式版本在 GHCR 发布三张同版本镜像：
+
+| 服务 | 默认镜像 |
+| --- | --- |
+| Hub 与管理台 | `ghcr.io/yiiilin/agent-hub:0.1.0` |
+| Runtime 与 Pi standalone | `ghcr.io/yiiilin/agent-hub-runtime:0.1.0` |
+| Model Gateway | `ghcr.io/yiiilin/agent-hub-gateway:0.1.0` |
+
+`AGENT_HUB_IMAGE_REGISTRY` 和 `AGENT_HUB_IMAGE_TAG` 可统一覆盖 registry 与版本。生产升级时只修改一次版本值，三张镜像必须保持相同 Agent Hub 版本。若 Package 不是公开可读，先使用仅具备 `read:packages` 权限的部署凭证登录，且不要把凭证写入 `.env`、Compose 或 shell history：
+
+```bash
+printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username YOUR_GITHUB_USER --password-stdin
+```
+
 至少需要设置：
 
 - `POSTGRES_PASSWORD` 和与其一致的 `DATABASE_URL`。建议密码使用 URL-safe 随机值，避免连接串编码歧义。
@@ -56,7 +70,8 @@ Session 配置原子物化成功后，Runtime 对空闲 Pi 调用原生 `reload_
 默认启动生产 Hub：
 
 ```bash
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 docker compose ps
 ```
 
@@ -67,7 +82,8 @@ Model Gateway 不发布宿主机端口，只连接 `model-network`；Runtime 只
 生产 Runtime 是可选 profile，因为 Runtime 可以部署在其他节点。若要在同一台机器运行，在管理台创建一次性 Enrollment Token，设置 `RUNTIME_ENROLLMENT_TOKEN` 和稳定的 `RUNTIME_HOSTNAME`，然后启动：
 
 ```bash
-docker compose --profile runtime up -d --build
+docker compose --profile runtime pull
+docker compose --profile runtime up -d
 ```
 
 Runtime 镜像固定执行 `/opt/agent-hub/pi/pi`，版本由镜像内

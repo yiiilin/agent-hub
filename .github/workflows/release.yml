@@ -1,0 +1,145 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify release version
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release tag must use vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+          ./scripts/verify-release-version.sh "${GITHUB_REF_NAME#v}"
+
+      - name: Scan repository for credentials
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: false
+
+  images:
+    name: Build ${{ matrix.name }} image
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: hub
+            suffix: ""
+            dockerfile: deploy/backend.Dockerfile
+          - name: runtime
+            suffix: -runtime
+            dockerfile: deploy/runtime.Dockerfile
+          - name: model-gateway
+            suffix: -gateway
+            dockerfile: deploy/gateway.Dockerfile
+    steps:
+      - name: Check out source and Pi
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Reject persisted checkout credentials
+        shell: bash
+        run: |
+          if git config --file .git/config --get-regexp '^http\..*extraheader$' >/dev/null 2>&1; then
+            echo "checkout credentials remain in .git/config" >&2
+            exit 1
+          fi
+          module_config=.git/modules/third_party/pi/config
+          if [ -f "$module_config" ] && git config --file "$module_config" --get-regexp '^http\..*extraheader$' >/dev/null 2>&1; then
+            echo "checkout credentials remain in the Pi module config" >&2
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ghcr.io/${{ github.repository }}${{ matrix.suffix }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest
+            type=sha,format=long
+
+      - name: Build and publish image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+          provenance: mode=max
+          sbom: true
+
+  github-release:
+    name: Create GitHub release
+    needs: images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release notes
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" \
+              --title "Agent Hub $GITHUB_REF_NAME" \
+              --notes-file CHANGELOG.md \
+              --latest
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --verify-tag \
+              --title "Agent Hub $GITHUB_REF_NAME" \
+              --notes-file CHANGELOG.md \
+              --latest
+          fi
