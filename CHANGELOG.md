@@ -22,5 +22,5 @@
 ### Security
 
 - 模型密钥、OAuth 凭证、Runtime 凭证和 Bundle 存储凭证均由部署环境注入，不写入源码或镜像。
-- Release 工作流在构建前执行凭证扫描，并为镜像生成 provenance 与 SBOM。
+- Release 工作流在 GHCR 鉴权和发布前完成全历史与镜像凭证扫描，且不上传原始扫描报告。
 - LDAP QA 私钥改为测试环境启动时临时生成，不再保存在 Git 中。
