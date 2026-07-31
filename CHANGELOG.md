@@ -17,6 +17,7 @@
 ### Changed
 
 - 生产 `compose.yml` 默认拉取同一 `0.1.0` 版本的 GHCR Hub、Runtime 和 Model Gateway 镜像。
+- Release workflow 在登录 GHCR 前扫描完整 Git 历史、候选镜像配置及每个最终 image layer，不上传扫描报告、Buildx cache 或 build record。
 
 ### Security
 

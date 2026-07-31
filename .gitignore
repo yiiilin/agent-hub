@@ -5,7 +5,9 @@
 /frontend/test-results/
 /frontend/playwright-report/
 /qa/artifacts/
-/.env
+.env
+.env.*
+!.env.example
 /runtime-data/
 .gstack/
 

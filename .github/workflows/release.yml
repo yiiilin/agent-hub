@@ -9,6 +9,12 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
+  DOCKER_BUILD_SUMMARY: "false"
+  GITLEAKS_VERSION: "8.28.0"
+  GITLEAKS_LINUX_X64_SHA256: a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb
+
 jobs:
   validate:
     name: Validate release
@@ -68,25 +74,35 @@ jobs:
       - name: Reject persisted checkout credentials
         shell: bash
         run: |
-          if git config --file .git/config --get-regexp '^http\..*extraheader$' >/dev/null 2>&1; then
-            echo "checkout credentials remain in .git/config" >&2
-            exit 1
-          fi
-          module_config=.git/modules/third_party/pi/config
-          if [ -f "$module_config" ] && git config --file "$module_config" --get-regexp '^http\..*extraheader$' >/dev/null 2>&1; then
-            echo "checkout credentials remain in the Pi module config" >&2
-            exit 1
-          fi
+          mapfile -t git_configs < <(find .git -type f -name config -print)
+          for config in "${git_configs[@]}"; do
+            if git config --file "$config" --get-regexp '^(http\..*extraheader|credential\.|url\.)' >/dev/null 2>&1; then
+              echo "credential-bearing Git configuration remains in $config" >&2
+              exit 1
+            fi
+            if git config --file "$config" --get-regexp '^remote\..*\.url$' 2>/dev/null \
+              | rg --quiet 'https?://[^/@[:space:]]+@'; then
+              echo "a Git remote URL contains user information in $config" >&2
+              exit 1
+            fi
+          done
+
+      - name: Install Gitleaks
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          install_dir="$RUNNER_TEMP/gitleaks-install"
+          mkdir -p "$install_dir"
+          curl --fail --location --silent --show-error \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            --output "$archive"
+          echo "${GITLEAKS_LINUX_X64_SHA256}  ${archive}" | sha256sum --check --status
+          tar --extract --gzip --file "$archive" --directory "$install_dir" gitleaks
+          chmod 0755 "$install_dir/gitleaks"
+          echo "$install_dir" >> "$GITHUB_PATH"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
 
       - name: Generate image metadata
         id: meta
@@ -100,19 +116,43 @@ jobs:
             type=raw,value=latest
             type=sha,format=long
 
-      - name: Build and publish image
+      - name: Build image locally
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          load: true
+          push: false
+          tags: agent-hub-release/${{ matrix.name }}:${{ github.sha }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.name }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
-          provenance: mode=max
-          sbom: true
+          provenance: false
+          sbom: false
+
+      - name: Scan image layers for credentials
+        env:
+          LOCAL_IMAGE: agent-hub-release/${{ matrix.name }}:${{ github.sha }}
+        shell: bash
+        run: ./scripts/scan-image-secrets.sh "$LOCAL_IMAGE"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Publish scanned image
+        env:
+          LOCAL_IMAGE: agent-hub-release/${{ matrix.name }}:${{ github.sha }}
+          RELEASE_TAGS: ${{ steps.meta.outputs.tags }}
+        shell: bash
+        run: |
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+            docker image tag "$LOCAL_IMAGE" "$tag"
+            docker image push "$tag"
+          done <<< "$RELEASE_TAGS"
 
   github-release:
     name: Create GitHub release

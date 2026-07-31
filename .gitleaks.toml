@@ -9,3 +9,10 @@ id = "generic-api-key"
   [[rules.allowlists]]
 description = "Pi model-data manifests contain only verified SHA-256 checksums"
 paths = ['''^third_party/pi-model-data/v0\.81\.1/\.manifest\.json$''']
+
+  [[rules.allowlists]]
+description = "Lexical minification pairs selection anchor and focus keys"
+condition = "AND"
+regexTarget = "match"
+regexes = ['''^[A-Za-z_$][A-Za-z0-9_$]*\.anchor\.key,[A-Za-z_$][A-Za-z0-9_$]*=[A-Za-z_$][A-Za-z0-9_$]*\.focus\.key;$''']
+paths = ['''(^|/)app/frontend/dist/assets/index-[A-Za-z0-9_-]+\.js$''']
