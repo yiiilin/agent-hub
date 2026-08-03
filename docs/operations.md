@@ -44,7 +44,8 @@ Session 配置原子物化成功后，Runtime 对空闲 Pi 调用原生 `reload_
 
 根目录 `compose.yml` 是默认生产编排。它启动 PostgreSQL、私有 MinIO、Hub 和无状态 Model Gateway；Hub backend 镜像同时包含并直接托管 React/Vite 静态资源，不需要独立 frontend 或 Nginx 容器。Hub 不包含 Mock OIDC，生产配置也不启用开发用户、开发 Model Connection、fake provider 或 fake Pi RPC。先以 `.env.example` 为清单配置 `.env` 并执行 `chmod 600 .env`；关键值为空时 Compose 会在创建容器前拒绝启动。`.env` 已同时被 Git 和 Docker build context 排除。
 
-正式版本在 GHCR 发布三张同版本镜像：
+正式版本只能从 `main` 分支上的版本标签发布，在 GHCR 发布三张同版本镜像。Release
+workflow 会拒绝不属于 `origin/main` 历史的标签：
 
 | 服务 | 默认镜像 |
 | --- | --- |

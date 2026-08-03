@@ -35,6 +35,14 @@ jobs:
             echo "release tag must use vMAJOR.MINOR.PATCH" >&2
             exit 1
           fi
+          if ! git show-ref --verify --quiet refs/remotes/origin/main; then
+            echo "release checkout is missing origin/main" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "release tag must point to a commit on main" >&2
+            exit 1
+          fi
           ./scripts/verify-release-version.sh "${GITHUB_REF_NAME#v}"
 
       - name: Install Gitleaks
