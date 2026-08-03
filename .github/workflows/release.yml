@@ -5,14 +5,20 @@ on:
     tags:
       - "v*.*.*"
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing vMAJOR.MINOR.PATCH tag to publish
+        required: true
+        type: string
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.release_tag || github.ref }}
   cancel-in-progress: false
 
 env:
   DOCKER_BUILD_RECORD_UPLOAD: "false"
   DOCKER_BUILD_SUMMARY: "false"
+  RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
   GITLEAKS_VERSION: "8.28.0"
   GITLEAKS_LINUX_X64_SHA256: a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb
 
@@ -20,19 +26,23 @@ jobs:
   validate:
     name: Validate release
     runs-on: ubuntu-latest
+    outputs:
+      release_commit: ${{ steps.release.outputs.commit }}
     permissions:
       contents: read
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ inputs.release_tag || github.ref }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Verify release version
+        id: release
         shell: bash
         run: |
-          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "release tag must use vMAJOR.MINOR.PATCH" >&2
             exit 1
           fi
@@ -40,11 +50,13 @@ jobs:
             echo "release checkout is missing origin/main" >&2
             exit 1
           fi
-          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+          release_commit=$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")
+          if ! git merge-base --is-ancestor "$release_commit" refs/remotes/origin/main; then
             echo "release tag must point to a commit on main" >&2
             exit 1
           fi
-          ./scripts/verify-release-version.sh "${GITHUB_REF_NAME#v}"
+          ./scripts/verify-release-version.sh "${RELEASE_TAG#v}"
+          echo "commit=$release_commit" >> "$GITHUB_OUTPUT"
 
       - name: Install Gitleaks
         shell: bash
@@ -94,6 +106,7 @@ jobs:
       - name: Check out source and Pi
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ inputs.release_tag || github.ref }}
           submodules: recursive
           persist-credentials: false
 
@@ -148,11 +161,14 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}${{ matrix.suffix }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=semver,pattern={{version}},value=${{ env.RELEASE_TAG }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ env.RELEASE_TAG }}
+            type=semver,pattern={{major}},value=${{ env.RELEASE_TAG }}
             type=raw,value=latest
-            type=sha,format=long
+            type=raw,value=sha-${{ needs.validate.outputs.release_commit }}
+          labels: |
+            org.opencontainers.image.version=${{ env.RELEASE_TAG }}
+            org.opencontainers.image.revision=${{ needs.validate.outputs.release_commit }}
 
       - name: Build image locally
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
@@ -162,14 +178,14 @@ jobs:
           platforms: linux/amd64
           load: true
           push: false
-          tags: agent-hub-release/${{ matrix.name }}:${{ github.sha }}
+          tags: agent-hub-release/${{ matrix.name }}:${{ needs.validate.outputs.release_commit }}
           labels: ${{ steps.meta.outputs.labels }}
           provenance: false
           sbom: false
 
       - name: Scan image layers for credentials
         env:
-          LOCAL_IMAGE: agent-hub-release/${{ matrix.name }}:${{ github.sha }}
+          LOCAL_IMAGE: agent-hub-release/${{ matrix.name }}:${{ needs.validate.outputs.release_commit }}
         shell: bash
         run: ./scripts/scan-image-secrets.sh "$LOCAL_IMAGE"
 
@@ -182,7 +198,7 @@ jobs:
 
       - name: Publish scanned image
         env:
-          LOCAL_IMAGE: agent-hub-release/${{ matrix.name }}:${{ github.sha }}
+          LOCAL_IMAGE: agent-hub-release/${{ matrix.name }}:${{ needs.validate.outputs.release_commit }}
           RELEASE_TAGS: ${{ steps.meta.outputs.tags }}
         shell: bash
         run: |
@@ -202,6 +218,7 @@ jobs:
       - name: Check out release notes
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ inputs.release_tag || github.ref }}
           persist-credentials: false
 
       - name: Create or update release
@@ -209,15 +226,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release edit "$GITHUB_REF_NAME" \
-              --title "Agent Hub $GITHUB_REF_NAME" \
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" \
+              --title "Agent Hub $RELEASE_TAG" \
               --notes-file CHANGELOG.md \
               --latest
           else
-            gh release create "$GITHUB_REF_NAME" \
+            gh release create "$RELEASE_TAG" \
               --verify-tag \
-              --title "Agent Hub $GITHUB_REF_NAME" \
+              --title "Agent Hub $RELEASE_TAG" \
               --notes-file CHANGELOG.md \
               --latest
           fi

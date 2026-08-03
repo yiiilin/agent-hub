@@ -60,6 +60,13 @@ build record 均不上传；任何扫描发现都会在登录 registry 前终止
 tag 前仍需在本地对待推送历史执行同一份 `.gitleaks.toml`，因为远端 workflow 无法撤回
 已经推送的 Git 对象。
 
+标签推送未产生 workflow 运行时，不移动或覆盖现有标签；从 `main` 手动重试并明确指定
+已有版本标签：
+
+```bash
+gh workflow run Release --ref main -f release_tag=v0.1.0
+```
+
 固定 Pi `0.81.1` 的 compiled binary 会被 Gitleaks `8.28.0` 的通用规则命中 6 个源码
 表达式。`scripts/scan-image-secrets.sh` 不按规则或整个文件放行，而是同时固定命中数量与
 排序后 `RuleID`/完整 `Match` 集合的 SHA-256；原始命中只存在于 runner 的 `0700` 临时
