@@ -96,7 +96,12 @@ pub(super) struct SkillExecBroker;
 
 #[cfg(not(target_os = "linux"))]
 impl SkillExecBroker {
-    pub(super) fn start(_run_env: &RunEnv, _tools: &[String]) -> anyhow::Result<Self> {
+    pub(super) fn start(
+        _run_env: &RunEnv,
+        _tools: &[String],
+        _hub_url: &str,
+        _maintenance_token_file: Option<&Path>,
+    ) -> anyhow::Result<Self> {
         anyhow::bail!("Skill execution requires Linux Landlock isolation")
     }
 
@@ -178,6 +183,7 @@ const MAX_TIMEOUT: Duration = Duration::from_secs(300);
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "linux")]
 const LANDLOCK_DIRECTORY_READ: u64 = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
+pub(super) const AGENT_HUB_MAINTENANCE_SKILL_NAME: &str = "agent-hub-maintenance";
 
 #[cfg(target_os = "linux")]
 #[derive(Debug, Deserialize)]
@@ -257,6 +263,8 @@ struct SkillExecBrokerContext {
     tools: Vec<String>,
     token: String,
     stop: Arc<AtomicBool>,
+    hub_url: Option<String>,
+    maintenance_token_file: Option<PathBuf>,
 }
 
 #[cfg(target_os = "linux")]
@@ -267,6 +275,8 @@ struct SkillExecExecutionContext<'a> {
     tools: &'a [String],
     stop: &'a AtomicBool,
     disconnected: &'a AtomicBool,
+    hub_url: Option<&'a str>,
+    maintenance_token_file: Option<&'a Path>,
 }
 
 #[cfg(target_os = "linux")]
@@ -280,7 +290,12 @@ pub(super) struct SkillExecBroker {
 
 #[cfg(target_os = "linux")]
 impl SkillExecBroker {
-    pub(super) fn start(run_env: &RunEnv, tools: &[String]) -> anyhow::Result<Self> {
+    pub(super) fn start(
+        run_env: &RunEnv,
+        tools: &[String],
+        hub_url: &str,
+        maintenance_token_file: Option<&Path>,
+    ) -> anyhow::Result<Self> {
         let root = run_env.engine_state_root.join(SKILL_EXEC_DIRECTORY);
         let catalog_path = root.join(SKILL_EXEC_CATALOG_FILE);
         let packages_root = root.join(SKILL_EXEC_PACKAGES_DIRECTORY);
@@ -288,7 +303,12 @@ impl SkillExecBroker {
         super::prepare_private_directory(&root, "Skill execution directory")?;
         super::prepare_private_directory(&packages_root, "Skill package execution directory")?;
         super::prepare_private_directory(&temp_root, "Skill execution temporary directory")?;
-        load_catalog(&catalog_path, &packages_root).context("validate Skill execution catalog")?;
+        let catalog = load_catalog(&catalog_path, &packages_root)
+            .context("validate Skill execution catalog")?;
+        let management_enabled = catalog
+            .skills
+            .iter()
+            .any(|skill| skill.name == AGENT_HUB_MAINTENANCE_SKILL_NAME);
 
         // Session roots can exceed Linux's 107-byte Unix socket path limit.
         let socket_dir = tempfile::Builder::new()
@@ -315,6 +335,12 @@ impl SkillExecBroker {
             tools: tools.to_vec(),
             token: token.clone(),
             stop: Arc::clone(&stop),
+            hub_url: management_enabled
+                .then(|| hub_url.to_owned())
+                .filter(|value| !value.is_empty()),
+            maintenance_token_file: management_enabled
+                .then(|| maintenance_token_file.map(Path::to_path_buf))
+                .flatten(),
         };
         let actor = thread::spawn(move || run_broker(listener, &context));
         Ok(Self {
@@ -394,6 +420,8 @@ fn handle_connection(mut stream: UnixStream, context: &SkillExecBrokerContext) {
             tools: &context.tools,
             stop: &context.stop,
             disconnected: &disconnected,
+            hub_url: context.hub_url.as_deref(),
+            maintenance_token_file: context.maintenance_token_file.as_deref(),
         };
         let execution = execute_program(&program, &request, &execution_context);
         monitor_done.store(true, Ordering::Release);
@@ -686,6 +714,7 @@ fn execute_program_in_temp(
         call_temp,
         context.workdir,
         context.tools,
+        context.maintenance_token_file,
     )?;
     let mut command = Command::new(launch.interpreter.as_deref().unwrap_or(program));
     command.env_clear();
@@ -704,8 +733,14 @@ fn execute_program_in_temp(
         .env("AGENT_HUB_SKILL_TMPDIR", call_temp)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
+        .stderr(Stdio::piped());
+    if let Some(hub_url) = context.hub_url {
+        command.env("AGENT_HUB_HUB_URL", hub_url);
+    }
+    if let Some(token_file) = context.maintenance_token_file {
+        command.env("AGENT_HUB_API_KEY_FILE", token_file);
+    }
+    command.process_group(0);
     let ruleset_fd = sandbox.ruleset.as_raw_fd();
     unsafe {
         command.pre_exec(move || restrict_landlock_child(ruleset_fd));
@@ -876,6 +911,7 @@ impl SkillExecFilesystemSandbox {
         call_temp: &Path,
         workdir: &Path,
         tools: &[String],
+        maintenance_token_file: Option<&Path>,
     ) -> anyhow::Result<Self> {
         let abi_version = super::landlock_abi_version().context("query Linux Landlock ABI")?;
         anyhow::ensure!(
@@ -895,6 +931,9 @@ impl SkillExecFilesystemSandbox {
         let workspace_access = skill_exec_workspace_landlock_access(tools);
         if workspace_access != 0 {
             PiFilesystemSandbox::add_directory(&mut rules, workdir, workspace_access)?;
+        }
+        if let Some(token_file) = maintenance_token_file {
+            PiFilesystemSandbox::add_optional_file(&mut rules, token_file, LANDLOCK_FILE_READ)?;
         }
         PiFilesystemSandbox::add_directory(&mut rules, call_temp, LANDLOCK_RUNTIME_WRITE)?;
         for path in [
@@ -1086,6 +1125,8 @@ mod tests {
         let run_env = RunEnv {
             workdir: session.join("workspace"),
             engine_state_root: session.join("engine-state"),
+            hub_url: "http://127.0.0.1:8080".into(),
+            maintenance_token_file: None,
         };
         fs::create_dir_all(&run_env.workdir).unwrap();
         fs::create_dir_all(super::super::pi_temp_directory(&run_env)).unwrap();
@@ -1177,6 +1218,8 @@ printf 'input=%s own=%s temp=%s\n' "$input" "$own" "$(IFS= read -r value < "$TMP
             tools: &tools,
             stop: &stop,
             disconnected: &disconnected,
+            hub_url: None,
+            maintenance_token_file: None,
         };
         let output = execute_program(&fixture.program, &request, &context).unwrap();
         assert_eq!(
@@ -1218,6 +1261,8 @@ printf 'workspace-read-denied\n'
             tools: &tools,
             stop: &stop,
             disconnected: &disconnected,
+            hub_url: None,
+            maintenance_token_file: None,
         };
 
         let output = execute_program(&fixture.program, &request, &context).unwrap();
@@ -1248,6 +1293,8 @@ printf 'workspace-read-denied\n'
             tools: &tools,
             stop: &stop,
             disconnected: &disconnected,
+            hub_url: None,
+            maintenance_token_file: None,
         };
 
         assert!(execute_program(&fixture.program, &request, &context)
@@ -1282,6 +1329,8 @@ printf '%s\n' "$!" > "$1"
             tools: &tools,
             stop: &stop,
             disconnected: &disconnected,
+            hub_url: None,
+            maintenance_token_file: None,
         };
 
         let output = execute_program(&fixture.program, &request, &context).unwrap();
@@ -1366,6 +1415,8 @@ printf '%s\n' "$!" > "$1"
             tools: &tools,
             stop: &stop,
             disconnected: &disconnected,
+            hub_url: None,
+            maintenance_token_file: None,
         };
         let output = execute_program(&fixture.program, &request, &context).unwrap();
         assert!(output.timed_out);
@@ -1375,9 +1426,13 @@ printf '%s\n' "$!" > "$1"
     #[test]
     fn broker_rejects_an_invalid_capability_token() {
         let fixture = fixture("#!/bin/sh\nprintf should-not-run\n");
-        let broker =
-            SkillExecBroker::start(&fixture.run_env, &["read".into(), "skill_exec".into()])
-                .unwrap();
+        let broker = SkillExecBroker::start(
+            &fixture.run_env,
+            &["read".into(), "skill_exec".into()],
+            "http://127.0.0.1:8080",
+            None,
+        )
+        .unwrap();
         let mut stream = UnixStream::connect(broker.socket_path()).unwrap();
         let encoded = serde_json::to_vec(&request(Vec::new(), None)).unwrap();
         stream.write_all(&encoded).unwrap();
@@ -1411,10 +1466,103 @@ printf '%s\n' "$!" > "$1"
             super::super::pi_temp_directory(&fixture.run_env).join(SKILL_EXEC_SOCKET_FILE);
         assert!(session_local_socket.to_string_lossy().len() >= 108);
 
-        let broker =
-            SkillExecBroker::start(&fixture.run_env, &["read".into(), "skill_exec".into()])
-                .unwrap();
+        let broker = SkillExecBroker::start(
+            &fixture.run_env,
+            &["read".into(), "skill_exec".into()],
+            "http://127.0.0.1:8080",
+            None,
+        )
+        .unwrap();
 
         assert!(broker.socket_path().to_string_lossy().len() < 108);
+    }
+
+    fn write_catalog_name(fixture: &Fixture, name: &str) {
+        let package_root = fixture.program.parent().unwrap().parent().unwrap();
+        fs::write(
+            &fixture.catalog_path,
+            serde_json::to_vec(&json!({
+                "version": 1,
+                "skills": [{
+                    "name": name,
+                    "package_id": uuid::Uuid::new_v4(),
+                    "package_root": package_root,
+                    "executables": ["bin/client"]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&fixture.catalog_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn send_broker_request(broker: &SkillExecBroker, skill: &str) -> SkillExecResponse {
+        let mut stream = UnixStream::connect(broker.socket_path()).unwrap();
+        let request = SkillExecRequest {
+            token: broker.token().to_owned(),
+            skill: skill.into(),
+            program: "bin/client".into(),
+            args: Vec::new(),
+            stdin: String::new(),
+            timeout_ms: None,
+        };
+        stream
+            .write_all(&serde_json::to_vec(&request).unwrap())
+            .unwrap();
+        stream.write_all(b"\n").unwrap();
+        let mut response = String::new();
+        std::io::BufReader::new(stream)
+            .read_line(&mut response)
+            .unwrap();
+        serde_json::from_str(&response).unwrap()
+    }
+
+    #[test]
+    fn maintenance_skill_receives_hub_url_and_token_file() {
+        let mut fixture = fixture(
+            "#!/bin/sh\nprintf '%s|%s|' \"$AGENT_HUB_HUB_URL\" \"$AGENT_HUB_API_KEY_FILE\"; IFS= read -r key < \"$AGENT_HUB_API_KEY_FILE\"; printf '%s' \"$key\"\n",
+        );
+        let token_file = fixture._temp.path().join("maintenance-token");
+        fs::write(&token_file, "maintenance-key\n").unwrap();
+        fs::set_permissions(&token_file, fs::Permissions::from_mode(0o400)).unwrap();
+        fixture.run_env.maintenance_token_file = Some(token_file.clone());
+        write_catalog_name(&fixture, AGENT_HUB_MAINTENANCE_SKILL_NAME);
+        let broker = SkillExecBroker::start(
+            &fixture.run_env,
+            &["read".into(), "skill_exec".into()],
+            "http://hub.internal",
+            Some(&token_file),
+        )
+        .unwrap();
+        let response = send_broker_request(&broker, AGENT_HUB_MAINTENANCE_SKILL_NAME);
+        assert!(response.ok, "{}", response.error.unwrap_or_default());
+        assert_eq!(
+            response.stdout,
+            format!(
+                "http://hub.internal|{}|maintenance-key",
+                token_file.display()
+            )
+        );
+    }
+
+    #[test]
+    fn non_maintenance_skill_does_not_receive_hub_credentials() {
+        let fixture = fixture(
+            "#!/bin/sh\nprintf '%s|%s' \"$AGENT_HUB_HUB_URL\" \"$AGENT_HUB_API_KEY_FILE\"\n",
+        );
+        let token_file = fixture._temp.path().join("maintenance-token");
+        fs::write(&token_file, "maintenance-key\n").unwrap();
+        fs::set_permissions(&token_file, fs::Permissions::from_mode(0o400)).unwrap();
+        write_catalog_name(&fixture, "deploy");
+        let broker = SkillExecBroker::start(
+            &fixture.run_env,
+            &["read".into(), "skill_exec".into()],
+            "http://hub.internal",
+            Some(&token_file),
+        )
+        .unwrap();
+        let response = send_broker_request(&broker, "deploy");
+        assert!(response.ok, "{}", response.error.unwrap_or_default());
+        assert_eq!(response.stdout, "|");
     }
 }

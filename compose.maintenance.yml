@@ -1,0 +1,10 @@
+services:
+  runtime:
+    environment:
+      RUNTIME_MAINTENANCE_TOKEN_FILE: /run/secrets/agent-hub-maintenance-token
+    secrets:
+      - agent-hub-maintenance-token
+
+secrets:
+  agent-hub-maintenance-token:
+    file: ./secrets/agent-hub-maintenance-token

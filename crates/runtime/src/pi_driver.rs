@@ -826,7 +826,14 @@ impl PersistentPiRpcProcess {
         let skill_exec_enabled = tools.iter().any(|tool| tool == "skill_exec");
         materialize_skill_exec_extension(run_env, skill_exec_enabled)?;
         let skill_exec_broker = skill_exec_enabled
-            .then(|| SkillExecBroker::start(run_env, tools))
+            .then(|| {
+                SkillExecBroker::start(
+                    run_env,
+                    tools,
+                    &run_env.hub_url,
+                    run_env.maintenance_token_file.as_deref(),
+                )
+            })
             .transpose()
             .context("start Skill execution broker")?;
 
@@ -2264,6 +2271,8 @@ mod tests {
         let run_env = RunEnv {
             workdir: session_root.join("workspace"),
             engine_state_root: session_root.join("engine-state"),
+            hub_url: "http://127.0.0.1:8080".into(),
+            maintenance_token_file: None,
         };
         let agent_dir = pi_agent_directory(&run_env);
         let session_dir = run_env.engine_state_root.join(PI_SESSION_DIRECTORY);

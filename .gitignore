@@ -5,6 +5,7 @@
 /frontend/test-results/
 /frontend/playwright-report/
 /qa/artifacts/
+/skills/agent-hub-maintenance/bin/agent-hub
 .env
 .env.*
 !.env.example

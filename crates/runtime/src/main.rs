@@ -73,6 +73,7 @@ struct Config {
     max_online_sessions: usize,
     workdir_ttl: Duration,
     local_skills_dir: Option<PathBuf>,
+    maintenance_token_file: Option<PathBuf>,
     sandbox_mode: String,
     sandbox_downgrade_reason: Option<String>,
     health_bind_addr: SocketAddr,
@@ -563,6 +564,10 @@ impl Config {
             max_online_sessions,
             workdir_ttl: Duration::from_secs(workdir_ttl_secs),
             local_skills_dir: env::var("RUNTIME_LOCAL_SKILLS_DIR").ok().map(PathBuf::from),
+            maintenance_token_file: env::var("RUNTIME_MAINTENANCE_TOKEN_FILE")
+                .ok()
+                .map(PathBuf::from)
+                .filter(|path| !path.as_os_str().is_empty()),
             sandbox_mode: env::var("RUNTIME_SANDBOX_MODE")
                 .unwrap_or_else(|_| "workspace-write+network".into()),
             sandbox_downgrade_reason: env::var("RUNTIME_SANDBOX_DOWNGRADE_REASON")
@@ -1796,12 +1801,14 @@ async fn execute_run(
         config.model_proxy_idle_timeout,
     )
     .await?;
-    let run_env = prepare_run_env_with_local_skills(
+    let run_env = prepare_run_env_with_management(
         &config.work_root,
         &claim,
         Some(&model_proxy.base_url),
         config.local_skills_dir.as_deref(),
         Some(client),
+        &config.hub_url,
+        config.maintenance_token_file.as_deref(),
     )
     .await?;
     info!(
@@ -2112,12 +2119,14 @@ async fn execute_managed_run_inner(
         ),
     };
     restore_claim_session_bundle_if_needed(config, client, &claim).await?;
-    let run_env = prepare_run_env_with_local_skills(
+    let run_env = prepare_run_env_with_management(
         &config.work_root,
         &claim,
         Some(&model_proxy.base_url),
         config.local_skills_dir.as_deref(),
         Some(client),
+        &config.hub_url,
+        config.maintenance_token_file.as_deref(),
     )
     .await?;
     let metadata =
@@ -5578,6 +5587,8 @@ fn stable_tool_request_uuid(
 struct RunEnv {
     workdir: PathBuf,
     engine_state_root: PathBuf,
+    hub_url: String,
+    maintenance_token_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -5948,12 +5959,55 @@ async fn prepare_run_env(
     prepare_run_env_with_local_skills(root, claim, model_base_url, None, None).await
 }
 
+async fn prepare_run_env_with_management(
+    root: &Path,
+    claim: &ClaimRunResponse,
+    model_base_url: Option<&str>,
+    local_skills_dir: Option<&Path>,
+    client: Option<&HubClient>,
+    hub_url: &str,
+    maintenance_token_file: Option<&Path>,
+) -> anyhow::Result<RunEnv> {
+    prepare_run_env_with_local_skills_and_management(
+        root,
+        claim,
+        model_base_url,
+        local_skills_dir,
+        client,
+        hub_url,
+        maintenance_token_file,
+    )
+    .await
+}
+
+#[cfg(test)]
 async fn prepare_run_env_with_local_skills(
     root: &Path,
     claim: &ClaimRunResponse,
     model_base_url: Option<&str>,
     local_skills_dir: Option<&Path>,
     client: Option<&HubClient>,
+) -> anyhow::Result<RunEnv> {
+    prepare_run_env_with_local_skills_and_management(
+        root,
+        claim,
+        model_base_url,
+        local_skills_dir,
+        client,
+        "http://127.0.0.1:8080",
+        None,
+    )
+    .await
+}
+
+async fn prepare_run_env_with_local_skills_and_management(
+    root: &Path,
+    claim: &ClaimRunResponse,
+    model_base_url: Option<&str>,
+    local_skills_dir: Option<&Path>,
+    client: Option<&HubClient>,
+    hub_url: &str,
+    maintenance_token_file: Option<&Path>,
 ) -> anyhow::Result<RunEnv> {
     let paths = SessionPaths::for_claim(root, claim)?;
     fs::create_dir_all(&paths.workspace).await?;
@@ -5985,6 +6039,8 @@ async fn prepare_run_env_with_local_skills(
     let run_env = RunEnv {
         workdir: paths.workspace,
         engine_state_root: paths.engine_state,
+        hub_url: hub_url.to_owned(),
+        maintenance_token_file: maintenance_token_file.map(Path::to_path_buf),
     };
     pi_driver::materialize_integration_tools(&run_env, claim.integration_context.as_ref())?;
     Ok(run_env)
@@ -14682,6 +14738,7 @@ done
             max_online_sessions: DEFAULT_MAX_ONLINE_SESSIONS,
             workdir_ttl: Duration::from_secs(3600),
             local_skills_dir: None,
+            maintenance_token_file: None,
             sandbox_mode: "workspace-write+network".into(),
             sandbox_downgrade_reason: None,
             health_bind_addr: "127.0.0.1:0".parse().unwrap(),
