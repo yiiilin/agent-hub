@@ -35,6 +35,7 @@ skills/agent-hub-maintenance/，bin/agent-hub 由构建脚本生成，不提交�
     mkdir -p /root/compose/agent-hub/secrets
     umask 077
     printf '%s' 'ahk_...' > /root/compose/agent-hub/secrets/agent-hub-maintenance-token
+    chmod 0444 /root/compose/agent-hub/secrets/agent-hub-maintenance-token
 
 2. 使用维护 override 启动：
 
@@ -48,4 +49,3 @@ skills/agent-hub-maintenance/，bin/agent-hub 由构建脚本生成，不提交�
 - 当前 API Key 继承所属用户权限；使用前确认该 Key 属于 super_admin 且只用于维护。
 - 未来建议为管理 Key 增加细粒度 scope，进一步缩小 CLI 的写权限。
 - 宿主机 Docker/Compose 操作不在本 Skill 范围内；需要时另做窄权限 Host Operator。
-
