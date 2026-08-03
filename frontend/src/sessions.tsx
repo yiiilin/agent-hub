@@ -436,15 +436,15 @@ function ActivityIcon({ kind }: { kind: ActivityKind }) {
   return <Minimize2 size={15} />;
 }
 
-export function ChatActivityGroup({ activities, startedAt, endedAt, active = false }: { activities: ActivityEntry[]; startedAt?: number; endedAt?: number; active?: boolean }) {
+export function ChatActivityGroup({ activities, startedAt, endedAt, active = false, clockOffset }: { activities: ActivityEntry[]; startedAt?: number; endedAt?: number; active?: boolean; clockOffset?: number }) {
   const { locale, t } = useI18n();
-  const [now, setNow] = useState(() => Date.now());
+  const [now, setNow] = useState(() => Date.now() - (clockOffset ?? 0));
   useEffect(() => {
     if (!active) return;
-    setNow(Date.now());
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    setNow(Date.now() - (clockOffset ?? 0));
+    const timer = window.setInterval(() => setNow(Date.now() - (clockOffset ?? 0)), 1000);
     return () => window.clearInterval(timer);
-  }, [active, startedAt]);
+  }, [active, clockOffset, startedAt]);
   const durationEndedAt = active ? now : endedAt;
   return <details className="session-activity-events"><summary><span>{t('agentActivityDuration').replace('{duration}', formatActivityDuration(activities, locale, startedAt, durationEndedAt))}</span><ChevronRight className="session-activity-chevron" size={16} aria-hidden="true" /></summary><div>{activities.map((activity) => <div className="session-activity-row" key={activity.id}><span className="session-activity-icon" aria-hidden="true"><ActivityIcon kind={activity.kind} /></span><div className="session-activity-content"><span className="session-activity-heading"><strong>{t(activityKeys[activity.kind])}</strong>{activity.status && <small className={`session-activity-status status-${activity.status}`}>{t(activityStatusKeys[activity.status] ?? 'statusFailed')}</small>}{activity.kind === 'tool' && activity.status && activity.status !== 'pending' && <small className="session-activity-elapsed">{formatActivityDuration([activity], locale)}</small>}</span>{activity.summary && (activity.kind === 'command' ? <code>{activity.summary}</code> : <span className="session-activity-summary">{activity.summary}</span>)}{activity.output && <div className="session-activity-output"><span>{t('activityOutput')}</span><pre>{activity.output}</pre></div>}</div></div>)}</div></details>;
 }
@@ -661,6 +661,13 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
     () => events.filter((event) => sessionRunIdSet.has(event.run_id)),
     [events, sessionRunIdSet]
   );
+  const serverClockOffset = useMemo(() => {
+    const timestamps = [
+      ...sessionEvents.map((event) => eventTimestamp(event.created_at)),
+      ...sessionMessages.map((message) => eventTimestamp(message.accepted_at))
+    ].filter((timestamp) => timestamp > 0);
+    return timestamps.length > 0 ? Date.now() - Math.max(...timestamps) : undefined;
+  }, [sessionEvents, sessionMessages]);
   const runProcessingWindows = useMemo(() => new Map(sessionRunIds.map((runId) => {
     const acceptedAt = sessionMessages
       .filter((message) => message.run_id === runId && message.role === 'user')
@@ -1125,6 +1132,7 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
                   return <ChatActivityGroup
                     active={active && window.endedAt === undefined}
                     activities={entry.activities}
+                    clockOffset={serverClockOffset}
                     endedAt={window.endedAt}
                     key={entry.id}
                     startedAt={window.startedAt}

@@ -707,6 +707,14 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
       )] as const;
     }));
   }, [events, timeline]);
+  const clockOffset = useMemo(() => {
+    const timestamps = [
+      ...events.map((event) => eventTimestamp(event.created_at)),
+      ...messages.map((message) => eventTimestamp(message.accepted_at)),
+      ...optimisticMessages.map((message) => eventTimestamp(message.acceptedAt))
+    ].filter((timestamp) => timestamp > 0);
+    return timestamps.length > 0 ? Date.now() - Math.max(...timestamps) : undefined;
+  }, [events, messages, optimisticMessages]);
 
   const lastUserRunId = [...timeline].reverse().find((entry) => entry.kind === 'message' && entry.role === 'user')?.runId ?? null;
   const lastRunTerminal = lastUserRunId ? events.some((event) => event.run_id === lastUserRunId && isTerminalEvent(event)) : false;
@@ -782,7 +790,7 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
           if (entry.kind === 'activity-group') {
             const active = activeRunInProgress && entry.runId === lastUserRunId;
             const window = activityGroupProcessingWindow(timeline, index, runWindows.get(entry.runId), active);
-            return <ChatActivityGroup active={active && window.endedAt === undefined} activities={entry.activities} endedAt={window.endedAt} key={entry.id} startedAt={window.startedAt} />;
+            return <ChatActivityGroup active={active && window.endedAt === undefined} activities={entry.activities} clockOffset={clockOffset} endedAt={window.endedAt} key={entry.id} startedAt={window.startedAt} />;
           }
           if (entry.kind === 'failure') return <ChatRunFailure failure={entry.failure} key={entry.id} />;
           return <ChatMessageBubble agentName={agent?.name ?? null} content={entry.content} key={entry.id} role={entry.role} state={entry.state} streaming={entry.streaming} />;

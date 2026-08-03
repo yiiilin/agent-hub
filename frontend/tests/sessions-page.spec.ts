@@ -882,6 +882,32 @@ test('an unfinished processing segment keeps increasing without a duplicate thin
   await expect(detail.locator('.session-thinking')).toHaveCount(0);
 });
 
+test('an active processing segment anchors to server timestamps instead of the browser clock', async ({ page }) => {
+  const startedAt = Date.now() - 60_000;
+  const latestEventAt = startedAt + 5_000;
+  await installSessionApi(page, {
+    activeMessages: [
+      message('active', 1, 'user', 'Measure processing from the bubble.', { accepted_at: new Date(startedAt).toISOString() })
+    ],
+    activeEvents: [
+      { seq: 1, run_id: 'run-active', event_type: 'status', role: null, content: 'running', payload: { status: 'running' }, created_at: new Date(latestEventAt).toISOString() },
+      { seq: 2, run_id: 'run-active', event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'reasoning-live', item_type: 'reasoning', phase: 'started' }, created_at: new Date(latestEventAt).toISOString() }
+    ],
+    activeStreamEvents: []
+  });
+  await page.goto('/sessions');
+
+  const detail = page.getByRole('region', { name: 'Session details' });
+  const summary = detail.locator('details.session-activity-events summary');
+  await expect(summary).toContainText('Worked for');
+  const first = Number.parseFloat((await summary.textContent())?.match(/[\d.]+/)?.[0] ?? '0');
+  expect(first).toBeGreaterThanOrEqual(4);
+  expect(first).toBeLessThan(15);
+  await page.waitForTimeout(1_200);
+  const second = Number.parseFloat((await summary.textContent())?.match(/[\d.]+/)?.[0] ?? '0');
+  expect(second).toBeGreaterThan(first);
+});
+
 test('conversation streams replies, folds readable activity, steers, stops, and keeps history read-only', async ({ page }) => {
   const fixture = await installSessionApi(page);
   await page.goto('/sessions');
