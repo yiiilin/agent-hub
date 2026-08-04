@@ -1401,6 +1401,8 @@ struct PiRunState {
     assistant_emitted_for_turn: bool,
     thinking_started: HashSet<u64>,
     thinking_ended: HashSet<u64>,
+    thinking_ids: BTreeMap<u64, u64>,
+    thinking_sequence: u64,
     tool_started: HashSet<String>,
     tool_ended: HashSet<String>,
     tool_outputs: BTreeMap<String, String>,
@@ -1434,6 +1436,8 @@ impl PiRunState {
             assistant_emitted_for_turn: false,
             thinking_started: HashSet::new(),
             thinking_ended: HashSet::new(),
+            thinking_ids: BTreeMap::new(),
+            thinking_sequence: 0,
             tool_started: HashSet::new(),
             tool_ended: HashSet::new(),
             tool_outputs: BTreeMap::new(),
@@ -1465,6 +1469,7 @@ impl PiRunState {
                 self.assistant_emitted_for_turn = false;
                 self.thinking_started.clear();
                 self.thinking_ended.clear();
+                self.thinking_ids.clear();
                 self.push_turn_started();
             }
             "message_start" => {}
@@ -1549,13 +1554,18 @@ impl PiRunState {
                 });
             }
             "thinking_start" => {
-                let index = pi_content_index(event)?;
+                let content_index = pi_content_index(event)?;
+                let index = match self.thinking_ids.get(&content_index) {
+                    Some(&index) if !self.thinking_ended.contains(&index) => index,
+                    _ => self.allocate_thinking_item_index(content_index),
+                };
                 if self.thinking_started.insert(index) {
                     self.events.push(pi_reasoning_event(index, "started", None));
                 }
             }
             "thinking_delta" => {
-                let index = pi_content_index(event)?;
+                let content_index = pi_content_index(event)?;
+                let index = self.thinking_item_index(content_index);
                 let delta = event
                     .get("delta")
                     .and_then(Value::as_str)
@@ -1567,7 +1577,8 @@ impl PiRunState {
                     .push(pi_reasoning_event(index, "summary_delta", Some(delta)));
             }
             "thinking_end" => {
-                let index = pi_content_index(event)?;
+                let content_index = pi_content_index(event)?;
+                let index = self.thinking_item_index(content_index);
                 if self.thinking_ended.insert(index) {
                     let content = event.get("content").and_then(Value::as_str);
                     self.events
@@ -2126,6 +2137,23 @@ fn validate_pi_response(
     Ok(())
 }
 
+impl PiRunState {
+    fn thinking_item_index(&mut self, content_index: u64) -> u64 {
+        *self.thinking_ids.entry(content_index).or_insert_with(|| {
+            let index = self.thinking_sequence;
+            self.thinking_sequence += 1;
+            index
+        })
+    }
+
+    fn allocate_thinking_item_index(&mut self, content_index: u64) -> u64 {
+        let index = self.thinking_sequence;
+        self.thinking_sequence += 1;
+        self.thinking_ids.insert(content_index, index);
+        index
+    }
+}
+
 fn pi_content_index(event: &serde_json::Map<String, Value>) -> anyhow::Result<u64> {
     event
         .get("contentIndex")
@@ -2611,6 +2639,48 @@ if [ "$$" -ne 1 ] && IFS= read -r _ < /proc/1/maps; then exit 31; fi
         assert_eq!(
             String::from_utf8(denied_by_bash_only.stdout).unwrap(),
             "secret-read-denied\n"
+        );
+    }
+
+    #[test]
+    fn repeated_pi_content_indexes_get_distinct_reasoning_item_ids() {
+        let mut state = PiRunState::new(
+            uuid::Uuid::new_v4(),
+            "native-session".into(),
+            BTreeMap::new(),
+        );
+        for event in [
+            json!({"type": "agent_start"}),
+            json!({"type": "turn_start"}),
+            json!({"type": "message_update", "assistantMessageEvent": {"type": "thinking_start", "contentIndex": 0}}),
+            json!({"type": "message_update", "assistantMessageEvent": {"type": "thinking_delta", "contentIndex": 0, "delta": "one"}}),
+            json!({"type": "message_update", "assistantMessageEvent": {"type": "thinking_end", "contentIndex": 0, "content": "one"}}),
+            json!({"type": "message_update", "assistantMessageEvent": {"type": "thinking_start", "contentIndex": 0}}),
+            json!({"type": "message_update", "assistantMessageEvent": {"type": "thinking_delta", "contentIndex": 0, "delta": "two"}}),
+            json!({"type": "message_update", "assistantMessageEvent": {"type": "thinking_end", "contentIndex": 0, "content": "two"}}),
+        ] {
+            state.handle_event(&event).unwrap();
+        }
+        let mut item_ids = state
+            .events
+            .iter()
+            .filter(|event| event.event_type == "item")
+            .filter(|event| {
+                event.payload.get("item_type").and_then(Value::as_str) == Some("reasoning")
+            })
+            .filter_map(|event| {
+                event
+                    .payload
+                    .get("item_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        item_ids.sort();
+        item_ids.dedup();
+        assert_eq!(
+            item_ids,
+            vec!["pi-thinking-0".to_string(), "pi-thinking-1".to_string()]
         );
     }
 }
