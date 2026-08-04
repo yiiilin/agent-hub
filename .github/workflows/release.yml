@@ -229,12 +229,12 @@ jobs:
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release edit "$RELEASE_TAG" \
               --title "Agent Hub $RELEASE_TAG" \
-              --notes-file CHANGELOG.md \
+              --notes-file RELEASE_NOTES.md \
               --latest
           else
             gh release create "$RELEASE_TAG" \
               --verify-tag \
               --title "Agent Hub $RELEASE_TAG" \
-              --notes-file CHANGELOG.md \
+              --notes-file RELEASE_NOTES.md \
               --latest
           fi
