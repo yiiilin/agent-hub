@@ -478,17 +478,52 @@ export function ChatMessageBubble({
   </article>;
 }
 
-export function ChatThinkingBubble() {
-  const { t } = useI18n();
+export function runThinkingStage(events: RunEvent[]): { key: TranslationKey; detail?: string } {
+  let fallback: { key: TranslationKey; detail?: string } = { key: 'runStageWaitingRuntime' };
+  for (const event of events) {
+    if (event.event_type === 'status') fallback = { key: 'runStageStarting' };
+    if (event.event_type === 'turn_started') fallback = { key: 'runStageStartingAgent' };
+    if (event.event_type === 'item') {
+      const itemType = payloadString(event.payload, 'item_type');
+      const tool = payloadString(event.payload, 'tool') ?? undefined;
+      if (itemType === 'reasoning') return { key: 'runStageThinking' };
+      if (itemType === 'dynamicToolCall' || itemType === 'mcpToolCall') return { key: 'runStageTool', detail: tool };
+      if (itemType === 'commandExecution') return { key: 'runStageCommand', detail: tool };
+      if (itemType === 'webSearch') return { key: 'runStageTool', detail: 'web search' };
+    }
+    if (event.event_type === 'tool_request') {
+      return { key: 'runStageTool', detail: payloadString(event.payload, 'tool_name') ?? undefined };
+    }
+    if (event.event_type === 'message_delta') return { key: 'runStageGenerating' };
+  }
+  return fallback;
+}
+
+export function ChatThinkingBubble({ stage = 'runStageThinking', detail, lastEventAt }: { stage?: TranslationKey; detail?: string; lastEventAt?: number }) {
+  const { locale, t } = useI18n();
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const silentSeconds = lastEventAt && lastEventAt > 0
+    ? Math.max(0, Math.floor((now - lastEventAt) / 1000))
+    : undefined;
+  const stuck = silentSeconds !== undefined && silentSeconds >= 60;
   return <article className="session-bubble role-assistant session-thinking">
     <span className="session-message-avatar" aria-hidden="true"><Bot size={17} /></span>
     <div className="session-message-body">
       <div className="session-thinking-indicator" role="status" aria-label={t('agentThinking')}>
-        <span className="session-thinking-label">{t('agentThinking')}</span>
+        <span className="session-thinking-label">{t(stage)}</span>
+        {detail && <span className="session-thinking-detail">{detail}</span>}
         <span className="session-thinking-dot" aria-hidden="true" />
         <span className="session-thinking-dot" aria-hidden="true" />
         <span className="session-thinking-dot" aria-hidden="true" />
       </div>
+      {lastEventAt && <div className="session-thinking-meta">
+        <span>{t('runStageLastEvent').replace('{time}', new Date(lastEventAt).toLocaleTimeString(locale))}</span>
+        {silentSeconds !== undefined && <span>{t('runStageSilent').replace('{seconds}', String(silentSeconds))}{stuck ? t('runStageStuck') : ''}</span>}
+      </div>}
     </div>
   </article>;
 }
@@ -948,6 +983,12 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
     ? [...timelineItems].reverse().find((entry) => entry.runId === activeRunId)
     : undefined;
   const showThinking = activeRunInProgress && activeRunLastTimelineItem?.kind !== 'activity-group';
+  const activeThinking = useMemo(() => {
+    if (!activeRunId) return undefined;
+    const runEvents = sessionEvents.filter((event) => event.run_id === activeRunId);
+    const lastEventAt = runEvents.reduce((max, event) => Math.max(max, eventTimestamp(event.created_at)), 0) || undefined;
+    return { stage: runThinkingStage(runEvents), lastEventAt };
+  }, [activeRunId, sessionEvents]);
 
   useLayoutEffect(() => {
     const scroll = chatScrollRef.current;
@@ -1187,7 +1228,7 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
                   stateLabel={entry.kind === 'message' && entry.state ? deliveryLabel(entry.state) : undefined}
                 />;
               })}
-              {!conversationDraft && showThinking && <ChatThinkingBubble />}
+              {!conversationDraft && showThinking && <ChatThinkingBubble stage={activeThinking?.stage.key ?? 'runStageThinking'} detail={activeThinking?.stage.detail} lastEventAt={activeThinking?.lastEventAt} />}
             </div>
           </div>
           {canMutate && <form className="session-composer session-chat-composer" onSubmit={submitMessage}>

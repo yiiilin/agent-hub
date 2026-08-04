@@ -992,6 +992,8 @@ textarea {
 .session-thinking { align-items: center; }
 .session-thinking-indicator { min-height: 28px; display: flex; align-items: center; gap: 5px; color: var(--text-secondary); font-size: 12px; }
 .session-thinking-label { margin-right: 2px; }
+.session-thinking-detail { color: var(--text-secondary); font-weight: 600; }
+.session-thinking-meta { margin-top: 4px; display: flex; gap: 10px; color: var(--text-tertiary); font-size: 11px; font-variant-numeric: tabular-nums; }
 .session-thinking-dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; animation: session-thinking-pulse 1.2s ease-in-out infinite; }
 .session-thinking-dot:nth-of-type(3) { animation-delay: 150ms; }
 .session-thinking-dot:nth-of-type(4) { animation-delay: 300ms; }

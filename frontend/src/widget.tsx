@@ -25,6 +25,7 @@ import {
   projectActivities,
   projectRunFailures,
   resizeComposer,
+  runThinkingStage,
   runProcessingWindow,
   type ActivityEntry,
   type RunFailureEntry
@@ -781,6 +782,12 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
     ? [...timeline].reverse().find((entry) => entry.runId === lastUserRunId)
     : undefined;
   const showThinking = activeRunInProgress && activeRunLastTimelineItem?.kind !== 'activity-group';
+  const activeThinking = useMemo(() => {
+    if (!lastUserRunId) return undefined;
+    const runEvents = events.filter((event) => event.run_id === lastUserRunId);
+    const lastEventAt = runEvents.reduce((max, event) => Math.max(max, eventTimestamp(event.created_at)), 0) || undefined;
+    return { stage: runThinkingStage(runEvents), lastEventAt };
+  }, [events, lastUserRunId]);
 
   useLayoutEffect(() => {
     const scroll = chatScrollRef.current;
@@ -872,7 +879,7 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
           if (entry.kind === 'failure') return <ChatRunFailure failure={entry.failure} key={entry.id} />;
           return <ChatMessageBubble agentName={agent?.name ?? null} content={entry.content} key={entry.id} role={entry.role} state={entry.state} streaming={entry.streaming} />;
         })}
-        {showThinking && <ChatThinkingBubble />}
+        {showThinking && <ChatThinkingBubble stage={activeThinking?.stage.key ?? 'runStageThinking'} detail={activeThinking?.stage.detail} lastEventAt={activeThinking?.lastEventAt} />}
       </div>
     </div>
     <form className="session-composer session-chat-composer widget-composer" onSubmit={submit}>
