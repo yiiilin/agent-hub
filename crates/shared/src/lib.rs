@@ -828,6 +828,8 @@ pub struct AgentDto {
     pub model_policy: Value,
     pub sandbox_policy: Value,
     pub managed_skill_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub secret_declarations: Vec<AgentSecretDeclarationDto>,
     pub mcp_allowlist: Value,
     #[serde(default = "default_agent_tool_allowlist")]
     pub tool_allowlist: Vec<String>,
@@ -998,6 +1000,76 @@ pub struct SkillPackageDto {
     pub files: Vec<SkillPackageFileDto>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentSecretDeclarationDto {
+    pub name: String,
+    pub kind: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserSecretDto {
+    pub id: Uuid,
+    pub owner_id: Uuid,
+    pub name: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_size_bytes: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_sha256: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateUserSecretRequest {
+    pub name: String,
+    pub kind: String,
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub file_base64: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateUserSecretRequest {
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub file_name: Option<String>,
+    #[serde(default)]
+    pub file_base64: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecretGrantDto {
+    pub user_id: Uuid,
+    pub agent_id: Uuid,
+    pub secret_name: String,
+    pub granted_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateSecretGrantRequest {
+    pub agent_id: Uuid,
+    pub secret_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecretGrantRequirementDto {
+    pub name: String,
+    pub kind: String,
+    pub description: String,
+}
+
 pub const MAX_SKILL_PACKAGE_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_SKILL_PACKAGE_EXPANDED_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_SKILL_PACKAGE_FILES: usize = 1024;
@@ -1006,6 +1078,8 @@ pub const MAX_SKILL_PACKAGE_FILES: usize = 1024;
 pub struct AgentExecutionConfigurationDto {
     pub revision: i64,
     pub instructions: String,
+    #[serde(default)]
+    pub secret_declarations: Vec<AgentSecretDeclarationDto>,
     #[serde(default)]
     pub model_selection: Option<ModelSelectionDto>,
     #[serde(default)]
@@ -1150,6 +1224,35 @@ pub fn execution_configuration_fingerprint(
     }
     subagents.sort_by_key(|subagent| subagent.name.trim().to_lowercase());
 
+    let mut secret_declarations = configuration.secret_declarations.clone();
+    secret_declarations.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
+    let mut declaration_names = BTreeSet::new();
+    for declaration in &secret_declarations {
+        let valid_name = !declaration.name.is_empty()
+            && declaration.name.len() <= 128
+            && declaration
+                .name
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+            && (declaration
+                .name
+                .starts_with(|byte: char| byte.is_ascii_uppercase())
+                || declaration.name.starts_with('_'));
+        if !valid_name
+            || !matches!(declaration.kind.as_str(), "value" | "file")
+            || declaration.description.len() > 512
+            || !declaration_names.insert(declaration.name.clone())
+        {
+            return Err(ExecutionConfigurationError(
+                "Agent Secret Declarations must have unique valid names and kinds",
+            ));
+        }
+    }
+
     let mut names = BTreeSet::new();
     let mut skills = configuration.skills.clone();
     for skill in &mut skills {
@@ -1250,6 +1353,7 @@ pub fn execution_configuration_fingerprint(
         "model_policy": configuration.model_policy,
         "sandbox_policy": configuration.sandbox_policy,
         "skills": skill_metadata,
+        "secret_declarations": secret_declarations,
         "mcp_allowlist": mcp_allowlist,
         "tool_allowlist": tool_allowlist,
     });
@@ -1699,6 +1803,8 @@ pub struct CreateAgentRequest {
     pub subagents: Vec<SubagentDefinition>,
     #[serde(default = "default_agent_tool_allowlist")]
     pub tool_allowlist: Vec<String>,
+    #[serde(default)]
+    pub secret_declarations: Vec<AgentSecretDeclarationDto>,
 }
 
 fn legacy_hub_proxy_model_policy() -> Value {
@@ -1728,6 +1834,8 @@ pub struct UpdateAgentRequest {
     pub mcp_allowlist: Value,
     #[serde(default = "default_agent_tool_allowlist")]
     pub tool_allowlist: Vec<String>,
+    #[serde(default)]
+    pub secret_declarations: Vec<AgentSecretDeclarationDto>,
 }
 
 pub const AGENT_TOOL_NAMES: &[&str] = &[
@@ -2074,8 +2182,16 @@ pub struct ClaimRunResponse {
     pub integration_context: Option<IntegrationContextDto>,
     pub resume: Option<RunResumeDto>,
     pub model_proxy_token: String,
+    #[serde(default)]
+    pub secret_values: Vec<RunSecretValueDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_context: Option<ClaimSessionContextDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunSecretValueDto {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

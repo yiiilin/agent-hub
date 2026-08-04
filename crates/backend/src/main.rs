@@ -458,6 +458,22 @@ fn build_router(state: AppState) -> Router {
         .route("/api/auth/api-keys/{api_key_id}/renew", post(renew_api_key))
         .route("/api/auth/api-keys/{api_key_id}", delete(delete_api_key))
         .route(
+            "/api/secrets",
+            get(list_user_secrets).post(create_user_secret),
+        )
+        .route(
+            "/api/secrets/{secret_id}",
+            put(update_user_secret).delete(delete_user_secret),
+        )
+        .route(
+            "/api/secret-grants",
+            get(list_secret_grants).post(create_secret_grants),
+        )
+        .route(
+            "/api/secret-grants/{agent_id}/{secret_name}",
+            delete(delete_secret_grant),
+        )
+        .route(
             "/api/model-connections",
             get(list_model_connections).post(create_model_connection),
         )
@@ -691,6 +707,10 @@ fn build_router(state: AppState) -> Router {
         .route("/api/runtime/register", post(runtime_register))
         .route("/api/runtime/heartbeat", post(runtime_heartbeat))
         .route("/api/runtime/runs/claim", post(runtime_claim_run))
+        .route(
+            "/api/runtime/runs/{run_id}/secrets/{secret_name}",
+            get(runtime_download_run_secret_file),
+        )
         .route(
             "/api/runtime/runs/{run_id}/skills/{skill_id}/package",
             get(runtime_download_run_skill_package),
@@ -4998,6 +5018,7 @@ async fn create_agent(
     .execute(&mut *tx)
     .await?;
     replace_subagents_tx(&mut tx, id, &req.subagents).await?;
+    replace_agent_secret_declarations_tx(&mut tx, id, &req.secret_declarations).await?;
     tx.commit().await?;
     Ok(Json(load_agent_for_user(&state.pool, id, &user).await?))
 }
@@ -5189,6 +5210,7 @@ async fn update_agent(
         .await?;
     }
     replace_subagents_tx(&mut tx, agent_id, &req.subagents).await?;
+    replace_agent_secret_declarations_tx(&mut tx, agent_id, &req.secret_declarations).await?;
     tx.commit().await?;
     Ok(Json(
         load_agent_for_user(&state.pool, agent_id, &user).await?,
@@ -6283,6 +6305,10 @@ async fn create_hub_session_message(
         ));
     }
     let agent_id: Uuid = session.get("agent_id");
+    let missing_grants = missing_secret_grants(&state.pool, user.id, agent_id).await?;
+    if !missing_grants.is_empty() {
+        return Err(ApiError::requires_secret_grants(missing_grants));
+    }
     let mut tx = state.pool.begin().await?;
     ensure_agent_can_start_run_tx(&mut tx, agent_id, user.id).await?;
     let accepted = accept_session_message_tx(
@@ -12419,6 +12445,7 @@ async fn runtime_claim_run(
         model_policy: agent_row.get("a_model_policy"),
         sandbox_policy: agent_row.get("a_sandbox_policy"),
         managed_skill_ids: Vec::new(),
+        secret_declarations: Vec::new(),
         mcp_allowlist: agent_row.get("a_mcp_allowlist"),
         tool_allowlist: serde_json::from_value(agent_row.get("a_tool_allowlist"))
             .expect("Agent tool policy is constrained"),
@@ -12430,6 +12457,7 @@ async fn runtime_claim_run(
         updated_at: agent_row.get("a_updated_at"),
     };
     agent.subagents = load_subagents_tx(&mut tx, agent.id).await?;
+    agent.secret_declarations = load_agent_secret_declarations(&state.pool, agent.id).await?;
     apply_session_tool_policy_to_agent_tx(&mut tx, hub_session_id, &mut agent).await?;
     let execution_config_revision: i64 = agent_row.get("a_execution_config_revision");
     let skill_rows = sqlx::query(
@@ -12547,6 +12575,52 @@ async fn runtime_claim_run(
             context.tools = json!([]);
         }
     }
+    let mut secret_values = Vec::new();
+    {
+        let subject_user_id =
+            sqlx::query_scalar::<_, Uuid>("SELECT owner_id FROM hub_sessions WHERE id = $1")
+                .bind(hub_session_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if let Some(user_id) = subject_user_id {
+            for declaration in &agent.secret_declarations {
+                if declaration.kind != "value" {
+                    continue;
+                }
+                let authorized = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM secret_grants
+                        WHERE user_id = $1 AND agent_id = $2 AND secret_name = $3
+                     ) AND EXISTS(
+                        SELECT 1 FROM user_secrets WHERE owner_id = $1 AND name = $3
+                     )",
+                )
+                .bind(user_id)
+                .bind(agent.id)
+                .bind(&declaration.name)
+                .fetch_one(&mut *tx)
+                .await?;
+                if authorized {
+                    let (ciphertext, nonce) = sqlx::query_as::<_, (Vec<u8>, Vec<u8>)>(
+                        "SELECT value_ciphertext, value_nonce
+                         FROM user_secrets WHERE owner_id = $1 AND name = $2",
+                    )
+                    .bind(user_id)
+                    .bind(&declaration.name)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    let value = state
+                        .model_secret_cipher
+                        .decrypt(&ciphertext, &nonce)
+                        .map_err(|_| ApiError::internal("Secret decryption failed"))?;
+                    secret_values.push(RunSecretValueDto {
+                        name: declaration.name.clone(),
+                        value,
+                    });
+                }
+            }
+        }
+    }
     tx.commit().await?;
 
     Ok(Json(ClaimRunResponse {
@@ -12557,9 +12631,97 @@ async fn runtime_claim_run(
         integration_context,
         resume,
         model_proxy_token,
+        secret_values,
         session_context,
     })
     .into_response())
+}
+
+async fn runtime_download_run_secret_file(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((run_id, secret_name)): Path<(Uuid, String)>,
+) -> Result<Response, ApiError> {
+    let runtime_id = require_runtime(&state, &headers).await?;
+    let ownership_generation =
+        parse_required_header::<i64>(&headers, "x-agent-hub-ownership-generation")?;
+    validate_ownership_generation(ownership_generation)?;
+    if !validate_secret_name(&secret_name) {
+        return Err(ApiError::bad_request("secret name is invalid"));
+    }
+    let row = sqlx::query(
+        "SELECT runs.agent_id, sessions.owner_id
+         FROM runs
+         JOIN hub_sessions AS sessions ON sessions.id = runs.hub_session_id
+         WHERE runs.id = $1
+           AND runs.runtime_id = $2
+           AND runs.session_ownership_generation = $3
+           AND runs.status IN ('running', 'waiting_tool')",
+    )
+    .bind(run_id)
+    .bind(runtime_id)
+    .bind(ownership_generation)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(ApiError::not_found("Run secret file not found"))?;
+    let agent_id: Uuid = row.get("agent_id");
+    let owner_id: Uuid = row.get("owner_id");
+    let declared = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(
+            SELECT 1 FROM agent_secret_declarations
+            WHERE agent_id = $1 AND name = $2 AND kind = 'file'
+         )",
+    )
+    .bind(agent_id)
+    .bind(&secret_name)
+    .fetch_one(&state.pool)
+    .await?;
+    if !declared {
+        return Err(ApiError::not_found("Run secret file not found"));
+    }
+    let row = sqlx::query(
+        "SELECT us.file_ciphertext, us.file_nonce, us.file_name
+         FROM user_secrets AS us
+         WHERE us.owner_id = $1 AND us.name = $2
+           AND EXISTS(
+               SELECT 1 FROM secret_grants AS grants
+               WHERE grants.user_id = us.owner_id
+                 AND grants.agent_id = $3
+                 AND grants.secret_name = us.name
+           )",
+    )
+    .bind(owner_id)
+    .bind(&secret_name)
+    .bind(agent_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(ApiError::not_found("Run secret file not found"))?;
+    let ciphertext: Vec<u8> = row.get("file_ciphertext");
+    let nonce: Vec<u8> = row.get("file_nonce");
+    let file_name: String = row.get("file_name");
+    let plaintext = state
+        .model_secret_cipher
+        .decrypt(&ciphertext, &nonce)
+        .map_err(|_| ApiError::internal("Secret file decryption failed"))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(plaintext)
+        .map_err(|_| ApiError::internal("Secret file plaintext is invalid"))?;
+    let content_disposition = format!("attachment; filename=\"{file_name}\"");
+    Ok((
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            ),
+            (
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_str(&content_disposition)
+                    .map_err(|_| ApiError::internal("invalid secret file name"))?,
+            ),
+        ],
+        Body::from(bytes),
+    )
+        .into_response())
 }
 
 async fn runtime_download_run_skill_package(
@@ -17390,8 +17552,521 @@ async fn load_subagents_tx(
 
 async fn hydrate_agent_configuration(pool: &PgPool, agent: &mut AgentDto) -> Result<(), ApiError> {
     agent.managed_skill_ids = load_managed_skill_ids(pool, agent.id).await?;
+    agent.secret_declarations = load_agent_secret_declarations(pool, agent.id).await?;
     agent.subagents = load_subagents(pool, agent.id).await?;
     Ok(())
+}
+
+fn validate_secret_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        && (name.starts_with(|byte: char| byte.is_ascii_uppercase()) || name.starts_with('_'))
+}
+
+fn validate_secret_declarations(
+    declarations: &[AgentSecretDeclarationDto],
+) -> Result<(), ApiError> {
+    let mut names = BTreeSet::new();
+    for declaration in declarations {
+        if !validate_secret_name(&declaration.name)
+            || !matches!(declaration.kind.as_str(), "value" | "file")
+            || declaration.description.len() > 512
+            || !names.insert(declaration.name.clone())
+        {
+            return Err(ApiError::bad_request(
+                "Agent Secret Declarations must have unique valid names and kinds",
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn load_agent_secret_declarations(
+    pool: &PgPool,
+    agent_id: Uuid,
+) -> Result<Vec<AgentSecretDeclarationDto>, ApiError> {
+    let rows = sqlx::query(
+        "SELECT name, kind, description
+         FROM agent_secret_declarations
+         WHERE agent_id = $1
+         ORDER BY name",
+    )
+    .bind(agent_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| AgentSecretDeclarationDto {
+            name: row.get("name"),
+            kind: row.get("kind"),
+            description: row.get("description"),
+        })
+        .collect())
+}
+
+async fn replace_agent_secret_declarations_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    agent_id: Uuid,
+    declarations: &[AgentSecretDeclarationDto],
+) -> Result<(), ApiError> {
+    validate_secret_declarations(declarations)?;
+    sqlx::query("DELETE FROM agent_secret_declarations WHERE agent_id = $1")
+        .bind(agent_id)
+        .execute(&mut **tx)
+        .await?;
+    for declaration in declarations {
+        sqlx::query(
+            "INSERT INTO agent_secret_declarations (agent_id, name, kind, description)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(agent_id)
+        .bind(declaration.name.trim())
+        .bind(&declaration.kind)
+        .bind(declaration.description.trim())
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn missing_secret_grants(
+    pool: &PgPool,
+    user_id: Uuid,
+    agent_id: Uuid,
+) -> Result<Vec<SecretGrantRequirementDto>, ApiError> {
+    let declarations = load_agent_secret_declarations(pool, agent_id).await?;
+    let mut missing = Vec::new();
+    for declaration in declarations {
+        let owned = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM user_secrets WHERE owner_id = $1 AND name = $2",
+        )
+        .bind(user_id)
+        .bind(&declaration.name)
+        .fetch_optional(pool)
+        .await?;
+        if owned.is_none() {
+            continue;
+        }
+        let granted = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                SELECT 1 FROM secret_grants
+                WHERE user_id = $1 AND agent_id = $2 AND secret_name = $3
+             )",
+        )
+        .bind(user_id)
+        .bind(agent_id)
+        .bind(&declaration.name)
+        .fetch_one(pool)
+        .await?;
+        if !granted {
+            missing.push(SecretGrantRequirementDto {
+                name: declaration.name,
+                kind: declaration.kind,
+                description: declaration.description,
+            });
+        }
+    }
+    Ok(missing)
+}
+
+fn user_secret_from_row(row: sqlx::postgres::PgRow) -> UserSecretDto {
+    UserSecretDto {
+        id: row.get("id"),
+        owner_id: row.get("owner_id"),
+        name: row.get("name"),
+        kind: row.get("kind"),
+        file_name: row.get("file_name"),
+        file_size_bytes: row.get("file_size_bytes"),
+        file_sha256: row.get("file_sha256"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+async fn list_user_secrets(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<UserSecretDto>>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    let rows = sqlx::query(
+        "SELECT id, owner_id, name, kind, file_name, file_size_bytes, file_sha256,
+                created_at, updated_at
+         FROM user_secrets
+         WHERE owner_id = $1
+         ORDER BY created_at DESC, id",
+    )
+    .bind(user.id)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(rows.into_iter().map(user_secret_from_row).collect()))
+}
+
+async fn create_user_secret(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<CreateUserSecretRequest>,
+) -> Result<Json<UserSecretDto>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    if !validate_secret_name(&req.name) {
+        return Err(ApiError::bad_request("Secret name is invalid"));
+    }
+    let id = Uuid::new_v4();
+    let (
+        value_ciphertext,
+        value_nonce,
+        file_ciphertext,
+        file_nonce,
+        file_name,
+        file_size,
+        file_sha256,
+    ) = match req.kind.as_str() {
+        "value" => {
+            let value = req
+                .value
+                .ok_or(ApiError::bad_request("value is required"))?;
+            if value.is_empty() || value.len() > 8192 {
+                return Err(ApiError::bad_request(
+                    "Secret value must be between 1 and 8192 bytes",
+                ));
+            }
+            let encrypted = state
+                .model_secret_cipher
+                .encrypt(&value)
+                .map_err(|_| ApiError::internal("Secret encryption failed"))?;
+            (
+                Some(encrypted.ciphertext),
+                Some(encrypted.nonce),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        "file" => {
+            let file_name = req
+                .file_name
+                .ok_or(ApiError::bad_request("file_name is required"))?
+                .trim()
+                .to_owned();
+            if file_name.is_empty() || file_name.len() > 255 || file_name.contains('/') {
+                return Err(ApiError::bad_request("file_name is invalid"));
+            }
+            let encoded = req
+                .file_base64
+                .ok_or(ApiError::bad_request("file_base64 is required"))?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|_| ApiError::bad_request("file_base64 is invalid"))?;
+            if bytes.is_empty() || bytes.len() > 1024 * 1024 {
+                return Err(ApiError::bad_request(
+                    "Secret file must be between 1 byte and 1 MiB",
+                ));
+            }
+            let sha = format!("{:x}", Sha256::digest(&bytes));
+            let plaintext = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            let encrypted = state
+                .model_secret_cipher
+                .encrypt(&plaintext)
+                .map_err(|_| ApiError::internal("Secret file encryption failed"))?;
+            (
+                None,
+                None,
+                Some(encrypted.ciphertext),
+                Some(encrypted.nonce),
+                Some(file_name),
+                Some(bytes.len() as i64),
+                Some(sha),
+            )
+        }
+        _ => return Err(ApiError::bad_request("kind must be value or file")),
+    };
+    sqlx::query(
+        "INSERT INTO user_secrets
+             (id, owner_id, name, kind, value_ciphertext, value_nonce,
+              file_ciphertext, file_nonce, file_name, file_size_bytes, file_sha256)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+    )
+    .bind(id)
+    .bind(user.id)
+    .bind(req.name.trim())
+    .bind(&req.kind)
+    .bind(value_ciphertext)
+    .bind(value_nonce)
+    .bind(file_ciphertext)
+    .bind(file_nonce)
+    .bind(file_name)
+    .bind(file_size)
+    .bind(file_sha256)
+    .execute(&state.pool)
+    .await?;
+    let row = sqlx::query(
+        "SELECT id, owner_id, name, kind, file_name, file_size_bytes, file_sha256,
+                created_at, updated_at
+         FROM user_secrets WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&state.pool)
+    .await?;
+    Ok(Json(user_secret_from_row(row)))
+}
+
+async fn update_user_secret(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(secret_id): Path<Uuid>,
+    Json(req): Json<UpdateUserSecretRequest>,
+) -> Result<Json<UserSecretDto>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    let row = sqlx::query("SELECT kind FROM user_secrets WHERE id = $1 AND owner_id = $2")
+        .bind(secret_id)
+        .bind(user.id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(ApiError::not_found("secret not found"))?;
+    let kind: String = row.get("kind");
+    match kind.as_str() {
+        "value" => {
+            let value = req
+                .value
+                .ok_or(ApiError::bad_request("value is required"))?;
+            if value.is_empty() || value.len() > 8192 {
+                return Err(ApiError::bad_request(
+                    "Secret value must be between 1 and 8192 bytes",
+                ));
+            }
+            let encrypted = state
+                .model_secret_cipher
+                .encrypt(&value)
+                .map_err(|_| ApiError::internal("Secret encryption failed"))?;
+            sqlx::query(
+                "UPDATE user_secrets
+                 SET value_ciphertext = $1, value_nonce = $2, updated_at = now()
+                 WHERE id = $3 AND owner_id = $4",
+            )
+            .bind(encrypted.ciphertext)
+            .bind(encrypted.nonce)
+            .bind(secret_id)
+            .bind(user.id)
+            .execute(&state.pool)
+            .await?;
+        }
+        "file" => {
+            let encoded = req
+                .file_base64
+                .ok_or(ApiError::bad_request("file_base64 is required"))?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|_| ApiError::bad_request("file_base64 is invalid"))?;
+            if bytes.is_empty() || bytes.len() > 1024 * 1024 {
+                return Err(ApiError::bad_request(
+                    "Secret file must be between 1 byte and 1 MiB",
+                ));
+            }
+            let file_name = req
+                .file_name
+                .ok_or(ApiError::bad_request("file_name is required"))?
+                .trim()
+                .to_owned();
+            if file_name.is_empty() || file_name.len() > 255 || file_name.contains('/') {
+                return Err(ApiError::bad_request("file_name is invalid"));
+            }
+            let sha = format!("{:x}", Sha256::digest(&bytes));
+            let plaintext = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            let encrypted = state
+                .model_secret_cipher
+                .encrypt(&plaintext)
+                .map_err(|_| ApiError::internal("Secret file encryption failed"))?;
+            sqlx::query(
+                "UPDATE user_secrets
+                 SET file_ciphertext = $1, file_nonce = $2, file_name = $3,
+                     file_size_bytes = $4, file_sha256 = $5, updated_at = now()
+                 WHERE id = $6 AND owner_id = $7",
+            )
+            .bind(encrypted.ciphertext)
+            .bind(encrypted.nonce)
+            .bind(file_name)
+            .bind(bytes.len() as i64)
+            .bind(sha)
+            .bind(secret_id)
+            .bind(user.id)
+            .execute(&state.pool)
+            .await?;
+        }
+        _ => return Err(ApiError::internal("secret kind is invalid")),
+    }
+    let row = sqlx::query(
+        "SELECT id, owner_id, name, kind, file_name, file_size_bytes, file_sha256,
+                created_at, updated_at
+         FROM user_secrets WHERE id = $1",
+    )
+    .bind(secret_id)
+    .fetch_one(&state.pool)
+    .await?;
+    Ok(Json(user_secret_from_row(row)))
+}
+
+async fn delete_user_secret(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(secret_id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    let name = sqlx::query_scalar::<_, String>(
+        "SELECT name FROM user_secrets WHERE id = $1 AND owner_id = $2",
+    )
+    .bind(secret_id)
+    .bind(user.id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(ApiError::not_found("secret not found"))?;
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("DELETE FROM user_secrets WHERE id = $1 AND owner_id = $2")
+        .bind(secret_id)
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM secret_grants WHERE user_id = $1 AND secret_name = $2")
+        .bind(user.id)
+        .bind(&name)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct SecretGrantListQuery {
+    agent_id: Option<Uuid>,
+}
+
+async fn list_secret_grants(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<SecretGrantListQuery>,
+) -> Result<Json<Vec<SecretGrantDto>>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    let mut builder = sqlx::QueryBuilder::<Postgres>::new(
+        "SELECT user_id, agent_id, secret_name, granted_at FROM secret_grants WHERE user_id = ",
+    );
+    builder.push_bind(user.id);
+    if let Some(agent_id) = query.agent_id {
+        builder.push(" AND agent_id = ");
+        builder.push_bind(agent_id);
+    }
+    builder.push(" ORDER BY granted_at DESC, secret_name");
+    let rows = builder.build().fetch_all(&state.pool).await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| SecretGrantDto {
+                user_id: row.get("user_id"),
+                agent_id: row.get("agent_id"),
+                secret_name: row.get("secret_name"),
+                granted_at: row.get("granted_at"),
+            })
+            .collect(),
+    ))
+}
+
+async fn create_secret_grants(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<CreateSecretGrantRequest>,
+) -> Result<Json<Vec<SecretGrantDto>>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    load_agent_for_user(&state.pool, req.agent_id, &user).await?;
+    if req.secret_names.is_empty() || req.secret_names.len() > 128 {
+        return Err(ApiError::bad_request(
+            "secret_names must contain between 1 and 128 entries",
+        ));
+    }
+    let mut tx = state.pool.begin().await?;
+    for name in &req.secret_names {
+        if !validate_secret_name(name) {
+            return Err(ApiError::bad_request("secret name is invalid"));
+        }
+        let declared = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                SELECT 1 FROM agent_secret_declarations
+                WHERE agent_id = $1 AND name = $2
+             )",
+        )
+        .bind(req.agent_id)
+        .bind(name)
+        .fetch_one(&mut *tx)
+        .await?;
+        let owned = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                SELECT 1 FROM user_secrets WHERE owner_id = $1 AND name = $2
+             )",
+        )
+        .bind(user.id)
+        .bind(name)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !declared || !owned {
+            return Err(ApiError::bad_request(format!(
+                "secret {name} is not declared by the Agent or not owned by the user"
+            )));
+        }
+        sqlx::query(
+            "INSERT INTO secret_grants (user_id, agent_id, secret_name)
+             VALUES ($1, $2, $3)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(user.id)
+        .bind(req.agent_id)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    let rows = sqlx::query(
+        "SELECT user_id, agent_id, secret_name, granted_at
+         FROM secret_grants
+         WHERE user_id = $1 AND agent_id = $2
+           AND secret_name = ANY($3)
+         ORDER BY granted_at DESC, secret_name",
+    )
+    .bind(user.id)
+    .bind(req.agent_id)
+    .bind(&req.secret_names)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| SecretGrantDto {
+                user_id: row.get("user_id"),
+                agent_id: row.get("agent_id"),
+                secret_name: row.get("secret_name"),
+                granted_at: row.get("granted_at"),
+            })
+            .collect(),
+    ))
+}
+
+async fn delete_secret_grant(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((agent_id, secret_name)): Path<(Uuid, String)>,
+) -> Result<StatusCode, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    if !validate_secret_name(&secret_name) {
+        return Err(ApiError::bad_request("secret name is invalid"));
+    }
+    sqlx::query(
+        "DELETE FROM secret_grants
+         WHERE user_id = $1 AND agent_id = $2 AND secret_name = $3",
+    )
+    .bind(user.id)
+    .bind(agent_id)
+    .bind(&secret_name)
+    .execute(&state.pool)
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 fn normalized_subagents(definitions: &[SubagentDefinition]) -> Vec<String> {
@@ -17431,6 +18106,23 @@ fn agent_execution_configuration_changed(
             != normalized_unordered_entries(&request.mcp_allowlist)
         || existing.tool_allowlist != request.tool_allowlist
         || existing_skill_ids != requested_skill_ids
+        || normalized_secret_declarations(&existing.secret_declarations)
+            != normalized_secret_declarations(&request.secret_declarations)
+}
+
+fn normalized_secret_declarations(declarations: &[AgentSecretDeclarationDto]) -> Vec<String> {
+    let mut entries = declarations
+        .iter()
+        .map(|declaration| {
+            canonical_json(&json!({
+                "name": declaration.name,
+                "kind": declaration.kind,
+                "description": declaration.description,
+            }))
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries
 }
 
 fn normalized_unordered_entries(value: &Value) -> Vec<String> {
@@ -17651,6 +18343,7 @@ fn build_agent_execution_configuration(
         model_policy: agent.model_policy.clone(),
         sandbox_policy: agent.sandbox_policy.clone(),
         skills: skills.into_values().collect(),
+        secret_declarations: agent.secret_declarations.clone(),
         mcp_allowlist: agent.mcp_allowlist.clone(),
         tool_allowlist: agent.tool_allowlist.clone(),
     })
@@ -21821,6 +22514,7 @@ fn agent_from_row(row: sqlx::postgres::PgRow) -> AgentDto {
         model_policy: row.get("model_policy"),
         sandbox_policy: row.get("sandbox_policy"),
         managed_skill_ids: row.try_get("managed_skill_ids").unwrap_or_default(),
+        secret_declarations: Vec::new(),
         mcp_allowlist: row.get("mcp_allowlist"),
         tool_allowlist: row
             .try_get::<Value, _>("tool_allowlist")
@@ -22192,6 +22886,7 @@ struct ApiError {
     status: StatusCode,
     message: String,
     retry_after_seconds: Option<u64>,
+    details: Option<Value>,
 }
 
 impl ApiError {
@@ -22200,6 +22895,7 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
             retry_after_seconds: None,
+            details: None,
         }
     }
 
@@ -22208,6 +22904,7 @@ impl ApiError {
             status: StatusCode::UNAUTHORIZED,
             message: message.into(),
             retry_after_seconds: None,
+            details: None,
         }
     }
 
@@ -22216,6 +22913,7 @@ impl ApiError {
             status: StatusCode::FORBIDDEN,
             message: message.into(),
             retry_after_seconds: None,
+            details: None,
         }
     }
 
@@ -22224,6 +22922,7 @@ impl ApiError {
             status: StatusCode::CONFLICT,
             message: message.into(),
             retry_after_seconds: None,
+            details: None,
         }
     }
 
@@ -22232,6 +22931,7 @@ impl ApiError {
             status: StatusCode::GONE,
             message: message.into(),
             retry_after_seconds: None,
+            details: None,
         }
     }
 
@@ -22240,6 +22940,7 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             message: message.into(),
             retry_after_seconds: None,
+            details: None,
         }
     }
 
@@ -22248,6 +22949,7 @@ impl ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
             retry_after_seconds: None,
+            details: None,
         }
     }
 
@@ -22256,6 +22958,7 @@ impl ApiError {
             status: StatusCode::BAD_GATEWAY,
             message: message.into(),
             retry_after_seconds: None,
+            details: None,
         }
     }
 
@@ -22264,6 +22967,7 @@ impl ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: message.into(),
             retry_after_seconds: None,
+            details: None,
         }
     }
 
@@ -22272,6 +22976,7 @@ impl ApiError {
             status: StatusCode::GATEWAY_TIMEOUT,
             message: message.into(),
             retry_after_seconds: None,
+            details: None,
         }
     }
 
@@ -22280,13 +22985,27 @@ impl ApiError {
             status: StatusCode::TOO_MANY_REQUESTS,
             message: message.into(),
             retry_after_seconds: Some(retry_after_seconds),
+            details: None,
+        }
+    }
+
+    fn requires_secret_grants(requirements: Vec<SecretGrantRequirementDto>) -> Self {
+        Self {
+            status: StatusCode::from_u16(428).unwrap_or(StatusCode::BAD_REQUEST),
+            message: "the Agent requires additional Secret Grants".into(),
+            retry_after_seconds: None,
+            details: Some(json!({ "secret_grants_required": requirements })),
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let mut response = (self.status, Json(json!({ "error": self.message }))).into_response();
+        let mut body = json!({ "error": self.message });
+        if let Some(details) = self.details {
+            body["details"] = details;
+        }
+        let mut response = (self.status, Json(body)).into_response();
         if let Some(retry_after_seconds) = self.retry_after_seconds {
             if let Ok(value) = HeaderValue::from_str(&retry_after_seconds.to_string()) {
                 response.headers_mut().insert(header::RETRY_AFTER, value);
