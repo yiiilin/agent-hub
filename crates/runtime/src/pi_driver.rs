@@ -435,10 +435,7 @@ impl PiFilesystemSandbox {
         Self::add_directory(&mut rules, &run_env.workdir, workspace_access)?;
         let secret_readable = tools
             .iter()
-            .any(|tool| matches!(tool.as_str(), "read" | "grep" | "find" | "ls"))
-            && !tools
-                .iter()
-                .any(|tool| matches!(tool.as_str(), "bash" | "edit" | "write"));
+            .any(|tool| matches!(tool.as_str(), "read" | "grep" | "find" | "ls"));
         if secret_readable {
             Self::add_optional_directory(
                 &mut rules,
@@ -2572,7 +2569,7 @@ if [ "$$" -ne 1 ] && IFS= read -r _ < /proc/1/maps; then exit 31; fi
     }
 
     #[test]
-    fn landlock_secret_files_require_read_capable_tools_without_bash_edit_or_write() {
+    fn landlock_secret_files_are_readable_for_granted_read_capable_tools() {
         let temp = tempfile::tempdir().unwrap();
         let fixture = isolated_run_env(temp.path(), "first");
         let secret_dir = fixture.run_env.engine_state_root.join("secrets");
@@ -2580,67 +2577,39 @@ if [ "$$" -ne 1 ] && IFS= read -r _ < /proc/1/maps; then exit 31; fi
         let secret_file = secret_dir.join("secret.txt");
         fs::write(&secret_file, "granted-secret\n").unwrap();
 
-        let output = run_sandboxed_shell(
-            &fixture,
-            &["read", "grep", "find", "ls"],
-            "IFS= read -r value < \"$1\"\n[ \"$value\" = \"granted-secret\" ]\nprintf 'secret-read-ok\\n'\n",
-            &[&secret_file],
-        );
-        assert!(
-            output.status.success(),
-            "secrets must be readable with read-capable tools: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(
-            String::from_utf8(output.stdout).unwrap(),
-            "secret-read-ok\n"
-        );
+        let read_script = "IFS= read -r value < \"$1\"\n[ \"$value\" = \"granted-secret\" ]\nprintf 'secret-read-ok\\n'\n";
+        for tools in [
+            &["read", "grep", "find", "ls"][..],
+            &["read", "bash"][..],
+            &["read", "edit"][..],
+            &["read", "write"][..],
+        ] {
+            let output = run_sandboxed_shell(&fixture, tools, read_script, &[&secret_file]);
+            assert!(
+                output.status.success(),
+                "secrets must be readable with granted read-capable tools {:?}: {}",
+                tools,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                "secret-read-ok\n"
+            );
+        }
 
-        let denied_by_bash = run_sandboxed_shell(
+        let denied_by_bash_only = run_sandboxed_shell(
             &fixture,
             &["bash"],
             "if /bin/sh -c 'IFS= read -r _ < \"$1\"' sh \"$1\"; then exit 91; fi\nprintf 'secret-read-denied\\n'\n",
             &[&secret_file],
         );
         assert!(
-            denied_by_bash.status.success(),
-            "secrets must be hidden from bash-only tools: {}",
-            String::from_utf8_lossy(&denied_by_bash.stderr)
+            denied_by_bash_only.status.success(),
+            "secrets must stay hidden from tools without read capability: {}",
+            String::from_utf8_lossy(&denied_by_bash_only.stderr)
         );
         assert_eq!(
-            String::from_utf8(denied_by_bash.stdout).unwrap(),
-            "secret-read-denied\n"
-        );
-
-        let denied_by_edit = run_sandboxed_shell(
-            &fixture,
-            &["read", "edit"],
-            "if /bin/sh -c 'IFS= read -r _ < \"$1\"' sh \"$1\"; then exit 92; fi\nprintf 'secret-read-denied\\n'\n",
-            &[&secret_file],
-        );
-        assert!(
-            denied_by_edit.status.success(),
-            "secrets must be hidden when edit is enabled: {}",
-            String::from_utf8_lossy(&denied_by_edit.stderr)
-        );
-        assert_eq!(
-            String::from_utf8(denied_by_edit.stdout).unwrap(),
-            "secret-read-denied\n"
-        );
-
-        let denied_by_write = run_sandboxed_shell(
-            &fixture,
-            &["read", "write"],
-            "if /bin/sh -c 'IFS= read -r _ < \"$1\"' sh \"$1\"; then exit 93; fi\nprintf 'secret-read-denied\\n'\n",
-            &[&secret_file],
-        );
-        assert!(
-            denied_by_write.status.success(),
-            "secrets must be hidden when write is enabled: {}",
-            String::from_utf8_lossy(&denied_by_write.stderr)
-        );
-        assert_eq!(
-            String::from_utf8(denied_by_write.stdout).unwrap(),
+            String::from_utf8(denied_by_bash_only.stdout).unwrap(),
             "secret-read-denied\n"
         );
     }
