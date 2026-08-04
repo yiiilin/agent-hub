@@ -12606,7 +12606,14 @@ async fn runtime_claim_run(
                 .fetch_one(&mut *tx)
                 .await?;
                 if authorized {
-                    match declaration.kind.as_str() {
+                    let secret_kind = sqlx::query_scalar::<_, String>(
+                        "SELECT kind FROM user_secrets WHERE owner_id = $1 AND name = $2",
+                    )
+                    .bind(user_id)
+                    .bind(&declaration.name)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                    match secret_kind.as_str() {
                         "value" => {
                             let (ciphertext, nonce) = sqlx::query_as::<_, (Vec<u8>, Vec<u8>)>(
                                 "SELECT value_ciphertext, value_nonce
@@ -12695,7 +12702,7 @@ async fn runtime_download_run_secret_file(
     let declared = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS(
             SELECT 1 FROM agent_secret_declarations
-            WHERE agent_id = $1 AND name = $2 AND kind = 'file'
+            WHERE agent_id = $1 AND name = $2
          )",
     )
     .bind(agent_id)
@@ -17676,6 +17683,11 @@ async fn missing_secret_grants(
         if owned.is_none() {
             continue;
         }
+        let secret_kind =
+            sqlx::query_scalar::<_, String>("SELECT kind FROM user_secrets WHERE id = $1")
+                .bind(owned.unwrap())
+                .fetch_one(pool)
+                .await?;
         let granted = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(
                 SELECT 1 FROM secret_grants
@@ -17690,7 +17702,7 @@ async fn missing_secret_grants(
         if !granted {
             missing.push(SecretGrantRequirementDto {
                 name: declaration.name,
-                kind: declaration.kind,
+                kind: secret_kind,
                 description: declaration.description,
             });
         }

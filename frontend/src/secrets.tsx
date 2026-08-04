@@ -20,8 +20,8 @@ function readFileAsBase64(file: File): Promise<string> {
   });
 }
 
-function formatFileSize(bytes: number | null, locale: string) {
-  if (bytes === null) return '-';
+function formatFileSize(bytes: number | null | undefined, locale: string) {
+  if (bytes === null || bytes === undefined || !Number.isFinite(bytes)) return '-';
   return new Intl.NumberFormat(locale, {
     style: 'unit',
     unit: 'byte',

@@ -185,9 +185,8 @@ function SecretDeclarationsEditor({ declarations, disabled, onChange }: { declar
   return <section className="secret-variable-editor">
     <div className="agent-subagent-heading"><span className="field-label">{t('secretVariables')}</span><button type="button" className="secondary" disabled={disabled || declarations.length >= 128} onClick={() => onChange([...declarations, emptySecretDeclaration()])}><Plus size={16} /> {t('addSecretVariable')}</button></div>
     {declarations.length === 0 ? <div className="compact-empty">{t('noSecretVariables')}</div> : <div className="secret-variable-list">
-      {declarations.map((declaration, index) => <div className="secret-variable-row" key={`${declaration.name}-${index}`}>
+      {declarations.map((declaration, index) => <div className="secret-variable-row" key={index}>
         <label>{t('secretName')}<input maxLength={128} disabled={disabled} value={declaration.name} onChange={(event) => update(index, { name: event.target.value })} /></label>
-        <label>{t('secretKind')}<select disabled={disabled} value={declaration.kind} onChange={(event) => update(index, { kind: event.target.value === 'file' ? 'file' : 'value' })}><option value="value">{t('secretKindValue')}</option><option value="file">{t('secretKindFile')}</option></select></label>
         <label>{t('secretDescription')}<input maxLength={512} disabled={disabled} value={declaration.description} onChange={(event) => update(index, { description: event.target.value })} /></label>
         <button type="button" className="icon-button" disabled={disabled} aria-label={`${t('removeSecretVariable')}: ${declaration.name || index + 1}`} title={t('removeSecretVariable')} onClick={() => onChange(declarations.filter((_, candidateIndex) => candidateIndex !== index))}><Trash2 size={16} /></button>
       </div>)}
@@ -1347,8 +1346,8 @@ export function AgentPage({
     <div className="agent-detail-layout">
       <aside className="agent-inspector" role="complementary" aria-label={t('agentInspector')}>
         <section className="agent-identity"><Bot size={28} /><div><strong>{agent.name}</strong><span>{agent.instructions}</span></div></section>
-        <section><h2>{t('agentInspectorRuntime')}</h2><dl><div><dt>{t('agentAvailability')}</dt><dd>{availabilityLabel(availability, t)}</dd></div><div><dt>{t('runtime')}</dt><dd>{runtime?.hostname ?? availabilityLabel(availability, t)}</dd></div></dl></section>
-        <section><h2>{t('agentInspectorModel')}</h2><dl><div><dt>{t('agentModelSelection')}</dt><dd>{modelName(agent.model_selection, modelOptions.items, t('modelNotConfigured'))}</dd></div><div><dt>{t('reasoningEffort')}</dt><dd>{agent.model_settings.reasoning_effort}</dd></div><div><dt>{t('subagents')}</dt><dd>{agent.subagents.length}</dd></div></dl></section>
+        <section><h2>{t('agentInspectorRuntime')}</h2><dl><div><dt>{t('runtime')}</dt><dd>{runtime?.hostname ?? availabilityLabel(availability, t)}</dd></div></dl></section>
+        <section><h2>{t('agentInspectorModel')}</h2><dl><div><dt>{t('agentModelSelection')}</dt><dd>{modelName(agent.model_selection, modelOptions.items, t('modelNotConfigured'))}</dd></div></dl></section>
         <section><h2>{t('agentInspectorAccess')}</h2><dl><div><dt>{t('visibility')}</dt><dd>{visibilityLabel(agent.visibility, t)}</dd></div>{agent.visibility === 'public_to' && <div><dt>{t('agentPublicTo')}</dt><dd>{agent.public_to.length}</dd></div>}</dl></section>
         <section><h2>{t('managedSkills')}</h2><div className="agent-skill-chips">{managedSkills.map((skill) => <span key={skill.id}>{skill.name}</span>)}{managedSkills.length === 0 && <span>{t('none')}</span>}</div></section>
         <section><h2>{t('details')}</h2><dl><div><dt>{t('created')}</dt><dd>{new Date(agent.created_at).toLocaleString(locale)}</dd></div><div><dt>{t('updated')}</dt><dd>{new Date(agent.updated_at).toLocaleString(locale)}</dd></div></dl></section>
