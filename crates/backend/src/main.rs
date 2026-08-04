@@ -6094,6 +6094,10 @@ async fn create_run(
         ));
     }
     let agent = load_agent_for_user(&state.pool, agent_id, &user).await?;
+    let missing_grants = missing_secret_grants(&state.pool, user.id, agent_id).await?;
+    if !missing_grants.is_empty() {
+        return Err(ApiError::requires_secret_grants(missing_grants));
+    }
     let mut tx = state.pool.begin().await?;
     let existing_session_id = match req.hub_session_id {
         Some(session_id) => Some(session_id),

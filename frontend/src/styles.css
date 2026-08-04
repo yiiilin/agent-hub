@@ -1021,6 +1021,7 @@ textarea {
 .session-activity-status:is(.status-error, .status-timeout, .status-timed_out, .status-unknown, .status-cancelled) { border-color: #ead1ce; background: #fff2f1; color: #9a3d37; }
 .session-activity-content > code { display: block; color: #303136; white-space: pre-wrap; }
 .session-activity-summary { white-space: pre-wrap; }
+.session-reasoning-text { color: var(--color-muted-foreground); font-size: 13px; line-height: 1.5; white-space: pre-wrap; padding: 2px 0 6px; }
 .session-activity-output { min-width: 0; display: grid; gap: 3px; border-left: 2px solid #d7d7d7; padding-left: 8px; }
 .session-activity-output > span { color: #77777c; font-size: 10px; font-weight: 650; }
 .session-activity-output pre { min-width: 0; max-height: 220px; overflow: auto; margin: 0; color: #414147; font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }

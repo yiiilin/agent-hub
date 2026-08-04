@@ -1160,6 +1160,12 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
               {!conversationDraft && !messagesLoading && !messagesError && timelineItems.length === 0 && <div className="operation-state">{t('noMessages')}</div>}
               {!conversationDraft && timelineItems.map((entry, index) => {
                 if (entry.kind === 'activity-group') {
+                  const reasoningText = entry.activities.every((activity) => activity.kind === 'reasoning')
+                    ? entry.activities.map((activity) => activity.summary).filter(Boolean).join('\\n')
+                    : '';
+                  if (reasoningText) {
+                    return <div className="session-reasoning-text" key={entry.id}>{reasoningText}</div>;
+                  }
                   const active = activeRunInProgress && entry.runId === activeRunId;
                   const window = activityGroupProcessingWindow(timelineItems, index, runProcessingWindows.get(entry.runId), active);
                   return <ChatActivityGroup
