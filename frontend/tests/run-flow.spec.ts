@@ -1142,6 +1142,67 @@ test('widget dispatches and renders ordered Client Tool technical events at desk
   expect(failedApi).toEqual([]);
 });
 
+
+test('widget live steps keep real event order even when inferred start times disagree', async ({ page }) => {
+  const runId = '70000000-0000-0000-0000-000000000071';
+  const sessionId = '71000000-0000-0000-0000-000000000071';
+  const startedAt = Date.now();
+  const pageErrors: string[] = [];
+  const consoleErrors: string[] = [];
+  page.on('pageerror', (error) => pageErrors.push(error.message));
+  page.on('console', (message) => { if (message.type() === 'error') consoleErrors.push(message.text()); });
+  await page.route('**/api/**', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const path = url.pathname;
+    if (path === '/api/widget/session') return route.fulfill({ json: {
+      id: 'agent-id', name: 'Ordered Widget Agent', instructions: '',
+      expires_at: new Date(startedAt + 60 * 60_000).toISOString(), history_enabled: false
+    } });
+    if (path === '/api/client/runs' && request.method() === 'POST') {
+      return route.fulfill({ json: {
+        id: runId, agent_id: 'agent-id', automation_id: null, integration_session_id: sessionId,
+        parent_run_id: null, runtime_id: null, hub_session_id: '72000000-0000-0000-0000-000000000071',
+        hub_message_id: null, hub_turn_id: null, session_ownership_generation: null,
+        status: 'running', initial_message: 'Order the steps', native_session_id: 'native-session',
+        work_dir_ref: 'workspace', source: 'widget', created_at: new Date(startedAt).toISOString(),
+        updated_at: new Date(startedAt).toISOString()
+      } });
+    }
+    if (path === `/api/client/sessions/${sessionId}/messages`) return route.fulfill({ json: [] });
+    if (path === `/api/client/sessions/${sessionId}/events/stream`) {
+      if (url.searchParams.has('after')) return route.fulfill({ contentType: 'text/event-stream', body: '' });
+      const events = [
+        { seq: 1, run_id: runId, event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'thought-a', item_type: 'reasoning', phase: 'started', duration_ms: 3000 }, created_at: new Date(startedAt + 5_000).toISOString() },
+        { seq: 2, run_id: runId, event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'thought-a', item_type: 'reasoning', phase: 'completed', summary: ['Widget first thought.'], duration_ms: 3000 }, created_at: new Date(startedAt + 6_000).toISOString() },
+        { seq: 3, run_id: runId, event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'tool-b', item_type: 'dynamicToolCall', phase: 'started', tool: 'inspect_widget_b' }, created_at: new Date(startedAt + 8_000).toISOString() },
+        { seq: 4, run_id: runId, event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'tool-b', item_type: 'dynamicToolCall', phase: 'completed', tool: 'inspect_widget_b', output: 'b done' }, created_at: new Date(startedAt + 9_000).toISOString() },
+        { seq: 5, run_id: runId, event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'tool-c', item_type: 'dynamicToolCall', phase: 'started', tool: 'inspect_widget_c' }, created_at: new Date(startedAt + 10_000).toISOString() },
+        { seq: 6, run_id: runId, event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'tool-c', item_type: 'dynamicToolCall', phase: 'completed', tool: 'inspect_widget_c', output: 'c done' }, created_at: new Date(startedAt + 11_000).toISOString() },
+        { seq: 7, run_id: runId, event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'thought-d', item_type: 'reasoning', phase: 'started', duration_ms: 9000 }, created_at: new Date(startedAt + 12_000).toISOString() },
+        { seq: 8, run_id: runId, event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'thought-d', item_type: 'reasoning', phase: 'completed', summary: ['Widget second thought.'], duration_ms: 9000 }, created_at: new Date(startedAt + 13_000).toISOString() }
+      ];
+      return route.fulfill({
+        contentType: 'text/event-stream',
+        body: events.map((event) => `event: run_event\ndata: ${JSON.stringify(event)}\n\n`).join('')
+      });
+    }
+    return route.fulfill({ status: 404, json: { error: `Unhandled test route: ${path}` } });
+  });
+  await page.goto('/widget#token=widget-token');
+  await expect(page.getByText('Ordered Widget Agent')).toBeVisible();
+  await page.getByRole('textbox', { name: 'Message' }).fill('Order the steps');
+  await page.getByRole('button', { name: 'Send' }).click();
+  const steps = page.locator('.session-live-steps > *');
+  await expect(steps).toHaveCount(4);
+  await expect(steps.nth(0)).toContainText('Widget first thought.');
+  await expect(steps.nth(1)).toContainText('inspect_widget_b');
+  await expect(steps.nth(2)).toContainText('inspect_widget_c');
+  await expect(steps.nth(3)).toContainText('Widget second thought.');
+  expect(pageErrors).toEqual([]);
+  expect(consoleErrors).toEqual([]);
+});
+
 function modelProxyConfigProbe(workDirRef: string) {
   const runRoot = dirname(workDirRef);
   const script = `

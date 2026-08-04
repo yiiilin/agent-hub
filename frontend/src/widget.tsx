@@ -23,6 +23,7 @@ import {
   ActivityLiveStep,
   activityGroupProcessingWindow,
   activityGroupIsClosed,
+  compareTimelineEntries,
   mergeRunEvents,
   projectActivities,
   projectRunFailures,
@@ -743,7 +744,7 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
         failure
       });
     }
-    entries.sort((left, right) => left.occurredAt - right.occurredAt || left.sequence - right.sequence);
+    entries.sort(compareTimelineEntries);
     return entries.reduce<TimelineItem[]>((items, entry) => {
       if (entry.kind !== 'activity') {
         items.push(entry);

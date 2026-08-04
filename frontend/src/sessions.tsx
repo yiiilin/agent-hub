@@ -75,7 +75,7 @@ type TimelineEntry =
   | { kind: 'message'; id: string; sequence: number; occurredAt: number; outputEndedAt?: number; runId: string | null; role: string; content: string; state?: string; mode?: string }
   | { kind: 'live'; id: string; sequence: number; occurredAt: number; outputEndedAt?: number; runId: string; role: string; content: string }
   | { kind: 'failure'; id: string; sequence: number; occurredAt: number; runId: string; failure: RunFailureEntry }
-  | { kind: 'activity'; id: string; sequence: number; occurredAt: number; activity: ActivityEntry };
+  | { kind: 'activity'; id: string; sequence: number; occurredAt: number; runId: string; activity: ActivityEntry };
 
 type TimelineItem = Exclude<TimelineEntry, { kind: 'activity' }>
   | { kind: 'activity-group'; id: string; runId: string; activities: ActivityEntry[] };
@@ -434,8 +434,18 @@ export function projectActivities(events: RunEvent[]) {
     activities.set(key, current ? mergeActivity(current, activity) : activity);
   }
   return [...activities.values()].sort((left, right) => (
-    left.occurredAt - right.occurredAt || left.sequence - right.sequence
+    left.runId.localeCompare(right.runId) || left.sequence - right.sequence
   ));
+}
+
+export function compareTimelineEntries(
+  left: { kind: string; runId: string | null; occurredAt: number; sequence: number; activity?: { sequence: number } },
+  right: { kind: string; runId: string | null; occurredAt: number; sequence: number; activity?: { sequence: number } }
+) {
+  if (left.kind === 'activity' && right.kind === 'activity' && left.runId !== null && left.runId === right.runId) {
+    return (left.activity?.sequence ?? 0) - (right.activity?.sequence ?? 0);
+  }
+  return left.occurredAt - right.occurredAt || left.sequence - right.sequence;
 }
 
 export function resizeComposer(textarea: HTMLTextAreaElement | null) {
@@ -973,6 +983,7 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
         id: activity.id,
         sequence: activity.sequence * 1000 + 2,
         occurredAt: activity.occurredAt,
+        runId: activity.runId,
         activity
       });
     }
@@ -986,7 +997,7 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
         failure
       });
     }
-    return entries.sort((left, right) => left.occurredAt - right.occurredAt || left.sequence - right.sequence);
+    return entries.sort(compareTimelineEntries);
   }, [sessionEvents, sessionMessages]);
   const timelineItems = useMemo(() => {
     return timeline.reduce<TimelineItem[]>((items, entry) => {

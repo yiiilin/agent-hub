@@ -858,7 +858,7 @@ test('processing time is split by visible replies while tool work stays in the s
   await expect(groups.nth(1)).toContainText('Prepared the final answer.');
 });
 
-test('an unfinished processing segment keeps increasing without a duplicate thinking bubble', async ({ page }) => {
+test('an unfinished processing segment renders live steps without a duplicate thinking bubble', async ({ page }) => {
   const startedAt = Date.now() - 250;
   await installSessionApi(page, {
     activeMessages: [
@@ -873,25 +873,24 @@ test('an unfinished processing segment keeps increasing without a duplicate thin
   await page.goto('/sessions');
 
   const detail = page.getByRole('region', { name: 'Session details' });
-  const summary = detail.locator('details.session-activity-events summary');
-  await expect(summary).toContainText('Worked for');
-  const first = Number.parseFloat((await summary.textContent())?.match(/[\d.]+/)?.[0] ?? '0');
-  await page.waitForTimeout(1_200);
-  const second = Number.parseFloat((await summary.textContent())?.match(/[\d.]+/)?.[0] ?? '0');
-  expect(second).toBeGreaterThan(first);
+  const liveSteps = detail.locator('.session-live-steps');
+  await expect(liveSteps).toBeVisible();
+  await expect(liveSteps).toContainText('Thought');
+  await expect(detail.locator('details.session-activity-events')).toHaveCount(0);
   await expect(detail.locator('.session-thinking')).toHaveCount(0);
 });
 
-test('an active processing segment anchors to server timestamps instead of the browser clock', async ({ page }) => {
+test('a closed processing segment anchors its duration to server timestamps instead of the browser clock', async ({ page }) => {
   const startedAt = Date.now() - 60_000;
-  const latestEventAt = startedAt + 5_000;
   await installSessionApi(page, {
     activeMessages: [
-      message('active', 1, 'user', 'Measure processing from the bubble.', { accepted_at: new Date(startedAt).toISOString() })
+      message('active', 1, 'user', 'Measure processing from the bubble.', { accepted_at: new Date(startedAt).toISOString() }),
+      message('active', 2, 'assistant', 'Replied from the server.', { accepted_at: new Date(startedAt + 10_000).toISOString() })
     ],
     activeEvents: [
-      { seq: 1, run_id: 'run-active', event_type: 'status', role: null, content: 'running', payload: { status: 'running' }, created_at: new Date(latestEventAt).toISOString() },
-      { seq: 2, run_id: 'run-active', event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'reasoning-live', item_type: 'reasoning', phase: 'started' }, created_at: new Date(latestEventAt).toISOString() }
+      { seq: 1, run_id: 'run-active', event_type: 'status', role: null, content: 'running', payload: { status: 'running' }, created_at: new Date(startedAt + 100).toISOString() },
+      { seq: 2, run_id: 'run-active', event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'reasoning-live', item_type: 'reasoning', phase: 'started' }, created_at: new Date(startedAt + 5_000).toISOString() },
+      { seq: 3, run_id: 'run-active', event_type: 'status', role: null, content: 'completed', payload: { status: 'completed' }, created_at: new Date(startedAt + 9_000).toISOString() }
     ],
     activeStreamEvents: []
   });
@@ -899,13 +898,44 @@ test('an active processing segment anchors to server timestamps instead of the b
 
   const detail = page.getByRole('region', { name: 'Session details' });
   const summary = detail.locator('details.session-activity-events summary');
-  await expect(summary).toContainText('Worked for');
-  const first = Number.parseFloat((await summary.textContent())?.match(/[\d.]+/)?.[0] ?? '0');
-  expect(first).toBeGreaterThanOrEqual(4);
-  expect(first).toBeLessThan(15);
-  await page.waitForTimeout(1_200);
-  const second = Number.parseFloat((await summary.textContent())?.match(/[\d.]+/)?.[0] ?? '0');
-  expect(second).toBeGreaterThan(first);
+  await expect(summary).toContainText('Worked for 10 sec');
+  await expect(detail.locator('.session-live-steps')).toHaveCount(0);
+  await expect(detail.locator('.session-thinking')).toHaveCount(0);
+});
+
+
+test('activity rows keep real event order even when inferred start times disagree', async ({ page }) => {
+  await installSessionApi(page, {
+    activeMessages: [
+      message('active', 1, 'user', 'Order the steps.', { accepted_at: '2026-07-17T10:00:00.000Z' }),
+      message('active', 2, 'assistant', 'Done.', { accepted_at: '2026-07-17T10:00:12.000Z' })
+    ],
+    activeEvents: [
+      { seq: 1, run_id: 'run-active', event_type: 'status', role: null, content: 'running', payload: { status: 'running' }, created_at: '2026-07-17T10:00:00.500Z' },
+      { seq: 2, run_id: 'run-active', event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'thought-a', item_type: 'reasoning', phase: 'started', duration_ms: 3000 }, created_at: '2026-07-17T10:00:05.000Z' },
+      { seq: 3, run_id: 'run-active', event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'thought-a', item_type: 'reasoning', phase: 'completed', summary: ['First thought.'], duration_ms: 3000 }, created_at: '2026-07-17T10:00:05.500Z' },
+      { seq: 4, run_id: 'run-active', event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'tool-b', item_type: 'dynamicToolCall', phase: 'started', tool: 'inspect_b' }, created_at: '2026-07-17T10:00:07.000Z' },
+      { seq: 5, run_id: 'run-active', event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'tool-b', item_type: 'dynamicToolCall', phase: 'completed', tool: 'inspect_b', output: 'b done' }, created_at: '2026-07-17T10:00:08.000Z' },
+      { seq: 6, run_id: 'run-active', event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'tool-c', item_type: 'dynamicToolCall', phase: 'started', tool: 'inspect_c' }, created_at: '2026-07-17T10:00:09.000Z' },
+      { seq: 7, run_id: 'run-active', event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'tool-c', item_type: 'dynamicToolCall', phase: 'completed', tool: 'inspect_c', output: 'c done' }, created_at: '2026-07-17T10:00:10.000Z' },
+      { seq: 8, run_id: 'run-active', event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'thought-d', item_type: 'reasoning', phase: 'started', duration_ms: 8000 }, created_at: '2026-07-17T10:00:11.000Z' },
+      { seq: 9, run_id: 'run-active', event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'thought-d', item_type: 'reasoning', phase: 'completed', summary: ['Second thought.'], duration_ms: 8000 }, created_at: '2026-07-17T10:00:11.500Z' },
+      { seq: 10, run_id: 'run-active', event_type: 'status', role: null, content: 'completed', payload: { status: 'completed' }, created_at: '2026-07-17T10:00:12.500Z' }
+    ],
+    activeStreamEvents: []
+  });
+  await page.goto('/sessions');
+
+  const detail = page.getByRole('region', { name: 'Session details' });
+  const activity = detail.locator('details.session-activity-events');
+  await expect(activity).toHaveCount(1);
+  await activity.locator('summary').click();
+  const rows = activity.locator('.session-activity-row');
+  await expect(rows).toHaveCount(4);
+  await expect(rows.nth(0)).toContainText('First thought.');
+  await expect(rows.nth(1)).toContainText('inspect_b');
+  await expect(rows.nth(2)).toContainText('inspect_c');
+  await expect(rows.nth(3)).toContainText('Second thought.');
 });
 
 test('conversation streams replies, folds readable activity, steers, stops, and keeps history read-only', async ({ page }) => {
