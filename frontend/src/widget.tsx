@@ -20,7 +20,9 @@ import {
   ChatMessageBubble,
   ChatRunFailure,
   ChatThinkingBubble,
+  ActivityLiveStep,
   activityGroupProcessingWindow,
+  activityGroupIsClosed,
   mergeRunEvents,
   projectActivities,
   projectRunFailures,
@@ -866,13 +868,10 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
         {transcriptLoading && timeline.length === 0 && <div className="widget-transcript-state">{t('loadingMessages')}</div>}
         {timeline.map((entry, index) => {
           if (entry.kind === 'activity-group') {
-            const reasoningText = entry.activities.every((activity) => activity.kind === 'reasoning')
-              ? entry.activities.map((activity) => activity.summary).filter(Boolean).join('\\n')
-              : '';
-            if (reasoningText) {
-              return <div className="session-reasoning-text" key={entry.id}>{reasoningText}</div>;
-            }
             const active = activeRunInProgress && entry.runId === lastUserRunId;
+            if (active && !activityGroupIsClosed(timeline, index, entry.runId)) {
+              return <div className="session-live-steps" key={entry.id}>{entry.activities.map((activity) => <ActivityLiveStep activity={activity} key={activity.id} />)}</div>;
+            }
             const window = activityGroupProcessingWindow(timeline, index, runWindows.get(entry.runId), active);
             return <ChatActivityGroup active={active && window.endedAt === undefined} activities={entry.activities} clockOffset={clockOffset} endedAt={window.endedAt} key={entry.id} startedAt={window.startedAt} />;
           }

@@ -227,6 +227,35 @@ export function activityGroupProcessingWindow(
   return { startedAt, endedAt };
 }
 
+export function activityGroupIsClosed(
+  timeline: readonly TimelineItem[],
+  index: number,
+  runId: string
+) {
+  for (let cursor = index + 1; cursor < timeline.length; cursor += 1) {
+    const candidate = timeline[cursor];
+    if (candidate.runId !== runId) continue;
+    if (candidate.kind === 'message' && candidate.role === 'assistant') return true;
+    if (candidate.kind === 'message' && candidate.role === 'user') return false;
+  }
+  return false;
+}
+
+export function ActivityLiveStep({ activity }: { activity: ActivityEntry }) {
+  const { t } = useI18n();
+  if (activity.kind === 'reasoning' && activity.summary) {
+    return <div className="session-reasoning-text">{activity.summary}</div>;
+  }
+  const label = t(activityKeys[activity.kind] ?? 'activityTool');
+  return <div className="session-live-activity">
+    <span className="session-live-activity-icon" aria-hidden="true"><ActivityIcon kind={activity.kind} /></span>
+    <div className="session-live-activity-body">
+      <span className="session-live-activity-heading"><strong>{label}</strong>{activity.summary && <code>{activity.summary}</code>}</span>
+      {activity.output && <pre className="session-live-activity-output">{activity.output}</pre>}
+    </div>
+  </div>;
+}
+
 function payloadNumber(payload: Record<string, unknown>, key: string) {
   return typeof payload[key] === 'number' && Number.isFinite(payload[key]) ? payload[key] as number : null;
 }
@@ -1201,13 +1230,10 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
               {!conversationDraft && !messagesLoading && !messagesError && timelineItems.length === 0 && <div className="operation-state">{t('noMessages')}</div>}
               {!conversationDraft && timelineItems.map((entry, index) => {
                 if (entry.kind === 'activity-group') {
-                  const reasoningText = entry.activities.every((activity) => activity.kind === 'reasoning')
-                    ? entry.activities.map((activity) => activity.summary).filter(Boolean).join('\\n')
-                    : '';
-                  if (reasoningText) {
-                    return <div className="session-reasoning-text" key={entry.id}>{reasoningText}</div>;
-                  }
                   const active = activeRunInProgress && entry.runId === activeRunId;
+                  if (active && !activityGroupIsClosed(timelineItems, index, entry.runId)) {
+                    return <div className="session-live-steps" key={entry.id}>{entry.activities.map((activity) => <ActivityLiveStep activity={activity} key={activity.id} />)}</div>;
+                  }
                   const window = activityGroupProcessingWindow(timelineItems, index, runProcessingWindows.get(entry.runId), active);
                   return <ChatActivityGroup
                     active={active && window.endedAt === undefined}

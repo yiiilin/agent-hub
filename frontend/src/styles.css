@@ -1024,6 +1024,12 @@ textarea {
 .session-activity-content > code { display: block; color: #303136; white-space: pre-wrap; }
 .session-activity-summary { white-space: pre-wrap; }
 .session-reasoning-text { color: var(--color-muted-foreground); font-size: 13px; line-height: 1.5; white-space: pre-wrap; padding: 2px 0 6px; }
+.session-live-steps { display: flex; flex-direction: column; gap: 6px; padding: 2px 0 6px; }
+.session-live-activity { display: flex; gap: 8px; align-items: flex-start; color: var(--text-secondary); font-size: 12px; }
+.session-live-activity-icon { margin-top: 2px; }
+.session-live-activity-heading { display: flex; align-items: center; gap: 6px; }
+.session-live-activity-heading code { background: transparent; color: var(--text-secondary); }
+.session-live-activity-output { margin: 4px 0 0; white-space: pre-wrap; color: var(--text-tertiary); font-size: 11px; }
 .session-activity-output { min-width: 0; display: grid; gap: 3px; border-left: 2px solid #d7d7d7; padding-left: 8px; }
 .session-activity-output > span { color: #77777c; font-size: 10px; font-weight: 650; }
 .session-activity-output pre { min-width: 0; max-height: 220px; overflow: auto; margin: 0; color: #414147; font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
