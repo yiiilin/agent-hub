@@ -113,6 +113,51 @@ export type SubagentDefinition = {
   disabled_reason?: string | null;
 };
 
+export type AgentSecretDeclaration = {
+  name: string;
+  kind: 'value' | 'file';
+  description: string;
+};
+
+export type UserSecret = {
+  id: string;
+  owner_id: string;
+  name: string;
+  kind: 'value' | 'file';
+  file_name: string | null;
+  file_size_bytes: number | null;
+  file_sha256: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type CreateUserSecretRequest = {
+  name: string;
+  kind: 'value' | 'file';
+  value?: string;
+  file_name?: string;
+  file_base64?: string;
+};
+
+export type UpdateUserSecretRequest = {
+  value?: string;
+  file_name?: string;
+  file_base64?: string;
+};
+
+export type SecretGrant = {
+  user_id: string;
+  agent_id: string;
+  secret_name: string;
+  granted_at: string;
+};
+
+export type SecretGrantRequirement = {
+  name: string;
+  kind: 'value' | 'file';
+  description: string;
+};
+
 export type Agent = {
   id: string;
   name: string;
@@ -131,6 +176,7 @@ export type Agent = {
   model_policy: Record<string, unknown>;
   sandbox_policy: Record<string, unknown>;
   managed_skill_ids: string[];
+  secret_declarations: AgentSecretDeclaration[];
   mcp_allowlist: unknown[];
   tool_allowlist: string[];
   created_at: string;
@@ -531,6 +577,7 @@ export type CreateConfiguredAgentRequest = {
   model_settings: AgentModelSettings;
   subagents: SubagentDefinition[];
   tool_allowlist: string[];
+  secret_declarations: AgentSecretDeclaration[];
 };
 
 export type UpdateModelConnectionRequest = Pick<
@@ -767,11 +814,18 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     headers
   });
   if (!response.ok) {
-    const body = await response.json().catch(() => null) as { error?: unknown } | null;
+    const body = await response.json().catch(() => null) as { error?: unknown; details?: { secret_grants_required?: SecretGrantRequirement[] } } | null;
     const code = body?.error === 'MCP redacted secret cannot be saved without an existing value'
       ? 'mcp_redacted_secret_missing'
-      : 'request_failed';
-    throw new ApiError(response.status, code, typeof body?.error === 'string' ? body.error : null);
+      : response.status === 428 && Array.isArray(body?.details?.secret_grants_required)
+        ? 'secret_grants_required'
+        : 'request_failed';
+    throw new ApiError(
+      response.status,
+      code,
+      typeof body?.error === 'string' ? body.error : null,
+      body?.details ?? null
+    );
   }
   if (response.status === 204) {
     return undefined as T;
@@ -797,8 +851,9 @@ function sessionMessagePagePath(path: string, query: SessionMessagePageQuery) {
 export class ApiError extends Error {
   constructor(
     public readonly status: number,
-    public readonly code: 'request_failed' | 'mcp_redacted_secret_missing',
-    public readonly detail: string | null = null
+    public readonly code: 'request_failed' | 'mcp_redacted_secret_missing' | 'secret_grants_required',
+    public readonly detail: string | null = null,
+    public readonly details: { secret_grants_required?: SecretGrantRequirement[] } | null = null
   ) {
     super(detail ?? 'Request failed');
     this.name = 'ApiError';
@@ -1133,6 +1188,7 @@ export const api = {
         subagents: agent.subagents,
         sandbox_policy: agent.sandbox_policy,
         managed_skill_ids: agent.managed_skill_ids,
+        secret_declarations: agent.secret_declarations,
         mcp_allowlist: agent.mcp_allowlist,
         tool_allowlist: agent.tool_allowlist
       }),
@@ -1140,6 +1196,31 @@ export const api = {
     }),
   deleteAgent: (agentId: string, signal?: AbortSignal) =>
     request<void>(`/api/agents/${agentId}`, { method: 'DELETE', signal }),
+  secrets: (signal?: AbortSignal) => request<UserSecret[]>('/api/secrets', { signal }),
+  createSecret: (body: CreateUserSecretRequest, signal?: AbortSignal) =>
+    request<UserSecret>('/api/secrets', {
+      method: 'POST',
+      body: JSON.stringify(body),
+      signal
+    }),
+  updateSecret: (secretId: string, body: UpdateUserSecretRequest, signal?: AbortSignal) =>
+    request<UserSecret>('/api/secrets/' + secretId, {
+      method: 'PUT',
+      body: JSON.stringify(body),
+      signal
+    }),
+  deleteSecret: (secretId: string, signal?: AbortSignal) =>
+    request<void>('/api/secrets/' + secretId, { method: 'DELETE', signal }),
+  secretGrants: (agentId?: string, signal?: AbortSignal) =>
+    request<SecretGrant[]>(agentId ? '/api/secret-grants?agent_id=' + agentId : '/api/secret-grants', { signal }),
+  createSecretGrants: (agentId: string, secretNames: string[], signal?: AbortSignal) =>
+    request<SecretGrant[]>('/api/secret-grants', {
+      method: 'POST',
+      body: JSON.stringify({ agent_id: agentId, secret_names: secretNames }),
+      signal
+    }),
+  deleteSecretGrant: (agentId: string, secretName: string, signal?: AbortSignal) =>
+    request<void>('/api/secret-grants/' + agentId + '/' + encodeURIComponent(secretName), { method: 'DELETE', signal }),
   integrationAppOptions: (signal?: AbortSignal) =>
     request<IntegrationAppOptions>('/api/integration-app-options', { signal }),
   integrationApps: (signal?: AbortSignal) =>

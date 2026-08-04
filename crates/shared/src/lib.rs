@@ -2184,6 +2184,8 @@ pub struct ClaimRunResponse {
     pub model_proxy_token: String,
     #[serde(default)]
     pub secret_values: Vec<RunSecretValueDto>,
+    #[serde(default)]
+    pub secret_files: Vec<RunSecretFileDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_context: Option<ClaimSessionContextDto>,
 }
@@ -2192,6 +2194,13 @@ pub struct ClaimRunResponse {
 pub struct RunSecretValueDto {
     pub name: String,
     pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunSecretFileDto {
+    pub name: String,
+    pub size_bytes: i64,
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

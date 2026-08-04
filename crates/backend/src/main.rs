@@ -12576,6 +12576,7 @@ async fn runtime_claim_run(
         }
     }
     let mut secret_values = Vec::new();
+    let mut secret_files = Vec::new();
     {
         let subject_user_id =
             sqlx::query_scalar::<_, Uuid>("SELECT owner_id FROM hub_sessions WHERE id = $1")
@@ -12584,9 +12585,6 @@ async fn runtime_claim_run(
                 .await?;
         if let Some(user_id) = subject_user_id {
             for declaration in &agent.secret_declarations {
-                if declaration.kind != "value" {
-                    continue;
-                }
                 let authorized = sqlx::query_scalar::<_, bool>(
                     "SELECT EXISTS(
                         SELECT 1 FROM secret_grants
@@ -12601,22 +12599,42 @@ async fn runtime_claim_run(
                 .fetch_one(&mut *tx)
                 .await?;
                 if authorized {
-                    let (ciphertext, nonce) = sqlx::query_as::<_, (Vec<u8>, Vec<u8>)>(
-                        "SELECT value_ciphertext, value_nonce
-                         FROM user_secrets WHERE owner_id = $1 AND name = $2",
-                    )
-                    .bind(user_id)
-                    .bind(&declaration.name)
-                    .fetch_one(&mut *tx)
-                    .await?;
-                    let value = state
-                        .model_secret_cipher
-                        .decrypt(&ciphertext, &nonce)
-                        .map_err(|_| ApiError::internal("Secret decryption failed"))?;
-                    secret_values.push(RunSecretValueDto {
-                        name: declaration.name.clone(),
-                        value,
-                    });
+                    match declaration.kind.as_str() {
+                        "value" => {
+                            let (ciphertext, nonce) = sqlx::query_as::<_, (Vec<u8>, Vec<u8>)>(
+                                "SELECT value_ciphertext, value_nonce
+                                     FROM user_secrets WHERE owner_id = $1 AND name = $2",
+                            )
+                            .bind(user_id)
+                            .bind(&declaration.name)
+                            .fetch_one(&mut *tx)
+                            .await?;
+                            let value = state
+                                .model_secret_cipher
+                                .decrypt(&ciphertext, &nonce)
+                                .map_err(|_| ApiError::internal("Secret decryption failed"))?;
+                            secret_values.push(RunSecretValueDto {
+                                name: declaration.name.clone(),
+                                value,
+                            });
+                        }
+                        "file" => {
+                            let (size_bytes, sha256) = sqlx::query_as::<_, (i64, String)>(
+                                "SELECT file_size_bytes, file_sha256
+                                     FROM user_secrets WHERE owner_id = $1 AND name = $2",
+                            )
+                            .bind(user_id)
+                            .bind(&declaration.name)
+                            .fetch_one(&mut *tx)
+                            .await?;
+                            secret_files.push(RunSecretFileDto {
+                                name: declaration.name.clone(),
+                                size_bytes,
+                                sha256,
+                            });
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -12632,6 +12650,7 @@ async fn runtime_claim_run(
         resume,
         model_proxy_token,
         secret_values,
+        secret_files,
         session_context,
     })
     .into_response())

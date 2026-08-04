@@ -433,6 +433,19 @@ impl PiFilesystemSandbox {
         let mut rules = BTreeMap::new();
         let workspace_access = workspace_landlock_access(tools);
         Self::add_directory(&mut rules, &run_env.workdir, workspace_access)?;
+        let secret_readable = tools
+            .iter()
+            .any(|tool| matches!(tool.as_str(), "read" | "grep" | "find" | "ls"))
+            && !tools
+                .iter()
+                .any(|tool| matches!(tool.as_str(), "bash" | "edit" | "write"));
+        if secret_readable {
+            Self::add_optional_directory(
+                &mut rules,
+                &run_env.engine_state_root.join("secrets"),
+                LANDLOCK_DIRECTORY_LIST | LANDLOCK_ACCESS_FS_READ_FILE,
+            )?;
+        }
         for path in [agent_dir, session_dir, pi_home, pi_temp] {
             Self::add_directory(&mut rules, path, LANDLOCK_RUNTIME_WRITE)?;
         }
@@ -884,6 +897,13 @@ impl PersistentPiRpcProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for secret in &run_env.secret_values {
+            command.env(format!("AGENT_SECRET_{}", secret.name), &secret.value);
+        }
+        for file in &run_env.secret_files {
+            let path = run_env.engine_state_root.join("secrets").join(&file.name);
+            command.env(format!("AGENT_SECRET_FILE_{}", file.name), path);
+        }
         if let Some(broker) = &skill_exec_broker {
             command
                 .env("AGENT_HUB_SKILL_EXEC_SOCKET", broker.socket_path())
@@ -2273,6 +2293,8 @@ mod tests {
             engine_state_root: session_root.join("engine-state"),
             hub_url: "http://127.0.0.1:8080".into(),
             maintenance_token_file: None,
+            secret_values: Vec::new(),
+            secret_files: Vec::new(),
         };
         let agent_dir = pi_agent_directory(&run_env);
         let session_dir = run_env.engine_state_root.join(PI_SESSION_DIRECTORY);

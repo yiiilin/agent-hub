@@ -1464,6 +1464,29 @@ impl HubClient {
         Ok(destination)
     }
 
+    async fn download_run_secret_file(
+        &self,
+        run_id: Uuid,
+        ownership_generation: i64,
+        name: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        let url = format!("{}/api/runtime/runs/{run_id}/secrets/{name}", self.hub_url);
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(self.runtime_credential())
+            .header("x-agent-hub-ownership-generation", ownership_generation)
+            .send()
+            .await?
+            .error_for_status()?;
+        let bytes = response.bytes().await?;
+        anyhow::ensure!(
+            bytes.len() <= 1024 * 1024,
+            "Run secret file download exceeds the 1 MiB limit"
+        );
+        Ok(bytes.to_vec())
+    }
+
     async fn append_event(
         &self,
         run_id: Uuid,
@@ -5589,6 +5612,8 @@ struct RunEnv {
     engine_state_root: PathBuf,
     hub_url: String,
     maintenance_token_file: Option<PathBuf>,
+    secret_values: Vec<RunSecretValueDto>,
+    secret_files: Vec<RunSecretFileDto>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6036,11 +6061,51 @@ async fn prepare_run_env_with_local_skills_and_management(
         }),
     )
     .await?;
+    let secret_dir = paths.engine_state.join("secrets");
+    fs::create_dir_all(&secret_dir).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&secret_dir, stdfs::Permissions::from_mode(0o700)).await?;
+    }
+    if let Some(client) = client {
+        let ownership_generation = claim.run.session_ownership_generation.unwrap_or_default();
+        for file in &claim.secret_files {
+            let bytes = client
+                .download_run_secret_file(claim.run.id, ownership_generation, &file.name)
+                .await
+                .with_context(|| format!("download Run secret file {}", file.name))?;
+            anyhow::ensure!(
+                bytes.len() as i64 == file.size_bytes,
+                "Run secret file size does not match its manifest"
+            );
+            let checksum = format!("{:x}", Sha256::digest(&bytes));
+            anyhow::ensure!(
+                checksum == file.sha256,
+                "Run secret file checksum does not match its manifest"
+            );
+            let destination = secret_dir.join(&file.name);
+            let mut options = fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                options.mode(0o600);
+            }
+            let mut output = options
+                .open(&destination)
+                .await
+                .context("create Run secret file")?;
+            output.write_all(&bytes).await?;
+            output.sync_all().await?;
+        }
+    }
     let run_env = RunEnv {
         workdir: paths.workspace,
         engine_state_root: paths.engine_state,
         hub_url: hub_url.to_owned(),
         maintenance_token_file: maintenance_token_file.map(Path::to_path_buf),
+        secret_values: claim.secret_values.clone(),
+        secret_files: claim.secret_files.clone(),
     };
     pi_driver::materialize_integration_tools(&run_env, claim.integration_context.as_ref())?;
     Ok(run_env)

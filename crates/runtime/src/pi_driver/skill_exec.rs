@@ -1127,6 +1127,8 @@ mod tests {
             engine_state_root: session.join("engine-state"),
             hub_url: "http://127.0.0.1:8080".into(),
             maintenance_token_file: None,
+            secret_values: Vec::new(),
+            secret_files: Vec::new(),
         };
         fs::create_dir_all(&run_env.workdir).unwrap();
         fs::create_dir_all(super::super::pi_temp_directory(&run_env)).unwrap();
