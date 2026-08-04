@@ -1932,6 +1932,27 @@ async fn finish_claimed_run(
     Ok(())
 }
 
+fn run_secret_fingerprint(claim: &ClaimRunResponse) -> String {
+    let mut values = claim
+        .secret_values
+        .iter()
+        .map(|secret| (secret.name.clone(), secret.value.clone()))
+        .collect::<Vec<_>>();
+    values.sort();
+    let mut files = claim
+        .secret_files
+        .iter()
+        .map(|file| (file.name.clone(), file.size_bytes, file.sha256.clone()))
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let encoded = serde_json::to_vec(&json!({
+        "values": values,
+        "files": files
+    }))
+    .unwrap_or_default();
+    format!("{:x}", Sha256::digest(&encoded))
+}
+
 fn session_supervisor_metadata_for_claim(
     runtime_id: Uuid,
     claim: &ClaimRunResponse,
@@ -1955,6 +1976,7 @@ fn session_supervisor_metadata_for_claim(
         runtime_id,
         ownership_generation,
         lifecycle_status: "online".into(),
+        secret_fingerprint: run_secret_fingerprint(&claim),
         idle_deadline_unix_ms: None,
         checkpoint_reason: None,
         checkpoint_retry_unix_ms: None,
@@ -4265,6 +4287,7 @@ impl SessionSupervisorManager {
             runtime_id: self.runtime_id,
             ownership_generation,
             lifecycle_status: "online".into(),
+            secret_fingerprint: run_secret_fingerprint(&claim),
             idle_deadline_unix_ms: None,
             checkpoint_reason: None,
             checkpoint_retry_unix_ms: None,
@@ -4419,7 +4442,9 @@ impl SessionSupervisorManager {
                         busy,
                         tool_allowlist: current_tool_allowlist,
                     } => {
-                        if *current_tool_allowlist == tool_allowlist {
+                        if *current_tool_allowlist == tool_allowlist
+                            && current_metadata.secret_fingerprint == metadata.secret_fingerprint
+                        {
                             return Ok(Arc::clone(supervisor));
                         }
                         anyhow::ensure!(
@@ -5653,6 +5678,8 @@ struct SessionSupervisorMetadata {
     runtime_id: Uuid,
     ownership_generation: i64,
     lifecycle_status: String,
+    #[serde(default)]
+    secret_fingerprint: String,
     #[serde(default)]
     idle_deadline_unix_ms: Option<i64>,
     #[serde(default)]
