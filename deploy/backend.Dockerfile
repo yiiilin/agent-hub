@@ -15,7 +15,7 @@ WORKDIR /app
 COPY Cargo.toml Cargo.toml
 COPY Cargo.lock Cargo.lock
 COPY crates crates
-RUN cargo build --release -p agent-hub-backend
+RUN cargo build --release -p agent-hub-backend -p agent-hub-cli
 
 FROM debian:bookworm-slim
 WORKDIR /app
@@ -26,6 +26,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && mkdir -p /var/lib/agent-hub \
     && chown -R agenthub:agenthub /var/lib/agent-hub
 COPY --from=backend-builder /app/target/release/agent-hub-backend /usr/local/bin/agent-hub-backend
+COPY --from=backend-builder /app/target/release/agent-hub-cli /usr/share/agent-hub/builtin/agent-hub-maintenance/bin/agent-hub
+COPY skills/agent-hub-maintenance/SKILL.md /usr/share/agent-hub/builtin/agent-hub-maintenance/SKILL.md
 COPY --from=frontend-builder /app/frontend/dist /app/frontend/dist
 USER 10001:10001
 CMD ["agent-hub-backend"]

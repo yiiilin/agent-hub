@@ -4,6 +4,10 @@ agent-hub-cli 是 Agent Hub 的第一方管理 CLI，agent-hub-maintenance 是�
 Package。两者都放在本仓库：CLI 源码在 crates/agent-hub-cli/，Skill 内容在
 skills/agent-hub-maintenance/，bin/agent-hub 由构建脚本生成，不提交二进制。
 
+从内置版本开始，Hub 镜像会同时打包 CLI 二进制和 SKILL.md。Backend 启动后会自动创建或更新
+agent-hub-maintenance Skill 并上传 Package，不再需要手动安装脚本。首次启动时如果还没有
+super_admin 用户，会自动延迟重试，直到第一个超级管理员出现。
+
 ## 凭据模型
 
 - CLI 通过 Hub 管理 API 认证，使用现有 API Key。
@@ -16,7 +20,7 @@ skills/agent-hub-maintenance/，bin/agent-hub 由构建脚本生成，不提交�
 
 ## 构建与安装
 
-执行：
+手动安装脚本仅用于离线/旧版本或本地开发：
 
     ./scripts/install-agent-hub-maintenance.sh
 
@@ -27,6 +31,12 @@ skills/agent-hub-maintenance/，bin/agent-hub 由构建脚本生成，不提交�
 - AGENT_ID：私有维护智能体 ID。
 
 脚本会构建 CLI、创建/更新 Skill、上传 Package，并把 Skill 绑定到指定智能体。
+
+默认部署不需要运行该脚本；如需自动绑定到某个维护智能体，在 backend 环境变量中配置：
+
+    AGENT_HUB_MAINTENANCE_AGENT_ID=<维护智能体 UUID>
+
+该智能体必须属于同一个 super_admin 用户，seed 会自动把内置 Skill 绑定过去。
 
 ## 生产部署
 
@@ -42,7 +52,7 @@ skills/agent-hub-maintenance/，bin/agent-hub 由构建脚本生成，不提交�
     docker compose -f compose.yml -f compose.maintenance.yml up -d
 
 3. 只把 agent-hub-maintenance Skill 绑定到私有“Agent Hub 维护助手”，
-   不要绑定公开智能体。
+   不要绑定公开智能体。若已配置 AGENT_HUB_MAINTENANCE_AGENT_ID，seed 会自动完成绑定。
 
 ## 安全说明
 

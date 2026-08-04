@@ -1,4 +1,7 @@
 services:
+  backend:
+    environment:
+      AGENT_HUB_MAINTENANCE_AGENT_ID: ${AGENT_HUB_MAINTENANCE_AGENT_ID:-}
   runtime:
     environment:
       RUNTIME_MAINTENANCE_TOKEN_FILE: /run/secrets/agent-hub-maintenance-token
