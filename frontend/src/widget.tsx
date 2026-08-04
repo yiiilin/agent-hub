@@ -23,7 +23,6 @@ import {
   ActivityLiveStep,
   activityGroupProcessingWindow,
   activityGroupIsClosed,
-  compareTimelineEntries,
   mergeRunEvents,
   projectActivities,
   projectRunFailures,
@@ -729,7 +728,7 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
         kind: 'activity',
         id: activity.id,
         runId: activity.runId,
-        occurredAt: activity.occurredAt,
+        occurredAt: activity.sortAt,
         sequence: activity.sequence * 1000 + 2,
         activity
       });
@@ -744,7 +743,7 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
         failure
       });
     }
-    entries.sort(compareTimelineEntries);
+    entries.sort((left, right) => left.occurredAt - right.occurredAt || left.sequence - right.sequence);
     return entries.reduce<TimelineItem[]>((items, entry) => {
       if (entry.kind !== 'activity') {
         items.push(entry);

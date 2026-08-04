@@ -56,6 +56,7 @@ export type ActivityEntry = {
   phase: string;
   sequence: number;
   occurredAt: number;
+  sortAt: number;
   endedAt: number;
   summary: string | null;
   output: string | null;
@@ -75,7 +76,7 @@ type TimelineEntry =
   | { kind: 'message'; id: string; sequence: number; occurredAt: number; outputEndedAt?: number; runId: string | null; role: string; content: string; state?: string; mode?: string }
   | { kind: 'live'; id: string; sequence: number; occurredAt: number; outputEndedAt?: number; runId: string; role: string; content: string }
   | { kind: 'failure'; id: string; sequence: number; occurredAt: number; runId: string; failure: RunFailureEntry }
-  | { kind: 'activity'; id: string; sequence: number; occurredAt: number; runId: string; activity: ActivityEntry };
+  | { kind: 'activity'; id: string; sequence: number; occurredAt: number; activity: ActivityEntry };
 
 type TimelineItem = Exclude<TimelineEntry, { kind: 'activity' }>
   | { kind: 'activity-group'; id: string; runId: string; activities: ActivityEntry[] };
@@ -347,6 +348,7 @@ function activityFromEvent(event: RunEvent): ActivityEntry | null {
       phase: event.event_type === 'tool_request' ? 'started' : 'completed',
       sequence: event.seq,
       occurredAt: Math.max(0, endedAt - elapsedMs),
+      sortAt: endedAt,
       endedAt,
       summary: payloadString(event.payload, 'tool_name'),
       output,
@@ -395,6 +397,7 @@ function activityFromEvent(event: RunEvent): ActivityEntry | null {
     phase,
     sequence: event.seq,
     occurredAt: Math.max(0, endedAt - duration),
+    sortAt: endedAt,
     endedAt,
     summary,
     output: payloadString(event.payload, 'output'),
@@ -414,6 +417,7 @@ function mergeActivity(current: ActivityEntry, incoming: ActivityEntry): Activit
     kind: incoming.kind,
     phase: incoming.phase,
     occurredAt: Math.min(current.occurredAt, incoming.occurredAt),
+    sortAt: Math.min(current.sortAt, incoming.sortAt),
     endedAt: Math.max(current.endedAt, incoming.endedAt),
     sequence: Math.min(current.sequence, incoming.sequence),
     summary,
@@ -436,16 +440,6 @@ export function projectActivities(events: RunEvent[]) {
   return [...activities.values()].sort((left, right) => (
     left.runId.localeCompare(right.runId) || left.sequence - right.sequence
   ));
-}
-
-export function compareTimelineEntries(
-  left: { kind: string; runId: string | null; occurredAt: number; sequence: number; activity?: { sequence: number } },
-  right: { kind: string; runId: string | null; occurredAt: number; sequence: number; activity?: { sequence: number } }
-) {
-  if (left.kind === 'activity' && right.kind === 'activity' && left.runId !== null && left.runId === right.runId) {
-    return (left.activity?.sequence ?? 0) - (right.activity?.sequence ?? 0);
-  }
-  return left.occurredAt - right.occurredAt || left.sequence - right.sequence;
 }
 
 export function resizeComposer(textarea: HTMLTextAreaElement | null) {
@@ -982,8 +976,7 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
         kind: 'activity',
         id: activity.id,
         sequence: activity.sequence * 1000 + 2,
-        occurredAt: activity.occurredAt,
-        runId: activity.runId,
+        occurredAt: activity.sortAt,
         activity
       });
     }
@@ -997,7 +990,7 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
         failure
       });
     }
-    return entries.sort(compareTimelineEntries);
+    return entries.sort((left, right) => left.occurredAt - right.occurredAt || left.sequence - right.sequence);
   }, [sessionEvents, sessionMessages]);
   const timelineItems = useMemo(() => {
     return timeline.reduce<TimelineItem[]>((items, entry) => {

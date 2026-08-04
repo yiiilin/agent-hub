@@ -938,6 +938,40 @@ test('activity rows keep real event order even when inferred start times disagre
   await expect(rows.nth(3)).toContainText('Second thought.');
 });
 
+test('a visible reply splits steps by real event time even when a later long step infers an earlier start', async ({ page }) => {
+  await installSessionApi(page, {
+    activeMessages: [
+      message('active', 1, 'user', 'Order across a reply.', { accepted_at: '2026-07-17T10:00:00.000Z' }),
+      message('active', 2, 'assistant', 'Interim reply.', { accepted_at: '2026-07-17T10:00:04.000Z' }),
+      message('active', 3, 'assistant', 'Final reply.', { accepted_at: '2026-07-17T10:00:12.000Z' })
+    ],
+    activeEvents: [
+      { seq: 1, run_id: 'run-active', event_type: 'status', role: null, content: 'running', payload: { status: 'running' }, created_at: '2026-07-17T10:00:00.500Z' },
+      { seq: 2, run_id: 'run-active', event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'thought-a', item_type: 'reasoning', phase: 'completed', summary: ['First thought.'] }, created_at: '2026-07-17T10:00:02.000Z' },
+      { seq: 3, run_id: 'run-active', event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'tool-b', item_type: 'dynamicToolCall', phase: 'started', tool: 'inspect_b' }, created_at: '2026-07-17T10:00:07.000Z' },
+      { seq: 4, run_id: 'run-active', event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'tool-b', item_type: 'dynamicToolCall', phase: 'completed', tool: 'inspect_b', output: 'b done' }, created_at: '2026-07-17T10:00:08.000Z' },
+      { seq: 5, run_id: 'run-active', event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'tool-c', item_type: 'dynamicToolCall', phase: 'started', tool: 'inspect_c' }, created_at: '2026-07-17T10:00:09.000Z' },
+      { seq: 6, run_id: 'run-active', event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'tool-c', item_type: 'dynamicToolCall', phase: 'completed', tool: 'inspect_c', output: 'c done' }, created_at: '2026-07-17T10:00:10.000Z' },
+      { seq: 7, run_id: 'run-active', event_type: 'item', role: 'assistant', content: null, payload: { item_id: 'thought-d', item_type: 'reasoning', phase: 'completed', summary: ['Second thought.'], duration_ms: 8000 }, created_at: '2026-07-17T10:00:11.000Z' },
+      { seq: 8, run_id: 'run-active', event_type: 'status', role: null, content: 'completed', payload: { status: 'completed' }, created_at: '2026-07-17T10:00:13.000Z' }
+    ],
+    activeStreamEvents: []
+  });
+  await page.goto('/sessions');
+
+  const detail = page.getByRole('region', { name: 'Session details' });
+  const groups = detail.locator('details.session-activity-events');
+  await expect(groups).toHaveCount(2);
+  await expect(groups.nth(0)).toContainText('First thought.');
+  await expect(groups.nth(0)).not.toContainText('Second thought.');
+  await groups.nth(1).locator('summary').click();
+  const rows = groups.nth(1).locator('.session-activity-row');
+  await expect(rows).toHaveCount(3);
+  await expect(rows.nth(0)).toContainText('inspect_b');
+  await expect(rows.nth(1)).toContainText('inspect_c');
+  await expect(rows.nth(2)).toContainText('Second thought.');
+});
+
 test('conversation streams replies, folds readable activity, steers, stops, and keeps history read-only', async ({ page }) => {
   const fixture = await installSessionApi(page);
   await page.goto('/sessions');
