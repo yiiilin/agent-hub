@@ -5070,6 +5070,8 @@ impl SessionSupervisorManager {
                 ownership_generation,
                 route: SkillPackageDownloadRoute::Session { session_id },
             }),
+            &[],
+            &[],
         )
         .await?;
         if let Some(supervisor) = supervisor.as_ref() {
@@ -6147,6 +6149,8 @@ async fn prepare_run_env_with_local_skills_and_management(
                 run_id: claim.run.id,
             },
         }),
+        &claim.secret_values,
+        &claim.secret_files,
     )
     .await?;
     let secret_dir = paths.engine_state.join("secrets");
@@ -6667,6 +6671,47 @@ fn pi_agent_directory(pi_home: &Path) -> PathBuf {
     pi_home.join(PI_AGENT_DIRECTORY)
 }
 
+const PI_SECRET_GUIDANCE_MARKER: &str = "## 已授权秘钥";
+
+fn render_pi_secret_guidance(
+    secret_values: &[RunSecretValueDto],
+    secret_files: &[RunSecretFileDto],
+) -> Option<String> {
+    let mut lines = Vec::new();
+    for secret in secret_values {
+        lines.push(format!(
+            "- {}：环境变量 AGENT_SECRET_{}",
+            secret.name, secret.name
+        ));
+    }
+    for file in secret_files {
+        lines.push(format!(
+            "- {}：文件路径由环境变量 AGENT_SECRET_FILE_{} 提供",
+            file.name, file.name
+        ));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}\n{}",
+        PI_SECRET_GUIDANCE_MARKER,
+        lines.join("\n")
+    ))
+}
+
+fn read_existing_pi_secret_guidance(agent_dir: &Path) -> Option<String> {
+    let existing = stdfs::read(agent_dir.join("AGENTS.md")).ok()?;
+    let existing = String::from_utf8_lossy(&existing);
+    let marker = existing.find(PI_SECRET_GUIDANCE_MARKER)?;
+    let guidance = existing[marker..].trim_end();
+    if guidance.is_empty() {
+        None
+    } else {
+        Some(guidance.to_owned())
+    }
+}
+
 async fn synchronize_pi_execution_configuration(
     paths: &SessionPaths,
     configuration: &AgentExecutionConfigurationDto,
@@ -6674,6 +6719,8 @@ async fn synchronize_pi_execution_configuration(
     model_configuration: PiModelConfigurationMaterialization<'_>,
     local_skills_dir: Option<&Path>,
     package_context: Option<SkillPackageMaterializationContext<'_>>,
+    secret_values: &[RunSecretValueDto],
+    secret_files: &[RunSecretFileDto],
 ) -> anyhow::Result<()> {
     let agent_dir = pi_agent_directory(&paths.engine_state);
     let skill_exec_dir = paths.engine_state.join(SKILL_EXEC_DIRECTORY);
@@ -6684,7 +6731,12 @@ async fn synchronize_pi_execution_configuration(
     let stage_skill_exec_dir = stage.join(SKILL_EXEC_DIRECTORY);
     let result: anyhow::Result<()> = async {
         fs::create_dir_all(stage_agent_dir.join("skills")).await?;
-        let instructions = format!("{}\n", configuration.instructions.trim_end());
+        let mut instructions = format!("{}\n", configuration.instructions.trim_end());
+        if let Some(guidance) = render_pi_secret_guidance(secret_values, secret_files)
+            .or_else(|| read_existing_pi_secret_guidance(&agent_dir))
+        {
+            instructions.push_str(&format!("\n\n{guidance}\n"));
+        }
         write_private_file(&stage_agent_dir.join("AGENTS.md"), instructions.as_bytes())
             .context("stage Pi Agent guidance")?;
 
@@ -8559,6 +8611,8 @@ mod tests {
             PiModelConfigurationMaterialization::PreserveExisting,
             None,
             None,
+            &[],
+            &[],
         )
         .await
         .unwrap();
@@ -11514,6 +11568,8 @@ mod tests {
             },
             None,
             None,
+            &[],
+            &[],
         )
         .await
         .unwrap();
@@ -11568,6 +11624,8 @@ mod tests {
             PiModelConfigurationMaterialization::PreserveExisting,
             None,
             None,
+            &[],
+            &[],
         )
         .await
         .unwrap();
@@ -11751,6 +11809,74 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn pi_agent_guidance_lists_granted_secrets_and_survives_refresh() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut claim = test_claim();
+        claim.secret_values = vec![RunSecretValueDto {
+            name: "TEST".into(),
+            value: "secret-value-must-not-leak".into(),
+        }];
+        claim.secret_files = vec![RunSecretFileDto {
+            name: "TEST_FILE".into(),
+            size_bytes: 9,
+            sha256: "abc".into(),
+        }];
+        claim.expected_configuration_fingerprint =
+            execution_configuration_fingerprint(&claim.execution_configuration).unwrap();
+        let paths = SessionPaths::for_claim(temp.path(), &claim).unwrap();
+        fs::create_dir_all(&paths.workspace).await.unwrap();
+        fs::create_dir_all(&paths.engine_state).await.unwrap();
+        fs::create_dir_all(&paths.staging).await.unwrap();
+
+        synchronize_pi_execution_configuration(
+            &paths,
+            &claim.execution_configuration,
+            &claim.expected_configuration_fingerprint,
+            PiModelConfigurationMaterialization::RunBindings {
+                model_base_url: Some("http://127.0.0.1:4567/v1"),
+            },
+            None,
+            None,
+            &claim.secret_values,
+            &claim.secret_files,
+        )
+        .await
+        .unwrap();
+
+        let agent_dir = paths.engine_state.join(".pi/agent");
+        let guidance = fs::read_to_string(agent_dir.join("AGENTS.md"))
+            .await
+            .unwrap();
+        assert!(guidance.contains("## 已授权秘钥"));
+        assert!(guidance.contains("AGENT_SECRET_TEST"));
+        assert!(guidance.contains("AGENT_SECRET_FILE_TEST_FILE"));
+        assert!(!guidance.contains("secret-value-must-not-leak"));
+
+        let mut refreshed = claim.execution_configuration.clone();
+        refreshed.revision += 1;
+        refreshed.instructions = "refreshed guidance".into();
+        let refreshed_fingerprint = execution_configuration_fingerprint(&refreshed).unwrap();
+        synchronize_pi_execution_configuration(
+            &paths,
+            &refreshed,
+            &refreshed_fingerprint,
+            PiModelConfigurationMaterialization::PreserveExisting,
+            None,
+            None,
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        let guidance = fs::read_to_string(agent_dir.join("AGENTS.md"))
+            .await
+            .unwrap();
+        assert!(guidance.contains("refreshed guidance"));
+        assert!(guidance.contains("## 已授权秘钥"));
+        assert!(guidance.contains("AGENT_SECRET_FILE_TEST_FILE"));
+    }
+
     #[tokio::test]
     async fn pi_integration_tools_materialize_as_data_and_empty_catalog_removes_bridge() {
         use std::os::unix::fs::{symlink, PermissionsExt};
