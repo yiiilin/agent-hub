@@ -156,6 +156,22 @@ _Avoid_: Agent visibility, Application ownership, Session Origin
 The current versioned instructions, associated Skills, model and reasoning choices, sandbox and approval policies, and MCP or tool access that an Agent supplies to a new Turn. It excludes user credentials and Session-owned state.
 _Avoid_: Agent profile, user credentials, active Turn snapshot
 
+**Secret Variable**:
+A named secret owned by one Hub User, containing either a value or a file, stored encrypted by Hub and never returned in plaintext after creation. It is the user-side counterpart of an Agent Secret Declaration.
+_Avoid_: API Key, model provider secret, Agent secret, CI/CD variable
+
+**Agent Secret Declaration**:
+A named variable key declared by one Agent, with a kind (environment variable or file) and a usage hint, that references no concrete user secret. The Agent sees only the key, never whether any user owns or grants the secret.
+_Avoid_: Agent-bound secret, managed secret, secret policy
+
+**Secret Grant**:
+A persistent authorization record binding one Hub User, one Agent, and one Secret Variable key, created after the user allows use during a Session. It is remembered by default and can be revoked; revocation affects new Runs only.
+_Avoid_: one-time approval, session-scoped consent, secret subscription
+
+**Secret Injection**:
+The Runtime-side materialization of authorized secrets into a Session: values become AGENT_SECRET_<KEY> environment variables, files become read-only files under the Session's private engine-state/secrets directory with AGENT_SECRET_FILE_<KEY>. It never writes secrets into the Workspace or Session Bundle.
+_Avoid_: workspace secret file, shell-visible secret, bundle-backed secret
+
 **Model API Connection**:
 A reusable provider access configuration containing one endpoint, credential, API type, and set of allowed model identifiers. It is either Global or Personal and does not define an Agent's model invocation settings.
 _Avoid_: Model Connection, Model, provider environment variables
