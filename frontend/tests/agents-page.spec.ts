@@ -39,6 +39,7 @@ type AgentFixture = {
   sandbox_policy: Record<string, unknown>;
   managed_skill_ids: string[];
   mcp_allowlist: unknown[];
+  secret_declarations: Array<{ name: string; kind: 'value' | 'file'; description: string }>;
   created_at: string;
   updated_at: string;
 };
@@ -108,6 +109,7 @@ function agentFixture(overrides: Partial<AgentFixture> & Pick<AgentFixture, 'id'
     sandbox_policy: {},
     managed_skill_ids: [],
     mcp_allowlist: [],
+    secret_declarations: [],
     created_at: '2026-07-10T12:00:00.000Z',
     updated_at: '2026-07-10T12:00:00.000Z',
     ...overrides
@@ -466,7 +468,7 @@ test('agent detail uses the six-tab IA and stacks the inspector first on mobile'
   await page.goto(`/agents/${agent().id}`);
 
   const tabs = page.getByRole('tablist', { name: 'Agent detail sections' }).getByRole('tab');
-  await expect(tabs).toHaveText(['Activity', 'Instructions', 'Models', 'Skills', 'MCP', 'Access']);
+  await expect(tabs).toHaveText(['Activity', 'Instructions', 'Models', 'Secrets', 'Skills', 'MCP', 'Access']);
   await expect(tabs.nth(0)).toHaveAttribute('aria-selected', 'true');
   const inspector = page.getByRole('complementary', { name: 'Agent inspector' });
   await expect(inspector).toContainText(agent().name);
@@ -848,7 +850,7 @@ test('agent detail controls match manage and administer permissions while activi
     });
     await installDetailApi(page, { agent });
     await page.goto(`/agents/${agent.id}`);
-    await expect(page.getByRole('tablist', { name: 'Agent detail sections' }).getByRole('tab')).toHaveCount(6);
+    await expect(page.getByRole('tablist', { name: 'Agent detail sections' }).getByRole('tab')).toHaveCount(7);
     await expect(page.getByRole('button', { name: 'Delete agent', exact: true })).toHaveCount(permission.administer ? 1 : 0);
     await expect(page.getByRole('tabpanel', { name: 'Activity' }).getByRole('button', { name: 'Start run' })).toHaveCount(0);
     await expect(page.getByRole('tabpanel', { name: 'Activity' }).getByLabel('Message', { exact: true })).toHaveCount(0);
@@ -1008,7 +1010,7 @@ test('agent pages localize and stay overflow-free at 1280, 1440, and 390 pixels'
   await page.getByRole('tab', { name: 'Access' }).click();
   await expect(page.getByRole('tabpanel', { name: 'Access' }).getByLabel('Runtime binding').locator('option').nth(1)).toContainText('online');
   await page.getByLabel('Language').selectOption('zh-CN');
-  await expect(page.getByRole('tablist', { name: '智能体详情分区' }).getByRole('tab')).toHaveText(['活动', '指令', '模型', '技能', 'MCP', '访问权限']);
+  await expect(page.getByRole('tablist', { name: '智能体详情分区' }).getByRole('tab')).toHaveText(['活动', '指令', '模型', '密钥', '技能', 'MCP', '访问权限']);
   await page.getByRole('tab', { name: '活动' }).click();
   await expect(runRow).toContainText('已完成');
   await expect(runRow).toContainText('集成工具结果');

@@ -8881,6 +8881,13 @@ async fn create_widget_run(
     let mut tx = state.pool.begin().await?;
     let credential = lock_widget_credential_tx(&mut tx, &token, &headers).await?;
     ensure_agent_has_configured_model_tx(&mut tx, credential.agent_id).await?;
+    if !credential.is_anonymous() {
+        let missing_grants =
+            missing_secret_grants(&state.pool, credential.owner_id, credential.agent_id).await?;
+        if !missing_grants.is_empty() {
+            return Err(ApiError::requires_secret_grants(missing_grants));
+        }
+    }
     let client_message_key = normalize_client_message_key(req.client_message_key.as_deref())?;
     let (requested_integration_session_id, requested_hub_session_id) =
         widget_run_session_locator(&credential, &req)?;
@@ -17995,7 +18002,14 @@ async fn create_secret_grants(
     headers: HeaderMap,
     Json(req): Json<CreateSecretGrantRequest>,
 ) -> Result<Json<Vec<SecretGrantDto>>, ApiError> {
-    let user = require_user(&state, &headers).await?;
+    let (user, client_agent_id) = require_secret_grant_user(&state, &headers).await?;
+    if let Some(allowed_agent_id) = client_agent_id {
+        if allowed_agent_id != req.agent_id {
+            return Err(ApiError::forbidden(
+                "the Widget credential may only grant secrets for its Agent",
+            ));
+        }
+    }
     load_agent_for_user(&state.pool, req.agent_id, &user).await?;
     if req.secret_names.is_empty() || req.secret_names.len() > 128 {
         return Err(ApiError::bad_request(
@@ -18065,6 +18079,29 @@ async fn create_secret_grants(
             })
             .collect(),
     ))
+}
+
+async fn require_secret_grant_user(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(UserDto, Option<Uuid>), ApiError> {
+    if let Some(token) = client_access_token_from_headers(headers) {
+        let mut tx = state.pool.begin().await?;
+        let credential = load_widget_credential_tx(&mut tx, &token, headers).await?;
+        if credential.is_anonymous() {
+            return Err(ApiError::forbidden(
+                "anonymous Widgets cannot grant secrets",
+            ));
+        }
+        let row = sqlx::query("SELECT id, email, display_name, role FROM users WHERE id = $1")
+            .bind(credential.owner_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(ApiError::unauthorized("Widget credential user not found"))?;
+        tx.commit().await?;
+        return Ok((user_from_row(row), Some(credential.agent_id)));
+    }
+    Ok((require_user(state, headers).await?, None))
 }
 
 async fn delete_secret_grant(
@@ -25914,6 +25951,7 @@ mod tests {
                 model_selection: None,
                 model_settings: Some(AgentModelSettings::default()),
                 subagents: Vec::new(),
+                secret_declarations: Vec::new(),
                 tool_allowlist: default_agent_tool_allowlist(),
             }),
         )
@@ -25932,6 +25970,7 @@ mod tests {
             model_policy: agent.model_policy.clone(),
             sandbox_policy: agent.sandbox_policy.clone(),
             managed_skill_ids: Vec::new(),
+            secret_declarations: agent.secret_declarations.clone(),
             mcp_allowlist: json!([{
                 "name": "github",
                 "command": "gh-mcp",
@@ -47667,6 +47706,7 @@ mod tests {
             model_policy: json!({}),
             sandbox_policy: json!({}),
             managed_skill_ids: Vec::new(),
+            secret_declarations: Vec::new(),
             mcp_allowlist: json!([]),
             tool_allowlist: default_agent_tool_allowlist(),
             is_owner: false,
@@ -47700,6 +47740,7 @@ mod tests {
             model_policy: json!({ "provider": "hub-proxy" }),
             sandbox_policy: json!({ "mode": "workspace-write", "network_access": true }),
             managed_skill_ids: Vec::new(),
+            secret_declarations: Vec::new(),
             mcp_allowlist: json!([]),
             tool_allowlist: default_agent_tool_allowlist(),
         }
@@ -48497,6 +48538,7 @@ mod tests {
                     enabled: true,
                     disabled_reason: None,
                 }],
+                secret_declarations: Vec::new(),
                 tool_allowlist: default_agent_tool_allowlist(),
             }),
         )
@@ -48666,6 +48708,7 @@ mod tests {
                     enabled: true,
                     disabled_reason: None,
                 }],
+                secret_declarations: Vec::new(),
                 tool_allowlist: default_agent_tool_allowlist(),
             }),
         )
@@ -49195,6 +49238,7 @@ mod tests {
                     enabled: true,
                     disabled_reason: None,
                 }],
+                secret_declarations: Vec::new(),
                 tool_allowlist: default_agent_tool_allowlist(),
             }),
         )
@@ -50389,6 +50433,7 @@ mod tests {
             model_policy: agent.model_policy.clone(),
             sandbox_policy: agent.sandbox_policy.clone(),
             managed_skill_ids: agent.managed_skill_ids.clone(),
+            secret_declarations: agent.secret_declarations.clone(),
             mcp_allowlist: agent.mcp_allowlist.clone(),
             tool_allowlist: agent.tool_allowlist.clone(),
         }

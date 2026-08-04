@@ -16,6 +16,7 @@ V1 保留以下可浏览器验证的产品链路；其执行和存储边界已�
 10. Integration App 统一 OAuth、外部 Session API 和 Widget，可委托多个 Agent，并通过应用级或用户级 Application Token 使用显式 Agent scopes。
 11. Automation、Skill、API Key、Runtime 和 Administration 均以列表或专用 Tab 为主体，新建/编辑表单只在点击操作按钮后打开。
 12. Model API Connection 以独立一级菜单管理 Global/Personal provider 地址、密钥、单一 API Type 和多个 Allowed Model ID；Agent/子 Agent 管理具体 Model Selection 和调用参数。System Default 保存 Global connection/model pair；Runtime 只使用 Run binding 和 Hub 的 Responses 入口，Hub 经内部无状态 Model Gateway 访问 OpenAI Responses、Chat Completions 或 Anthropic Messages provider。
+13. 个人密钥变量按用户保存，Agent 只声明名称/类型；授权、注入、撤销、沙箱与 Bundle 排除规则见 `docs/secret-variables-spec.md`。
 
 ## 兼容边界
 

@@ -40,7 +40,8 @@ async function createOwnedAgentFixture(page: import('@playwright/test').Page, la
     public_to: [],
     model_selection: { connection_id: model.id, model_id: 'hub-proxy-smoke' },
     model_settings: automaticModelSettings,
-    subagents: []
+    subagents: [],
+    secret_declarations: []
   } });
   expect(agentResponse.ok()).toBeTruthy();
   return {
@@ -127,7 +128,7 @@ test('automation history supports errors, retry, pagination, failed logs, empty 
     { id: automationB, agent_id: agentId, owner_id: ownerId, name: 'History B', trigger_type: 'manual', prompt: 'B', schedule: null, webhook_token: null, enabled: true, last_triggered_at: null, created_at: '2026-07-11T07:00:00Z' }
   ];
   await page.route('**/api/auth/me', (route) => route.fulfill({ json: { id: ownerId, email: 'history@example.com', display_name: 'History', role: 'member' } }));
-  await page.route('**/api/agents', (route) => route.fulfill({ json: [{ id: agentId, owner_id: ownerId, name: 'History agent', instructions: '', visibility: 'private', public_to: [], runtime_id: null, is_owner: true, can_manage: true, can_administer: true, can_invoke: true, model_policy: {}, sandbox_policy: {}, skills_manifest: [], managed_skill_ids: [], mcp_allowlist: [], created_at: '2026-07-11T07:00:00Z', updated_at: '2026-07-11T07:00:00Z' }] }));
+  await page.route('**/api/agents', (route) => route.fulfill({ json: [{ id: agentId, owner_id: ownerId, name: 'History agent', instructions: '', visibility: 'private', public_to: [], runtime_id: null, is_owner: true, can_manage: true, can_administer: true, can_invoke: true, model_policy: {}, sandbox_policy: {}, skills_manifest: [], managed_skill_ids: [], mcp_allowlist: [], secret_declarations: [], created_at: '2026-07-11T07:00:00Z', updated_at: '2026-07-11T07:00:00Z' }] }));
   await page.route('**/api/automations', (route) => route.fulfill({ json: automations }));
   let historyAttempts = 0;
   await page.route('**/api/automations/*/runs?*', async (route) => {
@@ -192,7 +193,7 @@ test('automation history polling is serial and ignores a delayed previous select
   let aInFlight = 0;
   let maxAInFlight = 0;
   await page.route('**/api/auth/me', (route) => route.fulfill({ json: { id: ownerId, email: 'poll@example.com', display_name: 'Poll', role: 'member' } }));
-  await page.route('**/api/agents', (route) => route.fulfill({ json: [{ id: agentId, owner_id: ownerId, name: 'Poll agent', instructions: '', visibility: 'private', public_to: [], runtime_id: null, is_owner: true, can_manage: true, can_administer: true, can_invoke: true, model_policy: {}, sandbox_policy: {}, skills_manifest: [], managed_skill_ids: [], mcp_allowlist: [], created_at: '2026-07-11T07:00:00Z', updated_at: '2026-07-11T07:00:00Z' }] }));
+  await page.route('**/api/agents', (route) => route.fulfill({ json: [{ id: agentId, owner_id: ownerId, name: 'Poll agent', instructions: '', visibility: 'private', public_to: [], runtime_id: null, is_owner: true, can_manage: true, can_administer: true, can_invoke: true, model_policy: {}, sandbox_policy: {}, skills_manifest: [], managed_skill_ids: [], mcp_allowlist: [], secret_declarations: [], created_at: '2026-07-11T07:00:00Z', updated_at: '2026-07-11T07:00:00Z' }] }));
   await page.route('**/api/automations', (route) => route.fulfill({ json: [
     { id: automationA, agent_id: agentId, owner_id: ownerId, name: 'Polling A', trigger_type: 'manual', prompt: 'A', schedule: null, webhook_token: null, enabled: true, last_triggered_at: null, created_at: '2026-07-11T07:00:00Z' },
     { id: automationB, agent_id: agentId, owner_id: ownerId, name: 'Polling B', trigger_type: 'manual', prompt: 'B', schedule: null, webhook_token: null, enabled: true, last_triggered_at: null, created_at: '2026-07-11T07:00:00Z' }
@@ -243,7 +244,7 @@ test('triggering B from A page two selects B page one and reselecting B preserve
   let bTriggered = false;
   const bHistoryPages: number[] = [];
   await page.route('**/api/auth/me', (route) => route.fulfill({ json: { id: ownerId, email: 'trigger@example.com', display_name: 'Trigger', role: 'member' } }));
-  await page.route('**/api/agents', (route) => route.fulfill({ json: [{ id: agentId, owner_id: ownerId, name: 'Trigger agent', instructions: '', visibility: 'private', public_to: [], runtime_id: null, is_owner: true, can_manage: true, can_administer: true, can_invoke: true, model_policy: {}, sandbox_policy: {}, skills_manifest: [], managed_skill_ids: [], mcp_allowlist: [], created_at: '2026-07-11T07:00:00Z', updated_at: '2026-07-11T07:00:00Z' }] }));
+  await page.route('**/api/agents', (route) => route.fulfill({ json: [{ id: agentId, owner_id: ownerId, name: 'Trigger agent', instructions: '', visibility: 'private', public_to: [], runtime_id: null, is_owner: true, can_manage: true, can_administer: true, can_invoke: true, model_policy: {}, sandbox_policy: {}, skills_manifest: [], managed_skill_ids: [], mcp_allowlist: [], secret_declarations: [], created_at: '2026-07-11T07:00:00Z', updated_at: '2026-07-11T07:00:00Z' }] }));
   await page.route('**/api/automations', (route) => route.fulfill({ json: automations }));
   await page.route(`**/api/automations/${automationB}/trigger`, (route) => {
     bTriggered = true;
@@ -287,7 +288,7 @@ test('successful trigger keeps B history when the following Automation list refr
   ];
   let listRequests = 0;
   await page.route('**/api/auth/me', (route) => route.fulfill({ json: { id: ownerId, email: 'refresh@example.com', display_name: 'Refresh', role: 'member' } }));
-  await page.route('**/api/agents', (route) => route.fulfill({ json: [{ id: agentId, owner_id: ownerId, name: 'Refresh agent', instructions: '', visibility: 'private', public_to: [], runtime_id: null, is_owner: true, can_manage: true, can_administer: true, can_invoke: true, model_policy: {}, sandbox_policy: {}, skills_manifest: [], managed_skill_ids: [], mcp_allowlist: [], created_at: '2026-07-11T07:00:00Z', updated_at: '2026-07-11T07:00:00Z' }] }));
+  await page.route('**/api/agents', (route) => route.fulfill({ json: [{ id: agentId, owner_id: ownerId, name: 'Refresh agent', instructions: '', visibility: 'private', public_to: [], runtime_id: null, is_owner: true, can_manage: true, can_administer: true, can_invoke: true, model_policy: {}, sandbox_policy: {}, skills_manifest: [], managed_skill_ids: [], mcp_allowlist: [], secret_declarations: [], created_at: '2026-07-11T07:00:00Z', updated_at: '2026-07-11T07:00:00Z' }] }));
   await page.route('**/api/automations', (route) => {
     listRequests += 1;
     return listRequests === 1 ? route.fulfill({ json: automations }) : route.fulfill({ status: 500, json: { error: 'list unavailable' } });
@@ -315,7 +316,7 @@ test('canceling an edit restores form fields without clearing terminal history o
   const automation = { id: automationId, agent_id: agentId, owner_id: ownerId, name: 'Discard A', trigger_type: 'manual', prompt: 'Saved prompt', schedule: null, webhook_token: null, enabled: true, last_triggered_at: null, created_at: '2026-07-11T07:00:00Z' };
   let historyRequests = 0;
   await page.route('**/api/auth/me', (route) => route.fulfill({ json: { id: ownerId, email: 'discard@example.com', display_name: 'Discard', role: 'member' } }));
-  await page.route('**/api/agents', (route) => route.fulfill({ json: [{ id: agentId, owner_id: ownerId, name: 'Discard agent', instructions: '', visibility: 'private', public_to: [], runtime_id: null, is_owner: true, can_manage: true, can_administer: true, can_invoke: true, model_policy: {}, sandbox_policy: {}, skills_manifest: [], managed_skill_ids: [], mcp_allowlist: [], created_at: '2026-07-11T07:00:00Z', updated_at: '2026-07-11T07:00:00Z' }] }));
+  await page.route('**/api/agents', (route) => route.fulfill({ json: [{ id: agentId, owner_id: ownerId, name: 'Discard agent', instructions: '', visibility: 'private', public_to: [], runtime_id: null, is_owner: true, can_manage: true, can_administer: true, can_invoke: true, model_policy: {}, sandbox_policy: {}, skills_manifest: [], managed_skill_ids: [], mcp_allowlist: [], secret_declarations: [], created_at: '2026-07-11T07:00:00Z', updated_at: '2026-07-11T07:00:00Z' }] }));
   await page.route('**/api/automations', (route) => route.fulfill({ json: [automation] }));
   await page.route(`**/api/automations/${automationId}/runs?*`, (route) => {
     historyRequests += 1;
@@ -362,7 +363,7 @@ test('a delayed B trigger does not replace C selected while the request is pendi
   let bHistoryRequests = 0;
   let listRequests = 0;
   await page.route('**/api/auth/me', (route) => route.fulfill({ json: { id: ownerId, email: 'race-c@example.com', display_name: 'Race C', role: 'member' } }));
-  await page.route('**/api/agents', (route) => route.fulfill({ json: [{ id: agentId, owner_id: ownerId, name: 'Race agent', instructions: '', visibility: 'private', public_to: [], runtime_id: null, is_owner: true, can_manage: true, can_administer: true, can_invoke: true, model_policy: {}, sandbox_policy: {}, skills_manifest: [], managed_skill_ids: [], mcp_allowlist: [], created_at: '2026-07-11T07:00:00Z', updated_at: '2026-07-11T07:00:00Z' }] }));
+  await page.route('**/api/agents', (route) => route.fulfill({ json: [{ id: agentId, owner_id: ownerId, name: 'Race agent', instructions: '', visibility: 'private', public_to: [], runtime_id: null, is_owner: true, can_manage: true, can_administer: true, can_invoke: true, model_policy: {}, sandbox_policy: {}, skills_manifest: [], managed_skill_ids: [], mcp_allowlist: [], secret_declarations: [], created_at: '2026-07-11T07:00:00Z', updated_at: '2026-07-11T07:00:00Z' }] }));
   await page.route('**/api/automations', (route) => { listRequests += 1; return route.fulfill({ json: automations }); });
   await page.route(`**/api/automations/${automationB}/trigger`, async (route) => {
     triggerStarted.resolve();
@@ -398,7 +399,7 @@ test('a delayed B trigger does not close or replace the New automation draft', a
   const releaseTrigger = deferred();
   let listRequests = 0;
   await page.route('**/api/auth/me', (route) => route.fulfill({ json: { id: ownerId, email: 'race-new@example.com', display_name: 'Race New', role: 'member' } }));
-  await page.route('**/api/agents', (route) => route.fulfill({ json: [{ id: agentId, owner_id: ownerId, name: 'Race agent', instructions: '', visibility: 'private', public_to: [], runtime_id: null, is_owner: true, can_manage: true, can_administer: true, can_invoke: true, model_policy: {}, sandbox_policy: {}, skills_manifest: [], managed_skill_ids: [], mcp_allowlist: [], created_at: '2026-07-11T07:00:00Z', updated_at: '2026-07-11T07:00:00Z' }] }));
+  await page.route('**/api/agents', (route) => route.fulfill({ json: [{ id: agentId, owner_id: ownerId, name: 'Race agent', instructions: '', visibility: 'private', public_to: [], runtime_id: null, is_owner: true, can_manage: true, can_administer: true, can_invoke: true, model_policy: {}, sandbox_policy: {}, skills_manifest: [], managed_skill_ids: [], mcp_allowlist: [], secret_declarations: [], created_at: '2026-07-11T07:00:00Z', updated_at: '2026-07-11T07:00:00Z' }] }));
   await page.route('**/api/automations', (route) => { listRequests += 1; return route.fulfill({ json: [automation] }); });
   await page.route(`**/api/automations/${automationB}/trigger`, async (route) => {
     triggerStarted.resolve();

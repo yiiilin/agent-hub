@@ -8,6 +8,7 @@ import { FormDialog } from './components/form-dialog';
 import { MarkdownEditor } from './components/markdown-editor';
 import { SkillDetailPage, SkillsPage } from './skills';
 import { SessionsPage } from './sessions';
+import { SecretsPage } from './secrets';
 import { AdministrationPage } from './administration';
 import { AgentPage as AgentDetailPage, AgentsPage } from './agents';
 import { IntegrationAppsPage } from './integrations';
@@ -19,7 +20,7 @@ import { WidgetApp } from './widget';
 import { UsageDocsPage } from './usage-docs';
 import './styles.css';
 
-type Route = { name: 'login' } | { name: 'agents' } | { name: 'agent'; agentId: string } | { name: 'sessions' } | { name: 'integrations' } | { name: 'skills' } | { name: 'skill'; skillId: string } | { name: 'models' } | { name: 'apiKeys' } | { name: 'guide' } | { name: 'docs' } | { name: 'automations' } | { name: 'runtimes' } | { name: 'administration' } | { name: 'widget'; token?: string; appClientId?: string } | { name: 'notFound' };
+type Route = { name: 'login' } | { name: 'agents' } | { name: 'agent'; agentId: string } | { name: 'sessions' } | { name: 'integrations' } | { name: 'skills' } | { name: 'skill'; skillId: string } | { name: 'secrets' } | { name: 'models' } | { name: 'apiKeys' } | { name: 'guide' } | { name: 'docs' } | { name: 'automations' } | { name: 'runtimes' } | { name: 'administration' } | { name: 'widget'; token?: string; appClientId?: string } | { name: 'notFound' };
 
 function parseRoute(): Route {
   const path = window.location.pathname;
@@ -37,6 +38,7 @@ function parseRoute(): Route {
   const skillMatch = path.match(/^\/skills\/([^/]+)\/?$/);
   if (skillMatch) return { name: 'skill', skillId: decodeURIComponent(skillMatch[1]) };
   if (path.startsWith('/skills/')) return { name: 'notFound' };
+  if (path === '/secrets' || path === '/secrets/') return { name: 'secrets' };
   if (path.startsWith('/api-keys')) return { name: 'apiKeys' };
   if (path === '/models' || path === '/models/') return { name: 'models' };
   if (path.startsWith('/models/')) return { name: 'notFound' };
@@ -115,6 +117,7 @@ function App() {
       {route.name === 'agent' && <AgentDetailPage key={route.agentId} agentId={route.agentId} currentUser={user} navigate={navigate} setNavigationBlocker={setNavigationBlocker} RunConsole={RunConsole} />}
       {route.name === 'skills' && <SkillsPage navigate={navigate} />}
       {route.name === 'skill' && <SkillDetailPage key={route.skillId} skillId={route.skillId} navigate={navigate} setNavigationBlocker={setNavigationBlocker} />}
+      {route.name === 'secrets' && <SecretsPage />}
       {route.name === 'apiKeys' && <ApiKeysPage />}
       {route.name === 'models' && <ModelsPage currentUser={user} />}
       {route.name === 'guide' && <UsageDocsPage />}
@@ -175,6 +178,7 @@ function Shell({ user, children, onUserUpdated }: { user: User | null; children:
           </div>
           <div className="nav-group"><span>{t('resources')}</span>
             <button className="nav-button" aria-current={current('skills')} onClick={() => goTo('/skills')}><Sparkles size={18} /> {t('skills')}</button>
+            <button className="nav-button" aria-current={current('secrets')} onClick={() => goTo('/secrets')}><LockKeyhole size={18} /> {t('personalSecrets')}</button>
             <button className="nav-button" aria-current={current('models')} onClick={() => goTo('/models')}><BrainCircuit size={18} /> {t('models')}</button>
             <button className="nav-button" aria-current={current('apiKeys')} onClick={() => goTo('/api-keys')}><KeyRound size={18} /> {t('apiKeys')}</button>
           </div>

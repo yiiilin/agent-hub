@@ -39,6 +39,7 @@ function agent(id: string, name: string, runtimeId: string | null) {
     skills_manifest: [],
     managed_skill_ids: [],
     mcp_allowlist: [],
+    secret_declarations: [],
     created_at: '2026-07-11T08:00:00.000Z',
     updated_at: '2026-07-11T08:00:00.000Z'
   };

@@ -141,6 +141,7 @@ type AgentConfiguration = Pick<Agent,
   | 'sandbox_policy'
   | 'managed_skill_ids'
   | 'mcp_allowlist'
+  | 'secret_declarations'
 >;
 
 function createAgentRequest(name: string, instructions: string) {
@@ -151,7 +152,8 @@ function createAgentRequest(name: string, instructions: string) {
     public_to: [],
     model_selection: null,
     model_settings: automaticModelSettings,
-    subagents: []
+    subagents: [],
+    secret_declarations: []
   };
 }
 
@@ -168,7 +170,8 @@ function updateAgentRequest(agent: AgentConfiguration, changes: Partial<AgentCon
     subagents: updated.subagents,
     sandbox_policy: updated.sandbox_policy,
     managed_skill_ids: updated.managed_skill_ids,
-    mcp_allowlist: updated.mcp_allowlist
+    mcp_allowlist: updated.mcp_allowlist,
+    secret_declarations: updated.secret_declarations
   };
 }
 
@@ -192,6 +195,7 @@ function consoleAgentFixture(agentId: string, ownerId: string, now: string) {
     sandbox_policy: {},
     managed_skill_ids: [],
     mcp_allowlist: [],
+    secret_declarations: [],
     created_at: now,
     updated_at: now
   };

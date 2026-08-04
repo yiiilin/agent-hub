@@ -897,13 +897,7 @@ impl PersistentPiRpcProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for secret in &run_env.secret_values {
-            command.env(format!("AGENT_SECRET_{}", secret.name), &secret.value);
-        }
-        for file in &run_env.secret_files {
-            let path = run_env.engine_state_root.join("secrets").join(&file.name);
-            command.env(format!("AGENT_SECRET_FILE_{}", file.name), path);
-        }
+        apply_pi_secret_environment(&mut command, run_env);
         if let Some(broker) = &skill_exec_broker {
             command
                 .env("AGENT_HUB_SKILL_EXEC_SOCKET", broker.socket_path())
@@ -1375,6 +1369,16 @@ impl PersistentPiRpcProcess {
 impl Drop for PersistentPiRpcProcess {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+fn apply_pi_secret_environment(command: &mut Command, run_env: &RunEnv) {
+    for secret in &run_env.secret_values {
+        command.env(format!("AGENT_SECRET_{}", secret.name), &secret.value);
+    }
+    for file in &run_env.secret_files {
+        let path = run_env.engine_state_root.join("secrets").join(&file.name);
+        command.env(format!("AGENT_SECRET_FILE_{}", file.name), path);
     }
 }
 
@@ -2271,12 +2275,14 @@ fn pi_result_text(result: Option<&Value>) -> String {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::{
+        collections::BTreeMap,
         os::unix::process::CommandExt,
         process::{Command, Output, Stdio},
     };
 
     use super::*;
     use crate::RunEnv;
+    use agent_hub_shared::{RunSecretFileDto, RunSecretValueDto};
 
     struct IsolatedRunEnv {
         run_env: RunEnv,
@@ -2483,6 +2489,159 @@ if [ "$$" -ne 1 ] && IFS= read -r _ < /proc/1/maps; then exit 31; fi
             output.status.success(),
             "sandbox proc probe failed: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn secret_environment_is_injected_into_pi_process_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine_state_root = temp.path().join("sessions/first/engine-state");
+        let run_env = RunEnv {
+            workdir: temp.path().join("sessions/first/workspace"),
+            engine_state_root: engine_state_root.clone(),
+            hub_url: "http://127.0.0.1:8080".into(),
+            maintenance_token_file: None,
+            secret_values: vec![
+                RunSecretValueDto {
+                    name: "TOKEN".into(),
+                    value: "value-one".into(),
+                },
+                RunSecretValueDto {
+                    name: "API_KEY".into(),
+                    value: "value-two".into(),
+                },
+            ],
+            secret_files: vec![
+                RunSecretFileDto {
+                    name: "CREDENTIALS".into(),
+                    size_bytes: 1,
+                    sha256: "checksum-one".into(),
+                },
+                RunSecretFileDto {
+                    name: "CERT".into(),
+                    size_bytes: 1,
+                    sha256: "checksum-two".into(),
+                },
+            ],
+        };
+        let mut command = Command::new("pi");
+
+        apply_pi_secret_environment(&mut command, &run_env);
+
+        let envs = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            envs.get("AGENT_SECRET_TOKEN")
+                .and_then(|value| value.as_deref()),
+            Some("value-one")
+        );
+        assert_eq!(
+            envs.get("AGENT_SECRET_API_KEY")
+                .and_then(|value| value.as_deref()),
+            Some("value-two")
+        );
+        assert_eq!(
+            envs.get("AGENT_SECRET_FILE_CREDENTIALS")
+                .and_then(|value| value.as_deref()),
+            Some(
+                engine_state_root
+                    .join("secrets")
+                    .join("CREDENTIALS")
+                    .to_str()
+                    .unwrap()
+            )
+        );
+        assert_eq!(
+            envs.get("AGENT_SECRET_FILE_CERT")
+                .and_then(|value| value.as_deref()),
+            Some(
+                engine_state_root
+                    .join("secrets")
+                    .join("CERT")
+                    .to_str()
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn landlock_secret_files_require_read_capable_tools_without_bash_edit_or_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = isolated_run_env(temp.path(), "first");
+        let secret_dir = fixture.run_env.engine_state_root.join("secrets");
+        fs::create_dir_all(&secret_dir).unwrap();
+        let secret_file = secret_dir.join("secret.txt");
+        fs::write(&secret_file, "granted-secret\n").unwrap();
+
+        let output = run_sandboxed_shell(
+            &fixture,
+            &["read", "grep", "find", "ls"],
+            "IFS= read -r value < \"$1\"\n[ \"$value\" = \"granted-secret\" ]\nprintf 'secret-read-ok\\n'\n",
+            &[&secret_file],
+        );
+        assert!(
+            output.status.success(),
+            "secrets must be readable with read-capable tools: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "secret-read-ok\n"
+        );
+
+        let denied_by_bash = run_sandboxed_shell(
+            &fixture,
+            &["bash"],
+            "if /bin/sh -c 'IFS= read -r _ < \"$1\"' sh \"$1\"; then exit 91; fi\nprintf 'secret-read-denied\\n'\n",
+            &[&secret_file],
+        );
+        assert!(
+            denied_by_bash.status.success(),
+            "secrets must be hidden from bash-only tools: {}",
+            String::from_utf8_lossy(&denied_by_bash.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(denied_by_bash.stdout).unwrap(),
+            "secret-read-denied\n"
+        );
+
+        let denied_by_edit = run_sandboxed_shell(
+            &fixture,
+            &["read", "edit"],
+            "if /bin/sh -c 'IFS= read -r _ < \"$1\"' sh \"$1\"; then exit 92; fi\nprintf 'secret-read-denied\\n'\n",
+            &[&secret_file],
+        );
+        assert!(
+            denied_by_edit.status.success(),
+            "secrets must be hidden when edit is enabled: {}",
+            String::from_utf8_lossy(&denied_by_edit.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(denied_by_edit.stdout).unwrap(),
+            "secret-read-denied\n"
+        );
+
+        let denied_by_write = run_sandboxed_shell(
+            &fixture,
+            &["read", "write"],
+            "if /bin/sh -c 'IFS= read -r _ < \"$1\"' sh \"$1\"; then exit 93; fi\nprintf 'secret-read-denied\\n'\n",
+            &[&secret_file],
+        );
+        assert!(
+            denied_by_write.status.success(),
+            "secrets must be hidden when write is enabled: {}",
+            String::from_utf8_lossy(&denied_by_write.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(denied_by_write.stdout).unwrap(),
+            "secret-read-denied\n"
         );
     }
 }

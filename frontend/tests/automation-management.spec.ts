@@ -25,6 +25,7 @@ const agent = {
   sandbox_policy: {},
   managed_skill_ids: [],
   mcp_allowlist: [],
+  secret_declarations: [],
   created_at: '2026-07-17T08:00:00.000Z',
   updated_at: '2026-07-17T08:00:00.000Z'
 };

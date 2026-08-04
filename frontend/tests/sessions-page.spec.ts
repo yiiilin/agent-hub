@@ -112,12 +112,12 @@ async function installSessionApi(page: Page, options: {
     {
       id: activeAgentId, name: 'Active Agent', instructions: '', visibility: 'private', public_to: [], runtime_id: null,
       owner_id: ownerId, is_owner: true, can_manage: true, can_administer: true, can_invoke: true,
-      model_policy: {}, sandbox_policy: {}, managed_skill_ids: [], mcp_allowlist: [], created_at: now, updated_at: now
+      model_policy: {}, sandbox_policy: {}, managed_skill_ids: [], mcp_allowlist: [], secret_declarations: [], created_at: now, updated_at: now
     },
     {
       id: newAgentId, name: 'New Agent', instructions: '', visibility: 'public', public_to: [], runtime_id: null,
       owner_id: '10000000-0000-4000-8000-000000000099', is_owner: false, can_manage: false, can_administer: false, can_invoke: true,
-      model_policy: {}, sandbox_policy: {}, managed_skill_ids: [], mcp_allowlist: [], created_at: now, updated_at: now
+      model_policy: {}, sandbox_policy: {}, managed_skill_ids: [], mcp_allowlist: [], secret_declarations: [], created_at: now, updated_at: now
     }
   ];
 

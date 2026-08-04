@@ -4,10 +4,12 @@ import {
   type AgentHubClient,
   type ClientAgent,
   type ClientSession,
+  type SecretGrantRequirement,
   type SessionEvent,
   type SessionMessage,
   type SessionSubscription,
-  type SessionSummary
+  type SessionSummary,
+  isSecretGrantsRequiredError
 } from '@agent-hub/client';
 import { ArrowUp, Bot, History, Languages, Plus, X } from 'lucide-react';
 import { type FormEvent, type TouchEvent, type WheelEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
@@ -37,6 +39,12 @@ type PersistedWidgetState = {
   sessionId: string | null;
   draft: string;
   draftClientMessageKey: string;
+};
+
+type SecretGrantPrompt = {
+  requirements: SecretGrantRequirement[];
+  content: string;
+  clientMessageKey: string;
 };
 
 type OptimisticMessage = {
@@ -228,6 +236,9 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
   const [draftClientMessageKey, setDraftClientMessageKey] = useState(initialState.draftClientMessageKey);
   const [runPending, setRunPending] = useState(false);
   const [streamError, setStreamError] = useState(false);
+  const [secretGrantPrompt, setSecretGrantPrompt] = useState<SecretGrantPrompt | null>(null);
+  const [grantPending, setGrantPending] = useState(false);
+  const grantPendingRef = useRef(false);
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [hostOrigin, setHostOrigin] = useState<string | null>(initialHostOrigin);
@@ -433,11 +444,11 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
     }
   }, [activateSession, initialState.sessionId, t, widgetFetch]);
 
-  const startRun = useCallback(async (requestedContent: string) => {
+  const startRun = useCallback(async (requestedContent: string, requestedMessageKey?: string) => {
     const session = sessionRef.current;
     const content = requestedContent.trim();
     if (!session || !content || runPendingRef.current || !ready) return;
-    const messageKey = draftClientMessageKey;
+    const messageKey = requestedMessageKey ?? draftClientMessageKey;
     const optimistic: OptimisticMessage = {
       id: `optimistic-${messageKey}`,
       content,
@@ -450,6 +461,7 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
     setRunPending(true);
     setStreamError(false);
     setError(null);
+    setSecretGrantPrompt(null);
     setOptimisticMessages((current) => [...current.filter((item) => item.clientMessageKey !== messageKey), optimistic]);
     try {
       const result = await session.send(content, { clientMessageKey: messageKey });
@@ -467,8 +479,13 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
       await loadMessages(session, false);
       void refreshHistory();
       postWidgetMessage('agent-hub:run-started', { runId: result.run.id, sessionId: result.sessionId });
-    } catch {
+    } catch (error) {
       if (session === sessionRef.current) {
+        if (isSecretGrantsRequiredError(error) && selectedTokenRef.current !== null) {
+          setOptimisticMessages((current) => current.filter((item) => item.clientMessageKey !== messageKey));
+          setSecretGrantPrompt({ requirements: error.requirements, content, clientMessageKey: messageKey });
+          return;
+        }
         setOptimisticMessages((current) => current.map((item) => item.clientMessageKey === messageKey
           ? { ...item, failed: true }
           : item));
@@ -479,6 +496,47 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
       if (mountedRef.current) setRunPending(false);
     }
   }, [draft, draftClientMessageKey, loadMessages, postWidgetMessage, ready, refreshHistory, subscribeToSession, t]);
+
+  const allowSecretGrant = useCallback(async () => {
+    const prompt = secretGrantPrompt;
+    if (!prompt || grantPendingRef.current) return;
+    const session = sessionRef.current;
+    const agentId = agent?.id ?? clientRef.current?.agent?.id;
+    if (!session || !agentId) return;
+    grantPendingRef.current = true;
+    setGrantPending(true);
+    try {
+      const token = selectedTokenRef.current;
+      if (!token) return;
+      const response = await fetch('/api/secret-grants', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer ' + token
+        },
+        body: JSON.stringify({
+          agent_id: agentId,
+          secret_names: prompt.requirements.map((requirement) => requirement.name)
+        })
+      });
+      if (!response.ok) throw new Error('Secret grant request failed');
+      if (session !== sessionRef.current) return;
+      setSecretGrantPrompt(null);
+      await startRun(prompt.content, prompt.clientMessageKey);
+    } catch (cause) {
+      console.error(cause);
+      if (session === sessionRef.current) setError(t('secretGrantFailed'));
+    } finally {
+      grantPendingRef.current = false;
+      if (mountedRef.current) setGrantPending(false);
+    }
+  }, [agent?.id, secretGrantPrompt, startRun, t]);
+
+  const cancelSecretGrant = useCallback(() => {
+    setSecretGrantPrompt(null);
+  }, []);
+
   submitFromHostRef.current = startRun;
 
   useEffect(() => {
@@ -783,6 +841,19 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
       {!historyLoading && !historyError && historySessions.length > 0 && <div className="widget-history-list">{historySessions.map((item) => <button type="button" key={item.id} className={`widget-history-item ${item.id === selectedSessionId ? 'selected' : ''}`} onClick={() => { const client = clientRef.current; if (client) void activateSession(client.existing(item.id)); }}><span>{item.preview || t('newConversation')}</span>{historyUpdatedAt(item) && <time>{new Date(historyUpdatedAt(item)!).toLocaleString(locale)}</time>}</button>)}</div>}
     </aside>}
     <div className="session-chat-scroll" ref={chatScrollRef} onScroll={handleScroll} onWheel={handleWheel} onTouchStart={handleTouchStart} onTouchEnd={handleTouchEnd}>
+      {secretGrantPrompt && <div className="session-banner" role="alert">
+        <strong>{t('secretGrantRequired')}</strong>
+        <span>{t('secretGrantRequiredHelp')}</span>
+        <ul>
+          {secretGrantPrompt.requirements.map((requirement) => (
+            <li key={requirement.name}><strong>{requirement.name}</strong>{requirement.description ? ` — ${requirement.description}` : null}</li>
+          ))}
+        </ul>
+        <div className="widget-secret-grant-actions">
+          <button type="button" className="primary" disabled={grantPending} onClick={() => void allowSecretGrant()}>{t('allowSecretGrant')}</button>
+          <button type="button" className="secondary" disabled={grantPending} onClick={cancelSecretGrant}>{t('cancel')}</button>
+        </div>
+      </div>}
       {error && <div className="session-banner error" role="alert">{error}</div>}
       <div className="session-transcript widget-transcript" aria-live="polite" aria-busy={transcriptLoading || olderMessagesLoading}>
         {transcriptLoading && timeline.length === 0 && <div className="widget-transcript-state">{t('loadingMessages')}</div>}

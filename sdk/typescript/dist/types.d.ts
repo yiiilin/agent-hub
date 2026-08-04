@@ -97,6 +97,11 @@ export interface SendResult {
     clientMessageKey: string;
     raw: unknown;
 }
+export interface SecretGrantRequirement {
+    name: string;
+    kind: string;
+    description?: string;
+}
 export interface SessionEventBase {
     sequence: number;
     eventId?: string;

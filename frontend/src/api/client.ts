@@ -1159,10 +1159,10 @@ export const api = {
   modelCallErrors: (query: ModelLedgerQuery = {}, signal?: AbortSignal) =>
     request<ModelCallErrorPage>(modelLedgerPath('/api/model-call-errors', query), { signal }),
   agents: (signal?: AbortSignal) => request<Agent[]>('/api/agents', { signal }),
-  createAgent: (name: string, instructions: string, visibility: string, publicTo: string[] = [], signal?: AbortSignal) =>
+  createAgent: (name: string, instructions: string, visibility: string, publicTo: string[] = [], secretDeclarations: AgentSecretDeclaration[] = [], signal?: AbortSignal) =>
     request<Agent>('/api/agents', {
       method: 'POST',
-      body: JSON.stringify({ name, instructions, visibility, public_to: publicTo }),
+      body: JSON.stringify({ name, instructions, visibility, public_to: publicTo, secret_declarations: secretDeclarations }),
       signal
     }),
   createConfiguredAgent: (agent: CreateConfiguredAgentRequest, signal?: AbortSignal) =>

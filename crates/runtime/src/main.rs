@@ -6025,6 +6025,22 @@ async fn prepare_run_env_with_local_skills(
     .await
 }
 
+fn validate_run_secret_file_download(
+    manifest: &RunSecretFileDto,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        bytes.len() as i64 == manifest.size_bytes,
+        "Run secret file size does not match its manifest"
+    );
+    let checksum = format!("{:x}", Sha256::digest(bytes));
+    anyhow::ensure!(
+        checksum == manifest.sha256,
+        "Run secret file checksum does not match its manifest"
+    );
+    Ok(())
+}
+
 async fn prepare_run_env_with_local_skills_and_management(
     root: &Path,
     claim: &ClaimRunResponse,
@@ -6075,16 +6091,20 @@ async fn prepare_run_env_with_local_skills_and_management(
                 .download_run_secret_file(claim.run.id, ownership_generation, &file.name)
                 .await
                 .with_context(|| format!("download Run secret file {}", file.name))?;
-            anyhow::ensure!(
-                bytes.len() as i64 == file.size_bytes,
-                "Run secret file size does not match its manifest"
-            );
-            let checksum = format!("{:x}", Sha256::digest(&bytes));
-            anyhow::ensure!(
-                checksum == file.sha256,
-                "Run secret file checksum does not match its manifest"
-            );
+            validate_run_secret_file_download(file, &bytes)?;
             let destination = secret_dir.join(&file.name);
+            match fs::read(&destination).await {
+                Ok(existing) => {
+                    let existing_checksum = format!("{:x}", Sha256::digest(&existing));
+                    if existing.len() as i64 == file.size_bytes && existing_checksum == file.sha256
+                    {
+                        continue;
+                    }
+                    fs::remove_file(&destination).await?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
             let mut options = fs::OpenOptions::new();
             options.create_new(true).write(true);
             #[cfg(unix)]
@@ -14374,6 +14394,46 @@ done
     }
 
     #[test]
+    fn secret_file_download_validation_accepts_matching_size_and_checksum() {
+        let bytes = b"granted-secret-content".to_vec();
+        let manifest = RunSecretFileDto {
+            name: "CREDENTIALS".into(),
+            size_bytes: bytes.len() as i64,
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+        };
+
+        assert!(validate_run_secret_file_download(&manifest, &bytes).is_ok());
+    }
+
+    #[test]
+    fn secret_file_download_validation_rejects_size_mismatch() {
+        let bytes = b"granted-secret-content".to_vec();
+        let manifest = RunSecretFileDto {
+            name: "CREDENTIALS".into(),
+            size_bytes: bytes.len() as i64 + 1,
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+        };
+
+        let error = validate_run_secret_file_download(&manifest, &bytes).unwrap_err();
+
+        assert!(error.to_string().contains("size does not match"));
+    }
+
+    #[test]
+    fn secret_file_download_validation_rejects_checksum_mismatch() {
+        let bytes = b"granted-secret-content".to_vec();
+        let manifest = RunSecretFileDto {
+            name: "CREDENTIALS".into(),
+            size_bytes: bytes.len() as i64,
+            sha256: "0".repeat(64),
+        };
+
+        let error = validate_run_secret_file_download(&manifest, &bytes).unwrap_err();
+
+        assert!(error.to_string().contains("checksum does not match"));
+    }
+
+    #[test]
     fn tool_request_ids_are_scoped_to_run_for_uuid_and_non_uuid_sources() {
         let arguments = json!({ "value": 1 });
         let uuid_source = Uuid::from_u128(3).to_string();
@@ -14729,6 +14789,7 @@ done
                 "repo-review",
                 "Check the diff.",
             )],
+            secret_declarations: Vec::new(),
             mcp_allowlist: json!([{ "name": "filesystem", "command": "fs" }]),
             tool_allowlist: default_agent_tool_allowlist(),
         };
@@ -14768,6 +14829,7 @@ done
                 model_policy: json!({ "provider": "hub-proxy" }),
                 sandbox_policy: json!({ "mode": "workspace-write", "network_access": true }),
                 managed_skill_ids: Vec::new(),
+                secret_declarations: Vec::new(),
                 mcp_allowlist: json!([{ "name": "filesystem", "command": "fs" }]),
                 tool_allowlist: default_agent_tool_allowlist(),
                 is_owner: false,
@@ -14782,6 +14844,8 @@ done
             integration_context: None,
             resume: None,
             model_proxy_token: "test-model-proxy-token".into(),
+            secret_values: Vec::new(),
+            secret_files: Vec::new(),
             session_context: None,
         }
     }

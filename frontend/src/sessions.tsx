@@ -1,6 +1,7 @@
 import { ArrowUp, Bot, Brain, ChevronDown, ChevronRight, FilePenLine, ImageIcon, ListChecks, Minimize2, PanelLeft, Plus, RefreshCw, Search, Square, Terminal, Trash2, Users, Wrench, X } from 'lucide-react';
 import { FormEvent, lazy, Suspense, type TouchEvent, type WheelEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { api, type Agent, type HubSession, type HubSessionMessage, type RunEvent } from './api/client';
+import { api, ApiError, type Agent, type HubSession, type HubSessionMessage, type RunEvent, type SecretGrantRequirement } from './api/client';
+import { FormDialog } from './components/form-dialog';
 import { useI18n } from './i18n';
 import type { TranslationKey } from './i18n';
 import { discardConversationDraft, loadConversationDraft, loadSelectedSessionAgent, saveConversationDraft, saveSelectedSessionAgent } from './session-drafts';
@@ -549,6 +550,8 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
   const [actionError, setActionError] = useState(false);
   const [conversationCreateError, setConversationCreateError] = useState(false);
   const [sessionListOpen, setSessionListOpen] = useState(false);
+  const [secretGrantRequest, setSecretGrantRequest] = useState<{ agentId: string; requirements: SecretGrantRequirement[] } | null>(null);
+  const [granting, setGranting] = useState(false);
 
   const loadSessions = useCallback(async (
     preferredId?: string,
@@ -984,8 +987,7 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
     }
   }
 
-  async function submitMessage(event: FormEvent) {
-    event.preventDefault();
+  async function sendDraft() {
     const content = draft.trim();
     const pendingConversationDraft = conversationDraft;
     const pendingDraftGeneration = conversationDraftGeneration.current;
@@ -1018,19 +1020,50 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
         ? current
         : [...current, accepted.message]);
       setDraft('');
-    } catch {
-      if (mountedRef.current) {
-        if (pendingConversationDraft) {
-          if (pendingDraftGeneration === conversationDraftGeneration.current) {
-            setConversationCreateError(true);
-          }
-        } else {
-          setActionError(true);
+    } catch (caught) {
+      if (!mountedRef.current) return;
+      if (caught instanceof ApiError && caught.code === 'secret_grants_required' && caught.details?.secret_grants_required?.length) {
+        const agentId = pendingConversationDraft ? pendingConversationDraft.agentId : selectedSession?.agent_id;
+        if (agentId) {
+          setSecretGrantRequest({ agentId, requirements: caught.details.secret_grants_required });
+          return;
         }
+      }
+      if (pendingConversationDraft) {
+        if (pendingDraftGeneration === conversationDraftGeneration.current) {
+          setConversationCreateError(true);
+        }
+      } else {
+        setActionError(true);
       }
     } finally {
       if (mountedRef.current) setSending(false);
     }
+  }
+
+  function submitMessage(event: FormEvent) {
+    event.preventDefault();
+    void sendDraft();
+  }
+
+  async function allowSecretGrant() {
+    if (!secretGrantRequest || granting) return;
+    setGranting(true);
+    try {
+      await api.createSecretGrants(secretGrantRequest.agentId, secretGrantRequest.requirements.map((requirement) => requirement.name));
+      if (!mountedRef.current) return;
+      setSecretGrantRequest(null);
+      await sendDraft();
+    } catch {
+      if (mountedRef.current) setActionError(true);
+    } finally {
+      if (mountedRef.current) setGranting(false);
+    }
+  }
+
+  function cancelSecretGrant() {
+    if (granting) return;
+    setSecretGrantRequest(null);
   }
 
   function selectAgent(agentId: string) {
@@ -1165,5 +1198,18 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
         </>}
       </section>
     </div>
+    {secretGrantRequest && <FormDialog title={t('secretGrantRequired')} busy={granting} onClose={cancelSecretGrant} className="secret-grant-dialog" footer={<>
+      <button type="button" className="secondary" disabled={granting} onClick={cancelSecretGrant}>{t('cancel')}</button>
+      <button type="button" className="primary" disabled={granting} onClick={allowSecretGrant}>{granting ? t('saving') : t('allowSecretGrant')}</button>
+    </>}>
+      <p className="secret-grant-help">{t('secretGrantRequiredHelp')}</p>
+      <ul className="secret-grant-requirements">{secretGrantRequest.requirements.map((requirement) => (
+        <li key={requirement.name}>
+          <code>{requirement.name}</code>
+          <span>{requirement.kind === 'file' ? t('secretKindFile') : t('secretKindValue')}</span>
+          {requirement.description && <span>{requirement.description}</span>}
+        </li>
+      ))}</ul>
+    </FormDialog>}
   </section>;
 }

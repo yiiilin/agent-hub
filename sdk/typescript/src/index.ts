@@ -6,7 +6,12 @@ export {
   connect,
   connectAnonymous,
 } from "./client.js";
-export { AgentHubError, ClientToolError } from "./errors.js";
+export {
+  AgentHubError,
+  ClientToolError,
+  SecretGrantsRequiredError,
+  isSecretGrantsRequiredError,
+} from "./errors.js";
 export { IndexedDbToolJournalStorage, MemoryToolJournalStorage } from "./storage.js";
 export type {
   AgentHubClientOptions,
@@ -28,6 +33,7 @@ export type {
   Run,
   SendOptions,
   SendResult,
+  SecretGrantRequirement,
   SessionEvent,
   SessionEventBase,
   SessionEventListener,

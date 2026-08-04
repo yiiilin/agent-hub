@@ -4,6 +4,7 @@ import {
   Agent,
   api,
   ApiError,
+  type AgentSecretDeclaration,
   type AgentModelSettings,
   type AgentModelSettingsOverride,
   type SubagentDefinition,
@@ -153,6 +154,45 @@ function settingsForSelection(settings: AgentModelSettings, selection: ModelSele
 
 function optionalNumber(value: string) {
   return value.trim() ? Number(value) : null;
+}
+
+const secretVariableNamePattern = /^[A-Z_][A-Z0-9_]*$/;
+
+function emptySecretDeclaration(): AgentSecretDeclaration {
+  return { name: '', kind: 'value', description: '' };
+}
+
+function validateSecretDeclarations(declarations: AgentSecretDeclaration[]): 'secretNameInvalid' | 'secretVariableNameDuplicate' | null {
+  const names = new Set<string>();
+  for (const declaration of declarations) {
+    const name = declaration.name.trim();
+    if (!secretVariableNamePattern.test(name) || name.length > 128) return 'secretNameInvalid';
+    if (names.has(name)) return 'secretVariableNameDuplicate';
+    names.add(name);
+  }
+  return null;
+}
+
+function sameSecretDeclarations(left: AgentSecretDeclaration[], right: AgentSecretDeclaration[]) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function SecretDeclarationsEditor({ declarations, disabled, onChange }: { declarations: AgentSecretDeclaration[]; disabled: boolean; onChange: (declarations: AgentSecretDeclaration[]) => void }) {
+  const { t } = useI18n();
+  function update(index: number, patch: Partial<AgentSecretDeclaration>) {
+    onChange(declarations.map((declaration, candidateIndex) => candidateIndex === index ? { ...declaration, ...patch } : declaration));
+  }
+  return <section className="secret-variable-editor">
+    <div className="agent-subagent-heading"><span className="field-label">{t('secretVariables')}</span><button type="button" className="secondary" disabled={disabled || declarations.length >= 128} onClick={() => onChange([...declarations, emptySecretDeclaration()])}><Plus size={16} /> {t('addSecretVariable')}</button></div>
+    {declarations.length === 0 ? <div className="compact-empty">{t('noSecretVariables')}</div> : <div className="secret-variable-list">
+      {declarations.map((declaration, index) => <div className="secret-variable-row" key={`${declaration.name}-${index}`}>
+        <label>{t('secretName')}<input maxLength={128} disabled={disabled} value={declaration.name} onChange={(event) => update(index, { name: event.target.value })} /></label>
+        <label>{t('secretKind')}<select disabled={disabled} value={declaration.kind} onChange={(event) => update(index, { kind: event.target.value === 'file' ? 'file' : 'value' })}><option value="value">{t('secretKindValue')}</option><option value="file">{t('secretKindFile')}</option></select></label>
+        <label>{t('secretDescription')}<input maxLength={512} disabled={disabled} value={declaration.description} onChange={(event) => update(index, { description: event.target.value })} /></label>
+        <button type="button" className="icon-button" disabled={disabled} aria-label={`${t('removeSecretVariable')}: ${declaration.name || index + 1}`} title={t('removeSecretVariable')} onClick={() => onChange(declarations.filter((_, candidateIndex) => candidateIndex !== index))}><Trash2 size={16} /></button>
+      </div>)}
+    </div>}
+  </section>;
 }
 
 function modelOptionLabel(option: ModelConnectionOption, t: ReturnType<typeof useI18n>['t']) {
@@ -605,9 +645,11 @@ function CreateAgentModal({ currentUser, navigate, onClose }: { currentUser: Use
   const [modelSettings, setModelSettings] = useState<AgentModelSettings>(automaticAgentModelSettings);
   const [subagents, setSubagents] = useState<SubagentDefinition[]>([]);
   const [toolAllowlist, setToolAllowlist] = useState<string[]>([...builtInTools]);
+  const [secretDeclarations, setSecretDeclarations] = useState<AgentSecretDeclaration[]>([]);
   const [subagentDialog, setSubagentDialog] = useState<SubagentDialogState | null>(null);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState(false);
+  const [secretError, setSecretError] = useState('');
   const nameRef = useRef<HTMLInputElement>(null);
   const pendingRef = useRef(false);
   const mountedRef = useRef(true);
@@ -670,6 +712,12 @@ function CreateAgentModal({ currentUser, navigate, onClose }: { currentUser: Use
   async function create(event: FormEvent) {
     event.preventDefault();
     if (pendingRef.current) return;
+    const declarationError = validateSecretDeclarations(secretDeclarations);
+    if (declarationError) {
+      setSecretError(t(declarationError));
+      return;
+    }
+    setSecretError('');
     pendingRef.current = true;
     setPending(true);
     setError(false);
@@ -684,7 +732,8 @@ function CreateAgentModal({ currentUser, navigate, onClose }: { currentUser: Use
         model_selection: modelSelection,
         model_settings: modelSettings,
         subagents: subagents,
-        tool_allowlist: toolAllowlist
+        tool_allowlist: toolAllowlist,
+        secret_declarations: secretDeclarations
       }, controller.signal);
       if (controller.signal.aborted || !mountedRef.current) return;
       navigate(`/agents/${agent.id}`);
@@ -738,6 +787,8 @@ function CreateAgentModal({ currentUser, navigate, onClose }: { currentUser: Use
               const value = selectionValue({ connection_id: option.connection_id, model_id: option.model_id });
               return <option key={value} value={value} disabled={option.status === 'disabled' && value !== selectionValue(modelSelection)}>{modelOptionLabel(option, t)}</option>;
             })}</select></label><AgentModelSettingsFields settings={modelSettings} apiType={selectedOption(modelSelection, modelOptions.items)?.api_type ?? 'openai_responses'} disabled={pending} onChange={setModelSettings} /></>}
+        <SecretDeclarationsEditor declarations={secretDeclarations} disabled={pending} onChange={setSecretDeclarations} />
+        {secretError && <div className="error" role="alert">{secretError}</div>}
         <section className="agent-subagent-section">
           <div className="agent-subagent-heading"><span className="field-label">{t('subagents')}</span><button type="button" className="secondary" disabled={pending || modelsLoading || modelsError || subagents.length >= 32} onClick={() => openSubagent(null)}><Plus size={16} /> {t('addSubagent')}</button></div>
           <SubagentTable definitions={subagents} modelOptions={modelOptions.items} canManage disabled={pending} onEdit={openSubagent} onDelete={deleteSubagent} />
@@ -753,14 +804,15 @@ function CreateAgentModal({ currentUser, navigate, onClose }: { currentUser: Use
   </>;
 }
 
-type DetailTab = 'activity' | 'instructions' | 'models' | 'skills' | 'mcp' | 'access';
+type DetailTab = 'activity' | 'instructions' | 'models' | 'secrets' | 'skills' | 'mcp' | 'access';
 type NavigationBlockerSetter = (blocker: (() => boolean) | null) => void;
 type RunConsoleComponent = ComponentType<{ run: Run }>;
 
-const detailTabs: Array<{ id: DetailTab; key: 'tabActivity' | 'tabInstructions' | 'tabModels' | 'tabSkills' | 'tabMcp' | 'tabAccess' }> = [
+const detailTabs: Array<{ id: DetailTab; key: 'tabActivity' | 'tabInstructions' | 'tabModels' | 'tabSecrets' | 'tabSkills' | 'tabMcp' | 'tabAccess' }> = [
   { id: 'activity', key: 'tabActivity' },
   { id: 'instructions', key: 'tabInstructions' },
   { id: 'models', key: 'tabModels' },
+  { id: 'secrets', key: 'tabSecrets' },
   { id: 'skills', key: 'tabSkills' },
   { id: 'mcp', key: 'tabMcp' },
   { id: 'access', key: 'tabAccess' }
@@ -898,6 +950,8 @@ export function AgentPage({
   const [managedSkillBase, setManagedSkillBase] = useState<string[]>([]);
   const [modelDraft, setModelDraft] = useState<AgentModelDraft>({ modelSelection: null, modelSettings: automaticAgentModelSettings, subagents: [] });
   const [modelBase, setModelBase] = useState<AgentModelDraft>({ modelSelection: null, modelSettings: automaticAgentModelSettings, subagents: [] });
+  const [secretDraft, setSecretDraft] = useState<AgentSecretDeclaration[]>([]);
+  const [secretBase, setSecretBase] = useState<AgentSecretDeclaration[]>([]);
   const [accessDraft, setAccessDraft] = useState({ visibility: 'private', publicTo: [] as string[], runtimeId: null as string | null, toolAllowlist: [...builtInTools] as string[] });
   const [accessBase, setAccessBase] = useState({ visibility: 'private', publicTo: [] as string[], runtimeId: null as string | null, toolAllowlist: [...builtInTools] as string[] });
 
@@ -916,6 +970,7 @@ export function AgentPage({
   const skillsDirty = skillsDialogOpen && !sameIds(managedSkillDraft, managedSkillBase);
   const mcpDirty = Boolean(mcpDialog && !sameMcpDraft(mcpDialog.draft, mcpDialog.base));
   const modelDirty = !sameAgentModelDraft(modelDraft, modelBase);
+  const secretDirty = !sameSecretDeclarations(secretDraft, secretBase);
   const subagentDialogDirty = Boolean(subagentDialog && !sameAgentModelDraft(
     { ...modelDraft, subagents: [subagentDialog.draft] },
     { ...modelDraft, subagents: [editableSubagent(subagentDialog.index === null ? undefined : modelDraft.subagents[subagentDialog.index])] }
@@ -924,7 +979,7 @@ export function AgentPage({
     || !sameIds(accessDraft.publicTo, accessBase.publicTo)
     || accessDraft.runtimeId !== accessBase.runtimeId
     || !sameIds(accessDraft.toolAllowlist, accessBase.toolAllowlist);
-  const dirty = instructionDirty || skillsDirty || mcpDirty || modelDirty || subagentDialogDirty || accessDirty;
+  const dirty = instructionDirty || skillsDirty || mcpDirty || modelDirty || secretDirty || subagentDialogDirty || accessDirty;
 
   const applyLoadedAgent = useCallback((loaded: Agent) => {
     setAgent(loaded);
@@ -936,6 +991,8 @@ export function AgentPage({
     const models = agentModelDraft(loaded);
     setModelDraft(models);
     setModelBase(models);
+    setSecretDraft(loaded.secret_declarations);
+    setSecretBase(loaded.secret_declarations);
     const access = {
       visibility: loaded.visibility,
       publicTo: loaded.public_to,
@@ -1064,9 +1121,16 @@ export function AgentPage({
     setConfigPending(false);
   }
 
-  async function saveAgentTab(event: FormEvent, tab: 'instructions' | 'models' | 'skills' | 'access') {
+  async function saveAgentTab(event: FormEvent, tab: 'instructions' | 'models' | 'secrets' | 'skills' | 'access') {
     event.preventDefault();
     if (!agent || !agent.can_manage) return;
+    if (tab === 'secrets') {
+      const declarationError = validateSecretDeclarations(secretDraft);
+      if (declarationError) {
+        setError(t(declarationError));
+        return;
+      }
+    }
     const operation = beginConfigMutation();
     if (!operation) return;
     try {
@@ -1078,6 +1142,7 @@ export function AgentPage({
         model_settings: modelDraft.modelSettings,
         subagents: modelDraft.subagents
       };
+      if (tab === 'secrets') next = { ...next, secret_declarations: secretDraft };
       if (tab === 'skills') next = { ...next, managed_skill_ids: managedSkillDraft };
       if (tab === 'access') next = {
         ...next,
@@ -1104,6 +1169,10 @@ export function AgentPage({
         setModelDraft(saved);
         setModelBase(saved);
         setSubagentDialog(null);
+      }
+      if (tab === 'secrets') {
+        setSecretDraft(updated.secret_declarations);
+        setSecretBase(updated.secret_declarations);
       }
       if (tab === 'access') {
         const saved = { visibility: updated.visibility, publicTo: updated.public_to, runtimeId: updated.runtime_id, toolAllowlist: normalizeToolAllowlist(updated.tool_allowlist) };
@@ -1304,6 +1373,12 @@ export function AgentPage({
               <section className="agent-subagent-section"><div className="agent-subagent-heading"><span className="field-label">{t('subagents')}</span><button type="button" className="secondary" disabled={configPending || modelDraft.subagents.length >= 32} onClick={() => openSubagentDialog(null)}><Plus size={16} /> {t('addSubagent')}</button></div><SubagentTable definitions={modelDraft.subagents} modelOptions={modelOptions.items} canManage disabled={configPending} onEdit={openSubagentDialog} onDelete={deleteSubagentDefinition} /></section>
               <button className="primary" disabled={configPending || !modelDirty}><Save size={16} /> {configPending ? t('saving') : t('saveAgent')}</button>
             </form> : <div className="stack agent-readonly"><dl className="agent-model-summary"><div><dt>{t('agentModelSelection')}</dt><dd>{modelName(agent.model_selection, modelOptions.items, t('modelNotConfigured'))}</dd></div><div><dt>{t('reasoningEffort')}</dt><dd>{agent.model_settings.reasoning_effort}</dd></div></dl><SubagentTable definitions={agent.subagents} modelOptions={modelOptions.items} canManage={false} disabled onEdit={() => undefined} onDelete={() => undefined} /></div>}
+          </section>
+          <section id="agent-panel-secrets" role="tabpanel" aria-labelledby="agent-tab-secrets" aria-label={t('tabSecrets')} hidden={activeTab !== 'secrets'}>
+            {agent.can_manage ? <form className="stack" onSubmit={(event) => saveAgentTab(event, 'secrets')}>
+              <SecretDeclarationsEditor declarations={secretDraft} disabled={configPending} onChange={setSecretDraft} />
+              <button className="primary" disabled={configPending || !secretDirty}><Save size={16} /> {configPending ? t('saving') : t('saveAgent')}</button>
+            </form> : <SecretDeclarationsEditor declarations={agent.secret_declarations} disabled onChange={() => undefined} />}
           </section>
           <section id="agent-panel-skills" role="tabpanel" aria-labelledby="agent-tab-skills" aria-label={t('tabSkills')} hidden={activeTab !== 'skills'}>
             {agent.can_manage && <div className="button-row agent-panel-actions"><button type="button" className="secondary" disabled={configPending} onClick={openSkillsDialog}><Pencil size={16} /> {t('editManagedSkills')}</button></div>}

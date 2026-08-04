@@ -1,4 +1,4 @@
-import { AgentHubError, ClientToolError } from "./errors.js";
+import { AgentHubError, ClientToolError, SecretGrantsRequiredError } from "./errors.js";
 import { IndexedDbToolJournalStorage } from "./storage.js";
 import type {
   AgentHubClientOptions,
@@ -14,6 +14,7 @@ import type {
   Run,
   SendOptions,
   SendResult,
+  SecretGrantRequirement,
   SessionEvent,
   SessionEventListener,
   SessionListOptions,
@@ -277,6 +278,28 @@ function responseMessage(body: unknown, fallback: string): { code: string; messa
     };
   }
   return { code: "request_failed", message: fallback };
+}
+
+function secretGrantRequirements(
+  status: number,
+  body: unknown,
+): SecretGrantRequirement[] | undefined {
+  if (status !== 428 || !isRecord(body) || !isRecord(body.details)) return undefined;
+  const raw = body.details.secret_grants_required;
+  if (!Array.isArray(raw)) return undefined;
+  const requirements: SecretGrantRequirement[] = [];
+  for (const item of raw) {
+    if (!isRecord(item) || typeof item.name !== "string" || typeof item.kind !== "string") {
+      return undefined;
+    }
+    const description = item.description;
+    requirements.push({
+      name: item.name,
+      kind: item.kind,
+      ...(typeof description === "string" ? { description } : {}),
+    });
+  }
+  return requirements.length > 0 ? requirements : undefined;
 }
 
 async function parseBody(response: Response): Promise<unknown> {
@@ -1149,6 +1172,10 @@ export class AgentHubClient {
     const body = await parseBody(response);
     if (!response.ok) {
       const error = responseMessage(body, `Agent Hub request failed with status ${response.status}`);
+      const requirements = secretGrantRequirements(response.status, body);
+      if (requirements) {
+        throw new SecretGrantsRequiredError(error.message, requirements, body);
+      }
       throw new AgentHubError(response.status, error.code, error.message, body);
     }
     return body as T;

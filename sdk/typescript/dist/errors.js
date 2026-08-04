@@ -10,6 +10,20 @@ export class AgentHubError extends Error {
         this.details = details;
     }
 }
+export class SecretGrantsRequiredError extends AgentHubError {
+    requirements;
+    constructor(message, requirements, details) {
+        super(428, "secret_grants_required", message, details);
+        this.name = "SecretGrantsRequiredError";
+        this.requirements = requirements;
+    }
+}
+export function isSecretGrantsRequiredError(error) {
+    return error instanceof SecretGrantsRequiredError
+        || (error instanceof AgentHubError
+            && error.status === 428
+            && error.code === "secret_grants_required");
+}
 export class ClientToolError extends Error {
     code;
     retryable;
