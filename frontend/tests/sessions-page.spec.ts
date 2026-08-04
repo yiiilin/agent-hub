@@ -942,8 +942,7 @@ test('a visible reply splits steps by real event time even when a later long ste
   await installSessionApi(page, {
     activeMessages: [
       message('active', 1, 'user', 'Order across a reply.', { accepted_at: '2026-07-17T10:00:00.000Z' }),
-      message('active', 2, 'assistant', 'Interim reply.', { accepted_at: '2026-07-17T10:00:04.000Z' }),
-      message('active', 3, 'assistant', 'Final reply.', { accepted_at: '2026-07-17T10:00:12.000Z' })
+      message('active', 2, 'assistant', 'Interim reply.', { accepted_at: '2026-07-17T10:00:04.000Z' })
     ],
     activeEvents: [
       { seq: 1, run_id: 'run-active', event_type: 'status', role: null, content: 'running', payload: { status: 'running' }, created_at: '2026-07-17T10:00:00.500Z' },
@@ -960,6 +959,12 @@ test('a visible reply splits steps by real event time even when a later long ste
   await page.goto('/sessions');
 
   const detail = page.getByRole('region', { name: 'Session details' });
+  const transcript = detail.locator('.session-transcript > *');
+  await expect(transcript).toHaveCount(4);
+  await expect(transcript.nth(0)).toContainText('Order across a reply.');
+  await expect(transcript.nth(1)).toHaveClass(/session-activity-events/);
+  await expect(transcript.nth(2)).toContainText('Interim reply.');
+  await expect(transcript.nth(3)).toHaveClass(/session-activity-events/);
   const groups = detail.locator('details.session-activity-events');
   await expect(groups).toHaveCount(2);
   await expect(groups.nth(0)).toContainText('First thought.');
