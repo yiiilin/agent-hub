@@ -977,6 +977,28 @@ test('a visible reply splits steps by real event time even when a later long ste
   await expect(rows.nth(2)).toContainText('Second thought.');
 });
 
+test('a run waiting on the model shows the model-response stage', async ({ page }) => {
+  const startedAt = Date.now() - 5_000;
+  await installSessionApi(page, {
+    activeMessages: [
+      message('active', 1, 'user', 'Wait for the model.', { accepted_at: new Date(startedAt).toISOString() })
+    ],
+    activeEvents: [
+      { seq: 1, run_id: 'run-active', event_type: 'status', role: null, content: 'running', payload: { status: 'running' }, created_at: new Date(startedAt + 100).toISOString() },
+      { seq: 2, run_id: 'run-active', event_type: 'turn_started', role: null, content: null, payload: { native_session_id: 'native-session', native_turn_id: 'native-turn' }, created_at: new Date(startedAt + 200).toISOString() },
+      { seq: 3, run_id: 'run-active', event_type: 'model_request', role: null, content: null, payload: { status: 'started' }, created_at: new Date(startedAt + 300).toISOString() }
+    ],
+    activeStreamEvents: []
+  });
+  await page.goto('/sessions');
+
+  const detail = page.getByRole('region', { name: 'Session details' });
+  const bubble = detail.locator('.session-thinking');
+  await expect(bubble).toBeVisible();
+  await expect(bubble).toContainText('Waiting for the model response...');
+  await expect(bubble).toContainText('Last event:');
+});
+
 test('conversation streams replies, folds readable activity, steers, stops, and keeps history read-only', async ({ page }) => {
   const fixture = await installSessionApi(page);
   await page.goto('/sessions');

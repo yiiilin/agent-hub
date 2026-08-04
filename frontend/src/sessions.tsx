@@ -516,6 +516,7 @@ export function runThinkingStage(events: RunEvent[]): { key: TranslationKey; det
   for (const event of events) {
     if (event.event_type === 'status') fallback = { key: 'runStageStarting' };
     if (event.event_type === 'turn_started') fallback = { key: 'runStageStartingAgent' };
+    if (event.event_type === 'model_request') fallback = { key: 'runStageWaitingModel' };
     if (event.event_type === 'item') {
       const itemType = payloadString(event.payload, 'item_type');
       const tool = payloadString(event.payload, 'tool') ?? undefined;

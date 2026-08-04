@@ -2271,6 +2271,7 @@ async fn execute_managed_pi_with_streaming(
         .hub_session_id
         .context("claimed Run is missing its Hub Session id")?;
     let run_id = claim.run.id;
+    manager.attach_model_proxy_event_tx(session_id, run_id, event_tx.clone())?;
     let mut driver = tokio::spawn({
         let manager = Arc::clone(&manager);
         let claim = claim.clone();
@@ -2469,11 +2470,19 @@ struct LocalModelProxy {
 
 impl LocalModelProxy {
     fn activate_run(&self, run_id: Uuid, model_proxy_token: &str) {
-        *self.state.active_run.write().unwrap() = LocalModelProxyRunAuth {
+        let mut active_run = self.state.active_run.write().unwrap();
+        let event_tx = if active_run.run_id == run_id {
+            active_run.event_tx.take()
+        } else {
+            None
+        };
+        *active_run = LocalModelProxyRunAuth {
             model_proxy_token: model_proxy_token.to_owned(),
             run_id,
             turn_acknowledged: false,
+            event_tx,
         };
+        drop(active_run);
         self.state.turn_acknowledged.notify_waiters();
     }
 
@@ -2486,6 +2495,20 @@ impl LocalModelProxy {
         active_run.turn_acknowledged = true;
         drop(active_run);
         self.state.turn_acknowledged.notify_waiters();
+        Ok(())
+    }
+
+    fn attach_event_tx(
+        &self,
+        run_id: Uuid,
+        event_tx: tokio_mpsc::Sender<AppendRunEventRequest>,
+    ) -> anyhow::Result<()> {
+        let mut active_run = self.state.active_run.write().unwrap();
+        anyhow::ensure!(
+            active_run.run_id == run_id,
+            "model proxy Run changed before event channel attachment"
+        );
+        active_run.event_tx = Some(event_tx);
         Ok(())
     }
 }
@@ -2501,6 +2524,7 @@ struct LocalModelProxyRunAuth {
     model_proxy_token: String,
     run_id: Uuid,
     turn_acknowledged: bool,
+    event_tx: Option<tokio_mpsc::Sender<AppendRunEventRequest>>,
 }
 
 struct LocalModelProxyState {
@@ -2533,6 +2557,7 @@ async fn start_model_proxy(
             model_proxy_token: model_proxy_token.to_owned(),
             run_id,
             turn_acknowledged: false,
+            event_tx: None,
         }),
         turn_acknowledged: Notify::new(),
     });
@@ -2595,6 +2620,15 @@ async fn local_model_proxy_request(
         }
         acknowledged.await;
     };
+    if let Some(event_tx) = active_run.event_tx.clone() {
+        let _ = event_tx.try_send(AppendRunEventRequest {
+            event_type: "model_request".into(),
+            role: None,
+            content: None,
+            payload: json!({ "status": "started" }),
+            waiting_tool: None,
+        });
+    }
     let mut upstream_url = format!("{}/api/runtime/model-proxy/v1/{}", state.hub_url, path);
     if let Some(query) = query.filter(|query| !query.is_empty()) {
         upstream_url.push('?');
@@ -5104,6 +5138,17 @@ impl SessionSupervisorManager {
         self.model_proxy(session_id)
             .context("Session model proxy is unavailable")?
             .acknowledge_turn(run_id)
+    }
+
+    fn attach_model_proxy_event_tx(
+        &self,
+        session_id: Uuid,
+        run_id: Uuid,
+        event_tx: tokio_mpsc::Sender<AppendRunEventRequest>,
+    ) -> anyhow::Result<()> {
+        self.model_proxy(session_id)
+            .context("Session model proxy is unavailable")?
+            .attach_event_tx(run_id, event_tx)
     }
 
     fn refresh_failed_supervisors(&self) {
@@ -12931,6 +12976,66 @@ mod tests {
             run_id.to_string().as_str()
         );
         assert_eq!(request.body.as_ref(), request_body);
+        hub.abort();
+    }
+
+    #[tokio::test]
+    async fn local_model_proxy_emits_model_request_event_before_forwarding() {
+        let forwarded = Arc::new(std::sync::Mutex::new(false));
+        let app = Router::new().route(
+            "/api/runtime/model-proxy/v1/{*path}",
+            post({
+                let forwarded = Arc::clone(&forwarded);
+                move || {
+                    let forwarded = Arc::clone(&forwarded);
+                    async move {
+                        *forwarded.lock().unwrap() = true;
+                        Json(json!({ "ok": true }))
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hub_addr = listener.local_addr().unwrap();
+        let hub = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = HubClient {
+            http: reqwest::Client::new(),
+            hub_url: format!("http://{hub_addr}"),
+            runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
+            protocol_capabilities: HashSet::new(),
+        };
+        let run_id = Uuid::new_v4();
+        let binding_id = Uuid::new_v4();
+        let proxy = start_model_proxy(
+            &client,
+            run_id,
+            "scoped-model-token",
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        let (event_tx, mut event_rx) = engine_event_channel();
+        proxy.attach_event_tx(run_id, event_tx).unwrap();
+        proxy.activate_run(run_id, "scoped-model-token");
+        proxy.acknowledge_turn(run_id).unwrap();
+        let response = reqwest::Client::new()
+            .post(format!("{}/responses", proxy.base_url))
+            .header("x-agent-hub-model-binding-id", binding_id.to_string())
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(br#"{"model":"gpt-main","input":"wait"}"#.as_slice())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(*forwarded.lock().unwrap());
+        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("model_request event timed out")
+            .expect("event channel closed");
+        assert_eq!(event.event_type, "model_request");
+        assert_eq!(event.payload["status"], "started");
+        assert!(event.role.is_none());
+        assert!(event.content.is_none());
         hub.abort();
     }
 
