@@ -281,7 +281,25 @@ fn replace_private_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
             drop(file);
             fs::rename(&temporary, path)
                 .with_context(|| format!("replace private file {}", path.display()))?;
-            chown_private_path_if_root(path).context("chown private file to sandbox UID")?;
+            // These files are control-created read-only Pi sources (integration
+            // tools, Skill execution extension). They must never be
+            // owner-writable by the sandbox user: a live session process could
+            // otherwise open a write descriptor during the next Run preparation
+            // and keep tampering after the final protect step.
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                use std::os::unix::fs::PermissionsExt;
+                let cpath =
+                    CString::new(path.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
+                // SAFETY: pointer is NUL-terminated and the path is valid.
+                if unsafe { libc::chown(cpath.as_ptr(), 0, PI_SANDBOX_GID) } != 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .context("chown private file to root:agenthub");
+                }
+                fs::set_permissions(path, fs::Permissions::from_mode(0o440))
+                    .context("protect private file as read-only")?;
+            }
             Ok(())
         })();
         if result.is_err() {
