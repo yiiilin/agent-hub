@@ -1,24 +1,26 @@
-# 🚀 v0.2.0
+# 🚀 v0.3.0
 
-📅 发布日期：2026-08-04
+📅 发布日期：2026-08-05
 
 ## ✨ Features
 
-- 新增第一方 agent-hub-cli 管理 CLI 与 agent-hub-maintenance 维护 Skill，并随 Hub 镜像内置；Hub 启动后自动创建或更新该 Skill 与 CLI Package。
-- Runtime 只为绑定了维护 Skill 的会话注入 Hub 内部地址与只读维护 API Key 文件，其余 skill_exec 会话保持隔离。
-- 支持通过 AGENT_HUB_MAINTENANCE_AGENT_ID 自动将内置维护 Skill 绑定到指定维护智能体。
+- 会话级隔离沙箱：每个会话独立工作区（`/workspace`）、独立临时目录（`/tmp`）与只读引擎状态（`/agent-state`），Pi 以非特权用户运行。
+- 用户秘钥变量：创建 value/file 型秘钥，智能体声明并按需授权，运行时注入环境变量与 `/agent-state/secrets` 文件。
+- Skill 包与文档合并为单目录，包内任意文件（除 SKILL.md）都可作为 `skill_exec` 程序执行，不再强制 `bin/` 前缀。
+- 会话历史分页：首屏仅加载最新 10 条消息，向上滚动加载更早历史（控制台与 Widget）。
+- 会话活动步骤实时展示（思考、工具调用、命令），回复后自动折叠。
+- Runtime 镜像内置 ssh、python、git。
 
 ## 🐛 Bug Fixes
 
-- 修复会话活动“处理 N 秒”计时受浏览器与服务器时钟偏差影响的问题，改为以服务器事件时间为锚点持续递增。
+- 修复授权秘钥变化后 Pi 未刷新、秘钥指导残留、推理片段 ID 重复等问题。
+- 修复 Bundle 恢复后文件属主错误，恢复会话可继续写入。
 
 ## 🔒 Security
 
-- 维护 API Key 不写入 Skill Package、数据库或会话历史，仅以只读 secret 挂载，并受 Landlock 文件级读取限制。
-
-## 🛠️ Maintenance
-
-- 新增 compose.maintenance.yml 生产维护部署 override 与维护 CLI 使用文档。
+- 秘钥文件 `root:agenthub 0440` 只读发布，防止 truncate/chmod 绕过。
+- Pi 配置、扩展与技能源统一 `root:agenthub 0440/0550`，消除属主竞态与符号链接绕过。
+- `skill-exec` 执行源与 catalog 只读，沙箱用户无法篡改。
 
 ## 👥 Contributors
 

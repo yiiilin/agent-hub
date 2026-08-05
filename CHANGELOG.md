@@ -6,7 +6,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 本文件记录 Agent Hub 各正式版本面向使用者的变化。
 
-## [Unreleased]
+## [0.3.0] - 2026-08-05
+
+### Added
+
+- 新增用户级秘钥变量：用户可创建 value/file 型秘钥，智能体声明所需秘钥并在首次使用时申请授权；已授权秘钥以 `AGENT_SECRET_*` 环境变量和 `/agent-state/secrets` 文件形式注入，Widget 与第三方接入同样支持。
+- 每个会话独立沙箱：工作区映射为 `/workspace`、独立临时目录映射为 `/tmp`、engine-state 映射为只读 `/agent-state`；Pi 以非特权 UID 10001 运行，受 Landlock 与私有 mount namespace 约束。
+- Skill 包与文档合并为单目录 `.pi/agent/skills/<slug>/`，包内除 `SKILL.md` 外任意文件均可作为 `skill_exec` 程序执行。
+- 会话历史分页：控制台与 Widget 首屏只加载最新 10 条消息，向上滚动时再加载更早历史。
+- 会话活动步骤实时展示（思考、工具调用、命令输出），可见回复后自动折叠为“处理 N 秒”。
+- Runtime 镜像内置 ssh、python、git。
+
+### Changed
+
+- Model Gateway 默认上游首字超时调整为 60 秒。
+
+### Fixed
+
+- 修复推理片段 item id 重复、授权秘钥变化后 Pi 未刷新、秘钥指导文本在刷新时残留等问题。
+- 修复会话 Bundle 恢复后文件属主错误，恢复的工作区可继续写入。
+
+### Security
+
+- 会话秘钥文件以 `root:agenthub 0440` 只读发布，防止通过 truncate/chmod 绕过只读边界。
+- 控制创建的 Pi 配置、扩展与技能源统一 `root:agenthub 0440/0550`，沙箱用户无法改写或替换；消除目录/文件属主竞态与符号链接绕过窗口。
+- `skill-exec` catalog 与执行源只读，会话 Bundle 恢复路径在离线状态下修复属主。
 
 ## [0.2.0] - 2026-08-04
 
@@ -49,6 +73,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Release 工作流在 GHCR 鉴权和发布前完成全历史与镜像凭证扫描，且不上传原始扫描报告。
 - LDAP QA 私钥改为测试环境启动时临时生成，不再保存在 Git 中。
 
-[Unreleased]: https://github.com/yiiilin/agent-hub/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/yiiilin/agent-hub/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/yiiilin/agent-hub/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/yiiilin/agent-hub/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/yiiilin/agent-hub/releases/tag/v0.1.0
