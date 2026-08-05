@@ -6233,6 +6233,7 @@ async fn prepare_run_env_with_local_skills_and_management(
     };
     pi_driver::materialize_integration_tools(&run_env, claim.integration_context.as_ref())?;
     chown_session_tree(&paths.root).context("chown Session tree to sandbox UID")?;
+    protect_session_secret_files(&secret_dir).context("protect Session secret files")?;
     Ok(run_env)
 }
 
@@ -6638,6 +6639,50 @@ fn chown_session_tree(root: &Path) -> anyhow::Result<()> {
 
 #[cfg(not(unix))]
 fn chown_session_tree(_root: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// Secret files must be readable by the sandbox user but not writable or
+/// chmod-able by it. Landlock cannot restrict truncate(2) or chmod(2), so the
+/// files are owned by root:agenthub with mode 0440; the root control process
+/// can still rewrite them on the next Run while the unprivileged Pi process
+/// can only read them through /agent-state/secrets or the physical path.
+fn protect_session_secret_files(secret_dir: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        if !secret_dir.exists() {
+            return Ok(());
+        }
+        for entry in WalkDir::new(secret_dir).follow_links(false) {
+            let entry = entry?;
+            if entry.file_type().is_dir() {
+                continue;
+            }
+            let metadata = entry.metadata()?;
+            anyhow::ensure!(
+                metadata.is_file(),
+                "Session secret directory contains an unsupported file type",
+            );
+            let path = std::ffi::CString::new(entry.path().as_os_str().as_bytes())
+                .context("Session secret path contains a NUL byte")?;
+            // SAFETY: pointer is NUL-terminated and the path is valid.
+            if unsafe { libc::chown(path.as_ptr(), 0, PI_SANDBOX_GID) } != 0 {
+                return Err(std::io::Error::last_os_error()).context("chown Session secret file");
+            }
+            stdfs::set_permissions(entry.path(), stdfs::Permissions::from_mode(0o440))
+                .with_context(|| {
+                    format!("protect Session secret file {}", entry.path().display())
+                })?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn protect_session_secret_files(_secret_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
