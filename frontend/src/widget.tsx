@@ -34,7 +34,7 @@ import {
 } from './sessions';
 
 const terminalStatuses = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
-const historyPageSize = 50;
+const historyPageSize = 10;
 const bottomThreshold = 24;
 const historyThreshold = 64;
 

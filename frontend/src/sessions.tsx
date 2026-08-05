@@ -27,7 +27,7 @@ const deliveryKeys: Record<string, TranslationKey> = {
 };
 
 const terminalRunStatuses = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
-const sessionMessagePageSize = 50;
+const sessionMessagePageSize = 10;
 export const sessionMessageRequestLimit = sessionMessagePageSize + 1;
 const chatBottomThreshold = 24;
 const chatHistoryThreshold = 64;
