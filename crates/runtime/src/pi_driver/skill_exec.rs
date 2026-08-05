@@ -67,7 +67,7 @@ export default function registerAgentHubSkillExec(pi) {
       required: ["skill", "program"],
       properties: {
         skill: { type: "string", description: "Exact enabled Skill name" },
-        program: { type: "string", description: "Exact package path under bin/, for example bin/client" },
+        program: { type: "string", description: "Exact relative package path, for example client.sh" },
         args: { type: "array", items: { type: "string" }, maxItems: 128 },
         stdin: { type: "string", description: "Optional UTF-8 standard input" },
         timeout_ms: { type: "integer", minimum: 1, maximum: 300000 },
@@ -158,8 +158,6 @@ use super::{
 const SKILL_EXEC_DIRECTORY: &str = "skill-exec";
 #[cfg(target_os = "linux")]
 const SKILL_EXEC_CATALOG_FILE: &str = "catalog.json";
-#[cfg(target_os = "linux")]
-const SKILL_EXEC_PACKAGES_DIRECTORY: &str = "packages";
 #[cfg(target_os = "linux")]
 const SKILL_EXEC_TEMP_DIRECTORY: &str = "tmp";
 #[cfg(target_os = "linux")]
@@ -300,7 +298,7 @@ impl SkillExecBroker {
     ) -> anyhow::Result<Self> {
         let root = run_env.engine_state_root.join(SKILL_EXEC_DIRECTORY);
         let catalog_path = root.join(SKILL_EXEC_CATALOG_FILE);
-        let packages_root = root.join(SKILL_EXEC_PACKAGES_DIRECTORY);
+        let packages_root = super::pi_agent_directory(run_env).join("skills");
         let temp_root = root.join(SKILL_EXEC_TEMP_DIRECTORY);
         super::prepare_private_directory(&root, "Skill execution directory")?;
         super::prepare_private_directory(&packages_root, "Skill package execution directory")?;
@@ -629,12 +627,12 @@ fn validate_executable_path(value: &str) -> anyhow::Result<()> {
     );
     let components = Path::new(value).components().collect::<Vec<_>>();
     anyhow::ensure!(
-        components.len() >= 2
-            && components.first() == Some(&std::path::Component::Normal("bin".as_ref()))
+        !components.is_empty()
+            && value != "SKILL.md"
             && components
                 .iter()
                 .all(|component| matches!(component, std::path::Component::Normal(_))),
-        "Skill executable path must be a relative path below bin/"
+        "Skill executable path must be a relative package path other than SKILL.md"
     );
     Ok(())
 }
@@ -1175,9 +1173,9 @@ mod tests {
         fs::create_dir_all(&run_env.workdir).unwrap();
         fs::create_dir_all(super::super::pi_temp_directory(&run_env)).unwrap();
         let root = run_env.engine_state_root.join(SKILL_EXEC_DIRECTORY);
-        let packages_root = root.join(SKILL_EXEC_PACKAGES_DIRECTORY);
+        let packages_root = super::super::pi_agent_directory(&run_env).join("skills");
         let package_root = packages_root.join("package-one");
-        let program = package_root.join("bin/client");
+        let program = package_root.join("client");
         fs::create_dir_all(program.parent().unwrap()).unwrap();
         fs::create_dir_all(root.join(SKILL_EXEC_TEMP_DIRECTORY)).unwrap();
         fs::write(&program, script).unwrap();
@@ -1194,7 +1192,7 @@ mod tests {
                     "name": "deploy",
                     "package_id": uuid::Uuid::new_v4(),
                     "package_root": package_root,
-                    "executables": ["bin/client"]
+                    "executables": ["client"]
                 }]
             }))
             .unwrap(),
@@ -1215,7 +1213,7 @@ mod tests {
         SkillExecRequest {
             token: "token".into(),
             skill: "deploy".into(),
-            program: "bin/client".into(),
+            program: "client".into(),
             args,
             stdin: "input-value\n".into(),
             timeout_ms,
@@ -1416,11 +1414,12 @@ printf '%s\n' "$!" > "$1"
                 .contains("not executable")
         );
         assert!(validate_executable_path("../bin/client").is_err());
+        assert!(validate_executable_path("SKILL.md").is_err());
 
         let outside = fixture
             .run_env
             .engine_state_root
-            .join("other-package/bin/client");
+            .join("other-package/client");
         fs::create_dir_all(outside.parent().unwrap()).unwrap();
         fs::write(&outside, "#!/bin/sh\n").unwrap();
         fs::set_permissions(&outside, fs::Permissions::from_mode(0o500)).unwrap();
@@ -1432,7 +1431,7 @@ printf '%s\n' "$!" > "$1"
                     "name": "deploy",
                     "package_id": uuid::Uuid::new_v4(),
                     "package_root": outside.parent().unwrap().parent().unwrap(),
-                    "executables": ["bin/client"]
+                    "executables": ["client"]
                 }]
             }))
             .unwrap(),
@@ -1529,7 +1528,7 @@ printf '%s\n' "$!" > "$1"
     }
 
     fn write_catalog_name(fixture: &Fixture, name: &str) {
-        let package_root = fixture.program.parent().unwrap().parent().unwrap();
+        let package_root = fixture.program.parent().unwrap();
         fs::write(
             &fixture.catalog_path,
             serde_json::to_vec(&json!({
@@ -1538,7 +1537,7 @@ printf '%s\n' "$!" > "$1"
                     "name": name,
                     "package_id": uuid::Uuid::new_v4(),
                     "package_root": package_root,
-                    "executables": ["bin/client"]
+                    "executables": ["client"]
                 }]
             }))
             .unwrap(),
@@ -1552,7 +1551,7 @@ printf '%s\n' "$!" > "$1"
         let request = SkillExecRequest {
             token: broker.token().to_owned(),
             skill: skill.into(),
-            program: "bin/client".into(),
+            program: "client".into(),
             args: Vec::new(),
             stdin: String::new(),
             timeout_ms: None,

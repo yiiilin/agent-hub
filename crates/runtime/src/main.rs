@@ -6317,7 +6317,7 @@ fn validate_skill_package_manifest(package: &SkillPackageDto) -> anyhow::Result<
             skill_package_path_is_safe(&file.path)
                 && paths.insert(file.path.clone())
                 && is_lowercase_sha256_hex(&file.checksum_sha256)
-                && file.executable == file.path.starts_with("bin/")
+                && file.executable
                 && expanded_size <= MAX_SKILL_PACKAGE_EXPANDED_BYTES,
             "Skill package file metadata is invalid"
         );
@@ -6358,10 +6358,6 @@ async fn skill_package_cache_entry_is_valid(
         hasher.update(&buffer[..read]);
     }
     Ok(format!("{:x}", hasher.finalize()) == package.checksum_sha256)
-}
-
-fn stable_skill_package_directory(skill_id: Uuid, package_id: Uuid) -> String {
-    format!("{}-{}", skill_id.simple(), package_id.simple())
 }
 
 fn extract_skill_package_archive(
@@ -6558,6 +6554,31 @@ fn protect_skill_exec_tree(_root: &Path) -> anyhow::Result<()> {
     anyhow::bail!("private Skill execution sources require a Unix runtime")
 }
 
+fn protect_skill_package_directory(root: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    for entry in WalkDir::new(root).follow_links(false) {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        anyhow::ensure!(
+            metadata.is_dir() || metadata.is_file(),
+            "Skill package contains an unsupported file type"
+        );
+        let mode = if metadata.is_dir() || metadata.permissions().mode() & 0o111 != 0 {
+            0o500
+        } else {
+            0o400
+        };
+        stdfs::set_permissions(entry.path(), stdfs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn protect_skill_package_directory(_root: &Path) -> anyhow::Result<()> {
+    anyhow::bail!("private Skill package sources require a Unix runtime")
+}
+
 #[cfg(unix)]
 fn make_tree_owner_writable(root: &Path) -> anyhow::Result<()> {
     use std::os::unix::ffi::OsStrExt;
@@ -6627,8 +6648,6 @@ async fn materialize_skill_packages(
     stage_skill_exec_dir: &Path,
     package_context: Option<SkillPackageMaterializationContext<'_>>,
 ) -> anyhow::Result<Vec<String>> {
-    let stage_packages_root = stage_skill_exec_dir.join("packages");
-    fs::create_dir_all(&stage_packages_root).await?;
     fs::create_dir_all(stage_skill_exec_dir.join("tmp")).await?;
     let canonical_engine_state = fs::canonicalize(&paths.engine_state)
         .await
@@ -6637,12 +6656,11 @@ async fn materialize_skill_packages(
         canonical_engine_state.is_absolute(),
         "Session engine state path is not absolute"
     );
-    let final_packages_root = canonical_engine_state
-        .join(SKILL_EXEC_DIRECTORY)
-        .join("packages");
-    let mut package_directories = Vec::new();
     let mut catalog_entries = Vec::new();
-    let mut seen_package_directories = BTreeSet::new();
+    let final_skills_root = canonical_engine_state
+        .join(PI_AGENT_DIRECTORY)
+        .join("skills");
+    let mut seen_skill_directories = BTreeSet::new();
     for skill in &configuration.skills {
         let Some(package) = skill.package.as_ref() else {
             continue;
@@ -6664,39 +6682,41 @@ async fn materialize_skill_packages(
             )
             .await
             .with_context(|| format!("cache Skill package for {}", skill.name))?;
-        let package_directory = stable_skill_package_directory(source_id, package.id);
+        let skill_directory = skill_directory_name(&skill.name);
         anyhow::ensure!(
-            seen_package_directories.insert(package_directory.clone()),
+            seen_skill_directories.insert(skill_directory.clone()),
             "execution configuration contains a duplicate Skill package destination"
         );
-        let staged_package_root = stage_packages_root.join(&package_directory);
         let archive_path_for_extract = archive_path.clone();
         let package_for_extract = package.clone();
-        let staged_package_root_for_extract = staged_package_root.clone();
+        let staged_skill_root = stage_agent_dir.join("skills").join(&skill_directory);
+        fs::remove_dir_all(&staged_skill_root)
+            .await
+            .context("remove generated Skill stub before Package extraction")?;
+        let staged_skill_root_for_extract = staged_skill_root.clone();
         tokio::task::spawn_blocking(move || {
             extract_skill_package_archive(
                 &archive_path_for_extract,
                 &package_for_extract,
-                &staged_package_root_for_extract,
+                &staged_skill_root_for_extract,
             )
         })
         .await
         .context("Skill package extraction task stopped")??;
 
-        let pi_skill_root = stage_agent_dir
-            .join("skills")
-            .join(skill_directory_name(&skill.name));
-        let package_source = staged_package_root.clone();
-        let pi_skill_destination = pi_skill_root.clone();
-        tokio::task::spawn_blocking(move || {
-            copy_directory_snapshot(&package_source, &pi_skill_destination)
-        })
-        .await
-        .context("Pi Skill package copy task stopped")??;
-
-        let package_root = final_packages_root.join(&package_directory);
+        // The uploaded archive intentionally excludes SKILL.md (its content
+        // is stored as the Skill markdown); regenerate it in the single
+        // merged Skill directory so Pi discovery and Skill execution see
+        // the same tree.
+        write_private_file(
+            &staged_skill_root.join("SKILL.md"),
+            render_skill_markdown(&skill.name, &skill.description, &skill.content).as_bytes(),
+        )
+        .context("stage packaged Skill SKILL.md")?;
+        protect_skill_package_directory(&staged_skill_root)?;
+        let package_root = final_skills_root.join(&skill_directory);
         anyhow::ensure!(
-            package_root.starts_with(&final_packages_root),
+            package_root.starts_with(&final_skills_root),
             "Skill package root escaped the private execution source"
         );
         let package_root = package_root
@@ -6717,9 +6737,7 @@ async fn materialize_skill_packages(
             package_root,
             executables,
         });
-        package_directories.push(package_directory);
     }
-    package_directories.sort();
     catalog_entries.sort_by(|left, right| {
         left.name
             .cmp(&right.name)
@@ -6734,7 +6752,7 @@ async fn materialize_skill_packages(
     )
     .context("stage private Skill execution catalog")?;
     protect_skill_exec_tree(stage_skill_exec_dir)?;
-    Ok(package_directories)
+    Ok(Vec::new())
 }
 
 fn pi_agent_directory(pi_home: &Path) -> PathBuf {
@@ -7091,29 +7109,6 @@ fn pi_execution_materialization_sha256(
         format!("{SKILL_EXEC_DIRECTORY}/{SKILL_EXEC_CATALOG_FILE}"),
         skill_exec_dir.join(SKILL_EXEC_CATALOG_FILE),
     ));
-    let packages_root = skill_exec_dir.join("packages");
-    paths.extend(
-        WalkDir::new(&packages_root)
-            .follow_links(false)
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(|entry| {
-                let path = entry.into_path();
-                let relative = path
-                    .strip_prefix(&packages_root)
-                    .expect("walked Skill execution path has its configured root");
-                let logical = if relative.as_os_str().is_empty() {
-                    format!("{SKILL_EXEC_DIRECTORY}/packages")
-                } else {
-                    format!(
-                        "{SKILL_EXEC_DIRECTORY}/packages/{}",
-                        relative.to_string_lossy()
-                    )
-                };
-                (logical, path)
-            }),
-    );
     paths.sort_by(|left, right| left.0.cmp(&right.0));
     let mut digest = Sha256::new();
     for (logical, path) in paths {
@@ -7954,7 +7949,7 @@ mod tests {
         let skill_id = Uuid::new_v4();
         let (package, archive) = build_test_skill_package(
             Uuid::new_v4(),
-            &[("references/guide.txt", b"guide\n", false)],
+            &[("references/guide.txt", b"guide\n", true)],
         );
         let archive = Arc::new(archive);
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -8728,14 +8723,14 @@ mod tests {
             Uuid::new_v4(),
             &[
                 ("bin/client", b"#!/bin/sh\necho a\n", true),
-                ("references/guide.txt", b"guide a\n", false),
+                ("references/guide.txt", b"guide a\n", true),
             ],
         );
         let (package_b, archive_b) = build_test_skill_package(
             Uuid::new_v4(),
             &[
                 ("bin/client-next", b"#!/bin/sh\necho b\n", true),
-                ("references/next.txt", b"guide b\n", false),
+                ("references/next.txt", b"guide b\n", true),
             ],
         );
         claim.execution_configuration.skills[0].package = Some(package_a.clone());
@@ -8820,13 +8815,7 @@ mod tests {
                 .unwrap(),
             "guide a\n"
         );
-        let package_a_directory = stable_skill_package_directory(skill_id, package_a.id);
-        let package_a_root = first_paths
-            .engine_state
-            .join(SKILL_EXEC_DIRECTORY)
-            .join("packages")
-            .join(&package_a_directory);
-        assert!(package_a_root.join("bin/client").is_file());
+        assert!(pi_skill_root.join("bin/client").is_file());
         let catalog_path = first_paths
             .engine_state
             .join(SKILL_EXEC_DIRECTORY)
@@ -8838,16 +8827,18 @@ mod tests {
         assert_eq!(catalog.skills[0].name, "repo-review");
         assert_eq!(catalog.skills[0].source_id, skill_id);
         assert_eq!(catalog.skills[0].package_id, package_a.id);
-        assert_eq!(catalog.skills[0].executables, ["bin/client"]);
+        assert_eq!(
+            catalog.skills[0].executables,
+            ["bin/client", "references/guide.txt"]
+        );
         assert_eq!(
             stdfs::canonicalize(&catalog.skills[0].package_root).unwrap(),
-            stdfs::canonicalize(&package_a_root).unwrap()
+            stdfs::canonicalize(&pi_skill_root).unwrap()
         );
-        let canonical_packages_root =
-            stdfs::canonicalize(package_a_root.parent().unwrap()).unwrap();
+        let canonical_packages_root = stdfs::canonicalize(pi_skill_root.parent().unwrap()).unwrap();
         assert!(Path::new(&catalog.skills[0].package_root).starts_with(canonical_packages_root));
         assert_eq!(
-            fs::metadata(&package_a_root)
+            fs::metadata(&pi_skill_root)
                 .await
                 .unwrap()
                 .permissions()
@@ -8856,7 +8847,7 @@ mod tests {
             0o500
         );
         assert_eq!(
-            fs::metadata(package_a_root.join("bin/client"))
+            fs::metadata(pi_skill_root.join("bin/client"))
                 .await
                 .unwrap()
                 .permissions()
@@ -8916,7 +8907,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(applied.outcome, "applied", "{:?}", applied.native_error);
-        assert!(!package_a_root.exists());
         assert!(!pi_skill_root.join("bin/client").exists());
         assert_eq!(
             fs::read_to_string(pi_skill_root.join("references/next.txt"))
@@ -8924,12 +8914,7 @@ mod tests {
                 .unwrap(),
             "guide b\n"
         );
-        let package_b_root = first_paths
-            .engine_state
-            .join(SKILL_EXEC_DIRECTORY)
-            .join("packages")
-            .join(stable_skill_package_directory(skill_id, package_b.id));
-        assert!(package_b_root.join("bin/client-next").is_file());
+        assert!(pi_skill_root.join("bin/client-next").is_file());
         assert!(first_paths
             .engine_state
             .join(SKILL_EXEC_DIRECTORY)
@@ -8964,7 +8949,7 @@ mod tests {
             fs::metadata(&marker_path).await.unwrap().ino(),
             marker_inode
         );
-        assert!(package_b_root.join("bin/client-next").is_file());
+        assert!(pi_skill_root.join("bin/client-next").is_file());
 
         let broker_runtime_file = first_paths
             .engine_state
@@ -9008,14 +8993,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let isolated_package_root = isolated_env
-            .engine_state_root
-            .join(SKILL_EXEC_DIRECTORY)
-            .join("packages")
-            .join(package_a_directory);
+        let isolated_package_root = pi_agent_directory(&isolated_env.engine_state_root)
+            .join("skills")
+            .join(&skill_slug);
         assert!(isolated_package_root.join("references/guide.txt").is_file());
-        assert!(package_b_root.join("references/next.txt").is_file());
-        assert_ne!(isolated_package_root, package_b_root);
+        assert!(pi_skill_root.join("references/next.txt").is_file());
+        assert_ne!(isolated_package_root, pi_skill_root);
 
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2, "cache misses: {requests:?}");
@@ -9476,13 +9459,13 @@ mod tests {
                 .await
                 .unwrap();
         }
-        fs::create_dir_all(paths.engine_state.join("skill-exec/packages/private/bin"))
+        fs::create_dir_all(paths.engine_state.join(".pi/agent/skills/private/bin"))
             .await
             .unwrap();
         fs::write(
             paths
                 .engine_state
-                .join("skill-exec/packages/private/bin/client"),
+                .join(".pi/agent/skills/private/bin/client"),
             "private executable",
         )
         .await

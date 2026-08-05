@@ -110,7 +110,7 @@ export default function registerAgentHubIntegrationTools(pi) {
 }
 "#;
 
-fn pi_agent_directory(run_env: &RunEnv) -> PathBuf {
+pub(super) fn pi_agent_directory(run_env: &RunEnv) -> PathBuf {
     run_env.engine_state_root.join(PI_AGENT_DIRECTORY)
 }
 

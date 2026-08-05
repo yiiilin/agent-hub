@@ -28,14 +28,13 @@ RUNTIME_WORK_ROOT/
   skill-package-cache/<archive-sha256>.tar.zst       # Runtime 共享只读压缩缓存
   sessions/<session-id>/engine-state/
     .pi/agent/skills/<slug>/                         # Pi 原生 Skill 读取副本
-    skill-exec/packages/<skill-id>-<package-id>/     # 当前 Session 私有执行副本
     skill-exec/catalog.json
     skill-exec/tmp/                                  # 每次调用独立临时目录
 ```
 
-- 压缩缓存只按 SHA-256 复用并在每次命中时校验大小/checksum；目录权限为 `0700`、文件为 `0600`。解包目录绝不跨 Session 共享，完整 manifest、tar entry 类型、路径、大小、checksum 和 executable 标志均由 Runtime 再验证。
+- Skill 只有一份物化副本（`.pi/agent/skills/<slug>/`）：上传归档排除根 `SKILL.md`（内容存为 Skill 正文，物化时重新生成），其余文件全部标记为可执行并进入 `skill-exec/catalog.json` 白名单；目录与文件权限为 `0500/0400`，对 Pi 只读。压缩缓存只按 SHA-256 复用并在每次命中时校验大小/checksum；解包目录绝不跨 Session 共享，完整 manifest、tar entry 类型、路径、大小、checksum 和 executable 标志均由 Runtime 再验证。
 - Pi 通过原生 Skill discovery 发现 `.pi/agent/skills/<slug>/SKILL.md`，是否读取正文由 Pi 自身决定。启用 Skill 不会自动授予 `read`。
-- `skill_exec` 是显式 Agent/App 工具权限，不是通用 shell。它仅在最终工具交集仍允许 `skill_exec` 且至少一个已启用 Package 含 `bin/*` 时注册；请求必须精确匹配当前 Session catalog 中的 Skill 名和程序路径。
+- `skill_exec` 是显式 Agent/App 工具权限，不是通用 shell。它仅在最终工具交集仍允许 `skill_exec` 且至少一个已启用 Package 含可执行文件（除 `SKILL.md` 外的任意文件）时注册；请求必须精确匹配当前 Session catalog 中的 Skill 名和程序路径。
 - `skill_exec` 不拼接 shell 命令。脚本只能使用无参数的受控 shebang；每次调用使用独立 `HOME`/`TMPDIR`，Package 只读。是否可读写当前 Workspace 继续服从该 Agent 的最终文件工具权限，仅授权 `skill_exec` 时不能读取 Workspace。Linux Runtime 用 Landlock、私有 Unix socket/capability token、参数/输入/输出上限、超时和进程组终止约束子进程；主程序退出后也终止遗留后台进程。非 Linux Runtime 不开放该工具。
 - Session 配置原子切换成功后，Runtime 调用 Pi 原生 `reload_resources` 重新发现 Skill；活动 Turn 延迟到终态后处理。工具集合不变时不重启 Pi 或 Native Session，工具集合变化时在下一 Turn 前从原 JSONL 恢复同一个 Native Session。
 - Session Bundle 只保存 Workspace 和 Pi recovery JSONL，不保存 Package 派生副本、catalog、临时目录或 Runtime 压缩缓存。
@@ -55,8 +54,8 @@ RUNTIME_WORK_ROOT/
 - 删除被多个 Agent 绑定的 Skill 后，所有绑定消失，受影响的在线 Session 中 Hub-owned 派生文件被清理。
 - 活动 Turn 中删除 Skill 不改变该 Turn；终态后刷新且不重启 Pi。
 - 上传/替换/移除 Package 后，API 返回当前文件清单；失败替换保留旧 Package，Run 快照不被后续替换改变。
-- 两个 Session 即使启用同一 Package，也只有压缩缓存可共享；Pi Skill、可执行副本、catalog 和临时文件均位于各自 Session。
-- 未授权 `read` 时 Skill 不补回 `read`；未授权 `skill_exec` 或 Package 没有 `bin/*` 时 Pi 工具列表不含 `skill_exec`。
+- 两个 Session 即使启用同一 Package，也只有压缩缓存可共享；Pi Skill/可执行目录（`.pi/agent/skills`）、catalog 和临时文件均位于各自 Session。
+- 未授权 `read` 时 Skill 不补回 `read`；未授权 `skill_exec` 或 Package 没有文件时 Pi 工具列表不含 `skill_exec`。
 
 ## 测试计划
 

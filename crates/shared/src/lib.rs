@@ -1311,7 +1311,7 @@ pub fn execution_configuration_fingerprint(
                 if !path_is_safe
                     || !paths.insert(file.path.clone())
                     || !is_lowercase_sha256(&file.checksum_sha256)
-                    || file.executable != file.path.starts_with("bin/")
+                    || !file.executable
                     || expanded_bytes > MAX_SKILL_PACKAGE_EXPANDED_BYTES
                 {
                     return Err(ExecutionConfigurationError(

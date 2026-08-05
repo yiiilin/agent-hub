@@ -7507,7 +7507,7 @@ async fn stage_skill_package_upload(
             staged_path,
             size_bytes: file_size,
             checksum_sha256: format!("{:x}", hasher.finalize()),
-            executable: package_path.starts_with("bin/"),
+            executable: true,
         });
     }
     if multipart
@@ -25439,7 +25439,7 @@ mod tests {
                 .iter()
                 .map(|file| (file.path.as_str(), file.executable))
                 .collect::<Vec<_>>(),
-            [("bin/client", true), ("references/guide.md", false)]
+            [("bin/client", true), ("references/guide.md", true)]
         );
         assert!(upload
             .archive_path
@@ -25483,7 +25483,7 @@ mod tests {
                 staged_path: reference,
                 size_bytes: 15,
                 checksum_sha256: format!("{:x}", Sha256::digest(b"reference-bytes")),
-                executable: false,
+                executable: true,
             },
         ];
         let archive_path = root.path().join("package.tar.zst");
@@ -25520,7 +25520,7 @@ mod tests {
             entries[1],
             (
                 "references/guide.md".into(),
-                0o444,
+                0o755,
                 b"reference-bytes".to_vec()
             )
         );
