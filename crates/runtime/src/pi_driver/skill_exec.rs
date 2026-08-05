@@ -118,6 +118,7 @@ impl SkillExecBroker {
 #[cfg(target_os = "linux")]
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::CString,
     fs,
     io::{Read, Write},
     net::{Shutdown, TcpStream},
@@ -143,12 +144,14 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "linux")]
+#[cfg_attr(test, allow(unused_imports))]
 use super::{
-    add_landlock_path_rule, create_landlock_ruleset, restrict_landlock_child,
-    terminate_child_process_tree, workspace_landlock_access, PiFilesystemSandbox,
-    LANDLOCK_ACCESS_FS_EXECUTE, LANDLOCK_ACCESS_FS_READ_DIR, LANDLOCK_ACCESS_FS_READ_FILE,
-    LANDLOCK_DIRECTORY_LIST, LANDLOCK_FILE_READ, LANDLOCK_FILE_READ_ONLY, LANDLOCK_FILE_READ_WRITE,
-    LANDLOCK_RUNTIME_WRITE, PI_PROCESS_PATH,
+    add_landlock_path_rule, apply_mount_landlock_rules, create_landlock_ruleset,
+    restrict_landlock_child, terminate_child_process_tree, workspace_landlock_access,
+    LandlockPathKind, PiFilesystemSandbox, LANDLOCK_ACCESS_FS_EXECUTE, LANDLOCK_ACCESS_FS_READ_DIR,
+    LANDLOCK_ACCESS_FS_READ_FILE, LANDLOCK_DIRECTORY_LIST, LANDLOCK_DIRECTORY_READ_ONLY,
+    LANDLOCK_FILE_READ, LANDLOCK_FILE_READ_ONLY, LANDLOCK_FILE_READ_WRITE, LANDLOCK_RUNTIME_WRITE,
+    PI_PROCESS_PATH,
 };
 
 #[cfg(target_os = "linux")]
@@ -257,6 +260,7 @@ struct SkillExecBrokerContext {
     catalog_path: PathBuf,
     packages_root: PathBuf,
     temp_root: PathBuf,
+    engine_state: PathBuf,
     workdir: PathBuf,
     tools: Vec<String>,
     token: String,
@@ -269,6 +273,7 @@ struct SkillExecBrokerContext {
 struct SkillExecExecutionContext<'a> {
     packages_root: &'a Path,
     temp_root: &'a Path,
+    engine_state: &'a Path,
     workdir: &'a Path,
     tools: &'a [String],
     stop: &'a AtomicBool,
@@ -326,6 +331,7 @@ impl SkillExecBroker {
             catalog_path,
             packages_root,
             temp_root,
+            engine_state: run_env.engine_state_root.clone(),
             workdir: run_env.workdir.clone(),
             tools: tools.to_vec(),
             token: token.clone(),
@@ -409,6 +415,7 @@ fn handle_connection(mut stream: TcpStream, context: &SkillExecBrokerContext) {
         let execution_context = SkillExecExecutionContext {
             packages_root: &context.packages_root,
             temp_root: &context.temp_root,
+            engine_state: &context.engine_state,
             workdir: &context.workdir,
             tools: &context.tools,
             stop: &context.stop,
@@ -708,6 +715,7 @@ fn execute_program_in_temp(
         launch.interpreter.as_deref(),
         call_temp,
         context.workdir,
+        context.engine_state,
         context.tools,
         context.maintenance_token_file,
     )?;
@@ -736,9 +744,20 @@ fn execute_program_in_temp(
         command.env("AGENT_HUB_API_KEY_FILE", token_file);
     }
     command.process_group(0);
-    let ruleset_fd = sandbox.ruleset.as_raw_fd();
+    #[cfg_attr(test, allow(unused_variables))]
+    let SkillExecFilesystemSandbox {
+        ruleset,
+        mounts,
+        mount_rules,
+    } = sandbox;
+    let ruleset_fd = ruleset.as_raw_fd();
     unsafe {
         command.pre_exec(move || {
+            #[cfg(not(test))]
+            {
+                mounts.apply()?;
+                apply_mount_landlock_rules(ruleset_fd, &mount_rules)?;
+            }
             restrict_landlock_child(ruleset_fd)?;
             #[cfg(not(test))]
             {
@@ -749,6 +768,7 @@ fn execute_program_in_temp(
                 if libc::setuid(super::PI_SANDBOX_UID) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+                mounts.chdir_workspace()?;
             }
             Ok(())
         });
@@ -757,7 +777,7 @@ fn execute_program_in_temp(
     let mut child = command
         .spawn()
         .with_context(|| format!("spawn Skill executable {}", program.display()))?;
-    drop(sandbox);
+    drop(ruleset);
 
     let stdin = child.stdin.take().context("open Skill execution stdin")?;
     let stdin_bytes = request.stdin.as_bytes().to_vec();
@@ -908,16 +928,22 @@ fn resolve_direct_interpreter(interpreter: &str) -> anyhow::Result<PathBuf> {
 #[cfg(target_os = "linux")]
 struct SkillExecFilesystemSandbox {
     ruleset: fs::File,
+    #[cfg_attr(test, allow(dead_code))]
+    mounts: super::SessionMounts,
+    #[cfg_attr(test, allow(dead_code))]
+    mount_rules: Vec<(CString, super::LandlockPathKind, u64)>,
 }
 
 #[cfg(target_os = "linux")]
 impl SkillExecFilesystemSandbox {
+    #[allow(clippy::too_many_arguments)]
     fn prepare(
         program: &Path,
         package_root: &Path,
         interpreter: Option<&Path>,
         call_temp: &Path,
         workdir: &Path,
+        engine_state: &Path,
         tools: &[String],
         maintenance_token_file: Option<&Path>,
     ) -> anyhow::Result<Self> {
@@ -1007,7 +1033,31 @@ impl SkillExecFilesystemSandbox {
         for ((path, kind), access) in rules {
             add_landlock_path_rule(&ruleset, &path, kind, access)?;
         }
-        Ok(Self { ruleset })
+        let mounts = super::SessionMounts::new(workdir, engine_state, call_temp)
+            .context("prepare Skill Session mount paths")?;
+        let mut mount_rules = Vec::new();
+        if workspace_access != 0 {
+            mount_rules.push((
+                mounts.workspace_dst.clone(),
+                LandlockPathKind::Directory,
+                workspace_access,
+            ));
+        }
+        mount_rules.push((
+            mounts.agent_state_dst.clone(),
+            LandlockPathKind::Directory,
+            LANDLOCK_DIRECTORY_READ_ONLY,
+        ));
+        mount_rules.push((
+            mounts.tmp_dst.clone(),
+            LandlockPathKind::Directory,
+            LANDLOCK_RUNTIME_WRITE,
+        ));
+        Ok(Self {
+            ruleset,
+            mounts,
+            mount_rules,
+        })
     }
 }
 
@@ -1208,6 +1258,7 @@ printf 'input=%s own=%s temp=%s\n' "$input" "$own" "$(IFS= read -r value < "$TMP
         let context = SkillExecExecutionContext {
             packages_root: &fixture.packages_root,
             temp_root: &temp_root,
+            engine_state: &fixture.run_env.engine_state_root,
             workdir: &fixture.run_env.workdir,
             tools: &tools,
             stop: &stop,
@@ -1251,6 +1302,7 @@ printf 'workspace-read-denied\n'
         let context = SkillExecExecutionContext {
             packages_root: &fixture.packages_root,
             temp_root: &temp_root,
+            engine_state: &fixture.run_env.engine_state_root,
             workdir: &fixture.run_env.workdir,
             tools: &tools,
             stop: &stop,
@@ -1283,6 +1335,7 @@ printf 'workspace-read-denied\n'
         let context = SkillExecExecutionContext {
             packages_root: &fixture.packages_root,
             temp_root: &temp_root,
+            engine_state: &fixture.run_env.engine_state_root,
             workdir: &fixture.run_env.workdir,
             tools: &tools,
             stop: &stop,
@@ -1319,6 +1372,7 @@ printf '%s\n' "$!" > "$1"
         let context = SkillExecExecutionContext {
             packages_root: &fixture.packages_root,
             temp_root: &temp_root,
+            engine_state: &fixture.run_env.engine_state_root,
             workdir: &fixture.run_env.workdir,
             tools: &tools,
             stop: &stop,
@@ -1405,6 +1459,7 @@ printf '%s\n' "$!" > "$1"
         let context = SkillExecExecutionContext {
             packages_root: &fixture.packages_root,
             temp_root: &temp_root,
+            engine_state: &fixture.run_env.engine_state_root,
             workdir: &fixture.run_env.workdir,
             tools: &tools,
             stop: &stop,

@@ -6164,6 +6164,17 @@ async fn prepare_run_env_with_local_skills_and_management(
     }
     if let Some(client) = client {
         let ownership_generation = claim.run.session_ownership_generation.unwrap_or_default();
+        let mut desired_secrets = std::collections::BTreeSet::new();
+        desired_secrets.extend(claim.secret_values.iter().map(|secret| secret.name.clone()));
+        desired_secrets.extend(claim.secret_files.iter().map(|file| file.name.clone()));
+        for entry in stdfs::read_dir(&secret_dir).context("list Run secret directory")? {
+            let entry = entry.context("read Run secret directory entry")?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !desired_secrets.contains(&name) {
+                stdfs::remove_file(entry.path())
+                    .with_context(|| format!("remove revoked Run secret file {name}"))?;
+            }
+        }
         for secret in &claim.secret_values {
             let destination = secret_dir.join(&secret.name);
             let mut options = fs::OpenOptions::new();
@@ -6587,10 +6598,17 @@ fn chown_session_tree(root: &Path) -> anyhow::Result<()> {
     }
     for entry in WalkDir::new(root).follow_links(false) {
         let entry = entry?;
+        // Agent-created symlinks stay owned by the sandbox user; following
+        // them from the root control process could chown an outside target or
+        // fail on a dangling link, so only regular files and directories are
+        // touched, and never through a link.
+        if entry.file_type().is_symlink() {
+            continue;
+        }
         let path = std::ffi::CString::new(entry.path().as_os_str().as_bytes())
             .context("Session path contains a NUL byte")?;
         // SAFETY: pointer is NUL-terminated and the path is valid.
-        if unsafe { libc::chown(path.as_ptr(), PI_SANDBOX_UID, PI_SANDBOX_GID) } != 0 {
+        if unsafe { libc::lchown(path.as_ptr(), PI_SANDBOX_UID, PI_SANDBOX_GID) } != 0 {
             return Err(std::io::Error::last_os_error()).context("chown Session file");
         }
     }
@@ -6785,9 +6803,16 @@ async fn synchronize_pi_execution_configuration(
     let result: anyhow::Result<()> = async {
         fs::create_dir_all(stage_agent_dir.join("skills")).await?;
         let mut instructions = format!("{}\n", configuration.instructions.trim_end());
-        if let Some(guidance) = render_pi_secret_guidance(secret_values, secret_files)
-            .or_else(|| read_existing_pi_secret_guidance(&agent_dir))
-        {
+        let guidance = match model_configuration {
+            PiModelConfigurationMaterialization::RunBindings { .. } => {
+                render_pi_secret_guidance(secret_values, secret_files)
+            }
+            PiModelConfigurationMaterialization::PreserveExisting => {
+                render_pi_secret_guidance(secret_values, secret_files)
+                    .or_else(|| read_existing_pi_secret_guidance(&agent_dir))
+            }
+        };
+        if let Some(guidance) = guidance {
             instructions.push_str(&format!("\n\n{guidance}\n"));
         }
         write_private_file(&stage_agent_dir.join("AGENTS.md"), instructions.as_bytes())

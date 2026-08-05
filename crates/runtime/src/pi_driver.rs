@@ -436,22 +436,143 @@ struct LandlockPathBeneathAttr {
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum LandlockPathKind {
+pub(super) enum LandlockPathKind {
     Directory,
     File,
+}
+
+#[cfg(target_os = "linux")]
+pub(super) struct SessionMounts {
+    #[cfg_attr(test, allow(dead_code))]
+    workspace: CString,
+    #[cfg_attr(test, allow(dead_code))]
+    engine_state: CString,
+    #[cfg_attr(test, allow(dead_code))]
+    tmp: CString,
+    #[cfg_attr(test, allow(dead_code))]
+    workspace_dst: CString,
+    #[cfg_attr(test, allow(dead_code))]
+    agent_state_dst: CString,
+    #[cfg_attr(test, allow(dead_code))]
+    tmp_dst: CString,
+}
+
+#[cfg(target_os = "linux")]
+impl SessionMounts {
+    #[cfg_attr(test, allow(dead_code))]
+    pub(super) fn new(workspace: &Path, engine_state: &Path, tmp: &Path) -> std::io::Result<Self> {
+        let path_to_c = |path: &Path| -> std::io::Result<CString> {
+            CString::new(path.as_os_str().as_bytes()).map_err(std::io::Error::other)
+        };
+        Ok(Self {
+            workspace: path_to_c(workspace)?,
+            engine_state: path_to_c(engine_state)?,
+            tmp: path_to_c(tmp)?,
+            workspace_dst: CString::new(PI_WORKSPACE_MOUNT).map_err(std::io::Error::other)?,
+            agent_state_dst: CString::new(PI_AGENT_STATE_MOUNT).map_err(std::io::Error::other)?,
+            tmp_dst: CString::new(PI_TMP_MOUNT).map_err(std::io::Error::other)?,
+        })
+    }
+
+    /// Installs the per-Session mount namespace inside the pre-exec hook.
+    /// Every step is a raw syscall with precomputed CStrings; any failure
+    /// aborts the child so an unisolated Session can never start.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(super) fn apply(&self) -> std::io::Result<()> {
+        // SAFETY: scalar arguments only.
+        if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // Detach the inherited (possibly shared) mount tree before bind
+        // mounts; source/type/data are NULL and the flag is scalar.
+        // SAFETY: the target "/" is a static NUL-terminated literal.
+        if unsafe {
+            libc::mount(
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        for target in [&self.workspace_dst, &self.agent_state_dst, &self.tmp_dst] {
+            // SAFETY: target is NUL-terminated; EEXIST is expected on reruns.
+            if unsafe { libc::mkdir(target.as_ptr(), 0o755) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EEXIST) {
+                    return Err(error);
+                }
+            }
+        }
+        let bind = |source: &CString, destination: &CString| -> std::io::Result<()> {
+            // SAFETY: both pointers are NUL-terminated and stay live;
+            // MS_BIND requires no filesystem type.
+            if unsafe {
+                libc::mount(
+                    source.as_ptr(),
+                    destination.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        };
+        bind(&self.workspace, &self.workspace_dst)?;
+        bind(&self.engine_state, &self.agent_state_dst)?;
+        bind(&self.tmp, &self.tmp_dst)?;
+        // /agent-state must be read-only at the VFS level so truncate(2) and
+        // other write syscalls that Landlock cannot fully cover are blocked.
+        // SAFETY: remount only needs the NUL-terminated target.
+        if unsafe {
+            libc::mount(
+                std::ptr::null(),
+                self.agent_state_dst.as_ptr(),
+                std::ptr::null(),
+                libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg_attr(test, allow(dead_code))]
+    pub(super) fn chdir_workspace(&self) -> std::io::Result<()> {
+        // SAFETY: pointer is NUL-terminated.
+        if unsafe { libc::chdir(self.workspace_dst.as_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[cfg_attr(test, allow(dead_code))]
+pub(super) fn apply_mount_landlock_rules(
+    ruleset_fd: i32,
+    rules: &[(CString, LandlockPathKind, u64)],
+) -> std::io::Result<()> {
+    for (path, kind, access) in rules {
+        add_landlock_path_rule_raw(ruleset_fd, path, *kind, *access)?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
 struct PiFilesystemSandbox {
     rules: Vec<(CString, LandlockPathKind, u64)>,
     #[cfg_attr(test, allow(dead_code))]
-    workspace: PathBuf,
+    mounts: SessionMounts,
     #[cfg_attr(test, allow(dead_code))]
-    engine_state: PathBuf,
-    #[cfg_attr(test, allow(dead_code))]
-    pi_temp: PathBuf,
-    workspace_access: u64,
-    secret_readable: bool,
+    mount_rules: Vec<(CString, LandlockPathKind, u64)>,
 }
 
 #[cfg(target_os = "linux")]
@@ -587,74 +708,43 @@ impl PiFilesystemSandbox {
                 Ok((path, kind, access))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+        let mounts = SessionMounts::new(&run_env.workdir, &run_env.engine_state_root, pi_temp)
+            .context("prepare Session mount paths")?;
+        let mut mount_rules = Vec::new();
+        mount_rules.push((
+            mounts.workspace_dst.clone(),
+            LandlockPathKind::Directory,
+            workspace_access,
+        ));
+        mount_rules.push((
+            mounts.agent_state_dst.clone(),
+            LandlockPathKind::Directory,
+            LANDLOCK_DIRECTORY_READ_ONLY,
+        ));
+        if secret_readable {
+            mount_rules.push((
+                CString::new(format!("{PI_AGENT_STATE_MOUNT}/secrets"))
+                    .context("Secret mount path contains a NUL byte")?,
+                LandlockPathKind::Directory,
+                LANDLOCK_DIRECTORY_LIST | LANDLOCK_ACCESS_FS_READ_FILE,
+            ));
+        }
+        mount_rules.push((
+            mounts.tmp_dst.clone(),
+            LandlockPathKind::Directory,
+            LANDLOCK_RUNTIME_WRITE,
+        ));
         Ok(Self {
             rules,
-            workspace: run_env.workdir.clone(),
-            engine_state: run_env.engine_state_root.clone(),
-            pi_temp: pi_temp.to_path_buf(),
-            workspace_access,
-            secret_readable,
+            mounts,
+            mount_rules,
         })
     }
 
     fn apply_inside_pre_exec(&self) -> std::io::Result<()> {
         #[cfg(not(test))]
-        let mut mounted = false;
-        #[cfg(test)]
-        let mounted = false;
-        #[cfg(not(test))]
         {
-            if unsafe { libc::unshare(libc::CLONE_NEWNS) } == 0 {
-                // Detach the inherited (possibly shared) mount tree before
-                // bind mounts; the target pointer must be NUL-terminated.
-                // SAFETY: source/type/data are NULL and the flag is scalar.
-                unsafe {
-                    libc::mount(
-                        std::ptr::null(),
-                        c"/".as_ptr(),
-                        std::ptr::null(),
-                        libc::MS_REC | libc::MS_PRIVATE,
-                        std::ptr::null(),
-                    );
-                }
-                for target in [PI_WORKSPACE_MOUNT, PI_AGENT_STATE_MOUNT] {
-                    let target = CString::new(target).map_err(std::io::Error::other)?;
-                    // SAFETY: target is NUL-terminated; EEXIST is expected.
-                    unsafe {
-                        libc::mkdir(target.as_ptr(), 0o755);
-                    }
-                }
-                let bind = |source: &CString, destination: &CString| -> bool {
-                    // SAFETY: both pointers are NUL-terminated and stay live;
-                    // MS_BIND requires no filesystem type.
-                    unsafe {
-                        libc::mount(
-                            source.as_ptr(),
-                            destination.as_ptr(),
-                            std::ptr::null(),
-                            libc::MS_BIND,
-                            std::ptr::null(),
-                        ) == 0
-                    }
-                };
-                let workspace = CString::new(self.workspace.as_os_str().as_bytes())
-                    .map_err(std::io::Error::other)?;
-                let engine_state = CString::new(self.engine_state.as_os_str().as_bytes())
-                    .map_err(std::io::Error::other)?;
-                let pi_temp = CString::new(self.pi_temp.as_os_str().as_bytes())
-                    .map_err(std::io::Error::other)?;
-                let workspace_dst =
-                    CString::new(PI_WORKSPACE_MOUNT).map_err(std::io::Error::other)?;
-                let engine_state_dst =
-                    CString::new(PI_AGENT_STATE_MOUNT).map_err(std::io::Error::other)?;
-                let tmp_dst = CString::new(PI_TMP_MOUNT).map_err(std::io::Error::other)?;
-                if bind(&workspace, &workspace_dst)
-                    && bind(&engine_state, &engine_state_dst)
-                    && bind(&pi_temp, &tmp_dst)
-                {
-                    mounted = true;
-                }
-            }
+            self.mounts.apply()?;
         }
 
         let ruleset_fd = create_landlock_ruleset_raw().map_err(std::io::Error::other)?;
@@ -665,34 +755,9 @@ impl PiFilesystemSandbox {
         for (path, kind, access) in &self.rules {
             apply_rule(path, *kind, *access)?;
         }
-        if mounted {
-            let mut mount_rules = Vec::new();
-            mount_rules.push((
-                CString::new(PI_WORKSPACE_MOUNT).map_err(std::io::Error::other)?,
-                LandlockPathKind::Directory,
-                self.workspace_access,
-            ));
-            mount_rules.push((
-                CString::new(PI_AGENT_STATE_MOUNT).map_err(std::io::Error::other)?,
-                LandlockPathKind::Directory,
-                LANDLOCK_DIRECTORY_READ_ONLY,
-            ));
-            if self.secret_readable {
-                mount_rules.push((
-                    CString::new(format!("{PI_AGENT_STATE_MOUNT}/secrets"))
-                        .map_err(std::io::Error::other)?,
-                    LandlockPathKind::Directory,
-                    LANDLOCK_DIRECTORY_LIST | LANDLOCK_ACCESS_FS_READ_FILE,
-                ));
-            }
-            mount_rules.push((
-                CString::new(PI_TMP_MOUNT).map_err(std::io::Error::other)?,
-                LandlockPathKind::Directory,
-                LANDLOCK_RUNTIME_WRITE,
-            ));
-            for (path, kind, access) in mount_rules {
-                apply_rule(&path, kind, access)?;
-            }
+        #[cfg(not(test))]
+        {
+            apply_mount_landlock_rules(ruleset_fd, &self.mount_rules)?;
         }
         // Installs the /proc/self/maps rule (after fork), no_new_privs, the
         // Landlock restriction, and closes the ruleset descriptor.
@@ -707,11 +772,11 @@ impl PiFilesystemSandbox {
                 return Err(std::io::Error::last_os_error());
             }
         }
-        if mounted {
-            let workspace = CString::new(PI_WORKSPACE_MOUNT).map_err(std::io::Error::other)?;
+        #[cfg(not(test))]
+        {
             // SAFETY: pointer is NUL-terminated.
-            unsafe {
-                libc::chdir(workspace.as_ptr());
+            if unsafe { libc::chdir(self.mounts.workspace_dst.as_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error());
             }
         }
         Ok(())
