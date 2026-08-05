@@ -301,7 +301,7 @@ impl SkillExecBroker {
         let packages_root = super::pi_agent_directory(run_env).join("skills");
         let temp_root = root.join(SKILL_EXEC_TEMP_DIRECTORY);
         super::prepare_private_directory(&root, "Skill execution directory")?;
-        super::prepare_private_directory(&packages_root, "Skill package execution directory")?;
+        super::prepare_control_directory(&packages_root, "Skill package execution directory")?;
         super::prepare_private_directory(&temp_root, "Skill execution temporary directory")?;
         let catalog = load_catalog(&catalog_path, &packages_root)
             .context("validate Skill execution catalog")?;

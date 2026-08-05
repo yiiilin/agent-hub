@@ -32,7 +32,7 @@ RUNTIME_WORK_ROOT/
     skill-exec/tmp/                                  # 每次调用独立临时目录
 ```
 
-- Skill 只有一份物化副本（`.pi/agent/skills/<slug>/`）：上传归档排除根 `SKILL.md`（内容存为 Skill 正文，物化时重新生成），其余文件全部标记为可执行并进入 `skill-exec/catalog.json` 白名单；目录与文件权限为 `0500/0400`，对 Pi 只读。压缩缓存只按 SHA-256 复用并在每次命中时校验大小/checksum；解包目录绝不跨 Session 共享，完整 manifest、tar entry 类型、路径、大小、checksum 和 executable 标志均由 Runtime 再验证。
+- Skill 只有一份物化副本（`.pi/agent/skills/<slug>/`）：上传归档排除根 `SKILL.md`（内容存为 Skill 正文，物化时重新生成），其余文件全部标记为可执行并进入 `skill-exec/catalog.json` 白名单；目录与文件权限为 `0550/0440`，对 Pi 只读。压缩缓存只按 SHA-256 复用并在每次命中时校验大小/checksum；解包目录绝不跨 Session 共享，完整 manifest、tar entry 类型、路径、大小、checksum 和 executable 标志均由 Runtime 再验证。
 - Pi 通过原生 Skill discovery 发现 `.pi/agent/skills/<slug>/SKILL.md`，是否读取正文由 Pi 自身决定。启用 Skill 不会自动授予 `read`。
 - `skill_exec` 是显式 Agent/App 工具权限，不是通用 shell。它仅在最终工具交集仍允许 `skill_exec` 且至少一个已启用 Package 含可执行文件（除 `SKILL.md` 外的任意文件）时注册；请求必须精确匹配当前 Session catalog 中的 Skill 名和程序路径。
 - `skill_exec` 不拼接 shell 命令。脚本只能使用无参数的受控 shebang；每次调用使用独立 `HOME`/`TMPDIR`，Package 只读。是否可读写当前 Workspace 继续服从该 Agent 的最终文件工具权限，仅授权 `skill_exec` 时不能读取 Workspace。Linux Runtime 用 Landlock、私有 loopback TCP broker/随机 token、参数/输入/输出上限、超时和进程组终止约束子进程；主程序退出后也终止遗留后台进程。非 Linux Runtime 不开放该工具。

@@ -2101,6 +2101,11 @@ async fn restore_claim_session_bundle_if_needed(
                 .await
                 .context("remove replaced local Session directory")?;
         }
+        // The Bundle archive is extracted as root; restore ownership of the
+        // agent-facing trees while the Session is still offline so the next
+        // Run can write its Workspace and reopen its Pi session file.
+        let restored_paths = SessionPaths::for_session(&config.work_root, session_id);
+        chown_restored_session_tree(&restored_paths)?;
         let _ = fs::remove_dir_all(&restore_root).await;
         fs::remove_file(&archive_path)
             .await
@@ -2109,6 +2114,42 @@ async fn restore_claim_session_bundle_if_needed(
     }
     .await;
     restore_result.context(SessionBundleRestoreFailure)
+}
+
+/// Recursively restores ownership of a just-restored, offline Session tree.
+/// Unlike run-time preparation this is safe to walk recursively: no sandbox
+/// process is alive for a Session being restored from a Bundle. Symlinks are
+/// never followed.
+fn chown_restored_session_tree(paths: &SessionPaths) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        for root in [paths.workspace.clone(), paths.engine_state.join("sessions")] {
+            if !root.exists() {
+                continue;
+            }
+            for entry in WalkDir::new(&root).follow_links(false) {
+                let entry = entry?;
+                if entry.file_type().is_symlink() {
+                    continue;
+                }
+                let path = std::ffi::CString::new(entry.path().as_os_str().as_bytes())
+                    .context("restored Session path contains a NUL byte")?;
+                // SAFETY: pointer is NUL-terminated and the path is valid.
+                if unsafe { libc::lchown(path.as_ptr(), PI_SANDBOX_UID, PI_SANDBOX_GID) } != 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .context("chown restored Session file");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn chown_restored_session_tree(_paths: &SessionPaths) -> anyhow::Result<()> {
+    Ok(())
 }
 
 fn configured_runtime_id(claim: &ClaimRunResponse) -> anyhow::Result<Uuid> {
@@ -6634,15 +6675,9 @@ fn chown_control_created_dirs(paths: &SessionPaths) -> anyhow::Result<()> {
         paths.engine_state.join(SKILL_EXEC_DIRECTORY).join("tmp"),
     ];
     directories.extend(
-        [
-            ".pi/agent",
-            ".pi/agent/cache",
-            ".pi/sessions",
-            ".pi/home",
-            ".pi/tmp",
-        ]
-        .into_iter()
-        .map(|relative| paths.engine_state.join(relative)),
+        [".pi/agent/cache", "sessions", ".pi/home", ".pi/tmp"]
+            .into_iter()
+            .map(|relative| paths.engine_state.join(relative)),
     );
     for directory in directories {
         let path = std::ffi::CString::new(directory.as_os_str().as_bytes())
@@ -6753,7 +6788,7 @@ fn protect_pi_agent_execution_sources(
     let catalog = skill_exec_dir.join(SKILL_EXEC_CATALOG_FILE);
     if catalog.is_file() {
         chown_root_group(&catalog)?;
-        stdfs::set_permissions(&catalog, stdfs::Permissions::from_mode(0o440))?;
+        stdfs::set_permissions(&catalog, stdfs::Permissions::from_mode(0o400))?;
     }
     if secret_dir.is_dir() {
         chown_root_group(secret_dir)?;
@@ -7374,6 +7409,10 @@ fn legacy_v3_pi_execution_materialization_sha256(
         format!("{SKILL_EXEC_DIRECTORY}/{SKILL_EXEC_CATALOG_FILE}"),
         skill_exec_dir.join(SKILL_EXEC_CATALOG_FILE),
     ));
+    paths.push((
+        format!("{SKILL_EXEC_DIRECTORY}/packages"),
+        skill_exec_dir.join("packages"),
+    ));
     for directory in package_dirs {
         paths.extend(
             WalkDir::new(skill_exec_dir.join("packages").join(directory))
@@ -7428,7 +7467,6 @@ fn legacy_v3_pi_materialization_is_current(
     marker: &PiExecutionMaterializationMarker,
 ) -> bool {
     marker.format_version == 3
-        && !marker.owned_package_directories.is_empty()
         && marker
             .owned_skill_directories
             .iter()
@@ -7633,6 +7671,8 @@ fn commit_pi_execution_materialization(
     let secret_dir = agent_dir
         .parent()
         .context("Pi Agent directory has no parent")?
+        .parent()
+        .context("Pi Agent directory has no engine-state parent")?
         .join("secrets");
     protect_pi_agent_execution_sources(agent_dir, skill_exec_dir, &secret_dir)
         .context("protect installed Pi execution sources")?;
@@ -9130,7 +9170,7 @@ mod tests {
                 .permissions()
                 .mode()
                 & 0o777,
-            0o440
+            0o400
         );
         assert_eq!(
             fs::metadata(

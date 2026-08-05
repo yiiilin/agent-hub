@@ -139,7 +139,7 @@ fn materialize_skill_exec_extension(run_env: &RunEnv, enabled: bool) -> anyhow::
     if !enabled {
         return remove_file_if_present(&extension_path);
     }
-    prepare_private_directory(&pi_agent_directory(run_env), "Pi Agent directory")?;
+    prepare_control_directory(&pi_agent_directory(run_env), "Pi Agent directory")?;
     replace_private_file(&extension_path, SKILL_EXEC_EXTENSION_SOURCE.as_bytes())
         .context("write Skill execution Extension")
 }
@@ -310,7 +310,7 @@ pub(super) fn materialize_integration_tools(
         return Ok(());
     }
 
-    prepare_private_directory(&pi_agent_directory(run_env), "Pi Agent directory")?;
+    prepare_control_directory(&pi_agent_directory(run_env), "Pi Agent directory")?;
     replace_private_file(&tools_path, &serde_json::to_vec_pretty(&tools)?)
         .context("write Integration tools catalog")?;
     replace_private_file(&extension_path, PI_INTEGRATION_EXTENSION_SOURCE.as_bytes())
@@ -330,6 +330,26 @@ fn prepare_private_directory(path: &Path, purpose: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Creates a control-owned directory that the sandbox user can traverse but
+/// never write: used for the Pi agent directory and the Skill packages root
+/// so a live sandbox process cannot chmod/rename protected sources inside
+/// them between materialization steps.
+pub(super) fn prepare_control_directory(path: &Path, purpose: &str) -> anyhow::Result<()> {
+    fs::create_dir_all(path).with_context(|| format!("create {purpose}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+        let cpath = CString::new(path.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
+        // SAFETY: pointer is NUL-terminated and the path is valid.
+        if unsafe { libc::chown(cpath.as_ptr(), 0, PI_SANDBOX_GID) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("chown control directory");
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o550))
+            .with_context(|| format!("protect {purpose}"))?;
+    }
+    Ok(())
+}
 #[cfg(unix)]
 fn chown_private_path_if_root(path: &Path) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
@@ -1126,12 +1146,12 @@ impl PersistentPiRpcProcess {
         let pi_temp = pi_temp_directory(run_env);
         for (path, purpose) in [
             (&session_dir, "Pi Session directory"),
-            (&agent_dir, "Pi Agent directory"),
             (&pi_home, "Pi Home directory"),
             (&pi_temp, "Pi temporary directory"),
         ] {
             prepare_private_directory(path, purpose)?;
         }
+        prepare_control_directory(&agent_dir, "Pi Agent directory")?;
         let agent_cache = agent_dir.join("cache");
         prepare_private_directory(&agent_cache, "Pi Agent cache directory")?;
         let saved_session = saved_session
