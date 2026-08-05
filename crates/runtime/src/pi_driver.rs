@@ -747,7 +747,7 @@ impl PiFilesystemSandbox {
             self.mounts.apply()?;
         }
 
-        let ruleset_fd = create_landlock_ruleset_raw().map_err(std::io::Error::other)?;
+        let ruleset_fd = create_landlock_ruleset_raw()?;
         let apply_rule =
             |path: &CString, kind: LandlockPathKind, access: u64| -> std::io::Result<()> {
                 add_landlock_path_rule_raw(ruleset_fd, path, kind, access)
@@ -1132,6 +1132,8 @@ impl PersistentPiRpcProcess {
         ] {
             prepare_private_directory(path, purpose)?;
         }
+        let agent_cache = agent_dir.join("cache");
+        prepare_private_directory(&agent_cache, "Pi Agent cache directory")?;
         let saved_session = saved_session
             .map(|path| validate_saved_session_path(&session_dir, path))
             .transpose()?;
@@ -1148,6 +1150,12 @@ impl PersistentPiRpcProcess {
             })
             .transpose()
             .context("start Skill execution broker")?;
+        crate::protect_pi_agent_execution_sources(
+            &agent_dir,
+            &run_env.engine_state_root.join(crate::SKILL_EXEC_DIRECTORY),
+            &run_env.engine_state_root.join("secrets"),
+        )
+        .context("protect Pi Agent execution sources")?;
 
         #[cfg(target_os = "linux")]
         let filesystem_sandbox = PiFilesystemSandbox::prepare(

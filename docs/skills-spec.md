@@ -5,7 +5,7 @@
 1. 登录用户可创建、查看、更新和物理删除自己的 Hub-managed Skill；不存在归档状态。
 2. Skill 包含 `name`、`description`、Markdown `content`、revision 和内容 checksum，由 Hub 保存并按 owner 隔离；还可附加一个由普通文件组成的当前 Package。
 3. Agent 可绑定多个自己有权使用的 managed Skill；Agent-inline Skill 和 `skills_manifest` 不再存在。
-4. 管理台可以选择多个文件或一个目录上传。根目录必须有 UTF-8 `SKILL.md`，其中 YAML frontmatter 的 `name`、可选 `description` 和正文会原子替换 Skill 元数据；其余文件作为 Package 保存，`bin/` 下文件才标记为可执行。
+4. 管理台可以选择多个文件或一个目录上传。根目录必须有 UTF-8 `SKILL.md`，其中 YAML frontmatter 的 `name`、可选 `description` 和正文会原子替换 Skill 元数据；其余文件作为 Package 保存，全部标记为可执行（运行时白名单为除 `SKILL.md` 外的任意文件）。
 5. 开始新 Turn 前，Runtime 使用包含全部有效 Skill revision/checksum 和 Package 元数据的确定性 fingerprint，同步 Session 专属 `engine-state/.pi/agent/skills/` 与私有执行副本。
 6. 活动 Turn 期间不改写 Agent/Skill 文件；Steering Messages 使用 Turn 开始时的稳定文件集。
 7. 删除 Skill 在一个事务中删除 Skill 和全部 Agent 绑定，并为受影响的在线 Session 请求最新配置刷新。
@@ -35,7 +35,7 @@ RUNTIME_WORK_ROOT/
 - Skill 只有一份物化副本（`.pi/agent/skills/<slug>/`）：上传归档排除根 `SKILL.md`（内容存为 Skill 正文，物化时重新生成），其余文件全部标记为可执行并进入 `skill-exec/catalog.json` 白名单；目录与文件权限为 `0500/0400`，对 Pi 只读。压缩缓存只按 SHA-256 复用并在每次命中时校验大小/checksum；解包目录绝不跨 Session 共享，完整 manifest、tar entry 类型、路径、大小、checksum 和 executable 标志均由 Runtime 再验证。
 - Pi 通过原生 Skill discovery 发现 `.pi/agent/skills/<slug>/SKILL.md`，是否读取正文由 Pi 自身决定。启用 Skill 不会自动授予 `read`。
 - `skill_exec` 是显式 Agent/App 工具权限，不是通用 shell。它仅在最终工具交集仍允许 `skill_exec` 且至少一个已启用 Package 含可执行文件（除 `SKILL.md` 外的任意文件）时注册；请求必须精确匹配当前 Session catalog 中的 Skill 名和程序路径。
-- `skill_exec` 不拼接 shell 命令。脚本只能使用无参数的受控 shebang；每次调用使用独立 `HOME`/`TMPDIR`，Package 只读。是否可读写当前 Workspace 继续服从该 Agent 的最终文件工具权限，仅授权 `skill_exec` 时不能读取 Workspace。Linux Runtime 用 Landlock、私有 Unix socket/capability token、参数/输入/输出上限、超时和进程组终止约束子进程；主程序退出后也终止遗留后台进程。非 Linux Runtime 不开放该工具。
+- `skill_exec` 不拼接 shell 命令。脚本只能使用无参数的受控 shebang；每次调用使用独立 `HOME`/`TMPDIR`，Package 只读。是否可读写当前 Workspace 继续服从该 Agent 的最终文件工具权限，仅授权 `skill_exec` 时不能读取 Workspace。Linux Runtime 用 Landlock、私有 loopback TCP broker/随机 token、参数/输入/输出上限、超时和进程组终止约束子进程；主程序退出后也终止遗留后台进程。非 Linux Runtime 不开放该工具。
 - Session 配置原子切换成功后，Runtime 调用 Pi 原生 `reload_resources` 重新发现 Skill；活动 Turn 延迟到终态后处理。工具集合不变时不重启 Pi 或 Native Session，工具集合变化时在下一 Turn 前从原 JSONL 恢复同一个 Native Session。
 - Session Bundle 只保存 Workspace 和 Pi recovery JSONL，不保存 Package 派生副本、catalog、临时目录或 Runtime 压缩缓存。
 

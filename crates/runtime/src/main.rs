@@ -6224,16 +6224,21 @@ async fn prepare_run_env_with_local_skills_and_management(
         }
     }
     let run_env = RunEnv {
-        workdir: paths.workspace,
-        engine_state_root: paths.engine_state,
+        workdir: paths.workspace.clone(),
+        engine_state_root: paths.engine_state.clone(),
         hub_url: hub_url.to_owned(),
         maintenance_token_file: maintenance_token_file.map(Path::to_path_buf),
         secret_values: claim.secret_values.clone(),
         secret_files: claim.secret_files.clone(),
     };
     pi_driver::materialize_integration_tools(&run_env, claim.integration_context.as_ref())?;
-    chown_session_tree(&paths.root).context("chown Session tree to sandbox UID")?;
-    protect_session_secret_files(&secret_dir).context("protect Session secret files")?;
+    chown_control_created_dirs(&paths).context("chown Session directories to sandbox UID")?;
+    protect_pi_agent_execution_sources(
+        &paths.engine_state.join(PI_AGENT_DIRECTORY),
+        &paths.engine_state.join(SKILL_EXEC_DIRECTORY),
+        &secret_dir,
+    )
+    .context("protect Pi execution sources")?;
     Ok(run_env)
 }
 
@@ -6566,9 +6571,9 @@ fn protect_skill_package_directory(root: &Path) -> anyhow::Result<()> {
             "Skill package contains an unsupported file type"
         );
         let mode = if metadata.is_dir() || metadata.permissions().mode() & 0o111 != 0 {
-            0o500
+            0o550
         } else {
-            0o400
+            0o440
         };
         stdfs::set_permissions(entry.path(), stdfs::Permissions::from_mode(mode))?;
     }
@@ -6612,77 +6617,165 @@ fn make_tree_owner_writable(_root: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
-fn chown_session_tree(root: &Path) -> anyhow::Result<()> {
+fn chown_control_created_dirs(paths: &SessionPaths) -> anyhow::Result<()> {
     use std::os::unix::ffi::OsStrExt;
 
-    if !root.exists() {
-        return Ok(());
-    }
-    for entry in WalkDir::new(root).follow_links(false) {
-        let entry = entry?;
-        // Agent-created symlinks stay owned by the sandbox user; following
-        // them from the root control process could chown an outside target or
-        // fail on a dangling link, so only regular files and directories are
-        // touched, and never through a link.
-        if entry.file_type().is_symlink() {
-            continue;
-        }
-        let path = std::ffi::CString::new(entry.path().as_os_str().as_bytes())
+    // Only control-created directories are chowned to the sandbox user.
+    // Agent-created files are already owned by UID 10001, and recursive
+    // path-based chowns would let a concurrent sandbox process race a
+    // directory/symlink swap and redirect ownership outside the Session.
+    let mut directories = vec![
+        paths.workspace.clone(),
+        paths.engine_state.clone(),
+        paths.supervisor.clone(),
+        paths.staging.clone(),
+        paths.engine_state.join(".pi"),
+        paths.engine_state.join(SKILL_EXEC_DIRECTORY),
+        paths.engine_state.join(SKILL_EXEC_DIRECTORY).join("tmp"),
+    ];
+    directories.extend(
+        [
+            ".pi/agent",
+            ".pi/agent/cache",
+            ".pi/sessions",
+            ".pi/home",
+            ".pi/tmp",
+        ]
+        .into_iter()
+        .map(|relative| paths.engine_state.join(relative)),
+    );
+    for directory in directories {
+        let path = std::ffi::CString::new(directory.as_os_str().as_bytes())
             .context("Session path contains a NUL byte")?;
-        // SAFETY: pointer is NUL-terminated and the path is valid.
-        if unsafe { libc::lchown(path.as_ptr(), PI_SANDBOX_UID, PI_SANDBOX_GID) } != 0 {
-            return Err(std::io::Error::last_os_error()).context("chown Session file");
+        // SAFETY: pointer is NUL-terminated and the path is valid; a missing
+        // directory simply has not been materialized yet.
+        if unsafe { libc::chown(path.as_ptr(), PI_SANDBOX_UID, PI_SANDBOX_GID) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error).context("chown Session directory");
+            }
         }
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn chown_session_tree(_root: &Path) -> anyhow::Result<()> {
+fn chown_control_created_dirs(_paths: &SessionPaths) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Secret files must be readable by the sandbox user but not writable or
-/// chmod-able by it. Landlock cannot restrict truncate(2) or chmod(2), so the
-/// files are owned by root:agenthub with mode 0440; the root control process
-/// can still rewrite them on the next Run while the unprivileged Pi process
-/// can only read them through /agent-state/secrets or the physical path.
-fn protect_session_secret_files(secret_dir: &Path) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::fs::PermissionsExt;
+/// Makes control-created Pi sources read-only for the sandbox user by
+/// chowning them to root:agenthub with 0440/0550 modes. Landlock cannot
+/// restrict truncate(2), chmod(2) or rename/delete through an owner-writable
+/// directory, so read-only files must also live in directories the sandbox
+/// user cannot write.
+#[cfg(unix)]
+fn protect_pi_agent_execution_sources(
+    agent_dir: &Path,
+    skill_exec_dir: &Path,
+    secret_dir: &Path,
+) -> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
 
-        if !secret_dir.exists() {
-            return Ok(());
+    let chown_root_group = |path: &Path| -> anyhow::Result<()> {
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .context("protected path contains a NUL byte")?;
+        // SAFETY: pointer is NUL-terminated and the path is valid.
+        if unsafe { libc::chown(path.as_ptr(), 0, PI_SANDBOX_GID) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("chown protected path");
         }
-        for entry in WalkDir::new(secret_dir).follow_links(false) {
+        Ok(())
+    };
+    let protect_tree = |root: &Path, executable: bool| -> anyhow::Result<()> {
+        for entry in WalkDir::new(root).follow_links(false) {
             let entry = entry?;
-            if entry.file_type().is_dir() {
+            if entry.file_type().is_symlink() {
                 continue;
             }
             let metadata = entry.metadata()?;
             anyhow::ensure!(
-                metadata.is_file(),
-                "Session secret directory contains an unsupported file type",
+                metadata.is_dir() || metadata.is_file(),
+                "protected source contains an unsupported file type",
             );
-            let path = std::ffi::CString::new(entry.path().as_os_str().as_bytes())
-                .context("Session secret path contains a NUL byte")?;
-            // SAFETY: pointer is NUL-terminated and the path is valid.
-            if unsafe { libc::chown(path.as_ptr(), 0, PI_SANDBOX_GID) } != 0 {
-                return Err(std::io::Error::last_os_error()).context("chown Session secret file");
+            chown_root_group(entry.path())?;
+            let mode = if metadata.is_dir()
+                || (executable && metadata.permissions().mode() & 0o111 != 0)
+            {
+                0o550
+            } else {
+                0o440
+            };
+            stdfs::set_permissions(entry.path(), stdfs::Permissions::from_mode(mode))
+                .with_context(|| format!("protect {}", entry.path().display()))?;
+        }
+        Ok(())
+    };
+    for filename in [
+        "AGENTS.md",
+        "models.json",
+        "settings.json",
+        "skills-manifest.json",
+        PI_MATERIALIZATION_MARKER_FILE,
+        "agent-hub-integration-tools.json",
+        "agent-hub-integration-tools.mjs",
+        "agent-hub-skill-exec.mjs",
+    ] {
+        let path = agent_dir.join(filename);
+        if path.is_file() {
+            chown_root_group(&path)?;
+            stdfs::set_permissions(&path, stdfs::Permissions::from_mode(0o440))?;
+        }
+    }
+    for directory in ["extensions", "skills"] {
+        let root = agent_dir.join(directory);
+        if root.is_dir() {
+            protect_tree(&root, true)?;
+        }
+    }
+    // The agent directory itself is read-only for the sandbox user so a
+    // session cannot rename or delete its own protected sources; only the
+    // dedicated cache directory stays writable.
+    if agent_dir.is_dir() {
+        chown_root_group(agent_dir)?;
+        stdfs::set_permissions(agent_dir, stdfs::Permissions::from_mode(0o550))?;
+    }
+    let cache = agent_dir.join("cache");
+    if cache.is_dir() {
+        let path = std::ffi::CString::new(cache.as_os_str().as_bytes())
+            .context("cache path contains a NUL byte")?;
+        // SAFETY: pointer is NUL-terminated and the path is valid.
+        if unsafe { libc::chown(path.as_ptr(), PI_SANDBOX_UID, PI_SANDBOX_GID) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("chown Session cache");
+        }
+        stdfs::set_permissions(&cache, stdfs::Permissions::from_mode(0o700))?;
+    }
+    let catalog = skill_exec_dir.join(SKILL_EXEC_CATALOG_FILE);
+    if catalog.is_file() {
+        chown_root_group(&catalog)?;
+        stdfs::set_permissions(&catalog, stdfs::Permissions::from_mode(0o440))?;
+    }
+    if secret_dir.is_dir() {
+        chown_root_group(secret_dir)?;
+        stdfs::set_permissions(secret_dir, stdfs::Permissions::from_mode(0o750))?;
+        for entry in WalkDir::new(secret_dir).follow_links(false) {
+            let entry = entry?;
+            if entry.file_type().is_dir() || entry.file_type().is_symlink() {
+                continue;
             }
-            stdfs::set_permissions(entry.path(), stdfs::Permissions::from_mode(0o440))
-                .with_context(|| {
-                    format!("protect Session secret file {}", entry.path().display())
-                })?;
+            chown_root_group(entry.path())?;
+            stdfs::set_permissions(entry.path(), stdfs::Permissions::from_mode(0o440))?;
         }
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn protect_session_secret_files(_secret_dir: &Path) -> anyhow::Result<()> {
+fn protect_pi_agent_execution_sources(
+    _agent_dir: &Path,
+    _skill_exec_dir: &Path,
+    _secret_dir: &Path,
+) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -6936,6 +7029,14 @@ async fn synchronize_pi_execution_configuration(
         .await?;
         let owned_skill_directories =
             skill_directory_entries(&stage_agent_dir.join("skills")).await?;
+        // Protect ownership/modes before hashing so the marker digest
+        // matches the installed state after commit.
+        protect_pi_agent_execution_sources(
+            &stage_agent_dir,
+            &stage_skill_exec_dir,
+            &stage_agent_dir.join("secrets"),
+        )
+        .context("protect staged Pi execution sources")?;
         let materialization_sha256 = pi_execution_materialization_sha256(
             &stage_agent_dir,
             &owned_skill_directories,
@@ -7238,6 +7339,118 @@ fn legacy_pi_materialization_is_current(
             .is_ok_and(|digest| digest == marker.materialization_sha256)
 }
 
+fn legacy_v3_pi_execution_materialization_sha256(
+    agent_dir: &Path,
+    skill_dirs: &[String],
+    skill_exec_dir: &Path,
+    package_dirs: &[String],
+) -> anyhow::Result<String> {
+    let mut paths = [
+        "AGENTS.md",
+        "models.json",
+        "settings.json",
+        "skills-manifest.json",
+    ]
+    .into_iter()
+    .map(|path| (format!("pi-agent/{path}"), agent_dir.join(path)))
+    .collect::<Vec<_>>();
+    for directory in skill_dirs {
+        paths.extend(
+            WalkDir::new(agent_dir.join("skills").join(directory))
+                .follow_links(false)
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|entry| {
+                    let path = entry.into_path();
+                    let relative = path
+                        .strip_prefix(agent_dir)
+                        .expect("walked Pi Skill path has its configured root");
+                    (format!("pi-agent/{}", relative.to_string_lossy()), path)
+                }),
+        );
+    }
+    paths.push((
+        format!("{SKILL_EXEC_DIRECTORY}/{SKILL_EXEC_CATALOG_FILE}"),
+        skill_exec_dir.join(SKILL_EXEC_CATALOG_FILE),
+    ));
+    for directory in package_dirs {
+        paths.extend(
+            WalkDir::new(skill_exec_dir.join("packages").join(directory))
+                .follow_links(false)
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|entry| {
+                    let path = entry.into_path();
+                    let relative = path
+                        .strip_prefix(skill_exec_dir)
+                        .expect("walked Skill execution path has its configured root");
+                    (
+                        format!("{SKILL_EXEC_DIRECTORY}/{}", relative.to_string_lossy()),
+                        path,
+                    )
+                }),
+        );
+    }
+    paths.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut digest = Sha256::new();
+    for (logical, path) in paths {
+        let metadata = stdfs::symlink_metadata(&path)?;
+        digest.update(logical.as_bytes());
+        digest.update([0]);
+        if metadata.is_dir() {
+            digest.update(b"directory");
+        } else if metadata.is_file() {
+            digest.update(b"file");
+            digest.update(stdfs::read(&path)?);
+        } else {
+            anyhow::bail!("legacy Pi configuration contains an unsupported file type");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            digest.update((metadata.permissions().mode() & 0o777).to_le_bytes());
+        }
+        digest.update([0]);
+    }
+    Ok(digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn legacy_v3_pi_materialization_is_current(
+    agent_dir: &Path,
+    skill_exec_dir: &Path,
+    marker: &PiExecutionMaterializationMarker,
+) -> bool {
+    marker.format_version == 3
+        && !marker.owned_package_directories.is_empty()
+        && marker
+            .owned_skill_directories
+            .iter()
+            .all(|directory| is_single_normal_path_component(directory))
+        && marker
+            .owned_package_directories
+            .iter()
+            .all(|directory| is_single_normal_path_component(directory))
+        && private_file_permissions_are_valid(&agent_dir.join(PI_MATERIALIZATION_MARKER_FILE))
+        && private_file_permissions_are_valid(&agent_dir.join("AGENTS.md"))
+        && private_file_permissions_are_valid(&agent_dir.join("models.json"))
+        && private_file_permissions_are_valid(&agent_dir.join("settings.json"))
+        && private_file_permissions_are_valid(&agent_dir.join("skills-manifest.json"))
+        && legacy_v3_pi_execution_materialization_sha256(
+            agent_dir,
+            &marker.owned_skill_directories,
+            skill_exec_dir,
+            &marker.owned_package_directories,
+        )
+        .is_ok_and(|digest| digest == marker.materialization_sha256)
+}
+
 fn pi_materialization_is_current(
     agent_dir: &Path,
     skill_exec_dir: &Path,
@@ -7284,7 +7497,8 @@ fn validated_pi_execution_materialization(
     anyhow::ensure!(
         (marker.format_version == 3
             && pi_materialization_is_current(agent_dir, skill_exec_dir, &marker))
-            || legacy_pi_materialization_is_current(agent_dir, &marker),
+            || legacy_pi_materialization_is_current(agent_dir, &marker)
+            || legacy_v3_pi_materialization_is_current(agent_dir, skill_exec_dir, &marker),
         "current per-Session Pi configuration materialization is invalid"
     );
     Ok(marker)
@@ -7416,6 +7630,12 @@ fn commit_pi_execution_materialization(
         }
         return Err(error).context("replace Session Skill materialization");
     }
+    let secret_dir = agent_dir
+        .parent()
+        .context("Pi Agent directory has no parent")?
+        .join("secrets");
+    protect_pi_agent_execution_sources(agent_dir, skill_exec_dir, &secret_dir)
+        .context("protect installed Pi execution sources")?;
     Ok(())
 }
 
@@ -7465,7 +7685,10 @@ async fn skill_directory_entries(root: &Path) -> anyhow::Result<Vec<String>> {
 fn private_file_permissions_are_valid(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
-    stdfs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o777 == 0o600)
+    stdfs::metadata(path).is_ok_and(|metadata| {
+        let mode = metadata.permissions().mode() & 0o777;
+        mode == 0o600 || mode == 0o440
+    })
 }
 
 #[cfg(not(unix))]
@@ -8657,7 +8880,7 @@ mod tests {
                 .permissions()
                 .mode()
                 & 0o777,
-            0o600
+            0o440
         );
         assert_eq!(
             fs::metadata(&marker_path)
@@ -8666,7 +8889,7 @@ mod tests {
                 .permissions()
                 .mode()
                 & 0o777,
-            0o600
+            0o440
         );
 
         let _ = prepare_run_env(temp.path(), &claim, Some("http://127.0.0.1:41001/v1"))
@@ -8889,7 +9112,7 @@ mod tests {
                 .permissions()
                 .mode()
                 & 0o777,
-            0o500
+            0o550
         );
         assert_eq!(
             fs::metadata(pi_skill_root.join("bin/client"))
@@ -8898,7 +9121,7 @@ mod tests {
                 .permissions()
                 .mode()
                 & 0o777,
-            0o500
+            0o550
         );
         assert_eq!(
             fs::metadata(&catalog_path)
@@ -8907,7 +9130,7 @@ mod tests {
                 .permissions()
                 .mode()
                 & 0o777,
-            0o400
+            0o440
         );
         assert_eq!(
             fs::metadata(
@@ -12026,7 +12249,7 @@ mod tests {
                 .permissions()
                 .mode()
                 & 0o777,
-            0o600
+            0o440
         );
         assert_eq!(
             pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap(),
