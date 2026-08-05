@@ -2976,6 +2976,7 @@ mod tests {
         let configuration = AgentExecutionConfigurationDto {
             revision: 8,
             instructions: "Use the current managed Skills".into(),
+            secret_declarations: Vec::new(),
             model_selection: None,
             model_settings: AgentModelSettings::default(),
             subagents: Vec::new(),
@@ -3460,6 +3461,7 @@ mod tests {
         let configuration = AgentExecutionConfigurationDto {
             revision: 3,
             instructions: "Use the configured model".into(),
+            secret_declarations: Vec::new(),
             model_selection: Some(selection),
             model_settings: main_settings,
             subagents: vec![SubagentDefinition {
@@ -3515,6 +3517,7 @@ mod tests {
         let configuration = AgentExecutionConfigurationDto {
             revision: 1,
             instructions: String::new(),
+            secret_declarations: Vec::new(),
             model_selection: None,
             model_settings: AgentModelSettings::default(),
             subagents: Vec::new(),

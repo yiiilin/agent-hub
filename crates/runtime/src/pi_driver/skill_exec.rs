@@ -681,6 +681,8 @@ fn execute_program(
     fs::create_dir(&call_temp).context("create Skill execution temporary directory")?;
     fs::set_permissions(&call_temp, fs::Permissions::from_mode(0o700))
         .context("protect Skill execution temporary directory")?;
+    super::chown_private_path_if_root(&call_temp)
+        .context("chown Skill execution temporary directory")?;
     let result = execute_program_in_temp(program, package_root, &call_temp, request, context);
     let cleanup =
         fs::remove_dir_all(&call_temp).context("remove Skill execution temporary directory");

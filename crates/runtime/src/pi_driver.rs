@@ -281,6 +281,7 @@ fn replace_private_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
             drop(file);
             fs::rename(&temporary, path)
                 .with_context(|| format!("replace private file {}", path.display()))?;
+            chown_private_path_if_root(path).context("chown private file to sandbox UID")?;
             Ok(())
         })();
         if result.is_err() {
@@ -324,7 +325,32 @@ fn prepare_private_directory(path: &Path, purpose: &str) -> anyhow::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
             .with_context(|| format!("protect {purpose}"))?;
+        chown_private_path_if_root(path).with_context(|| format!("chown {purpose}"))?;
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn chown_private_path_if_root(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    // The Runtime control process runs as root to create per-Session mount
+    // namespaces; files and directories it materializes must be owned by the
+    // sandbox user so the dropped Pi/Skill children can use them. Tests and
+    // unprivileged environments keep their own ownership.
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
+    // SAFETY: pointer is NUL-terminated and the path is valid.
+    if unsafe { libc::chown(path.as_ptr(), PI_SANDBOX_UID, PI_SANDBOX_GID) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn chown_private_path_if_root(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -571,11 +597,6 @@ impl PiFilesystemSandbox {
         })
     }
 
-    /// Runs inside the fork between `Command::spawn` and `exec`, so it performs
-    /// only syscalls plus syscall-level helpers. Requires the parent process to
-    /// be root with CAP_SYS_ADMIN; on failure to unshare/mount (for example in
-    /// tests or unprivileged environments) it degrades to the real paths while
-    /// still applying Landlock and the sandbox UID/GID.
     fn apply_inside_pre_exec(&self) -> std::io::Result<()> {
         #[cfg(not(test))]
         let mut mounted = false;
@@ -584,20 +605,33 @@ impl PiFilesystemSandbox {
         #[cfg(not(test))]
         {
             if unsafe { libc::unshare(libc::CLONE_NEWNS) } == 0 {
+                // Detach the inherited (possibly shared) mount tree before
+                // bind mounts; the target pointer must be NUL-terminated.
+                // SAFETY: source/type/data are NULL and the flag is scalar.
+                unsafe {
+                    libc::mount(
+                        std::ptr::null(),
+                        c"/".as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_REC | libc::MS_PRIVATE,
+                        std::ptr::null(),
+                    );
+                }
                 for target in [PI_WORKSPACE_MOUNT, PI_AGENT_STATE_MOUNT] {
                     let target = CString::new(target).map_err(std::io::Error::other)?;
-                    // SAFETY: target is NUL-terminated; EEXIST is expected on reruns.
+                    // SAFETY: target is NUL-terminated; EEXIST is expected.
                     unsafe {
                         libc::mkdir(target.as_ptr(), 0o755);
                     }
                 }
                 let bind = |source: &CString, destination: &CString| -> bool {
-                    // SAFETY: both pointers are NUL-terminated and stay live for the syscall.
+                    // SAFETY: both pointers are NUL-terminated and stay live;
+                    // MS_BIND requires no filesystem type.
                     unsafe {
                         libc::mount(
                             source.as_ptr(),
                             destination.as_ptr(),
-                            b"".as_ptr() as *const libc::c_char,
+                            std::ptr::null(),
                             libc::MS_BIND,
                             std::ptr::null(),
                         ) == 0
@@ -641,7 +675,7 @@ impl PiFilesystemSandbox {
             mount_rules.push((
                 CString::new(PI_AGENT_STATE_MOUNT).map_err(std::io::Error::other)?,
                 LandlockPathKind::Directory,
-                LANDLOCK_RUNTIME_WRITE,
+                LANDLOCK_DIRECTORY_READ_ONLY,
             ));
             if self.secret_readable {
                 mount_rules.push((

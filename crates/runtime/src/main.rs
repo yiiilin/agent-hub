@@ -54,6 +54,8 @@ const SESSION_CLEANUP_DIRECTORY: &str = "session-cleanups";
 const SESSION_CLEANUP_STATE_FILE: &str = "state.json";
 const SKILL_PACKAGE_CACHE_DIRECTORY: &str = "skill-package-cache";
 const SKILL_EXEC_DIRECTORY: &str = "skill-exec";
+const PI_SANDBOX_UID: u32 = 10001;
+const PI_SANDBOX_GID: u32 = 10001;
 const SKILL_EXEC_CATALOG_FILE: &str = "catalog.json";
 
 #[derive(Clone)]
@@ -6219,6 +6221,7 @@ async fn prepare_run_env_with_local_skills_and_management(
         secret_files: claim.secret_files.clone(),
     };
     pi_driver::materialize_integration_tools(&run_env, claim.integration_context.as_ref())?;
+    chown_session_tree(&paths.root).context("chown Session tree to sandbox UID")?;
     Ok(run_env)
 }
 
@@ -6546,6 +6549,7 @@ fn protect_skill_exec_tree(_root: &Path) -> anyhow::Result<()> {
 
 #[cfg(unix)]
 fn make_tree_owner_writable(root: &Path) -> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
 
     if !root.exists() {
@@ -6556,12 +6560,45 @@ fn make_tree_owner_writable(root: &Path) -> anyhow::Result<()> {
         let metadata = entry.metadata()?;
         let mode = if metadata.is_dir() { 0o700 } else { 0o600 };
         stdfs::set_permissions(entry.path(), stdfs::Permissions::from_mode(mode))?;
+        // The Runtime control process now runs as root; the Pi child drops to
+        // UID/GID 10001 inside its pre-exec hook, so every private Session file
+        // must be owned by the sandbox user.
+        let path = std::ffi::CString::new(entry.path().as_os_str().as_bytes())
+            .context("Session path contains a NUL byte")?;
+        // SAFETY: pointer is NUL-terminated and the path is valid.
+        if unsafe { libc::chown(path.as_ptr(), PI_SANDBOX_UID, PI_SANDBOX_GID) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("chown Session file");
+        }
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
 fn make_tree_owner_writable(_root: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn chown_session_tree(root: &Path) -> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    if !root.exists() {
+        return Ok(());
+    }
+    for entry in WalkDir::new(root).follow_links(false) {
+        let entry = entry?;
+        let path = std::ffi::CString::new(entry.path().as_os_str().as_bytes())
+            .context("Session path contains a NUL byte")?;
+        // SAFETY: pointer is NUL-terminated and the path is valid.
+        if unsafe { libc::chown(path.as_ptr(), PI_SANDBOX_UID, PI_SANDBOX_GID) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("chown Session file");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn chown_session_tree(_root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 

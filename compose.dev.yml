@@ -207,6 +207,8 @@ services:
       retries: 30
     cap_add:
       - SYS_ADMIN
+    security_opt:
+      - apparmor=unconfined
     volumes:
       - runtime-data:/var/lib/agent-hub-runtime
     depends_on:
