@@ -24,7 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 agenthub \
     && useradd --system --uid 10001 --gid agenthub --no-create-home agenthub \
-    && mkdir -p /var/lib/agent-hub-runtime \
+    && mkdir -p /var/lib/agent-hub-runtime /workspace /agent-state \
     && chown -R agenthub:agenthub /var/lib/agent-hub-runtime
 
 FROM runtime-base
@@ -33,5 +33,7 @@ COPY --from=pi-builder --chown=root:root /opt/pi-runtime /opt/agent-hub/pi
 RUN chmod -R a-w /opt/agent-hub/pi
 ENV ENGINE_BIN=/opt/agent-hub/pi/pi
 ENV RUNTIME_ENGINE_VERSION=0.81.1
-USER 10001:10001
+# The control process needs CAP_SYS_ADMIN to create per-Session mount
+# namespaces; Pi itself is dropped to UID/GID 10001 inside the pre-exec hook.
+USER root
 CMD ["agent-hub-runtime"]

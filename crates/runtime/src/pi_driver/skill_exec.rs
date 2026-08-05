@@ -1,12 +1,13 @@
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 
 use super::RunEnv;
 
 pub(super) const SKILL_EXEC_EXTENSION_SOURCE: &str = r#"import { createConnection } from "node:net";
 
-const socketPath = process.env.AGENT_HUB_SKILL_EXEC_SOCKET;
+const portValue = process.env.AGENT_HUB_SKILL_EXEC_PORT;
 const token = process.env.AGENT_HUB_SKILL_EXEC_TOKEN;
-if (!socketPath || !token) {
+if (!portValue || !token) {
   throw new Error("Agent Hub Skill execution broker is not configured");
 }
 
@@ -14,7 +15,7 @@ function callBroker(params, signal) {
   return new Promise((resolve, reject) => {
     let settled = false;
     let buffer = "";
-    const socket = createConnection(socketPath);
+    const socket = createConnection({ host: "127.0.0.1", port: Number(portValue) });
     const finish = (callback, value) => {
       if (settled) return;
       settled = true;
@@ -119,12 +120,11 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::{Read, Write},
-    net::Shutdown,
+    net::{Shutdown, TcpStream},
     os::{
         fd::AsRawFd,
         unix::{
             fs::{MetadataExt, PermissionsExt},
-            net::{UnixListener, UnixStream},
             process::CommandExt,
         },
     },
@@ -159,8 +159,6 @@ const SKILL_EXEC_CATALOG_FILE: &str = "catalog.json";
 const SKILL_EXEC_PACKAGES_DIRECTORY: &str = "packages";
 #[cfg(target_os = "linux")]
 const SKILL_EXEC_TEMP_DIRECTORY: &str = "tmp";
-#[cfg(target_os = "linux")]
-const SKILL_EXEC_SOCKET_FILE: &str = "skill-exec.sock";
 #[cfg(target_os = "linux")]
 const MAX_CATALOG_BYTES: u64 = 1024 * 1024;
 #[cfg(target_os = "linux")]
@@ -281,8 +279,7 @@ struct SkillExecExecutionContext<'a> {
 
 #[cfg(target_os = "linux")]
 pub(super) struct SkillExecBroker {
-    _socket_dir: tempfile::TempDir,
-    socket_path: PathBuf,
+    port: u16,
     token: String,
     stop: Arc<AtomicBool>,
     actor: Option<thread::JoinHandle<()>>,
@@ -310,20 +307,18 @@ impl SkillExecBroker {
             .iter()
             .any(|skill| skill.name == AGENT_HUB_MAINTENANCE_SKILL_NAME);
 
-        // Session roots can exceed Linux's 107-byte Unix socket path limit.
-        let socket_dir = tempfile::Builder::new()
-            .prefix("ah-sx-")
-            .tempdir_in("/tmp")
-            .context("create private Skill execution socket directory")?;
-        let socket_path = socket_dir.path().join(SKILL_EXEC_SOCKET_FILE);
-        remove_socket_if_present(&socket_path)?;
-        let listener = UnixListener::bind(&socket_path)
-            .with_context(|| format!("bind Skill execution socket {}", socket_path.display()))?;
-        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
-            .context("protect Skill execution socket")?;
+        // A loopback TCP listener avoids the 107-byte Unix socket path limit
+        // and stays reachable from the unprivileged Pi process through its
+        // private mount namespace; the random token authenticates every request.
+        let listener =
+            TcpListener::bind("127.0.0.1:0").context("bind Skill execution loopback listener")?;
+        let port = listener
+            .local_addr()
+            .context("read Skill execution listener address")?
+            .port();
         listener
             .set_nonblocking(true)
-            .context("configure Skill execution socket")?;
+            .context("configure Skill execution listener")?;
 
         let token = uuid::Uuid::new_v4().simple().to_string();
         let stop = Arc::new(AtomicBool::new(false));
@@ -344,16 +339,15 @@ impl SkillExecBroker {
         };
         let actor = thread::spawn(move || run_broker(listener, &context));
         Ok(Self {
-            _socket_dir: socket_dir,
-            socket_path,
+            port,
             token,
             stop,
             actor: Some(actor),
         })
     }
 
-    pub(super) fn socket_path(&self) -> &Path {
-        &self.socket_path
+    pub(super) fn port(&self) -> u16 {
+        self.port
     }
 
     pub(super) fn token(&self) -> &str {
@@ -365,7 +359,6 @@ impl SkillExecBroker {
         if let Some(actor) = self.actor.take() {
             let _ = actor.join();
         }
-        let _ = remove_socket_if_present(&self.socket_path);
     }
 }
 
@@ -377,7 +370,7 @@ impl Drop for SkillExecBroker {
 }
 
 #[cfg(target_os = "linux")]
-fn run_broker(listener: UnixListener, context: &SkillExecBrokerContext) {
+fn run_broker(listener: TcpListener, context: &SkillExecBrokerContext) {
     while !context.stop.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => handle_connection(stream, context),
@@ -390,7 +383,7 @@ fn run_broker(listener: UnixListener, context: &SkillExecBrokerContext) {
 }
 
 #[cfg(target_os = "linux")]
-fn handle_connection(mut stream: UnixStream, context: &SkillExecBrokerContext) {
+fn handle_connection(mut stream: TcpStream, context: &SkillExecBrokerContext) {
     let response = (|| -> anyhow::Result<SkillExecResponse> {
         let request = read_request(&mut stream, &context.stop)?;
         anyhow::ensure!(
@@ -449,7 +442,7 @@ fn handle_connection(mut stream: UnixStream, context: &SkillExecBrokerContext) {
 }
 
 #[cfg(target_os = "linux")]
-fn read_request(stream: &mut UnixStream, stop: &AtomicBool) -> anyhow::Result<SkillExecRequest> {
+fn read_request(stream: &mut TcpStream, stop: &AtomicBool) -> anyhow::Result<SkillExecRequest> {
     stream
         .set_read_timeout(Some(Duration::from_millis(100)))
         .context("configure Skill execution request timeout")?;
@@ -743,7 +736,20 @@ fn execute_program_in_temp(
     command.process_group(0);
     let ruleset_fd = sandbox.ruleset.as_raw_fd();
     unsafe {
-        command.pre_exec(move || restrict_landlock_child(ruleset_fd));
+        command.pre_exec(move || {
+            restrict_landlock_child(ruleset_fd)?;
+            #[cfg(not(test))]
+            {
+                // SAFETY: these syscalls only use scalar arguments.
+                if libc::setgid(super::PI_SANDBOX_GID) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setuid(super::PI_SANDBOX_UID) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
     }
     let started = Instant::now();
     let mut child = command
@@ -1042,7 +1048,7 @@ fn bounded_reader<R: Read + Send + 'static>(
 
 #[cfg(target_os = "linux")]
 fn monitor_disconnect(
-    mut stream: UnixStream,
+    mut stream: TcpStream,
     disconnected: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
@@ -1080,22 +1086,6 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
             difference | (left ^ right)
         })
         == 0
-}
-
-#[cfg(target_os = "linux")]
-fn remove_socket_if_present(path: &Path) -> anyhow::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            anyhow::ensure!(
-                !metadata.is_dir(),
-                "Skill execution socket path is a directory"
-            );
-            fs::remove_file(path)
-                .with_context(|| format!("remove Skill execution socket {}", path.display()))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).context("inspect Skill execution socket"),
-    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -1435,7 +1425,7 @@ printf '%s\n' "$!" > "$1"
             None,
         )
         .unwrap();
-        let mut stream = UnixStream::connect(broker.socket_path()).unwrap();
+        let mut stream = TcpStream::connect(("127.0.0.1", broker.port())).unwrap();
         let encoded = serde_json::to_vec(&request(Vec::new(), None)).unwrap();
         stream.write_all(&encoded).unwrap();
         stream.write_all(b"\n").unwrap();
@@ -1452,7 +1442,7 @@ printf '%s\n' "$!" > "$1"
     }
 
     #[test]
-    fn broker_socket_supports_long_session_paths() {
+    fn broker_binds_loopback_regardless_of_session_path_length() {
         let mut fixture = fixture("#!/bin/sh\nprintf should-not-run\n");
         let session_root = fixture
             .run_env
@@ -1465,7 +1455,7 @@ printf '%s\n' "$!" > "$1"
         fixture.run_env.workdir = long_alias.join("workspace");
         fixture.run_env.engine_state_root = long_alias.join("engine-state");
         let session_local_socket =
-            super::super::pi_temp_directory(&fixture.run_env).join(SKILL_EXEC_SOCKET_FILE);
+            super::super::pi_temp_directory(&fixture.run_env).join("skill-exec.sock");
         assert!(session_local_socket.to_string_lossy().len() >= 108);
 
         let broker = SkillExecBroker::start(
@@ -1476,7 +1466,9 @@ printf '%s\n' "$!" > "$1"
         )
         .unwrap();
 
-        assert!(broker.socket_path().to_string_lossy().len() < 108);
+        assert!(broker.port() > 0);
+        let stream = std::net::TcpStream::connect(("127.0.0.1", broker.port())).unwrap();
+        drop(stream);
     }
 
     fn write_catalog_name(fixture: &Fixture, name: &str) {
@@ -1499,7 +1491,7 @@ printf '%s\n' "$!" > "$1"
     }
 
     fn send_broker_request(broker: &SkillExecBroker, skill: &str) -> SkillExecResponse {
-        let mut stream = UnixStream::connect(broker.socket_path()).unwrap();
+        let mut stream = TcpStream::connect(("127.0.0.1", broker.port())).unwrap();
         let request = SkillExecRequest {
             token: broker.token().to_owned(),
             skill: skill.into(),

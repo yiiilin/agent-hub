@@ -205,6 +205,8 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+    cap_add:
+      - SYS_ADMIN
     volumes:
       - runtime-data:/var/lib/agent-hub-runtime
     depends_on:

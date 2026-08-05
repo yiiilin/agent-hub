@@ -33,6 +33,13 @@ mod skill_exec;
 use skill_exec::{SkillExecBroker, SKILL_EXEC_EXTENSION_SOURCE};
 
 const PI_SESSION_DIRECTORY: &str = "sessions";
+const PI_WORKSPACE_MOUNT: &str = "/workspace";
+const PI_AGENT_STATE_MOUNT: &str = "/agent-state";
+const PI_TMP_MOUNT: &str = "/tmp";
+#[cfg_attr(test, allow(dead_code))]
+const PI_SANDBOX_UID: u32 = 10001;
+#[cfg_attr(test, allow(dead_code))]
+const PI_SANDBOX_GID: u32 = 10001;
 const PI_AGENT_DIRECTORY: &str = ".pi/agent";
 const PI_HOME_DIRECTORY: &str = ".pi/home";
 const PI_TEMP_DIRECTORY: &str = ".pi/tmp";
@@ -410,7 +417,15 @@ enum LandlockPathKind {
 
 #[cfg(target_os = "linux")]
 struct PiFilesystemSandbox {
-    ruleset: fs::File,
+    rules: Vec<(CString, LandlockPathKind, u64)>,
+    #[cfg_attr(test, allow(dead_code))]
+    workspace: PathBuf,
+    #[cfg_attr(test, allow(dead_code))]
+    engine_state: PathBuf,
+    #[cfg_attr(test, allow(dead_code))]
+    pi_temp: PathBuf,
+    workspace_access: u64,
+    secret_readable: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -538,15 +553,134 @@ impl PiFilesystemSandbox {
             }
         }
 
-        let ruleset = create_landlock_ruleset()?;
-        for ((path, kind), access) in rules {
-            add_landlock_path_rule(&ruleset, &path, kind, access)?;
-        }
-        Ok(Self { ruleset })
+        let rules = rules
+            .into_iter()
+            .map(|((path, kind), access)| {
+                let path = CString::new(path.as_os_str().as_bytes())
+                    .context("Landlock path contains a NUL byte")?;
+                Ok((path, kind, access))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Self {
+            rules,
+            workspace: run_env.workdir.clone(),
+            engine_state: run_env.engine_state_root.clone(),
+            pi_temp: pi_temp.to_path_buf(),
+            workspace_access,
+            secret_readable,
+        })
     }
 
-    fn ruleset_fd(&self) -> RawFd {
-        self.ruleset.as_raw_fd()
+    /// Runs inside the fork between `Command::spawn` and `exec`, so it performs
+    /// only syscalls plus syscall-level helpers. Requires the parent process to
+    /// be root with CAP_SYS_ADMIN; on failure to unshare/mount (for example in
+    /// tests or unprivileged environments) it degrades to the real paths while
+    /// still applying Landlock and the sandbox UID/GID.
+    fn apply_inside_pre_exec(&self) -> std::io::Result<()> {
+        #[cfg(not(test))]
+        let mut mounted = false;
+        #[cfg(test)]
+        let mounted = false;
+        #[cfg(not(test))]
+        {
+            if unsafe { libc::unshare(libc::CLONE_NEWNS) } == 0 {
+                for target in [PI_WORKSPACE_MOUNT, PI_AGENT_STATE_MOUNT] {
+                    let target = CString::new(target).map_err(std::io::Error::other)?;
+                    // SAFETY: target is NUL-terminated; EEXIST is expected on reruns.
+                    unsafe {
+                        libc::mkdir(target.as_ptr(), 0o755);
+                    }
+                }
+                let bind = |source: &CString, destination: &CString| -> bool {
+                    // SAFETY: both pointers are NUL-terminated and stay live for the syscall.
+                    unsafe {
+                        libc::mount(
+                            source.as_ptr(),
+                            destination.as_ptr(),
+                            b"".as_ptr() as *const libc::c_char,
+                            libc::MS_BIND,
+                            std::ptr::null(),
+                        ) == 0
+                    }
+                };
+                let workspace = CString::new(self.workspace.as_os_str().as_bytes())
+                    .map_err(std::io::Error::other)?;
+                let engine_state = CString::new(self.engine_state.as_os_str().as_bytes())
+                    .map_err(std::io::Error::other)?;
+                let pi_temp = CString::new(self.pi_temp.as_os_str().as_bytes())
+                    .map_err(std::io::Error::other)?;
+                let workspace_dst =
+                    CString::new(PI_WORKSPACE_MOUNT).map_err(std::io::Error::other)?;
+                let engine_state_dst =
+                    CString::new(PI_AGENT_STATE_MOUNT).map_err(std::io::Error::other)?;
+                let tmp_dst = CString::new(PI_TMP_MOUNT).map_err(std::io::Error::other)?;
+                if bind(&workspace, &workspace_dst)
+                    && bind(&engine_state, &engine_state_dst)
+                    && bind(&pi_temp, &tmp_dst)
+                {
+                    mounted = true;
+                }
+            }
+        }
+
+        let ruleset_fd = create_landlock_ruleset_raw().map_err(std::io::Error::other)?;
+        let apply_rule =
+            |path: &CString, kind: LandlockPathKind, access: u64| -> std::io::Result<()> {
+                add_landlock_path_rule_raw(ruleset_fd, path, kind, access)
+            };
+        for (path, kind, access) in &self.rules {
+            apply_rule(path, *kind, *access)?;
+        }
+        if mounted {
+            let mut mount_rules = Vec::new();
+            mount_rules.push((
+                CString::new(PI_WORKSPACE_MOUNT).map_err(std::io::Error::other)?,
+                LandlockPathKind::Directory,
+                self.workspace_access,
+            ));
+            mount_rules.push((
+                CString::new(PI_AGENT_STATE_MOUNT).map_err(std::io::Error::other)?,
+                LandlockPathKind::Directory,
+                LANDLOCK_RUNTIME_WRITE,
+            ));
+            if self.secret_readable {
+                mount_rules.push((
+                    CString::new(format!("{PI_AGENT_STATE_MOUNT}/secrets"))
+                        .map_err(std::io::Error::other)?,
+                    LandlockPathKind::Directory,
+                    LANDLOCK_DIRECTORY_LIST | LANDLOCK_ACCESS_FS_READ_FILE,
+                ));
+            }
+            mount_rules.push((
+                CString::new(PI_TMP_MOUNT).map_err(std::io::Error::other)?,
+                LandlockPathKind::Directory,
+                LANDLOCK_RUNTIME_WRITE,
+            ));
+            for (path, kind, access) in mount_rules {
+                apply_rule(&path, kind, access)?;
+            }
+        }
+        // Installs the /proc/self/maps rule (after fork), no_new_privs, the
+        // Landlock restriction, and closes the ruleset descriptor.
+        restrict_landlock_child(ruleset_fd)?;
+        #[cfg(not(test))]
+        {
+            // SAFETY: these syscalls only use scalar arguments.
+            if unsafe { libc::setgid(PI_SANDBOX_GID) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if unsafe { libc::setuid(PI_SANDBOX_UID) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        if mounted {
+            let workspace = CString::new(PI_WORKSPACE_MOUNT).map_err(std::io::Error::other)?;
+            // SAFETY: pointer is NUL-terminated.
+            unsafe {
+                libc::chdir(workspace.as_ptr());
+            }
+        }
+        Ok(())
     }
 
     fn add_directory(
@@ -651,6 +785,75 @@ fn landlock_abi_version() -> std::io::Result<i64> {
     } else {
         Ok(version)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn create_landlock_ruleset_raw() -> std::io::Result<i32> {
+    let ruleset = LandlockRulesetAttr {
+        handled_access_fs: LANDLOCK_ALL_FILESYSTEM_ACCESS,
+    };
+    // SAFETY: `ruleset` is a valid C-compatible structure for the syscall.
+    let raw_fd = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            &ruleset as *const LandlockRulesetAttr,
+            std::mem::size_of::<LandlockRulesetAttr>(),
+            0_u32,
+        )
+    };
+    if raw_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let raw_fd = i32::try_from(raw_fd).map_err(std::io::Error::other)?;
+    // SAFETY: the descriptor is valid; FD_CLOEXEC keeps it out of exec'd images.
+    if unsafe { libc::fcntl(raw_fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(raw_fd);
+        }
+        return Err(error);
+    }
+    Ok(raw_fd)
+}
+
+#[cfg(target_os = "linux")]
+fn add_landlock_path_rule_raw(
+    ruleset_fd: i32,
+    path: &CString,
+    kind: LandlockPathKind,
+    access: u64,
+) -> std::io::Result<()> {
+    let mut flags = libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    if kind == LandlockPathKind::Directory {
+        flags |= libc::O_DIRECTORY;
+    }
+    // SAFETY: `path` is NUL-terminated and remains live for the syscall.
+    let raw_fd = unsafe { libc::open(path.as_ptr(), flags) };
+    if raw_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let rule = LandlockPathBeneathAttr {
+        allowed_access: access,
+        parent_fd: raw_fd,
+    };
+    // SAFETY: both descriptors are valid and `rule` has the kernel ABI layout.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_add_rule,
+            ruleset_fd,
+            LANDLOCK_RULE_PATH_BENEATH,
+            &rule as *const LandlockPathBeneathAttr,
+            0_u32,
+        )
+    };
+    // SAFETY: the descriptor was opened above and is no longer needed.
+    unsafe {
+        libc::close(raw_fd);
+    }
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -897,7 +1100,7 @@ impl PersistentPiRpcProcess {
         apply_pi_secret_environment(&mut command, run_env);
         if let Some(broker) = &skill_exec_broker {
             command
-                .env("AGENT_HUB_SKILL_EXEC_SOCKET", broker.socket_path())
+                .env("AGENT_HUB_SKILL_EXEC_PORT", broker.port().to_string())
                 .env("AGENT_HUB_SKILL_EXEC_TOKEN", broker.token());
         }
         if let Some(saved_session) = &saved_session {
@@ -915,18 +1118,16 @@ impl PersistentPiRpcProcess {
         }
         #[cfg(target_os = "linux")]
         {
-            let ruleset_fd = filesystem_sandbox.ruleset_fd();
-            // The closure runs between fork and exec, so it performs only raw
-            // syscalls against the ruleset prepared by the parent.
+            let sandbox = filesystem_sandbox;
+            // The closure runs between fork and exec and performs only syscalls
+            // plus syscall-level helpers prepared by the parent.
             unsafe {
-                command.pre_exec(move || restrict_landlock_child(ruleset_fd));
+                command.pre_exec(move || sandbox.apply_inside_pre_exec());
             }
         }
         let mut child = command
             .spawn()
             .with_context(|| format!("spawn Pi RPC process: {pi_bin}"))?;
-        #[cfg(target_os = "linux")]
-        drop(filesystem_sandbox);
         cancellation.register_child(&child);
         let stdout = child.stdout.take().context("open Pi RPC stdout")?;
         let mut stderr = child.stderr.take().context("open Pi RPC stderr")?;
@@ -1372,9 +1573,11 @@ impl Drop for PersistentPiRpcProcess {
 fn apply_pi_secret_environment(command: &mut Command, run_env: &RunEnv) {
     for secret in &run_env.secret_values {
         command.env(format!("AGENT_SECRET_{}", secret.name), &secret.value);
+        let path = format!("/agent-state/secrets/{}", secret.name);
+        command.env(format!("AGENT_SECRET_FILE_{}", secret.name), path);
     }
     for file in &run_env.secret_files {
-        let path = run_env.engine_state_root.join("secrets").join(&file.name);
+        let path = format!("/agent-state/secrets/{}", file.name);
         command.env(format!("AGENT_SECRET_FILE_{}", file.name), path);
     }
 }
@@ -2369,7 +2572,6 @@ mod tests {
             &tools,
         )
         .unwrap();
-        let ruleset_fd = sandbox.ruleset_fd();
         let mut command = Command::new("/bin/sh");
         command
             .arg("-ceu")
@@ -2390,11 +2592,9 @@ mod tests {
             .stderr(Stdio::piped());
         // The same pre-exec hook used by the persistent Pi process.
         unsafe {
-            command.pre_exec(move || restrict_landlock_child(ruleset_fd));
+            command.pre_exec(move || sandbox.apply_inside_pre_exec());
         }
-        let output = command.output().unwrap();
-        drop(sandbox);
-        output
+        command.output().unwrap()
     }
 
     #[test]
@@ -2573,26 +2773,24 @@ if [ "$$" -ne 1 ] && IFS= read -r _ < /proc/1/maps; then exit 31; fi
             Some("value-two")
         );
         assert_eq!(
+            envs.get("AGENT_SECRET_FILE_TOKEN")
+                .and_then(|value| value.as_deref()),
+            Some("/agent-state/secrets/TOKEN")
+        );
+        assert_eq!(
+            envs.get("AGENT_SECRET_FILE_API_KEY")
+                .and_then(|value| value.as_deref()),
+            Some("/agent-state/secrets/API_KEY")
+        );
+        assert_eq!(
             envs.get("AGENT_SECRET_FILE_CREDENTIALS")
                 .and_then(|value| value.as_deref()),
-            Some(
-                engine_state_root
-                    .join("secrets")
-                    .join("CREDENTIALS")
-                    .to_str()
-                    .unwrap()
-            )
+            Some("/agent-state/secrets/CREDENTIALS")
         );
         assert_eq!(
             envs.get("AGENT_SECRET_FILE_CERT")
                 .and_then(|value| value.as_deref()),
-            Some(
-                engine_state_root
-                    .join("secrets")
-                    .join("CERT")
-                    .to_str()
-                    .unwrap()
-            )
+            Some("/agent-state/secrets/CERT")
         );
     }
 

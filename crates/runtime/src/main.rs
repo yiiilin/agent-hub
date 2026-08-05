@@ -1976,7 +1976,7 @@ fn session_supervisor_metadata_for_claim(
         runtime_id,
         ownership_generation,
         lifecycle_status: "online".into(),
-        secret_fingerprint: run_secret_fingerprint(&claim),
+        secret_fingerprint: run_secret_fingerprint(claim),
         idle_deadline_unix_ms: None,
         checkpoint_reason: None,
         checkpoint_retry_unix_ms: None,
@@ -4321,7 +4321,7 @@ impl SessionSupervisorManager {
             runtime_id: self.runtime_id,
             ownership_generation,
             lifecycle_status: "online".into(),
-            secret_fingerprint: run_secret_fingerprint(&claim),
+            secret_fingerprint: run_secret_fingerprint(claim),
             idle_deadline_unix_ms: None,
             checkpoint_reason: None,
             checkpoint_retry_unix_ms: None,
@@ -6162,6 +6162,21 @@ async fn prepare_run_env_with_local_skills_and_management(
     }
     if let Some(client) = client {
         let ownership_generation = claim.run.session_ownership_generation.unwrap_or_default();
+        for secret in &claim.secret_values {
+            let destination = secret_dir.join(&secret.name);
+            let mut options = fs::OpenOptions::new();
+            options.create(true).truncate(true).write(true);
+            #[cfg(unix)]
+            {
+                options.mode(0o600);
+            }
+            let mut output = options
+                .open(&destination)
+                .await
+                .context("create Run secret value file")?;
+            output.write_all(secret.value.as_bytes()).await?;
+            output.sync_all().await?;
+        }
         for file in &claim.secret_files {
             let bytes = client
                 .download_run_secret_file(claim.run.id, ownership_generation, &file.name)
@@ -6680,14 +6695,14 @@ fn render_pi_secret_guidance(
     let mut lines = Vec::new();
     for secret in secret_values {
         lines.push(format!(
-            "- {}：环境变量 AGENT_SECRET_{}",
-            secret.name, secret.name
+            "- {}：值已注入环境变量 AGENT_SECRET_{}，文件位于 /agent-state/secrets/{}",
+            secret.name, secret.name, secret.name
         ));
     }
     for file in secret_files {
         lines.push(format!(
-            "- {}：文件路径由环境变量 AGENT_SECRET_FILE_{} 提供",
-            file.name, file.name
+            "- {}：文件路径由环境变量 AGENT_SECRET_FILE_{} 提供（/agent-state/secrets/{}）",
+            file.name, file.name, file.name
         ));
     }
     if lines.is_empty() {
@@ -6712,6 +6727,7 @@ fn read_existing_pi_secret_guidance(agent_dir: &Path) -> Option<String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn synchronize_pi_execution_configuration(
     paths: &SessionPaths,
     configuration: &AgentExecutionConfigurationDto,
