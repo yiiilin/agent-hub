@@ -16,3 +16,7 @@ condition = "AND"
 regexTarget = "match"
 regexes = ['''^[A-Za-z_$][A-Za-z0-9_$]*\.anchor\.key,[A-Za-z_$][A-Za-z0-9_$]*=[A-Za-z_$][A-Za-z0-9_$]*\.focus\.key;$''']
 paths = ['''(^|/)app/frontend/dist/assets/index-[A-Za-z0-9_-]+\.js$''']
+
+  [[rules.allowlists]]
+description = "Debian Perl core header contains a generic API-key-like literal"
+paths = ['''.*/usr/lib/.*/perl/.*/CORE/cop\.h$''']
