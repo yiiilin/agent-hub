@@ -15567,7 +15567,7 @@ async fn accept_session_message_tx(
 
     let session = sqlx::query(
         "SELECT lifecycle_status, active_turn_id, configuration_fingerprint,
-                ownership_generation
+                ownership_generation, recovery_error
          FROM hub_sessions
          WHERE id = $1 AND owner_id = $2 AND agent_id = $3
          FOR UPDATE",
@@ -15581,6 +15581,12 @@ async fn accept_session_message_tx(
     let lifecycle_status: String = session.get("lifecycle_status");
     if lifecycle_status == "recovery_failed" || lifecycle_status == "historical" {
         return Err(ApiError::conflict("session is read-only"));
+    }
+    if session.get::<Option<String>, _>("recovery_error").is_some() {
+        sqlx::query("UPDATE hub_sessions SET recovery_error = NULL WHERE id = $1")
+            .bind(request.session_id)
+            .execute(&mut **tx)
+            .await?;
     }
 
     if let Some(client_message_key) = client_message_key.as_deref() {

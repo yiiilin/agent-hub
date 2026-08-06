@@ -1180,6 +1180,9 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
       setMessages((current) => current.some((message) => message.id === accepted.message.id)
         ? current
         : [...current, accepted.message]);
+      setSessions((current) => current.map((session) => session.id === selectedSession!.id
+        ? { ...session, recovery_error: null }
+        : session));
       setDraft('');
       followBottomRef.current = true;
     } catch (caught) {
