@@ -215,6 +215,7 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
   const submitFromHostRef = useRef<(content: string) => Promise<void>>(async () => undefined);
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const chatScrollRef = useRef<HTMLDivElement>(null);
+  const transcriptRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const followBottomRef = useRef(true);
   const historyPagingReadyRef = useRef(false);
@@ -636,8 +637,14 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
     if (!scroll) return;
     const scrollingUp = scroll.scrollTop < lastScrollTopRef.current - 1;
     lastScrollTopRef.current = scroll.scrollTop;
-    followBottomRef.current = scroll.scrollHeight - scroll.clientHeight - scroll.scrollTop <= bottomThreshold;
-    if (scrollingUp && scroll.scrollTop <= historyThreshold) requestOlderMessages();
+    // Only an actual upward user scroll disables bottom-following; programmatic
+    // scrolls caused by streaming content growth must not flip it off.
+    if (scrollingUp) {
+      followBottomRef.current = false;
+      if (scroll.scrollTop <= historyThreshold) requestOlderMessages();
+    } else if (scroll.scrollHeight - scroll.clientHeight - scroll.scrollTop <= bottomThreshold) {
+      followBottomRef.current = true;
+    }
   }, [requestOlderMessages]);
 
   const handleWheel = useCallback((event: WheelEvent<HTMLDivElement>) => {
@@ -807,6 +814,18 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
   }, [showThinking, timeline, transcriptLoading]);
 
   useEffect(() => {
+    const transcript = transcriptRef.current;
+    if (!transcript) return;
+    const observer = new ResizeObserver(() => {
+      const scroll = chatScrollRef.current;
+      if (!scroll || historyAnchorRef.current || !followBottomRef.current) return;
+      scroll.scrollTop = scroll.scrollHeight;
+    });
+    observer.observe(transcript);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
     if (!hostOrigin) return;
     const reportSize = () => postWidgetMessage('agent-hub:resize', {
       width: Math.ceil(document.documentElement.getBoundingClientRect().width),
@@ -864,7 +883,7 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
         </div>
       </div>}
       {error && <div className="session-banner error" role="alert">{error}</div>}
-      <div className="session-transcript widget-transcript" aria-live="polite" aria-busy={transcriptLoading || olderMessagesLoading}>
+      <div className="session-transcript widget-transcript" ref={transcriptRef} aria-live="polite" aria-busy={transcriptLoading || olderMessagesLoading}>
         {transcriptLoading && timeline.length === 0 && <div className="widget-transcript-state">{t('loadingMessages')}</div>}
         {timeline.map((entry, index) => {
           if (entry.kind === 'activity-group') {
