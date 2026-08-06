@@ -1,6 +1,7 @@
 import {
   BlockTypeSelect,
   BoldItalicUnderlineToggles,
+  CodeMirrorEditor,
   CreateLink,
   DiffSourceToggleWrapper,
   InsertThematicBreak,
@@ -8,6 +9,8 @@ import {
   MDXEditor,
   type MDXEditorMethods,
   UndoRedo,
+  codeBlockPlugin,
+  codeMirrorPlugin,
   diffSourcePlugin,
   headingsPlugin,
   linkPlugin,
@@ -63,6 +66,16 @@ export function MarkdownEditor({
     thematicBreakPlugin(),
     linkPlugin(),
     markdownShortcutPlugin(),
+    codeMirrorPlugin(),
+    codeBlockPlugin({
+      codeBlockEditorDescriptors: [
+        {
+          priority: 0,
+          match: () => true,
+          Editor: CodeMirrorEditor
+        }
+      ]
+    }),
     diffSourcePlugin({ viewMode: 'rich-text' }),
     toolbarPlugin({ toolbarContents: MarkdownToolbar })
   ], []);
