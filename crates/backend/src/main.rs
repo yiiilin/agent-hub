@@ -52,10 +52,13 @@ use serde_json::{json, Number, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Row, Transaction};
 use tokio::io::AsyncWriteExt;
+use tower::ServiceBuilder;
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     services::{ServeDir, ServeFile},
+    set_header::SetResponseHeaderLayer,
     trace::TraceLayer,
+    ServiceExt,
 };
 use tracing::{info, warn};
 use url::Url;
@@ -774,14 +777,27 @@ fn with_frontend<S>(router: Router<S>, frontend_dist_dir: PathBuf) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
+    let spa = ServiceBuilder::new()
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache"),
+        ))
+        .service(
+            ServeDir::new(&frontend_dist_dir)
+                .fallback(ServeFile::new(frontend_dist_dir.join("index.html"))),
+        );
     router
         .route("/api", any(api_not_found))
         .route("/api/", any(api_not_found))
         .route("/api/{*path}", any(api_not_found))
-        .fallback_service(
-            ServeDir::new(&frontend_dist_dir)
-                .fallback(ServeFile::new(frontend_dist_dir.join("index.html"))),
+        .nest_service(
+            "/assets",
+            ServeDir::new(frontend_dist_dir.join("assets")).append_response_header(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=31536000, immutable"),
+            ),
         )
+        .fallback_service(spa)
 }
 
 #[derive(Debug, Deserialize)]
@@ -802,6 +818,7 @@ async fn widget_page(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     if let Some(client_id) = query.app {
         let app = load_public_widget_app_by_client_id(&state.pool, &client_id).await?;
         let frame_ancestors = if app.allowed_origins.is_empty() {

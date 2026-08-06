@@ -973,7 +973,7 @@ textarea {
 .session-chat-title > div > span { color: var(--text-tertiary); font-size: 11px; }
 .session-chat-header > .status { flex: 0 0 auto; border-color: var(--border-subtle); background: var(--surface-secondary); color: var(--text-secondary); font-size: 10px; }
 .session-discard-draft { flex: 0 0 auto; color: #9f332d; }
-.session-chat-scroll { min-height: 0; overflow-y: auto; scroll-behavior: smooth; }
+.session-chat-scroll { min-height: 0; overflow-y: auto; }
 .session-transcript { min-height: 100%; display: flex; flex-direction: column; gap: 28px; padding: 34px max(24px, calc((100% - 768px) / 2)) 32px; background: var(--surface-primary); }
 .session-transcript > .operation-state { margin: auto; }
 .session-bubble { width: min(100%, 768px); min-width: 0; align-self: center; display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 13px; color: var(--text-primary); }

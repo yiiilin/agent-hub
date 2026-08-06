@@ -1110,6 +1110,8 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
     // Watch the inner transcript, whose height changes as messages and events
     // render. While bottom-following, every growth re-pins before paint so the
     // view never shows the top of freshly loaded history first.
+    // The transcript is conditionally rendered, so the observer must be
+    // re-attached whenever a Session (or the draft composer) appears.
     const observer = new ResizeObserver(() => {
       const scroll = chatScrollRef.current;
       if (!scroll || historyAnchorRef.current || !followBottomRef.current) return;
@@ -1117,7 +1119,7 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
     });
     observer.observe(transcript);
     return () => observer.disconnect();
-  }, []);
+  }, [selectedId, conversationDraft]);
 
   function lifecycleLabel(status: string) {
     return t(lifecycleKeys[status] ?? 'sessionStatusUnknown');
