@@ -29,6 +29,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::future::Future;
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt},
@@ -74,6 +75,7 @@ struct Config {
     session_idle_timeout: Duration,
     max_online_sessions: usize,
     workdir_ttl: Duration,
+    hub_upload_retry_delays_secs: Vec<u64>,
     local_skills_dir: Option<PathBuf>,
     maintenance_token_file: Option<PathBuf>,
     sandbox_mode: String,
@@ -118,6 +120,7 @@ impl RuntimeRunFailure {
             }),
         };
         AppendRunEventRequest {
+            event_id: Uuid::new_v4(),
             event_type: "status".into(),
             role: None,
             content: Some("failed".into()),
@@ -133,6 +136,41 @@ struct HubClient {
     hub_url: String,
     runtime_token: Arc<std::sync::RwLock<String>>,
     protocol_capabilities: HashSet<String>,
+    upload_retry_delays_secs: Vec<u64>,
+}
+
+async fn retry_hub_upload<T, F, Fut>(delays_secs: &[u64], mut operation: F) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    let mut last_error: Option<anyhow::Error> = None;
+    for (index, delay_secs) in delays_secs.iter().enumerate() {
+        if index > 0 && *delay_secs > 0 {
+            tokio::time::sleep(Duration::from_secs(*delay_secs)).await;
+        }
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if hub_upload_error_is_terminal(&error) {
+                    return Err(error);
+                }
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Hub upload retries exhausted")))
+}
+
+fn hub_upload_error_is_terminal(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<reqwest::Error>()
+        .and_then(|error| error.status())
+        .is_some_and(|status| {
+            status.is_client_error()
+                && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+                && status != reqwest::StatusCode::REQUEST_TIMEOUT
+        })
 }
 
 #[derive(Clone, Copy)]
@@ -565,6 +603,7 @@ impl Config {
             session_idle_timeout,
             max_online_sessions,
             workdir_ttl: Duration::from_secs(workdir_ttl_secs),
+            hub_upload_retry_delays_secs: vec![0, 1, 3, 7, 10],
             local_skills_dir: env::var("RUNTIME_LOCAL_SKILLS_DIR").ok().map(PathBuf::from),
             maintenance_token_file: env::var("RUNTIME_MAINTENANCE_TOKEN_FILE")
                 .ok()
@@ -769,6 +808,7 @@ fn hub_client_from_stored(
         hub_url: config.hub_url.clone(),
         runtime_token: Arc::new(std::sync::RwLock::new(stored.runtime_credential.clone())),
         protocol_capabilities: stored.protocol_capabilities.iter().cloned().collect(),
+        upload_retry_delays_secs: config.hub_upload_retry_delays_secs.clone(),
     }
 }
 
@@ -1142,28 +1182,28 @@ async fn run_claim_worker(
             Err(error) => Err(error),
         }
     };
-    let bundle_recovery_failed = result.as_ref().err().is_some_and(|error| {
-        error
-            .downcast_ref::<SessionBundleRestoreFailure>()
-            .is_some()
-    });
     if let Err(error) = result {
         let failure = RuntimeRunFailure::from_error(&error);
-        if let Some(session_id) = session_id {
-            manager.cancel_session(session_id, error.to_string());
-        }
         warn!(run_id = %run_id, error = %error, "run execution failed");
-        if let Some(ownership_generation) = ownership_generation {
-            match client.fail_run(run_id, ownership_generation, failure).await {
-                Ok(()) if bundle_recovery_failed => {
-                    if let Some(session_id) = session_id {
-                        manager.forget_fenced_session(session_id);
-                    }
-                }
-                Ok(()) => {}
-                Err(mark_error) => {
+        if let (Some(session_id), Some(ownership_generation)) = (session_id, ownership_generation) {
+            // The managed supervisor can no longer serve this Session. Drop it
+            // locally first so heartbeats stop reporting it, then tell the Hub
+            // to release ownership. If the release call itself fails, the Hub
+            // keeps the request in its release outbox (and heartbeats reconcile
+            // as a fallback), so the Session cannot stay stuck forever.
+            manager.forget_fenced_session(session_id);
+            let _ = client
+                .fail_run(run_id, ownership_generation, failure)
+                .await
+                .inspect_err(|mark_error| {
                     warn!(run_id = %run_id, error = %mark_error, "failed to mark run failed");
-                }
+                });
+            if let Err(release_error) = client
+                .release_session(session_id, ownership_generation, true)
+                .await
+            {
+                warn!(session_id = %session_id, error = %release_error,
+                    "failed to release Session ownership after run failure");
             }
         }
     }
@@ -1493,19 +1533,26 @@ impl HubClient {
         &self,
         run_id: Uuid,
         ownership_generation: i64,
-        req: AppendRunEventRequest,
+        mut req: AppendRunEventRequest,
     ) -> anyhow::Result<()> {
-        self.http
-            .post(format!("{}/api/runtime/runs/{run_id}/events", self.hub_url))
-            .bearer_auth(self.runtime_credential())
-            .json(&RuntimeSessionWriteRequest {
-                ownership_generation,
-                payload: req,
-            })
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(())
+        req.event_id = Uuid::new_v4();
+        retry_hub_upload(&self.upload_retry_delays_secs, || {
+            let req = req.clone();
+            async move {
+                self.http
+                    .post(format!("{}/api/runtime/runs/{run_id}/events", self.hub_url))
+                    .bearer_auth(self.runtime_credential())
+                    .json(&RuntimeSessionWriteRequest {
+                        ownership_generation,
+                        payload: req,
+                    })
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                Ok(())
+            }
+        })
+        .await
     }
 
     async fn begin_turn(
@@ -1757,20 +1804,26 @@ impl HubClient {
         ownership_generation: i64,
         req: CompleteRunRequest,
     ) -> anyhow::Result<()> {
-        self.http
-            .post(format!(
-                "{}/api/runtime/runs/{run_id}/complete",
-                self.hub_url
-            ))
-            .bearer_auth(self.runtime_credential())
-            .json(&RuntimeSessionWriteRequest {
-                ownership_generation,
-                payload: req,
-            })
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(())
+        retry_hub_upload(&self.upload_retry_delays_secs, || {
+            let req = req.clone();
+            async move {
+                self.http
+                    .post(format!(
+                        "{}/api/runtime/runs/{run_id}/complete",
+                        self.hub_url
+                    ))
+                    .bearer_auth(self.runtime_credential())
+                    .json(&RuntimeSessionWriteRequest {
+                        ownership_generation,
+                        payload: req,
+                    })
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                Ok(())
+            }
+        })
+        .await
     }
 
     async fn fail_run(
@@ -1791,6 +1844,31 @@ impl HubClient {
                 work_dir_ref: None,
             },
         )
+        .await
+    }
+
+    async fn release_session(
+        &self,
+        session_id: Uuid,
+        ownership_generation: i64,
+        force: bool,
+    ) -> anyhow::Result<()> {
+        retry_hub_upload(&self.upload_retry_delays_secs, || async move {
+            self.http
+                .post(format!(
+                    "{}/api/runtime/sessions/{session_id}/release",
+                    self.hub_url
+                ))
+                .bearer_auth(self.runtime_credential())
+                .json(&ReleaseRuntimeSessionRequest {
+                    ownership_generation,
+                    force,
+                })
+                .send()
+                .await?
+                .error_for_status()?;
+            Ok(())
+        })
         .await
     }
 }
@@ -2665,6 +2743,7 @@ async fn local_model_proxy_request(
     };
     if let Some(event_tx) = active_run.event_tx.clone() {
         let _ = event_tx.try_send(AppendRunEventRequest {
+            event_id: Uuid::new_v4(),
             event_type: "model_request".into(),
             role: None,
             content: None,
@@ -7975,6 +8054,7 @@ fn fake_engine_events(claim: &ClaimRunResponse) -> (Vec<AppendRunEventRequest>, 
         return (
             vec![
                 AppendRunEventRequest {
+                    event_id: Uuid::new_v4(),
                     event_type: "status".into(),
                     role: None,
                     content: Some("initialized fake Execution Engine".into()),
@@ -7982,6 +8062,7 @@ fn fake_engine_events(claim: &ClaimRunResponse) -> (Vec<AppendRunEventRequest>, 
                     waiting_tool: None,
                 },
                 AppendRunEventRequest {
+                    event_id: Uuid::new_v4(),
                     event_type: "tool_request".into(),
                     role: Some("assistant".into()),
                     content: Some(format!("Fake Execution Engine requested {tool_name} tool")),
@@ -8030,6 +8111,7 @@ fn fake_engine_events(claim: &ClaimRunResponse) -> (Vec<AppendRunEventRequest>, 
     (
         vec![
             AppendRunEventRequest {
+                event_id: Uuid::new_v4(),
                 event_type: "status".into(),
                 role: None,
                 content: Some("initialized fake Execution Engine".into()),
@@ -8037,6 +8119,7 @@ fn fake_engine_events(claim: &ClaimRunResponse) -> (Vec<AppendRunEventRequest>, 
                 waiting_tool: None,
             },
             AppendRunEventRequest {
+                event_id: Uuid::new_v4(),
                 event_type: "status".into(),
                 role: None,
                 content: Some("thread started".into()),
@@ -8044,6 +8127,7 @@ fn fake_engine_events(claim: &ClaimRunResponse) -> (Vec<AppendRunEventRequest>, 
                 waiting_tool: None,
             },
             AppendRunEventRequest {
+                event_id: Uuid::new_v4(),
                 event_type: "message".into(),
                 role: Some("assistant".into()),
                 content: Some(assistant_content),
@@ -8051,6 +8135,7 @@ fn fake_engine_events(claim: &ClaimRunResponse) -> (Vec<AppendRunEventRequest>, 
                 waiting_tool: None,
             },
             AppendRunEventRequest {
+                event_id: Uuid::new_v4(),
                 event_type: "usage".into(),
                 role: None,
                 content: None,
@@ -8287,6 +8372,7 @@ mod tests {
             hub_url: format!("http://{hub_addr}"),
             runtime_token: Arc::new(std::sync::RwLock::new("runtime-secret".into())),
             protocol_capabilities: HashSet::new(),
+            upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
         };
         let route = SkillPackageDownloadRoute::Run { run_id };
 
@@ -8520,6 +8606,7 @@ mod tests {
             hub_url: format!("http://{hub_addr}"),
             runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
             protocol_capabilities: HashSet::new(),
+            upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
         };
         let execution_configuration = test_claim().execution_configuration;
         let revision = execution_configuration.revision;
@@ -8574,6 +8661,7 @@ mod tests {
             hub_url: "http://127.0.0.1:1".into(),
             runtime_token: Arc::new(std::sync::RwLock::new("test-runtime-token".into())),
             protocol_capabilities: HashSet::new(),
+            upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
         };
         let run_dir = config.work_root.join(claim.run.id.to_string());
 
@@ -8647,6 +8735,7 @@ mod tests {
 
     fn test_tool_request_event() -> AppendRunEventRequest {
         AppendRunEventRequest {
+            event_id: Uuid::new_v4(),
             event_type: "tool_request".into(),
             role: Some("assistant".into()),
             content: Some("tool requested".into()),
@@ -8719,7 +8808,11 @@ mod tests {
     #[tokio::test]
     async fn complete_failure_after_finalize_does_not_fall_back_to_partial_publication() {
         let temp = tempfile::tempdir().unwrap();
-        let (client, requests, server) = recording_hub_client_with_failure(3, Some("/complete"));
+        // complete_run now retries uploads (0/1/3/7/10s, zeroed in tests), so
+        // make the Hub endpoint fail on every complete attempt and verify the
+        // retries exhaust without ever falling back to a partial publication:
+        // 1 event + 1 finalize + 5 complete attempts = 7 connections.
+        let (client, requests, server) = recording_hub_client_with_failure(7, Some("/complete"));
         let mut config = test_config();
         config.engine_driver = "fake".into();
         config.work_root = temp.path().to_path_buf();
@@ -8793,6 +8886,7 @@ mod tests {
             hub_url: format!("http://{addr}"),
             runtime_token: Arc::new(std::sync::RwLock::new("test-runtime-token".into())),
             protocol_capabilities: HashSet::from([ATOMIC_WAITING_TOOL_BATCH_CAPABILITY.into()]),
+            upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
         };
         let batch = FinalizeToolRequestsRequest {
             integration_session_id: Some(Uuid::new_v4()),
@@ -9100,6 +9194,7 @@ mod tests {
             hub_url: format!("http://{hub_addr}"),
             runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
             protocol_capabilities: HashSet::new(),
+            upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
         };
 
         let first_env = prepare_run_env_with_local_skills(
@@ -9695,6 +9790,7 @@ mod tests {
                 agent_id: claim.agent.id,
                 agent_name: claim.agent.name.clone(),
                 agent_deleted_at: None,
+                title: None,
                 origin_platform_name: None,
                 origin: HubSessionOriginDto::HubNative,
                 lifecycle_status: "online".into(),
@@ -9824,6 +9920,7 @@ mod tests {
                 hub_url: format!("http://{hub_addr}"),
                 runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
                 protocol_capabilities: HashSet::new(),
+                upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
             },
             work_root: temp.path().to_path_buf(),
             producing_engine_version: "0.104.0".into(),
@@ -9964,6 +10061,7 @@ mod tests {
             hub_url: format!("http://{hub_addr}"),
             runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
             protocol_capabilities: HashSet::new(),
+            upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
         };
         let mut config = test_config();
         config.work_root = temp.path().join("runtime");
@@ -9982,6 +10080,7 @@ mod tests {
                 agent_id: claim.agent.id,
                 agent_name: claim.agent.name.clone(),
                 agent_deleted_at: None,
+                title: None,
                 origin_platform_name: None,
                 origin: HubSessionOriginDto::HubNative,
                 lifecycle_status: "restoring".into(),
@@ -10107,6 +10206,7 @@ mod tests {
             hub_url: format!("http://{hub_addr}"),
             runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
             protocol_capabilities: HashSet::new(),
+            upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
         };
         let mut config = test_config();
         config.work_root = temp.path().join("runtime");
@@ -10126,6 +10226,7 @@ mod tests {
                 agent_id: claim.agent.id,
                 agent_name: claim.agent.name.clone(),
                 agent_deleted_at: None,
+                title: None,
                 origin_platform_name: None,
                 origin: HubSessionOriginDto::HubNative,
                 lifecycle_status: "restoring".into(),
@@ -10491,6 +10592,7 @@ mod tests {
             hub_url: "http://127.0.0.1:1".into(),
             runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
             protocol_capabilities: HashSet::new(),
+            upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
         };
         let dispatcher = Arc::new(RuntimeSessionCommandDispatcher::default());
 
@@ -11446,6 +11548,7 @@ mod tests {
             hub_url: format!("http://{hub_addr}"),
             runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
             protocol_capabilities: HashSet::new(),
+            upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
         };
         let transport = HubRuntimeCheckpointTransport {
             client,
@@ -11697,6 +11800,7 @@ mod tests {
             hub_url: format!("http://{hub_addr}"),
             runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
             protocol_capabilities: HashSet::new(),
+            upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
         };
 
         assert_eq!(fail_interrupted_restoring_runs(&manager, &client).await, 1);
@@ -11767,6 +11871,7 @@ mod tests {
             hub_url: format!("http://{hub_addr}"),
             runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
             protocol_capabilities: HashSet::new(),
+            upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
         };
 
         assert_eq!(fail_interrupted_restoring_runs(&manager, &client).await, 0);
@@ -13406,6 +13511,7 @@ mod tests {
             hub_url: format!("http://{hub_addr}"),
             runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
             protocol_capabilities: HashSet::new(),
+            upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
         };
         let run_id = Uuid::new_v4();
         let binding_id = Uuid::new_v4();
@@ -13498,6 +13604,7 @@ mod tests {
             hub_url: format!("http://{hub_addr}"),
             runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
             protocol_capabilities: HashSet::new(),
+            upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
         };
         let run_id = Uuid::new_v4();
         let binding_id = Uuid::new_v4();
@@ -13588,6 +13695,7 @@ Transfer-Encoding: chunked\r\n\
             hub_url: format!("http://{upstream_addr}"),
             runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
             protocol_capabilities: HashSet::new(),
+            upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
         };
         let run_id = Uuid::new_v4();
         let binding_id = Uuid::new_v4();
@@ -13662,6 +13770,7 @@ Transfer-Encoding: chunked\r\n\
             hub_url: format!("http://{upstream_addr}"),
             runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
             protocol_capabilities: HashSet::new(),
+            upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
         };
         let run_id = Uuid::new_v4();
         let binding_id = Uuid::new_v4();
@@ -13739,6 +13848,7 @@ Transfer-Encoding: chunked\r\n\
             hub_url: format!("http://{upstream_addr}"),
             runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
             protocol_capabilities: HashSet::new(),
+            upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
         };
         let first_run_id = Uuid::new_v4();
         let second_run_id = Uuid::new_v4();
@@ -14069,6 +14179,7 @@ Transfer-Encoding: chunked\r\n\
             hub_url: format!("http://{addr}"),
             runtime_token: Arc::new(std::sync::RwLock::new("old-runtime-credential".into())),
             protocol_capabilities: HashSet::new(),
+            upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
         };
         let worker = client.clone();
         let run_id = Uuid::new_v4();
@@ -14078,6 +14189,7 @@ Transfer-Encoding: chunked\r\n\
                 run_id,
                 1,
                 AppendRunEventRequest {
+                    event_id: Uuid::new_v4(),
                     event_type: "status".into(),
                     role: None,
                     content: Some("running".into()),
@@ -14312,6 +14424,7 @@ Transfer-Encoding: chunked\r\n\
             hub_url: config.hub_url.clone(),
             runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
             protocol_capabilities: HashSet::new(),
+            upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
         };
         let mut first = test_claim();
         first.model_proxy_token = "first-run-token".into();
@@ -14466,6 +14579,7 @@ Transfer-Encoding: chunked\r\n\
             hub_url: "http://127.0.0.1:1".into(),
             runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
             protocol_capabilities: HashSet::new(),
+            upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
         };
         let claim = test_claim();
         let session_id = claim.run.hub_session_id.unwrap();
@@ -14604,6 +14718,7 @@ done
             hub_url: config.hub_url.clone(),
             runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
             protocol_capabilities: HashSet::new(),
+            upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
         };
         let claim = test_claim();
         let session_id = claim.run.hub_session_id.unwrap();
@@ -14663,6 +14778,7 @@ done
             hub_url: "http://127.0.0.1:1".into(),
             runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
             protocol_capabilities: HashSet::new(),
+            upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
         };
         let claim = test_claim();
         let session_id = claim.run.hub_session_id.unwrap();
@@ -14782,6 +14898,7 @@ done
             hub_url: config.hub_url.clone(),
             runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
             protocol_capabilities: HashSet::new(),
+            upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
         };
         let first = test_claim();
         let first_session_id = first.run.hub_session_id.unwrap();
@@ -15232,6 +15349,7 @@ done
                 hub_url: format!("http://{addr}"),
                 runtime_token: Arc::new(std::sync::RwLock::new("test-runtime-token".into())),
                 protocol_capabilities: HashSet::from([ATOMIC_WAITING_TOOL_BATCH_CAPABILITY.into()]),
+                upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
             },
             requests,
             thread,
@@ -15493,6 +15611,7 @@ done
             session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
             max_online_sessions: DEFAULT_MAX_ONLINE_SESSIONS,
             workdir_ttl: Duration::from_secs(3600),
+            hub_upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
             local_skills_dir: None,
             maintenance_token_file: None,
             sandbox_mode: "workspace-write+network".into(),

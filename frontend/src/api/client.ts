@@ -341,9 +341,10 @@ export type HubSession = {
   id: string;
   owner_id: string;
   agent_id: string;
-  agent_name: string;
-  agent_deleted_at: string | null;
-  origin_platform_name: string | null;
+ agent_name: string;
+ agent_deleted_at: string | null;
+  title: string | null;
+ origin_platform_name: string | null;
   origin: HubSessionOrigin;
   lifecycle_status: string;
   native_session_id: string | null;
@@ -1286,9 +1287,17 @@ export const api = {
     }),
   runs: (agentId: string, signal?: AbortSignal) => request<Run[]>(`/api/agents/${agentId}/runs`, { signal }),
   sessions: (signal?: AbortSignal) => request<HubSession[]>('/api/sessions', { signal }),
-  session: (sessionId: string, signal?: AbortSignal) =>
-    request<HubSession>(`/api/sessions/${sessionId}`, { signal }),
-  sessionMessages: (sessionId: string, signal?: AbortSignal) =>
+ session: (sessionId: string, signal?: AbortSignal) =>
+   request<HubSession>(`/api/sessions/${sessionId}`, { signal }),
+  deleteSession: (sessionId: string, signal?: AbortSignal) =>
+    request<void>(`/api/sessions/${sessionId}`, { method: 'DELETE', signal }),
+  renameSession: (sessionId: string, title: string, signal?: AbortSignal) =>
+    request<HubSession>(`/api/sessions/${sessionId}/title`, {
+      method: 'PUT',
+      body: JSON.stringify({ title }),
+      signal
+    }),
+ sessionMessages: (sessionId: string, signal?: AbortSignal) =>
     request<HubSessionMessage[]>(`/api/sessions/${sessionId}/messages`, { signal }),
   sessionMessagePage: (sessionId: string, query: SessionMessagePageQuery, signal?: AbortSignal) =>
     request<HubSessionMessage[]>(sessionMessagePagePath(`/api/sessions/${sessionId}/messages`, query), { signal }),

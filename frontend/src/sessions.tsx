@@ -668,6 +668,10 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
   const [actionError, setActionError] = useState(false);
   const [conversationCreateError, setConversationCreateError] = useState(false);
   const [sessionListOpen, setSessionListOpen] = useState(false);
+  const [sessionContextMenu, setSessionContextMenu] = useState<{ sessionId: string; x: number; y: number } | null>(null);
+  const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
+  const [renamingSessionId, setRenamingSessionId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState('');
   const [secretGrantRequest, setSecretGrantRequest] = useState<{ agentId: string; requirements: SecretGrantRequirement[] } | null>(null);
   const [granting, setGranting] = useState(false);
 
@@ -1263,6 +1267,46 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
     setDraft('');
   }
 
+  async function deleteSelectedSession(sessionId: string) {
+    if (!window.confirm(t('deleteSessionConfirm'))) return;
+    setDeletingSessionId(sessionId);
+    setSessionContextMenu(null);
+    setActionError(false);
+    try {
+      await api.deleteSession(sessionId);
+      if (!mountedRef.current) return;
+      await loadSessions();
+    } catch {
+      if (mountedRef.current) setActionError(true);
+    } finally {
+      if (mountedRef.current) setDeletingSessionId(null);
+    }
+  }
+
+  async function submitSessionRename() {
+    const target = renamingSessionId;
+    const title = renameDraft.trim();
+    if (!target || !title || title.length > 40 || deletingSessionId) return;
+    setActionError(false);
+    try {
+      const updated = await api.renameSession(target, title);
+      if (!mountedRef.current) return;
+      setSessions((current) => current.map((session) => (session.id === updated.id ? updated : session)));
+      setRenamingSessionId(null);
+      setRenameDraft('');
+    } catch {
+      if (mountedRef.current) setActionError(true);
+    }
+  }
+
+  function openSessionRename(sessionId: string) {
+    const session = sessions.find((candidate) => candidate.id === sessionId);
+    if (!session) return;
+    setSessionContextMenu(null);
+    setRenamingSessionId(sessionId);
+    setRenameDraft(session.title ?? session.agent_name);
+  }
+
   return <section className="session-workspace session-chat-workspace" aria-labelledby="session-page-title">
     <h1 className="sr-only" id="session-page-title">{t('sessions')}</h1>
     {loadError && <div className="operation-alert" role="alert"><span>{t('sessionsLoadFailed')}</span><button type="button" onClick={() => void loadSessions()}>{t('retry')}</button></div>}
@@ -1281,7 +1325,10 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
           {loading && <div className="operation-state" role="status">{t('loadingSessions')}</div>}
           {!loading && sessions.length === 0 && !loadError && <div className="operation-state">{t('noSessions')}</div>}
           {!loading && sessions.length > 0 && filteredSessions.length === 0 && <div className="operation-state">{t('noSessionMatches')}</div>}
-          {filteredSessions.map((session) => <button className={`session-row${session.id === selectedId ? ' selected' : ''}`} type="button" key={session.id} aria-pressed={session.id === selectedId} onClick={() => {
+          {filteredSessions.map((session) => <button className={`session-row${session.id === selectedId ? ' selected' : ''}`} type="button" key={session.id} aria-pressed={session.id === selectedId} onContextMenu={(event) => {
+            event.preventDefault();
+            setSessionContextMenu({ sessionId: session.id, x: event.clientX, y: event.clientY });
+          }} onClick={() => {
             conversationDraftGeneration.current += 1;
             setConversationDraft(null);
             setConversationCreateError(false);
@@ -1289,7 +1336,7 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
             setSelectedId(session.id);
             setSessionListOpen(false);
           }}>
-            <span className="session-row-heading"><strong>{session.agent_name}</strong><span className={`session-row-status ${session.lifecycle_status}`} aria-label={lifecycleLabel(session.lifecycle_status)} title={lifecycleLabel(session.lifecycle_status)} /></span>
+            <span className="session-row-heading"><strong>{session.title || session.agent_name}</strong><span className={`session-row-status ${session.lifecycle_status}`} aria-label={lifecycleLabel(session.lifecycle_status)} title={lifecycleLabel(session.lifecycle_status)} /></span>
             <span className="session-row-preview"><span>{session.origin.kind === 'hub_native' ? t('hubNative') : session.origin_platform_name ?? t('external')}</span><time>{new Date(session.updated_at).toLocaleString(locale)}</time></span>
           </button>)}
         </div>
@@ -1312,7 +1359,7 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
             {selectedSession && <span className={`status ${selectedSession.lifecycle_status}`}>{lifecycleLabel(selectedSession.lifecycle_status)}</span>}
           </header>
           <div className="session-chat-scroll" ref={chatScrollRef} onScroll={handleChatScroll} onWheel={handleChatWheel} onTouchStart={handleChatTouchStart} onTouchEnd={handleChatTouchEnd}>
-            {selectedSession?.lifecycle_status === 'recovery_failed' && <div className="session-banner error" role="alert"><strong>{t('sessionStatusRecoveryFailed')}</strong><span>{selectedSession.recovery_error ?? t('recoveryFailedFallback')}</span></div>}
+            {selectedSession?.recovery_error && <div className="session-banner error" role="alert"><strong>{selectedSession.lifecycle_status === 'recovery_failed' ? t('sessionStatusRecoveryFailed') : t('sessionEnvironmentLost')}</strong><span>{selectedSession.recovery_error}</span></div>}
             {(selectedSession?.lifecycle_status === 'historical' || selectedSession?.agent_deleted_at) && <div className="session-banner"><strong>{t('historicalSession')}</strong><span>{t('historicalSessionHelp')}</span></div>}
             {stopRequestedRunId && <div className="session-banner success" role="status">{t('stopRequested')}</div>}
             {actionError && <div className="session-banner error" role="alert">{t('genericError')}</div>}
@@ -1364,6 +1411,19 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
         </>}
       </section>
     </div>
+    {sessionContextMenu && <>
+      <div className="session-context-menu-backdrop" onMouseDown={() => setSessionContextMenu(null)} onContextMenu={(event) => { event.preventDefault(); setSessionContextMenu(null); }} />
+      <div className="session-context-menu" role="menu" style={{ top: sessionContextMenu.y, left: sessionContextMenu.x }}>
+        <button type="button" role="menuitem" onClick={() => openSessionRename(sessionContextMenu.sessionId)}><FilePenLine size={14} /> {t('renameSession')}</button>
+        <button type="button" role="menuitem" className="danger" disabled={deletingSessionId === sessionContextMenu.sessionId} onClick={() => void deleteSelectedSession(sessionContextMenu.sessionId)}><Trash2 size={14} /> {deletingSessionId === sessionContextMenu.sessionId ? t('deletingSession') : t('deleteSession')}</button>
+      </div>
+    </>}
+    {renamingSessionId && <FormDialog title={t('renameSession')} onClose={() => setRenamingSessionId(null)} className="session-rename-dialog" footer={<>
+      <button type="button" className="secondary" onClick={() => setRenamingSessionId(null)}>{t('cancel')}</button>
+      <button type="button" className="primary" disabled={!renameDraft.trim() || renameDraft.trim().length > 40} onClick={() => void submitSessionRename()}>{t('saveChanges')}</button>
+    </>}>
+      <label>{t('sessionTitleLabel')}<input maxLength={40} autoFocus value={renameDraft} onChange={(event) => setRenameDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && renameDraft.trim() && renameDraft.trim().length <= 40) { event.preventDefault(); void submitSessionRename(); } }} /></label>
+    </FormDialog>}
     {secretGrantRequest && <FormDialog title={t('secretGrantRequired')} busy={granting} onClose={cancelSecretGrant} className="secret-grant-dialog" footer={<>
       <button type="button" className="secondary" disabled={granting} onClick={cancelSecretGrant}>{t('cancel')}</button>
       <button type="button" className="primary" disabled={granting} onClick={allowSecretGrant}>{granting ? t('saving') : t('allowSecretGrant')}</button>

@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::Mutex,
+};
 
 use agent_hub_shared::RunEventDto;
 use uuid::Uuid;
@@ -34,7 +37,11 @@ pub trait RunEventBus: Send + Sync {
 struct InMemoryEntry {
     sender: tokio::sync::broadcast::Sender<RunEventBusItem>,
     delta_seq: i64,
+    recent_event_ids: VecDeque<Uuid>,
+    recent_event_id_set: HashSet<Uuid>,
 }
+
+const RECENT_EVENT_ID_LIMIT: usize = 512;
 
 #[derive(Default)]
 pub struct InMemoryRunEventBus {
@@ -55,6 +62,8 @@ impl RunEventBus for InMemoryRunEventBus {
         let entry = inner.entry(run_id).or_insert_with(|| InMemoryEntry {
             sender: tokio::sync::broadcast::channel(8192).0,
             delta_seq: 0,
+            recent_event_ids: VecDeque::new(),
+            recent_event_id_set: HashSet::new(),
         });
         entry.delta_seq += 1;
         DELTA_SEQ_BASE + entry.delta_seq
@@ -62,7 +71,19 @@ impl RunEventBus for InMemoryRunEventBus {
 
     fn publish(&self, run_id: Uuid, event: RunEventDto, persisted: bool) {
         let mut inner = self.entry();
-        if let Some(entry) = inner.get(&run_id) {
+        if let Some(entry) = inner.get_mut(&run_id) {
+            // Idempotent fan-out: a retried upload reuses the same event id,
+            // so dedupe in memory before broadcasting. Persisted phase/message
+            // rows carry the same id and also pass through here once.
+            if !entry.recent_event_id_set.insert(event.event_id) {
+                return;
+            }
+            entry.recent_event_ids.push_back(event.event_id);
+            if entry.recent_event_ids.len() > RECENT_EVENT_ID_LIMIT {
+                if let Some(evicted) = entry.recent_event_ids.pop_front() {
+                    entry.recent_event_id_set.remove(&evicted);
+                }
+            }
             if entry.sender.receiver_count() > 0 {
                 let _ = entry.sender.send(RunEventBusItem { event, persisted });
                 return;
@@ -78,6 +99,8 @@ impl RunEventBus for InMemoryRunEventBus {
         let entry = inner.entry(run_id).or_insert_with(|| InMemoryEntry {
             sender: tokio::sync::broadcast::channel(8192).0,
             delta_seq: 0,
+            recent_event_ids: VecDeque::new(),
+            recent_event_id_set: HashSet::new(),
         });
         entry.sender.subscribe()
     }

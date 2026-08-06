@@ -956,6 +956,15 @@ textarea {
 .session-row-status.recovery_failed { background: #c9433a; }
 .session-row-preview { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--text-tertiary); font-size: 10px; }
 .session-row-preview span, .session-row-preview time { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-context-menu-backdrop { position: fixed; inset: 0; z-index: 50; }
+.session-context-menu { position: fixed; z-index: 51; min-width: 176px; display: grid; gap: 2px; padding: 5px; border: 1px solid var(--border-regular); border-radius: 9px; background: #fff; box-shadow: 0 10px 28px rgb(0 0 0 / 14%), 0 1px 4px rgb(0 0 0 / 8%); }
+.session-context-menu button { width: 100%; display: flex; align-items: center; gap: 8px; border: 0; border-radius: 6px; padding: 8px 10px; background: transparent; color: var(--text-primary); font-size: 13px; font-weight: 550; text-align: left; cursor: pointer; }
+.session-context-menu button:hover { background: rgb(0 0 0 / 5%); }
+.session-context-menu button.danger { color: #9f332d; }
+.session-context-menu button.danger:hover { background: #fff0ef; }
+.session-context-menu button:disabled { opacity: .55; cursor: default; }
+.session-rename-dialog label { display: grid; gap: 6px; color: var(--text-secondary); font-size: 13px; }
+.session-rename-dialog input { height: 36px; border: 1px solid var(--border-regular); border-radius: var(--radius-small); padding: 0 10px; color: var(--text-primary); }
 .session-detail { min-width: 0; min-height: 0; padding: 0; }
 .session-detail-state { min-height: 100%; display: grid; place-items: center; }
 .session-detail-header { display: flex; align-items: center; justify-content: space-between; gap: 18px; }

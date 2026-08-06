@@ -1850,6 +1850,7 @@ impl PiRunState {
                 self.done = true;
                 if self.final_status != "completed" {
                     self.events.push(AppendRunEventRequest {
+                        event_id: uuid::Uuid::new_v4(),
                         event_type: "status".into(),
                         role: None,
                         content: Some(self.final_status.clone()),
@@ -1894,6 +1895,7 @@ impl PiRunState {
                     .context("Pi text_delta is missing delta")?;
                 self.assistant_text.push_str(delta);
                 self.events.push(AppendRunEventRequest {
+                    event_id: uuid::Uuid::new_v4(),
                     event_type: "message_delta".into(),
                     role: Some("assistant".into()),
                     content: Some(delta.to_owned()),
@@ -1960,6 +1962,7 @@ impl PiRunState {
         self.push_assistant_message(&Value::Object(message.clone()));
         if let Some(usage) = message.get("usage") {
             self.events.push(AppendRunEventRequest {
+                event_id: uuid::Uuid::new_v4(),
                 event_type: "usage".into(),
                 role: None,
                 content: None,
@@ -1985,6 +1988,7 @@ impl PiRunState {
             return;
         }
         self.events.push(AppendRunEventRequest {
+            event_id: uuid::Uuid::new_v4(),
             event_type: "turn_started".into(),
             role: None,
             content: None,
@@ -2011,6 +2015,7 @@ impl PiRunState {
             return;
         }
         self.events.push(AppendRunEventRequest {
+            event_id: uuid::Uuid::new_v4(),
             event_type: "message".into(),
             role: Some("assistant".into()),
             content: Some(content),
@@ -2126,6 +2131,7 @@ impl PiRunState {
             return Ok(());
         }
         self.events.push(AppendRunEventRequest {
+            event_id: uuid::Uuid::new_v4(),
             event_type: "item".into(),
             role: Some("assistant".into()),
             content: None,
@@ -2151,6 +2157,7 @@ impl PiRunState {
             return Ok(());
         }
         self.events.push(AppendRunEventRequest {
+            event_id: uuid::Uuid::new_v4(),
             event_type: "item".into(),
             role: Some("assistant".into()),
             content: None,
@@ -2174,6 +2181,7 @@ impl PiRunState {
         let item_id = format!("pi-compaction-{}", self.compaction_generation);
         self.active_compaction = Some(item_id.clone());
         self.events.push(AppendRunEventRequest {
+            event_id: uuid::Uuid::new_v4(),
             event_type: "item".into(),
             role: Some("assistant".into()),
             content: None,
@@ -2193,6 +2201,7 @@ impl PiRunState {
             return Ok(());
         };
         self.events.push(AppendRunEventRequest {
+            event_id: uuid::Uuid::new_v4(),
             event_type: "item".into(),
             role: Some("assistant".into()),
             content: None,
@@ -2215,6 +2224,7 @@ impl PiRunState {
             .and_then(Value::as_str)
             .unwrap_or_default();
         self.events.push(AppendRunEventRequest {
+            event_id: uuid::Uuid::new_v4(),
             event_type: "item".into(),
             role: Some("assistant".into()),
             content: None,
@@ -2523,6 +2533,7 @@ fn pi_reasoning_event(index: u64, phase: &str, content: Option<&str>) -> AppendR
         };
     }
     AppendRunEventRequest {
+        event_id: uuid::Uuid::new_v4(),
         event_type: "item".into(),
         role: Some("assistant".into()),
         content: None,
@@ -2590,6 +2601,7 @@ fn pi_tool_event(
         payload["status"] = json!(if success { "completed" } else { "failed" });
     }
     AppendRunEventRequest {
+        event_id: uuid::Uuid::new_v4(),
         event_type: "item".into(),
         role: Some("assistant".into()),
         content: None,
@@ -2611,6 +2623,7 @@ fn pi_integration_tool_request(
     let tool_request_id =
         stable_tool_request_uuid(run_id, tool_name, Some(source_id), &arguments).to_string();
     AppendRunEventRequest {
+        event_id: uuid::Uuid::new_v4(),
         event_type: "tool_request".into(),
         role: Some("assistant".into()),
         content: Some(format!("Pi requested {tool_name} tool")),

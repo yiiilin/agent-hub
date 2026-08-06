@@ -204,6 +204,8 @@ pub struct HubSessionDto {
     pub agent_name: String,
     pub agent_deleted_at: Option<DateTime<Utc>>,
     #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
     pub origin_platform_name: Option<String>,
     pub origin: HubSessionOriginDto,
     pub lifecycle_status: String,
@@ -2237,6 +2239,8 @@ pub struct RuntimeSessionWriteRequest<T> {
 #[serde(deny_unknown_fields)]
 pub struct ReleaseRuntimeSessionRequest {
     pub ownership_generation: i64,
+    #[serde(default)]
+    pub force: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2313,12 +2317,18 @@ pub struct ForceDeleteRuntimeResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppendRunEventRequest {
+    #[serde(default = "random_append_event_id")]
+    pub event_id: Uuid,
     pub event_type: String,
     pub role: Option<String>,
     pub content: Option<String>,
     pub payload: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_tool: Option<WaitingToolRunTransition>,
+}
+
+fn random_append_event_id() -> Uuid {
+    Uuid::new_v4()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -365,7 +365,6 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         builtin_skill_seed_loop(builtin_skill_state).await;
     });
-
     let app = build_router(state);
     info!("backend listening on {bind_addr}");
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
@@ -553,7 +552,14 @@ fn build_router(state: AppState) -> Router {
             get(list_agent_runs).post(create_run),
         )
         .route("/api/sessions", get(list_hub_sessions))
-        .route("/api/sessions/{session_id}", get(get_hub_session))
+        .route(
+            "/api/sessions/{session_id}",
+            get(get_hub_session).delete(delete_hub_session),
+        )
+        .route(
+            "/api/sessions/{session_id}/title",
+            put(update_hub_session_title),
+        )
         .route(
             "/api/sessions/{session_id}/messages",
             get(list_hub_session_messages).post(create_hub_session_message),
@@ -1021,7 +1027,8 @@ fn openapi_document() -> Value {
                 "post": { "summary": "Create agent run", "parameters": [id("agent_id")], "requestBody": body("CreateRunRequest"), "responses": { "200": response("Run"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } }
             },
             "/api/sessions": { "get": { "summary": "List owned sessions", "responses": { "200": list_response("HubSession"), "401": { "$ref": "#/components/responses/Unauthorized" } } } },
-            "/api/sessions/{session_id}": { "get": { "summary": "Get owned session", "parameters": [id("session_id")], "responses": { "200": response("HubSession"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
+            "/api/sessions/{session_id}": { "get": { "summary": "Get owned session", "parameters": [id("session_id")], "responses": { "200": response("HubSession"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } }, "delete": { "summary": "Delete an owned session", "parameters": [id("session_id")], "responses": { "204": { "description": "Deleted" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
+            "/api/sessions/{session_id}/title": { "put": { "summary": "Rename an owned session", "parameters": [id("session_id")], "requestBody": body("UpdateHubSessionTitleRequest"), "responses": { "200": response("HubSession"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/sessions/{session_id}/messages": {
                 "get": { "summary": "List owned session messages", "parameters": [id("session_id"), { "name": "before_sequence", "in": "query", "required": false, "schema": { "type": "integer", "format": "int64", "minimum": 1 } }, { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "format": "int64", "minimum": 1, "maximum": 100 } }], "responses": { "200": list_response("HubSessionMessage"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } },
                 "post": { "summary": "Send an owned session message", "parameters": [id("session_id")], "requestBody": body("CreateHubSessionMessageRequest"), "responses": { "200": response("SessionMessageAcceptance"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } }
@@ -1294,9 +1301,10 @@ fn openapi_schemas() -> Value {
             { "type": "object", "additionalProperties": false, "required": ["kind", "platform_id", "tenant_id", "external_identity_id"], "properties": { "kind": { "type": "string", "const": "external" }, "platform_id": uuid(), "tenant_id": { "type": "string" }, "external_identity_id": uuid() } }
         ] },
         "CurrentSessionBundle": { "type": "object", "required": ["generation", "object_key", "checksum_sha256", "size_bytes", "history_checkpoint", "ownership_generation", "producing_engine_version", "created_at"], "properties": { "generation": { "type": "integer" }, "object_key": { "type": "string" }, "checksum_sha256": { "type": "string" }, "size_bytes": { "type": "integer", "minimum": 0 }, "history_checkpoint": { "type": "integer", "minimum": 0 }, "ownership_generation": { "type": "integer", "minimum": 0 }, "producing_engine_version": { "type": "string" }, "created_at": { "type": "string", "format": "date-time" } } },
-        "HubSession": { "type": "object", "required": ["id", "owner_id", "agent_id", "agent_name", "agent_deleted_at", "origin_platform_name", "origin", "lifecycle_status", "native_session_id", "active_turn_id", "history_checkpoint", "configuration_fingerprint", "runtime_owner_id", "ownership_generation", "recovery_error", "current_bundle", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": uuid(), "agent_id": uuid(), "agent_name": { "type": "string" }, "agent_deleted_at": { "type": ["string", "null"], "format": "date-time" }, "origin_platform_name": { "type": ["string", "null"] }, "origin": { "$ref": "#/components/schemas/HubSessionOrigin" }, "lifecycle_status": { "type": "string" }, "native_session_id": { "type": ["string", "null"] }, "active_turn_id": { "anyOf": [uuid(), { "type": "null" }] }, "history_checkpoint": { "type": "integer", "minimum": 0 }, "configuration_fingerprint": { "type": ["string", "null"] }, "runtime_owner_id": { "anyOf": [uuid(), { "type": "null" }] }, "ownership_generation": { "type": "integer", "minimum": 0 }, "recovery_error": { "type": ["string", "null"] }, "current_bundle": { "anyOf": [{ "$ref": "#/components/schemas/CurrentSessionBundle" }, { "type": "null" }] }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
+        "HubSession": { "type": "object", "required": ["id", "owner_id", "agent_id", "agent_name", "agent_deleted_at", "origin_platform_name", "origin", "lifecycle_status", "native_session_id", "active_turn_id", "history_checkpoint", "configuration_fingerprint", "runtime_owner_id", "ownership_generation", "recovery_error", "current_bundle", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": uuid(), "agent_id": uuid(), "agent_name": { "type": "string" }, "agent_deleted_at": { "type": ["string", "null"], "format": "date-time" }, "title": { "type": ["string", "null"] }, "origin_platform_name": { "type": ["string", "null"] }, "origin": { "$ref": "#/components/schemas/HubSessionOrigin" }, "lifecycle_status": { "type": "string" }, "native_session_id": { "type": ["string", "null"] }, "active_turn_id": { "anyOf": [uuid(), { "type": "null" }] }, "history_checkpoint": { "type": "integer", "minimum": 0 }, "configuration_fingerprint": { "type": ["string", "null"] }, "runtime_owner_id": { "anyOf": [uuid(), { "type": "null" }] }, "ownership_generation": { "type": "integer", "minimum": 0 }, "recovery_error": { "type": ["string", "null"] }, "current_bundle": { "anyOf": [{ "$ref": "#/components/schemas/CurrentSessionBundle" }, { "type": "null" }] }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
         "HubSessionMessage": { "type": "object", "required": ["id", "session_id", "sequence", "role", "message_kind", "content", "payload", "delivery_mode", "delivery_state", "client_message_key", "expected_native_turn_id", "turn_id", "run_id", "accepted_at"], "properties": { "id": uuid(), "session_id": uuid(), "sequence": { "type": "integer", "minimum": 1 }, "role": { "type": "string" }, "message_kind": { "type": "string" }, "content": { "type": ["string", "null"] }, "payload": {}, "delivery_mode": { "type": "string" }, "delivery_state": { "type": "string" }, "client_message_key": { "type": ["string", "null"] }, "expected_native_turn_id": { "type": ["string", "null"] }, "turn_id": { "anyOf": [uuid(), { "type": "null" }] }, "run_id": { "anyOf": [uuid(), { "type": "null" }] }, "accepted_at": { "type": "string", "format": "date-time" } } },
         "CreateHubSessionMessageRequest": { "type": "object", "required": ["content"], "properties": { "content": { "type": "string" }, "payload": {}, "delivery_mode": { "type": ["string", "null"] }, "client_message_key": { "type": ["string", "null"] }, "parent_run_id": { "anyOf": [uuid(), { "type": "null" }] } } },
+        "UpdateHubSessionTitleRequest": { "type": "object", "additionalProperties": false, "required": ["title"], "properties": { "title": { "type": "string", "minLength": 1, "maxLength": 40 } } },
         "SessionMessageAcceptance": { "type": "object", "required": ["message", "run"], "properties": { "message": { "$ref": "#/components/schemas/HubSessionMessage" }, "run": { "anyOf": [{ "$ref": "#/components/schemas/Run" }, { "type": "null" }] } } },
         "RunEvent": { "type": "object", "required": ["seq", "event_id", "run_id", "event_type", "payload", "created_at"], "properties": { "seq": { "type": "integer" }, "event_id": uuid(), "run_id": uuid(), "event_type": { "type": "string" }, "role": { "type": ["string", "null"] }, "content": { "type": ["string", "null"] }, "payload": {}, "created_at": { "type": "string", "format": "date-time" } } },
         "ClientToolRequestEvent": { "allOf": [{ "$ref": "#/components/schemas/RunEvent" }, { "type": "object", "properties": { "event_type": { "type": "string", "const": "tool_request" }, "payload": { "type": "object", "additionalProperties": false, "required": ["tool_call_id", "tool_name", "arguments", "batch_id", "expires_at"], "properties": { "tool_call_id": uuid(), "tool_name": { "type": "string" }, "arguments": {}, "batch_id": uuid(), "expires_at": { "type": "string", "format": "date-time" } } } } }] },
@@ -3193,6 +3201,295 @@ async fn delete_api_key(
         return Err(ApiError::not_found("api key not found"));
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateHubSessionTitleRequest {
+    title: String,
+}
+
+async fn update_hub_session_title(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(session_id): Path<Uuid>,
+    Json(req): Json<UpdateHubSessionTitleRequest>,
+) -> Result<Json<HubSessionDto>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    let title = req.title.trim();
+    if title.is_empty() || title.chars().count() > 40 {
+        return Err(ApiError::bad_request(
+            "Session title must be 1 to 40 characters",
+        ));
+    }
+    let updated = sqlx::query("UPDATE hub_sessions SET title = $1 WHERE id = $2 AND owner_id = $3")
+        .bind(title)
+        .bind(session_id)
+        .bind(user.id)
+        .execute(&state.pool)
+        .await?;
+    if updated.rows_affected() == 0 {
+        return Err(ApiError::not_found("session not found"));
+    }
+    get_hub_session(axum::extract::State(state), headers, Path(session_id)).await
+}
+
+async fn generate_session_title_in_background(
+    state: Arc<AppState>,
+    session_id: Uuid,
+    agent_id: Uuid,
+    user_id: Uuid,
+    first_message: String,
+) {
+    let outcome: anyhow::Result<()> = async {
+        let model = sqlx::query(
+            "SELECT a.name AS agent_name, a.model_connection_id, a.model_id,
+                    c.scope, c.name AS connection_name, c.base_url, c.api_type,
+                    c.api_key_ciphertext, c.api_key_nonce
+             FROM agents a
+             JOIN model_connections c ON c.id = a.model_connection_id
+             WHERE a.id = $1 AND a.deleted_at IS NULL
+               AND c.deleted_at IS NULL AND c.enabled",
+        )
+        .bind(agent_id)
+        .fetch_optional(&state.pool)
+        .await?;
+        let Some(model) = model else {
+            return Ok(());
+        };
+        let api_type =
+            model_upstream_protocol_from_name(&model.get::<String, _>("api_type"));
+        if api_type != ModelUpstreamProtocol::OpenaiResponses {
+            return Ok(());
+        }
+        let connection_id: Uuid = model.get("model_connection_id");
+        let model_id: String = model.get("model_id");
+        let base_url: String = model.get("base_url");
+        let connection_name: String = model.get("connection_name");
+        let connection_scope = match model.get::<String, _>("scope").as_str() {
+            "global" => ModelConnectionScope::Global,
+            _ => ModelConnectionScope::Personal,
+        };
+        let agent_name: String = model.get("agent_name");
+        let ciphertext: Vec<u8> = model.get("api_key_ciphertext");
+        let nonce: Vec<u8> = model.get("api_key_nonce");
+        let api_key = Zeroizing::new(
+            state
+                .model_secret_cipher
+                .decrypt(&ciphertext, &nonce)
+                .map_err(|_| anyhow::anyhow!("model secret decryption failed"))?,
+        );
+        let request_settings = ModelRequestSettings::for_protocol(api_type);
+        let prompt = format!("Generate a concise Chinese session title (about 15 characters) based on the user first message. Output only the title. User message: {}", first_message.chars().take(400).collect::<String>());
+        let request_body = serde_json::to_vec(&json!({
+            "model": model_id,
+            "input": prompt,
+            "max_output_tokens": 64,
+            "temperature": 0.3
+        }))?;
+        let request_id = Uuid::new_v4();
+        let response = send_model_gateway_request(
+            &state,
+            ModelGatewayForwardRequest {
+                request_id,
+                upstream_protocol: api_type,
+                request_settings: &request_settings,
+                upstream_url: &base_url,
+                query: None,
+                headers: &HeaderMap::new(),
+                body: &request_body,
+                api_key: &api_key,
+            },
+        )
+        .await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        let value = serde_json::from_slice::<Value>(&body)?;
+        if status.is_success() {
+            if let Some(usage) = extract_model_usage(&value) {
+                record_session_title_usage(
+                    &state,
+                    request_id,
+                    &value,
+                    usage,
+                    connection_id,
+                    &connection_scope,
+                    &connection_name,
+                    &model_id,
+                    &request_settings,
+                    agent_id,
+                    &agent_name,
+                    user_id,
+                )
+                .await?;
+            }
+            if let Some(text) = model_test_response_text(&value) {
+                let title = sanitize_session_title(&text);
+                if !title.is_empty() {
+                    sqlx::query(
+                        "UPDATE hub_sessions
+                         SET title = $1
+                         WHERE id = $2 AND title IS NULL",
+                    )
+                    .bind(&title)
+                    .bind(session_id)
+                    .execute(&state.pool)
+                    .await?;
+                }
+            }
+        } else {
+            record_session_title_error(
+                &state,
+                request_id,
+                Some(status.as_u16()),
+                "upstream_http",
+                "upstream_error",
+                "Session title generation failed",
+                connection_id,
+                &connection_scope,
+                &connection_name,
+                &model_id,
+                &request_settings,
+                agent_id,
+                &agent_name,
+                user_id,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = outcome {
+        warn!(session_id = %session_id, agent_id = %agent_id, error = %error,
+            "Session title generation failed");
+    }
+}
+
+fn sanitize_session_title(text: &str) -> String {
+    let title = text
+        .trim()
+        .trim_matches(['"', '\'', '“', '”', '「', '」', '《', '》'])
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim();
+    title.chars().take(40).collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_session_title_usage(
+    state: &AppState,
+    request_id: Uuid,
+    response: &Value,
+    usage: ObservedModelUsage,
+    connection_id: Uuid,
+    connection_scope: &ModelConnectionScope,
+    connection_name: &str,
+    model_id: &str,
+    request_settings: &ModelRequestSettings,
+    agent_id: Uuid,
+    agent_name: &str,
+    user_id: Uuid,
+) -> anyhow::Result<()> {
+    let display_name: Option<String> =
+        sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    let response_status = model_response_status(Some(response), true);
+    sqlx::query(
+        "INSERT INTO model_token_usage
+             (id, request_id, response_status, model_connection_id,
+              model_connection_scope_snapshot, model_connection_name_snapshot,
+              model_id_snapshot, api_type_snapshot,
+              request_settings_snapshot,
+              agent_id, agent_name_snapshot,
+              subject_type, subject_user_id, subject_display_name_snapshot,
+              input_tokens, output_tokens, total_tokens, cached_tokens,
+              reasoning_tokens)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                 'user', $12, $13, $14, $15, $16, $17, $18)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(request_id)
+    .bind(response_status)
+    .bind(connection_id)
+    .bind(model_connection_scope_name(*connection_scope))
+    .bind(connection_name)
+    .bind(model_id)
+    .bind(model_upstream_protocol_name(
+        ModelUpstreamProtocol::OpenaiResponses,
+    ))
+    .bind(model_request_settings_value(request_settings))
+    .bind(agent_id)
+    .bind(agent_name)
+    .bind(user_id)
+    .bind(display_name)
+    .bind(usage.input_tokens)
+    .bind(usage.output_tokens)
+    .bind(usage.total_tokens)
+    .bind(usage.cached_tokens)
+    .bind(usage.reasoning_tokens)
+    .execute(&state.pool)
+    .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_session_title_error(
+    state: &AppState,
+    request_id: Uuid,
+    upstream_http_status: Option<u16>,
+    error_kind: &str,
+    error_code: &str,
+    message: &str,
+    connection_id: Uuid,
+    connection_scope: &ModelConnectionScope,
+    connection_name: &str,
+    model_id: &str,
+    request_settings: &ModelRequestSettings,
+    agent_id: Uuid,
+    agent_name: &str,
+    user_id: Uuid,
+) -> anyhow::Result<()> {
+    let display_name: Option<String> =
+        sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    sqlx::query(
+        "INSERT INTO model_call_errors
+             (id, request_id, response_status, upstream_http_status,
+              error_kind, error_code, message, model_connection_id,
+              model_connection_scope_snapshot, model_connection_name_snapshot,
+              model_id_snapshot, api_type_snapshot,
+              request_settings_snapshot,
+              agent_id, agent_name_snapshot,
+              subject_type, subject_user_id, subject_display_name_snapshot)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                 $13, $14, $15, 'user', $16, $17)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(request_id)
+    .bind("failed")
+    .bind(upstream_http_status.map(i32::from))
+    .bind(error_kind)
+    .bind(error_code)
+    .bind(message)
+    .bind(connection_id)
+    .bind(model_connection_scope_name(*connection_scope))
+    .bind(connection_name)
+    .bind(model_id)
+    .bind(model_upstream_protocol_name(
+        ModelUpstreamProtocol::OpenaiResponses,
+    ))
+    .bind(model_request_settings_value(request_settings))
+    .bind(agent_id)
+    .bind(agent_name)
+    .bind(user_id)
+    .bind(display_name)
+    .execute(&state.pool)
+    .await?;
+    Ok(())
 }
 
 async fn list_model_connections(
@@ -6148,6 +6445,8 @@ async fn create_run(
             None => None,
         },
     };
+    let is_new_session = existing_session_id.is_none();
+    let first_message = req.message.clone();
     let session_id = if let Some(session_id) = existing_session_id {
         let origin_kind: String = sqlx::query_scalar(
             "SELECT origin_kind
@@ -6199,6 +6498,23 @@ async fn create_run(
         .run
         .ok_or(ApiError::internal("console message did not schedule a run"))?;
     tx.commit().await?;
+    if is_new_session {
+        let background_state = state.clone();
+        let background_session_id = session_id;
+        let background_agent_id = agent.id;
+        let background_user_id = user.id;
+        let background_message = first_message;
+        tokio::spawn(async move {
+            generate_session_title_in_background(
+                background_state,
+                background_session_id,
+                background_agent_id,
+                background_user_id,
+                background_message,
+            )
+            .await;
+        });
+    }
     Ok(Json(run))
 }
 
@@ -6216,6 +6532,7 @@ async fn list_hub_sessions(
                 (SELECT name FROM external_platforms
                  WHERE external_platforms.id = hub_sessions.origin_platform_id)
                     AS origin_platform_name,
+                title,
                 origin_tenant_id, origin_external_identity_id, lifecycle_status,
                 native_session_id, active_turn_id, history_checkpoint,
                 configuration_fingerprint, runtime_owner_id, ownership_generation,
@@ -6250,6 +6567,7 @@ async fn get_hub_session(
                 (SELECT name FROM external_platforms
                  WHERE external_platforms.id = hub_sessions.origin_platform_id)
                     AS origin_platform_name,
+                title,
                 origin_tenant_id, origin_external_identity_id, lifecycle_status,
                 native_session_id, active_turn_id, history_checkpoint,
                 configuration_fingerprint, runtime_owner_id, ownership_generation,
@@ -6268,6 +6586,144 @@ async fn get_hub_session(
     .await?
     .ok_or(ApiError::not_found("session not found"))?;
     Ok(Json(hub_session_from_row(row)))
+}
+
+async fn delete_hub_session(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(session_id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    let mut tx = state.pool.begin().await?;
+    let session = sqlx::query(
+        "SELECT lifecycle_status, runtime_owner_id, ownership_generation,
+                current_bundle_object_key
+         FROM hub_sessions
+         WHERE id = $1 AND owner_id = $2
+         FOR UPDATE",
+    )
+    .bind(session_id)
+    .bind(user.id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ApiError::not_found("session not found"))?;
+    let lifecycle_status: String = session.get("lifecycle_status");
+    if matches!(
+        lifecycle_status.as_str(),
+        "waiting_for_runtime" | "restoring" | "online" | "saving"
+    ) {
+        return Err(ApiError::conflict(
+            "session is active and cannot be deleted",
+        ));
+    }
+    let has_active_run: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM runs
+             WHERE hub_session_id = $1
+               AND status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')
+         )",
+    )
+    .bind(session_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if has_active_run {
+        return Err(ApiError::conflict("session has an active run"));
+    }
+    let runtime_owner_id: Option<Uuid> = session.get("runtime_owner_id");
+    let ownership_generation: i64 = session.get("ownership_generation");
+    if let Some(runtime_id) = runtime_owner_id {
+        record_runtime_session_cleanup_tx(
+            &mut tx,
+            runtime_id,
+            session_id,
+            ownership_generation,
+            None,
+        )
+        .await?;
+    }
+
+    sqlx::query("UPDATE hub_sessions SET active_turn_id = NULL WHERE id = $1")
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "UPDATE hub_session_messages
+         SET run_id = NULL, turn_id = NULL
+         WHERE session_id = $1",
+    )
+    .bind(session_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM integration_attachments
+         WHERE hub_message_id IN (
+             SELECT id FROM hub_session_messages WHERE session_id = $1
+         ) OR run_id IN (
+             SELECT id FROM runs WHERE hub_session_id = $1
+         )",
+    )
+    .bind(session_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM integration_messages
+         WHERE hub_message_id IN (
+             SELECT id FROM hub_session_messages WHERE session_id = $1
+         ) OR run_id IN (
+             SELECT id FROM runs WHERE hub_session_id = $1
+         )",
+    )
+    .bind(session_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM embed_sessions WHERE hub_session_id = $1")
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "DELETE FROM integration_tool_requests
+         WHERE hub_session_id = $1
+            OR run_id IN (SELECT id FROM runs WHERE hub_session_id = $1)",
+    )
+    .bind(session_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM integration_sessions WHERE hub_session_id = $1")
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM session_bundle_deletion_queue WHERE session_id = $1")
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM runs WHERE hub_session_id = $1")
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM hub_session_messages WHERE session_id = $1")
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM hub_session_turns WHERE session_id = $1")
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM hub_sessions WHERE id = $1")
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    let bundle_object_key: Option<String> = session.get("current_bundle_object_key");
+    if let (Some(object_key), Some(store)) =
+        (bundle_object_key, state.session_bundle_store.as_ref())
+    {
+        if let Err(error) = store.delete(&object_key).await {
+            warn!(session_id = %session_id, object_key = %object_key, error = %error,
+                "failed to delete Session Bundle object after Session deletion");
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -10759,6 +11215,28 @@ async fn runtime_heartbeat(
         }
     }
 
+    let reported_session_ids = reported_session_ids.into_iter().collect::<Vec<_>>();
+    sqlx::query(
+        "UPDATE hub_sessions
+         SET runtime_owner_id = NULL,
+             lifecycle_status = 'offline',
+             active_turn_id = NULL,
+             ownership_generation = ownership_generation + 1
+         WHERE runtime_owner_id = $1
+           AND NOT (id = ANY($2))
+           AND lifecycle_status IN ('restoring', 'online')
+           AND active_turn_id IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM runs
+               WHERE runs.hub_session_id = hub_sessions.id
+                 AND runs.status IN ('running', 'waiting_tool')
+           )",
+    )
+    .bind(runtime_id)
+    .bind(&reported_session_ids)
+    .execute(&mut *tx)
+    .await?;
+
     let owned_sessions = sqlx::query(
         "SELECT sessions.id, sessions.ownership_generation,
                 sessions.lifecycle_status, sessions.native_session_id,
@@ -11032,9 +11510,29 @@ async fn runtime_release_session(
     validate_ownership_generation(req.ownership_generation)?;
     let runtime_id = require_runtime(&state, &headers).await?;
     let mut tx = state.pool.begin().await?;
+    release_session_ownership_tx(
+        &mut tx,
+        runtime_id,
+        session_id,
+        req.ownership_generation,
+        req.force,
+    )
+    .await?;
+    let released = load_hub_session_tx(&mut tx, session_id).await?;
+    tx.commit().await?;
+    Ok(Json(released))
+}
+
+async fn release_session_ownership_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    runtime_id: Uuid,
+    session_id: Uuid,
+    ownership_generation: i64,
+    force: bool,
+) -> Result<(), ApiError> {
     sqlx::query("SELECT id FROM runtimes WHERE id = $1 FOR UPDATE")
         .bind(runtime_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?
         .ok_or(ApiError::unauthorized(
             "runtime is not active or its credential is invalid",
@@ -11050,15 +11548,17 @@ async fn runtime_release_session(
          FOR UPDATE",
     )
     .bind(session_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?
     .ok_or(ApiError::not_found("session not found"))?;
     if session.get::<Option<Uuid>, _>("runtime_owner_id") != Some(runtime_id)
-        || session.get::<i64, _>("ownership_generation") != req.ownership_generation
+        || session.get::<i64, _>("ownership_generation") != ownership_generation
     {
-        return Err(ApiError::forbidden(
-            "runtime does not own this Session generation",
-        ));
+        // Idempotent acknowledgement: ownership has already moved past this
+        // generation (released, re-claimed, or deleted), so the retried
+        // release request is already satisfied and must not disturb the
+        // current owner.
+        return Ok(());
     }
     if session.get::<Option<Uuid>, _>("active_turn_id").is_some() {
         return Err(ApiError::conflict(
@@ -11072,66 +11572,62 @@ async fn runtime_release_session(
          )",
     )
     .bind(session_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
     if unfinished_execution {
         return Err(ApiError::conflict(
             "unfinished Session execution must finish before ownership release",
         ));
     }
-    let bundle_checkpoint: Option<i64> = session.get("current_bundle_history_checkpoint");
-    let bundle_ownership_generation: Option<i64> =
-        session.get("current_bundle_ownership_generation");
-    let lifecycle_status: String = session.get("lifecycle_status");
-    let release_state_is_current = match lifecycle_status.as_str() {
-        "online" => true,
-        "saving" => {
-            session.get::<Option<i64>, _>("saving_history_checkpoint") == bundle_checkpoint
-                && session.get::<Option<i64>, _>("saving_ownership_generation")
-                    == Some(req.ownership_generation)
-                && session
-                    .get::<Option<Uuid>, _>("saving_checkpoint_attempt_id")
-                    .is_some()
-                && session.get::<Option<Uuid>, _>("current_bundle_checkpoint_attempt_id")
-                    == session.get::<Option<Uuid>, _>("saving_checkpoint_attempt_id")
+    if !force {
+        let bundle_checkpoint: Option<i64> = session.get("current_bundle_history_checkpoint");
+        let bundle_ownership_generation: Option<i64> =
+            session.get("current_bundle_ownership_generation");
+        let lifecycle_status: String = session.get("lifecycle_status");
+        let release_state_is_current = match lifecycle_status.as_str() {
+            "online" => true,
+            "saving" => {
+                session.get::<Option<i64>, _>("saving_history_checkpoint") == bundle_checkpoint
+                    && session.get::<Option<i64>, _>("saving_ownership_generation")
+                        == Some(ownership_generation)
+                    && session
+                        .get::<Option<Uuid>, _>("saving_checkpoint_attempt_id")
+                        .is_some()
+                    && session.get::<Option<Uuid>, _>("current_bundle_checkpoint_attempt_id")
+                        == session.get::<Option<Uuid>, _>("saving_checkpoint_attempt_id")
+            }
+            _ => false,
+        };
+        if bundle_checkpoint.is_none()
+            || bundle_ownership_generation != Some(ownership_generation)
+            || session.get::<Option<Uuid>, _>("current_bundle_runtime_id") != Some(runtime_id)
+            || !release_state_is_current
+        {
+            return Err(ApiError::conflict(
+                "current Session Bundle does not cover this ownership state and generation",
+            ));
         }
-        _ => false,
-    };
-    if bundle_checkpoint.is_none()
-        || bundle_ownership_generation != Some(req.ownership_generation)
-        || session.get::<Option<Uuid>, _>("current_bundle_runtime_id") != Some(runtime_id)
-        || !release_state_is_current
-    {
-        return Err(ApiError::conflict(
-            "current Session Bundle does not cover this ownership state and generation",
-        ));
-    }
-    let has_unreplayable_history: bool = sqlx::query_scalar(
-        "SELECT EXISTS(
-             SELECT 1 FROM hub_session_messages
-             WHERE session_id = $1
-               AND sequence > $2
-               AND delivery_state IN ('delivering', 'delivered')
-         )",
-    )
-    .bind(session_id)
-    .bind(bundle_checkpoint.unwrap())
-    .fetch_one(&mut *tx)
-    .await?;
-    if has_unreplayable_history {
-        return Err(ApiError::conflict(
-            "current Session Bundle is older than unreplayable Hub history",
-        ));
+        let has_unreplayable_history: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM hub_session_messages
+                 WHERE session_id = $1
+                   AND sequence > $2
+                   AND delivery_state IN ('delivering', 'delivered')
+             )",
+        )
+        .bind(session_id)
+        .bind(bundle_checkpoint.unwrap())
+        .fetch_one(&mut **tx)
+        .await?;
+        if has_unreplayable_history {
+            return Err(ApiError::conflict(
+                "current Session Bundle is older than unreplayable Hub history",
+            ));
+        }
     }
 
-    record_runtime_session_cleanup_tx(
-        &mut tx,
-        runtime_id,
-        session_id,
-        req.ownership_generation,
-        None,
-    )
-    .await?;
+    record_runtime_session_cleanup_tx(tx, runtime_id, session_id, ownership_generation, None)
+        .await?;
     sqlx::query(
         "UPDATE hub_sessions
          SET runtime_owner_id = NULL,
@@ -11145,6 +11641,7 @@ async fn runtime_release_session(
                  ) THEN 'waiting_for_runtime'
                  ELSE 'offline'
              END,
+             ownership_generation = ownership_generation + $4,
              saving_history_checkpoint = NULL,
              saving_ownership_generation = NULL,
              saving_reason = NULL,
@@ -11153,12 +11650,11 @@ async fn runtime_release_session(
     )
     .bind(session_id)
     .bind(runtime_id)
-    .bind(req.ownership_generation)
-    .execute(&mut *tx)
+    .bind(ownership_generation)
+    .bind(if force { 1 } else { 0 })
+    .execute(&mut **tx)
     .await?;
-    let released = load_hub_session_tx(&mut tx, session_id).await?;
-    tx.commit().await?;
-    Ok(Json(released))
+    Ok(())
 }
 
 fn checkpoint_reason_priority(reason: &str) -> Option<u8> {
@@ -12447,7 +12943,8 @@ async fn runtime_claim_run(
              lifecycle_status = CASE
                  WHEN runtime_owner_id = $1 THEN lifecycle_status
                  ELSE 'restoring'
-             END
+             END,
+             recovery_error = NULL
          WHERE id = $2
            AND (runtime_owner_id IS NULL OR runtime_owner_id = $1)
          RETURNING ownership_generation",
@@ -12973,6 +13470,7 @@ async fn runtime_append_event(
     reap_stale_runtimes(&state.pool).await?;
     let runtime_id = require_runtime(&state, &headers).await?;
     let AppendRunEventRequest {
+        event_id,
         event_type,
         role,
         content,
@@ -13010,7 +13508,7 @@ async fn runtime_append_event(
         tx.commit().await?;
         let event = RunEventDto {
             seq: state.run_event_bus.next_stream_seq(run_id),
-            event_id: Uuid::new_v4(),
+            event_id,
             run_id,
             event_type,
             role,
@@ -13028,6 +13526,7 @@ async fn runtime_append_event(
         runtime_id,
         req.ownership_generation,
         AppendRunEventRequest {
+            event_id: Uuid::new_v4(),
             event_type,
             role,
             content,
@@ -16306,6 +16805,7 @@ async fn insert_run_event_for_active_runtime(
     request: AppendRunEventRequest,
 ) -> Result<RunEventDto, ApiError> {
     let AppendRunEventRequest {
+        event_id,
         event_type,
         role,
         content,
@@ -16429,7 +16929,9 @@ async fn insert_run_event_for_active_runtime(
         && content
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty());
-    let event = insert_run_event_tx(tx, run_id, event_type, role, content, payload).await?;
+    let event =
+        insert_run_event_with_id_tx(tx, event_id, run_id, event_type, role, content, payload)
+            .await?;
     if refresh_session_activity {
         sqlx::query("UPDATE hub_sessions SET updated_at = now() WHERE id = $1")
             .bind(session_id)
@@ -16437,6 +16939,42 @@ async fn insert_run_event_for_active_runtime(
             .await?;
     }
     Ok(event)
+}
+
+async fn insert_run_event_with_id_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    event_id: Uuid,
+    run_id: Uuid,
+    event_type: String,
+    role: Option<String>,
+    content: Option<String>,
+    payload: Value,
+) -> Result<RunEventDto, ApiError> {
+    let row = sqlx::query(
+        "INSERT INTO run_events (event_id, run_id, event_type, role, content, payload)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (event_id) DO NOTHING
+         RETURNING seq, event_id, run_id, event_type, role, content, payload, created_at",
+    )
+    .bind(event_id)
+    .bind(run_id)
+    .bind(event_type)
+    .bind(role)
+    .bind(content)
+    .bind(payload)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(row) = row {
+        return Ok(event_from_row(row));
+    }
+    let existing = sqlx::query(
+        "SELECT seq, event_id, run_id, event_type, role, content, payload, created_at
+         FROM run_events WHERE event_id = $1",
+    )
+    .bind(event_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(event_from_row(existing))
 }
 
 async fn lock_owned_session_for_run_tx(
@@ -17122,13 +17660,93 @@ async fn reap_stale_runtimes(pool: &PgPool) -> Result<(), ApiError> {
     if !acquired {
         return Ok(());
     }
-    sqlx::query(
+    let stale_runtime_ids = sqlx::query_scalar::<_, Uuid>(
         "UPDATE runtimes
          SET status = 'offline'
-         WHERE status = 'online' AND last_heartbeat_at < now() - interval '30 seconds'",
+         WHERE status = 'online' AND last_heartbeat_at < now() - interval '30 seconds'
+         RETURNING id",
     )
-    .execute(&mut *tx)
+    .fetch_all(&mut *tx)
     .await?;
+    for runtime_id in stale_runtime_ids {
+        let failed_run_ids = sqlx::query_scalar::<_, Uuid>(
+            "UPDATE runs
+             SET status = 'failed', updated_at = now()
+             WHERE runtime_id = $1 AND status IN ('running', 'waiting_tool')
+             RETURNING id",
+        )
+        .bind(runtime_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        for run_id in failed_run_ids {
+            insert_run_event_tx(
+                &mut tx,
+                run_id,
+                "status".into(),
+                None,
+                Some("failed".into()),
+                json!({ "status": "failed", "reason": "runtime went offline" }),
+            )
+            .await?;
+        }
+        let reclaimed: Vec<(Uuid, String)> = sqlx::query_as(
+            "UPDATE hub_sessions
+             SET runtime_owner_id = NULL,
+                 lifecycle_status = CASE
+                     WHEN EXISTS (
+                         SELECT 1 FROM hub_session_messages
+                         WHERE session_id = hub_sessions.id
+                           AND delivery_state IN ('delivering', 'delivered')
+                           AND (hub_sessions.current_bundle_history_checkpoint IS NULL
+                                OR sequence > hub_sessions.current_bundle_history_checkpoint)
+                     ) THEN 'recovery_failed'
+                     WHEN EXISTS (
+                         SELECT 1 FROM runs
+                         WHERE hub_session_id = hub_sessions.id
+                           AND status = 'pending'
+                     ) OR EXISTS (
+                         SELECT 1 FROM hub_session_messages
+                         WHERE session_id = hub_sessions.id
+                           AND delivery_state = 'queued'
+                     ) THEN 'waiting_for_runtime'
+                     ELSE 'offline'
+                 END,
+                 active_turn_id = NULL,
+                 ownership_generation = ownership_generation + 1,
+                 recovery_error = CASE
+                     WHEN EXISTS (
+                         SELECT 1 FROM hub_session_messages
+                         WHERE session_id = hub_sessions.id
+                           AND delivery_state IN ('delivering', 'delivered')
+                           AND (hub_sessions.current_bundle_history_checkpoint IS NULL
+                                OR sequence > hub_sessions.current_bundle_history_checkpoint)
+                     ) OR current_bundle_history_checkpoint IS NULL
+                          OR current_bundle_history_checkpoint < history_checkpoint
+                     THEN '服务端发生意外，导致 agent 环境数据丢失，但对话历史还在'
+                     ELSE recovery_error
+                 END
+             WHERE runtime_owner_id = $1
+             RETURNING id, lifecycle_status",
+        )
+        .bind(runtime_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let unrecoverable_session_ids = reclaimed
+            .iter()
+            .filter(|(_, lifecycle_status)| lifecycle_status == "recovery_failed")
+            .map(|(session_id, _)| *session_id)
+            .collect::<Vec<_>>();
+        if !unrecoverable_session_ids.is_empty() {
+            sqlx::query(
+                "UPDATE runs
+                 SET status = 'failed', updated_at = now()
+                 WHERE hub_session_id = ANY($1) AND status = 'pending'",
+            )
+            .bind(&unrecoverable_session_ids)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -19692,6 +20310,7 @@ async fn load_claim_session_context_tx(
                 (SELECT name FROM external_platforms
                  WHERE external_platforms.id = hub_sessions.origin_platform_id)
                     AS origin_platform_name,
+                title,
                 origin_tenant_id, origin_external_identity_id, lifecycle_status,
                 native_session_id, active_turn_id, history_checkpoint,
                 configuration_fingerprint, runtime_owner_id, ownership_generation,
@@ -19754,6 +20373,7 @@ async fn load_hub_session_tx(
                 (SELECT name FROM external_platforms
                  WHERE external_platforms.id = hub_sessions.origin_platform_id)
                     AS origin_platform_name,
+                title,
                 origin_tenant_id, origin_external_identity_id, lifecycle_status,
                 native_session_id, active_turn_id, history_checkpoint,
                 configuration_fingerprint, runtime_owner_id, ownership_generation,
@@ -22975,6 +23595,7 @@ fn hub_session_from_row(row: sqlx::postgres::PgRow) -> HubSessionDto {
         agent_id: row.get("agent_id"),
         agent_name: row.get("agent_name"),
         agent_deleted_at: row.get("agent_deleted_at"),
+        title: row.get("title"),
         origin_platform_name: row.get("origin_platform_name"),
         origin,
         lifecycle_status: row.get("lifecycle_status"),
@@ -23930,6 +24551,7 @@ mod tests {
             "/api/agents/{agent_id}/model-options",
             "/api/sessions",
             "/api/sessions/{session_id}",
+            "/api/sessions/{session_id}/title",
             "/api/sessions/{session_id}/messages",
             "/api/runs/{run_id}/stop",
             "/api/runs/{run_id}/events/stream",
@@ -32847,6 +33469,7 @@ mod tests {
             runtime_write_generation(
                 1,
                 AppendRunEventRequest {
+                    event_id: Uuid::new_v4(),
                     event_type: "reasoning".into(),
                     role: Some("assistant".into()),
                     content: Some("technical progress".into()),
@@ -32872,6 +33495,7 @@ mod tests {
             runtime_write_generation(
                 1,
                 AppendRunEventRequest {
+                    event_id: Uuid::new_v4(),
                     event_type: "message".into(),
                     role: Some("assistant".into()),
                     content: Some("final assistant output".into()),
@@ -32949,6 +33573,7 @@ mod tests {
                 runtime_write_generation(
                     1,
                     AppendRunEventRequest {
+                        event_id: Uuid::new_v4(),
                         event_type: event_type.into(),
                         role: role.map(str::to_owned),
                         content: None,
@@ -33057,6 +33682,7 @@ mod tests {
             runtime_write_generation(
                 1,
                 AppendRunEventRequest {
+                    event_id: Uuid::new_v4(),
                     event_type: "message".into(),
                     role: Some("assistant".into()),
                     content: Some("stale event".into()),
@@ -33155,6 +33781,7 @@ mod tests {
             runtime_write_generation(
                 1,
                 AppendRunEventRequest {
+                    event_id: Uuid::new_v4(),
                     event_type: "turn_started".into(),
                     role: None,
                     content: None,
@@ -33434,6 +34061,7 @@ mod tests {
             runtime_write_generation(
                 1,
                 AppendRunEventRequest {
+                    event_id: Uuid::new_v4(),
                     event_type: "turn_started".into(),
                     role: None,
                     content: None,
@@ -33923,6 +34551,474 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn hub_owner_deletes_own_ended_session_with_references_and_isolation(pool: PgPool) {
+        let owner = create_hub_user(
+            &pool,
+            Some("hub-delete-owner@example.com"),
+            None,
+            Some("password-hash"),
+            true,
+        )
+        .await
+        .unwrap();
+        let other = create_hub_user(
+            &pool,
+            Some("hub-delete-other@example.com"),
+            None,
+            Some("password-hash"),
+            true,
+        )
+        .await
+        .unwrap();
+        for (token, user_id) in [
+            ("hub-delete-owner", owner.id),
+            ("hub-delete-other", other.id),
+        ] {
+            sqlx::query(
+                "INSERT INTO sessions (token_hash, user_id, expires_at)
+                 VALUES ($1, $2, now() + interval '1 hour')",
+            )
+            .bind(sha256_hex(token))
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let agent_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO agents (id, owner_id, name, instructions, visibility)
+             VALUES ($1, $2, 'Delete Agent', 'test', 'private')",
+        )
+        .bind(agent_id)
+        .bind(owner.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let ended_session_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO hub_sessions
+                 (id, owner_id, agent_id, origin_kind, lifecycle_status)
+             VALUES ($1, $2, $3, 'hub_native', 'offline')",
+        )
+        .bind(ended_session_id)
+        .bind(owner.id)
+        .bind(agent_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let turn_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO hub_session_turns
+                 (id, session_id, status, ownership_generation)
+             VALUES ($1, $2, 'completed', 0)",
+        )
+        .bind(turn_id)
+        .bind(ended_session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let run_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO runs
+                 (id, agent_id, owner_id, status, initial_message, source,
+                  hub_session_id, hub_turn_id, session_ownership_generation)
+             VALUES ($1, $2, $3, 'completed', 'hello', 'console', $4, $5, 0)",
+        )
+        .bind(run_id)
+        .bind(agent_id)
+        .bind(owner.id)
+        .bind(ended_session_id)
+        .bind(turn_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let message_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO hub_session_messages
+                 (id, session_id, role, message_kind, content, delivery_mode,
+                  delivery_state, turn_id, run_id)
+             VALUES ($1, $2, 'user', 'message', 'hello', 'next_turn',
+                     'delivered', $3, $4)",
+        )
+        .bind(message_id)
+        .bind(ended_session_id)
+        .bind(turn_id)
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO integration_tool_requests
+                 (id, session_id, hub_session_id, run_id, tool_name, status, expires_at)
+             VALUES ($1, NULL, $2, $3, 'example_tool', 'completed',
+                     now() + interval '1 hour')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(ended_session_id)
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO embed_sessions
+                 (token_hash, agent_id, owner_id, expires_at, hub_session_id)
+             VALUES ($1, $2, $3, now() + interval '1 hour', $4)",
+        )
+        .bind(sha256_hex("hub-delete-embed-token"))
+        .bind(agent_id)
+        .bind(owner.id)
+        .bind(ended_session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let other_session_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO hub_sessions
+                 (id, owner_id, agent_id, origin_kind, lifecycle_status)
+             VALUES ($1, $2, $3, 'hub_native', 'offline')",
+        )
+        .bind(other_session_id)
+        .bind(other.id)
+        .bind(agent_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let active_session_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO hub_sessions
+                 (id, owner_id, agent_id, origin_kind, lifecycle_status)
+             VALUES ($1, $2, $3, 'hub_native', 'online')",
+        )
+        .bind(active_session_id)
+        .bind(owner.id)
+        .bind(agent_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let app = build_router(test_state_with_browser_session_auth(pool.clone()));
+        let delete_request = |token: &str, session_id: Uuid| {
+            axum::http::Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/api/sessions/{session_id}"))
+                .header(header::COOKIE, format!("agent_hub_session={token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let get_request = |token: &str, session_id: Uuid| {
+            axum::http::Request::builder()
+                .uri(format!("/api/sessions/{session_id}"))
+                .header(header::COOKIE, format!("agent_hub_session={token}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let forbidden = app
+            .clone()
+            .oneshot(delete_request("hub-delete-owner", other_session_id))
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::NOT_FOUND);
+        assert!(sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM hub_sessions WHERE id = $1)"
+        )
+        .bind(other_session_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap());
+
+        let rejected = app
+            .clone()
+            .oneshot(delete_request("hub-delete-owner", active_session_id))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+
+        let rename_request = |token: &str, session_id: Uuid, title: &str| {
+            axum::http::Request::builder()
+                .method(Method::PUT)
+                .uri(format!("/api/sessions/{session_id}/title"))
+                .header(header::COOKIE, format!("agent_hub_session={token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(r#"{{"title":"{title}"}}"#)))
+                .unwrap()
+        };
+        let renamed = app
+            .clone()
+            .oneshot(rename_request(
+                "hub-delete-owner",
+                ended_session_id,
+                "Troubleshoot login",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(renamed.status(), StatusCode::OK);
+        let renamed: HubSessionDto = serde_json::from_slice(
+            &axum::body::to_bytes(renamed.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(renamed.title.as_deref(), Some("Troubleshoot login"));
+        let empty_title = app
+            .clone()
+            .oneshot(rename_request("hub-delete-owner", ended_session_id, "  "))
+            .await
+            .unwrap();
+        assert_eq!(empty_title.status(), StatusCode::BAD_REQUEST);
+
+        let deleted = app
+            .clone()
+            .oneshot(delete_request("hub-delete-owner", ended_session_id))
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+        for (table, column, id) in [
+            ("hub_sessions", "id", ended_session_id),
+            ("hub_session_turns", "session_id", ended_session_id),
+            ("hub_session_messages", "session_id", ended_session_id),
+            ("runs", "hub_session_id", ended_session_id),
+            ("embed_sessions", "hub_session_id", ended_session_id),
+        ] {
+            let exists: bool = sqlx::query_scalar(&format!(
+                "SELECT EXISTS(SELECT 1 FROM {table} WHERE {column} = $1)"
+            ))
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(!exists, "{table} should have been removed");
+        }
+        let after = app
+            .oneshot(get_request("hub-delete-owner", ended_session_id))
+            .await
+            .unwrap();
+        assert_eq!(after.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn runtime_force_release_reclaims_failed_session_without_bundle_and_clears_outbox(
+        pool: PgPool,
+    ) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        sqlx::query("UPDATE hub_sessions SET lifecycle_status = 'online' WHERE id = $1")
+            .bind(fixture.hub_session_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        let _ = runtime_complete_run(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(claim.run.id),
+            runtime_write_generation(
+                1,
+                CompleteRunRequest {
+                    status: "failed".into(),
+                    native_session_id: None,
+                    work_dir_ref: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let before: (Option<Uuid>, String, i64) = sqlx::query_as(
+            "SELECT runtime_owner_id, lifecycle_status, ownership_generation
+             FROM hub_sessions WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(before.0, Some(fixture.runtime_id));
+        assert_eq!(before.1, "online");
+        assert_eq!(before.2, 1);
+
+        let released = runtime_release_session(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(fixture.hub_session_id),
+            Json(ReleaseRuntimeSessionRequest {
+                ownership_generation: 1,
+                force: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(released.runtime_owner_id, None);
+        assert_eq!(released.ownership_generation, 2);
+        assert!(matches!(
+            released.lifecycle_status.as_str(),
+            "offline" | "waiting_for_runtime"
+        ));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn runtime_reaper_marks_unrecoverable_sessions_and_releases_recoverable_ones(
+        pool: PgPool,
+    ) {
+        let owner_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let runtime_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO users (id, email, password, display_name, role)
+             VALUES ($1, $2, 'unused', 'Reaper Test Owner', 'member')",
+        )
+        .bind(owner_id)
+        .bind(format!("reaper-{}@example.com", Uuid::new_v4().simple()))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agents (id, owner_id, name, instructions, visibility)
+             VALUES ($1, $2, 'Reaper Agent', 'test', 'private')",
+        )
+        .bind(agent_id)
+        .bind(owner_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runtimes
+                 (id, token_hash, hostname, labels, engine_version, capabilities,
+                  sandbox_mode, status, last_heartbeat_at)
+             VALUES ($1, $2, 'reaper-runtime', '{}', 'test', '{}'::jsonb,
+                     'workspace-write', 'online', now() - interval '2 minutes')",
+        )
+        .bind(runtime_id)
+        .bind(sha256_hex("reaper-runtime-token"))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let unrecoverable_session = Uuid::new_v4();
+        let recoverable_session = Uuid::new_v4();
+        for session_id in [unrecoverable_session, recoverable_session] {
+            sqlx::query(
+                "INSERT INTO hub_sessions
+                     (id, owner_id, agent_id, origin_kind, lifecycle_status,
+                      runtime_owner_id, ownership_generation)
+                 VALUES ($1, $2, $3, 'hub_native', 'online', $4, 1)",
+            )
+            .bind(session_id)
+            .bind(owner_id)
+            .bind(agent_id)
+            .bind(runtime_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let turn_id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO hub_session_turns
+                     (id, session_id, status, ownership_generation)
+                 VALUES ($1, $2, 'pending', 1)",
+            )
+            .bind(turn_id)
+            .bind(session_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let run_id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO runs
+                     (id, agent_id, owner_id, status, initial_message, source,
+                      hub_session_id, hub_turn_id, session_ownership_generation)
+                 VALUES ($1, $2, $3, 'pending', 'next', 'console', $4, $5, 1)",
+            )
+            .bind(run_id)
+            .bind(agent_id)
+            .bind(owner_id)
+            .bind(session_id)
+            .bind(turn_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO hub_session_messages
+                 (id, session_id, role, message_kind, content, delivery_mode,
+                  delivery_state, turn_id, run_id)
+             SELECT $1, id, 'user', 'message', 'delivered without bundle',
+                    'next_turn', 'delivered', $2, $3
+             FROM hub_sessions WHERE id = $4",
+        )
+        .bind(Uuid::new_v4())
+        .bind(
+            sqlx::query_scalar::<_, Uuid>("SELECT hub_turn_id FROM runs WHERE hub_session_id = $1")
+                .bind(unrecoverable_session)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+        )
+        .bind(
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM runs WHERE hub_session_id = $1")
+                .bind(unrecoverable_session)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+        )
+        .bind(unrecoverable_session)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO hub_session_messages
+                 (id, session_id, role, message_kind, content, delivery_mode,
+                  delivery_state)
+             SELECT $1, id, 'user', 'message', 'queued and replayable',
+                    'next_turn', 'queued'
+             FROM hub_sessions WHERE id = $2",
+        )
+        .bind(Uuid::new_v4())
+        .bind(recoverable_session)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        reap_stale_runtimes(&pool).await.unwrap();
+
+        let unrecoverable: (Option<Uuid>, String, Option<String>) = sqlx::query_as(
+            "SELECT runtime_owner_id, lifecycle_status, recovery_error
+             FROM hub_sessions WHERE id = $1",
+        )
+        .bind(unrecoverable_session)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unrecoverable.0, None);
+        assert_eq!(unrecoverable.1, "recovery_failed");
+        assert_eq!(
+            unrecoverable.2.as_deref(),
+            Some("服务端发生意外，导致 agent 环境数据丢失，但对话历史还在")
+        );
+        let recoverable: (Option<Uuid>, String) = sqlx::query_as(
+            "SELECT runtime_owner_id, lifecycle_status
+             FROM hub_sessions WHERE id = $1",
+        )
+        .bind(recoverable_session)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(recoverable.0, None);
+        assert_eq!(recoverable.1, "waiting_for_runtime");
+        let pending_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM runs
+             WHERE hub_session_id = $1 AND status = 'pending'",
+        )
+        .bind(unrecoverable_session)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pending_count, 0);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn widget_stop_is_scoped_to_the_embed_session_token(pool: PgPool) {
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
         let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM hub_sessions WHERE id = $1")
@@ -34307,6 +35403,7 @@ mod tests {
             runtime_write_generation(
                 1,
                 AppendRunEventRequest {
+                    event_id: Uuid::new_v4(),
                     event_type: "turn_started".into(),
                     role: None,
                     content: None,
@@ -35247,6 +36344,7 @@ mod tests {
             runtime_write_generation(
                 2,
                 AppendRunEventRequest {
+                    event_id: Uuid::new_v4(),
                     event_type: "message".into(),
                     role: Some("assistant".into()),
                     content: Some("old owner".into()),
@@ -37234,11 +38332,14 @@ mod tests {
             Path(fixture.hub_session_id),
             Json(ReleaseRuntimeSessionRequest {
                 ownership_generation: 2,
+                force: false,
             }),
         )
         .await
-        .unwrap_err();
-        assert_eq!(stale_generation.status, StatusCode::FORBIDDEN);
+        .unwrap()
+        .0;
+        assert_eq!(stale_generation.ownership_generation, 1);
+        assert_eq!(stale_generation.runtime_owner_id, Some(fixture.runtime_id));
 
         let foreign_runtime_id = Uuid::new_v4();
         let foreign_runtime_token = format!("ahrt_{}", Uuid::new_v4().simple());
@@ -37261,11 +38362,13 @@ mod tests {
             Path(fixture.hub_session_id),
             Json(ReleaseRuntimeSessionRequest {
                 ownership_generation: 1,
+                force: false,
             }),
         )
         .await
-        .unwrap_err();
-        assert_eq!(stale_owner.status, StatusCode::FORBIDDEN);
+        .unwrap()
+        .0;
+        assert_eq!(stale_owner.runtime_owner_id, Some(fixture.runtime_id));
 
         sqlx::query(
             "UPDATE hub_sessions SET current_bundle_ownership_generation = 2 WHERE id = $1",
@@ -37280,6 +38383,7 @@ mod tests {
             Path(fixture.hub_session_id),
             Json(ReleaseRuntimeSessionRequest {
                 ownership_generation: 1,
+                force: false,
             }),
         )
         .await
@@ -37305,6 +38409,7 @@ mod tests {
             Path(fixture.hub_session_id),
             Json(ReleaseRuntimeSessionRequest {
                 ownership_generation: 1,
+                force: false,
             }),
         )
         .await
@@ -37334,6 +38439,7 @@ mod tests {
             Path(fixture.hub_session_id),
             Json(ReleaseRuntimeSessionRequest {
                 ownership_generation: 1,
+                force: false,
             }),
         )
         .await
@@ -37362,6 +38468,7 @@ mod tests {
             Path(fixture.hub_session_id),
             Json(ReleaseRuntimeSessionRequest {
                 ownership_generation: 1,
+                force: false,
             }),
         )
         .await
@@ -37787,6 +38894,7 @@ mod tests {
             Path(fixture.hub_session_id),
             Json(ReleaseRuntimeSessionRequest {
                 ownership_generation: 1,
+                force: false,
             }),
         )
         .await
@@ -38313,6 +39421,7 @@ mod tests {
             Path(fixture.hub_session_id),
             Json(ReleaseRuntimeSessionRequest {
                 ownership_generation: 1,
+                force: false,
             }),
         )
         .await
@@ -38411,6 +39520,7 @@ mod tests {
             Path(fixture.hub_session_id),
             Json(ReleaseRuntimeSessionRequest {
                 ownership_generation: 1,
+                force: false,
             }),
         )
         .await
@@ -38470,6 +39580,7 @@ mod tests {
             Path(fixture.hub_session_id),
             Json(ReleaseRuntimeSessionRequest {
                 ownership_generation: 1,
+                force: false,
             }),
         )
         .await
@@ -39570,6 +40681,7 @@ mod tests {
             Path(fixture.hub_session_id),
             Json(ReleaseRuntimeSessionRequest {
                 ownership_generation: 1,
+                force: false,
             }),
         )
         .await
@@ -39697,6 +40809,7 @@ mod tests {
                 Path(session_id),
                 Json(ReleaseRuntimeSessionRequest {
                     ownership_generation: 1,
+                    force: false,
                 }),
             )
             .await
@@ -40385,6 +41498,7 @@ mod tests {
             runtime_write_generation(
                 1,
                 AppendRunEventRequest {
+                    event_id: Uuid::new_v4(),
                     event_type: "message".into(),
                     role: Some("assistant".into()),
                     content: Some("late".into()),
@@ -40402,6 +41516,7 @@ mod tests {
             Path(checkpointed_session_id),
             Json(ReleaseRuntimeSessionRequest {
                 ownership_generation: 1,
+                force: false,
             }),
         )
         .await
@@ -40467,6 +41582,7 @@ mod tests {
             Path(fixture.hub_session_id),
             Json(ReleaseRuntimeSessionRequest {
                 ownership_generation: 1,
+                force: false,
             }),
         )
         .await
@@ -50890,6 +52006,7 @@ mod tests {
 
     fn tool_request_event(tool_request_id: Uuid) -> AppendRunEventRequest {
         AppendRunEventRequest {
+            event_id: Uuid::new_v4(),
             event_type: "tool_request".into(),
             role: Some("assistant".into()),
             content: Some("lookup requested".into()),
