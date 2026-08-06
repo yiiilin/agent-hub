@@ -1089,6 +1089,21 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
     if (!messagesLoading) historyPagingReadyRef.current = true;
   }, [messagesLoading, selectedId, showThinking, timelineItems]);
 
+  useEffect(() => {
+    const scroll = chatScrollRef.current;
+    if (!scroll) return;
+    // While bottom-following, any content growth (streaming, markdown layout,
+    // session switch) keeps the view pinned to the very bottom. The flag is
+    // only cleared by an actual upward user scroll.
+    const observer = new ResizeObserver(() => {
+      if (!historyAnchorRef.current && followBottomRef.current) {
+        scroll.scrollTop = scroll.scrollHeight;
+      }
+    });
+    observer.observe(scroll);
+    return () => observer.disconnect();
+  }, []);
+
   function lifecycleLabel(status: string) {
     return t(lifecycleKeys[status] ?? 'sessionStatusUnknown');
   }
@@ -1136,6 +1151,7 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
         if (!mountedRef.current || pendingDraftGeneration !== conversationDraftGeneration.current) return;
         setDraft('');
         setConversationDraft(null);
+        followBottomRef.current = true;
         return;
       }
       const accepted = await api.createSessionMessage(selectedSession!.id, { content });
@@ -1144,6 +1160,7 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
         ? current
         : [...current, accepted.message]);
       setDraft('');
+      followBottomRef.current = true;
     } catch (caught) {
       if (!mountedRef.current) return;
       if (caught instanceof ApiError && caught.code === 'secret_grants_required' && caught.details?.secret_grants_required?.length) {
