@@ -13583,6 +13583,17 @@ async fn runtime_complete_run(
     )
     .await?;
     if matches!(status, "completed" | "failed" | "interrupted") {
+        // Safety net: drop any message deltas that never reached a final
+        // assistant message (for example on interruption).
+        sqlx::query(
+            "DELETE FROM run_events
+             WHERE run_id = $1 AND event_type = 'message_delta'",
+        )
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    if matches!(status, "completed" | "failed" | "interrupted") {
         move_queued_steers_to_next_turn_tx(
             &mut tx,
             hub_session_id,
@@ -16307,7 +16318,40 @@ async fn insert_run_event_for_active_runtime(
         && content
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty());
+    let event_type_name = event_type.clone();
+    let role_name = role.clone();
     let event = insert_run_event_tx(tx, run_id, event_type, role, content, payload).await?;
+    // Streaming deltas are transient: once an item phase completes, its
+    // summary/output deltas are pruned so a Run stays one row per phase
+    // instead of tens of thousands of tiny deltas. The completed item row
+    // carries the full content, and message_delta rows are only consumed by
+    // the live stream before the final assistant message replaces them.
+    if event_type_name == "item" {
+        let item_id = event.payload.get("item_id").and_then(Value::as_str);
+        let phase = event.payload.get("phase").and_then(Value::as_str);
+        if phase == Some("completed") {
+            if let Some(item_id) = item_id {
+                sqlx::query(
+                    "DELETE FROM run_events
+                     WHERE run_id = $1 AND event_type = 'item'
+                       AND payload->>'item_id' = $2
+                       AND payload->>'phase' IN ('summary_delta', 'output_delta')",
+                )
+                .bind(run_id)
+                .bind(item_id)
+                .execute(&mut **tx)
+                .await?;
+            }
+        }
+    } else if event_type_name == "message" && role_name.as_deref() == Some("assistant") {
+        sqlx::query(
+            "DELETE FROM run_events
+             WHERE run_id = $1 AND event_type = 'message_delta'",
+        )
+        .bind(run_id)
+        .execute(&mut **tx)
+        .await?;
+    }
     if refresh_session_activity {
         sqlx::query("UPDATE hub_sessions SET updated_at = now() WHERE id = $1")
             .bind(session_id)
@@ -32748,6 +32792,99 @@ mod tests {
                 .await
                 .unwrap();
         assert!(after_input > after_completion);
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn run_event_deltas_are_pruned_when_their_phase_completes(pool: PgPool) {
+        let fixture = integration_runtime_fixture(pool).await;
+        let append = |event_type: &str, role: Option<&str>, payload: Value| {
+            runtime_append_event(
+                State(fixture.state.clone()),
+                bearer_headers(&fixture.runtime_token),
+                Path(fixture.run_id),
+                runtime_write_generation(
+                    1,
+                    AppendRunEventRequest {
+                        event_type: event_type.into(),
+                        role: role.map(str::to_owned),
+                        content: None,
+                        payload,
+                        waiting_tool: None,
+                    },
+                ),
+            )
+        };
+        async fn count_run_item_events(pool: &PgPool, run_id: Uuid, item_id: &str) -> i64 {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM run_events
+                 WHERE run_id = $1 AND payload->>'item_id' = $2",
+            )
+            .bind(run_id)
+            .bind(item_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+        for index in 0..100 {
+            let _ = append(
+                "item",
+                Some("assistant"),
+                json!({
+                    "phase": "summary_delta",
+                    "item_id": "reasoning-1",
+                    "item_type": "reasoning",
+                    "summary": format!("chunk {index}"),
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            count_run_item_events(&fixture.state.pool, fixture.run_id, "reasoning-1").await,
+            100
+        );
+        let _ = append(
+            "item",
+            Some("assistant"),
+            json!({
+                "phase": "completed",
+                "item_id": "reasoning-1",
+                "item_type": "reasoning",
+                "summary": ["full reasoning"],
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            count_run_item_events(&fixture.state.pool, fixture.run_id, "reasoning-1").await,
+            1
+        );
+
+        for index in 0..50 {
+            let _ = append(
+                "message_delta",
+                Some("assistant"),
+                json!({ "source": "pi", "stream": true, "content": format!("c{index}") }),
+            )
+            .await
+            .unwrap();
+        }
+        let _ = append(
+            "message",
+            Some("assistant"),
+            json!({ "source": "pi", "stop_reason": "stop" }),
+        )
+        .await
+        .unwrap();
+        let deltas = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM run_events
+             WHERE run_id = $1 AND event_type = 'message_delta'",
+        )
+        .bind(fixture.run_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(deltas, 0);
     }
 
     #[sqlx::test(migrations = "./migrations")]
