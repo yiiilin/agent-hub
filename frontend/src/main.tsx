@@ -20,7 +20,7 @@ import { WidgetApp } from './widget';
 import { UsageDocsPage } from './usage-docs';
 import './styles.css';
 
-type Route = { name: 'login' } | { name: 'agents' } | { name: 'agent'; agentId: string } | { name: 'sessions' } | { name: 'integrations' } | { name: 'skills' } | { name: 'skill'; skillId: string } | { name: 'secrets' } | { name: 'models' } | { name: 'apiKeys' } | { name: 'guide' } | { name: 'docs' } | { name: 'automations' } | { name: 'runtimes' } | { name: 'administration' } | { name: 'widget'; token?: string; appClientId?: string } | { name: 'notFound' };
+type Route = { name: 'login' } | { name: 'agents' } | { name: 'agent'; agentId: string } | { name: 'sessions'; sessionId?: string } | { name: 'integrations' } | { name: 'skills' } | { name: 'skill'; skillId: string } | { name: 'secrets' } | { name: 'models' } | { name: 'apiKeys' } | { name: 'guide' } | { name: 'docs' } | { name: 'automations' } | { name: 'runtimes' } | { name: 'administration' } | { name: 'widget'; token?: string; appClientId?: string } | { name: 'notFound' };
 
 function parseRoute(): Route {
   const path = window.location.pathname;
@@ -42,6 +42,8 @@ function parseRoute(): Route {
   if (path.startsWith('/api-keys')) return { name: 'apiKeys' };
   if (path === '/models' || path === '/models/') return { name: 'models' };
   if (path.startsWith('/models/')) return { name: 'notFound' };
+  const sessionMatch = path.match(/^\/sessions\/([^/]+)\/?$/);
+  if (sessionMatch) return { name: 'sessions', sessionId: decodeURIComponent(sessionMatch[1]) };
   if (path.startsWith('/sessions')) return { name: 'sessions' };
   if (path === '/integrations' || path === '/integrations/') return { name: 'integrations' };
   if (path.startsWith('/integrations/')) return { name: 'notFound' };
@@ -111,7 +113,7 @@ function App() {
   return (
     <Shell user={user} onUserUpdated={setUser}>
       {route.name === 'agents' && <AgentsPage currentUser={user} navigate={navigate} />}
-      {route.name === 'sessions' && <SessionsPage currentUserId={user.id} />}
+      {route.name === 'sessions' && <SessionsPage currentUserId={user.id} initialSessionId={route.sessionId} />}
       {route.name === 'integrations' && <IntegrationAppsPage currentUser={user} />}
       {/* agentId 变化时重建详情页，避免旧 Agent 的表单、运行列表和 controls 在新路由加载期间残留。 */}
       {route.name === 'agent' && <AgentDetailPage key={route.agentId} agentId={route.agentId} currentUser={user} navigate={navigate} setNavigationBlocker={setNavigationBlocker} RunConsole={RunConsole} />}

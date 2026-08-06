@@ -1,4 +1,4 @@
-import { ArrowUp, Bot, Brain, ChevronDown, ChevronRight, FilePenLine, ImageIcon, ListChecks, Minimize2, PanelLeft, Plus, RefreshCw, Search, Square, Terminal, Trash2, Users, Wrench, X } from 'lucide-react';
+import { ArrowUp, Bot, Brain, ChevronDown, ChevronRight, FilePenLine, ImageIcon, Link2, ListChecks, Minimize2, PanelLeft, Plus, RefreshCw, Search, Square, Terminal, Trash2, Users, Wrench, X } from 'lucide-react';
 import { FormEvent, lazy, Suspense, type TouchEvent, type WheelEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError, type Agent, type HubSession, type HubSessionMessage, type RunEvent, type SecretGrantRequirement } from './api/client';
 import { FormDialog } from './components/form-dialog';
@@ -476,9 +476,22 @@ function ActivityIcon({ kind }: { kind: ActivityKind }) {
   return <Minimize2 size={15} />;
 }
 
+const visualCharsPerLine = 100;
+
+function wrapLongLines(text: string): string {
+  return text.split('\n').map((line) => {
+    if (line.length <= visualCharsPerLine) return line;
+    const chunks: string[] = [];
+    for (let start = 0; start < line.length; start += visualCharsPerLine) {
+      chunks.push(line.slice(start, start + visualCharsPerLine));
+    }
+    return chunks.join('\n');
+  }).join('\n');
+}
+
 function useLatestLines(text: string, maxLines = 15) {
   const [expanded, setExpanded] = useState(false);
-  const lines = text.split('\n');
+  const lines = wrapLongLines(text).split('\n');
   const hidden = Math.max(0, lines.length - maxLines);
   const visible = expanded || hidden === 0 ? text : lines.slice(-maxLines).join('\n');
   return { visible, hidden, expanded, toggle: () => setExpanded((value) => !value) };
@@ -628,7 +641,7 @@ function eventRefreshesSession(event: RunEvent) {
   return status !== null && terminalRunStatuses.has(status);
 }
 
-export function SessionsPage({ currentUserId }: { currentUserId: string }) {
+export function SessionsPage({ currentUserId, initialSessionId }: { currentUserId: string; initialSessionId?: string }) {
   const { locale, t } = useI18n();
   const mountedRef = useRef(true);
   const sessionLoadGeneration = useRef(0);
@@ -724,7 +737,7 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
 
   useEffect(() => {
     mountedRef.current = true;
-    void loadSessions();
+    void loadSessions(initialSessionId);
     return () => {
       mountedRef.current = false;
       sessionLoadGeneration.current += 1;
@@ -732,7 +745,7 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
       eventLoadGeneration.current += 1;
       streamGeneration.current += 1;
     };
-  }, [loadSessions]);
+  }, [loadSessions, initialSessionId]);
 
   useEffect(() => {
     const generation = ++messageLoadGeneration.current;
@@ -1302,15 +1315,35 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
     }
   }
 
-  function openSessionRename(sessionId: string) {
-    const session = sessions.find((candidate) => candidate.id === sessionId);
-    if (!session) return;
+ function openSessionRename(sessionId: string) {
+   const session = sessions.find((candidate) => candidate.id === sessionId);
+   if (!session) return;
+   setSessionContextMenu(null);
+   setRenamingSessionId(sessionId);
+   setRenameDraft(session.title ?? session.agent_name);
+ }
+
+  function copySessionLink(sessionId: string) {
+    const url = `${window.location.origin}/sessions/${sessionId}`;
     setSessionContextMenu(null);
-    setRenamingSessionId(sessionId);
-    setRenameDraft(session.title ?? session.agent_name);
+    const copy = () => {
+      const textarea = document.createElement('textarea');
+      textarea.value = url;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      try { document.execCommand('copy'); } catch { /* clipboard unavailable */ }
+      document.body.removeChild(textarea);
+    };
+    if (navigator.clipboard?.writeText) {
+      void navigator.clipboard.writeText(url).catch(copy);
+    } else {
+      copy();
+    }
   }
 
-  return <section className="session-workspace session-chat-workspace" aria-labelledby="session-page-title">
+ return <section className="session-workspace session-chat-workspace" aria-labelledby="session-page-title">
     <h1 className="sr-only" id="session-page-title">{t('sessions')}</h1>
     {loadError && <div className="operation-alert" role="alert"><span>{t('sessionsLoadFailed')}</span><button type="button" onClick={() => void loadSessions()}>{t('retry')}</button></div>}
     <div className="session-layout">
@@ -1331,8 +1364,9 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
           {filteredSessions.map((session) => <button className={`session-row${session.id === selectedId ? ' selected' : ''}`} type="button" key={session.id} aria-pressed={session.id === selectedId} onContextMenu={(event) => {
             event.preventDefault();
             setSessionContextMenu({ sessionId: session.id, x: event.clientX, y: event.clientY });
-          }} onClick={() => {
-            conversationDraftGeneration.current += 1;
+         }} onClick={() => {
+            window.history.replaceState(null, '', `/sessions/${session.id}`);
+           conversationDraftGeneration.current += 1;
             setConversationDraft(null);
             setConversationCreateError(false);
             setDraft('');
@@ -1417,6 +1451,7 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
     {sessionContextMenu && <>
       <div className="session-context-menu-backdrop" onMouseDown={() => setSessionContextMenu(null)} onContextMenu={(event) => { event.preventDefault(); setSessionContextMenu(null); }} />
       <div className="session-context-menu" role="menu" style={{ top: sessionContextMenu.y, left: sessionContextMenu.x }}>
+        <button type="button" role="menuitem" onClick={() => copySessionLink(sessionContextMenu.sessionId)}><Link2 size={14} /> {t('copySessionLink')}</button>
         <button type="button" role="menuitem" onClick={() => openSessionRename(sessionContextMenu.sessionId)}><FilePenLine size={14} /> {t('renameSession')}</button>
         <button type="button" role="menuitem" className="danger" disabled={deletingSessionId === sessionContextMenu.sessionId} onClick={() => void deleteSelectedSession(sessionContextMenu.sessionId)}><Trash2 size={14} /> {deletingSessionId === sessionContextMenu.sessionId ? t('deletingSession') : t('deleteSession')}</button>
       </div>
