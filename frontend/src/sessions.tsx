@@ -655,6 +655,7 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
   const followBottomRef = useRef(true);
   const historyPagingReadyRef = useRef(false);
   const lastChatScrollTopRef = useRef(0);
+  const titlePollTimerRef = useRef<number | null>(null);
   const olderMessagesLoadingRef = useRef(false);
   const historyAnchorRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
   const chatTouchStartYRef = useRef<number | null>(null);
@@ -976,6 +977,38 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
   useEffect(() => {
     resizeComposer(composerRef.current);
   }, [conversationDraft, draft, selectedId]);
+
+  function startTitlePoll(sessionId: string) {
+    if (titlePollTimerRef.current !== null) return;
+    let attempts = 0;
+    const poll = () => {
+      if (!mountedRef.current) return;
+      void api.session(sessionId).then((updated) => {
+        if (!mountedRef.current) return;
+        setSessions((current) => current.map((session) => (
+          session.id === updated.id ? updated : session
+        )));
+        if (updated.title) {
+          titlePollTimerRef.current = null;
+          return;
+        }
+        attempts += 1;
+        if (attempts < 6) {
+          titlePollTimerRef.current = window.setTimeout(poll, 8000);
+        } else {
+          titlePollTimerRef.current = null;
+        }
+      }).catch(() => {
+        attempts += 1;
+        if (attempts < 6) {
+          titlePollTimerRef.current = window.setTimeout(poll, 8000);
+        } else {
+          titlePollTimerRef.current = null;
+        }
+      });
+    };
+    titlePollTimerRef.current = window.setTimeout(poll, 8000);
+  }
 
   const sessionAgentOptions = useMemo(() => {
     const options = new Map<string, string>();

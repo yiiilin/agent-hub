@@ -11224,6 +11224,23 @@ async fn runtime_heartbeat(
         .execute(&mut *tx)
         .await?;
         if updated.rows_affected() != 1 {
+            let still_owned: Option<(Option<Uuid>, i64)> = sqlx::query_as(
+                "SELECT runtime_owner_id, ownership_generation
+                 FROM hub_sessions WHERE id = $1",
+            )
+            .bind(owned.session_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let owner_matches = still_owned.is_some_and(|(owner, generation)| {
+                owner == Some(runtime_id) && generation == owned.ownership_generation
+            });
+            if !owner_matches {
+                // This Runtime no longer owns that generation (released,
+                // reclaimed, or fenced). Do not fail the whole heartbeat:
+                // the owned-session snapshot below reflects Hub truth and
+                // lets the Runtime reconcile and drop its stale local copy.
+                continue;
+            }
             let hub_fenced: bool = sqlx::query_scalar(
                 "SELECT EXISTS(
                      SELECT 1 FROM hub_sessions
@@ -12110,24 +12127,6 @@ async fn runtime_salvage_session_bundle(
 ) -> Result<Json<RuntimeSessionBundleCommitResponseDto>, ApiError> {
     let runtime_id = require_runtime(&state, &headers).await?;
     let metadata = parse_session_bundle_upload_headers(&headers, state.session_bundle_max_bytes)?;
-    let obligation = sqlx::query(
-        "SELECT history_checkpoint, bundle_generation
-         FROM runtime_session_salvage_obligations
-         WHERE runtime_id = $1 AND session_id = $2 AND ownership_generation = $3",
-    )
-    .bind(runtime_id)
-    .bind(session_id)
-    .bind(metadata.ownership_generation)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or(ApiError::conflict("no salvage obligation"))?;
-    if metadata.bundle_generation != obligation.get::<i64, _>("bundle_generation")
-        || metadata.history_checkpoint < obligation.get::<i64, _>("history_checkpoint")
-    {
-        return Err(ApiError::conflict(
-            "Session Bundle does not match the salvage obligation",
-        ));
-    }
     let current = sqlx::query(
         "SELECT current_bundle_generation, current_bundle_checksum_sha256
          FROM hub_sessions WHERE id = $1",
@@ -12161,6 +12160,24 @@ async fn runtime_salvage_session_bundle(
             has_queued_work,
             ownership_released: true,
         }));
+    }
+    let obligation = sqlx::query(
+        "SELECT history_checkpoint, bundle_generation
+         FROM runtime_session_salvage_obligations
+         WHERE runtime_id = $1 AND session_id = $2 AND ownership_generation = $3",
+    )
+    .bind(runtime_id)
+    .bind(session_id)
+    .bind(metadata.ownership_generation)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(ApiError::conflict("no salvage obligation"))?;
+    if metadata.bundle_generation != obligation.get::<i64, _>("bundle_generation")
+        || metadata.history_checkpoint < obligation.get::<i64, _>("history_checkpoint")
+    {
+        return Err(ApiError::conflict(
+            "Session Bundle does not match the salvage obligation",
+        ));
     }
     let store =
         state
@@ -17959,6 +17976,14 @@ async fn reap_stale_runtimes(pool: &PgPool) -> Result<(), ApiError> {
                  END,
                  active_turn_id = NULL,
                  ownership_generation = ownership_generation + 1,
+                 saving_history_checkpoint = NULL,
+                 saving_ownership_generation = NULL,
+                 saving_reason = NULL,
+                 saving_checkpoint_attempt_id = NULL,
+                 last_checkpoint_attempt_id = NULL,
+                 last_checkpoint_ownership_generation = NULL,
+                 last_checkpoint_disposition = NULL,
+                 last_checkpoint_has_queued_work = NULL,
                  recovery_error = CASE
                      WHEN EXISTS (
                          SELECT 1 FROM hub_session_messages
@@ -35407,6 +35432,442 @@ mod tests {
         );
         assert_eq!(*stored.lock().unwrap(), bytes);
         object_server.abort();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn runtime_heartbeat_tolerates_stale_owned_sessions_instead_of_conflicting(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        sqlx::query("UPDATE hub_sessions SET lifecycle_status = 'online' WHERE id = $1")
+            .bind(fixture.hub_session_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        let _ = runtime_complete_run(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(claim.run.id),
+            runtime_write_generation(
+                1,
+                CompleteRunRequest {
+                    status: "failed".into(),
+                    native_session_id: None,
+                    work_dir_ref: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        // Release the session out from under the runtime (e.g. crash recovery).
+        let _ = runtime_release_session(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(fixture.hub_session_id),
+            Json(ReleaseRuntimeSessionRequest {
+                ownership_generation: 1,
+                force: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // The runtime still reports the old generation as owned.
+        let heartbeat = runtime_heartbeat(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Json(RuntimeHeartbeatRequest {
+                pending_credential_hash: None,
+                accepts_session_commands: true,
+                owned_sessions: vec![RuntimeOwnedSessionStateRequest {
+                    session_id: fixture.hub_session_id,
+                    ownership_generation: 1,
+                    lifecycle_status: "online".into(),
+                    checkpoint_reason: None,
+                }],
+                cleaned_sessions: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(
+            heartbeat
+                .owned_sessions
+                .iter()
+                .all(|session| session.session_id != fixture.hub_session_id),
+            "released Session must not appear in the owned snapshot"
+        );
+        let runtime_state: (String, chrono::DateTime<Utc>) =
+            sqlx::query_as("SELECT status, last_heartbeat_at FROM runtimes WHERE id = $1")
+                .bind(fixture.runtime_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(runtime_state.0, "online");
+        assert!(
+            runtime_state.1 > Utc::now() - chrono::Duration::seconds(30),
+            "heartbeat must keep the Runtime alive"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn runtime_reaper_reclaims_saving_sessions_and_clears_checkpoint_fields(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let _ = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        let attempt_id = Uuid::new_v4();
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET lifecycle_status = 'saving',
+                 saving_history_checkpoint = 1,
+                 saving_ownership_generation = 1,
+                 saving_reason = 'idle',
+                 saving_checkpoint_attempt_id = $1
+             WHERE id = $2",
+        )
+        .bind(attempt_id)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE runtimes SET last_heartbeat_at = now() - interval '2 minutes' WHERE id = $1",
+        )
+        .bind(fixture.runtime_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        reap_stale_runtimes(&fixture.state.pool).await.unwrap();
+
+        let session: (Option<Uuid>, String, Option<Uuid>, Option<String>) = sqlx::query_as(
+            "SELECT runtime_owner_id, lifecycle_status,
+                    saving_checkpoint_attempt_id, saving_reason
+             FROM hub_sessions WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(session.0, None);
+        assert!(matches!(
+            session.1.as_str(),
+            "offline" | "waiting_for_runtime"
+        ));
+        assert_eq!(session.2, None);
+        assert_eq!(session.3, None);
+        let runtime_status: String =
+            sqlx::query_scalar("SELECT status FROM runtimes WHERE id = $1")
+                .bind(fixture.runtime_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(runtime_status, "offline");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn runtime_reaper_fails_running_runs_and_allows_reclaiming_pending_work(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM runs WHERE id = $1")
+                .bind(claim.run.id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap(),
+            "running"
+        );
+        sqlx::query(
+            "UPDATE runtimes SET last_heartbeat_at = now() - interval '2 minutes' WHERE id = $1",
+        )
+        .bind(fixture.runtime_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        reap_stale_runtimes(&fixture.state.pool).await.unwrap();
+
+        let failed_run: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = $1")
+            .bind(claim.run.id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        assert_eq!(failed_run, "failed");
+        let session_owner: Option<Uuid> =
+            sqlx::query_scalar("SELECT runtime_owner_id FROM hub_sessions WHERE id = $1")
+                .bind(fixture.hub_session_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(session_owner, None);
+        let obligation: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM runtime_session_salvage_obligations
+             WHERE runtime_id = $1 AND session_id = $2",
+        )
+        .bind(fixture.runtime_id)
+        .bind(fixture.hub_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(obligation, 1);
+
+        // Bring the Runtime back and let it reclaim queued work.
+        sqlx::query(
+            "UPDATE runtimes SET status = 'online', last_heartbeat_at = now() WHERE id = $1",
+        )
+        .bind(fixture.runtime_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let _ = insert_pending_session_run(&fixture.state.pool, fixture.hub_session_id).await;
+        let reclaimed = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        assert_eq!(reclaimed.run.hub_session_id, Some(fixture.hub_session_id));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM runs WHERE status = 'pending'")
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn runtime_salvage_upload_is_idempotent_and_rejects_mismatched_obligations(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let stored = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let object_app = Router::new().route(
+            "/bundle-bucket/{*key}",
+            axum::routing::put({
+                let stored = Arc::clone(&stored);
+                move |body: Body| {
+                    let stored = Arc::clone(&stored);
+                    async move {
+                        *stored.lock().unwrap() =
+                            axum::body::to_bytes(body, 1024).await.unwrap().to_vec();
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let object_server =
+            tokio::spawn(async move { axum::serve(listener, object_app).await.unwrap() });
+        let store = crate::session_bundle_store::S3BundleStore::new(
+            crate::session_bundle_store::S3BundleStoreConfig {
+                endpoint: format!("http://{address}").parse().unwrap(),
+                bucket: "bundle-bucket".into(),
+                region: "us-test-1".into(),
+                access_key_id: "test-access".into(),
+                secret_access_key: "test-secret".into(),
+                session_token: None,
+                server_side_encryption: None,
+                kms_key_id: None,
+                allow_http: true,
+            },
+        )
+        .unwrap();
+        let mut state = (*fixture.state).clone();
+        state.session_bundle_store = Some(Arc::new(store));
+        state.session_bundle_max_bytes = 1024;
+        let state = Arc::new(state);
+
+        let bytes = Bytes::from_static(b"idempotent salvage body");
+        let checksum = format!("{:x}", Sha256::digest(&bytes));
+        let created_at = Utc::now();
+        let checkpoint_attempt_id = Uuid::new_v4();
+        let upload_headers = |generation: i64| {
+            let mut headers = bearer_headers(&fixture.runtime_token);
+            for (name, value) in [
+                ("content-length", bytes.len().to_string()),
+                ("x-agent-hub-ownership-generation", "2".into()),
+                (
+                    "x-agent-hub-checkpoint-attempt-id",
+                    checkpoint_attempt_id.to_string(),
+                ),
+                ("x-agent-hub-bundle-generation", generation.to_string()),
+                ("x-agent-hub-bundle-sha256", checksum.clone()),
+                ("x-agent-hub-bundle-size", bytes.len().to_string()),
+                ("x-agent-hub-history-checkpoint", "5".into()),
+                ("x-agent-hub-producing-engine-version", "0.104.0".into()),
+                ("x-agent-hub-bundle-created-at", created_at.to_rfc3339()),
+            ] {
+                headers.insert(
+                    HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    HeaderValue::from_str(&value).unwrap(),
+                );
+            }
+            headers
+        };
+
+        // No obligation yet: upload must be rejected.
+        let rejected = runtime_salvage_session_bundle(
+            State(state.clone()),
+            Path(fixture.hub_session_id),
+            upload_headers(2),
+            Body::from(bytes.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(rejected.status, StatusCode::CONFLICT);
+
+        sqlx::query(
+            "INSERT INTO runtime_session_salvage_obligations
+                 (runtime_id, session_id, ownership_generation, history_checkpoint,
+                  bundle_generation)
+             VALUES ($1, $2, 2, 5, 2)",
+        )
+        .bind(fixture.runtime_id)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        // Wrong bundle generation: rejected.
+        let mismatched = runtime_salvage_session_bundle(
+            State(state.clone()),
+            Path(fixture.hub_session_id),
+            upload_headers(3),
+            Body::from(bytes.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(mismatched.status, StatusCode::CONFLICT);
+
+        // Correct upload then replay: both succeed, one binding.
+        for _ in 0..2 {
+            let response = runtime_salvage_session_bundle(
+                State(state.clone()),
+                Path(fixture.hub_session_id),
+                upload_headers(2),
+                Body::from(bytes.clone()),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(response.bundle_generation, 2);
+        }
+        let binding: (Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT current_bundle_generation, current_bundle_checksum_sha256
+             FROM hub_sessions WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(binding, (Some(2), Some(checksum.clone())));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM runtime_session_salvage_obligations
+                 WHERE runtime_id = $1 AND session_id = $2",
+            )
+            .bind(fixture.runtime_id)
+            .bind(fixture.hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(*stored.lock().unwrap(), bytes);
+        object_server.abort();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn runtime_salvage_abandon_is_idempotent(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        sqlx::query(
+            "INSERT INTO runtime_session_salvage_obligations
+                 (runtime_id, session_id, ownership_generation, history_checkpoint,
+                  bundle_generation)
+             VALUES ($1, $2, 2, 5, 2)",
+        )
+        .bind(fixture.runtime_id)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        for _ in 0..2 {
+            let response = runtime_abandon_session_salvage(
+                State(fixture.state.clone()),
+                Path(fixture.hub_session_id),
+                bearer_headers(&fixture.runtime_token),
+                Json(AbandonRuntimeSalvageRequest {
+                    ownership_generation: 2,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response, StatusCode::NO_CONTENT);
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM runtime_session_salvage_obligations
+                 WHERE runtime_id = $1 AND session_id = $2",
+            )
+            .bind(fixture.runtime_id)
+            .bind(fixture.hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn session_recovery_notice_cleared_after_first_message(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET lifecycle_status = 'offline', runtime_owner_id = NULL,
+                 recovery_error = '服务端发生意外，导致 agent 环境数据丢失，但对话历史还在'
+             WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let mut tx = fixture.state.pool.begin().await.unwrap();
+        let _ = accept_session_message_tx(
+            &mut tx,
+            AcceptSessionMessage {
+                session_id: fixture.hub_session_id,
+                agent_id: fixture.agent_id,
+                owner_id: sqlx::query_scalar("SELECT owner_id FROM hub_sessions WHERE id = $1")
+                    .bind(fixture.hub_session_id)
+                    .fetch_one(&fixture.state.pool)
+                    .await
+                    .unwrap(),
+                content: "继续对话".into(),
+                payload: json!({}),
+                role: "user".into(),
+                message_kind: "message".into(),
+                requested_delivery_mode: "next_turn".into(),
+                client_message_key: None,
+                source: "console".into(),
+                automation_id: None,
+                integration_session_id: None,
+                parent_run_id: None,
+                continuation_turn_id: None,
+                model_subject_type: "user".into(),
+                model_subject_user_id: None,
+                model_source_integration_app_id: None,
+                external_user_context: None,
+            },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let notice: Option<String> =
+            sqlx::query_scalar("SELECT recovery_error FROM hub_sessions WHERE id = $1")
+                .bind(fixture.hub_session_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(notice, None);
     }
 
     #[sqlx::test(migrations = "./migrations")]
