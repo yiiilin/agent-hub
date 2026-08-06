@@ -1033,7 +1033,7 @@ textarea {
 .session-live-activity-output { margin: 4px 0 0; white-space: pre-wrap; color: var(--text-tertiary); font-size: 11px; }
 .session-activity-output { min-width: 0; display: grid; gap: 3px; border-left: 2px solid #d7d7d7; padding-left: 8px; }
 .session-activity-output > span { color: #77777c; font-size: 10px; font-weight: 650; }
-.session-activity-output pre { min-width: 0; max-height: 220px; overflow: auto; margin: 0; color: #414147; font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.session-activity-output pre { min-width: 0; margin: 0; color: #414147; font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .session-activity-collapsible { min-width: 0; margin: 0; color: #414147; font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .session-activity-content-toggle { align-self: start; border: 0; background: transparent; color: #77777c; font-size: 11px; font-weight: 650; padding: 2px 0 0; cursor: pointer; text-align: left; }
 .session-reasoning-live { margin: 4px 0 0; color: var(--color-muted-foreground); font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
