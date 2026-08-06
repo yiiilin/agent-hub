@@ -8,6 +8,9 @@ import type { TranslationKey } from './i18n';
 import './automations.css';
 
 const HISTORY_PAGE_SIZE = 20;
+const INTERVAL_PRESETS = ['30s', '1m', '5m', '10m', '15m', '30m', '1h', '2h', '3h', '6h', '12h', '24h'];
+const DEFAULT_INTERVAL = '1h';
+const DEFAULT_CRON = '0 * * * *';
 const ACTIVE_RUN_STATUSES = new Set(['pending', 'running', 'waiting_tool']);
 
 function triggerLabel(triggerType: string, t: ReturnType<typeof useI18n>['t']) {
@@ -114,9 +117,10 @@ function AutomationFormDialog({
     <form id="automation-form" className="automation-dialog-form" onSubmit={submit}>
       <label>{t('agent')}<select aria-label={t('agent')} disabled={editing || pending} required value={agentId} onChange={(event) => setAgentId(event.target.value)}>{agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select></label>
       <label>{t('name')}<input ref={nameRef} aria-label={t('name')} disabled={pending} required value={name} onChange={(event) => setName(event.target.value)} /></label>
-      <label>{t('trigger')}<select aria-label={t('trigger')} disabled={pending} value={triggerType} onChange={(event) => { setTriggerType(event.target.value); setSchedule(''); }}><option value="manual">{t('manual')}</option><option value="webhook">{t('webhook')}</option><option value="interval">{t('interval')}</option><option value="cron">{t('cron')}</option></select></label>
+      <label>{t('trigger')}<select aria-label={t('trigger')} disabled={pending} value={triggerType} onChange={(event) => { const next = event.target.value; setTriggerType(next); setSchedule(next === 'interval' ? DEFAULT_INTERVAL : next === 'cron' ? DEFAULT_CRON : ''); }}><option value="manual">{t('manual')}</option><option value="webhook">{t('webhook')}</option><option value="interval">{t('interval')}</option><option value="cron">{t('cron')}</option></select></label>
       <MarkdownEditor className="automation-prompt-field" label={t('prompt')} disabled={pending} required value={prompt} onChange={setPrompt} />
-      {scheduleRequired && <label>{t('schedule')}<input aria-label={t('schedule')} disabled={pending} required value={schedule} onChange={(event) => setSchedule(event.target.value)} placeholder={t('scheduleHint')} /></label>}
+      {triggerType === 'interval' && <label>{t('schedule')}<select aria-label={t('schedule')} disabled={pending} required value={schedule} onChange={(event) => setSchedule(event.target.value)}>{INTERVAL_PRESETS.includes(schedule) ? INTERVAL_PRESETS.map((preset) => <option key={preset} value={preset}>{preset}</option>) : <><option value={schedule}>{schedule}</option>{INTERVAL_PRESETS.map((preset) => <option key={preset} value={preset}>{preset}</option>)}</>}</select></label>}
+      {triggerType === 'cron' && <label>{t('schedule')}<input aria-label={t('schedule')} disabled={pending} required value={schedule} onChange={(event) => setSchedule(event.target.value)} placeholder={t('scheduleCronHint')} /></label>}
       <label className="check-row"><input aria-label={t('enabled')} disabled={pending} type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /> {t('enabled')}</label>
       {error && <div className="error" role="alert">{t('automationSaveFailed')}</div>}
     </form>

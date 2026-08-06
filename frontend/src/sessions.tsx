@@ -959,11 +959,19 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
     }).sort(newestSessionFirst);
   }, [locale, platformFilter, search, selectedAgentId, sessions, t]);
 
+  const autoOpenedDraftRef = useRef(false);
   useEffect(() => {
-    if (conversationDraft) return;
+    if (conversationDraft || autoOpenedDraftRef.current) return;
     if (selectedId && filteredSessions.some((session) => session.id === selectedId)) return;
-    setSelectedId(filteredSessions[0]?.id ?? null);
-  }, [conversationDraft, filteredSessions, selectedId]);
+    const agentId = selectedAgentId ?? agents.find((agent) => agent.can_invoke)?.id ?? null;
+    if (!agentId || !agents.find((agent) => agent.id === agentId && agent.can_invoke)) return;
+    autoOpenedDraftRef.current = true;
+    if (!selectedAgentId) {
+      saveSelectedSessionAgent(currentUserId, agentId);
+      setSelectedAgentId(agentId);
+    }
+    beginDraft(agentId);
+  }, [agents, conversationDraft, filteredSessions, selectedAgentId, selectedId]);
 
   const timeline = useMemo(() => {
     const entries: TimelineEntry[] = sessionMessages.filter((message) => Boolean(message.content)).map((message) => ({
@@ -1165,8 +1173,8 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
     setDraft('');
   }
 
-  function openConversationDraft() {
-    const agent = agents.find((candidate) => candidate.id === selectedAgentId && candidate.can_invoke);
+  function beginDraft(agentId: string) {
+    const agent = agents.find((candidate) => candidate.id === agentId && candidate.can_invoke);
     if (!agent) return;
     const stored = loadConversationDraft(currentUserId, agent.id);
     if (!stored) saveConversationDraft(currentUserId, agent.id, '');
@@ -1179,6 +1187,11 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
     setSelectedId(null);
     setDraft(stored?.content ?? '');
     setSessionListOpen(false);
+  }
+
+  function openConversationDraft() {
+    if (!selectedAgentId) return;
+    beginDraft(selectedAgentId);
   }
 
   function discardCurrentDraft() {
