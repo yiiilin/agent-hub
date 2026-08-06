@@ -1264,9 +1264,10 @@ fn openapi_schemas() -> Value {
         "ReasoningEffort": { "type": "string", "enum": ["default", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] },
         "AgentToolName": { "type": "string", "enum": ["read", "grep", "find", "ls", "edit", "write", "bash", "skill_exec", "integration"] },
         "SubagentDefinition": { "type": "object", "additionalProperties": false, "required": ["name", "description", "developer_instructions"], "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 64 }, "description": { "type": "string", "minLength": 1, "maxLength": 512 }, "developer_instructions": { "type": "string", "minLength": 1, "maxLength": 100000 }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings_override": { "$ref": "#/components/schemas/AgentModelSettingsOverride" }, "enabled": { "type": "boolean", "default": true }, "disabled_reason": { "type": ["string", "null"] } } },
+        "AgentSecretDeclaration": { "type": "object", "additionalProperties": false, "required": ["name", "kind"], "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Z_][A-Z0-9_]*$" }, "kind": { "type": "string", "enum": ["value", "file"] }, "description": { "type": "string", "maxLength": 512 } } },
         "Agent": { "type": "object", "required": ["id", "owner_id", "name", "instructions", "visibility", "public_to", "runtime_id", "model_selection", "model_settings", "subagents", "model_policy", "sandbox_policy", "managed_skill_ids", "mcp_allowlist", "tool_allowlist", "is_owner", "can_manage", "can_administer", "can_invoke", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": uuid(), "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string", "enum": ["private", "public", "public_to"] }, "public_to": { "type": "array", "items": uuid() }, "runtime_id": { "anyOf": [uuid(), { "type": "null" }] }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "subagents": { "type": "array", "items": { "$ref": "#/components/schemas/SubagentDefinition" } }, "model_policy": {}, "sandbox_policy": {}, "managed_skill_ids": { "type": "array", "items": uuid() }, "mcp_allowlist": {}, "tool_allowlist": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/components/schemas/AgentToolName" } }, "is_owner": { "type": "boolean" }, "can_manage": { "type": "boolean" }, "can_administer": { "type": "boolean" }, "can_invoke": { "type": "boolean" }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
-        "CreateAgentRequest": { "type": "object", "additionalProperties": false, "required": ["name", "instructions", "visibility"], "properties": { "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string" }, "public_to": { "type": "array", "items": uuid() }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "subagents": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/SubagentDefinition" } }, "tool_allowlist": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/components/schemas/AgentToolName" }, "default": ["read", "grep", "find", "ls", "edit", "write", "bash", "integration"] } } },
-        "UpdateAgentRequest": { "type": "object", "additionalProperties": false, "required": ["name", "instructions", "visibility", "public_to", "runtime_id", "model_selection", "model_settings", "subagents", "sandbox_policy", "managed_skill_ids", "mcp_allowlist"], "properties": { "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string" }, "public_to": { "type": "array", "items": uuid() }, "runtime_id": { "anyOf": [uuid(), { "type": "null" }] }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "subagents": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/SubagentDefinition" } }, "sandbox_policy": { "type": "object" }, "managed_skill_ids": { "type": "array", "items": uuid() }, "mcp_allowlist": {}, "tool_allowlist": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/components/schemas/AgentToolName" }, "default": ["read", "grep", "find", "ls", "edit", "write", "bash", "skill_exec", "integration"] } } },
+        "CreateAgentRequest": { "type": "object", "additionalProperties": false, "required": ["name", "instructions", "visibility"], "properties": { "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string" }, "public_to": { "type": "array", "items": uuid() }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "subagents": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/SubagentDefinition" } }, "secret_declarations": { "anyOf": [{ "type": "array", "items": { "$ref": "#/components/schemas/AgentSecretDeclaration" } }, { "type": "null" }] }, "tool_allowlist": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/components/schemas/AgentToolName" }, "default": ["read", "grep", "find", "ls", "edit", "write", "bash", "integration"] } } },
+        "UpdateAgentRequest": { "type": "object", "additionalProperties": false, "required": ["name", "instructions", "visibility", "public_to", "runtime_id", "model_selection", "model_settings", "subagents", "sandbox_policy", "managed_skill_ids", "mcp_allowlist"], "properties": { "name": { "type": "string" }, "instructions": { "type": "string" }, "visibility": { "type": "string" }, "public_to": { "type": "array", "items": uuid() }, "runtime_id": { "anyOf": [uuid(), { "type": "null" }] }, "model_selection": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" }, "subagents": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/SubagentDefinition" } }, "secret_declarations": { "anyOf": [{ "type": "array", "items": { "$ref": "#/components/schemas/AgentSecretDeclaration" } }, { "type": "null" }] }, "sandbox_policy": { "type": "object" }, "managed_skill_ids": { "type": "array", "items": uuid() }, "mcp_allowlist": {}, "tool_allowlist": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/components/schemas/AgentToolName" }, "default": ["read", "grep", "find", "ls", "edit", "write", "bash", "skill_exec", "integration"] } } },
         "Run": { "type": "object", "required": ["id", "agent_id", "automation_id", "integration_session_id", "parent_run_id", "runtime_id", "hub_session_id", "hub_message_id", "hub_turn_id", "session_ownership_generation", "status", "initial_message", "native_session_id", "work_dir_ref", "source", "created_at", "updated_at"], "properties": { "id": uuid(), "agent_id": uuid(), "automation_id": { "anyOf": [uuid(), { "type": "null" }] }, "integration_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "parent_run_id": { "anyOf": [uuid(), { "type": "null" }] }, "runtime_id": { "anyOf": [uuid(), { "type": "null" }] }, "hub_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "hub_message_id": { "anyOf": [uuid(), { "type": "null" }] }, "hub_turn_id": { "anyOf": [uuid(), { "type": "null" }] }, "session_ownership_generation": { "type": ["integer", "null"] }, "status": { "type": "string" }, "initial_message": { "type": "string" }, "native_session_id": { "type": ["string", "null"] }, "work_dir_ref": { "type": ["string", "null"] }, "source": { "type": "string" }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
         "RunListResponse": { "type": "object", "required": ["items", "total", "page", "page_size"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/Run" } }, "total": { "type": "integer", "minimum": 0 }, "page": { "type": "integer", "minimum": 1 }, "page_size": { "type": "integer", "minimum": 1, "maximum": 100 } } },
         "CreateRunRequest": { "type": "object", "required": ["message"], "properties": { "message": { "type": "string" }, "hub_session_id": { "anyOf": [uuid(), { "type": "null" }] }, "parent_run_id": { "anyOf": [uuid(), { "type": "null" }] }, "client_message_key": { "type": ["string", "null"] } } },
@@ -5021,7 +5022,12 @@ async fn create_agent(
     .execute(&mut *tx)
     .await?;
     replace_subagents_tx(&mut tx, id, &req.subagents).await?;
-    replace_agent_secret_declarations_tx(&mut tx, id, &req.secret_declarations).await?;
+    replace_agent_secret_declarations_tx(
+        &mut tx,
+        id,
+        req.secret_declarations.as_deref().unwrap_or_default(),
+    )
+    .await?;
     tx.commit().await?;
     Ok(Json(load_agent_for_user(&state.pool, id, &user).await?))
 }
@@ -5106,6 +5112,10 @@ async fn update_agent(
 ) -> Result<Json<AgentDto>, ApiError> {
     let user = require_user(&state, &headers).await?;
     let existing_agent = load_agent_manageable_by_user(&state.pool, agent_id, &user).await?;
+    let secret_declarations = req
+        .secret_declarations
+        .clone()
+        .unwrap_or_else(|| existing_agent.secret_declarations.clone());
     req.mcp_allowlist = merge_mcp_secrets(&existing_agent.mcp_allowlist, &req.mcp_allowlist);
     req.tool_allowlist = normalize_agent_tool_allowlist(&req.tool_allowlist)?;
     validate_agent_payload(&req)?;
@@ -5213,7 +5223,7 @@ async fn update_agent(
         .await?;
     }
     replace_subagents_tx(&mut tx, agent_id, &req.subagents).await?;
-    replace_agent_secret_declarations_tx(&mut tx, agent_id, &req.secret_declarations).await?;
+    replace_agent_secret_declarations_tx(&mut tx, agent_id, &secret_declarations).await?;
     tx.commit().await?;
     Ok(Json(
         load_agent_for_user(&state.pool, agent_id, &user).await?,
@@ -18273,8 +18283,13 @@ fn agent_execution_configuration_changed(
             != normalized_unordered_entries(&request.mcp_allowlist)
         || existing.tool_allowlist != request.tool_allowlist
         || existing_skill_ids != requested_skill_ids
-        || normalized_secret_declarations(&existing.secret_declarations)
-            != normalized_secret_declarations(&request.secret_declarations)
+        || request
+            .secret_declarations
+            .as_ref()
+            .is_some_and(|requested| {
+                normalized_secret_declarations(&existing.secret_declarations)
+                    != normalized_secret_declarations(requested)
+            })
 }
 
 fn normalized_secret_declarations(declarations: &[AgentSecretDeclarationDto]) -> Vec<String> {
@@ -26062,7 +26077,7 @@ mod tests {
                 model_selection: None,
                 model_settings: Some(AgentModelSettings::default()),
                 subagents: Vec::new(),
-                secret_declarations: Vec::new(),
+                secret_declarations: Some(Vec::new()),
                 tool_allowlist: default_agent_tool_allowlist(),
             }),
         )
@@ -26081,7 +26096,7 @@ mod tests {
             model_policy: agent.model_policy.clone(),
             sandbox_policy: agent.sandbox_policy.clone(),
             managed_skill_ids: Vec::new(),
-            secret_declarations: agent.secret_declarations.clone(),
+            secret_declarations: Some(agent.secret_declarations.clone()),
             mcp_allowlist: json!([{
                 "name": "github",
                 "command": "gh-mcp",
@@ -26119,6 +26134,65 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(agent_execution_revision(&state.pool, agent.id).await, 3);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn update_agent_omitted_secret_declarations_preserves_and_empty_array_clears(
+        pool: PgPool,
+    ) {
+        let token = create_user_session_with_role(&pool, "member").await;
+        let state = Arc::new(test_state_with_browser_session_auth(pool));
+        let declarations = vec![AgentSecretDeclarationDto {
+            name: "API_KEY".into(),
+            kind: "value".into(),
+            description: "Test key".into(),
+        }];
+        let agent = create_agent(
+            State(state.clone()),
+            session_headers(&token),
+            Json(CreateAgentRequest {
+                name: "Secret Declarations Agent".into(),
+                instructions: "Keep declarations".into(),
+                visibility: "private".into(),
+                public_to: Vec::new(),
+                model_selection: None,
+                model_settings: Some(AgentModelSettings::default()),
+                subagents: Vec::new(),
+                secret_declarations: Some(declarations.clone()),
+                tool_allowlist: default_agent_tool_allowlist(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(agent.secret_declarations, declarations);
+
+        let mut preserve = update_request_from_agent(&agent);
+        preserve.secret_declarations = None;
+        let preserved = update_agent(
+            State(state.clone()),
+            session_headers(&token),
+            Path(agent.id),
+            Json(preserve),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(preserved.secret_declarations, declarations);
+
+        let mut clear = update_request_from_agent(&preserved);
+        clear.secret_declarations = Some(Vec::new());
+        let cleared = update_agent(
+            State(state.clone()),
+            session_headers(&token),
+            Path(agent.id),
+            Json(clear),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(cleared.secret_declarations.is_empty());
     }
 
     #[sqlx::test]
@@ -47956,7 +48030,7 @@ mod tests {
             model_policy: json!({ "provider": "hub-proxy" }),
             sandbox_policy: json!({ "mode": "workspace-write", "network_access": true }),
             managed_skill_ids: Vec::new(),
-            secret_declarations: Vec::new(),
+            secret_declarations: Some(Vec::new()),
             mcp_allowlist: json!([]),
             tool_allowlist: default_agent_tool_allowlist(),
         }
@@ -48754,7 +48828,7 @@ mod tests {
                     enabled: true,
                     disabled_reason: None,
                 }],
-                secret_declarations: Vec::new(),
+                secret_declarations: Some(Vec::new()),
                 tool_allowlist: default_agent_tool_allowlist(),
             }),
         )
@@ -48924,7 +48998,7 @@ mod tests {
                     enabled: true,
                     disabled_reason: None,
                 }],
-                secret_declarations: Vec::new(),
+                secret_declarations: Some(Vec::new()),
                 tool_allowlist: default_agent_tool_allowlist(),
             }),
         )
@@ -49454,7 +49528,7 @@ mod tests {
                     enabled: true,
                     disabled_reason: None,
                 }],
-                secret_declarations: Vec::new(),
+                secret_declarations: Some(Vec::new()),
                 tool_allowlist: default_agent_tool_allowlist(),
             }),
         )
@@ -50649,7 +50723,7 @@ mod tests {
             model_policy: agent.model_policy.clone(),
             sandbox_policy: agent.sandbox_policy.clone(),
             managed_skill_ids: agent.managed_skill_ids.clone(),
-            secret_declarations: agent.secret_declarations.clone(),
+            secret_declarations: Some(agent.secret_declarations.clone()),
             mcp_allowlist: agent.mcp_allowlist.clone(),
             tool_allowlist: agent.tool_allowlist.clone(),
         }

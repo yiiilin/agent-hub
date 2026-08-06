@@ -384,6 +384,7 @@ async fn run(cli: Cli) -> Result<()> {
                     "subagents": current.get("subagents").cloned().unwrap_or(Value::Null),
                     "sandbox_policy": current.get("sandbox_policy").cloned().unwrap_or(Value::Null),
                     "managed_skill_ids": skills,
+                    "secret_declarations": current.get("secret_declarations").cloned().unwrap_or(Value::Null),
                     "mcp_allowlist": current.get("mcp_allowlist").cloned().unwrap_or(Value::Null),
                     "tool_allowlist": current.get("tool_allowlist").cloned().unwrap_or(Value::Null)
                 });

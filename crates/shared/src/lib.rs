@@ -1803,8 +1803,8 @@ pub struct CreateAgentRequest {
     pub subagents: Vec<SubagentDefinition>,
     #[serde(default = "default_agent_tool_allowlist")]
     pub tool_allowlist: Vec<String>,
-    #[serde(default)]
-    pub secret_declarations: Vec<AgentSecretDeclarationDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_declarations: Option<Vec<AgentSecretDeclarationDto>>,
 }
 
 fn legacy_hub_proxy_model_policy() -> Value {
@@ -1834,8 +1834,9 @@ pub struct UpdateAgentRequest {
     pub mcp_allowlist: Value,
     #[serde(default = "default_agent_tool_allowlist")]
     pub tool_allowlist: Vec<String>,
-    #[serde(default)]
-    pub secret_declarations: Vec<AgentSecretDeclarationDto>,
+    /// 省略/传 null 表示保留现有声明，只有显式数组才替换。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_declarations: Option<Vec<AgentSecretDeclarationDto>>,
 }
 
 pub const AGENT_TOOL_NAMES: &[&str] = &[
