@@ -476,7 +476,7 @@ function ActivityIcon({ kind }: { kind: ActivityKind }) {
   return <Minimize2 size={15} />;
 }
 
-function useLatestLines(text: string, maxLines = 20) {
+function useLatestLines(text: string, maxLines = 15) {
   const [expanded, setExpanded] = useState(false);
   const lines = text.split('\n');
   const hidden = Math.max(0, lines.length - maxLines);
