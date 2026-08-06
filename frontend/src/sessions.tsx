@@ -245,7 +245,13 @@ export function activityGroupIsClosed(
 export function ActivityLiveStep({ activity }: { activity: ActivityEntry }) {
   const { t } = useI18n();
   if (activity.kind === 'reasoning' && activity.summary) {
-    return <div className="session-reasoning-text">{activity.summary}</div>;
+    return <div className="session-live-activity">
+      <span className="session-live-activity-icon" aria-hidden="true"><ActivityIcon kind={activity.kind} /></span>
+      <div className="session-live-activity-body">
+        <span className="session-live-activity-heading"><strong>{t('activityReasoning')}</strong></span>
+        <pre className="session-reasoning-live">{activity.summary}</pre>
+      </div>
+    </div>;
   }
   const label = t(activityKeys[activity.kind] ?? 'activityTool');
   return <div className="session-live-activity">
@@ -470,6 +476,19 @@ function ActivityIcon({ kind }: { kind: ActivityKind }) {
   return <Minimize2 size={15} />;
 }
 
+function CollapsibleBlock({ label, text }: { label: string; text: string }) {
+  const { t } = useI18n();
+  const [expanded, setExpanded] = useState(false);
+  const lines = text.split('\n');
+  const hidden = Math.max(0, lines.length - 20);
+  const visible = expanded || hidden === 0 ? text : lines.slice(0, 20).join('\n');
+  return <div className="session-activity-output">
+    <span>{label}</span>
+    <pre className="session-activity-collapsible">{visible}</pre>
+    {hidden > 0 && <button type="button" className="session-activity-content-toggle" onClick={() => setExpanded((value) => !value)}>{expanded ? t('activityCollapse') : t('activityExpandLines').replace('{count}', String(hidden))}</button>}
+  </div>;
+}
+
 export function ChatActivityGroup({ activities, startedAt, endedAt, active = false, clockOffset }: { activities: ActivityEntry[]; startedAt?: number; endedAt?: number; active?: boolean; clockOffset?: number }) {
   const { locale, t } = useI18n();
   const [now, setNow] = useState(() => Date.now() - (clockOffset ?? 0));
@@ -494,7 +513,7 @@ export function ChatActivityGroup({ activities, startedAt, endedAt, active = fal
     onToggle={(event) => setExpanded(event.currentTarget.open)}
   >
     <summary><span>{t('agentActivityDuration').replace('{duration}', formatActivityDuration(activities, locale, startedAt, durationEndedAt))}</span><ChevronRight className="session-activity-chevron" size={16} aria-hidden="true" /></summary>
-    {expanded && <div>{!showAll && collapsedRows > 0 && <button type="button" className="session-activity-show-more" onClick={() => setShowAll(true)}>{t('activityRowsCollapsed').replace('{count}', String(collapsedRows))}</button>}{visibleActivities.map((activity) => <div className="session-activity-row" key={activity.id}><span className="session-activity-icon" aria-hidden="true"><ActivityIcon kind={activity.kind} /></span><div className="session-activity-content"><span className="session-activity-heading"><strong>{t(activityKeys[activity.kind])}</strong>{activity.status && <small className={`session-activity-status status-${activity.status}`}>{t(activityStatusKeys[activity.status] ?? 'statusFailed')}</small>}{activity.kind === 'tool' && activity.status && activity.status !== 'pending' && <small className="session-activity-elapsed">{formatActivityDuration([activity], locale)}</small>}</span>{activity.summary && (activity.kind === 'command' ? <code>{activity.summary}</code> : <span className="session-activity-summary">{activity.summary}</span>)}{activity.output && <div className="session-activity-output"><span>{t('activityOutput')}</span><pre>{activity.output}</pre></div>}</div></div>)}</div>}
+    {expanded && <div>{!showAll && collapsedRows > 0 && <button type="button" className="session-activity-show-more" onClick={() => setShowAll(true)}>{t('activityRowsCollapsed').replace('{count}', String(collapsedRows))}</button>}{visibleActivities.map((activity) => <div className="session-activity-row" key={activity.id}><span className="session-activity-icon" aria-hidden="true"><ActivityIcon kind={activity.kind} /></span><div className="session-activity-content"><span className="session-activity-heading"><strong>{t(activityKeys[activity.kind])}</strong>{activity.status && <small className={`session-activity-status status-${activity.status}`}>{t(activityStatusKeys[activity.status] ?? 'statusFailed')}</small>}{activity.kind === 'tool' && activity.status && activity.status !== 'pending' && <small className="session-activity-elapsed">{formatActivityDuration([activity], locale)}</small>}</span>{activity.summary && (activity.kind === 'command' ? <code>{activity.summary}</code> : activity.kind === 'reasoning' ? <CollapsibleBlock label={t('activityReasoning')} text={activity.summary} /> : <span className="session-activity-summary">{activity.summary}</span>)}{activity.output && <CollapsibleBlock label={t('activityOutput')} text={activity.output} />}</div></div>)}</div>}
   </details>;
 }
 
@@ -840,11 +859,18 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
     if (!scroll) return;
     const scrollingUp = scroll.scrollTop < lastChatScrollTopRef.current - 1;
     lastChatScrollTopRef.current = scroll.scrollTop;
-    followBottomRef.current = scroll.scrollHeight - scroll.clientHeight - scroll.scrollTop <= chatBottomThreshold;
-    if (historyPagingReadyRef.current
-      && scrollingUp
-      && scroll.scrollTop <= chatHistoryThreshold) {
-      requestOlderMessages();
+    // Only an actual upward user scroll disables bottom-following. Programmatic
+    // scrolls caused by streaming content growth must not recompute the flag
+    // from a stale scrollHeight, or the view stops following right after a
+    // message push.
+    if (scrollingUp) {
+      followBottomRef.current = false;
+      if (historyPagingReadyRef.current
+        && scroll.scrollTop <= chatHistoryThreshold) {
+        requestOlderMessages();
+      }
+    } else if (scroll.scrollHeight - scroll.clientHeight - scroll.scrollTop <= chatBottomThreshold) {
+      followBottomRef.current = true;
     }
   }, [requestOlderMessages]);
 

@@ -1034,6 +1034,9 @@ textarea {
 .session-activity-output { min-width: 0; display: grid; gap: 3px; border-left: 2px solid #d7d7d7; padding-left: 8px; }
 .session-activity-output > span { color: #77777c; font-size: 10px; font-weight: 650; }
 .session-activity-output pre { min-width: 0; max-height: 220px; overflow: auto; margin: 0; color: #414147; font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.session-activity-collapsible { min-width: 0; max-height: 220px; overflow: auto; margin: 0; color: #414147; font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.session-activity-content-toggle { align-self: start; border: 0; background: transparent; color: var(--accent); font-size: 11px; font-weight: 650; padding: 2px 0 0; cursor: pointer; text-align: left; }
+.session-reasoning-live { margin: 4px 0 0; color: var(--color-muted-foreground); font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
 .session-chat-composer { position: relative; width: min(calc(100% - 32px), 768px); justify-self: center; display: grid; grid-template-columns: minmax(0, 1fr); gap: 2px; margin: 0 auto 16px; border: 1px solid var(--border-regular); border-radius: 22px; padding: 8px 9px 8px 15px; background: rgb(255 255 255 / 94%); box-shadow: 0 8px 24px rgb(0 0 0 / 9%), 0 1px 3px rgb(0 0 0 / 6%); backdrop-filter: blur(16px); }
 .session-chat-composer:focus-within { border-color: rgb(36 107 148 / 32%); box-shadow: 0 9px 28px rgb(0 0 0 / 11%), 0 0 0 3px rgb(36 107 148 / 8%); }
 .session-chat-composer:has(> div > .session-composer-actions:only-child) { padding-right: 48px; }
