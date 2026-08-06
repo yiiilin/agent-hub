@@ -638,6 +638,7 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
   const sessionRefreshGeneration = useRef(0);
   const conversationDraftGeneration = useRef(0);
   const chatScrollRef = useRef<HTMLDivElement>(null);
+  const transcriptRef = useRef<HTMLDivElement>(null);
   const followBottomRef = useRef(true);
   const historyPagingReadyRef = useRef(false);
   const lastChatScrollTopRef = useRef(0);
@@ -1104,17 +1105,17 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
   }, [messagesLoading, selectedId, showThinking, timelineItems]);
 
   useEffect(() => {
-    const scroll = chatScrollRef.current;
-    if (!scroll) return;
-    // While bottom-following, any content growth (streaming, markdown layout,
-    // session switch) keeps the view pinned to the very bottom. The flag is
-    // only cleared by an actual upward user scroll.
+    const transcript = transcriptRef.current;
+    if (!transcript) return;
+    // Watch the inner transcript, whose height changes as messages and events
+    // render. While bottom-following, every growth re-pins before paint so the
+    // view never shows the top of freshly loaded history first.
     const observer = new ResizeObserver(() => {
-      if (!historyAnchorRef.current && followBottomRef.current) {
-        scroll.scrollTop = scroll.scrollHeight;
-      }
+      const scroll = chatScrollRef.current;
+      if (!scroll || historyAnchorRef.current || !followBottomRef.current) return;
+      scroll.scrollTop = scroll.scrollHeight;
     });
-    observer.observe(scroll);
+    observer.observe(transcript);
     return () => observer.disconnect();
   }, []);
 
@@ -1314,7 +1315,7 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
             {stopRequestedRunId && <div className="session-banner success" role="status">{t('stopRequested')}</div>}
             {actionError && <div className="session-banner error" role="alert">{t('genericError')}</div>}
             {conversationCreateError && <div className="session-banner error" role="alert">{t('conversationCreateFailed')}</div>}
-            <div className="session-transcript" aria-busy={messagesLoading || olderMessagesLoading}>
+            <div className="session-transcript" ref={transcriptRef} aria-busy={messagesLoading || olderMessagesLoading}>
               {!conversationDraft && messagesLoading && <div className="operation-state" role="status">{t('loadingMessages')}</div>}
               {!conversationDraft && !messagesLoading && messagesError && <div className="operation-state error" role="alert">{t('messagesLoadFailed')}</div>}
               {!conversationDraft && !messagesLoading && !messagesError && timelineItems.length === 0 && <div className="operation-state">{t('noMessages')}</div>}
