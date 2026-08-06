@@ -3270,6 +3270,7 @@ async fn generate_session_title_in_background(
     user_id: Uuid,
     first_message: String,
 ) {
+    info!(session_id = %session_id, agent_id = %agent_id, "session title generation started");
     let outcome: anyhow::Result<()> = async {
         let model = sqlx::query(
             "SELECT a.name AS agent_name, a.model_connection_id, a.model_id,
@@ -3284,6 +3285,8 @@ async fn generate_session_title_in_background(
         .fetch_optional(&state.pool)
         .await?;
         let Some(model) = model else {
+            warn!(session_id = %session_id, agent_id = %agent_id,
+                "session title generation skipped: no enabled model connection");
             return Ok(());
         };
         let api_type =
@@ -3309,7 +3312,10 @@ async fn generate_session_title_in_background(
                 .map_err(|_| anyhow::anyhow!("model secret decryption failed"))?,
         );
         let request_settings = ModelRequestSettings::for_protocol(api_type);
-        let prompt = format!("Generate a concise Chinese session title (about 15 characters) based on the user first message. Output only the title. User message: {}", first_message.chars().take(400).collect::<String>());
+        let prompt = format!(
+            "根据用户的第一条消息，为这段对话生成一个简洁的中文标题（15 字以内），概括用户的意图或任务主题。\n要求：不要写问候语或自我介绍；不要写“我能做什么”之类的回应；直接输出标题本身；不要引号，不要解释。\n\n示例：\n用户消息：帮我看看如何排查网络延迟问题\n标题：网络延迟问题排查\n\n用户消息：你好\n标题：日常问候\n\n用户消息：帮我规划一下数据库备份策略\n标题：数据库备份策略规划\n\n用户消息：{}\n标题：",
+            first_message.chars().take(400).collect::<String>()
+        );
         let request_body = serde_json::to_vec(&json!({
             "model": model_id,
             "input": prompt,
@@ -3364,7 +3370,11 @@ async fn generate_session_title_in_background(
                     .bind(session_id)
                     .execute(&state.pool)
                     .await?;
+                    info!(session_id = %session_id, title = %title,
+                        "session title generated");
                 }
+            } else {
+                warn!(session_id = %session_id, "session title generation got no text in the model response");
             }
         } else {
             record_session_title_error(

@@ -1218,6 +1218,7 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
         if (!mountedRef.current || pendingDraftGeneration !== conversationDraftGeneration.current) return;
         setDraft('');
         setConversationDraft(null);
+        startTitlePoll(run.hub_session_id);
         followBottomRef.current = true;
         return;
       }
@@ -1229,6 +1230,7 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
       setSessions((current) => current.map((session) => session.id === selectedSession!.id
         ? { ...session, recovery_error: null }
         : session));
+      startTitlePoll(selectedSession!.id);
       setDraft('');
       followBottomRef.current = true;
     } catch (caught) {
