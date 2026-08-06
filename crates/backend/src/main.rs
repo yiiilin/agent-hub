@@ -62,6 +62,7 @@ use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+mod run_event_bus;
 mod session_bundle_store;
 mod skill_package_store;
 
@@ -166,6 +167,7 @@ struct AppState {
     session_bundle_max_bytes: u64,
     auth_providers: Vec<Arc<dyn AuthProvider>>,
     session_issuer: Arc<dyn SessionIssuer>,
+    run_event_bus: Arc<dyn run_event_bus::RunEventBus + Send + Sync>,
 }
 
 struct MaybeConnectInfo(Option<SocketAddr>);
@@ -337,6 +339,7 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(EmbedJwtAuthProvider),
         ],
         session_issuer: Arc::new(BrowserSessionIssuer),
+        run_event_bus: Arc::new(run_event_bus::InMemoryRunEventBus::default()),
     };
 
     let scheduler_pool = state.pool.clone();
@@ -6406,28 +6409,64 @@ async fn stream_run_events(
     let pool = state.pool.clone();
     let authorization_state = state.clone();
     let authorization_headers = headers.clone();
+    let bus = state.run_event_bus.clone();
     let mut last_seq = query.after.unwrap_or(0);
     let event_stream = stream! {
-        loop {
-            // 长连接也必须持续检查 token、session 和 Agent 的当前授权状态。
-            if let Err(err) = authorize_run_stream(&authorization_state, &authorization_headers, run_id).await {
-                yield Ok(Event::default().event("error").data(err.message));
-                break;
-            }
-            match load_events_after(&pool, run_id, last_seq).await {
-                Ok(events) => {
-                    for event in events {
-                        last_seq = event.seq;
-                        let payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
-                        yield Ok(Event::default().event("run_event").id(event.seq.to_string()).data(payload));
-                    }
-                }
-                Err(err) => {
-                    yield Ok(Event::default().event("error").data(err.message));
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(700)).await;
-        }
+         // Catch-up: persisted events after the client's anchor.
+         if let Err(err) = load_events_after(&pool, run_id, last_seq).await {
+             yield Ok(Event::default().event("error").data(err.message));
+         } else if let Ok(events) = load_events_after(&pool, run_id, last_seq).await {
+             for event in events {
+                 last_seq = event.seq;
+                 let payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
+                 yield Ok(Event::default().event("run_event").id(event.seq.to_string()).data(payload));
+             }
+         }
+         let mut rx = bus.subscribe(run_id);
+         let mut ticker = tokio::time::interval(Duration::from_millis(700));
+         loop {
+             tokio::select! {
+                 item = rx.recv() => {
+                     match item {
+                         Ok(item) => {
+                             if item.persisted {
+                                 if item.event.seq <= last_seq { continue; }
+                                 last_seq = item.event.seq;
+                             } else if item.event.seq <= last_seq {
+                                 continue;
+                             }
+                             let payload = serde_json::to_string(&item.event).unwrap_or_else(|_| "{}".into());
+                             yield Ok(Event::default().event("run_event").id(item.event.seq.to_string()).data(payload));
+                         }
+                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                             rx = bus.subscribe(run_id);
+                         }
+                     }
+                 }
+                 _ = ticker.tick() => {
+                     // 长连接也必须持续检查 token、session 和 Agent 的当前授权状态，
+                     // 并兜底补齐可能被广播缓冲丢弃的持久化事件。
+                     if let Err(err) = authorize_run_stream(&authorization_state, &authorization_headers, run_id).await {
+                         yield Ok(Event::default().event("error").data(err.message));
+                         break;
+                     }
+                     match load_events_after(&pool, run_id, last_seq).await {
+                         Ok(events) => {
+                             for event in events {
+                                 last_seq = event.seq;
+                                 let payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
+                                 yield Ok(Event::default().event("run_event").id(event.seq.to_string()).data(payload));
+                             }
+                         }
+                         Err(err) => {
+                             yield Ok(Event::default().event("error").data(err.message));
+                             break;
+                         }
+                     }
+                 }
+             }
+         }
     };
     Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
 }
@@ -12906,15 +12945,71 @@ async fn runtime_append_event(
     // 写事件前先回收过期 runtime，避免超时 token 继续写入已失败的 run。
     reap_stale_runtimes(&state.pool).await?;
     let runtime_id = require_runtime(&state, &headers).await?;
+    let AppendRunEventRequest {
+        event_type,
+        role,
+        content,
+        payload,
+        waiting_tool,
+    } = req.payload;
+    if run_event_bus::is_streaming_delta(&event_type, &payload) {
+        if waiting_tool.is_some() {
+            return Err(ApiError::bad_request(
+                "waiting tool state is only valid for atomic batch finalize",
+            ));
+        }
+        // Deltas exist only for the live stream: validate ownership and the
+        // active Run, then fan out through the bus without persisting.
+        let mut tx = state.pool.begin().await?;
+        let session_id =
+            lock_owned_session_for_run_tx(&mut tx, run_id, runtime_id, req.ownership_generation)
+                .await?;
+        let active: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM runs
+             WHERE id = $1 AND runtime_id = $2
+               AND session_ownership_generation = $3
+               AND hub_session_id = $4 AND status = 'running'
+             FOR UPDATE",
+        )
+        .bind(run_id)
+        .bind(runtime_id)
+        .bind(req.ownership_generation)
+        .bind(session_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if active.is_none() {
+            return Err(ApiError::conflict("Run is not active for event append"));
+        }
+        tx.commit().await?;
+        let event = RunEventDto {
+            seq: state.run_event_bus.next_stream_seq(run_id),
+            event_id: Uuid::new_v4(),
+            run_id,
+            event_type,
+            role,
+            content,
+            payload,
+            created_at: chrono::Utc::now(),
+        };
+        state.run_event_bus.publish(run_id, event.clone(), false);
+        return Ok(Json(event));
+    }
     let mut tx = state.pool.begin().await?;
     let event = insert_run_event_for_active_runtime(
         &mut tx,
         run_id,
         runtime_id,
         req.ownership_generation,
-        req.payload,
+        AppendRunEventRequest {
+            event_type,
+            role,
+            content,
+            payload,
+            waiting_tool,
+        },
     )
     .await?;
+    state.run_event_bus.publish(run_id, event.clone(), true);
     tx.commit().await?;
     Ok(Json(event))
 }
@@ -13582,17 +13677,6 @@ async fn runtime_complete_run(
         json!({ "status": status }),
     )
     .await?;
-    if matches!(status, "completed" | "failed" | "interrupted") {
-        // Safety net: drop any message deltas that never reached a final
-        // assistant message (for example on interruption).
-        sqlx::query(
-            "DELETE FROM run_events
-             WHERE run_id = $1 AND event_type = 'message_delta'",
-        )
-        .bind(run_id)
-        .execute(&mut *tx)
-        .await?;
-    }
     if matches!(status, "completed" | "failed" | "interrupted") {
         move_queued_steers_to_next_turn_tx(
             &mut tx,
@@ -16318,40 +16402,7 @@ async fn insert_run_event_for_active_runtime(
         && content
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty());
-    let event_type_name = event_type.clone();
-    let role_name = role.clone();
     let event = insert_run_event_tx(tx, run_id, event_type, role, content, payload).await?;
-    // Streaming deltas are transient: once an item phase completes, its
-    // summary/output deltas are pruned so a Run stays one row per phase
-    // instead of tens of thousands of tiny deltas. The completed item row
-    // carries the full content, and message_delta rows are only consumed by
-    // the live stream before the final assistant message replaces them.
-    if event_type_name == "item" {
-        let item_id = event.payload.get("item_id").and_then(Value::as_str);
-        let phase = event.payload.get("phase").and_then(Value::as_str);
-        if phase == Some("completed") {
-            if let Some(item_id) = item_id {
-                sqlx::query(
-                    "DELETE FROM run_events
-                     WHERE run_id = $1 AND event_type = 'item'
-                       AND payload->>'item_id' = $2
-                       AND payload->>'phase' IN ('summary_delta', 'output_delta')",
-                )
-                .bind(run_id)
-                .bind(item_id)
-                .execute(&mut **tx)
-                .await?;
-            }
-        }
-    } else if event_type_name == "message" && role_name.as_deref() == Some("assistant") {
-        sqlx::query(
-            "DELETE FROM run_events
-             WHERE run_id = $1 AND event_type = 'message_delta'",
-        )
-        .bind(run_id)
-        .execute(&mut **tx)
-        .await?;
-    }
     if refresh_session_activity {
         sqlx::query("UPDATE hub_sessions SET updated_at = now() WHERE id = $1")
             .bind(session_id)
@@ -32795,13 +32846,15 @@ mod tests {
     }
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn run_event_deltas_are_pruned_when_their_phase_completes(pool: PgPool) {
+    async fn run_event_deltas_stream_live_but_only_phases_are_persisted(pool: PgPool) {
         let fixture = integration_runtime_fixture(pool).await;
+        let run_id = fixture.run_id;
+        let mut rx = fixture.state.run_event_bus.subscribe(run_id);
         let append = |event_type: &str, role: Option<&str>, payload: Value| {
             runtime_append_event(
                 State(fixture.state.clone()),
                 bearer_headers(&fixture.runtime_token),
-                Path(fixture.run_id),
+                Path(run_id),
                 runtime_write_generation(
                     1,
                     AppendRunEventRequest {
@@ -32825,6 +32878,7 @@ mod tests {
             .await
             .unwrap()
         }
+
         for index in 0..100 {
             let _ = append(
                 "item",
@@ -32840,9 +32894,15 @@ mod tests {
             .unwrap();
         }
         assert_eq!(
-            count_run_item_events(&fixture.state.pool, fixture.run_id, "reasoning-1").await,
-            100
+            count_run_item_events(&fixture.state.pool, run_id, "reasoning-1").await,
+            0,
+            "summary deltas must not be persisted"
         );
+        for _ in 0..100 {
+            let item = rx.recv().await.unwrap();
+            assert!(!item.persisted);
+        }
+
         let _ = append(
             "item",
             Some("assistant"),
@@ -32855,8 +32915,10 @@ mod tests {
         )
         .await
         .unwrap();
+        let completed = rx.recv().await.unwrap();
+        assert!(completed.persisted);
         assert_eq!(
-            count_run_item_events(&fixture.state.pool, fixture.run_id, "reasoning-1").await,
+            count_run_item_events(&fixture.state.pool, run_id, "reasoning-1").await,
             1
         );
 
@@ -32880,7 +32942,7 @@ mod tests {
             "SELECT count(*) FROM run_events
              WHERE run_id = $1 AND event_type = 'message_delta'",
         )
-        .bind(fixture.run_id)
+        .bind(run_id)
         .fetch_one(&fixture.state.pool)
         .await
         .unwrap();
@@ -46313,12 +46375,13 @@ mod tests {
         let fixture = integration_runtime_fixture(pool).await;
         sqlx::query(
             "INSERT INTO integration_tool_requests
-             (id, session_id, run_id, tool_name, arguments, status, expires_at)
-             VALUES ($1, $2, $3, 'lookup', '{}'::jsonb, 'pending', now() + interval '30 minutes')",
+              (id, session_id, run_id, hub_session_id, tool_name, arguments, status, expires_at)
+              VALUES ($1, $2, $3, $4, 'lookup', '{}'::jsonb, 'pending', now() + interval '30 minutes')",
         )
         .bind(fixture.tool_request_id)
         .bind(fixture.session_id)
         .bind(fixture.run_id)
+        .bind(fixture.hub_session_id)
         .execute(&fixture.state.pool)
         .await
         .unwrap();
@@ -50625,6 +50688,7 @@ mod tests {
             session_bundle_max_bytes: DEFAULT_SESSION_BUNDLE_MAX_BYTES,
             auth_providers: Vec::new(),
             session_issuer: Arc::new(BrowserSessionIssuer),
+            run_event_bus: Arc::new(run_event_bus::InMemoryRunEventBus::default()),
         }
     }
 
@@ -51326,6 +51390,7 @@ mod tests {
             session_bundle_max_bytes: DEFAULT_SESSION_BUNDLE_MAX_BYTES,
             auth_providers: Vec::new(),
             session_issuer: Arc::new(BrowserSessionIssuer),
+            run_event_bus: Arc::new(run_event_bus::InMemoryRunEventBus::default()),
         }
     }
 }
