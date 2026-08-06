@@ -249,7 +249,7 @@ export function ActivityLiveStep({ activity }: { activity: ActivityEntry }) {
       <span className="session-live-activity-icon" aria-hidden="true"><ActivityIcon kind={activity.kind} /></span>
       <div className="session-live-activity-body">
         <span className="session-live-activity-heading"><strong>{t('activityReasoning')}</strong></span>
-        <pre className="session-reasoning-live">{activity.summary}</pre>
+        <CollapsibleLive className="session-reasoning-live" text={activity.summary} />
       </div>
     </div>;
   }
@@ -258,7 +258,7 @@ export function ActivityLiveStep({ activity }: { activity: ActivityEntry }) {
     <span className="session-live-activity-icon" aria-hidden="true"><ActivityIcon kind={activity.kind} /></span>
     <div className="session-live-activity-body">
       <span className="session-live-activity-heading"><strong>{label}</strong>{activity.summary && <code>{activity.summary}</code>}</span>
-      {activity.output && <pre className="session-live-activity-output">{activity.output}</pre>}
+      {activity.output && <CollapsibleLive text={activity.output} />}
     </div>
   </div>;
 }
@@ -476,17 +476,31 @@ function ActivityIcon({ kind }: { kind: ActivityKind }) {
   return <Minimize2 size={15} />;
 }
 
-function CollapsibleBlock({ label, text }: { label: string; text: string }) {
-  const { t } = useI18n();
+function useLatestLines(text: string, maxLines = 20) {
   const [expanded, setExpanded] = useState(false);
   const lines = text.split('\n');
-  const hidden = Math.max(0, lines.length - 20);
-  const visible = expanded || hidden === 0 ? text : lines.slice(0, 20).join('\n');
+  const hidden = Math.max(0, lines.length - maxLines);
+  const visible = expanded || hidden === 0 ? text : lines.slice(-maxLines).join('\n');
+  return { visible, hidden, expanded, toggle: () => setExpanded((value) => !value) };
+}
+
+function CollapsibleBlock({ label, text }: { label: string; text: string }) {
+  const { t } = useI18n();
+  const { visible, hidden, expanded, toggle } = useLatestLines(text);
   return <div className="session-activity-output">
     <span>{label}</span>
+    {hidden > 0 && <button type="button" className="session-activity-content-toggle" onClick={toggle}>{t(expanded ? 'activityCollapse' : 'activityLinesCollapsed').replace('{count}', String(hidden))}</button>}
     <pre className="session-activity-collapsible">{visible}</pre>
-    {hidden > 0 && <button type="button" className="session-activity-content-toggle" onClick={() => setExpanded((value) => !value)}>{expanded ? t('activityCollapse') : t('activityExpandLines').replace('{count}', String(hidden))}</button>}
   </div>;
+}
+
+function CollapsibleLive({ text, className }: { text: string; className?: string }) {
+  const { t } = useI18n();
+  const { visible, hidden, expanded, toggle } = useLatestLines(text);
+  return <>
+    {hidden > 0 && <button type="button" className="session-activity-content-toggle" onClick={toggle}>{t(expanded ? 'activityCollapse' : 'activityLinesCollapsed').replace('{count}', String(hidden))}</button>}
+    <pre className={className ?? 'session-live-activity-output'}>{visible}</pre>
+  </>;
 }
 
 export function ChatActivityGroup({ activities, startedAt, endedAt, active = false, clockOffset }: { activities: ActivityEntry[]; startedAt?: number; endedAt?: number; active?: boolean; clockOffset?: number }) {
