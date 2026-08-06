@@ -1084,7 +1084,7 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
   const activeRunLastTimelineItem = activeRunId
     ? [...timelineItems].reverse().find((entry) => entry.runId === activeRunId)
     : undefined;
-  const showThinking = activeRunInProgress && activeRunLastTimelineItem?.kind !== 'activity-group';
+  const showThinking = activeRunInProgress && !historyReadOnly && activeRunLastTimelineItem?.kind !== 'activity-group';
   const activeThinking = useMemo(() => {
     if (!activeRunId) return undefined;
     const runEvents = sessionEvents.filter((event) => event.run_id === activeRunId);
@@ -1359,7 +1359,6 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
             {selectedSession && <span className={`status ${selectedSession.lifecycle_status}`}>{lifecycleLabel(selectedSession.lifecycle_status)}</span>}
           </header>
           <div className="session-chat-scroll" ref={chatScrollRef} onScroll={handleChatScroll} onWheel={handleChatWheel} onTouchStart={handleChatTouchStart} onTouchEnd={handleChatTouchEnd}>
-            {selectedSession?.recovery_error && <div className="session-banner error" role="alert"><strong>{selectedSession.lifecycle_status === 'recovery_failed' ? t('sessionStatusRecoveryFailed') : t('sessionEnvironmentLost')}</strong><span>{selectedSession.recovery_error}</span></div>}
             {(selectedSession?.lifecycle_status === 'historical' || selectedSession?.agent_deleted_at) && <div className="session-banner"><strong>{t('historicalSession')}</strong><span>{t('historicalSessionHelp')}</span></div>}
             {stopRequestedRunId && <div className="session-banner success" role="status">{t('stopRequested')}</div>}
             {actionError && <div className="session-banner error" role="alert">{t('genericError')}</div>}
@@ -1395,6 +1394,7 @@ export function SessionsPage({ currentUserId }: { currentUserId: string }) {
                 />;
               })}
               {!conversationDraft && showThinking && <ChatThinkingBubble stage={activeThinking?.stage.key ?? 'runStageThinking'} detail={activeThinking?.stage.detail} lastEventAt={activeThinking?.lastEventAt} />}
+              {selectedSession?.recovery_error && <div className="session-banner error session-recovery-notice" role="alert"><strong>{selectedSession.lifecycle_status === 'recovery_failed' ? t('sessionStatusRecoveryFailed') : t('sessionEnvironmentLost')}</strong><span>{selectedSession.recovery_error}</span></div>}
             </div>
           </div>
           {canMutate && <form className="session-composer session-chat-composer" onSubmit={submitMessage}>

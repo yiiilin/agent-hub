@@ -12725,15 +12725,13 @@ fn validate_execution_configuration_fingerprint(value: &str) -> Result<(), ApiEr
 const RUNTIME_CLAIM_SESSION_ELIGIBILITY_SQL: &str = "(($2::bigint > 0
         AND hs.runtime_owner_id IS NULL
         AND hs.lifecycle_status IN ('waiting_for_runtime', 'offline')
-        AND NOT EXISTS (
-          SELECT 1 FROM hub_session_messages AS unreplayable_messages
-          WHERE unreplayable_messages.session_id = hs.id
-            AND unreplayable_messages.delivery_state IN ('delivering', 'delivered')
-            AND (
-              hs.current_bundle_history_checkpoint IS NULL
-              OR unreplayable_messages.sequence > hs.current_bundle_history_checkpoint
-            )
-        ))
+      AND NOT EXISTS (
+        SELECT 1 FROM hub_session_messages AS unreplayable_messages
+        WHERE unreplayable_messages.session_id = hs.id
+          AND unreplayable_messages.delivery_state IN ('delivering', 'delivered')
+          AND hs.current_bundle_history_checkpoint IS NOT NULL
+          AND unreplayable_messages.sequence > hs.current_bundle_history_checkpoint
+      ))
       OR
       (hs.runtime_owner_id = $1
         AND hs.lifecycle_status IN ('restoring', 'online')
@@ -12943,8 +12941,7 @@ async fn runtime_claim_run(
              lifecycle_status = CASE
                  WHEN runtime_owner_id = $1 THEN lifecycle_status
                  ELSE 'restoring'
-             END,
-             recovery_error = NULL
+             END
          WHERE id = $2
            AND (runtime_owner_id IS NULL OR runtime_owner_id = $1)
          RETURNING ownership_generation",
@@ -17689,17 +17686,10 @@ async fn reap_stale_runtimes(pool: &PgPool) -> Result<(), ApiError> {
             )
             .await?;
         }
-        let reclaimed: Vec<(Uuid, String)> = sqlx::query_as(
+        sqlx::query(
             "UPDATE hub_sessions
              SET runtime_owner_id = NULL,
                  lifecycle_status = CASE
-                     WHEN EXISTS (
-                         SELECT 1 FROM hub_session_messages
-                         WHERE session_id = hub_sessions.id
-                           AND delivery_state IN ('delivering', 'delivered')
-                           AND (hub_sessions.current_bundle_history_checkpoint IS NULL
-                                OR sequence > hub_sessions.current_bundle_history_checkpoint)
-                     ) THEN 'recovery_failed'
                      WHEN EXISTS (
                          SELECT 1 FROM runs
                          WHERE hub_session_id = hub_sessions.id
@@ -17725,27 +17715,11 @@ async fn reap_stale_runtimes(pool: &PgPool) -> Result<(), ApiError> {
                      THEN '服务端发生意外，导致 agent 环境数据丢失，但对话历史还在'
                      ELSE recovery_error
                  END
-             WHERE runtime_owner_id = $1
-             RETURNING id, lifecycle_status",
+             WHERE runtime_owner_id = $1",
         )
         .bind(runtime_id)
-        .fetch_all(&mut *tx)
+        .execute(&mut *tx)
         .await?;
-        let unrecoverable_session_ids = reclaimed
-            .iter()
-            .filter(|(_, lifecycle_status)| lifecycle_status == "recovery_failed")
-            .map(|(session_id, _)| *session_id)
-            .collect::<Vec<_>>();
-        if !unrecoverable_session_ids.is_empty() {
-            sqlx::query(
-                "UPDATE runs
-                 SET status = 'failed', updated_at = now()
-                 WHERE hub_session_id = ANY($1) AND status = 'pending'",
-            )
-            .bind(&unrecoverable_session_ids)
-            .execute(&mut *tx)
-            .await?;
-        }
     }
     tx.commit().await?;
     Ok(())
@@ -34991,7 +34965,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(unrecoverable.0, None);
-        assert_eq!(unrecoverable.1, "recovery_failed");
+        assert_eq!(unrecoverable.1, "waiting_for_runtime");
         assert_eq!(
             unrecoverable.2.as_deref(),
             Some("服务端发生意外，导致 agent 环境数据丢失，但对话历史还在")
@@ -35014,7 +34988,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(pending_count, 0);
+        assert_eq!(pending_count, 1);
     }
 
     #[sqlx::test(migrations = "./migrations")]
