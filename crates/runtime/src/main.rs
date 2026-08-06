@@ -1014,6 +1014,22 @@ async fn run_registered_cycle(
                 }
                 Err(err) => warn!(error = %err, "claim failed"),
             }
+            for salvage in &heartbeat.salvage_sessions {
+                let salvage_config = config.clone();
+                let salvage_client = client.clone();
+                let salvage = salvage.clone();
+                workers.spawn(async move {
+                    if let Err(error) =
+                        drive_session_salvage(&salvage_config, &salvage_client, &salvage).await
+                    {
+                        warn!(
+                            session_id = %salvage.session_id,
+                            error = %error,
+                            "failed to salvage Session"
+                        );
+                    }
+                });
+            }
         }
         if let Some(manager) = &manager {
             let checkpoint_transport = HubRuntimeCheckpointTransport {
@@ -1037,6 +1053,83 @@ async fn run_registered_cycle(
         }
         tokio::time::sleep(config.poll_interval).await;
     }
+}
+
+async fn drive_session_salvage(
+    config: &Config,
+    client: &HubClient,
+    dto: &RuntimeSalvageSessionDto,
+) -> anyhow::Result<()> {
+    let paths = SessionPaths::for_session(&config.work_root, dto.session_id);
+    let metadata_file = paths.supervisor.join(SESSION_SUPERVISOR_METADATA_FILE);
+    let metadata = match fs::read(&metadata_file).await {
+        Ok(bytes) => match serde_json::from_slice::<SessionSupervisorMetadata>(&bytes) {
+            Ok(metadata) if metadata.ownership_generation == dto.ownership_generation => {
+                Some(metadata)
+            }
+            Ok(_) | Err(_) => None,
+        },
+        Err(_) => None,
+    };
+    let Some(metadata) = metadata else {
+        if let Err(error) = client
+            .abandon_salvage(dto.session_id, dto.ownership_generation)
+            .await
+        {
+            warn!(
+                session_id = %dto.session_id,
+                error = %error,
+                "failed to abandon salvage Session"
+            );
+        }
+        return Ok(());
+    };
+    let native_session_id = metadata
+        .native_session_id
+        .context("salvage Session has no Native Session id")?;
+    let producing_engine_version = if metadata.engine_version.trim().is_empty() {
+        config.engine_version.clone()
+    } else {
+        metadata.engine_version.clone()
+    };
+    let archive_path = paths.staging.join(format!(
+        "salvage-{}-{}.tar.zst",
+        dto.bundle_generation,
+        Uuid::new_v4().simple()
+    ));
+    let spec = session_bundle::SessionBundleCreateSpec {
+        session_id: dto.session_id,
+        native_session_id,
+        history_checkpoint: dto.history_checkpoint,
+        bundle_generation: dto.bundle_generation,
+        ownership_generation: dto.ownership_generation,
+        producing_engine_version,
+        created_at: chrono::Utc::now(),
+        workspace: paths.workspace,
+        engine_state_root: paths.engine_state,
+        archive_path,
+    };
+    let artifact =
+        tokio::task::spawn_blocking(move || session_bundle::create_session_bundle(&spec))
+            .await
+            .unwrap_or_else(|error| {
+                Err(anyhow::anyhow!(
+                    "salvage Session Bundle task stopped: {error}"
+                ))
+            })?;
+    client
+        .upload_salvage_bundle(dto.session_id, dto.ownership_generation, &artifact)
+        .await?;
+    if let Err(error) = fs::remove_file(&artifact.archive_path).await {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                session_id = %dto.session_id,
+                error = %error,
+                "failed to remove committed salvage Session Bundle staging file"
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn apply_runtime_session_command(
@@ -1696,6 +1789,76 @@ impl HubClient {
             .error_for_status()?
             .json()
             .await?)
+    }
+
+    async fn upload_salvage_bundle(
+        &self,
+        session_id: Uuid,
+        ownership_generation: i64,
+        artifact: &session_bundle::SessionBundleArtifact,
+    ) -> anyhow::Result<RuntimeSessionBundleCommitResponseDto> {
+        let file = fs::File::open(&artifact.archive_path)
+            .await
+            .context("open staged salvage Session Bundle")?;
+        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+        Ok(self
+            .http
+            .put(format!(
+                "{}/api/runtime/sessions/{session_id}/salvage-bundle",
+                self.hub_url
+            ))
+            .bearer_auth(self.runtime_credential())
+            .header("x-agent-hub-ownership-generation", ownership_generation)
+            .header(
+                "x-agent-hub-checkpoint-attempt-id",
+                Uuid::new_v4().to_string(),
+            )
+            .header(
+                "x-agent-hub-bundle-generation",
+                artifact.manifest.bundle_generation,
+            )
+            .header("x-agent-hub-bundle-sha256", &artifact.checksum_sha256)
+            .header("x-agent-hub-bundle-size", artifact.size_bytes)
+            .header(
+                "x-agent-hub-history-checkpoint",
+                artifact.manifest.history_checkpoint,
+            )
+            .header(
+                "x-agent-hub-producing-engine-version",
+                &artifact.manifest.producing_engine_version,
+            )
+            .header(
+                "x-agent-hub-bundle-created-at",
+                artifact.manifest.created_at.to_rfc3339(),
+            )
+            .header(reqwest::header::CONTENT_TYPE, "application/zstd")
+            .header(reqwest::header::CONTENT_LENGTH, artifact.size_bytes)
+            .body(body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    async fn abandon_salvage(
+        &self,
+        session_id: Uuid,
+        ownership_generation: i64,
+    ) -> anyhow::Result<()> {
+        self.http
+            .post(format!(
+                "{}/api/runtime/sessions/{session_id}/salvage-abandon",
+                self.hub_url
+            ))
+            .bearer_auth(self.runtime_credential())
+            .json(&AbandonRuntimeSalvageRequest {
+                ownership_generation,
+            })
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 
     async fn download_session_bundle(
@@ -14401,6 +14564,7 @@ Transfer-Encoding: chunked\r\n\
                         runtime_status: "online".into(),
                         owned_sessions: Vec::new(),
                         cleanup_sessions: Vec::new(),
+                        salvage_sessions: Vec::new(),
                         session_commands: Vec::new(),
                     })
                 }),
@@ -14695,6 +14859,7 @@ done
                         runtime_status: "online".into(),
                         owned_sessions: Vec::new(),
                         cleanup_sessions: Vec::new(),
+                        salvage_sessions: Vec::new(),
                         session_commands: Vec::new(),
                     })
                 }),
@@ -14875,6 +15040,7 @@ done
                         runtime_status: "online".into(),
                         owned_sessions: Vec::new(),
                         cleanup_sessions: Vec::new(),
+                        salvage_sessions: Vec::new(),
                         session_commands: Vec::new(),
                     })
                 }),
@@ -15402,6 +15568,7 @@ done
             runtime_status: "online".into(),
             owned_sessions: Vec::new(),
             cleanup_sessions: Vec::new(),
+            salvage_sessions: Vec::new(),
             session_commands: Vec::new(),
         })
         .unwrap();

@@ -756,6 +756,14 @@ fn build_router(state: AppState) -> Router {
             put(runtime_upload_session_bundle).get(runtime_download_session_bundle),
         )
         .route(
+            "/api/runtime/sessions/{session_id}/salvage-bundle",
+            put(runtime_salvage_session_bundle),
+        )
+        .route(
+            "/api/runtime/sessions/{session_id}/salvage-abandon",
+            post(runtime_abandon_session_salvage),
+        )
+        .route(
             "/api/runtime/runs/{run_id}/events",
             post(runtime_append_event),
         )
@@ -1112,6 +1120,26 @@ fn openapi_document() -> Value {
                     "responses": { "200": { "description": "Session Bundle stream", "content": { "application/zstd": { "schema": { "type": "string", "format": "binary" } } } }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "502": { "description": "Object storage transfer failed" }, "503": { "description": "Object storage is not configured" } }
                 }
             },
+            "/api/runtime/sessions/{session_id}/salvage-bundle": {
+                "put": {
+                    "summary": "Upload a salvaged Session Bundle after a Runtime crash",
+                    "security": [{ "runtimeBearer": [] }],
+                    "parameters": [
+                        id("session_id"),
+                        required_header("x-agent-hub-ownership-generation", json!({ "type": "integer", "minimum": 1 })),
+                        required_header("x-agent-hub-checkpoint-attempt-id", json!({ "type": "string", "format": "uuid" })),
+                        required_header("x-agent-hub-bundle-generation", json!({ "type": "integer", "minimum": 1 })),
+                        required_header("x-agent-hub-bundle-sha256", json!({ "type": "string", "pattern": "^[0-9a-f]{64}$" })),
+                        required_header("x-agent-hub-bundle-size", json!({ "type": "integer", "minimum": 0 })),
+                        required_header("x-agent-hub-history-checkpoint", json!({ "type": "integer", "minimum": 0 })),
+                        required_header("x-agent-hub-producing-engine-version", json!({ "type": "string" })),
+                        required_header("x-agent-hub-bundle-created-at", json!({ "type": "string", "format": "date-time" }))
+                    ],
+                    "requestBody": { "required": true, "content": { "application/zstd": { "schema": { "type": "string", "format": "binary" } } } },
+                    "responses": { "200": response("RuntimeSessionBundleCommitResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "409": { "$ref": "#/components/responses/Conflict" }, "502": { "description": "Object storage transfer failed" }, "503": { "description": "Object storage is not configured" } }
+                }
+            },
+            "/api/runtime/sessions/{session_id}/salvage-abandon": { "post": { "summary": "Abandon a Session salvage obligation", "security": [{ "runtimeBearer": [] }], "parameters": [id("session_id")], "requestBody": body("AbandonRuntimeSalvageRequest"), "responses": { "204": no_content(), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" } } } },
             "/api/runtime/runs/{run_id}/events": { "post": { "summary": "Append a generation-fenced Runtime event", "security": [{ "runtimeBearer": [] }], "parameters": [id("run_id")], "requestBody": body("RuntimeAppendRunEventRequest"), "responses": { "200": response("RunEvent"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" } } } },
             "/api/runtime/runs/{run_id}/tool-requests/finalize": { "post": { "summary": "Atomically finalize generation-fenced Runtime tool requests", "security": [{ "runtimeBearer": [] }], "parameters": [id("run_id")], "requestBody": body("RuntimeFinalizeToolRequestsRequest"), "responses": { "200": response("Run"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/runtime/runs/{run_id}/complete": { "post": { "summary": "Complete a generation-fenced Runtime Run", "security": [{ "runtimeBearer": [] }], "parameters": [id("run_id")], "requestBody": body("RuntimeCompleteRunRequest"), "responses": { "200": response("Run"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
@@ -1343,7 +1371,8 @@ fn openapi_schemas() -> Value {
         "RuntimeSteeringMessage": { "type": "object", "additionalProperties": false, "required": ["id", "sequence", "content"], "properties": { "id": uuid(), "sequence": { "type": "integer", "minimum": 1 }, "content": { "type": "string" } } },
         "RuntimeSessionCommand": { "type": "object", "additionalProperties": false, "required": ["command_id", "session_id", "ownership_generation", "command", "run_id", "turn_id", "native_session_id", "native_turn_id", "message", "configuration_revision", "fingerprint", "execution_configuration"], "properties": { "command_id": uuid(), "session_id": uuid(), "ownership_generation": { "type": "integer", "minimum": 1 }, "command": { "type": "string", "enum": ["checkpoint", "steer", "interrupt", "refresh_configuration"] }, "run_id": { "anyOf": [uuid(), { "type": "null" }] }, "turn_id": { "anyOf": [uuid(), { "type": "null" }] }, "native_session_id": { "type": ["string", "null"] }, "native_turn_id": { "type": ["string", "null"] }, "message": { "anyOf": [{ "$ref": "#/components/schemas/RuntimeSteeringMessage" }, { "type": "null" }] }, "configuration_revision": { "type": ["integer", "null"], "minimum": 1 }, "fingerprint": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" }, "execution_configuration": { "anyOf": [{ "$ref": "#/components/schemas/AgentExecutionConfiguration" }, { "type": "null" }] } } },
         "RuntimeHeartbeatRequest": { "type": "object", "additionalProperties": false, "properties": { "pending_credential_hash": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" }, "accepts_session_commands": { "type": "boolean", "default": false }, "owned_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeOwnedSessionStateRequest" } }, "cleaned_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeOwnedSessionGeneration" } } } },
-        "RuntimeHeartbeatResponse": { "type": "object", "additionalProperties": false, "required": ["rotation_requested", "pending_credential_accepted", "credential_activated", "runtime_status", "owned_sessions", "session_commands"], "properties": { "rotation_requested": { "type": "boolean" }, "pending_credential_accepted": { "type": "boolean" }, "credential_activated": { "type": "boolean" }, "runtime_status": { "type": "string" }, "owned_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeOwnedSessionSnapshot" } }, "cleanup_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeOwnedSessionGeneration" } }, "session_commands": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeSessionCommand" } } } },
+        "RuntimeHeartbeatResponse": { "type": "object", "additionalProperties": false, "required": ["rotation_requested", "pending_credential_accepted", "credential_activated", "runtime_status", "owned_sessions", "session_commands"], "properties": { "rotation_requested": { "type": "boolean" }, "pending_credential_accepted": { "type": "boolean" }, "credential_activated": { "type": "boolean" }, "runtime_status": { "type": "string" }, "owned_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeOwnedSessionSnapshot" } }, "cleanup_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeOwnedSessionGeneration" } }, "salvage_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeSalvageSession" } }, "session_commands": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeSessionCommand" } } } },
+        "RuntimeSalvageSession": { "type": "object", "additionalProperties": false, "required": ["session_id", "ownership_generation", "history_checkpoint", "bundle_generation"], "properties": { "session_id": uuid(), "ownership_generation": { "type": "integer", "minimum": 1 }, "history_checkpoint": { "type": "integer", "minimum": 0 }, "bundle_generation": { "type": "integer", "minimum": 1 } } },
         "RuntimeOwnedSessionGeneration": { "type": "object", "additionalProperties": false, "required": ["session_id", "ownership_generation"], "properties": { "session_id": uuid(), "ownership_generation": { "type": "integer", "minimum": 1 } } },
         "RuntimeClaimRunRequest": { "type": "object", "additionalProperties": false, "required": ["available_new_session_slots", "ready_owned_sessions"], "properties": { "available_new_session_slots": { "type": "integer", "minimum": 0 }, "ready_owned_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeOwnedSessionGeneration" } } } },
         "BeginRuntimeTurnRequest": { "type": "object", "additionalProperties": false, "required": ["configuration_fingerprint"], "properties": { "configuration_fingerprint": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" } } },
@@ -1364,6 +1393,7 @@ fn openapi_schemas() -> Value {
         "RuntimeCompleteSessionCommandRequest": { "type": "object", "additionalProperties": false, "required": ["ownership_generation", "payload"], "properties": { "ownership_generation": { "type": "integer", "minimum": 1 }, "payload": { "$ref": "#/components/schemas/CompleteRuntimeSessionCommandRequest" } } },
         "RuntimeCompleteRunRequest": { "type": "object", "additionalProperties": false, "required": ["ownership_generation", "payload"], "properties": { "ownership_generation": { "type": "integer", "minimum": 1 }, "payload": { "$ref": "#/components/schemas/CompleteRunRequest" } } },
         "ReleaseRuntimeSessionRequest": { "type": "object", "additionalProperties": false, "required": ["ownership_generation"], "properties": { "ownership_generation": { "type": "integer", "minimum": 1 } } },
+        "AbandonRuntimeSalvageRequest": { "type": "object", "additionalProperties": false, "required": ["ownership_generation"], "properties": { "ownership_generation": { "type": "integer", "minimum": 1 } } },
         "BeginRuntimeSessionCheckpointRequest": { "type": "object", "additionalProperties": false, "required": ["ownership_generation", "reason"], "properties": { "ownership_generation": { "type": "integer", "minimum": 1 }, "reason": { "type": "string", "enum": ["idle", "drain"] } } },
         "RuntimeSessionCheckpointAttempt": { "type": "object", "additionalProperties": false, "required": ["checkpoint_attempt_id", "history_checkpoint", "bundle_generation", "reason"], "properties": { "checkpoint_attempt_id": uuid(), "history_checkpoint": { "type": "integer", "minimum": 0 }, "bundle_generation": { "type": "integer", "minimum": 1 }, "reason": { "type": "string", "enum": ["idle", "drain"] } } },
         "RuntimeSessionBundleCommitResponse": { "type": "object", "additionalProperties": false, "required": ["checkpoint_attempt_id", "bundle_generation", "has_queued_work", "ownership_released"], "properties": { "checkpoint_attempt_id": uuid(), "bundle_generation": { "type": "integer", "minimum": 1 }, "has_queued_work": { "type": "boolean" }, "ownership_released": { "type": "boolean" } } },
@@ -11479,6 +11509,31 @@ async fn runtime_heartbeat(
         }
     }
     session_commands.extend(interrupt_commands);
+    let salvage_sessions = sqlx::query(
+        "UPDATE runtime_session_salvage_obligations
+         SET attempts = attempts + 1,
+             next_attempt_at = now() + interval '30 seconds',
+             updated_at = now()
+         WHERE (runtime_id, session_id, ownership_generation) IN (
+             SELECT runtime_id, session_id, ownership_generation
+             FROM runtime_session_salvage_obligations
+             WHERE runtime_id = $1 AND next_attempt_at <= now()
+             ORDER BY created_at, session_id
+             LIMIT 50
+         )
+         RETURNING session_id, ownership_generation, history_checkpoint, bundle_generation",
+    )
+    .bind(runtime_id)
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .map(|row| RuntimeSalvageSessionDto {
+        session_id: row.get("session_id"),
+        ownership_generation: row.get("ownership_generation"),
+        history_checkpoint: row.get("history_checkpoint"),
+        bundle_generation: row.get("bundle_generation"),
+    })
+    .collect();
     tx.commit().await?;
     Ok(Json(RuntimeHeartbeatResponse {
         rotation_requested: rotation_requested_at.is_some() && !credential_activated,
@@ -11487,6 +11542,7 @@ async fn runtime_heartbeat(
         runtime_status,
         owned_sessions,
         cleanup_sessions,
+        salvage_sessions,
         session_commands,
     }))
 }
@@ -12044,6 +12100,187 @@ async fn runtime_upload_session_bundle(
         }
     }
     Ok(Json(response))
+}
+
+async fn runtime_salvage_session_bundle(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<Uuid>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Json<RuntimeSessionBundleCommitResponseDto>, ApiError> {
+    let runtime_id = require_runtime(&state, &headers).await?;
+    let metadata = parse_session_bundle_upload_headers(&headers, state.session_bundle_max_bytes)?;
+    let obligation = sqlx::query(
+        "SELECT history_checkpoint, bundle_generation
+         FROM runtime_session_salvage_obligations
+         WHERE runtime_id = $1 AND session_id = $2 AND ownership_generation = $3",
+    )
+    .bind(runtime_id)
+    .bind(session_id)
+    .bind(metadata.ownership_generation)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(ApiError::conflict("no salvage obligation"))?;
+    if metadata.bundle_generation != obligation.get::<i64, _>("bundle_generation")
+        || metadata.history_checkpoint < obligation.get::<i64, _>("history_checkpoint")
+    {
+        return Err(ApiError::conflict(
+            "Session Bundle does not match the salvage obligation",
+        ));
+    }
+    let current = sqlx::query(
+        "SELECT current_bundle_generation, current_bundle_checksum_sha256
+         FROM hub_sessions WHERE id = $1",
+    )
+    .bind(session_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    if current.as_ref().is_some_and(|row| {
+        row.get::<Option<i64>, _>("current_bundle_generation") == Some(metadata.bundle_generation)
+            && row
+                .get::<Option<String>, _>("current_bundle_checksum_sha256")
+                .as_deref()
+                == Some(metadata.checksum_sha256.as_str())
+    }) {
+        let mut tx = state.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM runtime_session_salvage_obligations
+             WHERE runtime_id = $1 AND session_id = $2 AND ownership_generation = $3",
+        )
+        .bind(runtime_id)
+        .bind(session_id)
+        .bind(metadata.ownership_generation)
+        .execute(&mut *tx)
+        .await?;
+        let has_queued_work =
+            session_has_queued_work_tx(&mut tx, session_id, metadata.history_checkpoint).await?;
+        tx.commit().await?;
+        return Ok(Json(RuntimeSessionBundleCommitResponseDto {
+            checkpoint_attempt_id: metadata.checkpoint_attempt_id,
+            bundle_generation: metadata.bundle_generation,
+            has_queued_work,
+            ownership_released: true,
+        }));
+    }
+    let store =
+        state
+            .session_bundle_store
+            .as_ref()
+            .cloned()
+            .ok_or(ApiError::service_unavailable(
+                "Session Bundle object storage is not configured",
+            ))?;
+    let object_key = session_bundle_object_key(
+        session_id,
+        metadata.bundle_generation,
+        metadata.checkpoint_attempt_id,
+    );
+    let observed = Arc::new(AtomicU64::new(0));
+    let observed_stream = Arc::clone(&observed);
+    let declared_size = metadata.size_bytes;
+    let stream = body.into_data_stream().map(move |chunk| {
+        let chunk = chunk.map_err(|error| std::io::Error::other(error.to_string()))?;
+        let previous = observed_stream.fetch_add(chunk.len() as u64, Ordering::AcqRel);
+        let total = previous.saturating_add(chunk.len() as u64);
+        if total > declared_size {
+            return Err(std::io::Error::other(
+                "Session Bundle body exceeds its declared size",
+            ));
+        }
+        Ok(chunk)
+    });
+    if let Err(error) = store
+        .put_stream(
+            &object_key,
+            metadata.size_bytes,
+            &metadata.checksum_sha256,
+            stream,
+        )
+        .await
+    {
+        let _ = store.delete(&object_key).await;
+        warn!(session_id = %session_id, error = %error, "Session Bundle object upload failed");
+        return Err(ApiError::bad_gateway("Session Bundle object upload failed"));
+    }
+    if observed.load(Ordering::Acquire) != metadata.size_bytes {
+        let _ = store.delete(&object_key).await;
+        return Err(ApiError::bad_request(
+            "Session Bundle body size does not match its declaration",
+        ));
+    }
+
+    let mut tx = state.pool.begin().await?;
+    let updated = sqlx::query(
+        "UPDATE hub_sessions
+         SET current_bundle_generation = $1,
+             current_bundle_object_key = $2,
+             current_bundle_checksum_sha256 = $3,
+             current_bundle_size_bytes = $4,
+             current_bundle_history_checkpoint = $5,
+             current_bundle_ownership_generation = $6,
+             current_bundle_producing_engine_version = $7,
+             current_bundle_created_at = $8,
+             current_bundle_runtime_id = $9,
+             history_checkpoint = GREATEST(history_checkpoint, $5),
+             recovery_error = NULL
+         WHERE id = $10",
+    )
+    .bind(metadata.bundle_generation)
+    .bind(&object_key)
+    .bind(&metadata.checksum_sha256)
+    .bind(metadata.size_bytes as i64)
+    .bind(metadata.history_checkpoint)
+    .bind(metadata.ownership_generation)
+    .bind(&metadata.producing_engine_version)
+    .bind(metadata.created_at)
+    .bind(runtime_id)
+    .bind(session_id)
+    .execute(&mut *tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        let _ = store.delete(&object_key).await;
+        return Err(ApiError::conflict(
+            "salvage Session no longer accepts this Bundle",
+        ));
+    }
+    let has_queued_work =
+        session_has_queued_work_tx(&mut tx, session_id, metadata.history_checkpoint).await?;
+    sqlx::query(
+        "DELETE FROM runtime_session_salvage_obligations
+         WHERE runtime_id = $1 AND session_id = $2 AND ownership_generation = $3",
+    )
+    .bind(runtime_id)
+    .bind(session_id)
+    .bind(metadata.ownership_generation)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Json(RuntimeSessionBundleCommitResponseDto {
+        checkpoint_attempt_id: metadata.checkpoint_attempt_id,
+        bundle_generation: metadata.bundle_generation,
+        has_queued_work,
+        ownership_released: true,
+    }))
+}
+
+async fn runtime_abandon_session_salvage(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(req): Json<AbandonRuntimeSalvageRequest>,
+) -> Result<StatusCode, ApiError> {
+    validate_ownership_generation(req.ownership_generation)?;
+    let runtime_id = require_runtime(&state, &headers).await?;
+    sqlx::query(
+        "DELETE FROM runtime_session_salvage_obligations
+         WHERE runtime_id = $1 AND session_id = $2 AND ownership_generation = $3",
+    )
+    .bind(runtime_id)
+    .bind(session_id)
+    .bind(req.ownership_generation)
+    .execute(&state.pool)
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn runtime_download_session_bundle(
@@ -17692,6 +17929,19 @@ async fn reap_stale_runtimes(pool: &PgPool) -> Result<(), ApiError> {
             )
             .await?;
         }
+        sqlx::query(
+            "INSERT INTO runtime_session_salvage_obligations
+                 (runtime_id, session_id, ownership_generation, history_checkpoint,
+                  bundle_generation)
+             SELECT $1, id, ownership_generation, history_checkpoint,
+                    COALESCE(current_bundle_generation, 0) + 1
+             FROM hub_sessions
+             WHERE runtime_owner_id = $1
+             ON CONFLICT (runtime_id, session_id, ownership_generation) DO NOTHING",
+        )
+        .bind(runtime_id)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "UPDATE hub_sessions
              SET runtime_owner_id = NULL,
@@ -24575,6 +24825,8 @@ mod tests {
             "/api/runtime/sessions/{session_id}/checkpoint/begin",
             "/api/runtime/sessions/{session_id}/checkpoint/fail",
             "/api/runtime/sessions/{session_id}/bundle",
+            "/api/runtime/sessions/{session_id}/salvage-bundle",
+            "/api/runtime/sessions/{session_id}/salvage-abandon",
             "/api/runtime/runs/{run_id}/events",
             "/api/runtime/runs/{run_id}/tool-requests/finalize",
             "/api/runtime/runs/{run_id}/complete",
@@ -34995,6 +35247,166 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(pending_count, 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn runtime_salvage_obligation_recovers_crashed_workspace_bundle(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let _ = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        sqlx::query("UPDATE hub_sessions SET lifecycle_status = 'online' WHERE id = $1")
+            .bind(fixture.hub_session_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE runtimes
+             SET last_heartbeat_at = now() - interval '2 minutes'
+             WHERE id = $1",
+        )
+        .bind(fixture.runtime_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        reap_stale_runtimes(&fixture.state.pool).await.unwrap();
+
+        let obligation: (i64, i64, i64) = sqlx::query_as(
+            "SELECT ownership_generation, history_checkpoint, bundle_generation
+             FROM runtime_session_salvage_obligations
+             WHERE runtime_id = $1 AND session_id = $2",
+        )
+        .bind(fixture.runtime_id)
+        .bind(fixture.hub_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(obligation, (1, 3, 1));
+
+        let heartbeat = runtime_heartbeat(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Json(RuntimeHeartbeatRequest::default()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            heartbeat.salvage_sessions,
+            vec![RuntimeSalvageSessionDto {
+                session_id: fixture.hub_session_id,
+                ownership_generation: 1,
+                history_checkpoint: 3,
+                bundle_generation: 1,
+            }]
+        );
+
+        let stored = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let object_app = Router::new().route(
+            "/bundle-bucket/{*key}",
+            axum::routing::put({
+                let stored = Arc::clone(&stored);
+                move |body: Body| {
+                    let stored = Arc::clone(&stored);
+                    async move {
+                        *stored.lock().unwrap() =
+                            axum::body::to_bytes(body, 1024).await.unwrap().to_vec();
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let object_server =
+            tokio::spawn(async move { axum::serve(listener, object_app).await.unwrap() });
+        let store = crate::session_bundle_store::S3BundleStore::new(
+            crate::session_bundle_store::S3BundleStoreConfig {
+                endpoint: format!("http://{address}").parse().unwrap(),
+                bucket: "bundle-bucket".into(),
+                region: "us-test-1".into(),
+                access_key_id: "test-access".into(),
+                secret_access_key: "test-secret".into(),
+                session_token: None,
+                server_side_encryption: None,
+                kms_key_id: None,
+                allow_http: true,
+            },
+        )
+        .unwrap();
+        let mut state = (*fixture.state).clone();
+        state.session_bundle_store = Some(Arc::new(store));
+        state.session_bundle_max_bytes = 1024;
+        let state = Arc::new(state);
+
+        let bytes = Bytes::from_static(b"salvage bundle body");
+        let checksum = format!("{:x}", Sha256::digest(&bytes));
+        let checkpoint_attempt_id = Uuid::new_v4();
+        let mut headers = bearer_headers(&fixture.runtime_token);
+        for (name, value) in [
+            ("content-length", bytes.len().to_string()),
+            ("x-agent-hub-ownership-generation", obligation.0.to_string()),
+            (
+                "x-agent-hub-checkpoint-attempt-id",
+                checkpoint_attempt_id.to_string(),
+            ),
+            ("x-agent-hub-bundle-generation", obligation.2.to_string()),
+            ("x-agent-hub-bundle-sha256", checksum.clone()),
+            ("x-agent-hub-bundle-size", bytes.len().to_string()),
+            ("x-agent-hub-history-checkpoint", obligation.1.to_string()),
+            ("x-agent-hub-producing-engine-version", "0.104.0".into()),
+            ("x-agent-hub-bundle-created-at", Utc::now().to_rfc3339()),
+        ] {
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(&value).unwrap(),
+            );
+        }
+
+        let response = runtime_salvage_session_bundle(
+            State(state.clone()),
+            Path(fixture.hub_session_id),
+            headers,
+            Body::from(bytes.clone()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(response.checkpoint_attempt_id, checkpoint_attempt_id);
+        assert_eq!(response.bundle_generation, 1);
+        assert!(response.ownership_released);
+
+        let pointer: (Option<i64>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT current_bundle_generation, current_bundle_checksum_sha256, recovery_error
+             FROM hub_sessions WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(pointer, (Some(1), Some(checksum), None));
+        let bundle_metadata: (Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT current_bundle_history_checkpoint, current_bundle_ownership_generation
+             FROM hub_sessions WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(bundle_metadata, (Some(3), Some(1)));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM runtime_session_salvage_obligations
+                 WHERE runtime_id = $1 AND session_id = $2",
+            )
+            .bind(fixture.runtime_id)
+            .bind(fixture.hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(*stored.lock().unwrap(), bytes);
+        object_server.abort();
     }
 
     #[sqlx::test(migrations = "./migrations")]

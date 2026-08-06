@@ -2111,6 +2111,8 @@ pub struct RuntimeHeartbeatResponse {
     pub owned_sessions: Vec<RuntimeOwnedSessionSnapshotDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cleanup_sessions: Vec<RuntimeOwnedSessionGenerationDto>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub salvage_sessions: Vec<RuntimeSalvageSessionDto>,
     pub session_commands: Vec<RuntimeSessionCommandDto>,
 }
 
@@ -2128,6 +2130,21 @@ pub struct RuntimeOwnedSessionSnapshotDto {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeOwnedSessionGenerationDto {
     pub session_id: Uuid,
+    pub ownership_generation: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeSalvageSessionDto {
+    pub session_id: Uuid,
+    pub ownership_generation: i64,
+    pub history_checkpoint: i64,
+    pub bundle_generation: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AbandonRuntimeSalvageRequest {
     pub ownership_generation: i64,
 }
 
