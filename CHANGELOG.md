@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 本文件记录 Agent Hub 各正式版本面向使用者的变化。
 
+## [0.3.1] - 2026-08-06
+
+### Fixed
+
+- 修复打开包含超长历史活动的会话时前端卡死：活动组默认只渲染最新 20 行，顶部显示“已折叠 N 行”横幅，点击横幅后才展开全部内容。
+
 ## [0.3.0] - 2026-08-05
 
 ### Added
@@ -73,7 +79,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Release 工作流在 GHCR 鉴权和发布前完成全历史与镜像凭证扫描，且不上传原始扫描报告。
 - LDAP QA 私钥改为测试环境启动时临时生成，不再保存在 Git 中。
 
-[Unreleased]: https://github.com/yiiilin/agent-hub/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/yiiilin/agent-hub/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/yiiilin/agent-hub/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/yiiilin/agent-hub/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/yiiilin/agent-hub/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/yiiilin/agent-hub/releases/tag/v0.1.0

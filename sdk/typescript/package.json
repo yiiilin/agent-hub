@@ -1,6 +1,6 @@
 {
   "name": "@agent-hub/client",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Framework-neutral browser client for Agent Hub",
   "type": "module",
   "sideEffects": false,

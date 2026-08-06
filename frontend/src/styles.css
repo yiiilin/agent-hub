@@ -1010,6 +1010,7 @@ textarea {
 .session-activity-chevron { flex: 0 0 auto; transition: transform 140ms ease; }
 .session-activity-events[open] .session-activity-chevron { transform: rotate(90deg); }
 .session-activity-events > div { display: grid; border-top: 1px solid var(--border-subtle); }
+.session-activity-events .session-activity-show-more { width: 100%; border: 0; border-bottom: 1px solid var(--border-subtle); background: transparent; color: var(--accent); font-size: 11px; font-weight: 650; text-align: center; padding: 8px 11px; cursor: pointer; }
 .session-activity-row { min-width: 0; display: grid; grid-template-columns: 22px minmax(0, 1fr); align-items: start; gap: 10px; border-bottom: 1px solid var(--border-subtle); padding: 10px 11px; font-size: 11px; }
 .session-activity-row:last-child { border-bottom: 0; }
 .session-activity-row code, .session-activity-row span { min-width: 0; overflow-wrap: anywhere; }

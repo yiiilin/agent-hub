@@ -480,7 +480,22 @@ export function ChatActivityGroup({ activities, startedAt, endedAt, active = fal
     return () => window.clearInterval(timer);
   }, [active, clockOffset, startedAt]);
   const durationEndedAt = active ? now : endedAt;
-  return <details className="session-activity-events"><summary><span>{t('agentActivityDuration').replace('{duration}', formatActivityDuration(activities, locale, startedAt, durationEndedAt))}</span><ChevronRight className="session-activity-chevron" size={16} aria-hidden="true" /></summary><div>{activities.map((activity) => <div className="session-activity-row" key={activity.id}><span className="session-activity-icon" aria-hidden="true"><ActivityIcon kind={activity.kind} /></span><div className="session-activity-content"><span className="session-activity-heading"><strong>{t(activityKeys[activity.kind])}</strong>{activity.status && <small className={`session-activity-status status-${activity.status}`}>{t(activityStatusKeys[activity.status] ?? 'statusFailed')}</small>}{activity.kind === 'tool' && activity.status && activity.status !== 'pending' && <small className="session-activity-elapsed">{formatActivityDuration([activity], locale)}</small>}</span>{activity.summary && (activity.kind === 'command' ? <code>{activity.summary}</code> : <span className="session-activity-summary">{activity.summary}</span>)}{activity.output && <div className="session-activity-output"><span>{t('activityOutput')}</span><pre>{activity.output}</pre></div>}</div></div>)}</div></details>;
+  // A single Run can emit tens of thousands of reasoning/tool events;
+  // mounting every row eagerly freezes the page, so the group renders only
+  // the newest rows plus a collapsed-count banner and expands the full
+  // content on demand.
+  const [expanded, setExpanded] = useState(false);
+  const [showAll, setShowAll] = useState(false);
+  const previewRows = activities.slice(-20);
+  const collapsedRows = activities.length - previewRows.length;
+  const visibleActivities = showAll ? activities : previewRows;
+  return <details
+    className="session-activity-events"
+    onToggle={(event) => setExpanded(event.currentTarget.open)}
+  >
+    <summary><span>{t('agentActivityDuration').replace('{duration}', formatActivityDuration(activities, locale, startedAt, durationEndedAt))}</span><ChevronRight className="session-activity-chevron" size={16} aria-hidden="true" /></summary>
+    {expanded && <div>{!showAll && collapsedRows > 0 && <button type="button" className="session-activity-show-more" onClick={() => setShowAll(true)}>{t('activityRowsCollapsed').replace('{count}', String(collapsedRows))}</button>}{visibleActivities.map((activity) => <div className="session-activity-row" key={activity.id}><span className="session-activity-icon" aria-hidden="true"><ActivityIcon kind={activity.kind} /></span><div className="session-activity-content"><span className="session-activity-heading"><strong>{t(activityKeys[activity.kind])}</strong>{activity.status && <small className={`session-activity-status status-${activity.status}`}>{t(activityStatusKeys[activity.status] ?? 'statusFailed')}</small>}{activity.kind === 'tool' && activity.status && activity.status !== 'pending' && <small className="session-activity-elapsed">{formatActivityDuration([activity], locale)}</small>}</span>{activity.summary && (activity.kind === 'command' ? <code>{activity.summary}</code> : <span className="session-activity-summary">{activity.summary}</span>)}{activity.output && <div className="session-activity-output"><span>{t('activityOutput')}</span><pre>{activity.output}</pre></div>}</div></div>)}</div>}
+  </details>;
 }
 
 export function ChatMessageBubble({
