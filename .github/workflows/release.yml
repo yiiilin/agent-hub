@@ -238,3 +238,42 @@ jobs:
               --notes-file RELEASE_NOTES.md \
               --latest
           fi
+
+  cli-assets:
+    name: Build and upload CLI assets
+    needs: github-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+          persist-credentials: false
+
+      - name: Build CLI for linux/amd64
+        run: |
+          docker run --rm -v "$PWD":/workspace -w /workspace rust:1.91-bookworm \
+            cargo build --release -p agent-hub-cli
+
+      - name: Build CLI for linux/arm64
+        run: |
+          docker run --rm -v "$PWD":/workspace -w /workspace rust:1.91-bookworm \
+            bash -c "rustup target add aarch64-unknown-linux-gnu && \
+              apt-get update && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu && \
+              CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+              cargo build --release -p agent-hub-cli --target aarch64-unknown-linux-gnu"
+
+      - name: Stage and checksum assets
+        run: |
+          mkdir -p dist
+          cp target/release/agent-hub-cli dist/agent-hub-cli-linux-amd64
+          cp target/aarch64-unknown-linux-gnu/release/agent-hub-cli dist/agent-hub-cli-linux-arm64
+          chmod +x dist/agent-hub-cli-*
+          (cd dist && sha256sum agent-hub-cli-* > SHA256SUMS.txt)
+
+      - name: Upload assets to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$RELEASE_TAG" dist/* --clobber
