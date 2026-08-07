@@ -5340,7 +5340,13 @@ async fn list_agents(
          FROM agents AS a
          JOIN users AS owner ON owner.id = a.owner_id
          WHERE a.deleted_at IS NULL
-           AND (a.owner_id = $1 OR owner.role <> 'super_admin' OR $2 = 'super_admin')
+           AND (
+               a.owner_id = $1
+               OR a.visibility = 'public'
+               OR (a.visibility = 'public_to' AND $1 = ANY(a.public_to))
+               OR owner.role <> 'super_admin'
+               OR $2 = 'super_admin'
+           )
            AND (a.owner_id = $1 OR a.visibility = 'public'
                 OR (a.visibility = 'public_to' AND $1 = ANY(a.public_to))
                 OR $2 IN ('admin', 'super_admin'))
@@ -12063,9 +12069,8 @@ async fn runtime_heartbeat(
         .bind(runtime_id)
         .execute(&mut *tx)
         .await?;
-        session_commands.extend(
-            sqlx::query(
-                "SELECT messages.id AS command_id, messages.session_id,
+        let mut steer_commands = sqlx::query(
+            "SELECT messages.id AS command_id, messages.session_id,
                         sessions.ownership_generation, messages.run_id,
                         turns.id AS turn_id, sessions.native_session_id,
                         turns.native_turn_id, messages.sequence, messages.content
@@ -12082,33 +12087,44 @@ async fn runtime_heartbeat(
                    AND messages.run_id IS NOT NULL
                    AND messages.content IS NOT NULL
                  ORDER BY sessions.created_at, messages.sequence, messages.id",
-            )
-            .bind(runtime_id)
-            .fetch_all(&mut *tx)
-            .await?
-            .into_iter()
-            .map(|row| {
-                let command_id = row.get("command_id");
-                RuntimeSessionCommandDto {
-                    command_id,
-                    session_id: row.get("session_id"),
-                    ownership_generation: row.get("ownership_generation"),
-                    command: "steer".into(),
-                    run_id: row.get("run_id"),
-                    turn_id: Some(row.get("turn_id")),
-                    native_session_id: row.get("native_session_id"),
-                    native_turn_id: row.get("native_turn_id"),
-                    message: Some(RuntimeSteeringMessageDto {
-                        id: command_id,
-                        sequence: row.get("sequence"),
-                        content: row.get("content"),
-                    }),
-                    configuration_revision: None,
-                    fingerprint: None,
-                    execution_configuration: None,
-                }
-            }),
-        );
+        )
+        .bind(runtime_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|row| {
+            let command_id = row.get("command_id");
+            RuntimeSessionCommandDto {
+                command_id,
+                session_id: row.get("session_id"),
+                ownership_generation: row.get("ownership_generation"),
+                command: "steer".into(),
+                run_id: row.get("run_id"),
+                turn_id: Some(row.get("turn_id")),
+                native_session_id: row.get("native_session_id"),
+                native_turn_id: row.get("native_turn_id"),
+                message: Some(RuntimeSteeringMessageDto {
+                    id: command_id,
+                    sequence: row.get("sequence"),
+                    content: row.get("content"),
+                    attachments: Vec::new(),
+                }),
+                configuration_revision: None,
+                fingerprint: None,
+                execution_configuration: None,
+            }
+        })
+        .collect::<Vec<_>>();
+        for command in &mut steer_commands {
+            if let Some(message) = &mut command.message {
+                message.attachments =
+                    load_attachments_for_session_messages(&mut *tx, &[message.id])
+                        .await?
+                        .remove(&message.id)
+                        .unwrap_or_default();
+            }
+        }
+        session_commands.extend(steer_commands);
     }
     if accepts_session_commands {
         let refresh_rows = sqlx::query(
@@ -38649,6 +38665,59 @@ mod tests {
             load_run_for_user(&state.pool, protected_run_id, &super_admin)
                 .await
                 .is_ok()
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn public_super_admin_agents_are_visible_to_member_users(pool: PgPool) {
+        let member_token = create_user_session_with_role(&pool, "member").await;
+        let super_token = create_user_session_with_role(&pool, "super_admin").await;
+        let state = Arc::new(test_state_with_browser_session_auth(pool));
+        let member_id: Uuid =
+            sqlx::query_scalar("SELECT user_id FROM sessions WHERE token_hash = $1")
+                .bind(sha256_hex(&member_token))
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let super_id: Uuid =
+            sqlx::query_scalar("SELECT user_id FROM sessions WHERE token_hash = $1")
+                .bind(sha256_hex(&super_token))
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let public_super_agent = Uuid::new_v4();
+        let private_super_agent = Uuid::new_v4();
+        for (agent_id, visibility) in [
+            (public_super_agent, "public"),
+            (private_super_agent, "private"),
+        ] {
+            sqlx::query(
+                "INSERT INTO agents
+                     (id, owner_id, name, instructions, visibility, model_policy)
+                 VALUES ($1, $2, $3, 'instructions', $4,
+                         '{\"provider\":\"hub-proxy\"}'::jsonb)",
+            )
+            .bind(agent_id)
+            .bind(super_id)
+            .bind(format!("Super {visibility} Agent"))
+            .bind(visibility)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+
+        let visible = list_agents(State(state.clone()), session_headers(&member_token))
+            .await
+            .unwrap()
+            .0;
+        assert!(
+            visible.iter().any(|agent| agent.id == public_super_agent),
+            "public super_admin Agent must be visible to members"
+        );
+        assert!(
+            visible.iter().all(|agent| agent.id != private_super_agent),
+            "private super_admin Agent must stay hidden from members"
         );
     }
 

@@ -1203,6 +1203,30 @@ async fn apply_runtime_session_command(
                 .native_turn_id
                 .clone()
                 .context("steer command is missing its expected native Turn id")?;
+            let mut steer_content = message.content.clone();
+            if !message.attachments.is_empty() {
+                if let Some(client) = client {
+                    let notes = download_attachments_to_workspace(
+                        client,
+                        manager.work_root(),
+                        command.session_id,
+                        &message.attachments,
+                    )
+                    .await;
+                    if !notes.is_empty() {
+                        let note = notes.join("\n");
+                        if !steer_content.trim().is_empty() {
+                            steer_content.push('\n');
+                        }
+                        steer_content.push_str(&note);
+                    }
+                } else {
+                    warn!(
+                        session_id = %command.session_id,
+                        "steer carries attachments but no Hub client is available"
+                    );
+                }
+            }
             let outcome = manager
                 .steer(
                     command.session_id,
@@ -1210,7 +1234,7 @@ async fn apply_runtime_session_command(
                     native_session_id,
                     native_turn_id,
                     message.id,
-                    message.content.clone(),
+                    steer_content,
                 )
                 .await;
             match outcome {
@@ -2473,28 +2497,14 @@ fn unique_attachment_filename(used: &mut BTreeSet<String>, name: &str) -> String
     unreachable!("attachment filename counter overflowed")
 }
 
-async fn inject_session_attachments(
+async fn download_attachments_to_workspace(
     client: &HubClient,
-    claim: &mut ClaimRunResponse,
     work_root: &Path,
-) -> anyhow::Result<()> {
-    let Some(context) = claim.session_context.as_mut() else {
-        return Ok(());
-    };
-    let session_id = claim
-        .run
-        .hub_session_id
-        .context("claimed Run is missing its Hub Session id")?;
-    let mut attachments_by_id = BTreeMap::<Uuid, HubSessionAttachmentDto>::new();
-    for message in &context.messages {
-        for attachment in &message.attachments {
-            attachments_by_id
-                .entry(attachment.id)
-                .or_insert_with(|| attachment.clone());
-        }
-    }
-    if attachments_by_id.is_empty() {
-        return Ok(());
+    session_id: Uuid,
+    attachments: &[HubSessionAttachmentDto],
+) -> Vec<String> {
+    if attachments.is_empty() {
+        return Vec::new();
     }
     let attachment_dir = SessionPaths::for_session(work_root, session_id)
         .workspace
@@ -2505,11 +2515,11 @@ async fn inject_session_attachments(
             error = %error,
             "failed to create Session attachments directory; skipping attachment injection"
         );
-        return Ok(());
+        return Vec::new();
     }
     let mut used_names = BTreeSet::new();
     let mut notes = Vec::new();
-    for attachment in attachments_by_id.values() {
+    for attachment in attachments {
         let file_name = unique_attachment_filename(
             &mut used_names,
             &sanitize_attachment_filename(&attachment.name),
@@ -2539,6 +2549,36 @@ async fn inject_session_attachments(
             }
         }
     }
+    notes
+}
+
+async fn inject_session_attachments(
+    client: &HubClient,
+    claim: &mut ClaimRunResponse,
+    work_root: &Path,
+) -> anyhow::Result<()> {
+    let Some(context) = claim.session_context.as_mut() else {
+        return Ok(());
+    };
+    let session_id = claim
+        .run
+        .hub_session_id
+        .context("claimed Run is missing its Hub Session id")?;
+    let mut attachments_by_id = BTreeMap::<Uuid, HubSessionAttachmentDto>::new();
+    for message in &context.messages {
+        for attachment in &message.attachments {
+            attachments_by_id
+                .entry(attachment.id)
+                .or_insert_with(|| attachment.clone());
+        }
+    }
+    let notes = download_attachments_to_workspace(
+        client,
+        work_root,
+        session_id,
+        &attachments_by_id.into_values().collect::<Vec<_>>(),
+    )
+    .await;
     if notes.is_empty() {
         return Ok(());
     }
@@ -3961,6 +4001,10 @@ struct SessionCommandGate {
 }
 
 impl SessionSupervisorManager {
+    fn work_root(&self) -> &Path {
+        &self.work_root
+    }
+
     #[cfg(test)]
     fn new(work_root: PathBuf, runtime_id: Uuid, max_online_sessions: usize) -> Self {
         Self::new_with_idle_timeout(
@@ -4882,9 +4926,26 @@ impl SessionSupervisorManager {
             let saved_session = native_session_id
                 .as_deref()
                 .map(|session_id| {
-                    pi_driver::discover_session_file(&run_env.engine_state_root, session_id)
+                    match pi_driver::discover_session_file(&run_env.engine_state_root, session_id) {
+                        Ok(path) => Ok(Some(path)),
+                        Err(error)
+                            if error
+                                .downcast_ref::<std::io::Error>()
+                                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                                || error
+                                    .to_string()
+                                    .contains("Pi Session recovery file was not found") =>
+                        {
+                            // The local Pi session directory is gone (for
+                            // example after runtime GC); start fresh instead
+                            // of failing the whole Run.
+                            Ok(None)
+                        }
+                        Err(error) => Err(error),
+                    }
                 })
-                .transpose()?;
+                .transpose()?
+                .flatten();
             SessionSupervisor::start_pi(
                 session_id,
                 ownership_generation,

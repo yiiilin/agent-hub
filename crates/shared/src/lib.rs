@@ -2196,6 +2196,8 @@ pub struct RuntimeSteeringMessageDto {
     pub id: Uuid,
     pub sequence: i64,
     pub content: String,
+    #[serde(default)]
+    pub attachments: Vec<HubSessionAttachmentDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

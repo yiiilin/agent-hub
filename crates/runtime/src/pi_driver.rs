@@ -2237,6 +2237,12 @@ async fn post_vision_request(config: &VisionAnalyzeConfig, body: &Value) -> anyh
         "model proxy returned HTTP {status}: {text}"
     );
     let value: Value = serde_json::from_str(&text).context("parse vision analysis response")?;
+    if value.get("output").and_then(Value::as_array).is_none()
+        && value.get("output_text").and_then(Value::as_str).is_none()
+    {
+        warn!(status = %status, body = %text.chars().take(800).collect::<String>(),
+            "vision analysis response has no output text");
+    }
     vision_response_text(&value)
 }
 
