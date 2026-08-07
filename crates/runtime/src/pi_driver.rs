@@ -2185,12 +2185,34 @@ fn build_vision_request_body(model_id: &str, prompt: &str, image_data_url: &str)
 
 fn vision_response_text(value: &Value) -> anyhow::Result<String> {
     if let Some(outputs) = value.get("output").and_then(Value::as_array) {
-        let text = outputs
-            .iter()
-            .filter(|output| output.get("type").and_then(Value::as_str) == Some("output_text"))
-            .filter_map(|output| output.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("");
+        let mut chunks = Vec::new();
+        for output in outputs {
+            match output.get("type").and_then(Value::as_str) {
+                Some("output_text") => {
+                    if let Some(text) = output.get("text").and_then(Value::as_str) {
+                        chunks.push(text);
+                    }
+                }
+                Some("message") => {
+                    if let Some(content) = output.get("content").and_then(Value::as_array) {
+                        for part in content {
+                            let text = match part.get("type").and_then(Value::as_str) {
+                                Some("output_text" | "text") => {
+                                    part.get("text").and_then(Value::as_str)
+                                }
+                                Some("refusal") => part.get("refusal").and_then(Value::as_str),
+                                _ => None,
+                            };
+                            if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
+                                chunks.push(text);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let text = chunks.join("");
         if !text.trim().is_empty() {
             return Ok(text);
         }
