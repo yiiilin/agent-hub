@@ -560,7 +560,10 @@ fn build_router(state: AppState) -> Router {
             "/api/agents/{agent_id}/runs",
             get(list_agent_runs).post(create_run),
         )
-        .route("/api/sessions", get(list_hub_sessions))
+        .route(
+            "/api/sessions",
+            get(list_hub_sessions).post(create_session_with_message),
+        )
         .route(
             "/api/sessions/{session_id}",
             get(get_hub_session).delete(delete_hub_session),
@@ -572,6 +575,15 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/sessions/{session_id}/messages",
             get(list_hub_session_messages).post(create_hub_session_message),
+        )
+        .route(
+            "/api/sessions/{session_id}/messages/{message_id}/attachments",
+            post(bind_message_attachments),
+        )
+        .route(
+            "/api/sessions/{session_id}/messages/upload",
+            post(create_session_message_with_attachments)
+                .layer(DefaultBodyLimit::max(ATTACHMENT_UPLOAD_BODY_LIMIT)),
         )
         .route(
             "/api/attachments",
@@ -1061,7 +1073,7 @@ fn openapi_document() -> Value {
                 "get": { "summary": "List agent run history", "parameters": [id("agent_id")], "responses": { "200": list_response("Run"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } },
                 "post": { "summary": "Create agent run", "parameters": [id("agent_id")], "requestBody": body("CreateRunRequest"), "responses": { "200": response("Run"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } }
             },
-            "/api/sessions": { "get": { "summary": "List owned sessions", "responses": { "200": list_response("HubSession"), "401": { "$ref": "#/components/responses/Unauthorized" } } } },
+            "/api/sessions": { "get": { "summary": "List owned sessions", "responses": { "200": list_response("HubSession"), "401": { "$ref": "#/components/responses/Unauthorized" } } }, "post": { "summary": "Create an empty draft session for an agent", "requestBody": body("CreateDraftSessionRequest"), "responses": { "200": response("HubSession"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/sessions/{session_id}": { "get": { "summary": "Get owned session", "parameters": [id("session_id")], "responses": { "200": response("HubSession"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } }, "delete": { "summary": "Delete an owned session", "parameters": [id("session_id")], "responses": { "204": { "description": "Deleted" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/sessions/{session_id}/title": { "put": { "summary": "Rename an owned session", "parameters": [id("session_id")], "requestBody": body("UpdateHubSessionTitleRequest"), "responses": { "200": response("HubSession"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/sessions/{session_id}/messages": {
@@ -1364,6 +1376,7 @@ fn openapi_schemas() -> Value {
         "HubSessionAttachment": { "type": "object", "additionalProperties": false, "required": ["id", "session_id", "name", "content_type", "size_bytes", "created_at"], "properties": { "id": uuid(), "session_id": uuid(), "name": { "type": "string" }, "content_type": { "type": "string" }, "size_bytes": { "type": "integer", "minimum": 0 }, "created_at": { "type": "string", "format": "date-time" } } },
         "HubSessionMessage": { "type": "object", "required": ["id", "session_id", "sequence", "role", "message_kind", "content", "payload", "delivery_mode", "delivery_state", "client_message_key", "expected_native_turn_id", "turn_id", "run_id", "accepted_at"], "properties": { "id": uuid(), "session_id": uuid(), "sequence": { "type": "integer", "minimum": 1 }, "role": { "type": "string" }, "message_kind": { "type": "string" }, "content": { "type": ["string", "null"] }, "payload": {}, "attachments": { "type": "array", "items": { "$ref": "#/components/schemas/HubSessionAttachment" } }, "delivery_mode": { "type": "string" }, "delivery_state": { "type": "string" }, "client_message_key": { "type": ["string", "null"] }, "expected_native_turn_id": { "type": ["string", "null"] }, "turn_id": { "anyOf": [uuid(), { "type": "null" }] }, "run_id": { "anyOf": [uuid(), { "type": "null" }] }, "accepted_at": { "type": "string", "format": "date-time" } } },
         "CreateHubSessionMessageRequest": { "type": "object", "required": ["content"], "properties": { "content": { "type": "string" }, "payload": {}, "attachment_ids": { "type": "array", "items": uuid() }, "delivery_mode": { "type": ["string", "null"] }, "client_message_key": { "type": ["string", "null"] }, "parent_run_id": { "anyOf": [uuid(), { "type": "null" }] } } },
+        "CreateDraftSessionRequest": { "type": "object", "additionalProperties": false, "required": ["agent_id"], "properties": { "agent_id": uuid() } },
         "UpdateHubSessionTitleRequest": { "type": "object", "additionalProperties": false, "required": ["title"], "properties": { "title": { "type": "string", "minLength": 1, "maxLength": 40 } } },
         "SessionMessageAcceptance": { "type": "object", "required": ["message", "run"], "properties": { "message": { "$ref": "#/components/schemas/HubSessionMessage" }, "run": { "anyOf": [{ "$ref": "#/components/schemas/Run" }, { "type": "null" }] } } },
         "RunEvent": { "type": "object", "required": ["seq", "event_id", "run_id", "event_type", "payload", "created_at"], "properties": { "seq": { "type": "integer" }, "event_id": uuid(), "run_id": uuid(), "event_type": { "type": "string" }, "role": { "type": ["string", "null"] }, "content": { "type": ["string", "null"] }, "payload": {}, "created_at": { "type": "string", "format": "date-time" } } },
@@ -6665,6 +6678,349 @@ async fn list_hub_sessions(
     Ok(Json(rows.into_iter().map(hub_session_from_row).collect()))
 }
 
+struct ParsedMessageMultipart {
+    agent_id: Option<Uuid>,
+    content: String,
+    files: Vec<StagedAttachmentUpload>,
+}
+
+async fn parse_message_multipart(
+    mut multipart: Multipart,
+) -> Result<ParsedMessageMultipart, ApiError> {
+    let mut agent_id = None;
+    let mut content: Option<String> = None;
+    let mut files = Vec::new();
+    loop {
+        let mut field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(_) => return Err(ApiError::bad_request("message multipart body is invalid")),
+        };
+        let name = field.name().unwrap_or_default();
+        match name {
+            "agent_id" => {
+                if agent_id.is_some() {
+                    return Err(ApiError::bad_request(
+                        "message multipart contains more than one agent id",
+                    ));
+                }
+                let mut text = Vec::new();
+                while let Some(chunk) = field
+                    .chunk()
+                    .await
+                    .map_err(|_| ApiError::bad_request("message agent id is invalid"))?
+                {
+                    if text.len().saturating_add(chunk.len()) > 4096 {
+                        return Err(ApiError::bad_request("message agent id is too large"));
+                    }
+                    text.extend_from_slice(&chunk);
+                }
+                let text = String::from_utf8(text)
+                    .map_err(|_| ApiError::bad_request("message agent id must be UTF-8"))?;
+                agent_id = Some(
+                    Uuid::parse_str(text.trim())
+                        .map_err(|_| ApiError::bad_request("message agent id is invalid"))?,
+                );
+            }
+            "content" => {
+                if content.is_some() {
+                    return Err(ApiError::bad_request(
+                        "message multipart contains more than one content field",
+                    ));
+                }
+                let mut text = Vec::new();
+                while let Some(chunk) = field
+                    .chunk()
+                    .await
+                    .map_err(|_| ApiError::bad_request("message content is invalid"))?
+                {
+                    if text.len().saturating_add(chunk.len()) > 64 * 1024 {
+                        return Err(ApiError::bad_request("message content is too large"));
+                    }
+                    text.extend_from_slice(&chunk);
+                }
+                content = Some(
+                    String::from_utf8(text)
+                        .map_err(|_| ApiError::bad_request("message content must be UTF-8"))?,
+                );
+            }
+            "file" => {
+                if files.len() >= 10 {
+                    return Err(ApiError::bad_request("too many attachments in one message"));
+                }
+                let mut bytes = Vec::new();
+                let mut hasher = Sha256::new();
+                let mut size = 0_u64;
+                while let Some(chunk) = field
+                    .chunk()
+                    .await
+                    .map_err(|_| ApiError::bad_request("message attachment body is invalid"))?
+                {
+                    size = size.checked_add(chunk.len() as u64).ok_or_else(|| {
+                        ApiError::bad_request("message attachment exceeds the 100MB limit")
+                    })?;
+                    if size > MAX_ATTACHMENT_UPLOAD_BYTES {
+                        return Err(ApiError::payload_too_large(
+                            "message attachment exceeds the 100MB limit",
+                        ));
+                    }
+                    hasher.update(&chunk);
+                    bytes.extend_from_slice(&chunk);
+                }
+                if bytes.is_empty() {
+                    return Err(ApiError::bad_request(
+                        "message attachment must not be empty",
+                    ));
+                }
+                files.push(StagedAttachmentUpload {
+                    session_id: None,
+                    name: sanitize_attachment_file_name(field.file_name())?,
+                    content_type: sanitize_attachment_content_type(field.content_type())?,
+                    checksum_sha256: format!("{:x}", hasher.finalize()),
+                    bytes,
+                });
+            }
+            _ => {
+                return Err(ApiError::bad_request(
+                    "message multipart contains an unsupported field",
+                ));
+            }
+        }
+    }
+    let content = content
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(ApiError::bad_request("message content is required"))?;
+    Ok(ParsedMessageMultipart {
+        agent_id,
+        content,
+        files,
+    })
+}
+
+async fn store_attachments_for_message(
+    state: &AppState,
+    session_id: Uuid,
+    owner_id: Uuid,
+    files: Vec<StagedAttachmentUpload>,
+) -> Result<Vec<Uuid>, ApiError> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut tx = state.pool.begin().await?;
+    let session_owner_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT owner_id FROM hub_sessions WHERE id = $1 FOR UPDATE")
+            .bind(session_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let session_owner_id = session_owner_id.ok_or(ApiError::not_found("session not found"))?;
+    if session_owner_id != owner_id {
+        return Err(ApiError::not_found("session not found"));
+    }
+    let current_total: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(size_bytes), 0)::bigint
+         FROM hub_session_attachments WHERE session_id = $1",
+    )
+    .bind(session_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let incoming_total: i64 = files.iter().try_fold(0i64, |total, file| {
+        i64::try_from(file.bytes.len())
+            .map_err(|_| ApiError::bad_request("attachment file is too large"))
+            .and_then(|size| {
+                total
+                    .checked_add(size)
+                    .ok_or_else(|| ApiError::bad_request("attachment file is too large"))
+            })
+    })?;
+    if current_total
+        .checked_add(incoming_total)
+        .is_none_or(|total| total > MAX_ATTACHMENT_BYTES_PER_SESSION)
+    {
+        return Err(ApiError::bad_request(
+            "session attachment storage limit exceeded",
+        ));
+    }
+    let store = state.session_bundle_store.as_ref().ok_or_else(|| {
+        ApiError::service_unavailable("Attachment object storage is not configured")
+    })?;
+    let mut uploaded_keys = Vec::new();
+    let mut attachment_ids = Vec::new();
+    let result: Result<(), ApiError> = async {
+        for file in files {
+            let attachment_id = Uuid::new_v4();
+            let object_key = format!("attachments/{session_id}/{attachment_id}");
+            let body_bytes = Bytes::from(file.bytes);
+            let size = body_bytes.len() as u64;
+            let checksum = file.checksum_sha256.clone();
+            if store
+                .put_stream(
+                    &object_key,
+                    size,
+                    &checksum,
+                    futures_util::stream::once(async move { Ok::<_, std::io::Error>(body_bytes) }),
+                )
+                .await
+                .is_err()
+            {
+                return Err(ApiError::bad_gateway("attachment object upload failed"));
+            }
+            uploaded_keys.push(object_key.clone());
+            sqlx::query(
+                "INSERT INTO hub_session_attachments
+                     (id, session_id, owner_id, name, content_type, size_bytes,
+                      object_key, checksum_sha256)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            )
+            .bind(attachment_id)
+            .bind(session_id)
+            .bind(owner_id)
+            .bind(&file.name)
+            .bind(&file.content_type)
+            .bind(size as i64)
+            .bind(&object_key)
+            .bind(&checksum)
+            .execute(&mut *tx)
+            .await?;
+            attachment_ids.push(attachment_id);
+        }
+        Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => {
+            tx.commit().await?;
+            Ok(attachment_ids)
+        }
+        Err(error) => {
+            tx.rollback().await?;
+            for object_key in uploaded_keys {
+                let _ = store.delete(&object_key).await;
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn create_session_with_message(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Result<Json<SessionMessageAcceptanceDto>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    let parsed = parse_message_multipart(multipart).await?;
+    let agent_id = parsed
+        .agent_id
+        .ok_or(ApiError::bad_request("agent_id is required"))?;
+    let agent = load_agent_for_user(&state.pool, agent_id, &user).await?;
+    if !agent.can_invoke {
+        return Err(ApiError::forbidden("agent is not invocable"));
+    }
+    let mut tx = state.pool.begin().await?;
+    ensure_agent_can_start_run_tx(&mut tx, agent_id, user.id).await?;
+    let session_id = insert_hub_native_session_tx(&mut tx, user.id, agent_id).await?;
+    tx.commit().await?;
+    let attachment_ids =
+        match store_attachments_for_message(&state, session_id, user.id, parsed.files).await {
+            Ok(ids) => ids,
+            Err(error) => {
+                let _ = sqlx::query("DELETE FROM hub_sessions WHERE id = $1")
+                    .bind(session_id)
+                    .execute(&state.pool)
+                    .await;
+                return Err(error);
+            }
+        };
+    let mut tx = state.pool.begin().await?;
+    let accepted = accept_session_message_tx(
+        &mut tx,
+        AcceptSessionMessage {
+            session_id,
+            agent_id,
+            owner_id: user.id,
+            content: parsed.content,
+            payload: json!({}),
+            role: "user".into(),
+            message_kind: "message".into(),
+            requested_delivery_mode: "next_turn".into(),
+            client_message_key: None,
+            source: "console".into(),
+            automation_id: None,
+            integration_session_id: None,
+            parent_run_id: None,
+            continuation_turn_id: None,
+            model_subject_type: "user".into(),
+            model_subject_user_id: Some(user.id),
+            model_source_integration_app_id: None,
+            external_user_context: None,
+            attachment_ids,
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(accepted))
+}
+
+async fn create_session_message_with_attachments(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(session_id): Path<Uuid>,
+    multipart: Multipart,
+) -> Result<Json<SessionMessageAcceptanceDto>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    let parsed = parse_message_multipart(multipart).await?;
+    let session = sqlx::query(
+        "SELECT agent_id, origin_kind
+         FROM hub_sessions
+         WHERE id = $1 AND owner_id = $2",
+    )
+    .bind(session_id)
+    .bind(user.id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(ApiError::not_found("session not found"))?;
+    if session.get::<String, _>("origin_kind") != "hub_native" {
+        return Err(ApiError::conflict(
+            "External Sessions are read-only in the Hub console",
+        ));
+    }
+    let agent_id: Uuid = session.get("agent_id");
+    let missing_grants = missing_secret_grants(&state.pool, user.id, agent_id).await?;
+    if !missing_grants.is_empty() {
+        return Err(ApiError::requires_secret_grants(missing_grants));
+    }
+    let attachment_ids =
+        store_attachments_for_message(&state, session_id, user.id, parsed.files).await?;
+    let mut tx = state.pool.begin().await?;
+    ensure_agent_can_start_run_tx(&mut tx, agent_id, user.id).await?;
+    let accepted = accept_session_message_tx(
+        &mut tx,
+        AcceptSessionMessage {
+            session_id,
+            agent_id,
+            owner_id: user.id,
+            content: parsed.content,
+            payload: json!({}),
+            role: "user".into(),
+            message_kind: "message".into(),
+            requested_delivery_mode: "next_turn".into(),
+            client_message_key: None,
+            source: "console".into(),
+            automation_id: None,
+            integration_session_id: None,
+            parent_run_id: None,
+            continuation_turn_id: None,
+            model_subject_type: "user".into(),
+            model_subject_user_id: Some(user.id),
+            model_source_integration_app_id: None,
+            external_user_context: None,
+            attachment_ids,
+        },
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(accepted))
+}
+
 async fn get_hub_session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -6966,6 +7322,82 @@ async fn create_hub_session_message(
     .await?;
     tx.commit().await?;
     Ok(Json(accepted))
+}
+
+#[derive(Debug, Deserialize)]
+struct BindMessageAttachmentsRequest {
+    attachment_ids: Vec<Uuid>,
+}
+
+async fn bind_message_attachments(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((session_id, message_id)): Path<(Uuid, Uuid)>,
+    Json(req): Json<BindMessageAttachmentsRequest>,
+) -> Result<Json<HubSessionMessageDto>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    let attachment_ids = req.attachment_ids;
+    if attachment_ids.is_empty() || attachment_ids.len() > 10 {
+        return Err(ApiError::bad_request("bind between 1 and 10 attachments"));
+    }
+    let mut tx = state.pool.begin().await?;
+    let message = sqlx::query(
+        "SELECT messages.id, messages.sequence, messages.run_id
+         FROM hub_session_messages AS messages
+         JOIN hub_sessions AS sessions ON sessions.id = messages.session_id
+         WHERE messages.id = $1 AND messages.session_id = $2
+           AND sessions.owner_id = $3
+         FOR UPDATE OF messages",
+    )
+    .bind(message_id)
+    .bind(session_id)
+    .bind(user.id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::not_found("message not found"))?;
+    let run_id: Option<Uuid> = message.get("run_id");
+    let attachable = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id
+         FROM hub_session_attachments
+         WHERE session_id = $1 AND id = ANY($2) AND message_id IS NULL
+         FOR UPDATE",
+    )
+    .bind(session_id)
+    .bind(&attachment_ids)
+    .fetch_all(&mut *tx)
+    .await?;
+    if attachable.len() != attachment_ids.len() {
+        return Err(ApiError::bad_request(
+            "one or more attachments are missing, foreign, or already bound",
+        ));
+    }
+    sqlx::query(
+        "UPDATE hub_session_attachments
+         SET message_id = $1, run_id = $2
+         WHERE session_id = $3 AND id = ANY($4) AND message_id IS NULL",
+    )
+    .bind(message_id)
+    .bind(run_id)
+    .bind(session_id)
+    .bind(&attachment_ids)
+    .execute(&mut *tx)
+    .await?;
+    let row = sqlx::query(
+        "SELECT id, session_id, sequence, role, message_kind, content, payload,
+                delivery_mode, delivery_state, client_message_key,
+                expected_native_turn_id, turn_id, run_id, accepted_at
+         FROM hub_session_messages
+         WHERE id = $1 AND session_id = $2",
+    )
+    .bind(message_id)
+    .bind(session_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let row = row.ok_or(ApiError::not_found("message not found"))?;
+    let mut messages = vec![hub_message_from_row(row)];
+    fill_message_attachments(&mut *tx, &mut messages).await?;
+    tx.commit().await?;
+    Ok(Json(messages.remove(0)))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -25549,6 +25981,8 @@ mod tests {
             "/api/sessions/{session_id}",
             "/api/sessions/{session_id}/title",
             "/api/sessions/{session_id}/messages",
+            "/api/sessions/{session_id}/messages/upload",
+            "/api/sessions/{session_id}/messages/{message_id}/attachments",
             "/api/attachments",
             "/api/attachments/{attachment_id}",
             "/api/runs/{run_id}/stop",
@@ -38680,12 +39114,6 @@ mod tests {
         let member_token = create_user_session_with_role(&pool, "member").await;
         let super_token = create_user_session_with_role(&pool, "super_admin").await;
         let state = Arc::new(test_state_with_browser_session_auth(pool));
-        let member_id: Uuid =
-            sqlx::query_scalar("SELECT user_id FROM sessions WHERE token_hash = $1")
-                .bind(sha256_hex(&member_token))
-                .fetch_one(&state.pool)
-                .await
-                .unwrap();
         let super_id: Uuid =
             sqlx::query_scalar("SELECT user_id FROM sessions WHERE token_hash = $1")
                 .bind(sha256_hex(&super_token))

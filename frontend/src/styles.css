@@ -1138,6 +1138,8 @@ textarea {
   color: #1d4ed8;
   overflow-wrap: anywhere;
 }
+.session-composer-attachment-thumb { width: 34px; height: 34px; flex: 0 0 auto; object-fit: cover; border-radius: 6px; border: 1px solid var(--border-subtle); background: #fff; }
+
 
 .secret-token {
   display: block;

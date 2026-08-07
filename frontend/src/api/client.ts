@@ -1308,9 +1308,22 @@ export const api = {
       signal
     }),
   runs: (agentId: string, signal?: AbortSignal) => request<Run[]>(`/api/agents/${agentId}/runs`, { signal }),
-  sessions: (signal?: AbortSignal) => request<HubSession[]>('/api/sessions', { signal }),
+ sessions: (signal?: AbortSignal) => request<HubSession[]>('/api/sessions', { signal }),
+  createSessionWithMessage: (agentId: string, content: string, files: File[], signal?: AbortSignal) => {
+    const form = new FormData();
+    form.append('agent_id', agentId);
+    form.append('content', content);
+    for (const file of files) form.append('file', file);
+    return request<SessionMessageAcceptance>('/api/sessions', { method: 'POST', body: form, signal });
+  },
  session: (sessionId: string, signal?: AbortSignal) =>
    request<HubSession>(`/api/sessions/${sessionId}`, { signal }),
+  sendSessionMessageWithAttachments: (sessionId: string, content: string, files: File[], signal?: AbortSignal) => {
+    const form = new FormData();
+    form.append('content', content);
+    for (const file of files) form.append('file', file);
+    return request<SessionMessageAcceptance>(`/api/sessions/${sessionId}/messages/upload`, { method: 'POST', body: form, signal });
+  },
   deleteSession: (sessionId: string, signal?: AbortSignal) =>
     request<void>(`/api/sessions/${sessionId}`, { method: 'DELETE', signal }),
   renameSession: (sessionId: string, title: string, signal?: AbortSignal) =>
@@ -1323,10 +1336,16 @@ export const api = {
     request<HubSessionMessage[]>(`/api/sessions/${sessionId}/messages`, { signal }),
   sessionMessagePage: (sessionId: string, query: SessionMessagePageQuery, signal?: AbortSignal) =>
     request<HubSessionMessage[]>(sessionMessagePagePath(`/api/sessions/${sessionId}/messages`, query), { signal }),
-  createSessionMessage: (sessionId: string, message: CreateHubSessionMessage, signal?: AbortSignal) =>
-    request<SessionMessageAcceptance>(`/api/sessions/${sessionId}/messages`, {
+ createSessionMessage: (sessionId: string, message: CreateHubSessionMessage, signal?: AbortSignal) =>
+   request<SessionMessageAcceptance>(`/api/sessions/${sessionId}/messages`, {
+     method: 'POST',
+     body: JSON.stringify(message),
+     signal
+   }),
+  bindMessageAttachments: (sessionId: string, messageId: string, attachmentIds: string[], signal?: AbortSignal) =>
+    request<HubSessionMessage>(`/api/sessions/${sessionId}/messages/${messageId}/attachments`, {
       method: 'POST',
-      body: JSON.stringify(message),
+      body: JSON.stringify({ attachment_ids: attachmentIds }),
       signal
     }),
   uploadAttachment: (sessionId: string, file: File, signal?: AbortSignal) => {

@@ -6,7 +6,7 @@ import { useI18n } from '../i18n';
 export type PendingAttachment = {
   id: string;
   file: File;
-  status: 'uploading' | 'ready' | 'error';
+  status: 'pending' | 'uploading' | 'ready' | 'error';
   error: string | null;
   attachment: HubSessionAttachment | null;
 };
@@ -81,16 +81,19 @@ export function useChatAttachments(sessionId: string | null, upload: AttachmentU
   }, []);
 
   const addFiles = useCallback((files: readonly File[]) => {
-    if (!sessionIdRef.current || files.length === 0) return;
+    if (files.length === 0) return;
+    const targetSessionId = sessionIdRef.current;
     const entries = [...files].map((file) => ({
       id: pendingAttachmentId(),
       file,
-      status: 'uploading' as const,
+      status: targetSessionId ? ('uploading' as const) : ('pending' as const),
       error: null,
       attachment: null
     }));
     setItems((current) => [...current, ...entries]);
-    for (const entry of entries) uploadOne(entry);
+    if (targetSessionId) {
+      for (const entry of entries) uploadOne(entry);
+    }
   }, [uploadOne]);
 
   const openPicker = useCallback(() => inputRef.current?.click(), []);
@@ -126,6 +129,7 @@ export function useChatAttachments(sessionId: string | null, upload: AttachmentU
     items,
     readyIds,
     uploading,
+    pendingFiles: items.flatMap((item) => item.status === 'pending' ? [item.file] : []),
     dragging,
     inputRef,
     addFiles,
@@ -139,15 +143,29 @@ export function useChatAttachments(sessionId: string | null, upload: AttachmentU
   };
 }
 
+function PendingAttachmentThumb({ file }: { file: File }) {
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
+    const objectUrl = URL.createObjectURL(file);
+    setUrl(objectUrl);
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [file]);
+  if (!url) return <FileText size={14} aria-hidden="true" />;
+  return <img className="session-composer-attachment-thumb" src={url} alt={file.name} />;
+}
+
 export function ComposerAttachmentPreview({ items, onRemove }: { items: PendingAttachment[]; onRemove: (id: string) => void }) {
   const { locale, t } = useI18n();
   if (items.length === 0) return null;
   return <div className="session-composer-attachments" aria-label={t('attachment')}>
     {items.map((item) => (
       <div key={item.id} className={`session-composer-attachment status-${item.status}`}>
-        {item.status === 'uploading'
-          ? <Loader2 className="session-composer-attachment-spinner" size={14} aria-hidden="true" />
-          : <FileText size={14} aria-hidden="true" />}
+        {item.file.type.startsWith('image/')
+          ? <PendingAttachmentThumb file={item.file} />
+          : item.status === 'uploading'
+            ? <Loader2 className="session-composer-attachment-spinner" size={14} aria-hidden="true" />
+            : <FileText size={14} aria-hidden="true" />}
+        {item.status === 'pending' && <span className="session-composer-attachment-status">{t('attachmentPending')}</span>}
         <span className="session-composer-attachment-name">{item.file.name}</span>
         <small>{formatAttachmentSize(item.file.size, locale)}</small>
         {item.status === 'uploading' && <span className="session-composer-attachment-status">{t('attachmentUploading')}</span>}

@@ -797,6 +797,7 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
   const {
     items: pendingAttachments,
     readyIds: readyAttachmentIds,
+    pendingFiles: pendingAttachmentFiles,
     uploading: attachmentsUploading,
     dragging: attachmentsDragging,
     inputRef: attachmentInputRef,
@@ -806,7 +807,8 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
     clear: clearAttachments,
     handleDragOver: handleAttachmentDragOver,
     handleDragLeave: handleAttachmentDragLeave,
-    handleDrop: handleAttachmentDrop
+    handleDrop: handleAttachmentDrop,
+    addFiles: addAttachmentFiles
   } = useChatAttachments(selectedSession?.id ?? null, attachmentUploader);
   const sessionMessages = useMemo(
     () => messages.filter((message) => message.session_id === selectedId),
@@ -1226,8 +1228,16 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
     setConversationCreateError(false);
     try {
       if (pendingConversationDraft) {
-        const run = await api.createRun(pendingConversationDraft.agentId, content);
-        if (!run.hub_session_id) throw new Error('new conversation did not return a Session id');
+        const draftFiles = pendingAttachmentFiles;
+        let sessionId: string;
+        if (draftFiles.length > 0) {
+          const accepted = await api.createSessionWithMessage(pendingConversationDraft.agentId, content, draftFiles);
+          sessionId = accepted.message.session_id;
+        } else {
+          const run = await api.createRun(pendingConversationDraft.agentId, content);
+          if (!run.hub_session_id) throw new Error('new conversation did not return a Session id');
+          sessionId = run.hub_session_id;
+        }
         discardConversationDraft(currentUserId, pendingConversationDraft.agentId);
         if (!mountedRef.current) return;
         if (pendingDraftGeneration !== conversationDraftGeneration.current) {
@@ -1235,17 +1245,20 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
           return;
         }
         await loadSessions(
-          run.hub_session_id,
+          sessionId,
           () => pendingDraftGeneration === conversationDraftGeneration.current
         );
         if (!mountedRef.current || pendingDraftGeneration !== conversationDraftGeneration.current) return;
         setDraft('');
         setConversationDraft(null);
-        startTitlePoll(run.hub_session_id);
+        clearAttachments();
+        startTitlePoll(sessionId);
         followBottomRef.current = true;
         return;
       }
-      const accepted = await api.createSessionMessage(selectedSession!.id, { content, attachment_ids: readyAttachmentIds });
+      const accepted = pendingAttachmentFiles.length > 0
+        ? await api.sendSessionMessageWithAttachments(selectedSession!.id, content, pendingAttachmentFiles)
+        : await api.createSessionMessage(selectedSession!.id, { content, attachment_ids: readyAttachmentIds });
       if (!mountedRef.current) return;
       setMessages((current) => current.some((message) => message.id === accepted.message.id)
         ? current
@@ -1503,9 +1516,15 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
               if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return;
               event.preventDefault();
               event.currentTarget.form?.requestSubmit();
+            }} onPaste={(event) => {
+              const files = [...(event.clipboardData?.files ?? [])];
+              if (files.length > 0) {
+                event.preventDefault();
+                addAttachmentFiles(files);
+              }
             }} placeholder={selectedSession?.active_turn_id ? t('guideCurrentTurnPlaceholder') : t('messagePlaceholder')} /></label>
             <ComposerAttachmentPreview items={pendingAttachments} onRemove={removeAttachment} />
-            <div>{selectedSession && <span className="session-composer-attachment-controls">
+            <div>{canMutate && <span className="session-composer-attachment-controls">
               <input ref={attachmentInputRef} className="sr-only" type="file" multiple tabIndex={-1} aria-hidden="true" onChange={handleAttachmentInputChange} />
               <button type="button" className="icon-button session-attach-button" aria-label={t('attachment')} title={t('attachment')} disabled={sending || attachmentsUploading} onClick={openAttachmentPicker}><Paperclip size={17} /></button>
             </span>}<span className="session-composer-actions">{selectedSession?.active_turn_id && activeRunId && <button type="button" className="icon-button session-stop-button" aria-label={t('stopCurrentRun')} title={t('stopCurrentRun')} disabled={stopping || stopRequestedRunId === activeRunId} onClick={stopCurrentRun}><Square size={14} /></button>}<button type="submit" className="icon-button session-send-button" aria-label={sending ? t('sending') : t('send')} title={t('send')} disabled={sending || attachmentsUploading || !draft.trim()}><ArrowUp size={18} /></button></span></div>
