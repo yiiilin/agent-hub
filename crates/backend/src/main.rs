@@ -18897,7 +18897,13 @@ async fn load_agent_for_user(
          FROM agents AS a
          JOIN users AS owner ON owner.id = a.owner_id
          WHERE a.id = $1 AND a.deleted_at IS NULL
-           AND (a.owner_id = $2 OR owner.role <> 'super_admin' OR $3 = 'super_admin')
+           AND (
+               a.owner_id = $2
+               OR a.visibility = 'public'
+               OR (a.visibility = 'public_to' AND $2 = ANY(a.public_to))
+               OR owner.role <> 'super_admin'
+               OR $3 = 'super_admin'
+           )
            AND (a.owner_id = $2 OR a.visibility = 'public'
                 OR (a.visibility = 'public_to' AND $2 = ANY(a.public_to))
                 OR $3 IN ('admin', 'super_admin'))",
@@ -38718,6 +38724,20 @@ mod tests {
         assert!(
             visible.iter().all(|agent| agent.id != private_super_agent),
             "private super_admin Agent must stay hidden from members"
+        );
+        let member = require_user(&state, &session_headers(&member_token))
+            .await
+            .unwrap();
+        let fetched = load_agent_for_user(&state.pool, public_super_agent, &member)
+            .await
+            .expect("public super_admin Agent must be loadable by a member");
+        assert_eq!(fetched.id, public_super_agent);
+        assert_eq!(
+            load_agent_for_user(&state.pool, private_super_agent, &member)
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::NOT_FOUND
         );
     }
 
