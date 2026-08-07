@@ -6,6 +6,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 本文件记录 Agent Hub 各正式版本面向使用者的变化。
 
+## [0.3.3] - 2026-08-07
+
+### Added
+
+- 管理员（admin）可查看、修改并删除 super_admin 创建的智能体，并查看其 Run 历史；普通 member 仍不能访问私有超管智能体。
+- admin 编辑他人智能体时只能保留原有 Personal 模型选择或改用 Global 连接，不能查看或改绑 super_admin 的 Personal 连接。
+- 工具输出事件上限 32KB：超出后事件只保留尾部并带 `[output truncated: N bytes]` 标记；增量输出超过累计上限后停止流式。
+- `skill_exec` 大输出落盘：完整 stdout/stderr 写入会话隔离临时日志（单流 256MB、会话共享 512MB 硬上限），工具结果返回 `stdout_full_path` / `stderr_full_path`。
+
+### Fixed
+
+- 修复工具输出含二进制 NUL 字节导致事件写入 500、Run 失败、会话现场丢失的问题；Runtime 与 Hub 全部 run_events / JSONB 写入路径统一清洗 NUL。
+- 修复新 Run `initial_message`、integration/client tool 结果与 tool arguments 等旁路写入未清洗 NUL 的隐患。
+- Runtime 事件接口新增大小护栏，超限事件返回 400 而非写入数据库。
+
+### Security
+
+- 关闭 admin 通过直接构造 PATCH 把 super_admin 智能体改绑到任意 Personal 模型连接的口子。
+
 ## [0.3.2] - 2026-08-07
 
 ### Added
