@@ -1622,6 +1622,34 @@ impl HubClient {
         Ok(bytes.to_vec())
     }
 
+    async fn download_attachment(&self, attachment_id: Uuid) -> anyhow::Result<(Vec<u8>, String)> {
+        let primary_url = format!("{}/api/runtime/attachments/{attachment_id}", self.hub_url);
+        let mut response = self
+            .http
+            .get(&primary_url)
+            .bearer_auth(self.runtime_credential())
+            .send()
+            .await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            let fallback_url = format!("{}/api/attachments/{attachment_id}", self.hub_url);
+            response = self
+                .http
+                .get(fallback_url)
+                .bearer_auth(self.runtime_credential())
+                .send()
+                .await?;
+        }
+        let response = response.error_for_status()?;
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let bytes = response.bytes().await?.to_vec();
+        Ok((bytes, content_type))
+    }
+
     async fn append_event(
         &self,
         run_id: Uuid,
@@ -2400,6 +2428,137 @@ fn configured_runtime_id(claim: &ClaimRunResponse) -> anyhow::Result<Uuid> {
         .context("claimed Run is missing its Runtime id")
 }
 
+fn sanitize_attachment_filename(name: &str) -> String {
+    let base = name
+        .split(['/', '\\'])
+        .rev()
+        .find(|component| !component.trim().is_empty() && *component != "..")
+        .unwrap_or("attachment");
+    let sanitized = base
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>();
+    let sanitized = sanitized.trim();
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        "attachment".into()
+    } else {
+        sanitized.chars().take(200).collect()
+    }
+}
+
+fn unique_attachment_filename(used: &mut BTreeSet<String>, name: &str) -> String {
+    if used.insert(name.to_owned()) {
+        return name.to_owned();
+    }
+    let path = Path::new(name);
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("attachment");
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| !extension.is_empty());
+    for index in 1_u32.. {
+        let candidate = match extension {
+            Some(extension) => format!("{stem} ({index}).{extension}"),
+            None => format!("{stem} ({index})"),
+        };
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    unreachable!("attachment filename counter overflowed")
+}
+
+async fn inject_session_attachments(
+    client: &HubClient,
+    claim: &mut ClaimRunResponse,
+    work_root: &Path,
+) -> anyhow::Result<()> {
+    let Some(context) = claim.session_context.as_mut() else {
+        return Ok(());
+    };
+    let session_id = claim
+        .run
+        .hub_session_id
+        .context("claimed Run is missing its Hub Session id")?;
+    let mut attachments_by_id = BTreeMap::<Uuid, HubSessionAttachmentDto>::new();
+    for message in &context.messages {
+        for attachment in &message.attachments {
+            attachments_by_id
+                .entry(attachment.id)
+                .or_insert_with(|| attachment.clone());
+        }
+    }
+    if attachments_by_id.is_empty() {
+        return Ok(());
+    }
+    let attachment_dir = SessionPaths::for_session(work_root, session_id)
+        .workspace
+        .join("attachments");
+    if let Err(error) = fs::create_dir_all(&attachment_dir).await {
+        warn!(
+            session_id = %session_id,
+            error = %error,
+            "failed to create Session attachments directory; skipping attachment injection"
+        );
+        return Ok(());
+    }
+    let mut used_names = BTreeSet::new();
+    let mut notes = Vec::new();
+    for attachment in attachments_by_id.values() {
+        let file_name = unique_attachment_filename(
+            &mut used_names,
+            &sanitize_attachment_filename(&attachment.name),
+        );
+        let destination = attachment_dir.join(&file_name);
+        match client.download_attachment(attachment.id).await {
+            Ok((bytes, _content_type)) => {
+                if let Err(error) = fs::write(&destination, bytes).await {
+                    warn!(
+                        attachment_id = %attachment.id,
+                        error = %error,
+                        "failed to write Session attachment; skipping"
+                    );
+                    continue;
+                }
+                notes.push(format!(
+                    "（用户上传了附件：{}，类型 {}，工作区路径 /workspace/attachments/{}）",
+                    attachment.name, attachment.content_type, file_name
+                ));
+            }
+            Err(error) => {
+                warn!(
+                    attachment_id = %attachment.id,
+                    error = %error,
+                    "failed to download Session attachment; skipping"
+                );
+            }
+        }
+    }
+    if notes.is_empty() {
+        return Ok(());
+    }
+    let note = notes.join("\n");
+    let message_index = context
+        .messages
+        .iter()
+        .rposition(|message| message.role == "user")
+        .or_else(|| (!context.messages.is_empty()).then_some(context.messages.len() - 1));
+    if let Some(index) = message_index {
+        let message = &mut context.messages[index];
+        let content = message.content.get_or_insert_with(String::new);
+        if !content.trim().is_empty() {
+            content.push('\n');
+        }
+        content.push_str(&note);
+    }
+    Ok(())
+}
+
 async fn execute_managed_run(
     config: &Config,
     client: &HubClient,
@@ -2460,6 +2619,12 @@ async fn execute_managed_run_inner(
     .await?;
     let metadata =
         session_supervisor_metadata_for_claim(manager.runtime_id, &claim, &config.engine_version)?;
+    let vision_binding = model_binding(&claim.execution_configuration, "main")?;
+    let vision = Some(pi_driver::VisionAnalyzeConfig {
+        model_proxy_base_url: model_proxy.base_url.clone(),
+        model_binding_id: vision_binding.id,
+        model_id: vision_binding.model_id.clone(),
+    });
     manager
         .ensure_pi(
             metadata,
@@ -2468,6 +2633,7 @@ async fn execute_managed_run_inner(
             pi_driver::pi_tool_allowlist_for_claim(&claim)?,
             config.engine_timeout,
             Some(model_proxy),
+            vision,
         )
         .await?;
     if claim.session_context.is_some() {
@@ -2491,6 +2657,7 @@ async fn execute_managed_run_inner(
         );
         claim.session_context.as_mut().unwrap().messages = begin.messages;
     }
+    inject_session_attachments(client, &mut claim, &config.work_root).await?;
     info!(
         run_id = %claim.run.id,
         session_id = %session_id,
@@ -3124,6 +3291,7 @@ enum SessionProcessLaunch {
         saved_session: Option<PathBuf>,
         tools: Vec<String>,
         timeout: Duration,
+        vision: Option<pi_driver::VisionAnalyzeConfig>,
     },
 }
 
@@ -3145,6 +3313,7 @@ impl SessionProcessLaunch {
                 saved_session,
                 tools,
                 timeout,
+                vision,
             } => pi_driver::PersistentPiRpcProcess::start(
                 &binary,
                 &run_env,
@@ -3152,6 +3321,7 @@ impl SessionProcessLaunch {
                 &tools,
                 timeout,
                 cancellation,
+                vision,
             )
             .map(PersistentSessionProcess::Pi),
         }
@@ -3159,6 +3329,7 @@ impl SessionProcessLaunch {
 }
 
 impl SessionSupervisor {
+    #[allow(clippy::too_many_arguments)]
     async fn start_pi(
         session_id: Uuid,
         ownership_generation: i64,
@@ -3167,6 +3338,7 @@ impl SessionSupervisor {
         saved_session: Option<PathBuf>,
         tools: Vec<String>,
         timeout: Duration,
+        vision: Option<pi_driver::VisionAnalyzeConfig>,
     ) -> anyhow::Result<Arc<Self>> {
         anyhow::ensure!(
             ownership_generation > 0,
@@ -3182,6 +3354,7 @@ impl SessionSupervisor {
                     saved_session,
                     tools,
                     timeout,
+                    vision,
                 },
             )
         })
@@ -4689,6 +4862,7 @@ impl SessionSupervisorManager {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn ensure_pi(
         &self,
         metadata: SessionSupervisorMetadata,
@@ -4697,11 +4871,13 @@ impl SessionSupervisorManager {
         tools: Vec<String>,
         timeout: Duration,
         model_proxy: Option<Arc<LocalModelProxy>>,
+        vision: Option<pi_driver::VisionAnalyzeConfig>,
     ) -> anyhow::Result<Arc<SessionSupervisor>> {
         let session_id = metadata.session_id;
         let ownership_generation = metadata.ownership_generation;
         let native_session_id = metadata.native_session_id.clone();
         let launch_tools = tools.clone();
+        let launch_vision = vision.clone();
         self.ensure_session_supervisor(metadata, model_proxy, tools, move || async move {
             let saved_session = native_session_id
                 .as_deref()
@@ -4717,6 +4893,7 @@ impl SessionSupervisorManager {
                 saved_session,
                 launch_tools,
                 timeout,
+                launch_vision,
             )
             .await
         })
@@ -8452,8 +8629,157 @@ mod tests {
 
         assert_eq!(
             pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap(),
-            ["grep"]
+            ["grep", "vision_analyze"]
         );
+    }
+
+    #[test]
+    fn attachment_filenames_are_sanitized_and_uniquified() {
+        assert_eq!(sanitize_attachment_filename("photo.png"), "photo.png");
+        assert_eq!(
+            sanitize_attachment_filename("../evil/photo.png"),
+            "photo.png"
+        );
+        assert_eq!(sanitize_attachment_filename("a\\b/c.txt"), "c.txt");
+        assert_eq!(sanitize_attachment_filename(".."), "attachment");
+        assert_eq!(sanitize_attachment_filename("   "), "attachment");
+
+        let mut used = BTreeSet::new();
+        assert_eq!(
+            unique_attachment_filename(&mut used, "photo.png"),
+            "photo.png"
+        );
+        assert_eq!(
+            unique_attachment_filename(&mut used, "photo.png"),
+            "photo (1).png"
+        );
+        assert_eq!(
+            unique_attachment_filename(&mut used, "photo.png"),
+            "photo (2).png"
+        );
+        assert_eq!(unique_attachment_filename(&mut used, "archive"), "archive");
+        assert_eq!(
+            unique_attachment_filename(&mut used, "archive"),
+            "archive (1)"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_attachments_are_downloaded_and_announced_to_the_user_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut claim = test_claim();
+        let session_id = claim.run.hub_session_id.unwrap();
+        let attachment_id = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        claim.session_context = Some(ClaimSessionContextDto {
+            session: HubSessionDto {
+                id: session_id,
+                owner_id: claim.agent.owner_id,
+                agent_id: claim.agent.id,
+                agent_name: claim.agent.name.clone(),
+                agent_deleted_at: None,
+                title: None,
+                origin_platform_name: None,
+                origin: HubSessionOriginDto::HubNative,
+                lifecycle_status: "online".into(),
+                native_session_id: None,
+                active_turn_id: None,
+                history_checkpoint: 0,
+                configuration_fingerprint: None,
+                runtime_owner_id: None,
+                ownership_generation: 1,
+                recovery_error: None,
+                current_bundle: None,
+                created_at: now,
+                updated_at: now,
+            },
+            turn: HubSessionTurnDto {
+                id: Uuid::new_v4(),
+                session_id,
+                native_turn_id: None,
+                status: "running".into(),
+                configuration_fingerprint: None,
+                ownership_generation: 1,
+                started_at: Some(now),
+                ended_at: None,
+                created_at: now,
+                updated_at: now,
+            },
+            messages: vec![HubSessionMessageDto {
+                id: Uuid::new_v4(),
+                session_id,
+                sequence: 1,
+                role: "user".into(),
+                message_kind: "message".into(),
+                content: Some("看看这张图".into()),
+                payload: json!({}),
+                attachments: vec![HubSessionAttachmentDto {
+                    id: attachment_id,
+                    session_id,
+                    name: "photo.png".into(),
+                    content_type: "image/png".into(),
+                    size_bytes: 6,
+                    created_at: now,
+                }],
+                delivery_mode: "direct".into(),
+                delivery_state: "accepted".into(),
+                client_message_key: None,
+                expected_native_turn_id: None,
+                turn_id: None,
+                run_id: None,
+                accepted_at: now,
+            }],
+        });
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let request = read_http_request(&mut stream);
+            let request_text = String::from_utf8_lossy(&request);
+            assert!(request_text.contains(&format!("/api/runtime/attachments/{attachment_id}")));
+            let body = b"image!";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let client = HubClient {
+            http: reqwest::Client::new(),
+            hub_url: format!("http://{addr}"),
+            runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
+            protocol_capabilities: HashSet::new(),
+            upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
+        };
+        inject_session_attachments(&client, &mut claim, temp.path())
+            .await
+            .unwrap();
+
+        let paths = SessionPaths::for_session(temp.path(), session_id);
+        assert_eq!(
+            fs::read(paths.workspace.join("attachments/photo.png"))
+                .await
+                .unwrap(),
+            b"image!"
+        );
+        let message = claim
+            .session_context
+            .unwrap()
+            .messages
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(message.content.unwrap().contains(
+            "（用户上传了附件：photo.png，类型 image/png，工作区路径 /workspace/attachments/photo.png）"
+        ));
+        server.join().unwrap();
     }
 
     #[test]
@@ -8476,13 +8802,13 @@ mod tests {
 
         assert_eq!(
             pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap(),
-            ["read", "skill_exec"]
+            ["read", "skill_exec", "vision_analyze"]
         );
 
         claim.execution_configuration.tool_allowlist = vec!["read".into()];
         assert_eq!(
             pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap(),
-            ["read"]
+            ["read", "vision_analyze"]
         );
 
         claim.execution_configuration.tool_allowlist = vec!["read".into(), "skill_exec".into()];
@@ -8494,7 +8820,7 @@ mod tests {
             .executable = false;
         assert_eq!(
             pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap(),
-            ["read"]
+            ["read", "vision_analyze"]
         );
     }
 
@@ -9761,6 +10087,7 @@ mod tests {
                 pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap(),
                 Duration::from_secs(2),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -10332,6 +10659,7 @@ mod tests {
             &pi_driver::pi_tool_allowlist(&claim.agent),
             Duration::from_secs(2),
             Arc::new(EngineCancellation::default()),
+            None,
         )
         .unwrap();
         assert_eq!(process.native_session_id(), native_session_id);
@@ -12291,6 +12619,7 @@ mod tests {
             &pi_driver::pi_tool_allowlist(&claim.agent),
             Duration::from_secs(2),
             cancellation,
+            None,
         )
         .unwrap();
 
@@ -12400,6 +12729,7 @@ mod tests {
             &pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap(),
             Duration::from_secs(2),
             Arc::new(EngineCancellation::default()),
+            None,
         )
         .unwrap();
 
@@ -12561,7 +12891,17 @@ mod tests {
         );
         assert_eq!(
             pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap(),
-            ["read", "grep", "find", "ls", "edit", "write", "bash", "echo"]
+            [
+                "read",
+                "grep",
+                "find",
+                "ls",
+                "edit",
+                "write",
+                "bash",
+                "vision_analyze",
+                "echo"
+            ]
         );
 
         let catalog_sentinel = temp.path().join("catalog-sentinel");
@@ -12749,6 +13089,7 @@ mod tests {
             &pi_driver::pi_tool_allowlist(&claim.agent),
             Duration::from_secs(2),
             cancellation,
+            None,
         )
         .unwrap();
 
@@ -12787,6 +13128,7 @@ mod tests {
             &pi_driver::pi_tool_allowlist(&claim.agent),
             Duration::from_secs(2),
             cancellation,
+            None,
         )
         .unwrap();
 
@@ -12814,6 +13156,7 @@ mod tests {
             &pi_driver::pi_tool_allowlist(&claim.agent),
             Duration::from_secs(1),
             cancellation,
+            None,
         )
         .unwrap();
 
@@ -12854,6 +13197,7 @@ mod tests {
             &pi_driver::pi_tool_allowlist(&claim.agent),
             Duration::from_secs(2),
             cancellation,
+            None,
         )
         .unwrap();
         let (command_tx, command_rx) = mpsc::channel();
@@ -12917,6 +13261,7 @@ mod tests {
             None,
             pi_driver::pi_tool_allowlist(&first.agent),
             Duration::from_secs(2),
+            None,
         )
         .await
         .unwrap();
@@ -13017,6 +13362,7 @@ mod tests {
             None,
             pi_driver::pi_tool_allowlist(&first.agent),
             Duration::from_secs(2),
+            None,
         )
         .await
         .unwrap();
@@ -13127,6 +13473,7 @@ mod tests {
             &pi_driver::pi_tool_allowlist(&first.agent),
             Duration::from_secs(2),
             Arc::new(EngineCancellation::default()),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -13160,6 +13507,7 @@ mod tests {
             &pi_driver::pi_tool_allowlist(&second.agent),
             Duration::from_secs(2),
             Arc::new(EngineCancellation::default()),
+            None,
         )
         .unwrap();
         assert_eq!(recovered_process.native_session_id(), native_session_id);
@@ -13198,6 +13546,7 @@ mod tests {
             &pi_driver::pi_tool_allowlist(&first.agent),
             Duration::from_secs(2),
             cancellation,
+            None,
         )
         .unwrap();
 
@@ -13356,6 +13705,7 @@ mod tests {
             &pi_driver::pi_tool_allowlist(&first.agent),
             Duration::from_secs(15),
             Arc::new(EngineCancellation::default()),
+            None,
         )
         .unwrap();
 
@@ -14429,6 +14779,7 @@ Transfer-Encoding: chunked\r\n\
                 first_tools,
                 Duration::from_secs(2),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -14460,6 +14811,7 @@ Transfer-Encoding: chunked\r\n\
                 second_run_env,
                 second_tools,
                 Duration::from_secs(2),
+                None,
                 None,
             )
             .await
@@ -14804,6 +15156,7 @@ while [ "$#" -gt 0 ]; do
     --session-dir) session_dir="$2"; shift 2 ;;
     --mode|--tools) shift 2 ;;
     --no-extensions|--no-themes|--no-prompt-templates|--approve) shift ;;
+    --extension|-e) shift 2 ;;
     *) exit 64 ;;
   esac
 done
@@ -14982,6 +15335,7 @@ while [ "$#" -gt 0 ]; do
     --session-dir) session_dir="$2"; shift 2 ;;
     --mode|--tools) shift 2 ;;
     --no-extensions|--no-themes|--no-prompt-templates|--approve) shift ;;
+    --extension|-e) shift 2 ;;
     *) exit 64 ;;
   esac
 done

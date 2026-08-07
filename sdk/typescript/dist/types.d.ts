@@ -51,6 +51,14 @@ export interface SessionListOptions {
     limit?: number;
     signal?: AbortSignal;
 }
+export interface HubSessionAttachment {
+    id: string;
+    session_id: string;
+    name: string;
+    content_type: string;
+    size_bytes: number;
+    created_at: string;
+}
 export interface SessionMessage {
     id: string;
     session_id: string;
@@ -64,6 +72,7 @@ export interface SessionMessage {
     client_message_key?: string | null;
     run_id?: string | null;
     accepted_at?: string;
+    attachments?: HubSessionAttachment[];
     [key: string]: unknown;
 }
 export interface MessagePageOptions {
@@ -88,6 +97,7 @@ export interface Run {
 }
 export interface SendOptions {
     clientMessageKey?: string;
+    attachmentIds?: readonly string[];
     signal?: AbortSignal;
 }
 export interface SendResult {

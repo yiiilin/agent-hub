@@ -46,6 +46,7 @@ export declare class AgentHubClient {
     static connect(options: AgentHubClientOptions): Promise<AgentHubClient>;
     static connectAnonymous(options: AnonymousClientOptions): Promise<AgentHubClient>;
     get authorizedToolNames(): ReadonlySet<string>;
+    get accessToken(): string | null;
     get agent(): ClientAgent | null;
     get historyEnabled(): boolean;
     get isAnonymous(): boolean;

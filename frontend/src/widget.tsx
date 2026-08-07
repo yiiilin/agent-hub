@@ -11,10 +11,11 @@ import {
   type SessionSummary,
   isSecretGrantsRequiredError
 } from '@agent-hub/client';
-import { ArrowUp, Bot, History, Languages, Plus, X } from 'lucide-react';
+import { ArrowUp, Bot, History, Languages, Paperclip, Plus, X } from 'lucide-react';
 import { type FormEvent, type TouchEvent, type WheelEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { api, type RunEvent } from './api/client';
+import { api, widgetAttachmentUrl, type HubSessionAttachment, type RunEvent } from './api/client';
 import { useI18n } from './i18n';
+import { ComposerAttachmentPreview, useChatAttachments } from './components/chat-attachments';
 import {
   ChatActivityGroup,
   ChatMessageBubble,
@@ -53,6 +54,7 @@ type SecretGrantPrompt = {
 type OptimisticMessage = {
   id: string;
   content: string;
+  attachments: HubSessionAttachment[];
   clientMessageKey: string;
   runId: string | null;
   acceptedAt: string;
@@ -65,6 +67,7 @@ type MessageTimelineEntry = {
   runId: string | null;
   role: string;
   content: string;
+  attachments: HubSessionAttachment[];
   occurredAt: number;
   outputEndedAt?: number;
   sequence: number;
@@ -246,6 +249,25 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [hostOrigin, setHostOrigin] = useState<string | null>(initialHostOrigin);
+  const attachmentUploader = useCallback((sessionId: string, file: File, signal?: AbortSignal) => {
+    const token = selectedTokenRef.current ?? clientRef.current?.accessToken ?? '';
+    if (!token) return Promise.reject(new Error('Widget credential unavailable'));
+    return api.uploadWidgetAttachment(sessionId, file, token, signal);
+  }, []);
+  const {
+    items: pendingAttachments,
+    readyIds: readyAttachmentIds,
+    uploading: attachmentsUploading,
+    dragging: attachmentsDragging,
+    inputRef: attachmentInputRef,
+    openPicker: openAttachmentPicker,
+    handleInputChange: handleAttachmentInputChange,
+    remove: removeAttachment,
+    clear: clearAttachments,
+    handleDragOver: handleAttachmentDragOver,
+    handleDragLeave: handleAttachmentDragLeave,
+    handleDrop: handleAttachmentDrop
+  } = useChatAttachments(sessionRef.current?.id ?? null, attachmentUploader);
 
   const widgetFetch = useCallback<typeof fetch>((input, init) => {
     const headers = new Headers(input instanceof Request ? input.headers : undefined);
@@ -451,11 +473,13 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
   const startRun = useCallback(async (requestedContent: string, requestedMessageKey?: string) => {
     const session = sessionRef.current;
     const content = requestedContent.trim();
-    if (!session || !content || runPendingRef.current || !ready) return;
+    if (!session || !content || runPendingRef.current || !ready || attachmentsUploading) return;
     const messageKey = requestedMessageKey ?? draftClientMessageKey;
+    const readyAttachments = pendingAttachments.flatMap((item) => item.status === 'ready' && item.attachment ? [item.attachment] : []);
     const optimistic: OptimisticMessage = {
       id: `optimistic-${messageKey}`,
       content,
+      attachments: readyAttachments,
       clientMessageKey: messageKey,
       runId: null,
       acceptedAt: new Date().toISOString(),
@@ -468,9 +492,10 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
     setSecretGrantPrompt(null);
     setOptimisticMessages((current) => [...current.filter((item) => item.clientMessageKey !== messageKey), optimistic]);
     try {
-      const result = await session.send(content, { clientMessageKey: messageKey });
+      const result = await session.send(content, { clientMessageKey: messageKey, attachmentIds: readyAttachmentIds });
       if (session !== sessionRef.current) return;
       setSelectedSessionId(result.sessionId);
+      clearAttachments();
       setOptimisticMessages((current) => current.map((item) => item.clientMessageKey === messageKey
         ? { ...item, runId: result.run.id }
         : item));
@@ -499,7 +524,7 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
       runPendingRef.current = false;
       if (mountedRef.current) setRunPending(false);
     }
-  }, [draft, draftClientMessageKey, loadMessages, postWidgetMessage, ready, refreshHistory, subscribeToSession, t]);
+  }, [attachmentsUploading, clearAttachments, draft, draftClientMessageKey, loadMessages, pendingAttachments, postWidgetMessage, ready, readyAttachmentIds, refreshHistory, subscribeToSession, t]);
 
   const allowSecretGrant = useCallback(async () => {
     const prompt = secretGrantPrompt;
@@ -672,6 +697,7 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
         runId: message.run_id ?? null,
         role: message.role,
         content: message.content!,
+        attachments: message.attachments ?? [],
         occurredAt: eventTimestamp(message.accepted_at),
         sequence: message.sequence * 1000,
         state: message.delivery_state
@@ -685,6 +711,7 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
         runId: message.runId,
         role: 'user',
         content: message.content,
+        attachments: message.attachments,
         occurredAt: eventTimestamp(message.acceptedAt),
         sequence: Number.MAX_SAFE_INTEGER - 2,
         state: message.failed ? 'failed' : 'queued'
@@ -702,6 +729,7 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
           runId: event.run_id,
           role: event.role ?? 'assistant',
           content: event.content,
+          attachments: [],
           occurredAt: eventTimestamp(event.created_at),
           sequence: event.seq * 1000 + 1
         });
@@ -724,6 +752,7 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
         runId,
         role: 'assistant',
         content: deltas.map((event) => event.content).join(''),
+        attachments: [],
         occurredAt: eventTimestamp(deltas[0]?.created_at),
         outputEndedAt: eventTimestamp(deltas.at(-1)?.created_at),
         sequence: (deltas[0]?.seq ?? 0) * 1000 + 1,
@@ -895,18 +924,22 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
             return <ChatActivityGroup active={active && window.endedAt === undefined} activities={entry.activities} clockOffset={clockOffset} endedAt={window.endedAt} key={entry.id} startedAt={window.startedAt} />;
           }
           if (entry.kind === 'failure') return <ChatRunFailure failure={entry.failure} key={entry.id} />;
-          return <ChatMessageBubble agentName={agent?.name ?? null} content={entry.content} key={entry.id} role={entry.role} state={entry.state} streaming={entry.streaming} />;
+          return <ChatMessageBubble agentName={agent?.name ?? null} attachments={entry.attachments} attachmentUrlFor={widgetAttachmentUrl} content={entry.content} key={entry.id} role={entry.role} state={entry.state} streaming={entry.streaming} />;
         })}
         {showThinking && <ChatThinkingBubble stage={activeThinking?.stage.key ?? 'runStageThinking'} detail={activeThinking?.stage.detail} lastEventAt={activeThinking?.lastEventAt} />}
       </div>
     </div>
-    <form className="session-composer session-chat-composer widget-composer" onSubmit={submit}>
+    <form className={`session-composer session-chat-composer widget-composer${attachmentsDragging ? ' session-composer-dragging' : ''}`} onSubmit={submit} onDragOver={handleAttachmentDragOver} onDragLeave={handleAttachmentDragLeave} onDrop={handleAttachmentDrop}>
       <label><span className="sr-only">{t('message')}</span><textarea ref={composerRef} rows={2} aria-label={t('message')} value={draft} onChange={(event) => updateDraft(event.target.value)} onInput={(event) => resizeComposer(event.currentTarget)} onKeyDown={(event) => {
         if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return;
         event.preventDefault();
         event.currentTarget.form?.requestSubmit();
       }} placeholder={t('messagePlaceholder')} /></label>
-      <div><span className="session-composer-actions"><button type="submit" className="icon-button session-send-button" aria-label={runPending ? t('sending') : t('send')} title={t('send')} disabled={!ready || runPending || !draft.trim()}><ArrowUp size={18} /></button></span></div>
+      <ComposerAttachmentPreview items={pendingAttachments} onRemove={removeAttachment} />
+      <div>{selectedSessionId && <span className="session-composer-attachment-controls">
+        <input ref={attachmentInputRef} className="sr-only" type="file" multiple tabIndex={-1} aria-hidden="true" onChange={handleAttachmentInputChange} />
+        <button type="button" className="icon-button session-attach-button" aria-label={t('attachment')} title={t('attachment')} disabled={!ready || runPending || attachmentsUploading} onClick={openAttachmentPicker}><Paperclip size={17} /></button>
+      </span>}<span className="session-composer-actions"><button type="submit" className="icon-button session-send-button" aria-label={runPending ? t('sending') : t('send')} title={t('send')} disabled={!ready || runPending || attachmentsUploading || !draft.trim()}><ArrowUp size={18} /></button></span></div>
     </form>
   </div>;
 }

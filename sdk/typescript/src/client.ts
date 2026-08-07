@@ -912,6 +912,10 @@ export class AgentHubClient {
     return new Set(this.#credential?.authorizedToolNames ?? []);
   }
 
+  get accessToken(): string | null {
+    return this.#credential?.token ?? null;
+  }
+
   get agent(): ClientAgent | null {
     const agent = this.#credential?.agent;
     return agent ? { ...agent } : null;
@@ -1217,8 +1221,9 @@ export class AgentHubClient {
     const normalized = content.trim();
     if (!normalized) throw new Error("message content is required");
     const key = options.clientMessageKey?.trim() || randomId("msg_");
-    const body: Record<string, string> = { message: normalized, client_message_key: key };
+    const body: Record<string, string | string[]> = { message: normalized, client_message_key: key };
     if (session.id) body.session_id = session.id;
+    if (options.attachmentIds && options.attachmentIds.length > 0) body.attachment_ids = [...options.attachmentIds];
     const value = await this.#requestJson<unknown>(PATHS.runs, {
       method: "POST",
       body: JSON.stringify(body),

@@ -775,6 +775,9 @@ export class AgentHubClient {
     get authorizedToolNames() {
         return new Set(this.#credential?.authorizedToolNames ?? []);
     }
+    get accessToken() {
+        return this.#credential?.token ?? null;
+    }
     get agent() {
         const agent = this.#credential?.agent;
         return agent ? { ...agent } : null;
@@ -1073,6 +1076,8 @@ export class AgentHubClient {
         const body = { message: normalized, client_message_key: key };
         if (session.id)
             body.session_id = session.id;
+        if (options.attachmentIds && options.attachmentIds.length > 0)
+            body.attachment_ids = [...options.attachmentIds];
         const value = await this.#requestJson(PATHS.runs, {
             method: "POST",
             body: JSON.stringify(body),

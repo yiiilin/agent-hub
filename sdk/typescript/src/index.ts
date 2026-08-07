@@ -25,6 +25,7 @@ export type {
   ErrorSessionEvent,
   EventListOptions,
   GenericSessionEvent,
+  HubSessionAttachment,
   JsonPrimitive,
   JsonValue,
   MessagePage,

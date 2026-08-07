@@ -383,6 +383,15 @@ export type ForceDeleteRuntimeResponse = {
   recovery_failed_session_ids: string[];
 };
 
+export type HubSessionAttachment = {
+  id: string;
+  session_id: string;
+  name: string;
+  content_type: string;
+  size_bytes: number;
+  created_at: string;
+};
+
 export type HubSessionMessage = {
   id: string;
   session_id: string;
@@ -398,6 +407,7 @@ export type HubSessionMessage = {
   turn_id: string | null;
   run_id: string | null;
   accepted_at: string;
+  attachments: HubSessionAttachment[];
 };
 
 export type SessionMessagePageQuery = {
@@ -407,6 +417,7 @@ export type SessionMessagePageQuery = {
 
 export type CreateHubSessionMessage = {
   content: string;
+  attachment_ids: string[];
   payload?: unknown;
   delivery_mode?: string | null;
   client_message_key?: string | null;
@@ -554,6 +565,7 @@ export type ModelConnection = {
   base_url: string;
   api_type: ModelUpstreamProtocol;
   allowed_model_ids: string[];
+  vision_model_id?: string | null;
   status: ModelConnectionStatus;
   has_api_key: boolean;
   created_at: string;
@@ -566,6 +578,7 @@ export type CreateModelConnectionRequest = {
   base_url: string;
   api_type: ModelUpstreamProtocol;
   allowed_model_ids: string[];
+  vision_model_id?: string | null;
   api_key: string;
 };
 
@@ -587,6 +600,7 @@ export type UpdateModelConnectionRequest = Pick<
   | 'base_url'
   | 'api_type'
   | 'allowed_model_ids'
+  | 'vision_model_id'
 > & { api_key?: string };
 
 export type ModelConnectionOption = {
@@ -847,6 +861,14 @@ function sessionMessagePagePath(path: string, query: SessionMessagePageQuery) {
   const params = new URLSearchParams({ limit: String(query.limit) });
   if (query.beforeSequence !== undefined) params.set('before_sequence', String(query.beforeSequence));
   return `${path}?${params.toString()}`;
+}
+
+export function attachmentUrl(id: string) {
+  return `/api/attachments/${encodeURIComponent(id)}`;
+}
+
+export function widgetAttachmentUrl(id: string) {
+  return `/api/widget/attachments/${encodeURIComponent(id)}`;
 }
 
 export class ApiError extends Error {
@@ -1307,6 +1329,27 @@ export const api = {
       body: JSON.stringify(message),
       signal
     }),
+  uploadAttachment: (sessionId: string, file: File, signal?: AbortSignal) => {
+    const body = new FormData();
+    body.append('file', file);
+    body.append('session_id', sessionId);
+    return request<HubSessionAttachment>('/api/attachments', {
+      method: 'POST',
+      body,
+      signal
+    });
+  },
+  uploadWidgetAttachment: (sessionId: string, file: File, token: string, signal?: AbortSignal) => {
+    const body = new FormData();
+    body.append('file', file);
+    body.append('session_id', sessionId);
+    return request<HubSessionAttachment>('/api/widget/attachments', {
+      method: 'POST',
+      body,
+      headers: { 'X-Agent-Hub-Embed-Token': token },
+      signal
+    });
+  },
   stopRun: (runId: string, signal?: AbortSignal) =>
     request<Run>(`/api/runs/${runId}/stop`, { method: 'POST', signal }),
   createRun: (

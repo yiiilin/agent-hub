@@ -1,7 +1,7 @@
 #![recursion_limit = "1024"]
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     convert::Infallible,
     env,
     io::Read,
@@ -88,6 +88,10 @@ const MAX_CLIENT_TOOL_COUNT: usize = 128;
 const MAX_CLIENT_TOOL_DEFINITIONS_BYTES: usize = 256_000;
 const MAX_CLIENT_TOOL_RESULT_BYTES: usize = 16_000;
 const EMBEDDED_ORIGIN_HEADER: &str = "x-agent-hub-embedded-origin";
+const MAX_ATTACHMENT_UPLOAD_BYTES: u64 = 104_857_600;
+const MAX_ATTACHMENT_BYTES_PER_SESSION: i64 = 524_288_000;
+const ATTACHMENT_UPLOAD_BODY_LIMIT: usize = MAX_ATTACHMENT_UPLOAD_BYTES as usize + 64 * 1024;
+const VISION_PROXY_HEADER: &str = "x-agent-hub-vision";
 const CLIENT_ACCESS_TTL_SECONDS: i64 = 15 * 60;
 const CLIENT_TOOL_DEADLINE_MINUTES: i64 = 5;
 const TOOL_REQUEST_BATCH_FINGERPRINT_KEY: &str = "tool_request_batch_fingerprint";
@@ -214,6 +218,7 @@ struct AcceptSessionMessage {
     model_subject_user_id: Option<Uuid>,
     model_source_integration_app_id: Option<Uuid>,
     external_user_context: Option<ExternalUserContextDto>,
+    attachment_ids: Vec<Uuid>,
 }
 
 #[allow(dead_code)] // Task 11 calls this only after Hub-managed object upload succeeds.
@@ -364,6 +369,10 @@ async fn main() -> anyhow::Result<()> {
     let builtin_skill_state = Arc::new(state.clone());
     tokio::spawn(async move {
         builtin_skill_seed_loop(builtin_skill_state).await;
+    });
+    let attachment_orphan_state = Arc::new(state.clone());
+    tokio::spawn(async move {
+        runtime_attachment_orphan_loop(attachment_orphan_state).await;
     });
     let app = build_router(state);
     info!("backend listening on {bind_addr}");
@@ -564,6 +573,11 @@ fn build_router(state: AppState) -> Router {
             "/api/sessions/{session_id}/messages",
             get(list_hub_session_messages).post(create_hub_session_message),
         )
+        .route(
+            "/api/attachments",
+            post(upload_attachment).layer(DefaultBodyLimit::max(ATTACHMENT_UPLOAD_BODY_LIMIT)),
+        )
+        .route("/api/attachments/{attachment_id}", get(download_attachment))
         .route("/api/runs/{run_id}", get(get_run))
         .route("/api/runs/{run_id}/stop", post(stop_hub_run))
         .route("/api/runs/{run_id}/events", get(list_run_events))
@@ -689,6 +703,15 @@ fn build_router(state: AppState) -> Router {
         .route("/api/widget/runs", post(create_widget_run))
         .route("/api/widget/runs/{run_id}/stop", post(stop_widget_run))
         .route(
+            "/api/widget/attachments",
+            post(upload_widget_attachment)
+                .layer(DefaultBodyLimit::max(ATTACHMENT_UPLOAD_BODY_LIMIT)),
+        )
+        .route(
+            "/api/widget/attachments/{attachment_id}",
+            get(download_widget_attachment),
+        )
+        .route(
             "/api/integrations/sessions",
             post(create_integration_session),
         )
@@ -758,6 +781,10 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/runtime/sessions/{session_id}/salvage-bundle",
             put(runtime_salvage_session_bundle),
+        )
+        .route(
+            "/api/runtime/attachments/{attachment_id}",
+            get(download_runtime_attachment),
         )
         .route(
             "/api/runtime/sessions/{session_id}/salvage-abandon",
@@ -1041,6 +1068,8 @@ fn openapi_document() -> Value {
                 "get": { "summary": "List owned session messages", "parameters": [id("session_id"), { "name": "before_sequence", "in": "query", "required": false, "schema": { "type": "integer", "format": "int64", "minimum": 1 } }, { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "format": "int64", "minimum": 1, "maximum": 100 } }], "responses": { "200": list_response("HubSessionMessage"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } },
                 "post": { "summary": "Send an owned session message", "parameters": [id("session_id")], "requestBody": body("CreateHubSessionMessageRequest"), "responses": { "200": response("SessionMessageAcceptance"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } }
             },
+            "/api/attachments": { "post": { "summary": "Upload one attachment to an owned session", "parameters": [{ "name": "session_id", "in": "query", "required": false, "schema": { "type": "string", "format": "uuid" } }], "requestBody": { "required": true, "content": { "multipart/form-data": { "schema": { "type": "object", "required": ["file"], "properties": { "file": { "type": "string", "format": "binary" }, "session_id": { "type": "string", "format": "uuid" } } } } } }, "responses": { "200": response("HubSessionAttachment"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" }, "413": { "description": "Attachment exceeds the 100MB upload limit" } } } },
+            "/api/attachments/{attachment_id}": { "get": { "summary": "Download an owned attachment", "parameters": [id("attachment_id")], "responses": { "200": { "description": "Attachment bytes", "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } } }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/runs/{run_id}": { "get": { "summary": "Get run", "parameters": [id("run_id")], "responses": { "200": response("Run"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/runs/{run_id}/stop": { "post": { "summary": "Stop an active Turn in an owned Session", "parameters": [id("run_id")], "responses": { "200": response("Run"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/runs/{run_id}/events": { "get": { "summary": "List run events", "parameters": [id("run_id")], "responses": { "200": list_response("RunEvent"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
@@ -1167,6 +1196,8 @@ fn openapi_document() -> Value {
             "/api/widget/sessions/{session_id}/events/stream": { "get": { "summary": "Stream one exact external Widget Session's Run events", "deprecated": true, "security": [{ "embedToken": [] }], "parameters": [id("session_id")], "responses": { "200": { "description": "Server-sent event stream", "content": { "text/event-stream": { "schema": { "type": "string" } } } }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/widget/runs": { "post": { "summary": "Create widget run", "deprecated": true, "security": [{ "embedToken": [] }], "requestBody": body("CreateWidgetRunRequest"), "responses": { "200": response("Run"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" } } } },
             "/api/widget/runs/{run_id}/stop": { "post": { "summary": "Stop the active Turn associated with this widget token", "deprecated": true, "security": [{ "embedToken": [] }], "parameters": [id("run_id")], "responses": { "200": response("Run"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
+            "/api/widget/attachments": { "post": { "summary": "Upload one attachment to the embed session", "deprecated": true, "security": [{ "embedToken": [] }], "parameters": [{ "name": "session_id", "in": "query", "required": false, "schema": { "type": "string", "format": "uuid" } }], "requestBody": { "required": true, "content": { "multipart/form-data": { "schema": { "type": "object", "required": ["file"], "properties": { "file": { "type": "string", "format": "binary" }, "session_id": { "type": "string", "format": "uuid" } } } } } }, "responses": { "200": response("HubSessionAttachment"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" }, "413": { "description": "Attachment exceeds the 100MB upload limit" } } } },
+            "/api/widget/attachments/{attachment_id}": { "get": { "summary": "Download an embed session attachment", "deprecated": true, "security": [{ "embedToken": [] }], "parameters": [id("attachment_id")], "responses": { "200": { "description": "Attachment bytes", "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } } }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/oauth/authorize": { "get": { "summary": "Authorize Integration App for an existing external identity", "security": [{ "sessionCookie": [] }], "parameters": [{ "name": "client_id", "in": "query", "required": true, "schema": { "type": "string" } }, { "name": "redirect_uri", "in": "query", "required": true, "schema": { "type": "string", "format": "uri" } }, { "name": "state", "in": "query", "required": false, "schema": { "type": "string" } }, { "name": "scope", "in": "query", "required": false, "schema": { "type": "string" } }, { "name": "external_user_id", "in": "query", "required": true, "schema": { "type": "string" } }, { "name": "tenant_id", "in": "query", "required": true, "schema": { "type": "string" } }], "responses": { "303": { "description": "Redirect with authorization code" }, "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" } } } },
             "/api/oauth/token": { "post": { "summary": "Issue authorization_code or client_credentials access token", "security": [], "requestBody": { "required": true, "content": { "application/x-www-form-urlencoded": { "schema": { "$ref": "#/components/schemas/OAuthTokenRequest" } } } }, "responses": { "200": response("OAuthTokenResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" } } } },
             "/api/oauth/userinfo": { "get": { "summary": "Get scoped OAuth user information", "security": [{ "integrationBearer": [] }], "responses": { "200": response("OAuthUserInfo"), "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" } } } },
@@ -1290,9 +1321,9 @@ fn openapi_schemas() -> Value {
         "AgentModelSettingsOverride": { "type": "object", "additionalProperties": false, "properties": { "reasoning_effort": { "anyOf": [{ "$ref": "#/components/schemas/ReasoningEffort" }, { "type": "null" }] }, "reasoning_summary": { "anyOf": [{ "$ref": "#/components/schemas/ModelReasoningSummary" }, { "type": "null" }] }, "verbosity": { "anyOf": [{ "$ref": "#/components/schemas/ModelVerbosity" }, { "type": "null" }] }, "context_window_tokens": { "type": ["integer", "null"], "minimum": 1 }, "auto_compact_token_limit": { "type": ["integer", "null"], "minimum": 1 }, "reasoning_summary_support": { "anyOf": [{ "$ref": "#/components/schemas/ModelReasoningSummarySupport" }, { "type": "null" }] }, "service_tier": { "type": ["string", "null"], "minLength": 1, "maxLength": 64 }, "provider_request_timeout_ms": { "type": ["integer", "null"], "minimum": 1 }, "stream_max_retries": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 }, "stream_idle_timeout_ms": { "type": ["integer", "null"], "minimum": 1 }, "request_settings": { "anyOf": [{ "$ref": "#/components/schemas/ModelRequestSettings" }, { "type": "null" }] } } },
         "ModelSelection": { "type": "object", "additionalProperties": false, "required": ["connection_id", "model_id"], "properties": { "connection_id": uuid(), "model_id": { "type": "string", "minLength": 1, "maxLength": 255 } } },
         "RunModelBinding": { "type": "object", "additionalProperties": false, "required": ["id", "run_id", "binding_key", "model_connection_id", "connection_name_snapshot", "connection_scope_snapshot", "model_id", "api_type", "model_settings"], "properties": { "id": uuid(), "run_id": uuid(), "binding_key": { "type": "string" }, "model_connection_id": uuid(), "connection_name_snapshot": { "type": "string" }, "connection_scope_snapshot": { "$ref": "#/components/schemas/ModelConnectionScope" }, "model_id": { "type": "string" }, "api_type": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "model_settings": { "$ref": "#/components/schemas/AgentModelSettings" } } },
-        "ModelConnection": { "type": "object", "additionalProperties": false, "required": ["id", "owner_id", "scope", "name", "base_url", "api_type", "allowed_model_ids", "status", "has_api_key", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": { "anyOf": [uuid(), { "type": "null" }] }, "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "name": { "type": "string" }, "base_url": { "type": "string", "format": "uri" }, "api_type": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "allowed_model_ids": { "type": "array", "minItems": 1, "maxItems": 256, "items": { "type": "string", "minLength": 1, "maxLength": 255 } }, "status": { "$ref": "#/components/schemas/ModelConnectionStatus" }, "has_api_key": { "type": "boolean" }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
-        "CreateModelConnectionRequest": { "type": "object", "additionalProperties": false, "required": ["scope", "name", "base_url", "api_type", "allowed_model_ids", "api_key"], "properties": { "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "name": { "type": "string", "minLength": 1, "maxLength": 128 }, "base_url": { "type": "string", "format": "uri" }, "api_type": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "allowed_model_ids": { "type": "array", "minItems": 1, "maxItems": 256, "items": { "type": "string", "minLength": 1, "maxLength": 255 } }, "api_key": { "type": "string", "minLength": 1, "format": "password", "writeOnly": true } } },
-        "UpdateModelConnectionRequest": { "type": "object", "additionalProperties": false, "required": ["name", "base_url", "api_type", "allowed_model_ids"], "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 128 }, "base_url": { "type": "string", "format": "uri" }, "api_type": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "allowed_model_ids": { "type": "array", "minItems": 1, "maxItems": 256, "items": { "type": "string", "minLength": 1, "maxLength": 255 } }, "api_key": { "type": ["string", "null"], "minLength": 1, "format": "password", "writeOnly": true } } },
+        "ModelConnection": { "type": "object", "additionalProperties": false, "required": ["id", "owner_id", "scope", "name", "base_url", "api_type", "allowed_model_ids", "status", "has_api_key", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": { "anyOf": [uuid(), { "type": "null" }] }, "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "name": { "type": "string" }, "base_url": { "type": "string", "format": "uri" }, "api_type": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "allowed_model_ids": { "type": "array", "minItems": 1, "maxItems": 256, "items": { "type": "string", "minLength": 1, "maxLength": 255 } }, "vision_model_id": { "anyOf": [{ "type": "string" }, { "type": "null" }] }, "status": { "$ref": "#/components/schemas/ModelConnectionStatus" }, "has_api_key": { "type": "boolean" }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
+        "CreateModelConnectionRequest": { "type": "object", "additionalProperties": false, "required": ["scope", "name", "base_url", "api_type", "allowed_model_ids", "api_key"], "properties": { "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "name": { "type": "string", "minLength": 1, "maxLength": 128 }, "base_url": { "type": "string", "format": "uri" }, "api_type": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "allowed_model_ids": { "type": "array", "minItems": 1, "maxItems": 256, "items": { "type": "string", "minLength": 1, "maxLength": 255 } }, "vision_model_id": { "anyOf": [{ "type": "string" }, { "type": "null" }] }, "api_key": { "type": "string", "minLength": 1, "format": "password", "writeOnly": true } } },
+        "UpdateModelConnectionRequest": { "type": "object", "additionalProperties": false, "required": ["name", "base_url", "api_type", "allowed_model_ids"], "properties": { "name": { "type": "string", "minLength": 1, "maxLength": 128 }, "base_url": { "type": "string", "format": "uri" }, "api_type": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "allowed_model_ids": { "type": "array", "minItems": 1, "maxItems": 256, "items": { "type": "string", "minLength": 1, "maxLength": 255 } }, "vision_model_id": { "anyOf": [{ "type": "string" }, { "type": "null" }] }, "api_key": { "type": ["string", "null"], "minLength": 1, "format": "password", "writeOnly": true } } },
         "UpdateModelConnectionStatusRequest": { "type": "object", "additionalProperties": false, "required": ["status"], "properties": { "status": { "$ref": "#/components/schemas/ModelConnectionStatus" } } },
         "ModelConnectionOption": { "type": "object", "additionalProperties": false, "required": ["connection_id", "connection_name", "model_id", "api_type", "scope", "status"], "properties": { "connection_id": uuid(), "connection_name": { "type": "string" }, "model_id": { "type": "string" }, "api_type": { "$ref": "#/components/schemas/ModelUpstreamProtocol" }, "scope": { "$ref": "#/components/schemas/ModelConnectionScope" }, "status": { "$ref": "#/components/schemas/ModelConnectionStatus" } } },
         "ModelConnectionOptions": { "type": "object", "additionalProperties": false, "required": ["items", "system_default"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/ModelConnectionOption" } }, "system_default": { "anyOf": [{ "$ref": "#/components/schemas/ModelSelection" }, { "type": "null" }] } } },
@@ -1330,8 +1361,9 @@ fn openapi_schemas() -> Value {
         ] },
         "CurrentSessionBundle": { "type": "object", "required": ["generation", "object_key", "checksum_sha256", "size_bytes", "history_checkpoint", "ownership_generation", "producing_engine_version", "created_at"], "properties": { "generation": { "type": "integer" }, "object_key": { "type": "string" }, "checksum_sha256": { "type": "string" }, "size_bytes": { "type": "integer", "minimum": 0 }, "history_checkpoint": { "type": "integer", "minimum": 0 }, "ownership_generation": { "type": "integer", "minimum": 0 }, "producing_engine_version": { "type": "string" }, "created_at": { "type": "string", "format": "date-time" } } },
         "HubSession": { "type": "object", "required": ["id", "owner_id", "agent_id", "agent_name", "agent_deleted_at", "origin_platform_name", "origin", "lifecycle_status", "native_session_id", "active_turn_id", "history_checkpoint", "configuration_fingerprint", "runtime_owner_id", "ownership_generation", "recovery_error", "current_bundle", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": uuid(), "agent_id": uuid(), "agent_name": { "type": "string" }, "agent_deleted_at": { "type": ["string", "null"], "format": "date-time" }, "title": { "type": ["string", "null"] }, "origin_platform_name": { "type": ["string", "null"] }, "origin": { "$ref": "#/components/schemas/HubSessionOrigin" }, "lifecycle_status": { "type": "string" }, "native_session_id": { "type": ["string", "null"] }, "active_turn_id": { "anyOf": [uuid(), { "type": "null" }] }, "history_checkpoint": { "type": "integer", "minimum": 0 }, "configuration_fingerprint": { "type": ["string", "null"] }, "runtime_owner_id": { "anyOf": [uuid(), { "type": "null" }] }, "ownership_generation": { "type": "integer", "minimum": 0 }, "recovery_error": { "type": ["string", "null"] }, "current_bundle": { "anyOf": [{ "$ref": "#/components/schemas/CurrentSessionBundle" }, { "type": "null" }] }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
-        "HubSessionMessage": { "type": "object", "required": ["id", "session_id", "sequence", "role", "message_kind", "content", "payload", "delivery_mode", "delivery_state", "client_message_key", "expected_native_turn_id", "turn_id", "run_id", "accepted_at"], "properties": { "id": uuid(), "session_id": uuid(), "sequence": { "type": "integer", "minimum": 1 }, "role": { "type": "string" }, "message_kind": { "type": "string" }, "content": { "type": ["string", "null"] }, "payload": {}, "delivery_mode": { "type": "string" }, "delivery_state": { "type": "string" }, "client_message_key": { "type": ["string", "null"] }, "expected_native_turn_id": { "type": ["string", "null"] }, "turn_id": { "anyOf": [uuid(), { "type": "null" }] }, "run_id": { "anyOf": [uuid(), { "type": "null" }] }, "accepted_at": { "type": "string", "format": "date-time" } } },
-        "CreateHubSessionMessageRequest": { "type": "object", "required": ["content"], "properties": { "content": { "type": "string" }, "payload": {}, "delivery_mode": { "type": ["string", "null"] }, "client_message_key": { "type": ["string", "null"] }, "parent_run_id": { "anyOf": [uuid(), { "type": "null" }] } } },
+        "HubSessionAttachment": { "type": "object", "additionalProperties": false, "required": ["id", "session_id", "name", "content_type", "size_bytes", "created_at"], "properties": { "id": uuid(), "session_id": uuid(), "name": { "type": "string" }, "content_type": { "type": "string" }, "size_bytes": { "type": "integer", "minimum": 0 }, "created_at": { "type": "string", "format": "date-time" } } },
+        "HubSessionMessage": { "type": "object", "required": ["id", "session_id", "sequence", "role", "message_kind", "content", "payload", "delivery_mode", "delivery_state", "client_message_key", "expected_native_turn_id", "turn_id", "run_id", "accepted_at"], "properties": { "id": uuid(), "session_id": uuid(), "sequence": { "type": "integer", "minimum": 1 }, "role": { "type": "string" }, "message_kind": { "type": "string" }, "content": { "type": ["string", "null"] }, "payload": {}, "attachments": { "type": "array", "items": { "$ref": "#/components/schemas/HubSessionAttachment" } }, "delivery_mode": { "type": "string" }, "delivery_state": { "type": "string" }, "client_message_key": { "type": ["string", "null"] }, "expected_native_turn_id": { "type": ["string", "null"] }, "turn_id": { "anyOf": [uuid(), { "type": "null" }] }, "run_id": { "anyOf": [uuid(), { "type": "null" }] }, "accepted_at": { "type": "string", "format": "date-time" } } },
+        "CreateHubSessionMessageRequest": { "type": "object", "required": ["content"], "properties": { "content": { "type": "string" }, "payload": {}, "attachment_ids": { "type": "array", "items": uuid() }, "delivery_mode": { "type": ["string", "null"] }, "client_message_key": { "type": ["string", "null"] }, "parent_run_id": { "anyOf": [uuid(), { "type": "null" }] } } },
         "UpdateHubSessionTitleRequest": { "type": "object", "additionalProperties": false, "required": ["title"], "properties": { "title": { "type": "string", "minLength": 1, "maxLength": 40 } } },
         "SessionMessageAcceptance": { "type": "object", "required": ["message", "run"], "properties": { "message": { "$ref": "#/components/schemas/HubSessionMessage" }, "run": { "anyOf": [{ "$ref": "#/components/schemas/Run" }, { "type": "null" }] } } },
         "RunEvent": { "type": "object", "required": ["seq", "event_id", "run_id", "event_type", "payload", "created_at"], "properties": { "seq": { "type": "integer" }, "event_id": uuid(), "run_id": uuid(), "event_type": { "type": "string" }, "role": { "type": ["string", "null"] }, "content": { "type": ["string", "null"] }, "payload": {}, "created_at": { "type": "string", "format": "date-time" } } },
@@ -3539,7 +3571,7 @@ async fn list_model_connections(
     let user = require_user(&state, &headers).await?;
     let rows = sqlx::query(
         "SELECT c.id, c.owner_id, c.scope, c.name, c.base_url, c.api_type,
-                c.allowed_model_ids, c.enabled,
+                c.allowed_model_ids, c.enabled, c.vision_model_id,
                 (c.api_key_ciphertext IS NOT NULL) AS has_api_key,
                 c.created_at, c.updated_at
          FROM model_connections c
@@ -3596,6 +3628,33 @@ async fn get_model_connection_options(
     }))
 }
 
+fn validate_vision_model_id(
+    vision_model_id: Option<String>,
+    allowed_model_ids: &[String],
+) -> Result<Option<String>, ApiError> {
+    let Some(vision_model_id) = vision_model_id else {
+        return Ok(None);
+    };
+    let vision_model_id = vision_model_id.trim();
+    if vision_model_id.is_empty() {
+        return Ok(None);
+    }
+    if vision_model_id.chars().count() > 255 || vision_model_id.chars().any(char::is_control) {
+        return Err(ApiError::bad_request(
+            "vision model id must contain 1 to 255 non-control characters",
+        ));
+    }
+    if !allowed_model_ids
+        .iter()
+        .any(|model_id| model_id == vision_model_id)
+    {
+        return Err(ApiError::bad_request(
+            "vision model id must be one of the allowed model ids",
+        ));
+    }
+    Ok(Some(vision_model_id.to_owned()))
+}
+
 async fn create_model_connection(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -3615,6 +3674,7 @@ async fn create_model_connection(
         allowed_model_ids,
         Some(&req.api_key),
     )?;
+    let vision_model_id = validate_vision_model_id(req.vision_model_id, &fields.allowed_model_ids)?;
     let encrypted = state
         .model_secret_cipher
         .encrypt(&req.api_key)
@@ -3627,8 +3687,9 @@ async fn create_model_connection(
     sqlx::query(
         "INSERT INTO model_connections
              (id, scope, owner_id, name, base_url, api_type,
-              allowed_model_ids, api_key_ciphertext, api_key_nonce, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+              allowed_model_ids, vision_model_id,
+              api_key_ciphertext, api_key_nonce, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(id)
     .bind(scope)
@@ -3637,6 +3698,7 @@ async fn create_model_connection(
     .bind(fields.base_url)
     .bind(model_upstream_protocol_name(req.api_type))
     .bind(fields.allowed_model_ids)
+    .bind(vision_model_id.as_deref())
     .bind(encrypted.ciphertext)
     .bind(encrypted.nonce)
     .bind(user.id)
@@ -3681,6 +3743,7 @@ async fn update_model_connection(
         allowed_model_ids,
         req.api_key.as_deref(),
     )?;
+    let vision_model_id = validate_vision_model_id(req.vision_model_id, &fields.allowed_model_ids)?;
     let encrypted = req
         .api_key
         .as_deref()
@@ -3732,15 +3795,17 @@ async fn update_model_connection(
     let updated = sqlx::query(
         "UPDATE model_connections
          SET name = $1, base_url = $2, api_type = $3, allowed_model_ids = $4,
-             api_key_ciphertext = COALESCE($5, api_key_ciphertext),
-             api_key_nonce = COALESCE($6, api_key_nonce),
+             vision_model_id = $5,
+             api_key_ciphertext = COALESCE($6, api_key_ciphertext),
+             api_key_nonce = COALESCE($7, api_key_nonce),
              updated_at = CURRENT_TIMESTAMP(3)
-         WHERE id = $7 AND deleted_at IS NULL",
+         WHERE id = $8 AND deleted_at IS NULL",
     )
     .bind(&fields.name)
     .bind(&fields.base_url)
     .bind(api_type_name)
     .bind(&fields.allowed_model_ids)
+    .bind(vision_model_id.as_deref())
     .bind(api_key_ciphertext)
     .bind(api_key_nonce)
     .bind(model_connection_id)
@@ -4441,6 +4506,7 @@ fn model_connection_from_row(row: &sqlx::postgres::PgRow) -> ModelConnectionDto 
         base_url: row.get("base_url"),
         api_type: model_upstream_protocol_from_name(&row.get::<String, _>("api_type")),
         allowed_model_ids: row.get("allowed_model_ids"),
+        vision_model_id: row.get("vision_model_id"),
         status: if row.get("enabled") {
             ModelConnectionStatus::Enabled
         } else {
@@ -4463,7 +4529,7 @@ async fn load_visible_model_connection(
 ) -> Result<ModelConnectionDto, ApiError> {
     let row = sqlx::query(
         "SELECT c.id, c.owner_id, c.scope, c.name, c.base_url, c.api_type,
-                c.allowed_model_ids, c.enabled,
+                c.allowed_model_ids, c.enabled, c.vision_model_id,
                 (c.api_key_ciphertext IS NOT NULL) AS has_api_key,
                 c.created_at, c.updated_at
          FROM model_connections c
@@ -4540,7 +4606,7 @@ async fn load_model_connection_secret_for_test(
     authorize_model_connection_mutation(pool, model_connection_id, user).await?;
     let row = sqlx::query(
         "SELECT c.id, c.owner_id, c.scope, c.name, c.base_url, c.api_type,
-                c.allowed_model_ids, c.enabled,
+                c.allowed_model_ids, c.enabled, c.vision_model_id,
                 (c.api_key_ciphertext IS NOT NULL) AS has_api_key,
                 c.created_at, c.updated_at,
                 c.api_key_ciphertext, c.api_key_nonce
@@ -6531,6 +6597,7 @@ async fn create_run(
             model_subject_user_id: Some(user.id),
             model_source_integration_app_id: None,
             external_user_context: None,
+            attachment_ids: Vec::new(),
         },
     )
     .await?;
@@ -6740,6 +6807,18 @@ async fn delete_hub_session(
         .bind(session_id)
         .execute(&mut *tx)
         .await?;
+    let attachment_object_keys = sqlx::query_scalar::<_, String>(
+        "SELECT object_key
+         FROM hub_session_attachments WHERE session_id = $1
+         ORDER BY object_key",
+    )
+    .bind(session_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM hub_session_attachments WHERE session_id = $1")
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM hub_session_messages WHERE session_id = $1")
         .bind(session_id)
         .execute(&mut *tx)
@@ -6761,6 +6840,14 @@ async fn delete_hub_session(
         if let Err(error) = store.delete(&object_key).await {
             warn!(session_id = %session_id, object_key = %object_key, error = %error,
                 "failed to delete Session Bundle object after Session deletion");
+        }
+    }
+    if let Some(store) = state.session_bundle_store.as_ref() {
+        for object_key in attachment_object_keys {
+            if let Err(error) = store.delete(&object_key).await {
+                warn!(session_id = %session_id, object_key = %object_key, error = %error,
+                    "failed to delete Attachment object after Session deletion");
+            }
         }
     }
     Ok(StatusCode::NO_CONTENT)
@@ -6809,7 +6896,12 @@ async fn list_hub_session_messages(
         .bind(limit)
         .fetch_all(&state.pool)
         .await?;
-    Ok(Json(rows.into_iter().map(hub_message_from_row).collect()))
+    let mut messages = rows
+        .into_iter()
+        .map(hub_message_from_row)
+        .collect::<Vec<_>>();
+    fill_message_attachments(&state.pool, &mut messages).await?;
+    Ok(Json(messages))
 }
 
 async fn create_hub_session_message(
@@ -6862,11 +6954,525 @@ async fn create_hub_session_message(
             model_subject_user_id: Some(user.id),
             model_source_integration_app_id: None,
             external_user_context: None,
+            attachment_ids: req.attachment_ids,
         },
     )
     .await?;
     tx.commit().await?;
     Ok(Json(accepted))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AttachmentUploadQuery {
+    session_id: Option<Uuid>,
+}
+
+struct StagedAttachmentUpload {
+    session_id: Option<Uuid>,
+    name: String,
+    content_type: String,
+    bytes: Vec<u8>,
+    checksum_sha256: String,
+}
+
+async fn upload_attachment(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AttachmentUploadQuery>,
+    multipart: Multipart,
+) -> Result<Json<HubSessionAttachmentDto>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    let staged = stage_attachment_upload(multipart).await?;
+    let session_id = resolve_attachment_session_id(query.session_id, staged.session_id)?;
+    upload_attachment_to_session(&state, session_id, user.id, staged).await
+}
+
+async fn upload_widget_attachment(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<AttachmentUploadQuery>,
+    multipart: Multipart,
+) -> Result<Json<HubSessionAttachmentDto>, ApiError> {
+    let token = client_access_token_from_headers(&headers)
+        .ok_or(ApiError::unauthorized("missing embed session"))?;
+    let mut tx = state.pool.begin().await?;
+    let credential = load_widget_credential_tx(&mut tx, &token, &headers).await?;
+    tx.commit().await?;
+    let staged = stage_attachment_upload(multipart).await?;
+    let session_id = resolve_attachment_session_id(query.session_id, staged.session_id)?;
+    let mut tx = state.pool.begin().await?;
+    let scoped = load_widget_scoped_session_tx(&mut tx, &credential, None, Some(session_id), false)
+        .await
+        .map_err(|error| {
+            if error.status == StatusCode::NOT_FOUND {
+                ApiError::not_found("Widget Session not found")
+            } else {
+                error
+            }
+        })?;
+    tx.commit().await?;
+    upload_attachment_to_session(&state, scoped.hub_session_id, credential.owner_id, staged).await
+}
+
+async fn download_attachment(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(attachment_id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    let row = load_attachment_with_session_owner(&state.pool, attachment_id).await?;
+    let session_owner_id: Uuid = row.get("session_owner_id");
+    if session_owner_id != user.id && !is_admin_role(&user.role) {
+        return Err(ApiError::not_found("attachment not found"));
+    }
+    serve_attachment_row(&state, row).await
+}
+
+async fn download_runtime_attachment(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(attachment_id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let runtime_id = require_runtime(&state, &headers).await?;
+    let row = sqlx::query(
+        "SELECT a.id, a.session_id, a.name, a.content_type, a.size_bytes, a.object_key
+         FROM hub_session_attachments AS a
+         JOIN hub_sessions AS s ON s.id = a.session_id
+         WHERE a.id = $1 AND s.runtime_owner_id = $2",
+    )
+    .bind(attachment_id)
+    .bind(runtime_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(ApiError::not_found("attachment not found"))?;
+    serve_attachment_row(&state, row).await
+}
+
+async fn download_widget_attachment(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(attachment_id): Path<Uuid>,
+) -> Result<Response, ApiError> {
+    let token = client_access_token_from_headers(&headers)
+        .ok_or(ApiError::unauthorized("missing embed session"))?;
+    let mut tx = state.pool.begin().await?;
+    let credential = load_widget_credential_tx(&mut tx, &token, &headers).await?;
+    let row = sqlx::query(
+        "SELECT a.id, a.session_id, a.name, a.content_type, a.size_bytes, a.object_key
+         FROM hub_session_attachments AS a
+         WHERE a.id = $1",
+    )
+    .bind(attachment_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let row = row.ok_or(ApiError::not_found("attachment not found"))?;
+    let attachment_session_id: Uuid = row.get("session_id");
+    load_widget_scoped_session_tx(
+        &mut tx,
+        &credential,
+        None,
+        Some(attachment_session_id),
+        false,
+    )
+    .await
+    .map_err(|error| {
+        if error.status == StatusCode::NOT_FOUND {
+            ApiError::not_found("attachment not found")
+        } else {
+            error
+        }
+    })?;
+    tx.commit().await?;
+    serve_attachment_row(&state, row).await
+}
+
+async fn stage_attachment_upload(
+    mut multipart: Multipart,
+) -> Result<StagedAttachmentUpload, ApiError> {
+    let mut session_id = None;
+    let mut file_name: Option<String> = None;
+    let mut content_type: Option<String> = None;
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut checksum_sha256: Option<String> = None;
+    loop {
+        let mut field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(_) => {
+                return Err(ApiError::bad_request(
+                    "attachment multipart body is invalid",
+                ))
+            }
+        };
+        match field.name() {
+            Some("session_id") => {
+                if session_id.is_some() {
+                    return Err(ApiError::bad_request(
+                        "attachment multipart contains more than one session id",
+                    ));
+                }
+                let mut text = Vec::new();
+                while let Some(chunk) = field
+                    .chunk()
+                    .await
+                    .map_err(|_| ApiError::bad_request("attachment session id is invalid"))?
+                {
+                    if text.len().saturating_add(chunk.len()) > 4096 {
+                        return Err(ApiError::bad_request("attachment session id is too large"));
+                    }
+                    text.extend_from_slice(&chunk);
+                }
+                let text = String::from_utf8(text)
+                    .map_err(|_| ApiError::bad_request("attachment session id must be UTF-8"))?;
+                let parsed = Uuid::parse_str(text.trim())
+                    .map_err(|_| ApiError::bad_request("attachment session id is invalid"))?;
+                session_id = Some(parsed);
+            }
+            Some("file") => {
+                if file_bytes.is_some() {
+                    return Err(ApiError::bad_request(
+                        "attachment multipart contains more than one file",
+                    ));
+                }
+                let mut bytes = Vec::new();
+                let mut hasher = Sha256::new();
+                let mut size = 0_u64;
+                while let Some(chunk) = field
+                    .chunk()
+                    .await
+                    .map_err(|_| ApiError::bad_request("attachment file body is invalid"))?
+                {
+                    size = size.checked_add(chunk.len() as u64).ok_or_else(|| {
+                        ApiError::bad_request("attachment file exceeds the 100MB limit")
+                    })?;
+                    if size > MAX_ATTACHMENT_UPLOAD_BYTES {
+                        return Err(ApiError::payload_too_large(
+                            "attachment file exceeds the 100MB limit",
+                        ));
+                    }
+                    hasher.update(&chunk);
+                    bytes.extend_from_slice(&chunk);
+                }
+                file_name = field.file_name().map(str::to_owned);
+                content_type = field.content_type().map(str::to_owned);
+                file_bytes = Some(bytes);
+                checksum_sha256 = Some(format!("{:x}", hasher.finalize()));
+            }
+            _ => {
+                return Err(ApiError::bad_request(
+                    "attachment multipart contains an unsupported field",
+                ));
+            }
+        }
+    }
+    let bytes = file_bytes.ok_or(ApiError::bad_request("attachment file is required"))?;
+    if bytes.is_empty() {
+        return Err(ApiError::bad_request("attachment file must not be empty"));
+    }
+    let name = sanitize_attachment_file_name(file_name.as_deref())?;
+    let content_type = sanitize_attachment_content_type(content_type.as_deref())?;
+    Ok(StagedAttachmentUpload {
+        session_id,
+        name,
+        content_type,
+        bytes,
+        checksum_sha256: checksum_sha256.expect("file bytes set the checksum"),
+    })
+}
+
+fn sanitize_attachment_file_name(value: Option<&str>) -> Result<String, ApiError> {
+    let value = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or(ApiError::bad_request("attachment file name is required"))?;
+    let value = value.rsplit(['/', '\\']).next().unwrap_or(value);
+    if value.is_empty() || value.chars().count() > 255 || value.chars().any(char::is_control) {
+        return Err(ApiError::bad_request("attachment file name is invalid"));
+    }
+    Ok(value.to_owned())
+}
+
+fn sanitize_attachment_content_type(value: Option<&str>) -> Result<String, ApiError> {
+    let value = value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("application/octet-stream");
+    if value.chars().count() > 255 || value.chars().any(char::is_control) {
+        return Err(ApiError::bad_request("attachment content type is invalid"));
+    }
+    Ok(value.to_owned())
+}
+
+fn resolve_attachment_session_id(
+    query_session_id: Option<Uuid>,
+    field_session_id: Option<Uuid>,
+) -> Result<Uuid, ApiError> {
+    match (query_session_id, field_session_id) {
+        (Some(query), Some(field)) if query != field => Err(ApiError::bad_request(
+            "attachment session id does not match",
+        )),
+        (Some(query), _) => Ok(query),
+        (None, Some(field)) => Ok(field),
+        (None, None) => Err(ApiError::bad_request("attachment session id is required")),
+    }
+}
+
+async fn upload_attachment_to_session(
+    state: &AppState,
+    session_id: Uuid,
+    owner_id: Uuid,
+    staged: StagedAttachmentUpload,
+) -> Result<Json<HubSessionAttachmentDto>, ApiError> {
+    let mut tx = state.pool.begin().await?;
+    let session_owner_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT owner_id FROM hub_sessions WHERE id = $1 FOR UPDATE")
+            .bind(session_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let session_owner_id = session_owner_id.ok_or(ApiError::not_found("session not found"))?;
+    if session_owner_id != owner_id {
+        return Err(ApiError::not_found("session not found"));
+    }
+    let current_total: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(size_bytes), 0)::bigint
+         FROM hub_session_attachments WHERE session_id = $1",
+    )
+    .bind(session_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let size_bytes = i64::try_from(staged.bytes.len())
+        .map_err(|_| ApiError::bad_request("attachment file is too large"))?;
+    if current_total
+        .checked_add(size_bytes)
+        .is_none_or(|total| total > MAX_ATTACHMENT_BYTES_PER_SESSION)
+    {
+        return Err(ApiError::bad_request(
+            "session attachment storage limit exceeded",
+        ));
+    }
+    let store = state.session_bundle_store.as_ref().ok_or_else(|| {
+        ApiError::service_unavailable("Attachment object storage is not configured")
+    })?;
+    let attachment_id = Uuid::new_v4();
+    let object_key = format!("attachments/{session_id}/{attachment_id}");
+    let body_bytes = Bytes::from(staged.bytes);
+    let size = body_bytes.len() as u64;
+    let checksum = staged.checksum_sha256.clone();
+    if let Err(error) = store
+        .put_stream(
+            &object_key,
+            size,
+            &checksum,
+            futures_util::stream::once(async move { Ok::<_, std::io::Error>(body_bytes) }),
+        )
+        .await
+    {
+        warn!(session_id = %session_id, object_key = %object_key, error = %error,
+            "Attachment object upload failed");
+        return Err(ApiError::bad_gateway("Attachment object upload failed"));
+    }
+    let row = sqlx::query(
+        "INSERT INTO hub_session_attachments
+             (id, session_id, owner_id, name, content_type, size_bytes,
+              object_key, checksum_sha256)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING id, session_id, name, content_type, size_bytes, created_at",
+    )
+    .bind(attachment_id)
+    .bind(session_id)
+    .bind(session_owner_id)
+    .bind(&staged.name)
+    .bind(&staged.content_type)
+    .bind(size_bytes)
+    .bind(&object_key)
+    .bind(&checksum)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Json(hub_session_attachment_from_row(row)))
+}
+
+async fn load_attachment_with_session_owner(
+    pool: &PgPool,
+    attachment_id: Uuid,
+) -> Result<sqlx::postgres::PgRow, ApiError> {
+    sqlx::query(
+        "SELECT a.id, a.session_id, a.name, a.content_type, a.size_bytes, a.object_key,
+                s.owner_id AS session_owner_id
+         FROM hub_session_attachments AS a
+         JOIN hub_sessions AS s ON s.id = a.session_id
+         WHERE a.id = $1",
+    )
+    .bind(attachment_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or(ApiError::not_found("attachment not found"))
+}
+
+async fn serve_attachment_row(
+    state: &AppState,
+    row: sqlx::postgres::PgRow,
+) -> Result<Response, ApiError> {
+    let object_key: String = row.get("object_key");
+    let name: String = row.get("name");
+    let content_type: String = row.get("content_type");
+    let store = state.session_bundle_store.as_ref().ok_or_else(|| {
+        ApiError::service_unavailable("Attachment object storage is not configured")
+    })?;
+    let object = match store.get(&object_key).await {
+        Ok(object) => object,
+        Err(error) => {
+            warn!(object_key = %object_key, error = %error,
+                "Attachment object download failed");
+            return Err(ApiError::not_found("attachment object not found"));
+        }
+    };
+    if !object.status().is_success() {
+        return Err(ApiError::not_found("attachment object not found"));
+    }
+    let mut response = Response::new(Body::from_stream(
+        object
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(std::io::Error::other)),
+    ));
+    *response.status_mut() = StatusCode::OK;
+    let response_headers = response.headers_mut();
+    response_headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&content_type)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
+    let disposition = if content_type.starts_with("image/") {
+        "inline".to_owned()
+    } else {
+        format!(
+            "attachment; filename*=UTF-8''{}",
+            attachment_filename_encoding(&name)
+        )
+    };
+    response_headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&disposition)
+            .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+    );
+    if let Ok(size_bytes) = row.try_get::<i64, _>("size_bytes") {
+        if let Ok(value) = HeaderValue::from_str(&size_bytes.to_string()) {
+            response_headers.insert(header::CONTENT_LENGTH, value);
+        }
+    }
+    Ok(response)
+}
+
+fn attachment_filename_encoding(name: &str) -> String {
+    let mut encoded = String::new();
+    for byte in name.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push_str(&format!("{byte:02X}"));
+            }
+        }
+    }
+    encoded
+}
+
+fn hub_session_attachment_from_row(row: sqlx::postgres::PgRow) -> HubSessionAttachmentDto {
+    HubSessionAttachmentDto {
+        id: row.get("id"),
+        session_id: row.get("session_id"),
+        name: row.get("name"),
+        content_type: row.get("content_type"),
+        size_bytes: row.get("size_bytes"),
+        created_at: row.get("created_at"),
+    }
+}
+
+async fn load_attachments_for_session_messages<'e, E>(
+    executor: E,
+    message_ids: &[Uuid],
+) -> Result<HashMap<Uuid, Vec<HubSessionAttachmentDto>>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
+    if message_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = sqlx::query(
+        "SELECT id, message_id, session_id, name, content_type, size_bytes, created_at
+         FROM hub_session_attachments
+         WHERE message_id = ANY($1)
+         ORDER BY created_at, id",
+    )
+    .bind(message_ids)
+    .fetch_all(executor)
+    .await?;
+    let mut by_message: HashMap<Uuid, Vec<HubSessionAttachmentDto>> = HashMap::new();
+    for row in rows {
+        by_message
+            .entry(row.get("message_id"))
+            .or_default()
+            .push(hub_session_attachment_from_row(row));
+    }
+    Ok(by_message)
+}
+
+async fn fill_message_attachments<'e, E>(
+    executor: E,
+    messages: &mut [HubSessionMessageDto],
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
+    let message_ids = messages
+        .iter()
+        .map(|message| message.id)
+        .collect::<Vec<_>>();
+    let attachments = load_attachments_for_session_messages(executor, &message_ids).await?;
+    for message in messages {
+        message.attachments = attachments.get(&message.id).cloned().unwrap_or_default();
+    }
+    Ok(())
+}
+
+async fn runtime_attachment_orphan_loop(state: Arc<AppState>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(30 * 60));
+    loop {
+        tick.tick().await;
+        if let Err(error) = cleanup_attachment_orphans(&state).await {
+            warn!(error = %error, "attachment orphan cleanup failed");
+        }
+    }
+}
+
+async fn cleanup_attachment_orphans(state: &AppState) -> Result<(), anyhow::Error> {
+    let mut tx = state.pool.begin().await?;
+    let object_keys = sqlx::query_scalar::<_, String>(
+        "SELECT object_key
+         FROM hub_session_attachments
+         WHERE message_id IS NULL AND created_at < now() - interval '24 hours'
+         ORDER BY created_at, object_key",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM hub_session_attachments
+         WHERE message_id IS NULL AND created_at < now() - interval '24 hours'",
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    if let Some(store) = state.session_bundle_store.as_ref() {
+        for object_key in object_keys {
+            if let Err(error) = store.delete(&object_key).await {
+                warn!(object_key = %object_key, error = %error,
+                    "failed to delete orphan Attachment object");
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn get_run(
@@ -9339,8 +9945,13 @@ async fn list_widget_session_messages(
         .bind(limit)
         .fetch_all(&mut *tx)
         .await?;
+    let mut messages = rows
+        .into_iter()
+        .map(hub_message_from_row)
+        .collect::<Vec<_>>();
+    fill_message_attachments(&mut *tx, &mut messages).await?;
     tx.commit().await?;
-    Ok(Json(rows.into_iter().map(hub_message_from_row).collect()))
+    Ok(Json(messages))
 }
 
 async fn list_widget_session_events(
@@ -9677,6 +10288,7 @@ async fn create_widget_run(
                 .then_some(credential.owner_id),
             model_source_integration_app_id: credential.oauth_app_id,
             external_user_context,
+            attachment_ids: Vec::new(),
         },
     )
     .await?;
@@ -9992,6 +10604,7 @@ async fn create_integration_message(
             model_subject_user_id: model_attribution.subject_user_id,
             model_source_integration_app_id: model_attribution.source_integration_app_id,
             external_user_context: None,
+            attachment_ids: Vec::new(),
         },
     )
     .await?;
@@ -10119,7 +10732,12 @@ async fn list_integration_messages(
     .bind(principal.subject_user_id)
     .fetch_all(&state.pool)
     .await?;
-    Ok(Json(rows.into_iter().map(hub_message_from_row).collect()))
+    let mut messages = rows
+        .into_iter()
+        .map(hub_message_from_row)
+        .collect::<Vec<_>>();
+    fill_message_attachments(&state.pool, &mut messages).await?;
+    Ok(Json(messages))
 }
 
 #[derive(Debug, Deserialize)]
@@ -10313,6 +10931,7 @@ async fn submit_integration_tool_result(
             model_subject_user_id: model_attribution.subject_user_id,
             model_source_integration_app_id: model_attribution.source_integration_app_id,
             external_user_context,
+            attachment_ids: Vec::new(),
         },
     )
     .await?;
@@ -10784,6 +11403,7 @@ async fn create_client_tool_continuation_tx(
             model_subject_user_id: scope.model_subject_user_id,
             model_source_integration_app_id: scope.model_source_integration_app_id,
             external_user_context,
+            attachment_ids: Vec::new(),
         },
     )
     .await?;
@@ -13914,7 +14534,7 @@ async fn runtime_begin_turn(
             "Turn begin configuration fingerprint changed after synchronization",
         ));
     }
-    let messages = sqlx::query(
+    let rows = sqlx::query(
         "SELECT id, session_id, sequence, role, message_kind, content, payload,
                 delivery_mode, delivery_state, client_message_key,
                 expected_native_turn_id, turn_id, run_id, accepted_at
@@ -13927,10 +14547,12 @@ async fn runtime_begin_turn(
     .bind(turn_id)
     .bind(run_id)
     .fetch_all(&mut *tx)
-    .await?
-    .into_iter()
-    .map(hub_message_from_row)
-    .collect();
+    .await?;
+    let mut messages = rows
+        .into_iter()
+        .map(hub_message_from_row)
+        .collect::<Vec<_>>();
+    fill_message_attachments(&mut *tx, &mut messages).await?;
     tx.commit().await?;
     Ok(Json(BeginRuntimeTurnResponse {
         session_id,
@@ -14608,6 +15230,21 @@ async fn runtime_model_proxy(
             "request model does not match the selected Model Connection",
         ));
     }
+    let vision_request = headers
+        .get(VISION_PROXY_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim() == "1");
+    let mut forwarded_body = body;
+    if vision_request {
+        if let Some(vision_model_id) = resolved.vision_model_id.as_deref() {
+            let mut vision_request_json = request_json;
+            vision_request_json["model"] = Value::String(vision_model_id.to_owned());
+            forwarded_body = Bytes::from(
+                serde_json::to_vec(&vision_request_json)
+                    .map_err(|_| ApiError::internal("model request could not be re-encoded"))?,
+            );
+        }
+    }
     let request_settings = resolved.accounting.request_settings.clone();
     proxy_model_request_to_upstream_with_options(
         &state,
@@ -14618,7 +15255,7 @@ async fn runtime_model_proxy(
             path,
             query: uri.query().map(str::to_owned),
             headers,
-            body,
+            body: forwarded_body,
             api_key: resolved.api_key,
             accounting: Some(resolved.accounting),
         },
@@ -14629,6 +15266,7 @@ async fn runtime_model_proxy(
 struct ResolvedModelProxyRequest {
     upstream_url: String,
     model_id: String,
+    vision_model_id: Option<String>,
     api_key: Zeroizing<String>,
     accounting: ModelProxyAccountingContext,
 }
@@ -14662,7 +15300,7 @@ async fn resolve_model_proxy_request(
         "SELECT c.id AS model_connection_id,
                 binding.connection_scope_snapshot AS model_connection_scope,
                 binding.connection_name_snapshot AS model_connection_name,
-                c.base_url,
+                c.base_url, c.vision_model_id,
                 binding.model_id, binding.api_type,
                 binding.model_settings->'request_settings' AS request_settings,
                 c.api_key_ciphertext, c.api_key_nonce,
@@ -14735,6 +15373,7 @@ async fn resolve_model_proxy_request(
     Ok(ResolvedModelProxyRequest {
         upstream_url: row.get("base_url"),
         model_id: model_id.clone(),
+        vision_model_id: row.get("vision_model_id"),
         api_key,
         accounting: ModelProxyAccountingContext {
             request_id: Uuid::new_v4(),
@@ -15888,6 +16527,30 @@ async fn accept_session_message_tx(
         None
     };
 
+    let attachment_ids = request
+        .attachment_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if !attachment_ids.is_empty() {
+        let matched = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM hub_session_attachments
+             WHERE id = ANY($1) AND session_id = $2 AND message_id IS NULL
+             FOR UPDATE",
+        )
+        .bind(&attachment_ids)
+        .bind(request.session_id)
+        .fetch_all(&mut **tx)
+        .await?;
+        if matched.len() != attachment_ids.len() {
+            return Err(ApiError::bad_request(
+                "one or more attachment ids do not belong to this session or are already bound",
+            ));
+        }
+    }
+
     let mut selected_run_id = None;
     let mut selected_turn_id = None;
     let mut expected_native_turn_id = None;
@@ -16016,7 +16679,29 @@ async fn accept_session_message_tx(
     .bind(selected_run_id)
     .fetch_one(&mut **tx)
     .await?;
-    let message = hub_message_from_row(message_row);
+    let mut message = hub_message_from_row(message_row);
+    if !attachment_ids.is_empty() {
+        let updated = sqlx::query(
+            "UPDATE hub_session_attachments
+             SET message_id = $1, run_id = $2
+             WHERE id = ANY($3) AND session_id = $4 AND message_id IS NULL",
+        )
+        .bind(message.id)
+        .bind(selected_run_id)
+        .bind(&attachment_ids)
+        .bind(request.session_id)
+        .execute(&mut **tx)
+        .await?;
+        if updated.rows_affected() != attachment_ids.len() as u64 {
+            return Err(ApiError::conflict(
+                "one or more attachments became unavailable while sending the message",
+            ));
+        }
+    }
+    message.attachments = load_attachments_for_session_messages(&mut **tx, &[message.id])
+        .await?
+        .remove(&message.id)
+        .unwrap_or_default();
 
     if let Some(run_id) = selected_run_id {
         sqlx::query(
@@ -16407,7 +17092,15 @@ async fn load_hub_message_by_client_key_tx(
     .bind(client_message_key)
     .fetch_optional(&mut **tx)
     .await?;
-    Ok(row.map(hub_message_from_row))
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let mut message = hub_message_from_row(row);
+    message.attachments = load_attachments_for_session_messages(&mut **tx, &[message.id])
+        .await?
+        .remove(&message.id)
+        .unwrap_or_default();
+    Ok(Some(message))
 }
 
 #[cfg(test)]
@@ -16493,6 +17186,7 @@ async fn insert_run_for_agent_tx(
             model_subject_user_id: Some(owner_id),
             model_source_integration_app_id: None,
             external_user_context: None,
+            attachment_ids: Vec::new(),
         },
     )
     .await?;
@@ -20618,10 +21312,15 @@ async fn load_claim_session_context_tx(
     .bind(run.id)
     .fetch_all(&mut **tx)
     .await?;
+    let mut messages = message_rows
+        .into_iter()
+        .map(hub_message_from_row)
+        .collect::<Vec<_>>();
+    fill_message_attachments(&mut **tx, &mut messages).await?;
     Ok(ClaimSessionContextDto {
         session: hub_session_from_row(session_row),
         turn: hub_turn_from_row(turn_row),
-        messages: message_rows.into_iter().map(hub_message_from_row).collect(),
+        messages,
     })
 }
 
@@ -23821,6 +24520,7 @@ fn hub_message_from_row(row: sqlx::postgres::PgRow) -> HubSessionMessageDto {
         message_kind: row.get("message_kind"),
         content: row.get("content"),
         payload: row.get("payload"),
+        attachments: Vec::new(),
         delivery_mode: row.get("delivery_mode"),
         delivery_state: row.get("delivery_state"),
         client_message_key: row.get("client_message_key"),
@@ -24070,6 +24770,15 @@ impl ApiError {
             status: StatusCode::TOO_MANY_REQUESTS,
             message: message.into(),
             retry_after_seconds: Some(retry_after_seconds),
+            details: None,
+        }
+    }
+
+    fn payload_too_large(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: message.into(),
+            retry_after_seconds: None,
             details: None,
         }
     }
@@ -24818,6 +25527,8 @@ mod tests {
             "/api/sessions/{session_id}",
             "/api/sessions/{session_id}/title",
             "/api/sessions/{session_id}/messages",
+            "/api/attachments",
+            "/api/attachments/{attachment_id}",
             "/api/runs/{run_id}/stop",
             "/api/runs/{run_id}/events/stream",
             "/api/client/session",
@@ -24837,6 +25548,8 @@ mod tests {
             "/api/widget/sessions/{session_id}/messages",
             "/api/widget/sessions/{session_id}/events",
             "/api/widget/sessions/{session_id}/events/stream",
+            "/api/widget/attachments",
+            "/api/widget/attachments/{attachment_id}",
             "/api/widget/runs/{run_id}/stop",
             "/api/integrations/sessions/{session_id}/runs/{run_id}/stop",
             "/api/integrations/tool-requests/{tool_request_id}/result",
@@ -24861,6 +25574,7 @@ mod tests {
             "/api/runtime/sessions/{session_id}/checkpoint/fail",
             "/api/runtime/sessions/{session_id}/bundle",
             "/api/runtime/sessions/{session_id}/salvage-bundle",
+            "/api/runtime/attachments/{attachment_id}",
             "/api/runtime/sessions/{session_id}/salvage-abandon",
             "/api/runtime/runs/{run_id}/events",
             "/api/runtime/runs/{run_id}/tool-requests/finalize",
@@ -25614,6 +26328,7 @@ mod tests {
             message_kind: "message".into(),
             content: Some("go".into()),
             payload: json!({}),
+            attachments: Vec::new(),
             delivery_mode: "next_turn".into(),
             delivery_state: "queued".into(),
             client_message_key: Some("message-1".into()),
@@ -27113,6 +27828,56 @@ mod tests {
         assert_eq!(body, Bytes::from_static(br#"{"ok":true}"#));
     }
 
+    async fn attach_test_model_connection(
+        pool: &PgPool,
+        agent_id: Uuid,
+        owner_id: Uuid,
+        model_id: &str,
+    ) {
+        let model_connection_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO model_connections
+                 (id, scope, name, base_url, api_type, allowed_model_ids,
+                  api_key_ciphertext, api_key_nonce, created_by)
+             VALUES ($1, 'global', $2, 'https://models.example.test',
+                     'openai_responses', $3, $4, $5, $6)",
+        )
+        .bind(model_connection_id)
+        .bind(format!("test-model-{}", Uuid::new_v4().simple()))
+        .bind(vec![model_id.to_owned()])
+        .bind(vec![1_u8; 17])
+        .bind(vec![2_u8; 12])
+        .bind(owner_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE agents
+             SET model_connection_id = $1, model_id = $2,
+                 model_settings = $3
+             WHERE id = $4",
+        )
+        .bind(model_connection_id)
+        .bind(model_id)
+        .bind(json!({
+            "reasoning_effort": "default",
+            "reasoning_summary": "default",
+            "verbosity": "default",
+            "context_window_tokens": null,
+            "auto_compact_token_limit": null,
+            "reasoning_summary_support": "auto",
+            "service_tier": null,
+            "provider_request_timeout_ms": null,
+            "stream_max_retries": null,
+            "stream_idle_timeout_ms": null,
+            "request_settings": { "protocol": "openai_responses" }
+        }))
+        .bind(agent_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     async fn accept_test_session_message(
         pool: &PgPool,
         session_id: Uuid,
@@ -27145,6 +27910,7 @@ mod tests {
                 model_subject_user_id: Some(owner_id),
                 model_source_integration_app_id: None,
                 external_user_context: None,
+                attachment_ids: Vec::new(),
             },
         )
         .await?;
@@ -27512,14 +28278,15 @@ mod tests {
             sqlx::query(
                 "INSERT INTO runs
                      (id, agent_id, owner_id, status, initial_message, source,
-                      hub_session_id, hub_turn_id)
-                 VALUES ($1, $2, $3, 'running', 'hello', 'console', $4, $5)",
+                      hub_session_id, hub_turn_id, session_ownership_generation)
+                 VALUES ($1, $2, $3, 'running', 'hello', 'console', $4, $5, $6)",
             )
             .bind(run_id)
             .bind(agent_id)
             .bind(owner.id)
             .bind(session_id)
             .bind(turn_id)
+            .bind(1_i64)
             .execute(&pool)
             .await
             .unwrap();
@@ -29284,6 +30051,7 @@ mod tests {
                             "client_instance_id": Uuid::new_v4(),
                             "tenant_id": "nonempty-grant-tenant",
                             "external_user_id": "nonempty-grant-user",
+                            "email": "nonempty-grant-user@example.com",
                             "client_tools": test_client_tool_definitions(&["blocked_tool"])
                         }))
                         .unwrap(),
@@ -29344,7 +30112,7 @@ mod tests {
                 .fetch_one(&timed_out.app.state.pool)
                 .await
                 .unwrap(),
-            "cancelled"
+            "failed"
         );
         assert_eq!(
             sqlx::query_scalar::<_, String>(
@@ -31719,6 +32487,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        attach_test_model_connection(&pool, agent_id, owner.id, "routing-agent-model").await;
         let session_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO hub_sessions
@@ -31924,6 +32693,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        attach_test_model_connection(&pool, agent_id, owner.id, "waiting-tool-agent-model").await;
         let session_id = Uuid::new_v4();
         let turn_id = Uuid::new_v4();
         let run_id = Uuid::new_v4();
@@ -32126,6 +32896,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        attach_test_model_connection(&pool, agent_id, owner.id, "hub-session-agent-model").await;
         let app = build_router(test_state_with_browser_session_auth(pool.clone()));
 
         let first_request = axum::http::Request::builder()
@@ -32505,6 +33276,20 @@ mod tests {
             .await
             .unwrap();
         }
+        attach_test_model_connection(
+            &pool,
+            first_agent,
+            agent_owner.id,
+            "integration-origin-first-model",
+        )
+        .await;
+        attach_test_model_connection(
+            &pool,
+            second_agent,
+            agent_owner.id,
+            "integration-origin-second-model",
+        )
+        .await;
         let first_app = Uuid::new_v4();
         let second_app = Uuid::new_v4();
         let first_platform = Uuid::new_v4();
@@ -32616,7 +33401,7 @@ mod tests {
                 .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(format!(
-                    r#"{{"agent_id":"{agent_id}","external_user_id":"{external_user}","tenant_id":"{tenant}","tools":[],"metadata":{{}}}}"#
+                    r#"{{"agent_id":"{agent_id}","external_user_id":"{external_user}","tenant_id":"{tenant}","email":"{external_user}-{tenant}@example.com","tools":[],"metadata":{{}}}}"#
                 )))
                 .unwrap()
         };
@@ -32785,7 +33570,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             app.clone().oneshot(cross_origin).await.unwrap().status(),
-            StatusCode::NOT_FOUND
+            StatusCode::FORBIDDEN
         );
 
         let message_request = |content: &'static str| {
@@ -32837,7 +33622,7 @@ mod tests {
                 .await
                 .unwrap()
                 .status(),
-            StatusCode::NOT_FOUND
+            StatusCode::CONFLICT
         );
 
         let duplicate = app
@@ -32871,8 +33656,12 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].id, accepted_message.id);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0].content.as_deref(),
+            Some("same app can continue")
+        );
+        assert_eq!(messages[1].id, accepted_message.id);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -34440,7 +35229,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+        assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
 
         let first = app
             .clone()
@@ -35866,6 +36655,7 @@ mod tests {
                 model_subject_user_id: None,
                 model_source_integration_app_id: None,
                 external_user_context: None,
+                attachment_ids: Vec::new(),
             },
         )
         .await
@@ -37303,8 +38093,20 @@ mod tests {
             }),
         )
         .await
-        .unwrap_err();
-        assert_eq!(stale.status, StatusCode::CONFLICT);
+        .unwrap()
+        .0;
+        assert_eq!(stale.runtime_status, "draining");
+        assert_eq!(
+            stale.owned_sessions,
+            vec![RuntimeOwnedSessionSnapshotDto {
+                session_id: fixture.hub_session_id,
+                ownership_generation: 1,
+                lifecycle_status: "online".into(),
+                native_session_id: Some("thread-current".into()),
+                active_run_id: Some(fixture.run_id),
+            }]
+        );
+        assert!(stale.session_commands.is_empty());
         assert_eq!(
             sqlx::query_scalar::<_, String>("SELECT status FROM runtimes WHERE id = $1")
                 .bind(fixture.runtime_id)
@@ -40711,6 +41513,7 @@ mod tests {
                 model_subject_user_id: Some(owner_id),
                 model_source_integration_app_id: None,
                 external_user_context: None,
+                attachment_ids: Vec::new(),
             },
         )
         .await
@@ -44320,13 +45123,26 @@ mod tests {
             .fetch_one(&fixture.state.pool)
             .await
             .unwrap(),
-            (Some(fixture.runtime_id), 1)
+            (None, 2)
         );
         assert_eq!(
             runtime_completion_run_state(&fixture.state.pool, fixture.run_id)
                 .await
                 .0,
-            "running"
+            "failed"
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (i64, i64, i64)>(
+                "SELECT ownership_generation, history_checkpoint, bundle_generation
+                 FROM runtime_session_salvage_obligations
+                 WHERE runtime_id = $1 AND session_id = $2",
+            )
+            .bind(fixture.runtime_id)
+            .bind(fixture.hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            (1, 0, 1)
         );
 
         let recovered = runtime_heartbeat(
@@ -44339,6 +45155,12 @@ mod tests {
         .0;
         assert_eq!(recovered.runtime_status, "online");
         assert!(recovered.session_commands.is_empty());
+        assert!(recovered.owned_sessions.is_empty());
+        assert_eq!(recovered.salvage_sessions.len(), 1);
+        assert_eq!(
+            recovered.salvage_sessions[0].session_id,
+            fixture.hub_session_id
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT ownership_generation FROM hub_sessions WHERE id = $1"
@@ -44347,7 +45169,7 @@ mod tests {
             .fetch_one(&fixture.state.pool)
             .await
             .unwrap(),
-            1
+            2
         );
 
         sqlx::query(
@@ -47542,6 +48364,7 @@ mod tests {
             session_headers(&session_token),
             Path(session_id),
             Json(CreateHubSessionMessageRequest {
+                attachment_ids: Vec::new(),
                 content: "must not continue".into(),
                 payload: json!({}),
                 delivery_mode: None,
@@ -47895,26 +48718,28 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO integration_tool_requests
-                 (id, session_id, run_id, tool_name, arguments, status,
+                 (id, session_id, hub_session_id, run_id, tool_name, arguments, status,
                   result_payload, expires_at, responded_at)
-             VALUES ($1, $2, $3, 'lookup', '{\"key\":\"kept\"}'::jsonb,
+             VALUES ($1, $2, $3, $4, 'lookup', '{\"key\":\"kept\"}'::jsonb,
                      'completed', '{\"value\":\"kept\"}'::jsonb,
                      now() + interval '5 minutes', now())",
         )
         .bind(completed_tool_id)
         .bind(fixture.session_id)
+        .bind(fixture.hub_session_id)
         .bind(completed_run_id)
         .execute(&fixture.state.pool)
         .await
         .unwrap();
         sqlx::query(
             "INSERT INTO integration_tool_requests
-                 (id, session_id, run_id, tool_name, arguments, status, expires_at)
-             VALUES ($1, $2, $3, 'lookup', '{}'::jsonb, 'pending',
+                 (id, session_id, hub_session_id, run_id, tool_name, arguments, status, expires_at)
+             VALUES ($1, $2, $3, $4, 'lookup', '{}'::jsonb, 'pending',
                      now() + interval '5 minutes')",
         )
         .bind(fixture.tool_request_id)
         .bind(fixture.session_id)
+        .bind(fixture.hub_session_id)
         .bind(fixture.run_id)
         .execute(&fixture.state.pool)
         .await
@@ -47988,7 +48813,7 @@ mod tests {
             .fetch_one(&fixture.state.pool)
             .await
             .unwrap(),
-            "failed"
+            "cancelled"
         );
         assert_eq!(
             sqlx::query_scalar::<_, String>(
@@ -48405,7 +49230,7 @@ mod tests {
         let append_wait_observed = wait_for_application_lock(
             &fixture.state.pool,
             &application_name,
-            "SELECT r.integration_session_id, r.status",
+            "SELECT r.integration_session_id, r.hub_session_id",
         )
         .await;
         let visible_before_ownership_commit =
@@ -48800,6 +49625,7 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        attach_test_model_connection(&pool, agent_id, owner_id, "automation-history-model").await;
         let history_index: String = sqlx::query_scalar(
             "SELECT indexdef FROM pg_indexes
              WHERE schemaname = current_schema() AND indexname = 'runs_automation_created_idx'",
@@ -49148,7 +49974,7 @@ mod tests {
             wait_for_application_lock(
                 &fixture.pool,
                 &archive_application,
-                "SELECT owner_id, deleted_at",
+                "SELECT agents.owner_id, agents.deleted_at",
             )
             .await
         );
@@ -49227,7 +50053,7 @@ mod tests {
         let archive_wait_observed = wait_for_application_lock(
             &fixture.pool,
             &archive_application,
-            "SELECT owner_id, deleted_at",
+            "SELECT agents.owner_id, agents.deleted_at",
         )
         .await;
 
@@ -50492,15 +51318,15 @@ mod tests {
             "INSERT INTO model_connections
                  (id, scope, name, base_url, api_type, allowed_model_ids,
                   api_key_ciphertext, api_key_nonce, created_by)
-             VALUES ($1, 'global', 'Integration Runtime Model',
-                     'https://models.example.test', 'openai_responses',
-                     $2, $3, $4, $5)",
+             VALUES ($1, 'global', $6, 'https://models.example.test',
+                     'openai_responses', $2, $3, $4, $5)",
         )
         .bind(model_connection_id)
         .bind(vec![model_id.clone()])
         .bind(vec![1_u8; 17])
         .bind(vec![2_u8; 12])
         .bind(owner_id)
+        .bind(format!("Integration Runtime Model {unique}"))
         .execute(&pool)
         .await
         .unwrap();
@@ -50911,6 +51737,7 @@ mod tests {
                 State(state.clone()),
                 session_headers(&member_token),
                 Json(CreateModelConnectionRequest {
+                    vision_model_id: None,
                     scope: ModelConnectionScope::Personal,
                     name: format!("{api_type:?} Agent Connection"),
                     base_url: format!("http://127.0.0.1:1/{}", Uuid::new_v4()),
@@ -51041,6 +51868,7 @@ mod tests {
             Path(default_connection.id),
             Query(UpdateModelConnectionQuery::default()),
             Json(UpdateModelConnectionRequest {
+                vision_model_id: None,
                 name: "Agent Default Renamed".into(),
                 base_url: default_connection.base_url.clone(),
                 api_type: default_connection.api_type,
@@ -51216,6 +52044,7 @@ mod tests {
             State(state.clone()),
             member_headers.clone(),
             Json(CreateModelConnectionRequest {
+                vision_model_id: None,
                 scope: ModelConnectionScope::Personal,
                 name: "Local Responses".into(),
                 base_url: "http://169.254.169.254/latest".into(),
@@ -51260,6 +52089,7 @@ mod tests {
             Path(personal.id),
             Query(UpdateModelConnectionQuery::default()),
             Json(UpdateModelConnectionRequest {
+                vision_model_id: None,
                 name: "Local Responses Updated".into(),
                 base_url: "https://models.internal.example/business".into(),
                 api_type: ModelUpstreamProtocol::AnthropicMessages,
@@ -51282,6 +52112,7 @@ mod tests {
             Path(personal.id),
             Query(UpdateModelConnectionQuery::default()),
             Json(UpdateModelConnectionRequest {
+                vision_model_id: None,
                 name: "Local Anthropic Updated".into(),
                 base_url: updated.base_url.clone(),
                 api_type: updated.api_type,
@@ -51309,6 +52140,7 @@ mod tests {
             Path(personal.id),
             Query(UpdateModelConnectionQuery::default()),
             Json(UpdateModelConnectionRequest {
+                vision_model_id: None,
                 name: preserved.name.clone(),
                 base_url: preserved.base_url.clone(),
                 api_type: preserved.api_type,
@@ -51339,6 +52171,7 @@ mod tests {
             State(state.clone()),
             member_headers.clone(),
             Json(CreateModelConnectionRequest {
+                vision_model_id: None,
                 scope: ModelConnectionScope::Global,
                 name: "Forbidden Global".into(),
                 base_url: "https://example.com".into(),
@@ -51355,6 +52188,7 @@ mod tests {
             State(state.clone()),
             admin_headers.clone(),
             Json(CreateModelConnectionRequest {
+                vision_model_id: None,
                 scope: ModelConnectionScope::Global,
                 name: "Global Responses".into(),
                 base_url: "https://example.com/provider".into(),
@@ -51434,6 +52268,7 @@ mod tests {
                 Path(personal.id),
                 Query(UpdateModelConnectionQuery::default()),
                 Json(UpdateModelConnectionRequest {
+                    vision_model_id: None,
                     name: "Invalid URL".into(),
                     base_url: invalid_url.into(),
                     api_type: preserved.api_type,
@@ -51453,6 +52288,7 @@ mod tests {
                 Path(personal.id),
                 Query(UpdateModelConnectionQuery::default()),
                 Json(UpdateModelConnectionRequest {
+                    vision_model_id: None,
                     name: personal.name.clone(),
                     base_url: personal.base_url.clone(),
                     api_type: personal.api_type,
@@ -51477,6 +52313,7 @@ mod tests {
             State(state.clone()),
             headers.clone(),
             Json(CreateModelConnectionRequest {
+                vision_model_id: None,
                 scope: ModelConnectionScope::Global,
                 name: "Force Update Global".into(),
                 base_url: "https://models.example.test".into(),
@@ -51538,6 +52375,7 @@ mod tests {
             Path(connection.id),
             Query(UpdateModelConnectionQuery::default()),
             Json(UpdateModelConnectionRequest {
+                vision_model_id: None,
                 name: connection.name.clone(),
                 base_url: connection.base_url.clone(),
                 api_type: connection.api_type,
@@ -51555,6 +52393,7 @@ mod tests {
             Path(connection.id),
             Query(UpdateModelConnectionQuery { force: true }),
             Json(UpdateModelConnectionRequest {
+                vision_model_id: None,
                 name: connection.name.clone(),
                 base_url: connection.base_url.clone(),
                 api_type: connection.api_type,
@@ -51592,6 +52431,7 @@ mod tests {
             Path(connection.id),
             Query(UpdateModelConnectionQuery::default()),
             Json(UpdateModelConnectionRequest {
+                vision_model_id: None,
                 name: connection.name.clone(),
                 base_url: connection.base_url.clone(),
                 api_type: ModelUpstreamProtocol::AnthropicMessages,
@@ -51609,6 +52449,7 @@ mod tests {
             Path(connection.id),
             Query(UpdateModelConnectionQuery { force: true }),
             Json(UpdateModelConnectionRequest {
+                vision_model_id: None,
                 name: connection.name,
                 base_url: connection.base_url,
                 api_type: ModelUpstreamProtocol::AnthropicMessages,
@@ -51644,6 +52485,7 @@ mod tests {
             State(state.clone()),
             admin_headers.clone(),
             Json(CreateModelConnectionRequest {
+                vision_model_id: None,
                 scope: ModelConnectionScope::Global,
                 name: "Referenced Global".into(),
                 base_url: "http://127.0.0.1:1".into(),
@@ -51858,6 +52700,7 @@ mod tests {
             State(state.clone()),
             member_headers.clone(),
             Json(CreateModelConnectionRequest {
+                vision_model_id: None,
                 scope: ModelConnectionScope::Personal,
                 name: "Test Success".into(),
                 base_url: format!("http://{address}/ok"),
@@ -51902,6 +52745,7 @@ mod tests {
             State(state.clone()),
             member_headers.clone(),
             Json(CreateModelConnectionRequest {
+                vision_model_id: None,
                 scope: ModelConnectionScope::Personal,
                 name: "Test Failure".into(),
                 base_url: format!("http://{address}/fail"),
@@ -51976,6 +52820,7 @@ mod tests {
             State(state.clone()),
             member_headers.clone(),
             Json(CreateModelConnectionRequest {
+                vision_model_id: None,
                 scope: ModelConnectionScope::Personal,
                 name: "Test Broken Body".into(),
                 base_url: format!("http://{address}/broken"),
@@ -52651,6 +53496,7 @@ mod tests {
                     model_subject_user_id: attribution.subject_user_id,
                     model_source_integration_app_id: attribution.source_integration_app_id,
                     external_user_context: None,
+                    attachment_ids: Vec::new(),
                 },
             )
             .await
@@ -52683,6 +53529,7 @@ mod tests {
             State(state.clone()),
             session_headers(token),
             Json(CreateModelConnectionRequest {
+                vision_model_id: None,
                 scope,
                 name: name.into(),
                 base_url: format!("http://127.0.0.1:1/{}", Uuid::new_v4()),
@@ -53206,7 +54053,7 @@ mod tests {
                      WHERE datname = current_database()
                        AND wait_event_type = 'Lock'
                        AND (
-                         (application_name = $1 AND query LIKE '%SELECT owner_id, deleted_at%')
+                         (application_name = $1 AND query LIKE '%SELECT agents.owner_id, agents.deleted_at%')
                          OR
                          (application_name = $2 AND query LIKE
                           '%SELECT id FROM agents WHERE id = $1 AND deleted_at IS NULL FOR UPDATE%')
@@ -53463,5 +54310,831 @@ mod tests {
             session_issuer: Arc::new(BrowserSessionIssuer),
             run_event_bus: Arc::new(run_event_bus::InMemoryRunEventBus::default()),
         }
+    }
+
+    struct AttachmentFixture {
+        state: Arc<AppState>,
+        owner_id: Uuid,
+        owner_token: String,
+        foreign_token: String,
+        agent_id: Uuid,
+        session_id: Uuid,
+    }
+
+    async fn attachment_fixture(pool: PgPool) -> AttachmentFixture {
+        let owner_id = Uuid::new_v4();
+        let foreign_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let model_connection_id = Uuid::new_v4();
+        let owner_token = format!("ahs_{}", Uuid::new_v4().simple());
+        let foreign_token = format!("ahs_{}", Uuid::new_v4().simple());
+        let unique = Uuid::new_v4().simple().to_string();
+        for (id, label) in [(owner_id, "owner"), (foreign_id, "foreign")] {
+            sqlx::query(
+                "INSERT INTO users (id, email, password, display_name, role)
+                 VALUES ($1, $2, 'unused', $3, 'member')",
+            )
+            .bind(id)
+            .bind(format!("attachment-{label}-{unique}@example.com"))
+            .bind(label)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for (token, user_id) in [(&owner_token, owner_id), (&foreign_token, foreign_id)] {
+            sqlx::query(
+                "INSERT INTO sessions (token_hash, user_id, expires_at)
+                 VALUES ($1, $2, now() + interval '1 hour')",
+            )
+            .bind(sha256_hex(token))
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let cipher = ModelSecretCipher::from_env_value(Some(
+            &base64::engine::general_purpose::STANDARD.encode([42_u8; 32]),
+        ))
+        .unwrap();
+        let encrypted = cipher.encrypt("attachment-test-secret").unwrap();
+        sqlx::query(
+            "INSERT INTO model_connections
+                 (id, scope, owner_id, name, base_url, api_type, allowed_model_ids,
+                  api_key_ciphertext, api_key_nonce, created_by)
+             VALUES ($1, 'personal', $2, 'Attachment Test Model',
+                     'http://models.example.test', 'openai_responses',
+                     ARRAY['attachment-model'], $3, $4, $2)",
+        )
+        .bind(model_connection_id)
+        .bind(owner_id)
+        .bind(encrypted.ciphertext)
+        .bind(encrypted.nonce)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO agents
+                 (id, owner_id, name, instructions, visibility, model_policy,
+                  model_connection_id, model_id, model_settings)
+             VALUES ($1, $2, 'Attachment Test Agent', 'test', 'private',
+                     '{\"provider\":\"hub-proxy\"}'::jsonb, $3, 'attachment-model',
+                     '{\"reasoning_effort\":\"default\",\"reasoning_summary\":\"default\",\"verbosity\":\"default\",\"context_window_tokens\":null,\"auto_compact_token_limit\":null,\"reasoning_summary_support\":\"auto\",\"service_tier\":null,\"provider_request_timeout_ms\":null,\"stream_max_retries\":null,\"stream_idle_timeout_ms\":null,\"request_settings\":{\"protocol\":\"openai_responses\"}}'::jsonb)",
+        )
+        .bind(agent_id)
+        .bind(owner_id)
+        .bind(model_connection_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO hub_sessions
+                 (id, owner_id, agent_id, origin_kind, lifecycle_status)
+             VALUES ($1, $2, $3, 'hub_native', 'waiting_for_runtime')",
+        )
+        .bind(session_id)
+        .bind(owner_id)
+        .bind(agent_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        AttachmentFixture {
+            state: Arc::new(test_state_with_browser_session_auth(pool)),
+            owner_id,
+            owner_token,
+            foreign_token,
+            agent_id,
+            session_id,
+        }
+    }
+
+    async fn attachment_multipart(
+        boundary: &str,
+        session_id: Option<Uuid>,
+        file_name: &str,
+        content_type: &str,
+        contents: &[u8],
+    ) -> Multipart {
+        use axum::extract::FromRequest;
+
+        let mut body = Vec::new();
+        if let Some(session_id) = session_id {
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            body.extend_from_slice(
+                format!(
+                    "Content-Disposition: form-data; name=\"session_id\"\r\n\r\n{session_id}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\n")
+                .as_bytes(),
+        );
+        body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+        body.extend_from_slice(contents);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let request = axum::http::Request::builder()
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        Multipart::from_request(request, &()).await.unwrap()
+    }
+
+    type AttachmentObjects = Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>;
+
+    async fn attachment_object_store() -> (
+        AttachmentObjects,
+        crate::session_bundle_store::S3BundleStore,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let objects = Arc::new(std::sync::Mutex::new(HashMap::<String, Vec<u8>>::new()));
+        let route_objects = Arc::clone(&objects);
+        let app = Router::new().route(
+            "/attachment-bucket/{*key}",
+            axum::routing::any(move |method: Method, Path(key): Path<String>, body: Body| {
+                let route_objects = Arc::clone(&route_objects);
+                async move {
+                    match method {
+                        Method::PUT => {
+                            let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                            route_objects.lock().unwrap().insert(key, bytes.to_vec());
+                            StatusCode::OK.into_response()
+                        }
+                        Method::GET => {
+                            let objects = route_objects.lock().unwrap();
+                            match objects.get(&key) {
+                                Some(bytes) => {
+                                    let mut response = Response::new(Body::from(bytes.clone()));
+                                    response.headers_mut().insert(
+                                        header::CONTENT_TYPE,
+                                        HeaderValue::from_static("application/octet-stream"),
+                                    );
+                                    response
+                                }
+                                None => StatusCode::NOT_FOUND.into_response(),
+                            }
+                        }
+                        Method::DELETE => {
+                            route_objects.lock().unwrap().remove(&key);
+                            StatusCode::NO_CONTENT.into_response()
+                        }
+                        _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let store = crate::session_bundle_store::S3BundleStore::new(
+            crate::session_bundle_store::S3BundleStoreConfig {
+                endpoint: format!("http://{address}").parse().unwrap(),
+                bucket: "attachment-bucket".into(),
+                region: "us-test-1".into(),
+                access_key_id: "test-access".into(),
+                secret_access_key: "test-secret".into(),
+                session_token: None,
+                server_side_encryption: None,
+                kms_key_id: None,
+                allow_http: true,
+            },
+        )
+        .unwrap();
+        (objects, store, server)
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn attachment_upload_and_download_enforce_ownership_and_content_type(pool: PgPool) {
+        let fixture = attachment_fixture(pool).await;
+        let (objects, store, server) = attachment_object_store().await;
+        let mut state = (*fixture.state).clone();
+        state.session_bundle_store = Some(Arc::new(store));
+        let state = Arc::new(state);
+
+        let uploaded = upload_attachment(
+            State(state.clone()),
+            session_headers(&fixture.owner_token),
+            Query(AttachmentUploadQuery::default()),
+            attachment_multipart(
+                "attachment-upload-test",
+                Some(fixture.session_id),
+                "report.pdf",
+                "application/pdf",
+                b"pdf-bytes",
+            )
+            .await,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(uploaded.name, "report.pdf");
+        assert_eq!(uploaded.content_type, "application/pdf");
+        assert_eq!(uploaded.size_bytes, 9);
+        assert_eq!(uploaded.session_id, fixture.session_id);
+        let row = sqlx::query_as::<_, (Option<Uuid>, Option<Uuid>, String, String)>(
+            "SELECT message_id, run_id, object_key, checksum_sha256
+             FROM hub_session_attachments WHERE id = $1",
+        )
+        .bind(uploaded.id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, None);
+        assert_eq!(row.1, None);
+        assert!(row
+            .2
+            .starts_with(&format!("attachments/{}/", fixture.session_id)));
+        assert_eq!(row.3, format!("{:x}", Sha256::digest(b"pdf-bytes")));
+        let object_key = row.2;
+        assert_eq!(
+            objects.lock().unwrap().get(&object_key).unwrap(),
+            b"pdf-bytes"
+        );
+
+        let response = download_attachment(
+            State(state.clone()),
+            session_headers(&fixture.owner_token),
+            Path(uploaded.id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/pdf"
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_DISPOSITION).unwrap(),
+            "attachment; filename*=UTF-8''report.pdf"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body, Bytes::from_static(b"pdf-bytes"));
+
+        let foreign_error = download_attachment(
+            State(state.clone()),
+            session_headers(&fixture.foreign_token),
+            Path(uploaded.id),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(foreign_error.status, StatusCode::NOT_FOUND);
+
+        let image = upload_attachment(
+            State(state.clone()),
+            session_headers(&fixture.owner_token),
+            Query(AttachmentUploadQuery {
+                session_id: Some(fixture.session_id),
+            }),
+            attachment_multipart("image-upload", None, "photo.png", "image/png", b"png-bytes")
+                .await,
+        )
+        .await
+        .unwrap()
+        .0;
+        let image_response = download_attachment(
+            State(state.clone()),
+            session_headers(&fixture.owner_token),
+            Path(image.id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            image_response
+                .headers()
+                .get(header::CONTENT_DISPOSITION)
+                .unwrap(),
+            "inline"
+        );
+        server.abort();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn attachment_upload_enforces_file_and_session_limits_and_rejects_foreign_owner(
+        pool: PgPool,
+    ) {
+        let fixture = attachment_fixture(pool).await;
+        let (_, store, server) = attachment_object_store().await;
+        let mut state = (*fixture.state).clone();
+        state.session_bundle_store = Some(Arc::new(store));
+        let state = Arc::new(state);
+
+        let app = build_router((*state).clone());
+        let huge = vec![0_u8; MAX_ATTACHMENT_UPLOAD_BYTES as usize + 1];
+        let mut huge_body = Vec::new();
+        huge_body.extend_from_slice(b"--huge-upload\r\n");
+        huge_body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"huge.bin\"\r\n",
+        );
+        huge_body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
+        huge_body.extend_from_slice(&huge);
+        huge_body.extend_from_slice(b"\r\n--huge-upload--\r\n");
+        let huge_request = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri(format!(
+                "/api/attachments?session_id={}",
+                fixture.session_id
+            ))
+            .header(
+                header::COOKIE,
+                format!("agent_hub_session={}", fixture.owner_token),
+            )
+            .header(
+                header::CONTENT_TYPE,
+                "multipart/form-data; boundary=huge-upload",
+            )
+            .body(Body::from(huge_body))
+            .unwrap();
+        let huge_response = app.oneshot(huge_request).await.unwrap();
+        assert_eq!(huge_response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        sqlx::query(
+            "INSERT INTO hub_session_attachments
+                 (id, session_id, owner_id, name, content_type, size_bytes,
+                  object_key, checksum_sha256)
+             VALUES ($1, $2, $3, 'seeded', 'application/octet-stream', $4,
+                     'attachments/seeded', $5)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(fixture.session_id)
+        .bind(fixture.owner_id)
+        .bind(MAX_ATTACHMENT_BYTES_PER_SESSION)
+        .bind("a".repeat(64))
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let over_total = upload_attachment(
+            State(state.clone()),
+            session_headers(&fixture.owner_token),
+            Query(AttachmentUploadQuery {
+                session_id: Some(fixture.session_id),
+            }),
+            attachment_multipart(
+                "over-total",
+                None,
+                "one.bin",
+                "application/octet-stream",
+                b"1",
+            )
+            .await,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(over_total.status, StatusCode::BAD_REQUEST);
+        assert!(over_total.message.contains("storage limit"));
+
+        let foreign = upload_attachment(
+            State(state.clone()),
+            session_headers(&fixture.foreign_token),
+            Query(AttachmentUploadQuery {
+                session_id: Some(fixture.session_id),
+            }),
+            attachment_multipart(
+                "foreign-upload",
+                None,
+                "foreign.bin",
+                "application/octet-stream",
+                b"foreign",
+            )
+            .await,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(foreign.status, StatusCode::NOT_FOUND);
+        server.abort();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn attachment_message_binding_returns_attachments_and_rejects_rebinding(pool: PgPool) {
+        let fixture = attachment_fixture(pool).await;
+        let (_, store, server) = attachment_object_store().await;
+        let mut state = (*fixture.state).clone();
+        state.session_bundle_store = Some(Arc::new(store));
+        let state = Arc::new(state);
+
+        let attachment = upload_attachment(
+            State(state.clone()),
+            session_headers(&fixture.owner_token),
+            Query(AttachmentUploadQuery {
+                session_id: Some(fixture.session_id),
+            }),
+            attachment_multipart(
+                "binding-upload",
+                None,
+                "bound.txt",
+                "text/plain",
+                b"bound-bytes",
+            )
+            .await,
+        )
+        .await
+        .unwrap()
+        .0;
+        let accepted = create_hub_session_message(
+            State(state.clone()),
+            session_headers(&fixture.owner_token),
+            Path(fixture.session_id),
+            Json(CreateHubSessionMessageRequest {
+                content: "message with attachment".into(),
+                payload: json!({}),
+                attachment_ids: vec![attachment.id],
+                delivery_mode: None,
+                client_message_key: None,
+                parent_run_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(accepted.message.attachments.len(), 1);
+        assert_eq!(accepted.message.attachments[0].id, attachment.id);
+        let bound: (Option<Uuid>, Option<Uuid>) =
+            sqlx::query_as("SELECT message_id, run_id FROM hub_session_attachments WHERE id = $1")
+                .bind(attachment.id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(bound.0, Some(accepted.message.id));
+        assert_eq!(bound.1, Some(accepted.run.as_ref().unwrap().id));
+
+        let listed = list_hub_session_messages(
+            State(state.clone()),
+            session_headers(&fixture.owner_token),
+            Path(fixture.session_id),
+            Query(SessionMessageListQuery::default()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(listed.iter().any(|message| {
+            message.id == accepted.message.id
+                && message
+                    .attachments
+                    .iter()
+                    .any(|item| item.id == attachment.id)
+        }));
+
+        let rebound = create_hub_session_message(
+            State(state.clone()),
+            session_headers(&fixture.owner_token),
+            Path(fixture.session_id),
+            Json(CreateHubSessionMessageRequest {
+                content: "second message".into(),
+                payload: json!({}),
+                attachment_ids: vec![attachment.id],
+                delivery_mode: None,
+                client_message_key: None,
+                parent_run_id: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(rebound.status, StatusCode::BAD_REQUEST);
+        server.abort();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn session_deletion_removes_attachment_rows_and_objects(pool: PgPool) {
+        let fixture = attachment_fixture(pool).await;
+        let (objects, store, server) = attachment_object_store().await;
+        let mut state = (*fixture.state).clone();
+        state.session_bundle_store = Some(Arc::new(store));
+        let state = Arc::new(state);
+        sqlx::query("UPDATE hub_sessions SET lifecycle_status = 'offline' WHERE id = $1")
+            .bind(fixture.session_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let attachment = upload_attachment(
+            State(state.clone()),
+            session_headers(&fixture.owner_token),
+            Query(AttachmentUploadQuery {
+                session_id: Some(fixture.session_id),
+            }),
+            attachment_multipart(
+                "delete-upload",
+                None,
+                "delete.bin",
+                "application/octet-stream",
+                b"delete-bytes",
+            )
+            .await,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(!objects.lock().unwrap().is_empty());
+
+        let deleted = delete_hub_session(
+            State(state.clone()),
+            session_headers(&fixture.owner_token),
+            Path(fixture.session_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(deleted, StatusCode::NO_CONTENT);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM hub_session_attachments WHERE id = $1"
+            )
+            .bind(attachment.id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert!(objects.lock().unwrap().is_empty());
+        server.abort();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn widget_attachment_upload_and_download_are_scoped_to_the_embed_token(pool: PgPool) {
+        let fixture = attachment_fixture(pool).await;
+        let (_, store, server) = attachment_object_store().await;
+        let mut state = (*fixture.state).clone();
+        state.session_bundle_store = Some(Arc::new(store));
+        let state = Arc::new(state);
+
+        let other_hub_session_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO hub_sessions
+                 (id, owner_id, agent_id, origin_kind, lifecycle_status)
+             VALUES ($1, $2, $3, 'hub_native', 'waiting_for_runtime')",
+        )
+        .bind(other_hub_session_id)
+        .bind(fixture.owner_id)
+        .bind(fixture.agent_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let widget_token = format!("ahe_{}", Uuid::new_v4().simple());
+        let other_widget_token = format!("ahe_{}", Uuid::new_v4().simple());
+        for (embed_id, token, hub_session_id) in [
+            (Uuid::new_v4(), &widget_token, fixture.session_id),
+            (Uuid::new_v4(), &other_widget_token, other_hub_session_id),
+        ] {
+            sqlx::query(
+                "INSERT INTO embed_sessions
+                     (id, token_hash, agent_id, owner_id, expires_at, hub_session_id)
+                 VALUES ($1, $2, $3, $4, now() + interval '1 hour', $5)",
+            )
+            .bind(embed_id)
+            .bind(sha256_hex(token))
+            .bind(fixture.agent_id)
+            .bind(fixture.owner_id)
+            .bind(hub_session_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        let mut widget_headers = HeaderMap::new();
+        widget_headers.insert(
+            HeaderName::from_static("x-agent-hub-embed-token"),
+            HeaderValue::from_str(&widget_token).unwrap(),
+        );
+        let uploaded = upload_widget_attachment(
+            State(state.clone()),
+            widget_headers.clone(),
+            Query(AttachmentUploadQuery {
+                session_id: Some(fixture.session_id),
+            }),
+            attachment_multipart(
+                "widget-upload",
+                None,
+                "widget.bin",
+                "application/octet-stream",
+                b"widget-bytes",
+            )
+            .await,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(uploaded.session_id, fixture.session_id);
+
+        let downloaded =
+            download_widget_attachment(State(state.clone()), widget_headers, Path(uploaded.id))
+                .await
+                .unwrap();
+        assert_eq!(downloaded.status(), StatusCode::OK);
+
+        let mut other_headers = HeaderMap::new();
+        other_headers.insert(
+            HeaderName::from_static("x-agent-hub-embed-token"),
+            HeaderValue::from_str(&other_widget_token).unwrap(),
+        );
+        let isolated = download_widget_attachment(
+            State(state.clone()),
+            other_headers.clone(),
+            Path(uploaded.id),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(isolated.status, StatusCode::NOT_FOUND);
+
+        let other_uploaded = upload_widget_attachment(
+            State(state.clone()),
+            other_headers,
+            Query(AttachmentUploadQuery {
+                session_id: Some(other_hub_session_id),
+            }),
+            attachment_multipart(
+                "widget-other-upload",
+                None,
+                "other.bin",
+                "application/octet-stream",
+                b"other-bytes",
+            )
+            .await,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(other_uploaded.session_id, other_hub_session_id);
+        server.abort();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn model_connection_vision_model_id_is_validated_and_persisted(pool: PgPool) {
+        let owner_id = Uuid::new_v4();
+        let token = format!("ahs_{}", Uuid::new_v4().simple());
+        let unique = Uuid::new_v4().simple().to_string();
+        sqlx::query(
+            "INSERT INTO users (id, email, password, display_name, role)
+             VALUES ($1, $2, 'unused', 'Vision Owner', 'member')",
+        )
+        .bind(owner_id)
+        .bind(format!("vision-{unique}@example.com"))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO sessions (token_hash, user_id, expires_at)
+             VALUES ($1, $2, now() + interval '1 hour')",
+        )
+        .bind(sha256_hex(&token))
+        .bind(owner_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = Arc::new(test_state_with_browser_session_auth(pool));
+
+        let created = create_model_connection(
+            State(state.clone()),
+            session_headers(&token),
+            Json(CreateModelConnectionRequest {
+                scope: ModelConnectionScope::Personal,
+                name: "Vision Connection".into(),
+                base_url: "http://models.example.test".into(),
+                api_type: ModelUpstreamProtocol::OpenaiResponses,
+                allowed_model_ids: vec!["main-model".into(), "vision-model".into()],
+                vision_model_id: Some("vision-model".into()),
+                api_key: "secret".into(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(created.vision_model_id.as_deref(), Some("vision-model"));
+
+        let invalid = create_model_connection(
+            State(state.clone()),
+            session_headers(&token),
+            Json(CreateModelConnectionRequest {
+                scope: ModelConnectionScope::Personal,
+                name: "Invalid Vision Connection".into(),
+                base_url: "http://models.example.test".into(),
+                api_type: ModelUpstreamProtocol::OpenaiResponses,
+                allowed_model_ids: vec!["main-model".into()],
+                vision_model_id: Some("other-model".into()),
+                api_key: "secret".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+
+        let updated = update_model_connection(
+            State(state.clone()),
+            session_headers(&token),
+            Path(created.id),
+            Query(UpdateModelConnectionQuery::default()),
+            Json(UpdateModelConnectionRequest {
+                name: created.name.clone(),
+                base_url: created.base_url.clone(),
+                api_type: created.api_type,
+                allowed_model_ids: created.allowed_model_ids.clone(),
+                vision_model_id: Some("main-model".into()),
+                api_key: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(updated.vision_model_id.as_deref(), Some("main-model"));
+
+        let cleared = update_model_connection(
+            State(state),
+            session_headers(&token),
+            Path(created.id),
+            Query(UpdateModelConnectionQuery::default()),
+            Json(UpdateModelConnectionRequest {
+                name: created.name,
+                base_url: created.base_url,
+                api_type: created.api_type,
+                allowed_model_ids: created.allowed_model_ids,
+                vision_model_id: Some(String::new()),
+                api_key: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(cleared.vision_model_id, None);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn model_proxy_rewrites_vision_requests_to_the_vision_model(pool: PgPool) {
+        let captured = Arc::new(std::sync::Mutex::new(None::<TestModelGatewayEnvelope>));
+        let captured_route = Arc::clone(&captured);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/internal/v1/responses",
+                post(move |Json(envelope): Json<TestModelGatewayEnvelope>| {
+                    let captured_route = Arc::clone(&captured_route);
+                    async move {
+                        *captured_route.lock().unwrap() = Some(envelope);
+                        Json(json!({ "status": "completed" }))
+                    }
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        sqlx::query(
+            "UPDATE model_connections
+             SET allowed_model_ids = ARRAY['runtime-claim-model', 'vision-claim-model'],
+                 vision_model_id = 'vision-claim-model'
+             WHERE id = $1",
+        )
+        .bind(fixture.model_connection_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        let binding_id = model_binding_id(&claim, "main");
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET lifecycle_status = 'online', active_turn_id = $1
+             WHERE id = $2",
+        )
+        .bind(fixture.turn_id)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let mut state = (*fixture.state).clone();
+        state.model_gateway_url = format!("http://{address}");
+        let app = build_router(state);
+
+        let request = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri("/api/runtime/model-proxy/v1/responses")
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", claim.model_proxy_token),
+            )
+            .header("x-agent-hub-run-id", fixture.run_id.to_string())
+            .header(MODEL_PROXY_BINDING_ID_HEADER, binding_id.to_string())
+            .header(VISION_PROXY_HEADER, "1")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                br#"{"model":"runtime-claim-model","input":[],"stream":false}"#.as_slice(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let envelope = captured.lock().unwrap().take().expect("gateway captured");
+        let forwarded: Value = serde_json::from_slice(&decode_gateway_body(&envelope)).unwrap();
+        assert_eq!(forwarded["model"], "vision-claim-model");
+        assert_eq!(forwarded["input"], json!([]));
+        assert_eq!(forwarded["stream"], json!(false));
+        server.abort();
     }
 }

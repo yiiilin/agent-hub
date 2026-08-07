@@ -2,9 +2,14 @@ use std::{
     collections::{BTreeMap, HashSet, VecDeque},
     env, fmt, fs,
     io::{BufRead, BufReader, Read, Write},
+    net::{Shutdown, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{mpsc, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
+    thread,
     time::{Duration, Instant},
 };
 #[cfg(target_os = "linux")]
@@ -18,8 +23,10 @@ use std::{
 
 use agent_hub_shared::{AgentDto, AppendRunEventRequest, ClaimRunResponse, IntegrationContextDto};
 use anyhow::Context;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc as tokio_mpsc;
+use tracing::warn;
 
 use super::{
     model_binding, pi_model_provider_name, pi_thinking_level, send_engine_event_with_backpressure,
@@ -47,6 +54,7 @@ const PI_PROCESS_PATH: &str = "/usr/bin:/bin";
 const PI_INTEGRATION_EXTENSION_FILE: &str = "agent-hub-integration-tools.mjs";
 const PI_INTEGRATION_TOOLS_FILE: &str = "agent-hub-integration-tools.json";
 const PI_SKILL_EXEC_EXTENSION_FILE: &str = "agent-hub-skill-exec.mjs";
+const PI_VISION_EXTENSION_FILE: &str = "agent-hub-vision.mjs";
 const PI_INTEGRATION_CONTEXT_LABEL: &str = "Agent Hub Integration context (JSON):";
 const PI_CLIENT_TOOL_PREFIX: &str = "agent_hub_client_tool_";
 const PI_BUILTIN_TOOL_NAMES: &[&str] = &[
@@ -58,7 +66,14 @@ const PI_BUILTIN_TOOL_NAMES: &[&str] = &[
     "write",
     "bash",
     "skill_exec",
+    "vision_analyze",
 ];
+const MAX_VISION_IMAGE_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_VISION_REQUEST_BYTES: usize = 128 * 1024;
+const VISION_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const VISION_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_VISION_PROMPT: &str = "请描述这张图片的内容";
+const VISION_PROXY_API_KEY_PLACEHOLDER: &str = "agent-hub-local-proxy";
 
 #[derive(Debug)]
 pub(super) struct PiRpcTimeout {
@@ -110,6 +125,87 @@ export default function registerAgentHubIntegrationTools(pi) {
 }
 "#;
 
+const PI_VISION_EXTENSION_SOURCE: &str = r#"
+import { createConnection } from "node:net";
+
+const portValue = process.env.AGENT_HUB_VISION_PORT;
+const token = process.env.AGENT_HUB_VISION_TOKEN;
+if (!portValue || !token) {
+  throw new Error("Agent Hub vision analysis broker is not configured");
+}
+
+function callBroker(params, signal) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let buffer = "";
+    const socket = createConnection({ host: "127.0.0.1", port: Number(portValue) });
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", onAbort);
+      socket.destroy();
+      callback(value);
+    };
+    const onAbort = () => finish(reject, new Error("Vision analysis aborted"));
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+    socket.setEncoding("utf8");
+    socket.on("connect", () => {
+      socket.write(`${JSON.stringify({ ...params, token })}\n`);
+    });
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      if (buffer.length > 2200000) {
+        finish(reject, new Error("Vision analysis response exceeded its limit"));
+        return;
+      }
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) return;
+      try {
+        finish(resolve, JSON.parse(buffer.slice(0, newline)));
+      } catch (error) {
+        finish(reject, error);
+      }
+    });
+    socket.on("error", (error) => finish(reject, error));
+    socket.on("close", () => {
+      if (!settled) finish(reject, new Error("Vision analysis broker disconnected"));
+    });
+  });
+}
+
+export default function registerAgentHubVisionAnalyze(pi) {
+  pi.registerTool({
+    name: "vision_analyze",
+    label: "Vision Analyze",
+    description: "Analyze an image in the workspace using the agent's vision model. Uploaded chat attachments are available under /workspace/attachments/<name>.",
+    promptSnippet: "vision_analyze(image_path, prompt?): describe or analyze the image at image_path.",
+    executionMode: "sequential",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      required: ["image_path"],
+      properties: {
+        image_path: { type: "string", description: "Path to the image inside the workspace, for example /workspace/attachments/photo.png" },
+        prompt: { type: "string", description: "Optional analysis prompt; defaults to describing the image" }
+      }
+    },
+    async execute(_toolCallId, params, signal) {
+      const response = await callBroker(params, signal);
+      if (!response.ok) throw new Error(response.error || "Vision analysis failed");
+      return {
+        content: [{ type: "text", text: response.text || "" }],
+        details: response,
+      };
+    },
+  });
+}
+
+"#;
+
 pub(super) fn pi_agent_directory(run_env: &RunEnv) -> PathBuf {
     run_env.engine_state_root.join(PI_AGENT_DIRECTORY)
 }
@@ -134,6 +230,10 @@ fn pi_skill_exec_extension_path(run_env: &RunEnv) -> PathBuf {
     pi_agent_directory(run_env).join(PI_SKILL_EXEC_EXTENSION_FILE)
 }
 
+fn pi_vision_extension_path(run_env: &RunEnv) -> PathBuf {
+    pi_agent_directory(run_env).join(PI_VISION_EXTENSION_FILE)
+}
+
 fn materialize_skill_exec_extension(run_env: &RunEnv, enabled: bool) -> anyhow::Result<()> {
     let extension_path = pi_skill_exec_extension_path(run_env);
     if !enabled {
@@ -142,6 +242,16 @@ fn materialize_skill_exec_extension(run_env: &RunEnv, enabled: bool) -> anyhow::
     prepare_control_directory(&pi_agent_directory(run_env), "Pi Agent directory")?;
     replace_private_file(&extension_path, SKILL_EXEC_EXTENSION_SOURCE.as_bytes())
         .context("write Skill execution Extension")
+}
+
+fn materialize_vision_extension(run_env: &RunEnv, enabled: bool) -> anyhow::Result<()> {
+    let extension_path = pi_vision_extension_path(run_env);
+    if !enabled {
+        return remove_file_if_present(&extension_path);
+    }
+    prepare_control_directory(&pi_agent_directory(run_env), "Pi Agent directory")?;
+    replace_private_file(&extension_path, PI_VISION_EXTENSION_SOURCE.as_bytes())
+        .context("write vision analysis Extension")
 }
 
 fn normalized_integration_tools(
@@ -1144,6 +1254,7 @@ pub(super) struct PersistentPiRpcProcess {
     stdout_reader: Option<std::thread::JoinHandle<()>>,
     stderr_reader: Option<std::thread::JoinHandle<Result<usize, std::io::Error>>>,
     skill_exec_broker: Option<SkillExecBroker>,
+    vision_broker: Option<VisionAnalyzeBroker>,
     cancellation: Arc<EngineCancellation>,
     timeout: Duration,
 }
@@ -1156,6 +1267,7 @@ impl PersistentPiRpcProcess {
         tools: &[String],
         timeout: Duration,
         cancellation: Arc<EngineCancellation>,
+        vision: Option<VisionAnalyzeConfig>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(!tools.is_empty(), "Pi tool allowlist must not be empty");
         let session_dir = run_env.engine_state_root.join(PI_SESSION_DIRECTORY);
@@ -1188,6 +1300,25 @@ impl PersistentPiRpcProcess {
             })
             .transpose()
             .context("start Skill execution broker")?;
+        let vision_enabled = tools.iter().any(|tool| tool == "vision_analyze");
+        let vision_broker = match (vision_enabled, vision) {
+            (true, Some(config)) => {
+                materialize_vision_extension(run_env, true)?;
+                Some(
+                    VisionAnalyzeBroker::start(run_env, config)
+                        .context("start vision analysis broker")?,
+                )
+            }
+            (true, None) => {
+                warn!("vision_analyze enabled without model proxy configuration; skipping");
+                materialize_vision_extension(run_env, false)?;
+                None
+            }
+            (false, _) => {
+                materialize_vision_extension(run_env, false)?;
+                None
+            }
+        };
         crate::protect_pi_agent_execution_sources(
             &agent_dir,
             &run_env.engine_state_root.join(crate::SKILL_EXEC_DIRECTORY),
@@ -1225,6 +1356,10 @@ impl PersistentPiRpcProcess {
         if skill_exec_extension.is_file() {
             command.arg("--extension").arg(&skill_exec_extension);
         }
+        let vision_extension = pi_vision_extension_path(run_env);
+        if vision_extension.is_file() {
+            command.arg("--extension").arg(&vision_extension);
+        }
         command
             .arg("--no-themes")
             .arg("--no-prompt-templates")
@@ -1247,6 +1382,11 @@ impl PersistentPiRpcProcess {
             command
                 .env("AGENT_HUB_SKILL_EXEC_PORT", broker.port().to_string())
                 .env("AGENT_HUB_SKILL_EXEC_TOKEN", broker.token());
+        }
+        if let Some(broker) = &vision_broker {
+            command
+                .env("AGENT_HUB_VISION_PORT", broker.port().to_string())
+                .env("AGENT_HUB_VISION_TOKEN", broker.token());
         }
         if let Some(saved_session) = &saved_session {
             command.arg("--session").arg(saved_session);
@@ -1311,6 +1451,7 @@ impl PersistentPiRpcProcess {
             stdout_reader: Some(stdout_reader),
             stderr_reader: Some(stderr_reader),
             skill_exec_broker,
+            vision_broker,
             cancellation,
             timeout,
         };
@@ -1581,6 +1722,9 @@ impl PersistentPiRpcProcess {
             Some(event_tx),
         )?;
         let binding = model_binding(&claim.execution_configuration, "main")?;
+        if let Some(broker) = &self.vision_broker {
+            broker.update_run(binding.id, binding.model_id.clone());
+        }
         let provider = pi_model_provider_name(binding.id);
         let request_id = self.send_request(json!({
             "type": "set_model",
@@ -1706,6 +1850,7 @@ impl PersistentPiRpcProcess {
             let _ = reader.join();
         }
         self.skill_exec_broker.take();
+        self.vision_broker.take();
     }
 }
 
@@ -1713,6 +1858,386 @@ impl Drop for PersistentPiRpcProcess {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct VisionAnalyzeConfig {
+    pub(super) model_proxy_base_url: String,
+    pub(super) model_binding_id: uuid::Uuid,
+    pub(super) model_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VisionAnalyzeRequest {
+    token: String,
+    image_path: String,
+    #[serde(default)]
+    prompt: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct VisionAnalyzeResponse {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    text: String,
+}
+
+struct VisionAnalyzeBrokerContext {
+    workdir: PathBuf,
+    token: String,
+    stop: Arc<AtomicBool>,
+    config: Arc<std::sync::Mutex<VisionAnalyzeConfig>>,
+}
+
+pub(super) struct VisionAnalyzeBroker {
+    port: u16,
+    token: String,
+    stop: Arc<AtomicBool>,
+    config: Arc<std::sync::Mutex<VisionAnalyzeConfig>>,
+    actor: Option<thread::JoinHandle<()>>,
+}
+
+impl VisionAnalyzeBroker {
+    fn start(run_env: &RunEnv, config: VisionAnalyzeConfig) -> anyhow::Result<Self> {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").context("bind vision analysis loopback listener")?;
+        let port = listener
+            .local_addr()
+            .context("read vision analysis listener address")?
+            .port();
+        listener
+            .set_nonblocking(true)
+            .context("configure vision analysis listener")?;
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = Arc::new(std::sync::Mutex::new(config));
+        let context = VisionAnalyzeBrokerContext {
+            workdir: run_env.workdir.clone(),
+            token: token.clone(),
+            stop: Arc::clone(&stop),
+            config: Arc::clone(&config),
+        };
+        let actor = thread::spawn(move || run_vision_broker(listener, &context));
+        Ok(Self {
+            port,
+            token,
+            stop,
+            config,
+            actor: Some(actor),
+        })
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+
+    fn token(&self) -> &str {
+        &self.token
+    }
+
+    fn update_run(&self, model_binding_id: uuid::Uuid, model_id: String) {
+        if let Ok(mut config) = self.config.lock() {
+            config.model_binding_id = model_binding_id;
+            config.model_id = model_id;
+        }
+    }
+
+    fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(actor) = self.actor.take() {
+            let _ = actor.join();
+        }
+    }
+}
+
+impl Drop for VisionAnalyzeBroker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn run_vision_broker(listener: TcpListener, context: &VisionAnalyzeBrokerContext) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            warn!(error = %error, "failed to build vision analysis runtime");
+            return;
+        }
+    };
+    while !context.stop.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((stream, _)) => handle_vision_connection(stream, context, &runtime),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn handle_vision_connection(
+    mut stream: TcpStream,
+    context: &VisionAnalyzeBrokerContext,
+    runtime: &tokio::runtime::Runtime,
+) {
+    let response = (|| -> anyhow::Result<VisionAnalyzeResponse> {
+        let request = read_vision_request(&mut stream, &context.stop)?;
+        anyhow::ensure!(
+            constant_time_eq(request.token.as_bytes(), context.token.as_bytes()),
+            "invalid vision analysis token"
+        );
+        let image_path = resolve_vision_image_path(&context.workdir, &request.image_path)?;
+        let metadata = fs::symlink_metadata(&image_path)
+            .with_context(|| format!("inspect image {}", image_path.display()))?;
+        anyhow::ensure!(metadata.is_file(), "image path is not a regular file");
+        anyhow::ensure!(
+            metadata.len() <= MAX_VISION_IMAGE_BYTES,
+            "图片过大，无法读取"
+        );
+        let bytes = fs::read(&image_path)
+            .with_context(|| format!("read image {}", image_path.display()))?;
+        let mime = vision_image_mime(&image_path);
+        let data_url = format!("data:{mime};base64,{}", base64_encode(&bytes));
+        let prompt = request
+            .prompt
+            .as_deref()
+            .filter(|prompt| !prompt.trim().is_empty())
+            .unwrap_or(DEFAULT_VISION_PROMPT);
+        let config = context
+            .config
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let body = build_vision_request_body(&config.model_id, prompt, &data_url);
+        let text = runtime.block_on(post_vision_request(&config, &body))?;
+        Ok(VisionAnalyzeResponse {
+            ok: true,
+            error: None,
+            text,
+        })
+    })()
+    .unwrap_or_else(|error| {
+        let message = error.to_string();
+        let message = if message == "图片过大，无法读取" {
+            message
+        } else {
+            format!("视觉分析失败：{message}")
+        };
+        VisionAnalyzeResponse {
+            ok: false,
+            error: Some(message),
+            text: String::new(),
+        }
+    });
+    if let Ok(encoded) = serde_json::to_vec(&response) {
+        let _ = stream.write_all(&encoded);
+        let _ = stream.write_all(b"\n");
+        let _ = stream.flush();
+    }
+    let _ = stream.shutdown(Shutdown::Both);
+}
+
+fn read_vision_request(
+    stream: &mut TcpStream,
+    stop: &AtomicBool,
+) -> anyhow::Result<VisionAnalyzeRequest> {
+    stream
+        .set_read_timeout(Some(VISION_REQUEST_READ_TIMEOUT))
+        .context("configure vision analysis request timeout")?;
+    let started = Instant::now();
+    let mut request = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        anyhow::ensure!(
+            !stop.load(Ordering::Acquire),
+            "vision analysis broker stopped"
+        );
+        anyhow::ensure!(
+            started.elapsed() <= VISION_REQUEST_READ_TIMEOUT,
+            "vision analysis request timed out"
+        );
+        match stream.read(&mut chunk) {
+            Ok(0) => anyhow::bail!("vision analysis request disconnected"),
+            Ok(read) => {
+                let bytes = &chunk[..read];
+                if let Some(newline) = bytes.iter().position(|byte| *byte == b"\n"[0]) {
+                    request.extend_from_slice(&bytes[..newline]);
+                    anyhow::ensure!(
+                        bytes[newline + 1..].iter().all(u8::is_ascii_whitespace),
+                        "vision analysis request contains trailing data"
+                    );
+                    break;
+                }
+                request.extend_from_slice(bytes);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(error).context("read vision analysis request"),
+        }
+        anyhow::ensure!(
+            request.len() <= MAX_VISION_REQUEST_BYTES,
+            "vision analysis request exceeded its limit"
+        );
+    }
+    anyhow::ensure!(
+        request.len() <= MAX_VISION_REQUEST_BYTES,
+        "vision analysis request exceeded its limit"
+    );
+    serde_json::from_slice(&request).context("parse vision analysis request")
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |acc, (left, right)| acc | (left ^ right))
+        == 0
+}
+
+fn resolve_vision_image_path(workdir: &Path, image_path: &str) -> anyhow::Result<PathBuf> {
+    anyhow::ensure!(
+        !image_path.trim().is_empty() && image_path.len() <= 4096,
+        "image path is invalid"
+    );
+    anyhow::ensure!(!image_path.as_bytes().contains(&0), "image path is invalid");
+    let relative = if let Some(rest) = image_path.strip_prefix("/workspace") {
+        rest.strip_prefix('/').unwrap_or("")
+    } else if image_path.starts_with('/') {
+        anyhow::bail!("image path must be inside the workspace");
+    } else {
+        image_path
+    };
+    let canonical_workdir = fs::canonicalize(workdir).context("resolve workspace directory")?;
+    let resolved = workdir.join(relative);
+    let canonical = fs::canonicalize(&resolved).context("resolve image path")?;
+    anyhow::ensure!(
+        canonical.starts_with(&canonical_workdir),
+        "image path escapes the workspace"
+    );
+    Ok(canonical)
+}
+
+fn vision_image_mime(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        Some("tiff") | Some("tif") => "image/tiff",
+        Some("svg") => "image/svg+xml",
+        _ => "image/png",
+    }
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0] as u32;
+        let second = chunk.get(1).copied().unwrap_or(0) as u32;
+        let third = chunk.get(2).copied().unwrap_or(0) as u32;
+        let combined = (first << 16) | (second << 8) | third;
+        encoded.push(ALPHABET[(combined >> 18) as usize & 63] as char);
+        encoded.push(ALPHABET[(combined >> 12) as usize & 63] as char);
+        encoded.push(if chunk.len() > 1 {
+            ALPHABET[(combined >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        encoded.push(if chunk.len() > 2 {
+            ALPHABET[combined as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    encoded
+}
+
+fn build_vision_request_body(model_id: &str, prompt: &str, image_data_url: &str) -> Value {
+    json!({
+        "model": model_id,
+        "input": [{
+            "role": "user",
+            "content": [
+                { "type": "input_text", "text": prompt },
+                { "type": "input_image", "image_url": image_data_url },
+            ],
+        }],
+        "max_output_tokens": 1024,
+    })
+}
+
+fn vision_response_text(value: &Value) -> anyhow::Result<String> {
+    if let Some(outputs) = value.get("output").and_then(Value::as_array) {
+        let text = outputs
+            .iter()
+            .filter(|output| output.get("type").and_then(Value::as_str) == Some("output_text"))
+            .filter_map(|output| output.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("");
+        if !text.trim().is_empty() {
+            return Ok(text);
+        }
+    }
+    if let Some(text) = value
+        .get("output_text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+    {
+        return Ok(text.to_owned());
+    }
+    anyhow::bail!("vision response contains no output text")
+}
+
+async fn post_vision_request(config: &VisionAnalyzeConfig, body: &Value) -> anyhow::Result<String> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(VISION_HTTP_TIMEOUT)
+        .build()
+        .context("build vision analysis HTTP client")?;
+    let response = client
+        .post(format!(
+            "{}/responses",
+            config.model_proxy_base_url.trim_end_matches('/')
+        ))
+        .bearer_auth(VISION_PROXY_API_KEY_PLACEHOLDER)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(
+            "x-agent-hub-model-binding-id",
+            config.model_binding_id.to_string(),
+        )
+        .header("x-agent-hub-vision", "1")
+        .json(body)
+        .send()
+        .await
+        .context("send vision analysis request through the local model proxy")?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .context("read vision analysis response")?;
+    anyhow::ensure!(
+        status.is_success(),
+        "model proxy returned HTTP {status}: {text}"
+    );
+    let value: Value = serde_json::from_str(&text).context("parse vision analysis response")?;
+    vision_response_text(&value)
 }
 
 fn apply_pi_secret_environment(command: &mut Command, run_env: &RunEnv) {
@@ -2324,6 +2849,9 @@ pub(super) fn pi_tool_allowlist_for_claim(claim: &ClaimRunResponse) -> anyhow::R
         });
     if skill_exec_enabled && !tools.iter().any(|tool| tool == "skill_exec") {
         tools.push("skill_exec".into());
+    }
+    if !tools.iter().any(|tool| tool == "vision_analyze") {
+        tools.push("vision_analyze".into());
     }
     if claim
         .execution_configuration
@@ -2950,6 +3478,45 @@ if [ "$$" -ne 1 ] && IFS= read -r _ < /proc/1/maps; then exit 31; fi
                 .and_then(|value| value.as_deref()),
             Some("/agent-state/secrets/CERT")
         );
+    }
+
+    #[test]
+    fn vision_request_body_contains_original_image_bytes() {
+        let image_bytes = (0_u8..=255).cycle().take(4096).collect::<Vec<_>>();
+        let data_url = format!("data:image/png;base64,{}", base64_encode(&image_bytes));
+        let body = build_vision_request_body("vision-model", "describe", &data_url);
+
+        assert_eq!(body["model"], "vision-model");
+        assert_eq!(body["max_output_tokens"], 1024);
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
+        let content = input[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[0]["text"], "describe");
+        assert_eq!(content[1]["type"], "input_image");
+        let url = content[1]["image_url"].as_str().unwrap();
+        let encoded = url.strip_prefix("data:image/png;base64,").unwrap();
+        assert_eq!(encoded, base64_encode(&image_bytes));
+    }
+
+    #[test]
+    fn vision_image_mime_and_path_resolution_are_safe() {
+        assert_eq!(vision_image_mime(Path::new("photo.PNG")), "image/png");
+        assert_eq!(vision_image_mime(Path::new("photo.jpeg")), "image/jpeg");
+        assert_eq!(vision_image_mime(Path::new("photo.unknown")), "image/png");
+
+        let temp = tempfile::tempdir().unwrap();
+        let workdir = temp.path().join("workspace");
+        fs::create_dir_all(&workdir).unwrap();
+        fs::write(workdir.join("photo.png"), b"image").unwrap();
+        assert_eq!(
+            resolve_vision_image_path(&workdir, "/workspace/photo.png").unwrap(),
+            fs::canonicalize(workdir.join("photo.png")).unwrap()
+        );
+        assert!(resolve_vision_image_path(&workdir, "/etc/passwd").is_err());
+        assert!(resolve_vision_image_path(&workdir, "../secret").is_err());
     }
 
     #[test]

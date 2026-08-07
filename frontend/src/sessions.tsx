@@ -1,7 +1,8 @@
-import { ArrowUp, Bot, Brain, ChevronDown, ChevronRight, FilePenLine, ImageIcon, Link2, ListChecks, Minimize2, PanelLeft, Plus, RefreshCw, Search, Square, Terminal, Trash2, Users, Wrench, X } from 'lucide-react';
+import { ArrowUp, Bot, Brain, ChevronDown, ChevronRight, FilePenLine, ImageIcon, Link2, ListChecks, Minimize2, PanelLeft, Paperclip, Plus, RefreshCw, Search, Square, Terminal, Trash2, Users, Wrench, X } from 'lucide-react';
 import { FormEvent, lazy, Suspense, type TouchEvent, type WheelEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { api, ApiError, type Agent, type HubSession, type HubSessionMessage, type RunEvent, type SecretGrantRequirement } from './api/client';
+import { api, ApiError, attachmentUrl, type Agent, type HubSession, type HubSessionAttachment, type HubSessionMessage, type RunEvent, type SecretGrantRequirement } from './api/client';
 import { FormDialog } from './components/form-dialog';
+import { ComposerAttachmentPreview, MessageAttachments, useChatAttachments } from './components/chat-attachments';
 import { useI18n } from './i18n';
 import type { TranslationKey } from './i18n';
 import { discardConversationDraft, loadConversationDraft, loadSelectedSessionAgent, saveConversationDraft, saveSelectedSessionAgent } from './session-drafts';
@@ -73,7 +74,7 @@ export type RunFailureEntry = {
 };
 
 type TimelineEntry =
-  | { kind: 'message'; id: string; sequence: number; occurredAt: number; outputEndedAt?: number; runId: string | null; role: string; content: string; state?: string; mode?: string }
+  | { kind: 'message'; id: string; sequence: number; occurredAt: number; outputEndedAt?: number; runId: string | null; role: string; content: string; attachments: HubSessionAttachment[]; state?: string; mode?: string }
   | { kind: 'live'; id: string; sequence: number; occurredAt: number; outputEndedAt?: number; runId: string; role: string; content: string }
   | { kind: 'failure'; id: string; sequence: number; occurredAt: number; runId: string; failure: RunFailureEntry }
   | { kind: 'activity'; id: string; sequence: number; occurredAt: number; activity: ActivityEntry };
@@ -546,6 +547,8 @@ export function ChatActivityGroup({ activities, startedAt, endedAt, active = fal
 
 export function ChatMessageBubble({
   agentName,
+  attachments = [],
+  attachmentUrlFor,
   content,
   role,
   state,
@@ -553,6 +556,8 @@ export function ChatMessageBubble({
   streaming = false
 }: {
   agentName: string | null;
+  attachments?: HubSessionAttachment[];
+  attachmentUrlFor: (id: string) => string;
   content: string;
   role: string;
   state?: string;
@@ -568,6 +573,7 @@ export function ChatMessageBubble({
       {role === 'assistant'
         ? <div className="session-message-text session-message-markdown"><Suspense fallback={<span className="session-message-markdown-loading">{content}</span>}><ChatMarkdown content={content} streaming={streaming} /></Suspense></div>
         : <div className="session-message-text">{content}</div>}
+      <MessageAttachments attachments={attachments} urlFor={attachmentUrlFor} />
     </div>
   </article>;
 }
@@ -786,6 +792,22 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
 
   const selectedSession = sessions.find((session) => session.id === selectedId) ?? null;
   const conversationAgentName = conversationDraft?.agentName ?? selectedSession?.agent_name ?? null;
+  const attachmentUploader = useCallback((sessionId: string, file: File, signal?: AbortSignal) =>
+    api.uploadAttachment(sessionId, file, signal), []);
+  const {
+    items: pendingAttachments,
+    readyIds: readyAttachmentIds,
+    uploading: attachmentsUploading,
+    dragging: attachmentsDragging,
+    inputRef: attachmentInputRef,
+    openPicker: openAttachmentPicker,
+    handleInputChange: handleAttachmentInputChange,
+    remove: removeAttachment,
+    clear: clearAttachments,
+    handleDragOver: handleAttachmentDragOver,
+    handleDragLeave: handleAttachmentDragLeave,
+    handleDrop: handleAttachmentDrop
+  } = useChatAttachments(selectedSession?.id ?? null, attachmentUploader);
   const sessionMessages = useMemo(
     () => messages.filter((message) => message.session_id === selectedId),
     [messages, selectedId]
@@ -1073,6 +1095,7 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
       runId: message.run_id,
       role: message.role,
       content: message.content!,
+      attachments: message.attachments ?? [],
       state: message.delivery_state,
       mode: message.delivery_mode
     }));
@@ -1197,7 +1220,7 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
     const content = draft.trim();
     const pendingConversationDraft = conversationDraft;
     const pendingDraftGeneration = conversationDraftGeneration.current;
-    if ((!selectedSession && !pendingConversationDraft) || !content || !canMutate || sending) return;
+    if ((!selectedSession && !pendingConversationDraft) || !content || !canMutate || sending || attachmentsUploading) return;
     setSending(true);
     setActionError(false);
     setConversationCreateError(false);
@@ -1222,7 +1245,7 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
         followBottomRef.current = true;
         return;
       }
-      const accepted = await api.createSessionMessage(selectedSession!.id, { content });
+      const accepted = await api.createSessionMessage(selectedSession!.id, { content, attachment_ids: readyAttachmentIds });
       if (!mountedRef.current) return;
       setMessages((current) => current.some((message) => message.id === accepted.message.id)
         ? current
@@ -1232,6 +1255,7 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
         : session));
       startTitlePoll(selectedSession!.id);
       setDraft('');
+      clearAttachments();
       followBottomRef.current = true;
     } catch (caught) {
       if (!mountedRef.current) return;
@@ -1458,6 +1482,8 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
                 if (entry.kind === 'failure') return <ChatRunFailure failure={entry.failure} key={entry.id} />;
                 return <ChatMessageBubble
                   agentName={conversationAgentName}
+                  attachments={entry.kind === 'message' ? entry.attachments : undefined}
+                  attachmentUrlFor={attachmentUrl}
                   content={entry.content}
                   key={entry.id}
                   role={entry.role}
@@ -1469,7 +1495,7 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
               {selectedSession?.recovery_error && <div className="session-banner error session-recovery-notice" role="alert"><strong>{selectedSession.lifecycle_status === 'recovery_failed' ? t('sessionStatusRecoveryFailed') : t('sessionEnvironmentLost')}</strong><span>{selectedSession.recovery_error}</span></div>}
             </div>
           </div>
-          {canMutate && <form className="session-composer session-chat-composer" onSubmit={submitMessage}>
+          {canMutate && <form className={`session-composer session-chat-composer${attachmentsDragging ? ' session-composer-dragging' : ''}`} onSubmit={submitMessage} onDragOver={handleAttachmentDragOver} onDragLeave={handleAttachmentDragLeave} onDrop={handleAttachmentDrop}>
             <label><span className="sr-only">{t('message')}</span><textarea ref={composerRef} rows={2} aria-label={t('message')} value={draft} onChange={(event) => {
               setDraft(event.target.value);
               if (conversationDraft) saveConversationDraft(currentUserId, conversationDraft.agentId, event.target.value);
@@ -1478,7 +1504,11 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
               event.preventDefault();
               event.currentTarget.form?.requestSubmit();
             }} placeholder={selectedSession?.active_turn_id ? t('guideCurrentTurnPlaceholder') : t('messagePlaceholder')} /></label>
-            <div><span className="session-composer-actions">{selectedSession?.active_turn_id && activeRunId && <button type="button" className="icon-button session-stop-button" aria-label={t('stopCurrentRun')} title={t('stopCurrentRun')} disabled={stopping || stopRequestedRunId === activeRunId} onClick={stopCurrentRun}><Square size={14} /></button>}<button type="submit" className="icon-button session-send-button" aria-label={sending ? t('sending') : t('send')} title={t('send')} disabled={sending || !draft.trim()}><ArrowUp size={18} /></button></span></div>
+            <ComposerAttachmentPreview items={pendingAttachments} onRemove={removeAttachment} />
+            <div>{selectedSession && <span className="session-composer-attachment-controls">
+              <input ref={attachmentInputRef} className="sr-only" type="file" multiple tabIndex={-1} aria-hidden="true" onChange={handleAttachmentInputChange} />
+              <button type="button" className="icon-button session-attach-button" aria-label={t('attachment')} title={t('attachment')} disabled={sending || attachmentsUploading} onClick={openAttachmentPicker}><Paperclip size={17} /></button>
+            </span>}<span className="session-composer-actions">{selectedSession?.active_turn_id && activeRunId && <button type="button" className="icon-button session-stop-button" aria-label={t('stopCurrentRun')} title={t('stopCurrentRun')} disabled={stopping || stopRequestedRunId === activeRunId} onClick={stopCurrentRun}><Square size={14} /></button>}<button type="submit" className="icon-button session-send-button" aria-label={sending ? t('sending') : t('send')} title={t('send')} disabled={sending || attachmentsUploading || !draft.trim()}><ArrowUp size={18} /></button></span></div>
           </form>}
         </>}
       </section>

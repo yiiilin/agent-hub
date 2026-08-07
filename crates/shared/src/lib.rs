@@ -244,6 +244,8 @@ pub struct HubSessionMessageDto {
     pub message_kind: String,
     pub content: Option<String>,
     pub payload: Value,
+    #[serde(default)]
+    pub attachments: Vec<HubSessionAttachmentDto>,
     pub delivery_mode: String,
     pub delivery_state: String,
     #[serde(default)]
@@ -252,6 +254,16 @@ pub struct HubSessionMessageDto {
     pub turn_id: Option<Uuid>,
     pub run_id: Option<Uuid>,
     pub accepted_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HubSessionAttachmentDto {
+    pub id: Uuid,
+    pub session_id: Uuid,
+    pub name: String,
+    pub content_type: String,
+    pub size_bytes: i64,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -360,6 +372,8 @@ pub struct ModelConnectionDto {
     pub base_url: String,
     pub api_type: ModelUpstreamProtocol,
     pub allowed_model_ids: Vec<String>,
+    #[serde(default)]
+    pub vision_model_id: Option<String>,
     pub status: ModelConnectionStatus,
     pub has_api_key: bool,
     pub created_at: DateTime<Utc>,
@@ -374,6 +388,8 @@ pub struct CreateModelConnectionRequest {
     pub base_url: String,
     pub api_type: ModelUpstreamProtocol,
     pub allowed_model_ids: Vec<String>,
+    #[serde(default)]
+    pub vision_model_id: Option<String>,
     pub api_key: String,
 }
 
@@ -384,6 +400,8 @@ pub struct UpdateModelConnectionRequest {
     pub base_url: String,
     pub api_type: ModelUpstreamProtocol,
     pub allowed_model_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_model_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
 }
@@ -1977,6 +1995,8 @@ pub struct CreateHubSessionMessageRequest {
     pub content: String,
     #[serde(default)]
     pub payload: Value,
+    #[serde(default)]
+    pub attachment_ids: Vec<Uuid>,
     #[serde(default)]
     pub delivery_mode: Option<String>,
     #[serde(default)]

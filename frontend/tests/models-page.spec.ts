@@ -15,6 +15,7 @@ const personalConnection = {
   base_url: 'https://personal.example.test/provider',
   api_type: 'openai_responses',
   allowed_model_ids: ['personal-main', 'personal-mini'],
+  vision_model_id: 'personal-vision',
   status: 'enabled',
   has_api_key: true,
   created_at: '2026-07-18T01:00:00.000Z',
@@ -140,6 +141,7 @@ test('Model API Connections use a multi-model access form and final V1 requests'
   await dialog.getByLabel('Base URL').fill('https://created.example.test/base');
   await dialog.getByLabel('API type').selectOption('anthropic_messages');
   await dialog.getByLabel('Allowed Model IDs').fill('created-main\ncreated-mini\ncreated-main');
+  await dialog.getByLabel('Vision model (optional)').fill('vision-mini');
   await dialog.getByLabel('API key').fill('one-time-provider-secret');
   await dialog.getByRole('button', { name: 'Create model connection' }).click();
   expect(requests.at(-1)).toEqual({
@@ -151,6 +153,7 @@ test('Model API Connections use a multi-model access form and final V1 requests'
       base_url: 'https://created.example.test/base',
       api_type: 'anthropic_messages',
       allowed_model_ids: ['created-main', 'created-mini'],
+      vision_model_id: 'vision-mini',
       api_key: 'one-time-provider-secret'
     }
   });
@@ -158,6 +161,8 @@ test('Model API Connections use a multi-model access form and final V1 requests'
 
   await page.getByRole('button', { name: 'Edit Personal Provider' }).click();
   dialog = page.getByRole('dialog', { name: 'Edit model connection' });
+  await expect(dialog.getByLabel('Vision model (optional)')).toHaveValue('personal-vision');
+  await dialog.getByLabel('Vision model (optional)').fill('');
   await dialog.getByLabel('Connection name').fill('Personal Provider Updated');
   await dialog.getByLabel('Allowed Model IDs').fill('personal-main\npersonal-reasoning');
   await dialog.getByRole('button', { name: 'Save changes' }).click();
@@ -168,7 +173,8 @@ test('Model API Connections use a multi-model access form and final V1 requests'
       name: 'Personal Provider Updated',
       base_url: personalConnection.base_url,
       api_type: 'openai_responses',
-      allowed_model_ids: ['personal-main', 'personal-reasoning']
+      allowed_model_ids: ['personal-main', 'personal-reasoning'],
+      vision_model_id: null
     }
   });
   await expect(dialog.getByRole('alert')).toContainText('Force saving clears affected selections');
@@ -180,7 +186,8 @@ test('Model API Connections use a multi-model access form and final V1 requests'
       name: 'Personal Provider Updated',
       base_url: personalConnection.base_url,
       api_type: 'openai_responses',
-      allowed_model_ids: ['personal-main', 'personal-reasoning']
+      allowed_model_ids: ['personal-main', 'personal-reasoning'],
+      vision_model_id: null
     }
   });
   expect(requests.at(-1)?.body).not.toHaveProperty('parameters');

@@ -90,6 +90,8 @@ type ModelTranslationKey =
   | 'modelApiKey'
   | 'modelApiKeyCreateHelp'
   | 'modelApiKeyEditHelp'
+  | 'visionModel'
+  | 'visionModelHelp'
   | 'modelSaveFailed'
   | 'forceUpdateModelConnection'
   | 'confirmForceUpdateModel'
@@ -216,6 +218,7 @@ function ConnectionFormDialog({
   const [modelIds, setModelIds] = useState(connection?.allowed_model_ids.join('\n') ?? '');
   const [apiType, setApiType] = useState<ModelUpstreamProtocol>(connection?.api_type ?? 'openai_responses');
   const [apiKey, setApiKey] = useState('');
+  const [visionModelId, setVisionModelId] = useState(connection?.vision_model_id ?? '');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(false);
   const [forceRequired, setForceRequired] = useState(false);
@@ -234,6 +237,7 @@ function ConnectionFormDialog({
           base_url: baseUrl.trim(),
           api_type: apiType,
           allowed_model_ids: normalizedModelIds,
+          vision_model_id: visionModelId.trim() || null,
           ...(apiKey.trim() ? { api_key: apiKey } : {})
         };
         onSaved(await api.updateModelConnection(state.connection.id, request, forceRequired));
@@ -244,6 +248,7 @@ function ConnectionFormDialog({
           base_url: baseUrl.trim(),
           api_type: apiType,
           allowed_model_ids: normalizedModelIds,
+          vision_model_id: visionModelId.trim() || null,
           api_key: apiKey
         };
         onSaved(await api.createModelConnection(request));
@@ -277,6 +282,7 @@ function ConnectionFormDialog({
         <label className="model-wide-field">{mt('modelBaseUrl')}<input type="url" inputMode="url" autoComplete="url" required value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} /></label>
         <label className="model-wide-field">{mt('modelUpstreamProtocol')}<select required value={apiType} onChange={(event) => setApiType(event.target.value as ModelUpstreamProtocol)}><option value="openai_responses">openai_responses</option><option value="openai_chat_completions">openai_chat_completions</option><option value="anthropic_messages">anthropic_messages</option></select></label>
         <label className="model-wide-field">{mt('allowedModelIds')}<textarea required rows={5} value={modelIds} onChange={(event) => setModelIds(event.target.value)} /><small>{mt('allowedModelIdsHelp')}</small></label>
+        <label className="model-wide-field">{mt('visionModel')}<input autoComplete="off" value={visionModelId} onChange={(event) => setVisionModelId(event.target.value)} /><small>{mt('visionModelHelp')}</small></label>
         <label className="model-wide-field">{mt('modelApiKey')}<input type="password" autoComplete="new-password" required={!connection} value={apiKey} onChange={(event) => setApiKey(event.target.value)} /><small>{connection ? mt('modelApiKeyEditHelp') : mt('modelApiKeyCreateHelp')}</small></label>
       </div>
       {forceRequired && <div className="model-alert error" role="alert">{mt('confirmForceUpdateModel')}</div>}
