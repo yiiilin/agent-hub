@@ -69,6 +69,7 @@ const PI_BUILTIN_TOOL_NAMES: &[&str] = &[
     "vision_analyze",
 ];
 const MAX_VISION_IMAGE_BYTES: u64 = 100 * 1024 * 1024;
+const MAX_TOOL_OUTPUT_EVENT_BYTES: usize = 32 * 1024;
 const MAX_VISION_REQUEST_BYTES: usize = 128 * 1024;
 const VISION_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const VISION_HTTP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -2631,7 +2632,9 @@ impl PiRunState {
             .unwrap_or(output.as_str())
             .to_owned();
         *previous = output;
-        if delta.is_empty() {
+        if delta.is_empty() || previous.len() > MAX_TOOL_OUTPUT_EVENT_BYTES {
+            // Once the accumulated tool output exceeds the event cap, stop
+            // streaming deltas; the completed event carries the truncated tail.
             return Ok(());
         }
         let args = value.get("args").cloned().unwrap_or_else(|| json!({}));
@@ -3150,7 +3153,27 @@ fn pi_tool_event(
             .unwrap_or_else(|| json!(args.to_string()));
     }
     if let Some(output) = output {
-        payload["output"] = json!(output);
+        // Tool output may contain raw binary (for example `head` on an ELF
+        // file); NUL bytes cannot be stored in PostgreSQL jsonb and previously
+        // failed the whole Run event upload, so replace them before upload.
+        // Keep only a bounded tail in the event so a huge `cat` cannot bloat
+        // the database; the marker line and structured fields stay visible.
+        let output = output.replace('\0', "\u{FFFD}");
+        if output.len() > MAX_TOOL_OUTPUT_EVENT_BYTES {
+            let original_len = output.len();
+            let tail_start = output.len() - MAX_TOOL_OUTPUT_EVENT_BYTES;
+            let tail_start = (tail_start..output.len())
+                .find(|index| output.is_char_boundary(*index))
+                .unwrap_or(output.len());
+            payload["output"] = json!(format!(
+                "[output truncated: {original_len} bytes]\n{}",
+                &output[tail_start..]
+            ));
+            payload["output_truncated"] = json!(true);
+            payload["output_size_bytes"] = json!(original_len);
+        } else {
+            payload["output"] = json!(output);
+        }
     }
     if let Some(success) = success {
         payload["success"] = json!(success);
@@ -3633,5 +3656,79 @@ if [ "$$" -ne 1 ] && IFS= read -r _ < /proc/1/maps; then exit 31; fi
             item_ids,
             vec!["pi-thinking-0".to_string(), "pi-thinking-1".to_string()]
         );
+    }
+
+    #[test]
+    fn tool_output_sanitizes_nul_bytes_before_upload() {
+        let args = json!({ "command": "head -c 8 /bin/ls" });
+        let event = pi_tool_event(
+            "tool-1",
+            "bash",
+            "completed",
+            &args,
+            Some("ELF\0binary\0"),
+            Some(true),
+        );
+        assert_eq!(event.payload["output"], json!("ELF\u{FFFD}binary\u{FFFD}"));
+        assert_eq!(event.payload["tool"], json!("bash"));
+        assert_eq!(event.payload["success"], json!(true));
+
+        let delta = pi_tool_event(
+            "tool-2",
+            "read",
+            "output_delta",
+            &json!({}),
+            Some("text\0tail"),
+            None,
+        );
+        assert_eq!(delta.payload["output"], json!("text\u{FFFD}tail"));
+    }
+
+    #[test]
+    fn tool_output_truncates_oversized_output_with_marker() {
+        let tail = "尾部🙂内容";
+        let huge = format!("{}{}", "x".repeat(40 * 1024), tail);
+        let event = pi_tool_event(
+            "tool-3",
+            "bash",
+            "completed",
+            &json!({ "command": "cat big.bin" }),
+            Some(&huge),
+            Some(true),
+        );
+        assert_eq!(event.payload["output_truncated"], json!(true));
+        assert_eq!(event.payload["output_size_bytes"], json!(huge.len()));
+        let rendered = event.payload["output"].as_str().unwrap();
+        assert!(rendered.starts_with(&format!("[output truncated: {} bytes]\n", huge.len())));
+        assert!(rendered.ends_with(tail));
+        assert!(
+            rendered.len() <= MAX_TOOL_OUTPUT_EVENT_BYTES + 64,
+            "rendered output stayed bounded"
+        );
+    }
+
+    #[test]
+    fn tool_output_deltas_stop_after_the_cumulative_cap() {
+        let mut state = PiRunState::new(
+            uuid::Uuid::new_v4(),
+            "native-session".into(),
+            BTreeMap::new(),
+        );
+        let tool_call_id = "overflow-tool";
+        for event in [
+            json!({"type": "tool_execution_start", "toolCallId": tool_call_id, "toolName": "bash", "args": {"command": "yes"}}),
+            json!({"type": "tool_execution_update", "toolCallId": tool_call_id, "toolName": "bash", "args": {"command": "yes"}, "partialResult": "x".repeat(30 * 1024)}),
+            json!({"type": "tool_execution_update", "toolCallId": tool_call_id, "toolName": "bash", "args": {"command": "yes"}, "partialResult": "x".repeat(40 * 1024)}),
+        ] {
+            state.handle_event(&event).unwrap();
+        }
+        let deltas = state
+            .events
+            .iter()
+            .filter(|event| {
+                event.payload.get("phase").and_then(Value::as_str) == Some("output_delta")
+            })
+            .count();
+        assert_eq!(deltas, 1, "only the delta before the cap is streamed");
     }
 }

@@ -62,6 +62,18 @@ JSONL 只接受 LF 分隔的完整 JSON 记录。未知、畸形或与当前请�
 response/event 是 Runtime driver error，子进程会被停止并由现有 Run 失败路径
 处理。
 
+工具输出事件保留增量输出，但单条事件输出上限 32KB：超过后事件只保留尾部并
+在前面加 `[output truncated: N bytes]` 标记，同时附带 `output_truncated` /
+`output_size_bytes` 字段；累计输出超过上限后不再流式增量 delta，最终
+`completed` 事件携带截断尾部。工具输出中的 NUL 字节在事件构造时替换为
+U+FFFD，Hub 事件写入层再做一次同样清洗，避免 jsonb 拒绝 `\u0000`。
+
+`skill_exec` 进程输出预览上限 1MiB；超过后进程不会被终止，完整 stdout/stderr
+写入会话 `engine-state/skill-exec/tmp/<call>-stdout.log` /
+`-stderr.log`（单次调用单流上限 256MB，超出后在日志尾部标记截断；整个会话
+spill 总量达到 512MB 后停止再落盘，避免重复溢出调用占满磁盘），工具结果文本
+末尾给出 `stdout_full_path` / `stderr_full_path`，事件仍只保留截断预览。
+
 ## 模型代理和设置
 
 Pi `models.json` 为每个 Run 的 `main` binding 创建一个 provider：

@@ -87,6 +87,7 @@ const SKILL_PACKAGE_UPLOAD_BODY_LIMIT: usize =
 const MAX_CLIENT_TOOL_COUNT: usize = 128;
 const MAX_CLIENT_TOOL_DEFINITIONS_BYTES: usize = 256_000;
 const MAX_CLIENT_TOOL_RESULT_BYTES: usize = 16_000;
+const MAX_RUNTIME_EVENT_BYTES: usize = 256 * 1024;
 const EMBEDDED_ORIGIN_HEADER: &str = "x-agent-hub-embedded-origin";
 const MAX_ATTACHMENT_UPLOAD_BYTES: u64 = 104_857_600;
 const MAX_ATTACHMENT_BYTES_PER_SESSION: i64 = 524_288_000;
@@ -5358,7 +5359,7 @@ async fn list_agents(
                OR a.visibility = 'public'
                OR (a.visibility = 'public_to' AND $1 = ANY(a.public_to))
                OR owner.role <> 'super_admin'
-               OR $2 = 'super_admin'
+               OR $2 IN ('admin', 'super_admin')
            )
            AND (a.owner_id = $1 OR a.visibility = 'public'
                 OR (a.visibility = 'public_to' AND $1 = ANY(a.public_to))
@@ -5489,14 +5490,24 @@ async fn get_agent_model_connection_options(
 ) -> Result<Json<ModelConnectionOptionsDto>, ApiError> {
     let user = require_user(&state, &headers).await?;
     let agent = load_agent_manageable_by_user(&state.pool, agent_id, &user).await?;
+    let owner_role: String = sqlx::query_scalar("SELECT role FROM users WHERE id = $1")
+        .bind(agent.owner_id)
+        .fetch_one(&state.pool)
+        .await?;
+    // Personal connections stay visible to the Agent owner and super admins;
+    // an ordinary admin managing another user's Agent only sees Global
+    // connections (mirrors the Model Connection administration boundary).
+    let include_owner_personal =
+        user.id == agent.owner_id || user.role == "super_admin" || owner_role != "super_admin";
     let rows = sqlx::query(
         "SELECT id, name, api_type, allowed_model_ids, scope, enabled
          FROM model_connections
          WHERE deleted_at IS NULL
-           AND (scope = 'global' OR owner_id = $1)
+           AND (scope = 'global' OR (owner_id = $1 AND $2))
          ORDER BY scope, lower(name), id",
     )
     .bind(agent.owner_id)
+    .bind(include_owner_personal)
     .fetch_all(&state.pool)
     .await?;
     let items = rows
@@ -5585,6 +5596,15 @@ async fn update_agent(
         &mut req.subagents,
     )
     .await?;
+    if user.id != existing_agent.owner_id && user.role != "super_admin" {
+        enforce_admin_agent_model_selection_tx(
+            &mut tx,
+            &existing_agent,
+            req.model_selection.as_ref(),
+            &req.subagents,
+        )
+        .await?;
+    }
     let model_connection_id = req
         .model_selection
         .as_ref()
@@ -5677,9 +5697,8 @@ async fn delete_agent(
     let user = require_user(&state, &headers).await?;
     let mut tx = state.pool.begin().await?;
     let agent = sqlx::query(
-        "SELECT agents.owner_id, agents.deleted_at, users.role AS owner_role
+        "SELECT agents.owner_id, agents.deleted_at
          FROM agents
-         JOIN users ON users.id = agents.owner_id
          WHERE agents.id = $1
          FOR UPDATE",
     )
@@ -5690,9 +5709,6 @@ async fn delete_agent(
         return Err(ApiError::not_found("agent not found"));
     };
     let owner_id: Uuid = agent.get("owner_id");
-    if user.role == "admin" && agent.get::<String, _>("owner_role") == "super_admin" {
-        return Err(ApiError::not_found("agent not found"));
-    }
     if owner_id != user.id && !is_admin_role(&user.role) {
         return Err(ApiError::forbidden(
             "agent management permission is required",
@@ -6488,7 +6504,7 @@ async fn list_agent_runs(
          WHERE runs.agent_id = $1
            AND (runs.owner_id = $2 OR $3 IN ('admin', 'super_admin'))
            AND (runs.owner_id = $2 OR run_owner.role <> 'super_admin'
-                OR $3 = 'super_admin')
+                OR $3 IN ('admin', 'super_admin'))
          ORDER BY runs.created_at DESC LIMIT 50",
     )
     .bind(agent_id)
@@ -11261,6 +11277,7 @@ async fn submit_integration_tool_result(
     let agent_id = integration_tool_request_agent_id(&state.pool, tool_request_id).await?;
     let principal = require_integration(&state, &headers, agent_id).await?;
     validate_tool_result(&req.result)?;
+    let result = sanitize_run_event_payload(req.result);
     let mut tx = state.pool.begin().await?;
     // Integration 写事务统一先锁 Agent，避免与归档形成反向锁顺序。
     lock_active_integration_agent_tx(&mut tx, principal.agent_id, principal.agent_owner_id).await?;
@@ -11333,7 +11350,7 @@ async fn submit_integration_tool_result(
     let content = format!(
         "Tool result for {}: {}",
         tool_request.tool_name,
-        compact_json(&req.result)
+        compact_json(&result)
     );
     let external_user_context = sqlx::query_scalar::<_, Option<Value>>(
         "SELECT external_user_context FROM runs WHERE id = $1",
@@ -11354,7 +11371,7 @@ async fn submit_integration_tool_result(
             content,
             payload: json!({
                 "tool_request_id": tool_request.id,
-                "result": req.result.clone()
+                "result": result.clone()
             }),
             role: "tool".into(),
             message_kind: "tool_result".into(),
@@ -11389,7 +11406,7 @@ async fn submit_integration_tool_result(
          SET status = 'completed', result_payload = $1, result_event_id = $2, follow_up_run_id = $3, responded_at = now()
          WHERE id = $4 AND status = 'pending'",
     )
-    .bind(&req.result)
+    .bind(&result)
     .bind(result_event_id)
     .bind(run.id)
     .bind(tool_request.id)
@@ -11506,6 +11523,10 @@ async fn submit_client_tool_result(
     Json(req): Json<SubmitClientToolResultRequest>,
 ) -> Result<Json<SubmitClientToolResultResponse>, ApiError> {
     let (result_payload, checksum) = validate_client_tool_result(&req.result)?;
+    // NUL bytes are rejected by PostgreSQL jsonb; sanitize before persisting
+    // while keeping the checksum over the client's original payload so an
+    // idempotent resubmit still matches.
+    let result_payload = sanitize_run_event_payload(result_payload);
     let token = client_access_token_from_headers(&headers)
         .ok_or(ApiError::unauthorized("missing Client Access Credential"))?;
     let mut tx = state.pool.begin().await?;
@@ -14848,6 +14869,15 @@ async fn runtime_append_event(
         state.run_event_bus.publish(run_id, event.clone(), false);
         return Ok(Json(event));
     }
+    // Streaming deltas never persist, so the size guard only applies to events
+    // that will be written into run_events.
+    let content_bytes = content.as_deref().map(str::len).unwrap_or(0);
+    let payload_bytes = serde_json::to_string(&payload)
+        .map_err(|_| ApiError::internal("run event payload could not be encoded"))?
+        .len();
+    if content_bytes.saturating_add(payload_bytes) > MAX_RUNTIME_EVENT_BYTES {
+        return Err(ApiError::bad_request("run event exceeds its size limit"));
+    }
     let mut tx = state.pool.begin().await?;
     let event = insert_run_event_for_active_runtime(
         &mut tx,
@@ -16903,9 +16933,12 @@ fn validate_widget_attribute_value(
 
 async fn accept_session_message_tx(
     tx: &mut Transaction<'_, Postgres>,
-    request: AcceptSessionMessage,
+    mut request: AcceptSessionMessage,
 ) -> Result<SessionMessageAcceptanceDto, ApiError> {
-    let content = request.content.trim();
+    let mut content = request.content.trim().to_owned();
+    sanitize_run_event_text(&mut content);
+    request.content = content.clone();
+    request.payload = sanitize_run_event_payload(request.payload);
     if content.is_empty() {
         return Err(ApiError::bad_request("message is required"));
     }
@@ -17117,7 +17150,7 @@ async fn accept_session_message_tx(
     .bind(request.session_id)
     .bind(&request.role)
     .bind(&request.message_kind)
-    .bind(content)
+    .bind(&content)
     .bind(&request.payload)
     .bind(&delivery_mode)
     .bind(&delivery_state)
@@ -17174,7 +17207,7 @@ async fn accept_session_message_tx(
             "message"
         })
         .bind(&request.role)
-        .bind(content)
+        .bind(&content)
         .bind(json!({ "source": request.source, "message": request.payload }))
         .bind(message.id)
         .execute(&mut **tx)
@@ -18350,15 +18383,50 @@ async fn insert_run_event_for_active_runtime(
     Ok(event)
 }
 
+fn sanitize_run_event_text(text: &mut String) {
+    if text.contains('\0') {
+        *text = text.replace('\0', "\u{FFFD}");
+    }
+}
+
+fn sanitize_run_event_payload(value: Value) -> Value {
+    match value {
+        Value::String(mut text) => {
+            sanitize_run_event_text(&mut text);
+            Value::String(text)
+        }
+        Value::Array(items) => {
+            Value::Array(items.into_iter().map(sanitize_run_event_payload).collect())
+        }
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(mut key, value)| {
+                    sanitize_run_event_text(&mut key);
+                    (key, sanitize_run_event_payload(value))
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 async fn insert_run_event_with_id_tx(
     tx: &mut Transaction<'_, Postgres>,
     event_id: Uuid,
     run_id: Uuid,
-    event_type: String,
-    role: Option<String>,
-    content: Option<String>,
+    mut event_type: String,
+    mut role: Option<String>,
+    mut content: Option<String>,
     payload: Value,
 ) -> Result<RunEventDto, ApiError> {
+    sanitize_run_event_text(&mut event_type);
+    if let Some(text) = role.as_mut() {
+        sanitize_run_event_text(text);
+    }
+    if let Some(text) = content.as_mut() {
+        sanitize_run_event_text(text);
+    }
+    let payload = sanitize_run_event_payload(payload);
     let row = sqlx::query(
         "INSERT INTO run_events (event_id, run_id, event_type, role, content, payload)
          VALUES ($1, $2, $3, $4, $5, $6)
@@ -18415,11 +18483,19 @@ async fn lock_owned_session_for_run_tx(
 async fn insert_run_event_tx(
     tx: &mut Transaction<'_, Postgres>,
     run_id: Uuid,
-    event_type: String,
-    role: Option<String>,
-    content: Option<String>,
+    mut event_type: String,
+    mut role: Option<String>,
+    mut content: Option<String>,
     payload: Value,
 ) -> Result<RunEventDto, ApiError> {
+    sanitize_run_event_text(&mut event_type);
+    if let Some(text) = role.as_mut() {
+        sanitize_run_event_text(text);
+    }
+    if let Some(text) = content.as_mut() {
+        sanitize_run_event_text(text);
+    }
+    let payload = sanitize_run_event_payload(payload);
     let row = sqlx::query(
         "INSERT INTO run_events (event_id, run_id, event_type, role, content, payload)
          VALUES ($1, $2, $3, $4, $5, $6)
@@ -19334,7 +19410,7 @@ async fn load_agent_for_user(
                OR a.visibility = 'public'
                OR (a.visibility = 'public_to' AND $2 = ANY(a.public_to))
                OR owner.role <> 'super_admin'
-               OR $3 = 'super_admin'
+               OR $3 IN ('admin', 'super_admin')
            )
            AND (a.owner_id = $2 OR a.visibility = 'public'
                 OR (a.visibility = 'public_to' AND $2 = ANY(a.public_to))
@@ -19386,10 +19462,8 @@ async fn load_agent_manageable_by_user(
                 a.model_policy, a.sandbox_policy, a.mcp_allowlist, a.tool_allowlist,
                 a.created_at, a.updated_at
          FROM agents AS a
-         JOIN users AS owner ON owner.id = a.owner_id
          WHERE a.id = $1 AND a.deleted_at IS NULL
-           AND (a.owner_id = $2 OR $3 = 'super_admin'
-                OR ($3 = 'admin' AND owner.role <> 'super_admin'))",
+           AND (a.owner_id = $2 OR $3 IN ('admin', 'super_admin'))",
     )
     .bind(agent_id)
     .bind(user.id)
@@ -19580,6 +19654,65 @@ fn effective_subagent_model_settings(
         ModelSettingOverride::Value(settings) => effective.request_settings = settings.clone(),
     }
     validate_agent_model_settings(effective, protocol)
+}
+
+async fn check_admin_agent_model_selection_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    retained: &[(Uuid, String)],
+    selection: Option<&ModelSelectionDto>,
+) -> Result<(), ApiError> {
+    let Some(selection) = selection else {
+        return Ok(());
+    };
+    if retained.iter().any(|(connection_id, model_id)| {
+        *connection_id == selection.connection_id && model_id == &selection.model_id
+    }) {
+        return Ok(());
+    }
+    let global: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM model_connections
+             WHERE id = $1 AND scope = 'global' AND enabled = true AND deleted_at IS NULL
+               AND $2 = ANY(allowed_model_ids)
+         )",
+    )
+    .bind(selection.connection_id)
+    .bind(&selection.model_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if global {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(
+            "admin model changes are limited to Global connections",
+        ))
+    }
+}
+
+async fn enforce_admin_agent_model_selection_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    existing: &AgentDto,
+    requested: Option<&ModelSelectionDto>,
+    subagents: &[SubagentDefinition],
+) -> Result<(), ApiError> {
+    // An ordinary admin may retain the Agent owner's existing Personal model
+    // selections, but may not point the Agent at a different Personal
+    // connection: the owner's Personal connections stay owner/super-only.
+    let mut retained = Vec::new();
+    if let Some(selection) = existing.model_selection.as_ref() {
+        retained.push((selection.connection_id, selection.model_id.clone()));
+    }
+    for subagent in &existing.subagents {
+        if let Some(selection) = subagent.model_selection.as_ref() {
+            retained.push((selection.connection_id, selection.model_id.clone()));
+        }
+    }
+    check_admin_agent_model_selection_tx(tx, &retained, requested).await?;
+    for subagent in subagents.iter().filter(|subagent| subagent.enabled) {
+        check_admin_agent_model_selection_tx(tx, &retained, subagent.model_selection.as_ref())
+            .await?;
+    }
+    Ok(())
 }
 
 async fn validate_agent_model_configuration_tx(
@@ -22266,16 +22399,20 @@ fn parse_tool_request_batch(
                     "tool request ids must be unique within a batch",
                 ));
             }
+            let mut tool_name = tool_name.to_owned();
+            sanitize_run_event_text(&mut tool_name);
             Ok(RuntimeToolRequestRegistration {
                 request_id,
                 position: i32::try_from(position)
                     .map_err(|_| ApiError::bad_request("tool request batch is too large"))?,
-                tool_name: tool_name.to_owned(),
-                arguments: event
-                    .payload
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or_else(|| json!({})),
+                tool_name,
+                arguments: sanitize_run_event_payload(
+                    event
+                        .payload
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or_else(|| json!({})),
+                ),
                 event: event.clone(),
             })
         })
@@ -22657,7 +22794,7 @@ async fn load_run_for_user(
          JOIN users AS run_owner ON run_owner.id = r.owner_id
          WHERE r.id = $1 AND (r.owner_id = $2 OR $3 IN ('admin', 'super_admin'))
            AND (r.owner_id = $2 OR run_owner.role <> 'super_admin'
-                OR $3 = 'super_admin')",
+                OR $3 IN ('admin', 'super_admin'))",
     )
     .bind(run_id)
     .bind(user.id)
@@ -27007,6 +27144,38 @@ mod tests {
         agent.visibility = "public".into();
         assert!(agent_access(&agent, &member).can_invoke);
         assert!(agent_access(&agent, &admin).can_invoke);
+    }
+
+    #[test]
+    fn run_event_sanitizers_remove_nul_bytes() {
+        let mut text = "before\0after".to_owned();
+        sanitize_run_event_text(&mut text);
+        assert_eq!(text, "before\u{FFFD}after");
+
+        let payload = json!({
+            "output": "ELF\0bin\0",
+            "nested": ["x\0", {"key": "v\0"}],
+            "count": 3,
+            "flag": true,
+            "nothing": null,
+        });
+        let sanitized = sanitize_run_event_payload(payload);
+        assert_eq!(sanitized["output"], json!("ELF\u{FFFD}bin\u{FFFD}"));
+        assert_eq!(sanitized["nested"][0], json!("x\u{FFFD}"));
+        assert_eq!(sanitized["nested"][1]["key"], json!("v\u{FFFD}"));
+        assert_eq!(sanitized["count"], json!(3));
+        assert_eq!(sanitized["flag"], json!(true));
+        assert_eq!(sanitized["nothing"], json!(null));
+
+        // Object keys must be sanitized too: jsonb rejects NUL anywhere.
+        let mut keyed = serde_json::Map::new();
+        keyed.insert("bad\0key".into(), json!("value"));
+        keyed.insert("ok".into(), json!("value"));
+        let sanitized_keyed = sanitize_run_event_payload(Value::Object(keyed));
+        let object = sanitized_keyed.as_object().unwrap();
+        assert!(object.contains_key("bad\u{FFFD}key"));
+        assert!(!object.keys().any(|key| key.contains('\0')));
+        assert_eq!(object["ok"], json!("value"));
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -38968,7 +39137,7 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn administrator_cannot_enumerate_super_admin_agents_or_runs(pool: PgPool) {
+    async fn administrator_can_manage_super_admin_agents_and_view_their_runs(pool: PgPool) {
         let admin_token = create_user_session_with_role(&pool, "admin").await;
         let member_token = create_user_session_with_role(&pool, "member").await;
         let super_token = create_user_session_with_role(&pool, "super_admin").await;
@@ -39012,7 +39181,7 @@ mod tests {
         )
         .bind(protected_session_id)
         .bind(super_id)
-        .bind(member_agent_id)
+        .bind(super_agent_id)
         .execute(&state.pool)
         .await
         .unwrap();
@@ -39036,7 +39205,7 @@ mod tests {
                      $4, $5, 0)",
         )
         .bind(protected_run_id)
-        .bind(member_agent_id)
+        .bind(super_agent_id)
         .bind(super_id)
         .bind(protected_session_id)
         .bind(protected_turn_id)
@@ -39054,7 +39223,7 @@ mod tests {
             .unwrap()
             .0;
         assert!(agents.iter().any(|agent| agent.id == member_agent_id));
-        assert!(agents.iter().all(|agent| agent.id != super_agent_id));
+        assert!(agents.iter().any(|agent| agent.id == super_agent_id));
 
         let admin = require_user(&state, &session_headers(&admin_token))
             .await
@@ -39064,8 +39233,40 @@ mod tests {
                 .await
                 .is_ok()
         );
+        assert!(load_agent_for_user(&state.pool, super_agent_id, &admin)
+            .await
+            .is_ok());
+        assert!(
+            load_agent_manageable_by_user(&state.pool, super_agent_id, &admin)
+                .await
+                .is_ok()
+        );
+
+        let admin_runs = list_agent_runs(
+            State(state.clone()),
+            session_headers(&admin_token),
+            Path(super_agent_id),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(admin_runs.iter().any(|run| run.id == protected_run_id));
+        assert!(load_run_for_user(&state.pool, protected_run_id, &admin)
+            .await
+            .is_ok());
+
+        let member = require_user(&state, &session_headers(&member_token))
+            .await
+            .unwrap();
         assert_eq!(
-            load_agent_for_user(&state.pool, super_agent_id, &admin)
+            load_agent_for_user(&state.pool, super_agent_id, &member)
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            load_run_for_user(&state.pool, protected_run_id, &member)
                 .await
                 .unwrap_err()
                 .status,
@@ -39074,30 +39275,26 @@ mod tests {
         assert_eq!(
             delete_agent(
                 State(state.clone()),
-                session_headers(&admin_token),
+                session_headers(&member_token),
                 Path(super_agent_id),
             )
             .await
             .unwrap_err()
             .status,
-            StatusCode::NOT_FOUND
+            StatusCode::FORBIDDEN
         );
+
         assert_eq!(
-            load_run_for_user(&state.pool, protected_run_id, &admin)
-                .await
-                .unwrap_err()
-                .status,
-            StatusCode::NOT_FOUND
+            delete_agent(
+                State(state.clone()),
+                session_headers(&admin_token),
+                Path(super_agent_id),
+            )
+            .await
+            .unwrap(),
+            StatusCode::NO_CONTENT
         );
-        let admin_runs = list_agent_runs(
-            State(state.clone()),
-            session_headers(&admin_token),
-            Path(member_agent_id),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert!(admin_runs.iter().all(|run| run.id != protected_run_id));
+
         let super_admin = require_user(&state, &session_headers(&super_token))
             .await
             .unwrap();
@@ -52235,6 +52432,112 @@ mod tests {
             session_headers(&admin_token),
             Path(created.id),
             Json(wrong_owner),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn admin_model_options_hide_super_admin_personal_connections(pool: PgPool) {
+        let admin_token = create_user_session_with_role(&pool, "admin").await;
+        let super_token = create_user_session_with_role(&pool, "super_admin").await;
+        let state = Arc::new(test_state_with_browser_session_auth(pool));
+        let super_user = require_user(&state, &session_headers(&super_token))
+            .await
+            .unwrap();
+        let global = create_test_model_connection_for_token(
+            &state,
+            &admin_token,
+            ModelConnectionScope::Global,
+            "Super Agent Global",
+        )
+        .await;
+        let super_personal = create_test_model_connection_for_token(
+            &state,
+            &super_token,
+            ModelConnectionScope::Personal,
+            "Super Agent Personal",
+        )
+        .await;
+        let super_agent_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO agents
+                 (id, owner_id, name, instructions, visibility, model_policy,
+                  model_connection_id, model_id)
+             VALUES ($1, $2, 'Protected Model Agent', '', 'private',
+                     '{\"provider\":\"hub-proxy\"}'::jsonb, $3, $4)",
+        )
+        .bind(super_agent_id)
+        .bind(super_user.id)
+        .bind(super_personal.id)
+        .bind(&super_personal.allowed_model_ids[0])
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let admin_options = get_agent_model_connection_options(
+            State(state.clone()),
+            session_headers(&admin_token),
+            Path(super_agent_id),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(admin_options
+            .items
+            .iter()
+            .any(|item| item.connection_id == global.id));
+        assert!(!admin_options
+            .items
+            .iter()
+            .any(|item| item.connection_id == super_personal.id));
+
+        let super_options = get_agent_model_connection_options(
+            State(state.clone()),
+            session_headers(&super_token),
+            Path(super_agent_id),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(super_options
+            .items
+            .iter()
+            .any(|item| item.connection_id == super_personal.id));
+
+        let mut admin_edit = test_update_agent_request();
+        admin_edit.model_selection = Some(test_model_selection(&super_personal));
+        let updated = update_agent(
+            State(state.clone()),
+            session_headers(&admin_token),
+            Path(super_agent_id),
+            Json(admin_edit),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            updated.model_selection,
+            Some(test_model_selection(&super_personal))
+        );
+
+        // An ordinary admin may retain the owner's existing Personal selection,
+        // but must not rebind the Agent to a different Personal connection.
+        let other_super_personal = create_test_model_connection_for_token(
+            &state,
+            &super_token,
+            ModelConnectionScope::Personal,
+            "Other Super Agent Personal",
+        )
+        .await;
+        let mut blocked = test_update_agent_request();
+        blocked.model_selection = Some(test_model_selection(&other_super_personal));
+        let error = update_agent(
+            State(state),
+            session_headers(&admin_token),
+            Path(super_agent_id),
+            Json(blocked),
         )
         .await
         .unwrap_err();

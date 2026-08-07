@@ -82,6 +82,8 @@ export default function registerAgentHubSkillExec(pi) {
       if (response.output_limit_exceeded) lines.push("output_limit_exceeded: true");
       if (response.stdout) lines.push(`stdout:\n${response.stdout}`);
       if (response.stderr) lines.push(`stderr:\n${response.stderr}`);
+      if (response.stdout_full_path) lines.push(`stdout_full_path: ${response.stdout_full_path}`);
+      if (response.stderr_full_path) lines.push(`stderr_full_path: ${response.stderr_full_path}`);
       if (lines.length === 0) lines.push("Skill client completed without output.");
       return {
         content: [{ type: "text", text: lines.join("\n") }],
@@ -131,7 +133,7 @@ use std::{
     },
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     thread,
@@ -174,6 +176,10 @@ const MAX_TOTAL_ARGUMENT_BYTES: usize = 128 * 1024;
 const MAX_STDIN_BYTES: usize = 1024 * 1024;
 #[cfg(target_os = "linux")]
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_SPILL_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_SESSION_SPILL_BYTES: u64 = 512 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(target_os = "linux")]
@@ -222,6 +228,8 @@ struct SkillExecResponse {
     exit_code: Option<i32>,
     stdout: String,
     stderr: String,
+    stdout_full_path: Option<String>,
+    stderr_full_path: Option<String>,
     timed_out: bool,
     output_limit_exceeded: bool,
     elapsed_ms: u64,
@@ -236,6 +244,8 @@ impl SkillExecResponse {
             exit_code: None,
             stdout: String::new(),
             stderr: String::new(),
+            stdout_full_path: None,
+            stderr_full_path: None,
             timed_out: false,
             output_limit_exceeded: false,
             elapsed_ms: 0,
@@ -248,6 +258,8 @@ struct SkillExecOutput {
     exit_code: Option<i32>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    stdout_full_path: Option<PathBuf>,
+    stderr_full_path: Option<PathBuf>,
     timed_out: bool,
     output_limit_exceeded: bool,
     elapsed: Duration,
@@ -263,6 +275,7 @@ struct SkillExecBrokerContext {
     tools: Vec<String>,
     token: String,
     stop: Arc<AtomicBool>,
+    spill_budget: Arc<AtomicU64>,
     hub_url: Option<String>,
     maintenance_token_file: Option<PathBuf>,
 }
@@ -275,6 +288,7 @@ struct SkillExecExecutionContext<'a> {
     workdir: &'a Path,
     tools: &'a [String],
     stop: &'a AtomicBool,
+    spill_budget: &'a Arc<AtomicU64>,
     disconnected: &'a AtomicBool,
     hub_url: Option<&'a str>,
     maintenance_token_file: Option<&'a Path>,
@@ -325,6 +339,7 @@ impl SkillExecBroker {
 
         let token = uuid::Uuid::new_v4().simple().to_string();
         let stop = Arc::new(AtomicBool::new(false));
+        let spill_budget_seed = session_spill_bytes(&temp_root)?;
         let context = SkillExecBrokerContext {
             catalog_path,
             packages_root,
@@ -334,6 +349,7 @@ impl SkillExecBroker {
             tools: tools.to_vec(),
             token: token.clone(),
             stop: Arc::clone(&stop),
+            spill_budget: Arc::new(AtomicU64::new(spill_budget_seed)),
             hub_url: management_enabled
                 .then(|| hub_url.to_owned())
                 .filter(|value| !value.is_empty()),
@@ -417,6 +433,7 @@ fn handle_connection(mut stream: TcpStream, context: &SkillExecBrokerContext) {
             workdir: &context.workdir,
             tools: &context.tools,
             stop: &context.stop,
+            spill_budget: &context.spill_budget,
             disconnected: &disconnected,
             hub_url: context.hub_url.as_deref(),
             maintenance_token_file: context.maintenance_token_file.as_deref(),
@@ -431,6 +448,14 @@ fn handle_connection(mut stream: TcpStream, context: &SkillExecBrokerContext) {
             exit_code: output.exit_code,
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            stdout_full_path: output
+                .stdout_full_path
+                .as_deref()
+                .map(|path| path.display().to_string()),
+            stderr_full_path: output
+                .stderr_full_path
+                .as_deref()
+                .map(|path| path.display().to_string()),
             timed_out: output.timed_out,
             output_limit_exceeded: output.output_limit_exceeded,
             elapsed_ms: u64::try_from(output.elapsed.as_millis()).unwrap_or(u64::MAX),
@@ -680,15 +705,27 @@ fn execute_program(
         .ancestors()
         .find(|ancestor| ancestor.parent() == Some(packages_root.as_path()))
         .context("Skill executable package root is invalid")?;
-    let call_temp = context
-        .temp_root
-        .join(uuid::Uuid::new_v4().simple().to_string());
+    let call_id = uuid::Uuid::new_v4().simple().to_string();
+    let call_temp = context.temp_root.join(&call_id);
+    let spill_enabled = context.spill_budget.load(Ordering::Relaxed) < MAX_SESSION_SPILL_BYTES;
+    let stdout_spill =
+        spill_enabled.then(|| context.temp_root.join(format!("{call_id}-stdout.log")));
+    let stderr_spill =
+        spill_enabled.then(|| context.temp_root.join(format!("{call_id}-stderr.log")));
     fs::create_dir(&call_temp).context("create Skill execution temporary directory")?;
     fs::set_permissions(&call_temp, fs::Permissions::from_mode(0o700))
         .context("protect Skill execution temporary directory")?;
     super::chown_private_path_if_root(&call_temp)
         .context("chown Skill execution temporary directory")?;
-    let result = execute_program_in_temp(program, package_root, &call_temp, request, context);
+    let result = execute_program_in_temp(
+        program,
+        package_root,
+        &call_temp,
+        stdout_spill.as_deref(),
+        stderr_spill.as_deref(),
+        request,
+        context,
+    );
     let cleanup =
         fs::remove_dir_all(&call_temp).context("remove Skill execution temporary directory");
     match (result, cleanup) {
@@ -703,6 +740,8 @@ fn execute_program_in_temp(
     program: &Path,
     package_root: &Path,
     call_temp: &Path,
+    stdout_spill: Option<&Path>,
+    stderr_spill: Option<&Path>,
     request: &SkillExecRequest,
     context: &SkillExecExecutionContext<'_>,
 ) -> anyhow::Result<SkillExecOutput> {
@@ -783,28 +822,28 @@ fn execute_program_in_temp(
         let mut stdin = stdin;
         stdin.write_all(&stdin_bytes)
     });
-    let output_limit_exceeded = Arc::new(AtomicBool::new(false));
+    let stdout_exceeded = Arc::new(AtomicBool::new(false));
+    let stderr_exceeded = Arc::new(AtomicBool::new(false));
+    let session_spill_budget = Arc::clone(context.spill_budget);
     let stdout_reader = bounded_reader(
         child.stdout.take().context("open Skill execution stdout")?,
-        Arc::clone(&output_limit_exceeded),
+        stdout_spill.map(Path::to_path_buf),
+        Arc::clone(&stdout_exceeded),
+        Arc::clone(&session_spill_budget),
     );
     let stderr_reader = bounded_reader(
         child.stderr.take().context("open Skill execution stderr")?,
-        Arc::clone(&output_limit_exceeded),
+        stderr_spill.map(Path::to_path_buf),
+        Arc::clone(&stderr_exceeded),
+        Arc::clone(&session_spill_budget),
     );
     let timeout = request
         .timeout_ms
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_TIMEOUT);
     let mut timed_out = false;
-    let mut limited = false;
     let exit_code = loop {
         if context.stop.load(Ordering::Acquire) || context.disconnected.load(Ordering::Acquire) {
-            terminate_child_process_tree(&mut child);
-            break None;
-        }
-        if output_limit_exceeded.load(Ordering::Acquire) {
-            limited = true;
             terminate_child_process_tree(&mut child);
             break None;
         }
@@ -835,12 +874,24 @@ fn execute_program_in_temp(
         !context.disconnected.load(Ordering::Acquire),
         "Skill execution client disconnected"
     );
+    let stdout_limited = stdout_exceeded.load(Ordering::Acquire);
+    let stderr_limited = stderr_exceeded.load(Ordering::Acquire);
     Ok(SkillExecOutput {
         exit_code,
         stdout,
         stderr,
+        stdout_full_path: if stdout_limited {
+            stdout_spill.map(Path::to_path_buf)
+        } else {
+            None
+        },
+        stderr_full_path: if stderr_limited {
+            stderr_spill.map(Path::to_path_buf)
+        } else {
+            None
+        },
         timed_out,
-        output_limit_exceeded: limited,
+        output_limit_exceeded: stdout_limited || stderr_limited,
         elapsed: started.elapsed(),
     })
 }
@@ -1075,25 +1126,139 @@ fn skill_exec_workspace_landlock_access(tools: &[String]) -> u64 {
 }
 
 #[cfg(target_os = "linux")]
+fn session_spill_bytes(temp_root: &Path) -> std::io::Result<u64> {
+    let mut total: u64 = 0;
+    for entry in fs::read_dir(temp_root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if (name.ends_with("-stdout.log") || name.ends_with("-stderr.log"))
+            && entry.file_type()?.is_file()
+        {
+            total = total.saturating_add(entry.metadata()?.len());
+        }
+    }
+    Ok(total)
+}
+
+#[cfg(target_os = "linux")]
 fn bounded_reader<R: Read + Send + 'static>(
     mut reader: R,
+    spill_path: Option<PathBuf>,
     exceeded: Arc<AtomicBool>,
+    session_budget: Arc<AtomicU64>,
 ) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
     thread::spawn(move || {
         let mut output = Vec::new();
+        let mut spill: Option<std::fs::File> = None;
+        let mut spilled_bytes: u64 = 0;
+        let mut spill_cap_noted = false;
         let mut chunk = [0_u8; 8192];
         loop {
             let read = reader.read(&mut chunk)?;
             if read == 0 {
                 return Ok(output);
             }
-            let remaining = MAX_OUTPUT_BYTES.saturating_sub(output.len());
-            output.extend_from_slice(&chunk[..read.min(remaining)]);
-            if read > remaining {
-                exceeded.store(true, Ordering::Release);
+            let bytes = &chunk[..read];
+            if spill.is_none() {
+                let remaining = MAX_OUTPUT_BYTES.saturating_sub(output.len());
+                if read <= remaining {
+                    output.extend_from_slice(bytes);
+                } else {
+                    output.extend_from_slice(&bytes[..remaining]);
+                    exceeded.store(true, Ordering::Release);
+                    if let Some(path) = spill_path.as_deref() {
+                        let mut file = std::fs::File::create(path)?;
+                        write_spill_output(
+                            &mut file,
+                            &mut spilled_bytes,
+                            &mut spill_cap_noted,
+                            &output,
+                            MAX_SPILL_BYTES,
+                            &session_budget,
+                            MAX_SESSION_SPILL_BYTES,
+                        )?;
+                        write_spill_output(
+                            &mut file,
+                            &mut spilled_bytes,
+                            &mut spill_cap_noted,
+                            &bytes[remaining..],
+                            MAX_SPILL_BYTES,
+                            &session_budget,
+                            MAX_SESSION_SPILL_BYTES,
+                        )?;
+                        super::chown_private_path_if_root(path)?;
+                        spill = Some(file);
+                    }
+                }
+            } else if let Some(file) = spill.as_mut() {
+                write_spill_output(
+                    file,
+                    &mut spilled_bytes,
+                    &mut spill_cap_noted,
+                    bytes,
+                    MAX_SPILL_BYTES,
+                    &session_budget,
+                    MAX_SESSION_SPILL_BYTES,
+                )?;
             }
         }
     })
+}
+
+fn write_spill_output(
+    file: &mut std::fs::File,
+    spilled_bytes: &mut u64,
+    cap_noted: &mut bool,
+    bytes: &[u8],
+    max_spill_bytes: u64,
+    session_budget: &AtomicU64,
+    max_session_spill_bytes: u64,
+) -> std::io::Result<()> {
+    // stdout and stderr reader threads share one session budget, so the byte
+    // reservation must be atomic: load -> compare_exchange, then write only
+    // the reserved prefix. A plain check-then-write could let both streams
+    // consume the same remaining quota and break the session hard cap.
+    let file_remaining =
+        usize::try_from(max_spill_bytes.saturating_sub(*spilled_bytes)).unwrap_or(usize::MAX);
+    let requested = bytes.len().min(file_remaining);
+    let mut reserved = 0usize;
+    if requested > 0 {
+        loop {
+            let current = session_budget.load(Ordering::Relaxed);
+            let session_remaining =
+                usize::try_from(max_session_spill_bytes.saturating_sub(current))
+                    .unwrap_or(usize::MAX);
+            let write = requested.min(session_remaining);
+            if write == 0 {
+                break;
+            }
+            let next = current.saturating_add(u64::try_from(write).unwrap_or(u64::MAX));
+            if session_budget
+                .compare_exchange(current, next, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                file.write_all(&bytes[..write])?;
+                *spilled_bytes += u64::try_from(write).unwrap_or(u64::MAX);
+                reserved = write;
+                break;
+            }
+        }
+    }
+    if reserved < bytes.len() && !*cap_noted {
+        let marker: &[u8] = if *spilled_bytes >= max_spill_bytes {
+            b"\n[full output truncated: spill cap reached]\n"
+        } else {
+            b"\n[session spill budget reached]\n"
+        };
+        file.write_all(marker)?;
+        // Markers are tiny but count toward both caps so the runtime counter
+        // stays consistent with the on-disk file sizes used as the seed.
+        session_budget.fetch_add(marker.len() as u64, Ordering::Relaxed);
+        *spilled_bytes += marker.len() as u64;
+        *cap_noted = true;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1253,6 +1418,7 @@ printf 'input=%s own=%s temp=%s\n' "$input" "$own" "$(IFS= read -r value < "$TMP
             .join(SKILL_EXEC_DIRECTORY)
             .join(SKILL_EXEC_TEMP_DIRECTORY);
         let tools = ["read".into(), "skill_exec".into()];
+        let spill_budget = Arc::new(AtomicU64::new(0));
         let context = SkillExecExecutionContext {
             packages_root: &fixture.packages_root,
             temp_root: &temp_root,
@@ -1260,6 +1426,7 @@ printf 'input=%s own=%s temp=%s\n' "$input" "$own" "$(IFS= read -r value < "$TMP
             workdir: &fixture.run_env.workdir,
             tools: &tools,
             stop: &stop,
+            spill_budget: &spill_budget,
             disconnected: &disconnected,
             hub_url: None,
             maintenance_token_file: None,
@@ -1297,6 +1464,7 @@ printf 'workspace-read-denied\n'
             .join(SKILL_EXEC_DIRECTORY)
             .join(SKILL_EXEC_TEMP_DIRECTORY);
         let tools = ["skill_exec".into()];
+        let spill_budget = Arc::new(AtomicU64::new(0));
         let context = SkillExecExecutionContext {
             packages_root: &fixture.packages_root,
             temp_root: &temp_root,
@@ -1304,6 +1472,7 @@ printf 'workspace-read-denied\n'
             workdir: &fixture.run_env.workdir,
             tools: &tools,
             stop: &stop,
+            spill_budget: &spill_budget,
             disconnected: &disconnected,
             hub_url: None,
             maintenance_token_file: None,
@@ -1330,6 +1499,7 @@ printf 'workspace-read-denied\n'
             .join(SKILL_EXEC_DIRECTORY)
             .join(SKILL_EXEC_TEMP_DIRECTORY);
         let tools = ["read".into(), "skill_exec".into()];
+        let spill_budget = Arc::new(AtomicU64::new(0));
         let context = SkillExecExecutionContext {
             packages_root: &fixture.packages_root,
             temp_root: &temp_root,
@@ -1337,6 +1507,7 @@ printf 'workspace-read-denied\n'
             workdir: &fixture.run_env.workdir,
             tools: &tools,
             stop: &stop,
+            spill_budget: &spill_budget,
             disconnected: &disconnected,
             hub_url: None,
             maintenance_token_file: None,
@@ -1367,6 +1538,7 @@ printf '%s\n' "$!" > "$1"
             .join(SKILL_EXEC_DIRECTORY)
             .join(SKILL_EXEC_TEMP_DIRECTORY);
         let tools = ["write".into(), "skill_exec".into()];
+        let spill_budget = Arc::new(AtomicU64::new(0));
         let context = SkillExecExecutionContext {
             packages_root: &fixture.packages_root,
             temp_root: &temp_root,
@@ -1374,6 +1546,7 @@ printf '%s\n' "$!" > "$1"
             workdir: &fixture.run_env.workdir,
             tools: &tools,
             stop: &stop,
+            spill_budget: &spill_budget,
             disconnected: &disconnected,
             hub_url: None,
             maintenance_token_file: None,
@@ -1455,6 +1628,7 @@ printf '%s\n' "$!" > "$1"
             .join(SKILL_EXEC_DIRECTORY)
             .join(SKILL_EXEC_TEMP_DIRECTORY);
         let tools = ["read".into(), "skill_exec".into()];
+        let spill_budget = Arc::new(AtomicU64::new(0));
         let context = SkillExecExecutionContext {
             packages_root: &fixture.packages_root,
             temp_root: &temp_root,
@@ -1462,6 +1636,7 @@ printf '%s\n' "$!" > "$1"
             workdir: &fixture.run_env.workdir,
             tools: &tools,
             stop: &stop,
+            spill_budget: &spill_budget,
             disconnected: &disconnected,
             hub_url: None,
             maintenance_token_file: None,
@@ -1469,6 +1644,234 @@ printf '%s\n' "$!" > "$1"
         let output = execute_program(&fixture.program, &request, &context).unwrap();
         assert!(output.timed_out);
         assert!(output.elapsed < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn bounded_reader_spills_full_output_to_file_when_exceeding_cap() {
+        let exceeded = Arc::new(AtomicBool::new(false));
+        let dir = tempfile::tempdir().unwrap();
+        let spill = dir.path().join("full.log");
+        let data = vec![b'z'; MAX_OUTPUT_BYTES + 4096];
+        let session_budget = Arc::new(AtomicU64::new(0));
+        let handle = bounded_reader(
+            std::io::Cursor::new(data.clone()),
+            Some(spill.clone()),
+            Arc::clone(&exceeded),
+            Arc::clone(&session_budget),
+        );
+        let output = handle.join().unwrap().unwrap();
+        assert_eq!(output, &data[..MAX_OUTPUT_BYTES]);
+        assert!(exceeded.load(Ordering::Acquire));
+        assert_eq!(fs::read(&spill).unwrap(), data);
+        assert!(session_budget.load(Ordering::Acquire) >= data.len() as u64);
+    }
+
+    #[test]
+    fn bounded_reader_skips_spill_when_output_fits() {
+        let exceeded = Arc::new(AtomicBool::new(false));
+        let dir = tempfile::tempdir().unwrap();
+        let spill = dir.path().join("full.log");
+        let data = vec![b'q'; 1024];
+        let session_budget = Arc::new(AtomicU64::new(0));
+        let handle = bounded_reader(
+            std::io::Cursor::new(data.clone()),
+            Some(spill.clone()),
+            Arc::clone(&exceeded),
+            Arc::clone(&session_budget),
+        );
+        let output = handle.join().unwrap().unwrap();
+        assert_eq!(output, data);
+        assert!(!exceeded.load(Ordering::Acquire));
+        assert!(!spill.exists());
+        assert_eq!(session_budget.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn write_spill_output_stops_at_the_cap_and_marks_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capped.log");
+        let mut file = std::fs::File::create(&path).unwrap();
+        let mut spilled = 0_u64;
+        let mut cap_noted = false;
+        let session_budget = AtomicU64::new(0);
+        let payload = vec![b'a'; 1024];
+        for _ in 0..10 {
+            write_spill_output(
+                &mut file,
+                &mut spilled,
+                &mut cap_noted,
+                &payload,
+                2048,
+                &session_budget,
+                MAX_SESSION_SPILL_BYTES,
+            )
+            .unwrap();
+        }
+        let marker = b"\n[full output truncated: spill cap reached]\n".len() as u64;
+        assert_eq!(spilled, 2048 + marker);
+        assert_eq!(session_budget.load(Ordering::Acquire), 2048 + marker);
+        assert!(cap_noted);
+        let written = fs::read(&path).unwrap();
+        assert!(written.ends_with(b"\n[full output truncated: spill cap reached]\n"));
+        assert_eq!(written.len(), (2048 + marker) as usize);
+    }
+
+    #[test]
+    fn session_spill_budget_seeds_from_existing_spill_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("unrelated.log"), b"x").unwrap();
+        assert_eq!(session_spill_bytes(dir.path()).unwrap(), 0);
+
+        let full = std::fs::File::create(dir.path().join("call-1-stdout.log")).unwrap();
+        full.set_len(MAX_SESSION_SPILL_BYTES).unwrap();
+        drop(full);
+        assert_eq!(
+            session_spill_bytes(dir.path()).unwrap(),
+            MAX_SESSION_SPILL_BYTES
+        );
+
+        let nearly = std::fs::File::create(dir.path().join("call-2-stderr.log")).unwrap();
+        nearly.set_len(MAX_SESSION_SPILL_BYTES - 1).unwrap();
+        drop(nearly);
+        assert_eq!(
+            session_spill_bytes(dir.path()).unwrap(),
+            MAX_SESSION_SPILL_BYTES.saturating_mul(2) - 1
+        );
+    }
+
+    #[test]
+    fn write_spill_output_shared_session_budget_is_a_hard_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("first-stdout.log");
+        let second_path = dir.path().join("second-stderr.log");
+        let mut first = std::fs::File::create(&first_path).unwrap();
+        let mut second = std::fs::File::create(&second_path).unwrap();
+        let mut first_spilled = 0_u64;
+        let mut second_spilled = 0_u64;
+        let mut first_noted = false;
+        let mut second_noted = false;
+        let session_budget = AtomicU64::new(0);
+        let payload = vec![b'b'; 1024];
+        // 10 chunks across two streams with an 8 KiB session budget: the total
+        // written to disk must never exceed the budget.
+        for _ in 0..5 {
+            write_spill_output(
+                &mut first,
+                &mut first_spilled,
+                &mut first_noted,
+                &payload,
+                MAX_SPILL_BYTES,
+                &session_budget,
+                8 * 1024,
+            )
+            .unwrap();
+            write_spill_output(
+                &mut second,
+                &mut second_spilled,
+                &mut second_noted,
+                &payload,
+                MAX_SPILL_BYTES,
+                &session_budget,
+                8 * 1024,
+            )
+            .unwrap();
+        }
+        let first_len = fs::metadata(&first_path).unwrap().len();
+        let second_len = fs::metadata(&second_path).unwrap().len();
+        let marker = b"\n[session spill budget reached]\n".len() as u64;
+        assert!(first_len + second_len <= 8 * 1024 + 2 * marker);
+        assert!(first_noted || second_noted);
+        assert!(session_budget.load(Ordering::Acquire) <= 8 * 1024 + 2 * marker);
+    }
+
+    #[test]
+    fn write_spill_output_concurrent_streams_respect_shared_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("a-stdout.log");
+        let second_path = dir.path().join("b-stderr.log");
+        let budget: u64 = 32 * 1024;
+        let session_budget = Arc::new(AtomicU64::new(0));
+        let payload = vec![b'c'; 4096];
+        let first = std::thread::spawn({
+            let session_budget = Arc::clone(&session_budget);
+            let payload = payload.clone();
+            let path = first_path.clone();
+            move || {
+                let mut file = std::fs::File::create(&path).unwrap();
+                let mut spilled = 0_u64;
+                let mut noted = false;
+                for _ in 0..100 {
+                    write_spill_output(
+                        &mut file,
+                        &mut spilled,
+                        &mut noted,
+                        &payload,
+                        MAX_SPILL_BYTES,
+                        &session_budget,
+                        budget,
+                    )
+                    .unwrap();
+                }
+            }
+        });
+        let second = std::thread::spawn({
+            let session_budget = Arc::clone(&session_budget);
+            let payload = payload.clone();
+            let path = second_path.clone();
+            move || {
+                let mut file = std::fs::File::create(&path).unwrap();
+                let mut spilled = 0_u64;
+                let mut noted = false;
+                for _ in 0..100 {
+                    write_spill_output(
+                        &mut file,
+                        &mut spilled,
+                        &mut noted,
+                        &payload,
+                        MAX_SPILL_BYTES,
+                        &session_budget,
+                        budget,
+                    )
+                    .unwrap();
+                }
+            }
+        });
+        first.join().unwrap();
+        second.join().unwrap();
+        let marker = b"\n[session spill budget reached]\n".len() as u64;
+        let total =
+            fs::metadata(&first_path).unwrap().len() + fs::metadata(&second_path).unwrap().len();
+        assert!(total <= budget + 2 * marker);
+        assert!(session_budget.load(Ordering::Acquire) <= budget + 2 * marker);
+    }
+
+    #[test]
+    fn skill_output_overflow_spills_full_log_and_marks_preview() {
+        let fixture = fixture(
+            r#"#!/bin/sh
+i=0
+while [ "$i" -lt 22000 ]; do
+  printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n'
+  i=$((i+1))
+done
+"#,
+        );
+        write_catalog_name(&fixture, "deploy");
+        let broker = SkillExecBroker::start(
+            &fixture.run_env,
+            &["read".into(), "skill_exec".into()],
+            "http://127.0.0.1:8080",
+            None,
+        )
+        .unwrap();
+        let response = send_broker_request(&broker, "deploy");
+        assert!(response.ok);
+        assert!(response.output_limit_exceeded);
+        let full_path = response.stdout_full_path.as_deref().expect("spill path");
+        let full_path = PathBuf::from(full_path);
+        assert!(full_path.exists());
+        assert_eq!(fs::metadata(&full_path).unwrap().len(), 1_430_000);
+        assert!(response.stdout.len() <= MAX_OUTPUT_BYTES);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 ## 范围
 
-1. Agent 支持更新 name、Markdown instructions、visibility、`public_to`、Runtime 约束、managed Skills、MCP allowlist 和显式 tool allowlist。
+1. Agent 支持更新 name、Markdown instructions、visibility、`public_to`、Runtime 约束、managed Skills、MCP allowlist 和显式 tool allowlist。`admin` 可查看、修改并删除任意 Agent（包括 `super_admin` 创建的），并查看其 Run 历史；`admin` 编辑 `super_admin` 创建的 Agent 时，模型下拉只展示 Global 连接（保留原 Personal 选择不变仍可保存）。
 2. `private`、`public_to` 和 `public` 仍是完整后端权限模型；只有 `admin` 和 `super_admin` 可创建或把 Agent 改为 `public`。
 3. sandbox policy 继续持久化并参与 Runtime 执行但不在管理台展示；模型改用 `docs/model-connections-spec.md` 的独立 Model Connection、Agent default、reasoning effort 和 Subagent Definition 表单。
 4. Agent 只绑定 Hub-managed Skills，不提供 `skills_manifest` 或 inline Skill。页面默认展示已启用 Skill，选择放在独立子菜单。
@@ -23,6 +23,7 @@
 - Agent instructions 使用统一所见即所得/Markdown 源码编辑器，新建和编辑默认只显示操作按钮。
 - Agent 可选择 owner 范围内的默认 Model Connection 和 reasoning effort，并通过子表单维护不扩大 Workspace、Skill、MCP 或 sandbox 权限的 Subagent Definitions。
 - member 无法在 UI 或 API 中创建 `public` Agent；admin/super_admin 可以。
+- `admin` 可列出、加载、修改并删除 `super_admin` 创建的 Agent，并可查看其 Run；普通 `member` 仍不能访问 private `super_admin` Agent。
 - 管理台不出现 raw model policy JSON、sandbox policy 或 inline Skill 编辑器；模型只通过结构化 Model Connection 和 reasoning controls 配置。
 - Skill 选择器默认收起，已启用 Skill 在主页直接可见。
 - MCP 表格中 secret 始终脱敏，保存脱敏占位符不覆盖旧值。
