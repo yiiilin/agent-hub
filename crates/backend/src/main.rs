@@ -10801,7 +10801,7 @@ async fn stop_widget_run(
                 model_subject_user_id, model_source_integration_app_id
          FROM runs
          WHERE id = $1 AND agent_id = $2 AND owner_id = $3
-           AND (($4::boolean = true AND source = 'widget')
+           AND (($4::boolean = true AND source IN ('widget', 'integration:tool_result'))
                 OR ($4::boolean = false AND widget_session_id = $5))",
     )
     .bind(run_id)
@@ -11690,7 +11690,7 @@ async fn lock_client_tool_batch_tx(
                 model_subject_user_id, model_source_integration_app_id
          FROM runs
          WHERE id = $1 AND agent_id = $2 AND owner_id = $3
-           AND hub_session_id = $4 AND source = 'widget'
+           AND hub_session_id = $4 AND source IN ('widget', 'integration:tool_result')
            AND client_instance_id IS NOT NULL
          FOR UPDATE",
     )
@@ -22850,7 +22850,7 @@ async fn authorize_run_stream(
         let run = sqlx::query(
             "SELECT integration_session_id, hub_session_id FROM runs
              WHERE id = $1 AND agent_id = $2 AND owner_id = $3
-               AND (($4::boolean = true AND source = 'widget')
+               AND (($4::boolean = true AND source IN ('widget', 'integration:tool_result'))
                     OR ($4::boolean = false AND widget_session_id = $5))",
         )
         .bind(run_id)
@@ -30268,6 +30268,173 @@ mod tests {
             }),
         )
         .await
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn client_tool_continuation_run_supports_claim_stream_and_stop(pool: PgPool) {
+        let fixture = prepare_client_tool_run(pool, &["first_action", "second_action"]).await;
+        // 第一批工具请求（原 widget run）。
+        runtime_finalize_tool_requests(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(fixture.run.id),
+            runtime_write(FinalizeToolRequestsRequest {
+                integration_session_id: fixture.run.integration_session_id,
+                native_session_id: "client-tool-native-session".into(),
+                work_dir_ref: "client-tool-workdir".into(),
+                tool_requests: vec![FinalizeToolRequestEvent {
+                    role: Some("assistant".into()),
+                    content: Some("first_action requested".into()),
+                    payload: json!({
+                        "tool_request_id": fixture.tool_call_ids[0],
+                        "tool_name": "first_action",
+                        "arguments": { "position": 0 }
+                    }),
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+        // 浏览器认领并提交工具结果后，Hub 创建续跑 run（integration:tool_result）。
+        let first_claim = claim_client_tool_call(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(fixture.tool_call_ids[0]),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(first_claim.status, "claimed");
+        let submitted = submit_client_tool_result(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(fixture.tool_call_ids[0]),
+            Json(SubmitClientToolResultRequest {
+                result: ClientToolResultDto::Success {
+                    output: json!({ "opened": true }),
+                },
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let continuation = submitted.run.unwrap();
+        assert_eq!(continuation.source, "integration:tool_result");
+        assert_eq!(continuation.parent_run_id, Some(fixture.run.id));
+
+        // runtime 认领续跑 run 后，模型在续跑 turn 中再次请求工具。
+        let generation: i64 = sqlx::query_scalar(
+            "SELECT ownership_generation FROM hub_sessions WHERE id = $1",
+        )
+        .bind(fixture.run.hub_session_id.unwrap())
+        .fetch_one(&fixture.app.state.pool)
+        .await
+        .unwrap();
+        let claimed_response = runtime_claim_run(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            runtime_claim_request(
+                0,
+                vec![RuntimeOwnedSessionGenerationDto {
+                    session_id: fixture.run.hub_session_id.unwrap(),
+                    ownership_generation: generation,
+                }],
+            ),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(claimed_response.status(), StatusCode::OK);
+        let continuation_runtime: Uuid =
+            sqlx::query_scalar("SELECT runtime_id FROM runs WHERE id = $1")
+                .bind(continuation.id)
+                .fetch_one(&fixture.app.state.pool)
+                .await
+                .unwrap();
+        let agent_runtime: Uuid =
+            sqlx::query_scalar("SELECT runtime_id FROM agents WHERE id = $1")
+                .bind(fixture.app.agent_id)
+                .fetch_one(&fixture.app.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(continuation_runtime, agent_runtime);
+
+        // 续跑 run 保留 Run Tool Executor（发起方浏览器）。
+        let executor: Uuid =
+            sqlx::query_scalar("SELECT client_instance_id FROM runs WHERE id = $1")
+                .bind(continuation.id)
+                .fetch_one(&fixture.app.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(executor, fixture.executor.client_instance_id);
+
+        // 续跑 run 中模型再次请求工具：runtime 激活续跑 turn 后提交第二个 batch。
+        let fingerprint = format!("sha256:{}", "a".repeat(64));
+        let _ = runtime_begin_turn(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(continuation.id),
+            runtime_write_generation(generation, BeginRuntimeTurnRequest {
+                configuration_fingerprint: fingerprint,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let second_call_id = Uuid::new_v4();
+        runtime_finalize_tool_requests(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(continuation.id),
+            runtime_write(FinalizeToolRequestsRequest {
+                integration_session_id: continuation.integration_session_id,
+                native_session_id: "client-tool-native-session".into(),
+                work_dir_ref: "client-tool-workdir".into(),
+                tool_requests: vec![FinalizeToolRequestEvent {
+                    role: Some("assistant".into()),
+                    content: Some("second_action requested".into()),
+                    payload: json!({
+                        "tool_request_id": second_call_id,
+                        "tool_name": "second_action",
+                        "arguments": { "position": 0 }
+                    }),
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+
+        // 修复前：浏览器 claim 续跑 run 的工具会 404 "Client Tool Run not found"。
+        let claim = claim_client_tool_call(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(second_call_id),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(claim.status, "claimed");
+
+        // 续跑 run 的事件流可授权（修复前 forbidden）。
+        authorize_run_stream(
+            &fixture.app.state,
+            &bearer_headers(&fixture.executor.access_token),
+            continuation.id,
+        )
+        .await
+        .unwrap();
+
+        // 续跑 run 可被浏览器停止（修复前 404）。
+        let stopped = stop_widget_run(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(continuation.id),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(stopped.status, "interrupted");
     }
 
     #[sqlx::test(migrations = "./migrations")]
