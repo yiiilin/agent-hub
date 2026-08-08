@@ -23099,8 +23099,7 @@ async fn load_widget_session_events_after_tx(
              JOIN runs ON runs.id = event.run_id
              WHERE runs.integration_session_id = $1
                AND runs.hub_session_id = $2
-               AND event.seq > $3
-             ORDER BY event.seq ASC",
+               AND event.seq > $3",
         );
         if let Some(limit) = limit {
             // 取最近 n 条（倒序截取后恢复正序），用于历史恢复场景。
@@ -23108,6 +23107,8 @@ async fn load_widget_session_events_after_tx(
                 "SELECT * FROM ({query} ORDER BY event.seq DESC LIMIT {}) AS recent ORDER BY seq ASC",
                 limit.max(1).min(2000)
             );
+        } else {
+            query.push_str(" ORDER BY event.seq ASC");
         }
         sqlx::query(&query)
         .bind(integration_session_id)
@@ -23122,8 +23123,7 @@ async fn load_widget_session_events_after_tx(
              FROM run_events AS event
              JOIN runs ON runs.id = event.run_id
              WHERE runs.hub_session_id = $1
-               AND event.seq > $2
-             ORDER BY event.seq ASC",
+               AND event.seq > $2",
         );
         if let Some(limit) = limit {
             // 取最近 n 条（倒序截取后恢复正序），用于历史恢复场景。
@@ -23131,6 +23131,8 @@ async fn load_widget_session_events_after_tx(
                 "SELECT * FROM ({query} ORDER BY event.seq DESC LIMIT {}) AS recent ORDER BY seq ASC",
                 limit.max(1).min(2000)
             );
+        } else {
+            query.push_str(" ORDER BY event.seq ASC");
         }
         sqlx::query(&query)
         .bind(session.hub_session_id)

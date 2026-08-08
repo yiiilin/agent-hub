@@ -1027,6 +1027,96 @@ export class AgentHubClient {
     await this.#authorizeFresh();
     if (handlers) this.registerTools(handlers);
     await this.#cleanupJournal();
+    await this.#recoverPendingTools();
+  }
+
+  /**
+   * 刷新/重连后恢复未完成的客户端工具调用：页面在工具执行中关闭/刷新时，
+   * journal 会遗留 executing/unknown 状态的条目。重新认领（Hub 幂等）并
+   * 执行 handler、提交结果，让操作无缝续上；Hub 侧已结束或属于其他
+   * Client Instance 的调用会被跳过或清理。
+   */
+  async #recoverPendingTools(): Promise<void> {
+    let entries: ToolJournalEntry[];
+    try {
+      entries = await this.#journal.list(this.clientInstanceId);
+    } catch {
+      return;
+    }
+    const pending = entries.filter((entry) =>
+      ["recorded", "executing", "unknown"].includes(entry.state)
+    );
+    for (const entry of pending) {
+      try {
+        const claim = await this.#requestJson<ClaimResponse>(
+          `/api/client/tool-calls/${encodeURIComponent(entry.toolCallId)}/claim`,
+          { method: "POST", body: "{}" },
+          { transientRetries: 1 },
+        );
+        const claimStatus = claim.status ?? claim.claim_status ?? (claim.terminal ? "terminal" : "claimed");
+        if (claim.terminal || ["completed", "failed", "expired", "timed_out", "terminal"].includes(claimStatus)) {
+          await this.#journal.delete(this.clientInstanceId, entry.toolCallId);
+          continue;
+        }
+        if (["completed", "acknowledged"].includes(entry.state)) {
+          continue;
+        }
+
+        const handler = this.#handlers.get(entry.toolName);
+        let result: ToolResult;
+        if (!handler) {
+          result = {
+            status: "error",
+            error: {
+              code: "tool_handler_not_registered",
+              message: `No handler is registered for Client Tool "${entry.toolName}"`,
+              retryable: false,
+            },
+          };
+        } else {
+          const controller = new AbortController();
+          const deadline = new Promise<never>((_resolve, reject) => {
+            globalThis.setTimeout(() => {
+              controller.abort(new DOMException("Client Tool deadline reached", "TimeoutError"));
+              reject(new DOMException("Client Tool deadline reached", "TimeoutError"));
+            }, 5 * 60_000);
+          });
+          try {
+            const output = await Promise.race([
+              handler(entry.input, {
+                toolCallId: entry.toolCallId,
+                sessionId: entry.sessionId,
+                ...(entry.runId ? { runId: entry.runId } : {}),
+                signal: combinedSignal(controller.signal, this.#lifetime.signal),
+              }),
+              deadline,
+            ]);
+            controller.abort();
+            result = checkedToolResult(output);
+          } catch (error) {
+            controller.abort();
+            result = {
+              status: "error",
+              error: {
+                code: "tool_handler_failed",
+                message: error instanceof Error ? error.message : "Client Tool handler failed",
+                retryable: false,
+              },
+            };
+          }
+        }
+        await this.#submitToolResult(entry.toolCallId, result);
+        const completed: ToolJournalEntry = { ...entry, result, state: "completed", updatedAt: Date.now() };
+        await this.#journal.put(completed);
+        await this.#acknowledgeEntry(completed);
+      } catch (error) {
+        if (error instanceof AgentHubError && (error.status === 404 || error.status === 403)) {
+          await this.#journal.delete(this.clientInstanceId, entry.toolCallId).catch(() => undefined);
+          continue;
+        }
+        await this.#journal.put({ ...entry, state: "unknown", updatedAt: Date.now() }).catch(() => undefined);
+      }
+    }
   }
 
   async #authorizeFresh(): Promise<void> {
