@@ -215,6 +215,8 @@ export interface ToolHandlerContext {
   sessionId: string;
   runId?: string;
   signal: AbortSignal;
+  /** 是否为会话恢复（刷新/重连）时补执行遗留调用；此时 handler 不应阻塞等待用户交互。 */
+  recovering?: boolean;
 }
 
 export type ToolHandler = (

@@ -1163,6 +1163,7 @@ export class AgentHubClient {
               sessionId: entry.sessionId,
               ...(entry.runId ? { runId: entry.runId } : {}),
               signal: combinedSignal(controller.signal, this.#lifetime.signal, signal),
+              recovering: true,
             }),
             deadline,
           ]);
