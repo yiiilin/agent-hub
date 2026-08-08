@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 本文件记录 Agent Hub 各正式版本面向使用者的变化。
 
+## [0.3.4] - 2026-08-08
+
+### Fixed
+
+- 修复 Client Tool 续跑 run（`source = integration:tool_result`）中工具请求无法被浏览器认领、事件流被拒绝授权、运行无法停止的问题：此前链式工具调用会返回 404 并让会话卡在 `waiting_tool`，现与 widget run 一样支持认领、流授权与停止，Executor 的 `client_instance_id` 校验保持不变。
+
 ## [0.3.3] - 2026-08-07
 
 ### Added
