@@ -1204,9 +1204,13 @@ export class AgentHubClient {
   async #events(sessionId: string, options: EventListOptions): Promise<SessionEvent[]> {
     const after = options.after ?? 0;
     if (!Number.isInteger(after) || after < 0) throw new Error("event cursor must be a non-negative integer");
+    const limit = options.limit;
     const value = await this.#requestJson<unknown>(pathWithQuery(
       `${PATHS.sessions}/${encodeURIComponent(sessionId)}/events`,
-      { after: after > 0 ? after : undefined },
+      {
+        after: after > 0 ? after : undefined,
+        ...(limit !== undefined ? { limit: String(limit) } : {}),
+      },
     ), {}, { signal: options.signal });
     if (!Array.isArray(value)) {
       throw new AgentHubError(500, "invalid_response", "Agent Hub returned an invalid event list");

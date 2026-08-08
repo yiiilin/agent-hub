@@ -7980,6 +7980,7 @@ async fn list_run_events(
 #[derive(Debug, Deserialize)]
 struct EventStreamQuery {
     after: Option<i64>,
+    limit: Option<i64>,
 }
 
 async fn stream_run_events(
@@ -10428,7 +10429,7 @@ async fn list_widget_session_events(
         false,
     )
     .await?;
-    let events = load_widget_session_events_after_tx(&mut tx, &scoped, after).await?;
+    let events = load_widget_session_events_after_tx(&mut tx, &scoped, after, query.limit).await?;
     tx.commit().await?;
     Ok(Json(events))
 }
@@ -10471,7 +10472,7 @@ async fn stream_widget_session_events(
                     false,
                 )
                 .await?;
-                let events = load_widget_session_events_after_tx(&mut tx, &scoped, last_seq).await?;
+                let events = load_widget_session_events_after_tx(&mut tx, &scoped, last_seq, None).await?;
                 tx.commit().await?;
                 Ok::<_, ApiError>(events)
             }.await;
@@ -23088,9 +23089,10 @@ async fn load_widget_session_events_after_tx(
     tx: &mut Transaction<'_, Postgres>,
     session: &WidgetScopedSession,
     after: i64,
+    limit: Option<i64>,
 ) -> Result<Vec<RunEventDto>, ApiError> {
     let rows = if let Some(integration_session_id) = session.integration_session_id {
-        sqlx::query(
+        let mut query = String::from(
             "SELECT event.seq, event.event_id, event.run_id, event.event_type,
                     event.role, event.content, event.payload, event.created_at
              FROM run_events AS event
@@ -23099,14 +23101,22 @@ async fn load_widget_session_events_after_tx(
                AND runs.hub_session_id = $2
                AND event.seq > $3
              ORDER BY event.seq ASC",
-        )
+        );
+        if let Some(limit) = limit {
+            // 取最近 n 条（倒序截取后恢复正序），用于历史恢复场景。
+            query = format!(
+                "SELECT * FROM ({query} ORDER BY event.seq DESC LIMIT {}) AS recent ORDER BY seq ASC",
+                limit.max(1).min(2000)
+            );
+        }
+        sqlx::query(&query)
         .bind(integration_session_id)
         .bind(session.hub_session_id)
         .bind(after)
         .fetch_all(&mut **tx)
         .await?
     } else {
-        sqlx::query(
+        let mut query = String::from(
             "SELECT event.seq, event.event_id, event.run_id, event.event_type,
                     event.role, event.content, event.payload, event.created_at
              FROM run_events AS event
@@ -23114,7 +23124,15 @@ async fn load_widget_session_events_after_tx(
              WHERE runs.hub_session_id = $1
                AND event.seq > $2
              ORDER BY event.seq ASC",
-        )
+        );
+        if let Some(limit) = limit {
+            // 取最近 n 条（倒序截取后恢复正序），用于历史恢复场景。
+            query = format!(
+                "SELECT * FROM ({query} ORDER BY event.seq DESC LIMIT {}) AS recent ORDER BY seq ASC",
+                limit.max(1).min(2000)
+            );
+        }
+        sqlx::query(&query)
         .bind(session.hub_session_id)
         .bind(after)
         .fetch_all(&mut **tx)

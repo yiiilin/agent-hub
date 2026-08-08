@@ -94,6 +94,8 @@ export interface MessagePage {
 
 export interface EventListOptions {
   after?: number;
+  /** 最多返回的事件条数（用于历史恢复时限制拉取量；省略则返回全部）。 */
+  limit?: number;
   signal?: AbortSignal;
 }
 
