@@ -367,6 +367,8 @@ pub enum ModelReasoningSummarySupport {
 pub struct ModelConnectionDto {
     pub id: Uuid,
     pub owner_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_email: Option<String>,
     pub scope: ModelConnectionScope,
     pub name: String,
     pub base_url: String,
@@ -854,6 +856,8 @@ pub struct AgentDto {
     #[serde(default = "default_agent_tool_allowlist")]
     pub tool_allowlist: Vec<String>,
     pub owner_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_email: Option<String>,
     pub is_owner: bool,
     pub can_manage: bool,
     pub can_administer: bool,
@@ -992,6 +996,8 @@ pub struct WidgetHistorySessionDto {
 pub struct SkillDto {
     pub id: Uuid,
     pub owner_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_email: Option<String>,
     pub name: String,
     pub description: String,
     pub content: String,
@@ -2548,6 +2554,7 @@ mod tests {
         let dto = ModelConnectionDto {
             id: Uuid::from_u128(101),
             owner_id: Some(Uuid::from_u128(102)),
+            owner_email: None,
             scope: ModelConnectionScope::Personal,
             name: "Provider access".into(),
             base_url: "https://models.example.test".into(),

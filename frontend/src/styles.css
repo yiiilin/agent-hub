@@ -1347,14 +1347,14 @@ textarea {
 .skills-list { border: 1px solid #d5dee9; background: #fff; }
 .skill-list-header { display: flex; align-items: center; min-height: 42px; border-bottom: 1px solid #d7e0e9; padding: 8px 18px; background: #f5f7fa; }
 .skill-list-header .check-row { width: auto; }
-.skill-list-row { display: grid; grid-template-columns: 22px minmax(0, 1fr) 140px minmax(180px, 230px); align-items: center; gap: 18px; min-height: 74px; padding: 13px 18px; border-bottom: 1px solid #e0e7ef; color: #253044; }
+.skill-list-row { display: grid; grid-template-columns: 22px minmax(0, 1fr) 150px 170px minmax(150px, 200px); align-items: center; gap: 18px; min-height: 74px; padding: 13px 18px; border-bottom: 1px solid #e0e7ef; color: #253044; }
 .skill-list-row:last-child { border-bottom: 0; }
 .skill-list-row:hover { background: #f4f7fa; }
 .skill-list-row > input { width: 16px; height: 16px; margin: 0; }
 .skill-list-main { display: grid; gap: 5px; min-width: 0; }
 .skill-list-main { color: inherit; text-decoration: none; }
 .skill-list-main strong, .skill-list-main span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.skill-list-main span, .skill-list-row time, .skill-list-usage { color: #68768a; font-size: 13px; }
+.skill-list-main span, .skill-list-row time, .skill-list-usage, .skill-list-owner { color: #68768a; font-size: 13px; }
 .skill-list-row time { text-align: right; }
 .state-panel { min-height: 180px; display: grid; place-content: center; justify-items: center; gap: 12px; text-align: center; }
 .state-panel h1, .state-panel p { margin: 0; }

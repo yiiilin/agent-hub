@@ -442,8 +442,8 @@ function ConnectionsTable({
     </div>
     <div className="models-table-wrap">
       <table className="models-table" aria-label={tableLabel}>
-        <thead><tr><th>{t('name')}</th><th>{mt('modelId')}</th><th>{mt('modelUpstreamProtocol')}</th><th>{mt('modelBaseUrl')}</th><th>{mt('modelScope')}</th><th>{t('status')}</th><th>{mt('systemDefault')}</th>{managementScope && <th>{mt('modelConnectionActions')}</th>}</tr></thead>
-        <tbody>{connections.length === 0 ? <tr><td className="models-empty-cell" colSpan={managementScope ? 8 : 7}>{emptyMessage}</td></tr> : connections.map((connection) => {
+        <thead><tr><th>{t('name')}</th><th>{mt('modelId')}</th><th>{mt('modelUpstreamProtocol')}</th><th>{mt('modelBaseUrl')}</th><th>{mt('modelScope')}</th><th>{t('createdBy')}</th><th>{t('status')}</th><th>{mt('systemDefault')}</th>{managementScope && <th>{mt('modelConnectionActions')}</th>}</tr></thead>
+        <tbody>{connections.length === 0 ? <tr><td className="models-empty-cell" colSpan={managementScope ? 9 : 8}>{emptyMessage}</td></tr> : connections.map((connection) => {
           const isSystemDefault = systemDefault?.connection_id === connection.id;
           const editLabel = actionLabel(mt('editModelConnectionAria'), connection);
           const testLabel = actionLabel(mt('testModelConnectionAria'), connection);
@@ -457,6 +457,7 @@ function ConnectionsTable({
             <td><code>{connection.api_type}</code></td>
             <td><code className="model-url">{connection.base_url}</code></td>
             <td><span className={`model-scope ${connection.scope}`}>{t((connection.scope === 'global' ? 'modelScopeGlobal' : 'modelScopePersonal') as TranslationKey)}</span></td>
+            <td>{connection.owner_email ?? ''}</td>
             <td><span className={`status ${connection.status}`}>{connection.status === 'enabled' ? t('enabled') : t('disabled')}</span></td>
             <td>{isSystemDefault ? <span className="model-default-mark"><Star size={14} /> <code>{systemDefault.model_id}</code></span> : t('none')}</td>
             {managementScope && <td><div className="models-table-actions">

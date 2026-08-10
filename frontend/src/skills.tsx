@@ -305,6 +305,7 @@ export function SkillsPage({ navigate }: { navigate: Navigate }) {
             <input type="checkbox" aria-label={t('selectSkill').replace('{name}', skill.name)} checked={selectedIds.includes(skill.id)} onChange={(event) => setSelectedIds((current) => event.target.checked ? [...current, skill.id] : current.filter((id) => id !== skill.id))} />
             <a className="skill-list-main" href={`/skills/${skill.id}`} onClick={(event) => appLink(event, `/skills/${skill.id}`, navigate)}><strong>{skill.name}</strong><span>{skill.description || t('noDescription')}</span></a>
             <span className="skill-list-usage">{loadingAgents ? t('loadingUsage') : agentsError ? t('skillUsageUnavailable') : count === 1 ? t('oneAgent') : t('agentCount').replace('{count}', String(count))}</span>
+            <span className="skill-list-owner">{skill.owner_email ?? ''}</span>
             <time dateTime={skill.updated_at}>{new Date(skill.updated_at).toLocaleString(locale)}</time>
           </div>;
         })}

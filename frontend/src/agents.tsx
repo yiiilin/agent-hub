@@ -28,7 +28,7 @@ import { builtInTools, normalizeToolAllowlist, ToolAllowlistPicker } from './com
 import { useI18n } from './i18n';
 
 type Navigate = (path: string, force?: boolean) => void;
-type SortField = 'name' | 'availability' | 'runtime' | 'visibility' | 'skills' | 'created';
+type SortField = 'name' | 'availability' | 'runtime' | 'visibility' | 'skills' | 'owner' | 'created';
 type SortDirection = 'asc' | 'desc';
 type Availability = 'automatic' | 'online' | 'offline' | 'unbound';
 
@@ -561,6 +561,7 @@ export function AgentsPage({ currentUser, navigate }: { currentUser: User; navig
       if (sortField === 'runtime') result = compareText(leftRuntime, rightRuntime);
       if (sortField === 'visibility') result = compareText(left.visibility, right.visibility);
       if (sortField === 'skills') result = left.managed_skill_ids.length - right.managed_skill_ids.length;
+      if (sortField === 'owner') result = compareText(left.owner_email ?? '', right.owner_email ?? '');
       if (sortField === 'created') result = Date.parse(left.created_at) - Date.parse(right.created_at);
       return result * direction || compareText(left.id, right.id) * direction;
     });
@@ -580,6 +581,7 @@ export function AgentsPage({ currentUser, navigate }: { currentUser: User; navig
     { field: 'runtime', label: t('agentRuntimeHostname') },
     { field: 'visibility', label: t('visibility') },
     { field: 'skills', label: t('agentManagedSkillCount') },
+    { field: 'owner', label: t('createdBy') },
     { field: 'created', label: t('created') }
   ];
 
@@ -612,6 +614,7 @@ export function AgentsPage({ currentUser, navigate }: { currentUser: User; navig
                       <td>{runtime?.hostname ?? (availability === 'automatic' ? t('agentAvailabilityAutomatic') : t('agentAvailabilityUnbound'))}</td>
                       <td>{visibilityLabel(agent.visibility, t)}</td>
                       <td>{agent.managed_skill_ids.length}</td>
+                      <td>{agent.owner_email ?? ''}</td>
                       <td><time dateTime={agent.created_at}>{new Date(agent.created_at).toLocaleString(locale)}</time></td>
                     </tr>;
                   })}</tbody>

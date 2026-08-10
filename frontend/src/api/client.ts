@@ -169,6 +169,7 @@ export type Agent = {
   model_settings: AgentModelSettings;
   subagents: SubagentDefinition[];
   owner_id: string;
+  owner_email?: string | null;
   is_owner: boolean;
   can_manage: boolean;
   can_administer: boolean;
@@ -240,6 +241,7 @@ export type WidgetRunTarget = {
 export type Skill = {
   id: string;
   owner_id: string;
+  owner_email?: string | null;
   name: string;
   description: string;
   content: string;
@@ -560,6 +562,7 @@ export type ModelConnectionStatus = 'enabled' | 'disabled';
 export type ModelConnection = {
   id: string;
   owner_id: string | null;
+  owner_email?: string | null;
   scope: ModelConnectionScope;
   name: string;
   base_url: string;
