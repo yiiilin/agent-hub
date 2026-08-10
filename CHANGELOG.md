@@ -6,6 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 本文件记录 Agent Hub 各正式版本面向使用者的变化。
 
+## [0.3.5] - 2026-08-10
+
+### Added
+
+- 技能共享：技能支持与智能体一致的可见性（private / public_to / public），所有用户可创建公开技能；遵循"可见即可读可挂载，可写才能改删"——共享技能可挂载到其他用户的智能体，编辑与删除仅限 owner 与 admin。
+- 智能体、技能、模型连接列表显示创建人（owner email）。
+- 自动化可绑定当前用户可调用的公共智能体（public / public_to），member 也能为公共智能体创建、编辑并触发自动化。
+- Widget 会话支持通过 Client API 删除（`DELETE /api/client/sessions/{session_id}`）。
+- Client 会话事件历史接口支持 `limit` 参数；断线重连与会话恢复后自动恢复 pending 的 Client 工具调用。
+- 登录页邮箱与密码占位符可在认证配置中自定义（管理台 → 认证配置，留空回退内置文案）。
+
+### Fixed
+
+- 思考内容折叠严格按 15 个视觉行截断（自动换行、空行均计入），折叠计数与实际显示一致。
+- 事件历史 limit 查询重复 ORDER BY 导致 500 的问题。
+- 智能体详情页左侧概览不再显示指令内容。
+- 登录页不再预填默认账号密码。
+
 ## [0.3.4] - 2026-08-08
 
 ### Fixed
