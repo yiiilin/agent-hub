@@ -1299,7 +1299,7 @@ fn openapi_schemas() -> Value {
         "PasswordRegistrationRequest": { "type": "object", "additionalProperties": false, "required": ["email", "password"], "properties": { "email": { "type": "string", "format": "email" }, "password": { "type": "string", "format": "password" }, "display_name": { "type": ["string", "null"] } } },
         "PasswordRegistrationResponse": { "type": "object", "required": ["user"], "properties": { "user": { "$ref": "#/components/schemas/User" } } },
         "AuthProvidersResponse": { "type": "object", "required": ["password_registration_enabled", "password_login_enabled", "ldap_login_enabled"], "properties": { "password_registration_enabled": { "type": "boolean" }, "password_login_enabled": { "type": "boolean" }, "ldap_login_enabled": { "type": "boolean" } } },
-        "AuthPolicy": { "type": "object", "additionalProperties": false, "required": ["password_registration_enabled", "password_login_enabled", "ldap_login_enabled"], "properties": { "password_registration_enabled": { "type": "boolean" }, "password_login_enabled": { "type": "boolean" }, "ldap_login_enabled": { "type": "boolean" } } },
+        "AuthPolicy": { "type": "object", "additionalProperties": false, "required": ["password_registration_enabled", "password_login_enabled", "ldap_login_enabled", "email_placeholder", "password_placeholder"], "properties": { "password_registration_enabled": { "type": "boolean" }, "password_login_enabled": { "type": "boolean" }, "ldap_login_enabled": { "type": "boolean" }, "email_placeholder": { "type": "string" }, "password_placeholder": { "type": "string" } } },
         "LdapConfiguration": { "type": "object", "additionalProperties": false, "required": ["url", "security", "base_dn", "bind_identity_template", "user_filter", "email_attribute", "display_name_attribute", "allow_insecure", "skip_tls_verify"], "properties": { "url": { "type": "string", "format": "uri" }, "security": { "type": "string", "enum": ["ldaps", "starttls", "plain"] }, "base_dn": { "type": "string" }, "bind_identity_template": { "type": "string", "default": "{email}", "description": "Bind identity template containing exactly one {email}; the substituted value is escaped as an LDAP DN attribute value." }, "user_filter": { "type": "string", "default": "(userPrincipalName={email})" }, "email_attribute": { "type": "string", "default": "mail" }, "display_name_attribute": { "type": "string", "default": "displayName" }, "allow_insecure": { "type": "boolean", "default": false }, "skip_tls_verify": { "type": "boolean", "default": false } } },
         "NullableLdapConfiguration": { "anyOf": [{ "$ref": "#/components/schemas/LdapConfiguration" }, { "type": "null" }] },
         "TestLdapConfigurationRequest": { "type": "object", "additionalProperties": false, "required": ["configuration", "email", "password"], "properties": { "configuration": { "$ref": "#/components/schemas/LdapConfiguration" }, "email": { "type": "string", "format": "email" }, "password": { "type": "string", "format": "password" } } },
@@ -2789,6 +2789,8 @@ async fn auth_providers(
         password_registration_enabled: policy.password_registration_enabled,
         password_login_enabled: policy.password_login_enabled,
         ldap_login_enabled: policy.ldap_login_enabled,
+        email_placeholder: policy.email_placeholder,
+        password_placeholder: policy.password_placeholder,
     }))
 }
 
@@ -2860,15 +2862,19 @@ async fn update_auth_policy(
          SET password_registration_enabled = $1,
              password_login_enabled = $2,
              ldap_login_enabled = $3,
-             updated_by = $4,
+             email_placeholder = $4,
+             password_placeholder = $5,
+             updated_by = $6,
              updated_at = now()
          WHERE singleton = true
          RETURNING password_registration_enabled, password_login_enabled,
-                   ldap_login_enabled",
+                   ldap_login_enabled, email_placeholder, password_placeholder",
     )
     .bind(policy.password_registration_enabled)
     .bind(policy.password_login_enabled)
     .bind(policy.ldap_login_enabled)
+    .bind(policy.email_placeholder.trim())
+    .bind(policy.password_placeholder.trim())
     .bind(user.id)
     .fetch_one(&mut *tx)
     .await?;
@@ -23339,7 +23345,7 @@ fn widget_credential_from_row(row: sqlx::postgres::PgRow) -> Result<WidgetCreden
 async fn load_auth_policy(pool: &PgPool) -> Result<AuthPolicyDto, ApiError> {
     let row = sqlx::query(
         "SELECT password_registration_enabled, password_login_enabled,
-                ldap_login_enabled
+                ldap_login_enabled, email_placeholder, password_placeholder
          FROM auth_policy WHERE singleton = true",
     )
     .fetch_one(pool)
@@ -24992,6 +24998,8 @@ fn auth_policy_from_row(row: sqlx::postgres::PgRow) -> AuthPolicyDto {
         password_registration_enabled: row.get("password_registration_enabled"),
         password_login_enabled: row.get("password_login_enabled"),
         ldap_login_enabled: row.get("ldap_login_enabled"),
+        email_placeholder: row.get("email_placeholder"),
+        password_placeholder: row.get("password_placeholder"),
     }
 }
 

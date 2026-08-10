@@ -437,6 +437,8 @@ export type AuthPolicy = {
   password_registration_enabled: boolean;
   password_login_enabled: boolean;
   ldap_login_enabled: boolean;
+  email_placeholder: string;
+  password_placeholder: string;
 };
 
 export type AuthProviders = AuthPolicy;

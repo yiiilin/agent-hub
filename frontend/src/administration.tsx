@@ -36,7 +36,9 @@ import './administration.css';
 const emptyPolicy: AuthPolicy = {
   password_registration_enabled: false,
   password_login_enabled: false,
-  ldap_login_enabled: false
+  ldap_login_enabled: false,
+  email_placeholder: '',
+  password_placeholder: ''
 };
 
 const emptyLdapConfiguration: LdapConfiguration = {
@@ -188,6 +190,8 @@ function AuthenticationTab() {
         <label><input type="checkbox" checked={policy.password_login_enabled} disabled={!policy.ldap_login_enabled} onChange={(event) => setPolicy((current) => ({ ...current, password_login_enabled: event.target.checked, password_registration_enabled: event.target.checked ? current.password_registration_enabled : false }))} /> {t('passwordLogin')}</label>
         <label><input type="checkbox" checked={policy.ldap_login_enabled} disabled={!ldapConfigured || !policy.password_login_enabled} onChange={(event) => setPolicy((current) => ({ ...current, ldap_login_enabled: event.target.checked }))} /> {t('ldapLogin')}</label>
       </div>
+      <label>{t('emailPlaceholderSetting')}<input value={policy.email_placeholder} maxLength={256} onChange={(event) => setPolicy((current) => ({ ...current, email_placeholder: event.target.value }))} /><span className="administration-field-help">{t('loginPlaceholderHelp')}</span></label>
+      <label>{t('passwordPlaceholderSetting')}<input value={policy.password_placeholder} maxLength={256} onChange={(event) => setPolicy((current) => ({ ...current, password_placeholder: event.target.value }))} /></label>
       {policy.password_registration_enabled && <div className="administration-persistent-warning" role="note"><AlertTriangle size={17} /><span>{t('passwordRegistrationRisk')}</span></div>}
       {!ldapConfigured && <p className="administration-field-help">{t('configureLdapBeforeEnabling')}</p>}
       <button type="button" className="primary admin-save" disabled={policySaving} onClick={savePolicy}><Save size={15} /> {policySaving ? t('saving') : t('saveAuthenticationPolicy')}</button>

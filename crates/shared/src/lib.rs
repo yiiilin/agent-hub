@@ -80,6 +80,10 @@ pub struct AuthPolicyDto {
     pub password_registration_enabled: bool,
     pub password_login_enabled: bool,
     pub ldap_login_enabled: bool,
+    #[serde(default)]
+    pub email_placeholder: String,
+    #[serde(default)]
+    pub password_placeholder: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1740,6 +1744,10 @@ pub struct AuthProvidersResponse {
     pub password_registration_enabled: bool,
     pub password_login_enabled: bool,
     pub ldap_login_enabled: bool,
+    #[serde(default)]
+    pub email_placeholder: String,
+    #[serde(default)]
+    pub password_placeholder: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2838,13 +2846,17 @@ mod tests {
             password_registration_enabled: true,
             password_login_enabled: false,
             ldap_login_enabled: true,
+            email_placeholder: String::new(),
+            password_placeholder: String::new(),
         };
         assert_eq!(
             serde_json::to_value(policy).unwrap(),
             json!({
                 "password_registration_enabled": true,
                 "password_login_enabled": false,
-                "ldap_login_enabled": true
+                "ldap_login_enabled": true,
+                "email_placeholder": "",
+                "password_placeholder": ""
             })
         );
 
