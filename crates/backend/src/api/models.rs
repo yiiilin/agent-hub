@@ -1745,6 +1745,7 @@ mod tests {
     use crate::api::support::test_util::*;
     use std::time::Duration;
 
+    use crate::{build_router, DEFAULT_MODEL_PROXY_TIMEOUT, VISION_PROXY_HEADER};
     use agent_hub_backend::ModelSecretCipher;
     use axum::{
         body::{Body, Bytes},
@@ -1755,7 +1756,6 @@ mod tests {
     };
     use base64::Engine;
     use chrono::Duration as ChronoDuration;
-    use crate::{build_router, DEFAULT_MODEL_PROXY_TIMEOUT, VISION_PROXY_HEADER};
     use futures_util::StreamExt;
     use tower::ServiceExt;
 

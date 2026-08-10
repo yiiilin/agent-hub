@@ -17,8 +17,8 @@ use axum::{
     response::{IntoResponse, Response},
     Json, Router,
 };
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -809,8 +809,7 @@ pub(crate) async fn model_upstream_stalls_after_first_chunk(
 pub(crate) async fn model_upstream_rate_limited(
     Json(_envelope): Json<TestModelGatewayEnvelope>,
 ) -> axum::response::Response {
-    let mut response =
-        axum::response::Response::new(axum::body::Body::from("provider rate limit"));
+    let mut response = axum::response::Response::new(axum::body::Body::from("provider rate limit"));
     *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
     response
         .headers_mut()
@@ -1763,7 +1762,10 @@ pub(crate) async fn tool_request_storage_state(
     .unwrap()
 }
 
-pub(crate) async fn tool_request_follow_up_run(pool: &PgPool, tool_request_id: Uuid) -> Option<Uuid> {
+pub(crate) async fn tool_request_follow_up_run(
+    pool: &PgPool,
+    tool_request_id: Uuid,
+) -> Option<Uuid> {
     sqlx::query_scalar("SELECT follow_up_run_id FROM integration_tool_requests WHERE id = $1")
         .bind(tool_request_id)
         .fetch_one(pool)
@@ -1781,7 +1783,10 @@ pub(crate) fn runtime_claim_request(
     })
 }
 
-pub(crate) async fn claim_runtime_run(state: &Arc<AppState>, runtime_token: &str) -> ClaimRunResponse {
+pub(crate) async fn claim_runtime_run(
+    state: &Arc<AppState>,
+    runtime_token: &str,
+) -> ClaimRunResponse {
     let ready_owned_sessions = sqlx::query_as::<_, (Uuid, i64)>(
         "SELECT hs.id, hs.ownership_generation
          FROM hub_sessions hs
@@ -2170,7 +2175,10 @@ pub(crate) async fn remove_tool_request_failure_trigger(
         .unwrap();
 }
 
-pub(crate) async fn install_run_event_failure_trigger(pool: &PgPool, run_id: Uuid) -> (String, String) {
+pub(crate) async fn install_run_event_failure_trigger(
+    pool: &PgPool,
+    run_id: Uuid,
+) -> (String, String) {
     let suffix = Uuid::new_v4().simple().to_string();
     let function_name = format!("test_fail_run_event_{suffix}");
     let trigger_name = format!("test_fail_run_event_trigger_{suffix}");
@@ -2359,10 +2367,8 @@ pub(crate) async fn attachment_multipart(
     if let Some(session_id) = session_id {
         body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
         body.extend_from_slice(
-            format!(
-                "Content-Disposition: form-data; name=\"session_id\"\r\n\r\n{session_id}\r\n"
-            )
-            .as_bytes(),
+            format!("Content-Disposition: form-data; name=\"session_id\"\r\n\r\n{session_id}\r\n")
+                .as_bytes(),
         );
     }
     body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
