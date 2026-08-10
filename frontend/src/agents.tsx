@@ -1348,7 +1348,7 @@ export function AgentPage({
     <header className="agent-detail-header"><div><Bot size={18} /><h1>{agent.name}</h1></div>{agent.can_administer && <button type="button" className="secondary danger" disabled={configPending} onClick={deleteAgent}><Trash2 size={16} /> {t('deleteAgent')}</button>}</header>
     <div className="agent-detail-layout">
       <aside className="agent-inspector" role="complementary" aria-label={t('agentInspector')}>
-        <section className="agent-identity"><Bot size={28} /><div><strong>{agent.name}</strong><span>{agent.instructions}</span></div></section>
+        <section className="agent-identity"><Bot size={28} /><div><strong>{agent.name}</strong></div></section>
         <section><h2>{t('agentInspectorRuntime')}</h2><dl><div><dt>{t('runtime')}</dt><dd>{runtime?.hostname ?? availabilityLabel(availability, t)}</dd></div></dl></section>
         <section><h2>{t('agentInspectorModel')}</h2><dl><div><dt>{t('agentModelSelection')}</dt><dd>{modelName(agent.model_selection, modelOptions.items, t('modelNotConfigured'))}</dd></div></dl></section>
         <section><h2>{t('agentInspectorAccess')}</h2><dl><div><dt>{t('visibility')}</dt><dd>{visibilityLabel(agent.visibility, t)}</dd></div>{agent.visibility === 'public_to' && <div><dt>{t('agentPublicTo')}</dt><dd>{agent.public_to.length}</dd></div>}</dl></section>

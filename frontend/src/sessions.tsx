@@ -477,43 +477,51 @@ function ActivityIcon({ kind }: { kind: ActivityKind }) {
   return <Minimize2 size={15} />;
 }
 
-const visualCharsPerLine = 100;
-
-function wrapLongLines(text: string): string {
-  return text.split('\n').map((line) => {
-    if (line.length <= visualCharsPerLine) return line;
-    const chunks: string[] = [];
-    for (let start = 0; start < line.length; start += visualCharsPerLine) {
-      chunks.push(line.slice(start, start + visualCharsPerLine));
-    }
-    return chunks.join('\n');
-  }).join('\n');
-}
-
 function useLatestLines(text: string, maxLines = 15) {
   const [expanded, setExpanded] = useState(false);
-  const lines = wrapLongLines(text).split('\n');
-  const hidden = Math.max(0, lines.length - maxLines);
-  const visible = expanded || hidden === 0 ? text : lines.slice(-maxLines).join('\n');
-  return { visible, hidden, expanded, toggle: () => setExpanded((value) => !value) };
+  const [totalLines, setTotalLines] = useState(0);
+  const measureRef = useRef<HTMLPreElement | null>(null);
+  useEffect(() => {
+    const pre = measureRef.current;
+    if (!pre) return;
+    const update = () => {
+      // 测量实际渲染的视觉行数（自动换行、空行均按真实高度计入）。
+      const lineHeight = parseFloat(getComputedStyle(pre).lineHeight);
+      if (lineHeight > 0) setTotalLines(Math.round(pre.scrollHeight / lineHeight));
+    };
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(pre);
+    return () => observer.disconnect();
+  }, [text]);
+  const hidden = Math.max(0, totalLines - maxLines);
+  const clamped = !expanded && hidden > 0;
+  return {
+    visible: text,
+    hidden,
+    clamped,
+    expanded,
+    toggle: () => setExpanded((value) => !value),
+    measureRef
+  };
 }
 
 function CollapsibleBlock({ label, text }: { label: string; text: string }) {
   const { t } = useI18n();
-  const { visible, hidden, expanded, toggle } = useLatestLines(text);
+  const { visible, hidden, clamped, expanded, toggle, measureRef } = useLatestLines(text);
   return <div className="session-activity-output">
     <span>{label}</span>
     {hidden > 0 && <button type="button" className="session-activity-content-toggle" onClick={toggle}>{t(expanded ? 'activityCollapse' : 'activityLinesCollapsed').replace('{count}', String(hidden))}</button>}
-    <pre className="session-activity-collapsible">{visible}</pre>
+    <pre ref={measureRef} className={`session-activity-collapsible${clamped ? ' session-lines-clamped' : ''}`}>{visible}</pre>
   </div>;
 }
 
 function CollapsibleLive({ text, className }: { text: string; className?: string }) {
   const { t } = useI18n();
-  const { visible, hidden, expanded, toggle } = useLatestLines(text);
+  const { visible, hidden, clamped, expanded, toggle, measureRef } = useLatestLines(text);
   return <>
     {hidden > 0 && <button type="button" className="session-activity-content-toggle" onClick={toggle}>{t(expanded ? 'activityCollapse' : 'activityLinesCollapsed').replace('{count}', String(hidden))}</button>}
-    <pre className={className ?? 'session-live-activity-output'}>{visible}</pre>
+    <pre ref={measureRef} className={`${className ?? 'session-live-activity-output'}${clamped ? ' session-lines-clamped' : ''}`}>{visible}</pre>
   </>;
 }
 
