@@ -2967,38 +2967,6 @@ mod tests {
     }
 
 
-    #[test]
-    fn run_event_sanitizers_remove_nul_bytes() {
-        let mut text = "before\0after".to_owned();
-        sanitize_run_event_text(&mut text);
-        assert_eq!(text, "before\u{FFFD}after");
-
-        let payload = json!({
-            "output": "ELF\0bin\0",
-            "nested": ["x\0", {"key": "v\0"}],
-            "count": 3,
-            "flag": true,
-            "nothing": null,
-        });
-        let sanitized = sanitize_run_event_payload(payload);
-        assert_eq!(sanitized["output"], json!("ELF\u{FFFD}bin\u{FFFD}"));
-        assert_eq!(sanitized["nested"][0], json!("x\u{FFFD}"));
-        assert_eq!(sanitized["nested"][1]["key"], json!("v\u{FFFD}"));
-        assert_eq!(sanitized["count"], json!(3));
-        assert_eq!(sanitized["flag"], json!(true));
-        assert_eq!(sanitized["nothing"], json!(null));
-
-        // Object keys must be sanitized too: jsonb rejects NUL anywhere.
-        let mut keyed = serde_json::Map::new();
-        keyed.insert("bad\0key".into(), json!("value"));
-        keyed.insert("ok".into(), json!("value"));
-        let sanitized_keyed = sanitize_run_event_payload(Value::Object(keyed));
-        let object = sanitized_keyed.as_object().unwrap();
-        assert!(object.contains_key("bad\u{FFFD}key"));
-        assert!(!object.keys().any(|key| key.contains('\0')));
-        assert_eq!(object["ok"], json!("value"));
-    }
-
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn super_admin_can_read_another_users_run_but_member_cannot(pool: PgPool) {
@@ -6997,196 +6965,6 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_claim_contains_complete_effective_execution_configuration(pool: PgPool) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let overridden_skill_id = Uuid::new_v4();
-        let managed_only_skill_id = Uuid::new_v4();
-        for (skill_id, name, content) in [
-            (overridden_skill_id, "review", "managed review"),
-            (managed_only_skill_id, "testing", "managed testing"),
-        ] {
-            sqlx::query(
-                "INSERT INTO skills
-                     (id, owner_id, name, description, content, content_checksum_sha256)
-                 SELECT $1, owner_id, $2, $2, $3, $4 FROM agents WHERE id = $5",
-            )
-            .bind(skill_id)
-            .bind(name)
-            .bind(content)
-            .bind(sha256_hex(content))
-            .bind(fixture.agent_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
-            sqlx::query("INSERT INTO agent_skills (agent_id, skill_id) VALUES ($1, $2)")
-                .bind(fixture.agent_id)
-                .bind(skill_id)
-                .execute(&fixture.state.pool)
-                .await
-                .unwrap();
-        }
-        sqlx::query(
-            "UPDATE agents
-             SET instructions = 'Task 9 instructions',
-                 mcp_allowlist = $1
-             WHERE id = $2",
-        )
-        .bind(json!([{
-            "name": "github",
-            "command": "gh-mcp",
-            "secrets": { "TOKEN": "claim-only-secret" }
-        }]))
-        .bind(fixture.agent_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "UPDATE runtimes
-             SET capabilities = capabilities || '{\"mcp_allowlist\":true}'::jsonb
-             WHERE id = $1",
-        )
-        .bind(fixture.runtime_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-
-        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-        let claim_json = serde_json::to_value(&claim).unwrap();
-        let configuration: AgentExecutionConfigurationDto =
-            serde_json::from_value(claim_json["execution_configuration"].clone())
-                .expect("claim must publish a typed execution configuration");
-        assert_eq!(configuration.revision, 1);
-        assert_eq!(configuration.instructions, "Task 9 instructions");
-        assert_eq!(configuration.skills.len(), 2);
-        let review = configuration
-            .skills
-            .iter()
-            .find(|skill| skill.name == "review")
-            .unwrap();
-        assert_eq!(review.source, "managed");
-        assert_eq!(review.source_id, Some(overridden_skill_id));
-        assert_eq!(review.revision, 1);
-        assert_eq!(review.content, "managed review");
-        assert_eq!(review.content_checksum_sha256, sha256_hex("managed review"));
-        let testing = configuration
-            .skills
-            .iter()
-            .find(|skill| skill.name == "testing")
-            .unwrap();
-        assert_eq!(testing.source, "managed");
-        assert_eq!(testing.source_id, Some(managed_only_skill_id));
-        assert_eq!(testing.revision, 1);
-        assert_eq!(
-            claim_json["expected_configuration_fingerprint"],
-            execution_configuration_fingerprint(&configuration).unwrap()
-        );
-        assert!(!claim_json["expected_configuration_fingerprint"]
-            .as_str()
-            .unwrap()
-            .contains("claim-only-secret"));
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_claim_waits_for_atomic_agent_and_skill_configuration_update(pool: PgPool) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let old_skill_id = Uuid::new_v4();
-        let new_skill_id = Uuid::new_v4();
-        for (skill_id, name, content) in [
-            (old_skill_id, "old-skill", "old content"),
-            (new_skill_id, "new-skill", "new content"),
-        ] {
-            sqlx::query(
-                "INSERT INTO skills
-                     (id, owner_id, name, description, content, content_checksum_sha256)
-                 SELECT $1, owner_id, $2, $2, $3, $4
-                 FROM agents WHERE id = $5",
-            )
-            .bind(skill_id)
-            .bind(name)
-            .bind(content)
-            .bind(sha256_hex(content))
-            .bind(fixture.agent_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
-        }
-        sqlx::query("INSERT INTO agent_skills (agent_id, skill_id) VALUES ($1, $2)")
-            .bind(fixture.agent_id)
-            .bind(old_skill_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
-
-        let mut update_tx = fixture.state.pool.begin().await.unwrap();
-        sqlx::query(
-            "UPDATE agents
-             SET instructions = 'new atomic instructions',
-                 execution_config_revision = execution_config_revision + 1
-             WHERE id = $1",
-        )
-        .bind(fixture.agent_id)
-        .execute(&mut *update_tx)
-        .await
-        .unwrap();
-        sqlx::query("DELETE FROM agent_skills WHERE agent_id = $1")
-            .bind(fixture.agent_id)
-            .execute(&mut *update_tx)
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO agent_skills (agent_id, skill_id) VALUES ($1, $2)")
-            .bind(fixture.agent_id)
-            .bind(new_skill_id)
-            .execute(&mut *update_tx)
-            .await
-            .unwrap();
-
-        let application_name = format!("runtime-claim-config-{}", Uuid::new_v4().simple());
-        let claim_state = Arc::new(test_state_with_pool(
-            postgres_test_pool_with_application_name(&fixture.state.pool, &application_name).await,
-        ));
-        let runtime_token = fixture.runtime_token.clone();
-        let mut claim_task =
-            tokio::spawn(async move { claim_runtime_run(&claim_state, &runtime_token).await });
-        let claim_wait_observed = wait_for_application_lock(
-            &fixture.state.pool,
-            &application_name,
-            "SELECT a.id AS a_id",
-        )
-        .await;
-        let pending_state = runtime_claim_run_state(&fixture.state.pool, fixture.run_id).await;
-
-        update_tx.commit().await.unwrap();
-        let claim = tokio::time::timeout(Duration::from_secs(3), &mut claim_task)
-            .await
-            .expect("runtime claim should unblock after Agent update commit")
-            .expect("runtime claim task should not panic");
-
-        assert!(
-            claim_wait_observed,
-            "runtime claim must wait for the complete Agent configuration update"
-        );
-        assert_eq!(pending_state, ("pending".into(), None, None));
-        assert_eq!(claim.agent.instructions, "new atomic instructions");
-        assert_eq!(claim.execution_configuration.revision, 2);
-        assert_eq!(
-            claim.execution_configuration.instructions,
-            "new atomic instructions"
-        );
-        assert_eq!(claim.execution_configuration.skills.len(), 1);
-        assert_eq!(
-            claim.execution_configuration.skills[0].source_id,
-            Some(new_skill_id)
-        );
-        assert_eq!(claim.execution_configuration.skills[0].name, "new-skill");
-        assert_eq!(
-            claim.expected_configuration_fingerprint,
-            execution_configuration_fingerprint(&claim.execution_configuration).unwrap()
-        );
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn archive_holding_agent_lock_finishes_before_runtime_claim_without_deadlock(
         pool: PgPool,
     ) {
@@ -7440,72 +7218,6 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_claim_resumes_native_session_without_parent_run(pool: PgPool) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        sqlx::query(
-            "UPDATE hub_sessions SET native_session_id = 'session-canonical-thread' WHERE id = $1",
-        )
-        .bind(fixture.hub_session_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-
-        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-
-        assert_eq!(claim.run.parent_run_id, None);
-        let resume = claim
-            .resume
-            .expect("a Session with a native Session must always resume it");
-        assert_eq!(resume.native_session_id, "session-canonical-thread");
-        assert_eq!(resume.work_dir_ref, None);
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_claim_prefers_native_session_over_conflicting_parent(pool: PgPool) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let parent_run_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO runs
-                 (id, agent_id, owner_id, status, initial_message, source,
-                  native_session_id, work_dir_ref, hub_session_id, hub_turn_id,
-                  session_ownership_generation)
-             SELECT $1, agent_id, owner_id, 'completed', 'parent', 'console',
-                    'stale-parent-thread', 'parent-work-dir', hub_session_id,
-                    hub_turn_id, session_ownership_generation
-             FROM runs WHERE id = $2",
-        )
-        .bind(parent_run_id)
-        .bind(fixture.run_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-        sqlx::query("UPDATE runs SET parent_run_id = $1 WHERE id = $2")
-            .bind(parent_run_id)
-            .bind(fixture.run_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
-        sqlx::query(
-            "UPDATE hub_sessions SET native_session_id = 'session-canonical-thread' WHERE id = $1",
-        )
-        .bind(fixture.hub_session_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-
-        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-
-        assert_eq!(claim.run.parent_run_id, Some(parent_run_id));
-        let resume = claim
-            .resume
-            .expect("the canonical native Session must override its parent Run");
-        assert_eq!(resume.native_session_id, "session-canonical-thread");
-        assert_eq!(resume.work_dir_ref.as_deref(), Some("parent-work-dir"));
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn session_ownership_competing_runtime_claims_have_one_generation_winner(pool: PgPool) {
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
         let second_runtime_id = Uuid::new_v4();
@@ -7661,158 +7373,6 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_claim_capacity_zero_rejects_new_but_allows_ready_owned_session(pool: PgPool) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-
-        let no_capacity = runtime_claim_run(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            runtime_claim_request(0, Vec::new()),
-        )
-        .await
-        .unwrap()
-        .into_response();
-        assert_eq!(no_capacity.status(), StatusCode::NO_CONTENT);
-        assert_eq!(
-            runtime_claim_run_state(&fixture.state.pool, fixture.run_id).await,
-            ("pending".into(), None, None)
-        );
-
-        let first = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-        let ownership_generation = first.run.session_ownership_generation.unwrap();
-        sqlx::query("UPDATE runs SET status = 'completed' WHERE id = $1")
-            .bind(first.run.id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
-        let next_run_id =
-            insert_pending_session_run(&fixture.state.pool, fixture.hub_session_id).await;
-
-        let ready_owned = runtime_claim_run(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            runtime_claim_request(
-                0,
-                vec![RuntimeOwnedSessionGenerationDto {
-                    session_id: fixture.hub_session_id,
-                    ownership_generation,
-                }],
-            ),
-        )
-        .await
-        .unwrap()
-        .into_response();
-        assert_eq!(ready_owned.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(ready_owned.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let claim: ClaimRunResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(claim.run.id, next_run_id);
-        assert_eq!(
-            claim.run.session_ownership_generation,
-            Some(ownership_generation)
-        );
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_claim_rejects_stale_foreign_and_duplicate_owned_session_snapshots(
-        pool: PgPool,
-    ) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let first = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-        let ownership_generation = first.run.session_ownership_generation.unwrap();
-        sqlx::query("UPDATE runs SET status = 'completed' WHERE id = $1")
-            .bind(first.run.id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
-        let next_run_id =
-            insert_pending_session_run(&fixture.state.pool, fixture.hub_session_id).await;
-
-        let stale = runtime_claim_run(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            runtime_claim_request(
-                0,
-                vec![RuntimeOwnedSessionGenerationDto {
-                    session_id: fixture.hub_session_id,
-                    ownership_generation: ownership_generation + 1,
-                }],
-            ),
-        )
-        .await
-        .unwrap()
-        .into_response();
-        assert_eq!(stale.status(), StatusCode::NO_CONTENT);
-
-        let foreign_runtime_id = Uuid::new_v4();
-        let foreign_runtime_token = format!("ahrt_{}", Uuid::new_v4().simple());
-        sqlx::query(
-            "INSERT INTO runtimes
-                 (id, token_hash, hostname, labels, engine_version, capabilities,
-                  sandbox_mode, status)
-             VALUES ($1, $2, $3, '{}', 'test', '{\"model_proxy\":true}'::jsonb,
-                     'workspace-write', 'online')",
-        )
-        .bind(foreign_runtime_id)
-        .bind(sha256_hex(&foreign_runtime_token))
-        .bind(format!("runtime-foreign-{}", Uuid::new_v4().simple()))
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-        sqlx::query("UPDATE agents SET runtime_id = NULL WHERE id = $1")
-            .bind(fixture.agent_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
-        let foreign = runtime_claim_run(
-            State(fixture.state.clone()),
-            bearer_headers(&foreign_runtime_token),
-            runtime_claim_request(
-                0,
-                vec![RuntimeOwnedSessionGenerationDto {
-                    session_id: fixture.hub_session_id,
-                    ownership_generation,
-                }],
-            ),
-        )
-        .await
-        .unwrap()
-        .into_response();
-        assert_eq!(foreign.status(), StatusCode::NO_CONTENT);
-
-        let duplicate = match runtime_claim_run(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            runtime_claim_request(
-                0,
-                vec![
-                    RuntimeOwnedSessionGenerationDto {
-                        session_id: fixture.hub_session_id,
-                        ownership_generation,
-                    },
-                    RuntimeOwnedSessionGenerationDto {
-                        session_id: fixture.hub_session_id,
-                        ownership_generation: ownership_generation + 1,
-                    },
-                ],
-            ),
-        )
-        .await
-        {
-            Ok(_) => panic!("duplicate owned Session snapshot unexpectedly reached claim logic"),
-            Err(error) => error,
-        };
-        assert_eq!(duplicate.status, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            runtime_claim_run_state(&fixture.state.pool, next_run_id).await,
-            ("pending".into(), None, None)
-        );
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn session_updated_at_tracks_only_conversation_input_and_output(pool: PgPool) {
         let fixture = integration_runtime_fixture(pool).await;
         let baseline = "2026-07-17T08:00:00Z".parse::<DateTime<Utc>>().unwrap();
@@ -7920,111 +7480,6 @@ mod tests {
                 .unwrap();
         assert!(after_input > after_completion);
     }
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn run_event_deltas_stream_live_but_only_phases_are_persisted(pool: PgPool) {
-        let fixture = integration_runtime_fixture(pool).await;
-        let run_id = fixture.run_id;
-        let mut rx = fixture.state.run_event_bus.subscribe(run_id);
-        let append = |event_type: &str, role: Option<&str>, payload: Value| {
-            runtime_append_event(
-                State(fixture.state.clone()),
-                bearer_headers(&fixture.runtime_token),
-                Path(run_id),
-                runtime_write_generation(
-                    1,
-                    AppendRunEventRequest {
-                        event_id: Uuid::new_v4(),
-                        event_type: event_type.into(),
-                        role: role.map(str::to_owned),
-                        content: None,
-                        payload,
-                        waiting_tool: None,
-                    },
-                ),
-            )
-        };
-        async fn count_run_item_events(pool: &PgPool, run_id: Uuid, item_id: &str) -> i64 {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM run_events
-                 WHERE run_id = $1 AND payload->>'item_id' = $2",
-            )
-            .bind(run_id)
-            .bind(item_id)
-            .fetch_one(pool)
-            .await
-            .unwrap()
-        }
-
-        for index in 0..100 {
-            let _ = append(
-                "item",
-                Some("assistant"),
-                json!({
-                    "phase": "summary_delta",
-                    "item_id": "reasoning-1",
-                    "item_type": "reasoning",
-                    "summary": format!("chunk {index}"),
-                }),
-            )
-            .await
-            .unwrap();
-        }
-        assert_eq!(
-            count_run_item_events(&fixture.state.pool, run_id, "reasoning-1").await,
-            0,
-            "summary deltas must not be persisted"
-        );
-        for _ in 0..100 {
-            let item = rx.recv().await.unwrap();
-            assert!(!item.persisted);
-        }
-
-        let _ = append(
-            "item",
-            Some("assistant"),
-            json!({
-                "phase": "completed",
-                "item_id": "reasoning-1",
-                "item_type": "reasoning",
-                "summary": ["full reasoning"],
-            }),
-        )
-        .await
-        .unwrap();
-        let completed = rx.recv().await.unwrap();
-        assert!(completed.persisted);
-        assert_eq!(
-            count_run_item_events(&fixture.state.pool, run_id, "reasoning-1").await,
-            1
-        );
-
-        for index in 0..50 {
-            let _ = append(
-                "message_delta",
-                Some("assistant"),
-                json!({ "source": "pi", "stream": true, "content": format!("c{index}") }),
-            )
-            .await
-            .unwrap();
-        }
-        let _ = append(
-            "message",
-            Some("assistant"),
-            json!({ "source": "pi", "stop_reason": "stop" }),
-        )
-        .await
-        .unwrap();
-        let deltas = sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM run_events
-             WHERE run_id = $1 AND event_type = 'message_delta'",
-        )
-        .bind(run_id)
-        .fetch_one(&fixture.state.pool)
-        .await
-        .unwrap();
-        assert_eq!(deltas, 0);
-    }
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
@@ -8093,374 +7548,6 @@ mod tests {
         assert_eq!(
             runtime_completion_run_state(&fixture.state.pool, fixture.run_id).await,
             ("running".into(), Some(fixture.runtime_id), None, None, None)
-        );
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_turn_started_event_binds_native_turn_before_completion(pool: PgPool) {
-        let fixture = integration_runtime_fixture(pool).await;
-        sqlx::query(
-            "UPDATE hub_sessions
-             SET native_session_id = NULL, active_turn_id = NULL
-             WHERE id = $1",
-        )
-        .bind(fixture.hub_session_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "UPDATE hub_session_turns
-             SET native_turn_id = NULL, status = 'starting', started_at = NULL
-             WHERE id = $1",
-        )
-        .bind(fixture.turn_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-        for content in ["first queued", "second queued"] {
-            sqlx::query(
-                "INSERT INTO hub_session_messages
-                     (id, session_id, role, message_kind, content, delivery_mode,
-                      delivery_state, turn_id, run_id)
-                 VALUES ($1, $2, 'user', 'message', $3, 'next_turn', 'delivering', $4, $5)",
-            )
-            .bind(Uuid::new_v4())
-            .bind(fixture.hub_session_id)
-            .bind(content)
-            .bind(fixture.turn_id)
-            .bind(fixture.run_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
-        }
-
-        let _ = runtime_append_event(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(fixture.run_id),
-            runtime_write_generation(
-                1,
-                AppendRunEventRequest {
-                    event_id: Uuid::new_v4(),
-                    event_type: "turn_started".into(),
-                    role: None,
-                    content: None,
-                    payload: json!({
-                        "native_session_id": "native-thread-bound",
-                        "native_turn_id": "native-turn-bound"
-                    }),
-                    waiting_tool: None,
-                },
-            ),
-        )
-        .await
-        .unwrap();
-
-        let session: (Option<String>, Option<Uuid>) = sqlx::query_as(
-            "SELECT native_session_id, active_turn_id FROM hub_sessions WHERE id = $1",
-        )
-        .bind(fixture.hub_session_id)
-        .fetch_one(&fixture.state.pool)
-        .await
-        .unwrap();
-        assert_eq!(session.0.as_deref(), Some("native-thread-bound"));
-        assert_eq!(session.1, Some(fixture.turn_id));
-        let turn: (Option<String>, String, bool) = sqlx::query_as(
-            "SELECT native_turn_id, status, started_at IS NOT NULL
-             FROM hub_session_turns WHERE id = $1",
-        )
-        .bind(fixture.turn_id)
-        .fetch_one(&fixture.state.pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            turn,
-            (Some("native-turn-bound".into()), "running".into(), true)
-        );
-        let states: Vec<String> = sqlx::query_scalar(
-            "SELECT delivery_state FROM hub_session_messages
-             WHERE run_id = $1 ORDER BY sequence",
-        )
-        .bind(fixture.run_id)
-        .fetch_all(&fixture.state.pool)
-        .await
-        .unwrap();
-        assert_eq!(states, vec!["delivered", "delivered"]);
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_begin_turn_generation_fences_synchronized_configuration(pool: PgPool) {
-        let fixture = integration_runtime_fixture(pool).await;
-        sqlx::query(
-            "UPDATE hub_sessions
-             SET native_session_id = NULL, active_turn_id = NULL,
-                 configuration_fingerprint = NULL
-             WHERE id = $1",
-        )
-        .bind(fixture.hub_session_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "UPDATE hub_session_turns
-             SET native_turn_id = NULL, status = 'pending', started_at = NULL,
-                 delivery_started_at = NULL, configuration_fingerprint = NULL
-             WHERE id = $1",
-        )
-        .bind(fixture.turn_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-
-        let invalid = runtime_begin_turn(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(fixture.run_id),
-            runtime_write_generation(
-                1,
-                BeginRuntimeTurnRequest {
-                    configuration_fingerprint: "sha256:not-a-digest".into(),
-                },
-            ),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            sqlx::query_as::<_, (Option<String>, String, Option<String>, bool)>(
-                "SELECT sessions.configuration_fingerprint, turns.status,
-                        turns.configuration_fingerprint,
-                        turns.delivery_started_at IS NULL
-                 FROM hub_sessions AS sessions
-                 JOIN hub_session_turns AS turns ON turns.session_id = sessions.id
-                 WHERE sessions.id = $1 AND turns.id = $2"
-            )
-            .bind(fixture.hub_session_id)
-            .bind(fixture.turn_id)
-            .fetch_one(&fixture.state.pool)
-            .await
-            .unwrap(),
-            (None, "pending".into(), None, true)
-        );
-
-        let cross_generation_binding = sqlx::query(
-            "UPDATE hub_session_turns
-             SET status = 'starting', delivery_started_at = now(),
-                 configuration_fingerprint = $1,
-                 ownership_generation = ownership_generation + 1
-             WHERE id = $2",
-        )
-        .bind(format!("sha256:{}", "f".repeat(64)))
-        .bind(fixture.turn_id)
-        .execute(&fixture.state.pool)
-        .await;
-        assert!(
-            cross_generation_binding.is_err(),
-            "configuration binding unexpectedly crossed an ownership generation"
-        );
-
-        let configuration_fingerprint = format!("sha256:{}", "a".repeat(64));
-        let request = || {
-            serde_json::from_value::<BeginRuntimeTurnRequest>(json!({
-                "configuration_fingerprint": configuration_fingerprint
-            }))
-            .unwrap()
-        };
-
-        let stale = runtime_begin_turn(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(fixture.run_id),
-            runtime_write_generation(2, request()),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(stale.status, StatusCode::FORBIDDEN);
-        assert_eq!(
-            sqlx::query_scalar::<_, Option<String>>(
-                "SELECT configuration_fingerprint FROM hub_sessions WHERE id = $1"
-            )
-            .bind(fixture.hub_session_id)
-            .fetch_one(&fixture.state.pool)
-            .await
-            .unwrap(),
-            None
-        );
-
-        let begun = runtime_begin_turn(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(fixture.run_id),
-            runtime_write_generation(1, request()),
-        )
-        .await
-        .unwrap()
-        .0;
-
-        let begun_json = serde_json::to_value(&begun).unwrap();
-        assert_eq!(
-            begun_json["configuration_fingerprint"],
-            configuration_fingerprint
-        );
-        assert_eq!(
-            sqlx::query_as::<_, (Option<String>, Option<String>)>(
-                "SELECT sessions.configuration_fingerprint, turns.configuration_fingerprint
-                 FROM hub_sessions AS sessions
-                 JOIN hub_session_turns AS turns ON turns.session_id = sessions.id
-                 WHERE sessions.id = $1 AND turns.id = $2"
-            )
-            .bind(fixture.hub_session_id)
-            .bind(fixture.turn_id)
-            .fetch_one(&fixture.state.pool)
-            .await
-            .unwrap(),
-            (
-                Some(configuration_fingerprint.clone()),
-                Some(configuration_fingerprint)
-            )
-        );
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_begin_turn_linearizes_initial_messages_and_late_message_becomes_steer(
-        pool: PgPool,
-    ) {
-        let fixture = integration_runtime_fixture(pool).await;
-        sqlx::query(
-            "UPDATE hub_sessions
-             SET native_session_id = NULL, active_turn_id = NULL
-             WHERE id = $1",
-        )
-        .bind(fixture.hub_session_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "UPDATE hub_session_turns
-             SET native_turn_id = NULL, status = 'pending', started_at = NULL,
-                 delivery_started_at = NULL
-             WHERE id = $1",
-        )
-        .bind(fixture.turn_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-        let early_message_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO hub_session_messages
-                 (id, session_id, role, message_kind, content, delivery_mode,
-                  delivery_state, turn_id, run_id)
-             VALUES ($1, $2, 'user', 'message', 'early', 'next_turn', 'queued', $3, $4)",
-        )
-        .bind(early_message_id)
-        .bind(fixture.hub_session_id)
-        .bind(fixture.turn_id)
-        .bind(fixture.run_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-        let configuration_fingerprint = format!("sha256:{}", "b".repeat(64));
-
-        let begun = runtime_begin_turn(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(fixture.run_id),
-            runtime_write_generation(
-                1,
-                BeginRuntimeTurnRequest {
-                    configuration_fingerprint: configuration_fingerprint.clone(),
-                },
-            ),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(begun.session_id, fixture.hub_session_id);
-        assert_eq!(begun.turn_id, fixture.turn_id);
-        assert_eq!(begun.messages.len(), 1);
-        assert_eq!(begun.messages[0].id, early_message_id);
-        assert_eq!(begun.messages[0].delivery_state, "delivering");
-
-        let late_message_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO hub_session_messages
-                 (id, session_id, role, message_kind, content, delivery_mode,
-                  delivery_state, turn_id, run_id)
-             VALUES ($1, $2, 'user', 'message', 'late', 'next_turn', 'queued', $3, $4)",
-        )
-        .bind(late_message_id)
-        .bind(fixture.hub_session_id)
-        .bind(fixture.turn_id)
-        .bind(fixture.run_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-        let retried = runtime_begin_turn(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(fixture.run_id),
-            runtime_write_generation(
-                1,
-                BeginRuntimeTurnRequest {
-                    configuration_fingerprint,
-                },
-            ),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(retried.messages.len(), 1);
-        assert_eq!(retried.messages[0].id, early_message_id);
-
-        let _ = runtime_append_event(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(fixture.run_id),
-            runtime_write_generation(
-                1,
-                AppendRunEventRequest {
-                    event_id: Uuid::new_v4(),
-                    event_type: "turn_started".into(),
-                    role: None,
-                    content: None,
-                    payload: json!({
-                        "native_session_id": "linear-thread",
-                        "native_turn_id": "linear-turn"
-                    }),
-                    waiting_tool: None,
-                },
-            ),
-        )
-        .await
-        .unwrap();
-
-        let deliveries: Vec<(Uuid, String, String, Option<String>)> = sqlx::query_as(
-            "SELECT id, delivery_mode, delivery_state, expected_native_turn_id
-             FROM hub_session_messages WHERE run_id = $1 ORDER BY sequence",
-        )
-        .bind(fixture.run_id)
-        .fetch_all(&fixture.state.pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            deliveries,
-            vec![
-                (
-                    early_message_id,
-                    "next_turn".into(),
-                    "delivered".into(),
-                    None
-                ),
-                (
-                    late_message_id,
-                    "steer".into(),
-                    "queued".into(),
-                    Some("linear-turn".into())
-                )
-            ]
         );
     }
 
@@ -9076,766 +8163,6 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_force_release_reclaims_failed_session_without_bundle_and_clears_outbox(
-        pool: PgPool,
-    ) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-        sqlx::query("UPDATE hub_sessions SET lifecycle_status = 'online' WHERE id = $1")
-            .bind(fixture.hub_session_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
-        let _ = runtime_complete_run(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(claim.run.id),
-            runtime_write_generation(
-                1,
-                CompleteRunRequest {
-                    status: "failed".into(),
-                    native_session_id: None,
-                    work_dir_ref: None,
-                },
-            ),
-        )
-        .await
-        .unwrap();
-        let before: (Option<Uuid>, String, i64) = sqlx::query_as(
-            "SELECT runtime_owner_id, lifecycle_status, ownership_generation
-             FROM hub_sessions WHERE id = $1",
-        )
-        .bind(fixture.hub_session_id)
-        .fetch_one(&fixture.state.pool)
-        .await
-        .unwrap();
-        assert_eq!(before.0, Some(fixture.runtime_id));
-        assert_eq!(before.1, "online");
-        assert_eq!(before.2, 1);
-
-        let released = runtime_release_session(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(fixture.hub_session_id),
-            Json(ReleaseRuntimeSessionRequest {
-                ownership_generation: 1,
-                force: true,
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(released.runtime_owner_id, None);
-        assert_eq!(released.ownership_generation, 2);
-        assert!(matches!(
-            released.lifecycle_status.as_str(),
-            "offline" | "waiting_for_runtime"
-        ));
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_reaper_marks_unrecoverable_sessions_and_releases_recoverable_ones(
-        pool: PgPool,
-    ) {
-        let owner_id = Uuid::new_v4();
-        let agent_id = Uuid::new_v4();
-        let runtime_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO users (id, email, password, display_name, role)
-             VALUES ($1, $2, 'unused', 'Reaper Test Owner', 'member')",
-        )
-        .bind(owner_id)
-        .bind(format!("reaper-{}@example.com", Uuid::new_v4().simple()))
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO agents (id, owner_id, name, instructions, visibility)
-             VALUES ($1, $2, 'Reaper Agent', 'test', 'private')",
-        )
-        .bind(agent_id)
-        .bind(owner_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO runtimes
-                 (id, token_hash, hostname, labels, engine_version, capabilities,
-                  sandbox_mode, status, last_heartbeat_at)
-             VALUES ($1, $2, 'reaper-runtime', '{}', 'test', '{}'::jsonb,
-                     'workspace-write', 'online', now() - interval '2 minutes')",
-        )
-        .bind(runtime_id)
-        .bind(sha256_hex("reaper-runtime-token"))
-        .execute(&pool)
-        .await
-        .unwrap();
-        let unrecoverable_session = Uuid::new_v4();
-        let recoverable_session = Uuid::new_v4();
-        for session_id in [unrecoverable_session, recoverable_session] {
-            sqlx::query(
-                "INSERT INTO hub_sessions
-                     (id, owner_id, agent_id, origin_kind, lifecycle_status,
-                      runtime_owner_id, ownership_generation)
-                 VALUES ($1, $2, $3, 'hub_native', 'online', $4, 1)",
-            )
-            .bind(session_id)
-            .bind(owner_id)
-            .bind(agent_id)
-            .bind(runtime_id)
-            .execute(&pool)
-            .await
-            .unwrap();
-            let turn_id = Uuid::new_v4();
-            sqlx::query(
-                "INSERT INTO hub_session_turns
-                     (id, session_id, status, ownership_generation)
-                 VALUES ($1, $2, 'pending', 1)",
-            )
-            .bind(turn_id)
-            .bind(session_id)
-            .execute(&pool)
-            .await
-            .unwrap();
-            let run_id = Uuid::new_v4();
-            sqlx::query(
-                "INSERT INTO runs
-                     (id, agent_id, owner_id, status, initial_message, source,
-                      hub_session_id, hub_turn_id, session_ownership_generation)
-                 VALUES ($1, $2, $3, 'pending', 'next', 'console', $4, $5, 1)",
-            )
-            .bind(run_id)
-            .bind(agent_id)
-            .bind(owner_id)
-            .bind(session_id)
-            .bind(turn_id)
-            .execute(&pool)
-            .await
-            .unwrap();
-        }
-        sqlx::query(
-            "INSERT INTO hub_session_messages
-                 (id, session_id, role, message_kind, content, delivery_mode,
-                  delivery_state, turn_id, run_id)
-             SELECT $1, id, 'user', 'message', 'delivered without bundle',
-                    'next_turn', 'delivered', $2, $3
-             FROM hub_sessions WHERE id = $4",
-        )
-        .bind(Uuid::new_v4())
-        .bind(
-            sqlx::query_scalar::<_, Uuid>("SELECT hub_turn_id FROM runs WHERE hub_session_id = $1")
-                .bind(unrecoverable_session)
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
-        )
-        .bind(
-            sqlx::query_scalar::<_, Uuid>("SELECT id FROM runs WHERE hub_session_id = $1")
-                .bind(unrecoverable_session)
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
-        )
-        .bind(unrecoverable_session)
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO hub_session_messages
-                 (id, session_id, role, message_kind, content, delivery_mode,
-                  delivery_state)
-             SELECT $1, id, 'user', 'message', 'queued and replayable',
-                    'next_turn', 'queued'
-             FROM hub_sessions WHERE id = $2",
-        )
-        .bind(Uuid::new_v4())
-        .bind(recoverable_session)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        reap_stale_runtimes(&pool).await.unwrap();
-
-        let unrecoverable: (Option<Uuid>, String, Option<String>) = sqlx::query_as(
-            "SELECT runtime_owner_id, lifecycle_status, recovery_error
-             FROM hub_sessions WHERE id = $1",
-        )
-        .bind(unrecoverable_session)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(unrecoverable.0, None);
-        assert_eq!(unrecoverable.1, "waiting_for_runtime");
-        assert_eq!(
-            unrecoverable.2.as_deref(),
-            Some("服务端发生意外，导致 agent 环境数据丢失，但对话历史还在")
-        );
-        let recoverable: (Option<Uuid>, String) = sqlx::query_as(
-            "SELECT runtime_owner_id, lifecycle_status
-             FROM hub_sessions WHERE id = $1",
-        )
-        .bind(recoverable_session)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(recoverable.0, None);
-        assert_eq!(recoverable.1, "waiting_for_runtime");
-        let pending_count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM runs
-             WHERE hub_session_id = $1 AND status = 'pending'",
-        )
-        .bind(unrecoverable_session)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(pending_count, 1);
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_salvage_obligation_recovers_crashed_workspace_bundle(pool: PgPool) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let _ = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-        sqlx::query("UPDATE hub_sessions SET lifecycle_status = 'online' WHERE id = $1")
-            .bind(fixture.hub_session_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
-        sqlx::query(
-            "UPDATE runtimes
-             SET last_heartbeat_at = now() - interval '2 minutes'
-             WHERE id = $1",
-        )
-        .bind(fixture.runtime_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-
-        reap_stale_runtimes(&fixture.state.pool).await.unwrap();
-
-        let obligation: (i64, i64, i64) = sqlx::query_as(
-            "SELECT ownership_generation, history_checkpoint, bundle_generation
-             FROM runtime_session_salvage_obligations
-             WHERE runtime_id = $1 AND session_id = $2",
-        )
-        .bind(fixture.runtime_id)
-        .bind(fixture.hub_session_id)
-        .fetch_one(&fixture.state.pool)
-        .await
-        .unwrap();
-        assert_eq!(obligation, (1, 3, 1));
-
-        let heartbeat = runtime_heartbeat(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Json(RuntimeHeartbeatRequest::default()),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(
-            heartbeat.salvage_sessions,
-            vec![RuntimeSalvageSessionDto {
-                session_id: fixture.hub_session_id,
-                ownership_generation: 1,
-                history_checkpoint: 3,
-                bundle_generation: 1,
-            }]
-        );
-
-        let stored = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let object_app = Router::new().route(
-            "/bundle-bucket/{*key}",
-            axum::routing::put({
-                let stored = Arc::clone(&stored);
-                move |body: Body| {
-                    let stored = Arc::clone(&stored);
-                    async move {
-                        *stored.lock().unwrap() =
-                            axum::body::to_bytes(body, 1024).await.unwrap().to_vec();
-                    }
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let object_server =
-            tokio::spawn(async move { axum::serve(listener, object_app).await.unwrap() });
-        let store = crate::session_bundle_store::S3BundleStore::new(
-            crate::session_bundle_store::S3BundleStoreConfig {
-                endpoint: format!("http://{address}").parse().unwrap(),
-                bucket: "bundle-bucket".into(),
-                region: "us-test-1".into(),
-                access_key_id: "test-access".into(),
-                secret_access_key: "test-secret".into(),
-                session_token: None,
-                server_side_encryption: None,
-                kms_key_id: None,
-                allow_http: true,
-            },
-        )
-        .unwrap();
-        let mut state = (*fixture.state).clone();
-        state.session_bundle_store = Some(Arc::new(store));
-        state.session_bundle_max_bytes = 1024;
-        let state = Arc::new(state);
-
-        let bytes = Bytes::from_static(b"salvage bundle body");
-        let checksum = format!("{:x}", Sha256::digest(&bytes));
-        let checkpoint_attempt_id = Uuid::new_v4();
-        let mut headers = bearer_headers(&fixture.runtime_token);
-        for (name, value) in [
-            ("content-length", bytes.len().to_string()),
-            ("x-agent-hub-ownership-generation", obligation.0.to_string()),
-            (
-                "x-agent-hub-checkpoint-attempt-id",
-                checkpoint_attempt_id.to_string(),
-            ),
-            ("x-agent-hub-bundle-generation", obligation.2.to_string()),
-            ("x-agent-hub-bundle-sha256", checksum.clone()),
-            ("x-agent-hub-bundle-size", bytes.len().to_string()),
-            ("x-agent-hub-history-checkpoint", obligation.1.to_string()),
-            ("x-agent-hub-producing-engine-version", "0.104.0".into()),
-            ("x-agent-hub-bundle-created-at", Utc::now().to_rfc3339()),
-        ] {
-            headers.insert(
-                HeaderName::from_bytes(name.as_bytes()).unwrap(),
-                HeaderValue::from_str(&value).unwrap(),
-            );
-        }
-
-        let response = runtime_salvage_session_bundle(
-            State(state.clone()),
-            Path(fixture.hub_session_id),
-            headers,
-            Body::from(bytes.clone()),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(response.checkpoint_attempt_id, checkpoint_attempt_id);
-        assert_eq!(response.bundle_generation, 1);
-        assert!(response.ownership_released);
-
-        let pointer: (Option<i64>, Option<String>, Option<String>) = sqlx::query_as(
-            "SELECT current_bundle_generation, current_bundle_checksum_sha256, recovery_error
-             FROM hub_sessions WHERE id = $1",
-        )
-        .bind(fixture.hub_session_id)
-        .fetch_one(&fixture.state.pool)
-        .await
-        .unwrap();
-        assert_eq!(pointer, (Some(1), Some(checksum), None));
-        let bundle_metadata: (Option<i64>, Option<i64>) = sqlx::query_as(
-            "SELECT current_bundle_history_checkpoint, current_bundle_ownership_generation
-             FROM hub_sessions WHERE id = $1",
-        )
-        .bind(fixture.hub_session_id)
-        .fetch_one(&fixture.state.pool)
-        .await
-        .unwrap();
-        assert_eq!(bundle_metadata, (Some(3), Some(1)));
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM runtime_session_salvage_obligations
-                 WHERE runtime_id = $1 AND session_id = $2",
-            )
-            .bind(fixture.runtime_id)
-            .bind(fixture.hub_session_id)
-            .fetch_one(&fixture.state.pool)
-            .await
-            .unwrap(),
-            0
-        );
-        assert_eq!(*stored.lock().unwrap(), bytes);
-        object_server.abort();
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_heartbeat_tolerates_stale_owned_sessions_instead_of_conflicting(pool: PgPool) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-        sqlx::query("UPDATE hub_sessions SET lifecycle_status = 'online' WHERE id = $1")
-            .bind(fixture.hub_session_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
-        let _ = runtime_complete_run(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(claim.run.id),
-            runtime_write_generation(
-                1,
-                CompleteRunRequest {
-                    status: "failed".into(),
-                    native_session_id: None,
-                    work_dir_ref: None,
-                },
-            ),
-        )
-        .await
-        .unwrap();
-        // Release the session out from under the runtime (e.g. crash recovery).
-        let _ = runtime_release_session(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(fixture.hub_session_id),
-            Json(ReleaseRuntimeSessionRequest {
-                ownership_generation: 1,
-                force: true,
-            }),
-        )
-        .await
-        .unwrap();
-
-        // The runtime still reports the old generation as owned.
-        let heartbeat = runtime_heartbeat(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Json(RuntimeHeartbeatRequest {
-                pending_credential_hash: None,
-                accepts_session_commands: true,
-                owned_sessions: vec![RuntimeOwnedSessionStateRequest {
-                    session_id: fixture.hub_session_id,
-                    ownership_generation: 1,
-                    lifecycle_status: "online".into(),
-                    checkpoint_reason: None,
-                }],
-                cleaned_sessions: Vec::new(),
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert!(
-            heartbeat
-                .owned_sessions
-                .iter()
-                .all(|session| session.session_id != fixture.hub_session_id),
-            "released Session must not appear in the owned snapshot"
-        );
-        let runtime_state: (String, chrono::DateTime<Utc>) =
-            sqlx::query_as("SELECT status, last_heartbeat_at FROM runtimes WHERE id = $1")
-                .bind(fixture.runtime_id)
-                .fetch_one(&fixture.state.pool)
-                .await
-                .unwrap();
-        assert_eq!(runtime_state.0, "online");
-        assert!(
-            runtime_state.1 > Utc::now() - chrono::Duration::seconds(30),
-            "heartbeat must keep the Runtime alive"
-        );
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_reaper_reclaims_saving_sessions_and_clears_checkpoint_fields(pool: PgPool) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let _ = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-        let attempt_id = Uuid::new_v4();
-        sqlx::query(
-            "UPDATE hub_sessions
-             SET lifecycle_status = 'saving',
-                 saving_history_checkpoint = 1,
-                 saving_ownership_generation = 1,
-                 saving_reason = 'idle',
-                 saving_checkpoint_attempt_id = $1
-             WHERE id = $2",
-        )
-        .bind(attempt_id)
-        .bind(fixture.hub_session_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "UPDATE runtimes SET last_heartbeat_at = now() - interval '2 minutes' WHERE id = $1",
-        )
-        .bind(fixture.runtime_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-
-        reap_stale_runtimes(&fixture.state.pool).await.unwrap();
-
-        let session: (Option<Uuid>, String, Option<Uuid>, Option<String>) = sqlx::query_as(
-            "SELECT runtime_owner_id, lifecycle_status,
-                    saving_checkpoint_attempt_id, saving_reason
-             FROM hub_sessions WHERE id = $1",
-        )
-        .bind(fixture.hub_session_id)
-        .fetch_one(&fixture.state.pool)
-        .await
-        .unwrap();
-        assert_eq!(session.0, None);
-        assert!(matches!(
-            session.1.as_str(),
-            "offline" | "waiting_for_runtime"
-        ));
-        assert_eq!(session.2, None);
-        assert_eq!(session.3, None);
-        let runtime_status: String =
-            sqlx::query_scalar("SELECT status FROM runtimes WHERE id = $1")
-                .bind(fixture.runtime_id)
-                .fetch_one(&fixture.state.pool)
-                .await
-                .unwrap();
-        assert_eq!(runtime_status, "offline");
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_reaper_fails_running_runs_and_allows_reclaiming_pending_work(pool: PgPool) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-        assert_eq!(
-            sqlx::query_scalar::<_, String>("SELECT status FROM runs WHERE id = $1")
-                .bind(claim.run.id)
-                .fetch_one(&fixture.state.pool)
-                .await
-                .unwrap(),
-            "running"
-        );
-        sqlx::query(
-            "UPDATE runtimes SET last_heartbeat_at = now() - interval '2 minutes' WHERE id = $1",
-        )
-        .bind(fixture.runtime_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-
-        reap_stale_runtimes(&fixture.state.pool).await.unwrap();
-
-        let failed_run: String = sqlx::query_scalar("SELECT status FROM runs WHERE id = $1")
-            .bind(claim.run.id)
-            .fetch_one(&fixture.state.pool)
-            .await
-            .unwrap();
-        assert_eq!(failed_run, "failed");
-        let session_owner: Option<Uuid> =
-            sqlx::query_scalar("SELECT runtime_owner_id FROM hub_sessions WHERE id = $1")
-                .bind(fixture.hub_session_id)
-                .fetch_one(&fixture.state.pool)
-                .await
-                .unwrap();
-        assert_eq!(session_owner, None);
-        let obligation: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM runtime_session_salvage_obligations
-             WHERE runtime_id = $1 AND session_id = $2",
-        )
-        .bind(fixture.runtime_id)
-        .bind(fixture.hub_session_id)
-        .fetch_one(&fixture.state.pool)
-        .await
-        .unwrap();
-        assert_eq!(obligation, 1);
-
-        // Bring the Runtime back and let it reclaim queued work.
-        sqlx::query(
-            "UPDATE runtimes SET status = 'online', last_heartbeat_at = now() WHERE id = $1",
-        )
-        .bind(fixture.runtime_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-        let _ = insert_pending_session_run(&fixture.state.pool, fixture.hub_session_id).await;
-        let reclaimed = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-        assert_eq!(reclaimed.run.hub_session_id, Some(fixture.hub_session_id));
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM runs WHERE status = 'pending'")
-                .fetch_one(&fixture.state.pool)
-                .await
-                .unwrap(),
-            0
-        );
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_salvage_upload_is_idempotent_and_rejects_mismatched_obligations(pool: PgPool) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let stored = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let object_app = Router::new().route(
-            "/bundle-bucket/{*key}",
-            axum::routing::put({
-                let stored = Arc::clone(&stored);
-                move |body: Body| {
-                    let stored = Arc::clone(&stored);
-                    async move {
-                        *stored.lock().unwrap() =
-                            axum::body::to_bytes(body, 1024).await.unwrap().to_vec();
-                    }
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let object_server =
-            tokio::spawn(async move { axum::serve(listener, object_app).await.unwrap() });
-        let store = crate::session_bundle_store::S3BundleStore::new(
-            crate::session_bundle_store::S3BundleStoreConfig {
-                endpoint: format!("http://{address}").parse().unwrap(),
-                bucket: "bundle-bucket".into(),
-                region: "us-test-1".into(),
-                access_key_id: "test-access".into(),
-                secret_access_key: "test-secret".into(),
-                session_token: None,
-                server_side_encryption: None,
-                kms_key_id: None,
-                allow_http: true,
-            },
-        )
-        .unwrap();
-        let mut state = (*fixture.state).clone();
-        state.session_bundle_store = Some(Arc::new(store));
-        state.session_bundle_max_bytes = 1024;
-        let state = Arc::new(state);
-
-        let bytes = Bytes::from_static(b"idempotent salvage body");
-        let checksum = format!("{:x}", Sha256::digest(&bytes));
-        let created_at = Utc::now();
-        let checkpoint_attempt_id = Uuid::new_v4();
-        let upload_headers = |generation: i64| {
-            let mut headers = bearer_headers(&fixture.runtime_token);
-            for (name, value) in [
-                ("content-length", bytes.len().to_string()),
-                ("x-agent-hub-ownership-generation", "2".into()),
-                (
-                    "x-agent-hub-checkpoint-attempt-id",
-                    checkpoint_attempt_id.to_string(),
-                ),
-                ("x-agent-hub-bundle-generation", generation.to_string()),
-                ("x-agent-hub-bundle-sha256", checksum.clone()),
-                ("x-agent-hub-bundle-size", bytes.len().to_string()),
-                ("x-agent-hub-history-checkpoint", "5".into()),
-                ("x-agent-hub-producing-engine-version", "0.104.0".into()),
-                ("x-agent-hub-bundle-created-at", created_at.to_rfc3339()),
-            ] {
-                headers.insert(
-                    HeaderName::from_bytes(name.as_bytes()).unwrap(),
-                    HeaderValue::from_str(&value).unwrap(),
-                );
-            }
-            headers
-        };
-
-        // No obligation yet: upload must be rejected.
-        let rejected = runtime_salvage_session_bundle(
-            State(state.clone()),
-            Path(fixture.hub_session_id),
-            upload_headers(2),
-            Body::from(bytes.clone()),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(rejected.status, StatusCode::CONFLICT);
-
-        sqlx::query(
-            "INSERT INTO runtime_session_salvage_obligations
-                 (runtime_id, session_id, ownership_generation, history_checkpoint,
-                  bundle_generation)
-             VALUES ($1, $2, 2, 5, 2)",
-        )
-        .bind(fixture.runtime_id)
-        .bind(fixture.hub_session_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-
-        // Wrong bundle generation: rejected.
-        let mismatched = runtime_salvage_session_bundle(
-            State(state.clone()),
-            Path(fixture.hub_session_id),
-            upload_headers(3),
-            Body::from(bytes.clone()),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(mismatched.status, StatusCode::CONFLICT);
-
-        // Correct upload then replay: both succeed, one binding.
-        for _ in 0..2 {
-            let response = runtime_salvage_session_bundle(
-                State(state.clone()),
-                Path(fixture.hub_session_id),
-                upload_headers(2),
-                Body::from(bytes.clone()),
-            )
-            .await
-            .unwrap()
-            .0;
-            assert_eq!(response.bundle_generation, 2);
-        }
-        let binding: (Option<i64>, Option<String>) = sqlx::query_as(
-            "SELECT current_bundle_generation, current_bundle_checksum_sha256
-             FROM hub_sessions WHERE id = $1",
-        )
-        .bind(fixture.hub_session_id)
-        .fetch_one(&fixture.state.pool)
-        .await
-        .unwrap();
-        assert_eq!(binding, (Some(2), Some(checksum.clone())));
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM runtime_session_salvage_obligations
-                 WHERE runtime_id = $1 AND session_id = $2",
-            )
-            .bind(fixture.runtime_id)
-            .bind(fixture.hub_session_id)
-            .fetch_one(&fixture.state.pool)
-            .await
-            .unwrap(),
-            0
-        );
-        assert_eq!(*stored.lock().unwrap(), bytes);
-        object_server.abort();
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_salvage_abandon_is_idempotent(pool: PgPool) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        sqlx::query(
-            "INSERT INTO runtime_session_salvage_obligations
-                 (runtime_id, session_id, ownership_generation, history_checkpoint,
-                  bundle_generation)
-             VALUES ($1, $2, 2, 5, 2)",
-        )
-        .bind(fixture.runtime_id)
-        .bind(fixture.hub_session_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-        for _ in 0..2 {
-            let response = runtime_abandon_session_salvage(
-                State(fixture.state.clone()),
-                Path(fixture.hub_session_id),
-                bearer_headers(&fixture.runtime_token),
-                Json(AbandonRuntimeSalvageRequest {
-                    ownership_generation: 2,
-                }),
-            )
-            .await
-            .unwrap();
-            assert_eq!(response, StatusCode::NO_CONTENT);
-        }
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM runtime_session_salvage_obligations
-                 WHERE runtime_id = $1 AND session_id = $2",
-            )
-            .bind(fixture.runtime_id)
-            .bind(fixture.hub_session_id)
-            .fetch_one(&fixture.state.pool)
-            .await
-            .unwrap(),
-            0
-        );
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn session_recovery_notice_cleared_after_first_message(pool: PgPool) {
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
         sqlx::query(
@@ -9891,86 +8218,191 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_heartbeat_replays_interrupt_before_steer_for_the_terminating_turn(
-        pool: PgPool,
-    ) {
-        let fixture = integration_runtime_fixture(pool).await;
-        sqlx::query("UPDATE hub_sessions SET native_session_id = 'interrupt-thread' WHERE id = $1")
+    async fn widget_stop_is_scoped_to_the_embed_session_token(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM hub_sessions WHERE id = $1")
             .bind(fixture.hub_session_id)
-            .execute(&fixture.state.pool)
+            .fetch_one(&fixture.state.pool)
             .await
             .unwrap();
-        sqlx::query("UPDATE hub_session_turns SET interrupt_requested_at = now() WHERE id = $1")
-            .bind(fixture.turn_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
-        let steer_id = Uuid::new_v4();
+        let widget_session_id = Uuid::new_v4();
+        let other_widget_session_id = Uuid::new_v4();
+        let other_hub_session_id = Uuid::new_v4();
+        let widget_token = format!("ahe_{}", Uuid::new_v4().simple());
+        let other_widget_token = format!("ahe_{}", Uuid::new_v4().simple());
         sqlx::query(
-            "INSERT INTO hub_session_messages
-                 (id, session_id, role, message_kind, content, delivery_mode,
-                  delivery_state, expected_native_turn_id, turn_id, run_id)
-             VALUES ($1, $2, 'user', 'message', 'must wait for next Turn',
-                     'steer', 'queued', 'fixture-native-turn', $3, $4)",
+            "INSERT INTO hub_sessions
+                 (id, owner_id, agent_id, origin_kind, lifecycle_status)
+             VALUES ($1, $2, $3, 'hub_native', 'waiting_for_runtime')",
         )
-        .bind(steer_id)
-        .bind(fixture.hub_session_id)
+        .bind(other_hub_session_id)
+        .bind(owner_id)
+        .bind(fixture.agent_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        for (embed_id, token, hub_session_id) in [
+            (widget_session_id, &widget_token, fixture.hub_session_id),
+            (
+                other_widget_session_id,
+                &other_widget_token,
+                other_hub_session_id,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO embed_sessions
+                     (id, token_hash, agent_id, owner_id, expires_at, hub_session_id)
+                 VALUES ($1, $2, $3, $4, now() + interval '1 hour', $5)",
+            )
+            .bind(embed_id)
+            .bind(sha256_hex(token))
+            .bind(fixture.agent_id)
+            .bind(owner_id)
+            .bind(hub_session_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET runtime_owner_id = $1, ownership_generation = 1,
+                 lifecycle_status = 'online', active_turn_id = $2,
+                 native_session_id = 'widget-stop-thread'
+             WHERE id = $3",
+        )
+        .bind(fixture.runtime_id)
         .bind(fixture.turn_id)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE hub_session_turns
+             SET native_turn_id = 'widget-stop-turn', status = 'running',
+                 ownership_generation = 1
+             WHERE id = $1",
+        )
+        .bind(fixture.turn_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE runs
+             SET runtime_id = $1, status = 'running', source = 'console',
+                 widget_session_id = NULL, session_ownership_generation = 1
+             WHERE id = $2",
+        )
+        .bind(fixture.runtime_id)
         .bind(fixture.run_id)
         .execute(&fixture.state.pool)
         .await
         .unwrap();
-        let heartbeat_request = RuntimeHeartbeatRequest {
-            accepts_session_commands: true,
-            ..RuntimeHeartbeatRequest::default()
-        };
-
-        let first = runtime_heartbeat(
+        let mut widget_headers = HeaderMap::new();
+        widget_headers.insert(
+            "x-agent-hub-embed-token",
+            axum::http::HeaderValue::from_str(&widget_token).unwrap(),
+        );
+        let steered = create_widget_run(
             State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Json(heartbeat_request.clone()),
+            widget_headers,
+            Json(CreateWidgetRunRequest {
+                message: "widget joins the active console Turn".into(),
+                session_id: None,
+                integration_session_id: None,
+                hub_session_id: Some(fixture.hub_session_id),
+                parent_run_id: None,
+                client_message_key: Some("widget-active-turn".into()),
+            }),
         )
         .await
         .unwrap()
         .0;
-        let replay = runtime_heartbeat(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Json(heartbeat_request),
-        )
-        .await
-        .unwrap()
-        .0;
-
-        for heartbeat in [first, replay] {
-            assert_eq!(heartbeat.session_commands.len(), 1);
-            assert_eq!(
-                heartbeat.session_commands[0],
-                RuntimeSessionCommandDto {
-                    command_id: fixture.turn_id,
-                    session_id: fixture.hub_session_id,
-                    ownership_generation: 1,
-                    command: "interrupt".into(),
-                    run_id: Some(fixture.run_id),
-                    turn_id: Some(fixture.turn_id),
-                    native_session_id: Some("interrupt-thread".into()),
-                    native_turn_id: Some("fixture-native-turn".into()),
-                    message: None,
-                    configuration_revision: None,
-                    fingerprint: None,
-                    execution_configuration: None,
-                }
-            );
-        }
+        assert_eq!(steered.id, fixture.run_id);
+        assert_eq!(steered.source, "console");
         assert_eq!(
-            sqlx::query_scalar::<_, String>(
-                "SELECT delivery_state FROM hub_session_messages WHERE id = $1"
+            sqlx::query_scalar::<_, Option<Uuid>>(
+                "SELECT widget_session_id FROM runs WHERE id = $1"
             )
-            .bind(steer_id)
+            .bind(fixture.run_id)
             .fetch_one(&fixture.state.pool)
             .await
             .unwrap(),
-            "queued"
+            Some(widget_session_id)
+        );
+        let app = build_router(test_state_with_pool(fixture.state.pool.clone()));
+        let stop_request = |token: &str| {
+            axum::http::Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/widget/runs/{}/stop", fixture.run_id))
+                .header("x-agent-hub-embed-token", token)
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let stream_request = |token: &str| {
+            axum::http::Request::builder()
+                .uri(format!("/api/runs/{}/events/stream", fixture.run_id))
+                .header("x-agent-hub-embed-token", token)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let forbidden_stream = app
+            .clone()
+            .oneshot(stream_request(&other_widget_token))
+            .await
+            .unwrap();
+        assert_eq!(forbidden_stream.status(), StatusCode::FORBIDDEN);
+        let own_stream = app
+            .clone()
+            .oneshot(stream_request(&widget_token))
+            .await
+            .unwrap();
+        assert_eq!(own_stream.status(), StatusCode::OK);
+
+        let forbidden = app
+            .clone()
+            .oneshot(stop_request(&other_widget_token))
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::NOT_FOUND);
+        let stopped = app.oneshot(stop_request(&widget_token)).await.unwrap();
+        assert_eq!(stopped.status(), StatusCode::OK);
+
+        let completed = runtime_complete_run(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(fixture.run_id),
+            runtime_write_generation(
+                1,
+                CompleteRunRequest {
+                    status: "interrupted".into(),
+                    native_session_id: Some("widget-stop-thread".into()),
+                    work_dir_ref: Some("widget-retained-workspace".into()),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(completed.status, "interrupted");
+        let rerouted_run_id: Uuid = sqlx::query_scalar(
+            "SELECT run_id FROM hub_session_messages
+             WHERE session_id = $1 AND client_message_key = 'widget-active-turn'",
+        )
+        .bind(fixture.hub_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_ne!(rerouted_run_id, fixture.run_id);
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<Uuid>>(
+                "SELECT widget_session_id FROM runs WHERE id = $1"
+            )
+            .bind(rerouted_run_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            Some(widget_session_id)
         );
     }
 
@@ -10118,171 +8550,6 @@ mod tests {
             Some("late-bound-thread")
         );
         assert_eq!(interrupt.native_turn_id.as_deref(), Some("late-bound-turn"));
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_interrupt_ack_is_generation_fenced_idempotent_and_stops_replay(pool: PgPool) {
-        let fixture = integration_runtime_fixture(pool).await;
-        sqlx::query(
-            "UPDATE hub_sessions SET native_session_id = 'interrupt-ack-thread' WHERE id = $1",
-        )
-        .bind(fixture.hub_session_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-        sqlx::query("UPDATE hub_session_turns SET interrupt_requested_at = now() WHERE id = $1")
-            .bind(fixture.turn_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
-
-        let stale = runtime_complete_session_command(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path((fixture.hub_session_id, fixture.turn_id)),
-            runtime_write_generation(
-                2,
-                CompleteRuntimeSessionCommandRequest {
-                    command: "interrupt".into(),
-                    outcome: "interrupted".into(),
-                    revision: None,
-                    fingerprint: None,
-                },
-            ),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(stale.status, StatusCode::FORBIDDEN);
-
-        let acknowledge = || {
-            runtime_complete_session_command(
-                State(fixture.state.clone()),
-                bearer_headers(&fixture.runtime_token),
-                Path((fixture.hub_session_id, fixture.turn_id)),
-                runtime_write_generation(
-                    1,
-                    CompleteRuntimeSessionCommandRequest {
-                        command: "interrupt".into(),
-                        outcome: "interrupted".into(),
-                        revision: None,
-                        fingerprint: None,
-                    },
-                ),
-            )
-        };
-        let _ = acknowledge().await.unwrap();
-        let acknowledged_at: DateTime<Utc> = sqlx::query_scalar(
-            "SELECT interrupt_acknowledged_at FROM hub_session_turns WHERE id = $1",
-        )
-        .bind(fixture.turn_id)
-        .fetch_one(&fixture.state.pool)
-        .await
-        .unwrap();
-        let _ = acknowledge().await.unwrap();
-        assert_eq!(
-            sqlx::query_scalar::<_, DateTime<Utc>>(
-                "SELECT interrupt_acknowledged_at FROM hub_session_turns WHERE id = $1"
-            )
-            .bind(fixture.turn_id)
-            .fetch_one(&fixture.state.pool)
-            .await
-            .unwrap(),
-            acknowledged_at
-        );
-
-        let heartbeat = runtime_heartbeat(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Json(RuntimeHeartbeatRequest {
-                accepts_session_commands: true,
-                ..RuntimeHeartbeatRequest::default()
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert!(heartbeat
-            .session_commands
-            .iter()
-            .all(|command| command.command != "interrupt"));
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_heartbeat_replays_delivering_steer_before_interrupt(pool: PgPool) {
-        let fixture = integration_runtime_fixture(pool).await;
-        sqlx::query(
-            "UPDATE hub_sessions SET native_session_id = 'interrupt-race-thread' WHERE id = $1",
-        )
-        .bind(fixture.hub_session_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-        sqlx::query("UPDATE hub_session_turns SET interrupt_requested_at = now() WHERE id = $1")
-            .bind(fixture.turn_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
-        let steer_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO hub_session_messages
-                 (id, session_id, role, message_kind, content, delivery_mode,
-                  delivery_state, expected_native_turn_id, turn_id, run_id)
-             VALUES ($1, $2, 'user', 'message', 'possibly already applied',
-                     'steer', 'delivering', 'fixture-native-turn', $3, $4)",
-        )
-        .bind(steer_id)
-        .bind(fixture.hub_session_id)
-        .bind(fixture.turn_id)
-        .bind(fixture.run_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-
-        let heartbeat = runtime_heartbeat(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Json(RuntimeHeartbeatRequest {
-                accepts_session_commands: true,
-                ..RuntimeHeartbeatRequest::default()
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(heartbeat.session_commands.len(), 2);
-        assert_eq!(heartbeat.session_commands[0].command, "steer");
-        assert_eq!(heartbeat.session_commands[0].command_id, steer_id);
-        assert_eq!(heartbeat.session_commands[1].command, "interrupt");
-        assert_eq!(heartbeat.session_commands[1].command_id, fixture.turn_id);
-
-        let _ = runtime_complete_session_command(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path((fixture.hub_session_id, steer_id)),
-            runtime_write_generation(
-                1,
-                CompleteRuntimeSessionCommandRequest {
-                    command: "steer".into(),
-                    outcome: "applied".into(),
-                    revision: None,
-                    fingerprint: None,
-                },
-            ),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            sqlx::query_scalar::<_, String>(
-                "SELECT delivery_state FROM hub_session_messages WHERE id = $1"
-            )
-            .bind(steer_id)
-            .fetch_one(&fixture.state.pool)
-            .await
-            .unwrap(),
-            "delivered"
-        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -10686,146 +8953,6 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_steer_commands_replay_after_lost_ack_and_complete_in_sequence(pool: PgPool) {
-        let fixture = integration_runtime_fixture(pool).await;
-        let first_message_id = Uuid::new_v4();
-        let second_message_id = Uuid::new_v4();
-        for (message_id, content) in [
-            (first_message_id, "first steer"),
-            (second_message_id, "second steer"),
-        ] {
-            sqlx::query(
-                "INSERT INTO hub_session_messages
-                     (id, session_id, role, message_kind, content, delivery_mode,
-                      delivery_state, expected_native_turn_id, turn_id, run_id)
-                 VALUES ($1, $2, 'user', 'message', $3, 'steer', 'queued',
-                         'fixture-native-turn', $4, $5)",
-            )
-            .bind(message_id)
-            .bind(fixture.hub_session_id)
-            .bind(content)
-            .bind(fixture.turn_id)
-            .bind(fixture.run_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
-        }
-        let heartbeat_request = RuntimeHeartbeatRequest {
-            pending_credential_hash: None,
-            accepts_session_commands: true,
-            owned_sessions: vec![RuntimeOwnedSessionStateRequest {
-                session_id: fixture.hub_session_id,
-                ownership_generation: 1,
-                lifecycle_status: "online".into(),
-                checkpoint_reason: None,
-            }],
-            cleaned_sessions: Vec::new(),
-        };
-
-        let first_delivery = runtime_heartbeat(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Json(heartbeat_request.clone()),
-        )
-        .await
-        .unwrap()
-        .0;
-        let replay = runtime_heartbeat(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Json(heartbeat_request),
-        )
-        .await
-        .unwrap()
-        .0;
-        let command_ids = |response: &RuntimeHeartbeatResponse| {
-            response
-                .session_commands
-                .iter()
-                .filter(|command| command.command == "steer")
-                .map(|command| {
-                    (
-                        command.command_id,
-                        command.message.as_ref().unwrap().sequence,
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        let delivered = command_ids(&first_delivery);
-        assert_eq!(delivered.len(), 2);
-        assert_eq!(delivered, command_ids(&replay));
-        assert_eq!(
-            delivered.iter().map(|entry| entry.0).collect::<Vec<_>>(),
-            vec![first_message_id, second_message_id]
-        );
-
-        let _ = runtime_complete_session_command(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path((fixture.hub_session_id, first_message_id)),
-            runtime_write_generation(
-                1,
-                CompleteRuntimeSessionCommandRequest {
-                    command: "steer".into(),
-                    outcome: "applied".into(),
-                    revision: None,
-                    fingerprint: None,
-                },
-            ),
-        )
-        .await
-        .unwrap();
-        let _ = runtime_complete_session_command(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path((fixture.hub_session_id, second_message_id)),
-            runtime_write_generation(
-                1,
-                CompleteRuntimeSessionCommandRequest {
-                    command: "steer".into(),
-                    outcome: "turn_ended".into(),
-                    revision: None,
-                    fingerprint: None,
-                },
-            ),
-        )
-        .await
-        .unwrap();
-
-        let first_state: String =
-            sqlx::query_scalar("SELECT delivery_state FROM hub_session_messages WHERE id = $1")
-                .bind(first_message_id)
-                .fetch_one(&fixture.state.pool)
-                .await
-                .unwrap();
-        assert_eq!(first_state, "delivered");
-        let fallback: (String, String, Option<String>, Uuid, Uuid) = sqlx::query_as(
-            "SELECT delivery_mode, delivery_state, expected_native_turn_id, turn_id, run_id
-             FROM hub_session_messages WHERE id = $1",
-        )
-        .bind(second_message_id)
-        .fetch_one(&fixture.state.pool)
-        .await
-        .unwrap();
-        assert_eq!(fallback.0, "next_turn");
-        assert_eq!(fallback.1, "queued");
-        assert_eq!(fallback.2, None);
-        assert_ne!(fallback.3, fixture.turn_id);
-        assert_ne!(fallback.4, fixture.run_id);
-        let pending: (String, String) = sqlx::query_as(
-            "SELECT runs.status, turns.status
-             FROM runs JOIN hub_session_turns AS turns ON turns.id = runs.hub_turn_id
-             WHERE runs.id = $1",
-        )
-        .bind(fallback.4)
-        .fetch_one(&fixture.state.pool)
-        .await
-        .unwrap();
-        assert_eq!(pending, ("pending".into(), "pending".into()));
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn turn_ended_fallback_moves_integration_message_and_attachment_context(pool: PgPool) {
         let fixture = integration_runtime_fixture(pool).await;
         let accepted = create_integration_message(
@@ -11046,24 +9173,63 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_heartbeat_preserves_draining_and_fences_owned_state_ack(pool: PgPool) {
+    async fn skill_delete_targets_agent_revision_and_stale_refresh_completion_cannot_clear_it(
+        pool: PgPool,
+    ) {
         let fixture = integration_runtime_fixture(pool).await;
-        sqlx::query("UPDATE hub_sessions SET native_session_id = 'thread-current' WHERE id = $1")
-            .bind(fixture.hub_session_id)
+        let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM agents WHERE id = $1")
+            .bind(fixture.agent_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        let skill_id = Uuid::new_v4();
+        sqlx::query("UPDATE agents SET execution_config_revision = 7 WHERE id = $1")
+            .bind(fixture.agent_id)
             .execute(&fixture.state.pool)
             .await
             .unwrap();
-        let _other_runtime_session = insert_idle_owned_session(
-            &fixture.state.pool,
-            fixture.hub_session_id,
-            fixture.other_runtime_id,
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET configuration_refresh_revision = 3,
+                 configuration_applied_revision = 3
+             WHERE id = $1",
         )
-        .await;
-        sqlx::query("UPDATE runtimes SET status = 'draining' WHERE id = $1")
-            .bind(fixture.runtime_id)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO skills
+                 (id, owner_id, name, description, content, content_checksum_sha256)
+             VALUES ($1, $2, 'refresh-skill', '', 'old', $3)",
+        )
+        .bind(skill_id)
+        .bind(owner_id)
+        .bind(sha256_hex("old"))
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO agent_skills (agent_id, skill_id) VALUES ($1, $2)")
+            .bind(fixture.agent_id)
+            .bind(skill_id)
             .execute(&fixture.state.pool)
             .await
             .unwrap();
+
+        delete_skills_for_user(&fixture.state.pool, owner_id, &[skill_id])
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_as::<_, (i64, i64)>(
+                "SELECT configuration_refresh_revision, configuration_applied_revision
+                 FROM hub_sessions WHERE id = $1",
+            )
+            .bind(fixture.hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            (8, 3)
+        );
 
         let heartbeat = runtime_heartbeat(
             State(fixture.state.clone()),
@@ -11076,212 +9242,356 @@ mod tests {
         .await
         .unwrap()
         .0;
-        assert_eq!(heartbeat.runtime_status, "draining");
+        let stale = heartbeat
+            .session_commands
+            .into_iter()
+            .find(|command| command.command == "refresh_configuration")
+            .unwrap();
+        assert_eq!(stale.configuration_revision, Some(8));
         assert_eq!(
-            heartbeat.owned_sessions,
-            vec![RuntimeOwnedSessionSnapshotDto {
-                session_id: fixture.hub_session_id,
-                ownership_generation: 1,
-                lifecycle_status: "online".into(),
-                native_session_id: Some("thread-current".into()),
-                active_run_id: Some(fixture.run_id),
-            }]
+            stale.configuration_revision,
+            stale
+                .execution_configuration
+                .as_ref()
+                .map(|configuration| configuration.revision)
         );
-        assert_eq!(heartbeat.session_commands.len(), 1);
-        assert_eq!(
-            heartbeat.session_commands[0],
-            RuntimeSessionCommandDto {
-                command_id: fixture.hub_session_id,
-                session_id: fixture.hub_session_id,
-                ownership_generation: 1,
-                command: "checkpoint".into(),
-                run_id: None,
-                turn_id: None,
-                native_session_id: None,
-                native_turn_id: None,
-                message: None,
-                configuration_revision: None,
-                fingerprint: None,
-                execution_configuration: None,
-            }
-        );
+        let stale_fingerprint = stale.fingerprint.clone().unwrap();
 
-        let stale = runtime_heartbeat(
+        sqlx::query(
+            "UPDATE agents
+             SET instructions = 'newer target', execution_config_revision = 9
+             WHERE id = $1",
+        )
+        .bind(fixture.agent_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE hub_sessions SET configuration_refresh_revision = 9 WHERE id = $1")
+            .bind(fixture.hub_session_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+
+        let _ = runtime_complete_session_command(
             State(fixture.state.clone()),
             bearer_headers(&fixture.runtime_token),
-            Json(RuntimeHeartbeatRequest {
-                pending_credential_hash: None,
-                accepts_session_commands: false,
-                owned_sessions: vec![RuntimeOwnedSessionStateRequest {
-                    session_id: fixture.hub_session_id,
-                    ownership_generation: 2,
-                    lifecycle_status: "saving".into(),
-                    checkpoint_reason: Some("drain".into()),
-                }],
-                cleaned_sessions: Vec::new(),
+            Path((fixture.hub_session_id, stale.command_id)),
+            Json(RuntimeSessionWriteRequest {
+                ownership_generation: 1,
+                payload: CompleteRuntimeSessionCommandRequest {
+                    command: "refresh_configuration".into(),
+                    outcome: "applied".into(),
+                    revision: Some(8),
+                    fingerprint: Some(stale_fingerprint),
+                },
             }),
         )
         .await
-        .unwrap()
-        .0;
-        assert_eq!(stale.runtime_status, "draining");
+        .unwrap();
         assert_eq!(
-            stale.owned_sessions,
-            vec![RuntimeOwnedSessionSnapshotDto {
-                session_id: fixture.hub_session_id,
-                ownership_generation: 1,
-                lifecycle_status: "online".into(),
-                native_session_id: Some("thread-current".into()),
-                active_run_id: Some(fixture.run_id),
-            }]
-        );
-        assert!(stale.session_commands.is_empty());
-        assert_eq!(
-            sqlx::query_scalar::<_, String>("SELECT status FROM runtimes WHERE id = $1")
-                .bind(fixture.runtime_id)
-                .fetch_one(&fixture.state.pool)
-                .await
-                .unwrap(),
-            "draining"
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, String>(
-                "SELECT lifecycle_status FROM hub_sessions WHERE id = $1"
+            sqlx::query_scalar::<_, i64>(
+                "SELECT configuration_applied_revision FROM hub_sessions WHERE id = $1",
             )
             .bind(fixture.hub_session_id)
             .fetch_one(&fixture.state.pool)
             .await
             .unwrap(),
-            "online"
+            3
         );
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_heartbeat_exposes_active_run_for_restoring_recovery(pool: PgPool) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
 
         let heartbeat = runtime_heartbeat(
             State(fixture.state.clone()),
             bearer_headers(&fixture.runtime_token),
-            Json(RuntimeHeartbeatRequest::default()),
+            Json(RuntimeHeartbeatRequest {
+                accepts_session_commands: true,
+                ..RuntimeHeartbeatRequest::default()
+            }),
         )
         .await
         .unwrap()
         .0;
-
-        assert_eq!(heartbeat.owned_sessions.len(), 1);
+        let current = heartbeat
+            .session_commands
+            .into_iter()
+            .find(|command| command.command == "refresh_configuration")
+            .unwrap();
+        assert_eq!(current.configuration_revision, Some(9));
         assert_eq!(
-            heartbeat.owned_sessions[0].session_id,
-            fixture.hub_session_id
+            current.configuration_revision,
+            current
+                .execution_configuration
+                .as_ref()
+                .map(|configuration| configuration.revision)
         );
-        assert_eq!(heartbeat.owned_sessions[0].lifecycle_status, "restoring");
+        let _ = runtime_complete_session_command(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path((fixture.hub_session_id, current.command_id)),
+            Json(RuntimeSessionWriteRequest {
+                ownership_generation: 1,
+                payload: CompleteRuntimeSessionCommandRequest {
+                    command: "refresh_configuration".into(),
+                    outcome: "applied".into(),
+                    revision: Some(9),
+                    fingerprint: current.fingerprint,
+                },
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(
-            heartbeat.owned_sessions[0].active_run_id,
-            Some(claim.run.id)
+            sqlx::query_scalar::<_, i64>(
+                "SELECT configuration_applied_revision FROM hub_sessions WHERE id = $1",
+            )
+            .bind(fixture.hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            9
         );
     }
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_heartbeat_dispatches_and_exactly_acknowledges_cleanup_obligations(
+    async fn administrator_authority_hides_super_admin_accounts_and_opens_global_resources(
         pool: PgPool,
     ) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let cleanup = RuntimeOwnedSessionGenerationDto {
-            session_id: Uuid::new_v4(),
-            ownership_generation: 7,
-        };
-        sqlx::query(
-            "INSERT INTO runtime_session_cleanup_obligations
-                 (runtime_id, session_id, ownership_generation)
-             VALUES ($1, $2, $3)",
-        )
-        .bind(fixture.runtime_id)
-        .bind(cleanup.session_id)
-        .bind(cleanup.ownership_generation)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
+        let member_token = create_user_session_with_role(&pool, "member").await;
+        let admin_token = create_user_session_with_role(&pool, "admin").await;
+        let super_token = create_user_session_with_role(&pool, "super_admin").await;
+        let state = Arc::new(test_state_with_browser_session_auth(pool));
+        let member_id: Uuid =
+            sqlx::query_scalar("SELECT user_id FROM sessions WHERE token_hash = $1")
+                .bind(sha256_hex(&member_token))
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let super_id: Uuid =
+            sqlx::query_scalar("SELECT user_id FROM sessions WHERE token_hash = $1")
+                .bind(sha256_hex(&super_token))
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
 
-        let first = runtime_heartbeat(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Json(RuntimeHeartbeatRequest::default()),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(first.cleanup_sessions, vec![cleanup.clone()]);
-
-        let other_runtime_id = Uuid::new_v4();
-        let other_runtime_token = format!("ahrt_{}", Uuid::new_v4().simple());
-        sqlx::query(
-            "INSERT INTO runtimes
-                 (id, token_hash, hostname, labels, engine_version, capabilities,
-                  sandbox_mode, status)
-             VALUES ($1, $2, $3, '{}', 'test', '{}'::jsonb,
-                     'workspace-write', 'online')",
-        )
-        .bind(other_runtime_id)
-        .bind(sha256_hex(&other_runtime_token))
-        .bind(format!("cleanup-other-{}", Uuid::new_v4().simple()))
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-        let other = runtime_heartbeat(
-            State(fixture.state.clone()),
-            bearer_headers(&other_runtime_token),
-            Json(RuntimeHeartbeatRequest {
-                cleaned_sessions: vec![cleanup.clone()],
-                ..RuntimeHeartbeatRequest::default()
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert!(other.cleanup_sessions.is_empty());
-
-        let wrong_generation = runtime_heartbeat(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Json(RuntimeHeartbeatRequest {
-                cleaned_sessions: vec![RuntimeOwnedSessionGenerationDto {
-                    session_id: cleanup.session_id,
-                    ownership_generation: cleanup.ownership_generation + 1,
-                }],
-                ..RuntimeHeartbeatRequest::default()
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(wrong_generation.cleanup_sessions, vec![cleanup.clone()]);
-
-        let acknowledged = runtime_heartbeat(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Json(RuntimeHeartbeatRequest {
-                cleaned_sessions: vec![cleanup.clone()],
-                ..RuntimeHeartbeatRequest::default()
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert!(acknowledged.cleanup_sessions.is_empty());
         assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM runtime_session_cleanup_obligations
-                 WHERE runtime_id = $1 AND session_id = $2",
+            list_admin_users(State(state.clone()), session_headers(&member_token))
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        let visible = list_admin_users(State(state.clone()), session_headers(&admin_token))
+            .await
+            .unwrap()
+            .0;
+        assert!(visible.iter().any(|item| item.user.id == member_id));
+        assert!(visible.iter().all(|item| item.user.role != "super_admin"));
+
+        let hidden = get_admin_user(
+            State(state.clone()),
+            session_headers(&admin_token),
+            Path(super_id),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(hidden.status, StatusCode::NOT_FOUND);
+        let hidden_password = set_admin_user_password(
+            State(state.clone()),
+            session_headers(&admin_token),
+            Path(super_id),
+            Json(AdminSetUserPasswordRequest {
+                password: "replacement-password".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(hidden_password.status, StatusCode::NOT_FOUND);
+
+        let _ = get_admin_user(
+            State(state.clone()),
+            session_headers(&admin_token),
+            Path(member_id),
+        )
+        .await
+        .unwrap();
+        let _ = get_auth_policy(State(state.clone()), session_headers(&admin_token))
+            .await
+            .unwrap();
+        let _ = list_external_platforms(State(state.clone()), session_headers(&admin_token))
+            .await
+            .unwrap();
+        let _ = list_runtime_enrollment_tokens(State(state), session_headers(&admin_token))
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn administrator_can_manage_super_admin_agents_and_view_their_runs(pool: PgPool) {
+        let admin_token = create_user_session_with_role(&pool, "admin").await;
+        let member_token = create_user_session_with_role(&pool, "member").await;
+        let super_token = create_user_session_with_role(&pool, "super_admin").await;
+        let state = Arc::new(test_state_with_browser_session_auth(pool));
+        let member_id: Uuid =
+            sqlx::query_scalar("SELECT user_id FROM sessions WHERE token_hash = $1")
+                .bind(sha256_hex(&member_token))
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let super_id: Uuid =
+            sqlx::query_scalar("SELECT user_id FROM sessions WHERE token_hash = $1")
+                .bind(sha256_hex(&super_token))
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let member_agent_id = Uuid::new_v4();
+        let super_agent_id = Uuid::new_v4();
+        for (agent_id, owner_id, name) in [
+            (member_agent_id, member_id, "Member Agent"),
+            (super_agent_id, super_id, "Protected Agent"),
+        ] {
+            sqlx::query(
+                "INSERT INTO agents
+                     (id, owner_id, name, instructions, visibility, model_policy)
+                 VALUES ($1, $2, $3, 'private instructions', 'private',
+                         '{\"provider\":\"hub-proxy\"}'::jsonb)",
             )
-            .bind(fixture.runtime_id)
-            .bind(cleanup.session_id)
-            .fetch_one(&fixture.state.pool)
+            .bind(agent_id)
+            .bind(owner_id)
+            .bind(name)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        let protected_session_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO hub_sessions
+                 (id, owner_id, agent_id, origin_kind, lifecycle_status)
+             VALUES ($1, $2, $3, 'hub_native', 'offline')",
+        )
+        .bind(protected_session_id)
+        .bind(super_id)
+        .bind(super_agent_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let protected_turn_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO hub_session_turns
+                 (id, session_id, status, ownership_generation)
+             VALUES ($1, $2, 'completed', 0)",
+        )
+        .bind(protected_turn_id)
+        .bind(protected_session_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let protected_run_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO runs
+                 (id, agent_id, owner_id, status, initial_message, source,
+                  hub_session_id, hub_turn_id, session_ownership_generation)
+             VALUES ($1, $2, $3, 'completed', 'private super prompt', 'console',
+                     $4, $5, 0)",
+        )
+        .bind(protected_run_id)
+        .bind(super_agent_id)
+        .bind(super_id)
+        .bind(protected_session_id)
+        .bind(protected_turn_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let directory = list_users(State(state.clone()), session_headers(&admin_token))
+            .await
+            .unwrap()
+            .0;
+        assert!(directory.iter().all(|user| user.id != super_id));
+        let agents = list_agents(State(state.clone()), session_headers(&admin_token))
+            .await
+            .unwrap()
+            .0;
+        assert!(agents.iter().any(|agent| agent.id == member_agent_id));
+        assert!(agents.iter().any(|agent| agent.id == super_agent_id));
+
+        let admin = require_user(&state, &session_headers(&admin_token))
+            .await
+            .unwrap();
+        assert!(
+            load_agent_manageable_by_user(&state.pool, member_agent_id, &admin)
+                .await
+                .is_ok()
+        );
+        assert!(load_agent_for_user(&state.pool, super_agent_id, &admin)
+            .await
+            .is_ok());
+        assert!(
+            load_agent_manageable_by_user(&state.pool, super_agent_id, &admin)
+                .await
+                .is_ok()
+        );
+
+        let admin_runs = list_agent_runs(
+            State(state.clone()),
+            session_headers(&admin_token),
+            Path(super_agent_id),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(admin_runs.iter().any(|run| run.id == protected_run_id));
+        assert!(load_run_for_user(&state.pool, protected_run_id, &admin)
+            .await
+            .is_ok());
+
+        let member = require_user(&state, &session_headers(&member_token))
+            .await
+            .unwrap();
+        assert_eq!(
+            load_agent_for_user(&state.pool, super_agent_id, &member)
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            load_run_for_user(&state.pool, protected_run_id, &member)
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            delete_agent(
+                State(state.clone()),
+                session_headers(&member_token),
+                Path(super_agent_id),
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::FORBIDDEN
+        );
+
+        assert_eq!(
+            delete_agent(
+                State(state.clone()),
+                session_headers(&admin_token),
+                Path(super_agent_id),
+            )
             .await
             .unwrap(),
-            0
+            StatusCode::NO_CONTENT
+        );
+
+        let super_admin = require_user(&state, &session_headers(&super_token))
+            .await
+            .unwrap();
+        assert!(
+            load_run_for_user(&state.pool, protected_run_id, &super_admin)
+                .await
+                .is_ok()
         );
     }
 
@@ -11508,232 +9818,286 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_bundle_upload_streams_and_atomically_commits_pointer(pool: PgPool) {
+    async fn user_erasure_requires_exact_administrator_confirmation_and_freezes_immediately(
+        pool: PgPool,
+    ) {
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-        let _ = runtime_complete_run(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(claim.run.id),
-            runtime_write_generation(
-                1,
-                CompleteRunRequest {
-                    status: "completed".into(),
-                    native_session_id: Some("bundle-upload-thread".into()),
-                    work_dir_ref: Some("bundle-upload-workdir".into()),
-                },
-            ),
-        )
-        .await
-        .unwrap();
-        let attempt = runtime_begin_session_checkpoint(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(fixture.hub_session_id),
-            Json(BeginRuntimeSessionCheckpointRequest {
-                ownership_generation: 1,
-                reason: "idle".into(),
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-
-        let stored = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let app = Router::new().route(
-            "/bundle-bucket/{*key}",
-            axum::routing::put({
-                let stored = Arc::clone(&stored);
-                move |body: Body| {
-                    let stored = Arc::clone(&stored);
-                    async move {
-                        *stored.lock().unwrap() =
-                            axum::body::to_bytes(body, 1024).await.unwrap().to_vec();
-                    }
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let store = crate::session_bundle_store::S3BundleStore::new(
-            crate::session_bundle_store::S3BundleStoreConfig {
-                endpoint: format!("http://{address}").parse().unwrap(),
-                bucket: "bundle-bucket".into(),
-                region: "us-test-1".into(),
-                access_key_id: "test-access".into(),
-                secret_access_key: "test-secret".into(),
-                session_token: None,
-                server_side_encryption: None,
-                kms_key_id: None,
-                allow_http: true,
-            },
-        )
-        .unwrap();
-        let mut state = (*fixture.state).clone();
-        state.session_bundle_store = Some(Arc::new(store));
-        state.session_bundle_max_bytes = 1024;
-        let state = Arc::new(state);
-        let bytes = Bytes::from_static(b"test bundle");
-        let checksum = format!("{:x}", Sha256::digest(&bytes));
-        let created_at = Utc::now();
-        let headers = runtime_bundle_upload_headers(
-            &fixture.runtime_token,
-            1,
-            &attempt,
-            &checksum,
-            bytes.len(),
-            created_at,
-        );
-
-        let mut limited_state = (*state).clone();
-        limited_state.session_bundle_max_bytes = (bytes.len() - 1) as u64;
-        let too_large = runtime_upload_session_bundle(
-            State(Arc::new(limited_state)),
-            Path(fixture.hub_session_id),
-            headers.clone(),
-            Body::from(bytes.clone()),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(too_large.status, StatusCode::BAD_REQUEST);
-        assert!(stored.lock().unwrap().is_empty());
-
-        let response = runtime_upload_session_bundle(
-            State(state.clone()),
-            Path(fixture.hub_session_id),
-            headers.clone(),
-            Body::from(bytes.clone()),
-        )
-        .await
-        .unwrap()
-        .0;
-
-        assert_eq!(
-            response.checkpoint_attempt_id,
-            attempt.checkpoint_attempt_id
-        );
-        assert_eq!(response.bundle_generation, attempt.bundle_generation);
-        assert!(!response.has_queued_work);
-        assert!(response.ownership_released);
-        assert_eq!(*stored.lock().unwrap(), bytes);
-        let replayed = runtime_upload_session_bundle(
-            State(state.clone()),
-            Path(fixture.hub_session_id),
-            headers,
-            Body::from(bytes.clone()),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(
-            replayed.checkpoint_attempt_id,
-            response.checkpoint_attempt_id
-        );
-        assert_eq!(replayed.bundle_generation, response.bundle_generation);
-        assert_eq!(replayed.ownership_released, response.ownership_released);
-        let other_runtime_id = Uuid::new_v4();
-        let other_runtime_token = format!("ahrt_{}", Uuid::new_v4().simple());
-        sqlx::query(
-            "INSERT INTO runtimes
-             (id, token_hash, hostname, labels, engine_version, capabilities, sandbox_mode, status)
-             VALUES ($1, $2, $3, '{}', 'test', '{}'::jsonb, 'workspace-write',
-                     'online')",
-        )
-        .bind(other_runtime_id)
-        .bind(sha256_hex(&other_runtime_token))
-        .bind(format!("other-runtime-{}", Uuid::new_v4().simple()))
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-        let foreign_replay = runtime_upload_session_bundle(
-            State(state),
-            Path(fixture.hub_session_id),
-            runtime_bundle_upload_headers(
-                &other_runtime_token,
-                1,
-                &attempt,
-                &checksum,
-                bytes.len(),
-                created_at,
-            ),
-            Body::from(bytes.clone()),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(foreign_replay.status, StatusCode::CONFLICT);
-        let pointer: (Option<i64>, Option<String>, Option<Uuid>, String) = sqlx::query_as(
-            "SELECT current_bundle_generation, current_bundle_checksum_sha256,
-                    runtime_owner_id, lifecycle_status
-             FROM hub_sessions WHERE id = $1",
+        let claimed = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        let (target_id, target_email): (Uuid, String) = sqlx::query_as(
+            "SELECT users.id, users.email
+             FROM users
+             JOIN hub_sessions ON hub_sessions.owner_id = users.id
+             WHERE hub_sessions.id = $1",
         )
         .bind(fixture.hub_session_id)
         .fetch_one(&fixture.state.pool)
         .await
         .unwrap();
-        assert_eq!(pointer.0, Some(attempt.bundle_generation));
-        assert_eq!(pointer.1.as_deref(), Some(checksum.as_str()));
-        assert_eq!(pointer.2, None);
-        assert_eq!(pointer.3, "offline");
-        server.abort();
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_bundle_download_requires_the_owned_restoring_generation(pool: PgPool) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let _ = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-        let bytes = Bytes::from_static(b"download bundle");
-        let checksum = format!("{:x}", Sha256::digest(&bytes));
-        let checkpoint_attempt_id = Uuid::new_v4();
-        let object_key =
-            session_bundle_object_key(fixture.hub_session_id, 1, checkpoint_attempt_id);
-        let created_at = Utc::now();
+        let target_session = format!("ahs_target_{}", Uuid::new_v4().simple());
+        let target_api_key = format!("ahk_target_{}", Uuid::new_v4().simple());
         sqlx::query(
-            "UPDATE hub_sessions
-             SET lifecycle_status = 'restoring', current_bundle_generation = 1,
-                 current_bundle_object_key = $2, current_bundle_checksum_sha256 = $3,
-                 current_bundle_size_bytes = $4, current_bundle_history_checkpoint = 3,
-                 current_bundle_ownership_generation = 1,
-                 current_bundle_producing_engine_version = '0.104.0',
-                 current_bundle_created_at = $5,
-                 current_bundle_checkpoint_attempt_id = $6,
-                 current_bundle_runtime_id = $7
-             WHERE id = $1",
+            "INSERT INTO sessions (token_hash, user_id, expires_at)
+             VALUES ($1, $2, now() + interval '1 hour')",
         )
-        .bind(fixture.hub_session_id)
-        .bind(&object_key)
-        .bind(&checksum)
-        .bind(bytes.len() as i64)
-        .bind(created_at)
-        .bind(checkpoint_attempt_id)
-        .bind(fixture.runtime_id)
+        .bind(sha256_hex(&target_session))
+        .bind(target_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO api_keys (id, user_id, name, prefix, token_hash)
+             VALUES ($1, $2, 'erasure test', 'ahk_target', $3)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(target_id)
+        .bind(sha256_hex(&target_api_key))
         .execute(&fixture.state.pool)
         .await
         .unwrap();
 
-        let get_count = Arc::new(AtomicU64::new(0));
-        let app = Router::new().route(
+        let member_token = create_user_session_with_role(&fixture.state.pool, "member").await;
+        let admin_token = create_user_session_with_role(&fixture.state.pool, "admin").await;
+        let super_token = create_super_admin_session(&fixture.state.pool).await;
+        let state = Arc::new(test_state_with_browser_session_auth(
+            fixture.state.pool.clone(),
+        ));
+        let member_error = erase_user(
+            State(state.clone()),
+            session_headers(&member_token),
+            Path(target_id),
+            Json(EraseUserRequest {
+                email: target_email.clone(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(member_error.status, StatusCode::FORBIDDEN);
+        let admin_confirmation = erase_user(
+            State(state.clone()),
+            session_headers(&admin_token),
+            Path(target_id),
+            Json(EraseUserRequest {
+                email: "wrong@example.com".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(admin_confirmation.status, StatusCode::CONFLICT);
+        for confirmation in ["wrong@example.com".to_owned(), target_email.to_uppercase()] {
+            let error = erase_user(
+                State(state.clone()),
+                session_headers(&super_token),
+                Path(target_id),
+                Json(EraseUserRequest {
+                    email: confirmation,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.status, StatusCode::CONFLICT);
+        }
+
+        for _ in 0..2 {
+            let (status, erasure) = erase_user(
+                State(state.clone()),
+                session_headers(&super_token),
+                Path(target_id),
+                Json(EraseUserRequest {
+                    email: target_email.clone(),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(status, StatusCode::ACCEPTED);
+            assert_eq!(erasure.status, "pending");
+        }
+
+        assert!(load_user_by_session(&fixture.state.pool, &target_session)
+            .await
+            .is_err());
+        assert!(load_user_by_api_key(&fixture.state.pool, &target_api_key)
+            .await
+            .is_err());
+        assert_eq!(
+            sqlx::query_as::<_, (Option<String>, bool, i64, i64)>(
+                "SELECT password, deletion_requested_at IS NOT NULL,
+                        (SELECT count(*) FROM sessions WHERE user_id = users.id),
+                        (SELECT count(*) FROM api_keys WHERE user_id = users.id)
+                 FROM users WHERE id = $1",
+            )
+            .bind(target_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            (None, true, 0, 0)
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM runs WHERE id = $1")
+                .bind(claimed.run.id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap(),
+            "failed"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM hub_session_turns WHERE id = $1")
+                .bind(fixture.turn_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap(),
+            "failed"
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (String, Option<Uuid>, i64)>(
+                "SELECT lifecycle_status, runtime_owner_id, ownership_generation
+                 FROM hub_sessions WHERE id = $1",
+            )
+            .bind(fixture.hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            ("historical".into(), None, 2)
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM hub_session_messages
+                 WHERE session_id = $1 AND delivery_state = 'failed'",
+            )
+            .bind(fixture.hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            3
+        );
+        let reuse = create_hub_user(
+            &fixture.state.pool,
+            Some(&target_email),
+            None,
+            Some("replacement-password"),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(reuse.status, StatusCode::CONFLICT);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn user_erasure_retries_storage_then_purges_owned_graph_and_minimizes_audit(
+        pool: PgPool,
+    ) {
+        let fixture = integration_runtime_fixture(pool).await;
+        let target_id: Uuid = sqlx::query_scalar(
+            "SELECT users.id
+             FROM users JOIN agents ON agents.owner_id = users.id
+             WHERE agents.id = $1",
+        )
+        .bind(fixture.agent_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        let suffix = &target_id.simple().to_string()[..8];
+        let target_display_name = format!("erase-{suffix}");
+        let target_email = format!("erase-{suffix}@example.com");
+        sqlx::query("UPDATE users SET display_name = $1, email = $2 WHERE id = $3")
+            .bind(&target_display_name)
+            .bind(&target_email)
+            .bind(target_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        let external_owner_id: Uuid =
+            sqlx::query_scalar("SELECT owner_id FROM hub_sessions WHERE id = $1")
+                .bind(fixture.hub_session_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        sqlx::query("UPDATE hub_sessions SET native_session_id = 'erasure-thread' WHERE id = $1")
+            .bind(fixture.hub_session_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        let unaffected_agent_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO agents
+                 (id, owner_id, name, instructions, visibility, public_to)
+             VALUES ($1, $2, 'Unaffected Agent', 'keep', 'public_to', ARRAY[$3]::uuid[])",
+        )
+        .bind(unaffected_agent_id)
+        .bind(external_owner_id)
+        .bind(target_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let owned_skill_id = Uuid::new_v4();
+        let skill_content = "private erased skill";
+        sqlx::query(
+            "INSERT INTO skills
+                 (id, owner_id, name, description, content, content_checksum_sha256)
+             VALUES ($1, $2, 'Erased Skill', 'private', $3, $4)",
+        )
+        .bind(owned_skill_id)
+        .bind(target_id)
+        .bind(skill_content)
+        .bind(sha256_hex(skill_content))
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO agent_skills (agent_id, skill_id) VALUES ($1, $2)")
+            .bind(unaffected_agent_id)
+            .bind(owned_skill_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+
+        let object_key = format!(
+            "sessions/{}/bundles/1-erasure.tar.zst",
+            fixture.hub_session_id
+        );
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET current_bundle_generation = 1, current_bundle_object_key = $2,
+                 current_bundle_checksum_sha256 = $3, current_bundle_size_bytes = 12,
+                 current_bundle_history_checkpoint = history_checkpoint,
+                 current_bundle_ownership_generation = ownership_generation,
+                 current_bundle_producing_engine_version = '0.104.0',
+                 current_bundle_created_at = now(), current_bundle_runtime_id = $4,
+                 current_bundle_checkpoint_attempt_id = $5
+             WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .bind(&object_key)
+        .bind("a".repeat(64))
+        .bind(fixture.runtime_id)
+        .bind(Uuid::new_v4())
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        let delete_count = Arc::new(AtomicU64::new(0));
+        let object_app = Router::new().route(
             "/bundle-bucket/{*key}",
-            get({
-                let get_count = Arc::clone(&get_count);
-                let bytes = bytes.clone();
+            axum::routing::delete({
+                let delete_count = Arc::clone(&delete_count);
                 move || {
-                    let get_count = Arc::clone(&get_count);
-                    let bytes = bytes.clone();
+                    let delete_count = Arc::clone(&delete_count);
                     async move {
-                        get_count.fetch_add(1, Ordering::SeqCst);
-                        bytes
+                        if delete_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        } else {
+                            StatusCode::NO_CONTENT
+                        }
                     }
                 }
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let object_address = listener.local_addr().unwrap();
+        let object_server =
+            tokio::spawn(async move { axum::serve(listener, object_app).await.unwrap() });
         let store = crate::session_bundle_store::S3BundleStore::new(
             crate::session_bundle_store::S3BundleStoreConfig {
-                endpoint: format!("http://{address}").parse().unwrap(),
+                endpoint: format!("http://{object_address}").parse().unwrap(),
                 bucket: "bundle-bucket".into(),
                 region: "us-test-1".into(),
                 access_key_id: "test-access".into(),
@@ -11745,321 +10109,171 @@ mod tests {
             },
         )
         .unwrap();
-        let mut state = (*fixture.state).clone();
+        let super_token = create_super_admin_session(&fixture.state.pool).await;
+        let acting_administrator_id: Uuid =
+            sqlx::query_scalar("SELECT user_id FROM sessions WHERE token_hash = $1")
+                .bind(sha256_hex(&super_token))
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        let mut state = test_state_with_browser_session_auth(fixture.state.pool.clone());
         state.session_bundle_store = Some(Arc::new(store));
         let state = Arc::new(state);
-        let download_headers = |token: &str, generation: i64| {
-            let mut headers = bearer_headers(token);
-            headers.insert(
-                "x-agent-hub-ownership-generation",
-                HeaderValue::from_str(&generation.to_string()).unwrap(),
-            );
-            headers
-        };
 
-        let stale = runtime_download_session_bundle(
+        let (_, pending) = erase_user(
             State(state.clone()),
-            Path(fixture.hub_session_id),
-            download_headers(&fixture.runtime_token, 2),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(stale.status, StatusCode::FORBIDDEN);
-
-        let other_runtime_token = format!("ahrt_{}", Uuid::new_v4().simple());
-        sqlx::query(
-            "INSERT INTO runtimes
-                 (id, token_hash, hostname, labels, engine_version, capabilities,
-                  sandbox_mode, status)
-             VALUES ($1, $2, $3, '{}', 'test', '{}'::jsonb,
-                     'workspace-write', 'online')",
-        )
-        .bind(Uuid::new_v4())
-        .bind(sha256_hex(&other_runtime_token))
-        .bind(format!(
-            "bundle-download-foreign-{}",
-            Uuid::new_v4().simple()
-        ))
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-        let foreign = runtime_download_session_bundle(
-            State(state.clone()),
-            Path(fixture.hub_session_id),
-            download_headers(&other_runtime_token, 1),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(foreign.status, StatusCode::FORBIDDEN);
-        assert_eq!(get_count.load(Ordering::SeqCst), 0);
-
-        let response = runtime_download_session_bundle(
-            State(state),
-            Path(fixture.hub_session_id),
-            download_headers(&fixture.runtime_token, 1),
+            session_headers(&super_token),
+            Path(target_id),
+            Json(EraseUserRequest {
+                email: target_email.clone(),
+            }),
         )
         .await
         .unwrap();
+        assert_eq!(pending.status, "pending");
+        assert_eq!(delete_count.load(Ordering::SeqCst), 1);
         assert_eq!(
-            response.headers()[header::CONTENT_LENGTH],
-            bytes.len().to_string()
-        );
-        assert_eq!(response.headers()["x-agent-hub-bundle-generation"], "1");
-        assert_eq!(response.headers()["x-agent-hub-bundle-sha256"], checksum);
-        assert!(response
-            .headers()
-            .get("x-agent-hub-bundle-object-key")
-            .is_none());
-        assert_eq!(
-            axum::body::to_bytes(response.into_body(), 1024)
-                .await
-                .unwrap(),
-            bytes
-        );
-        assert_eq!(get_count.load(Ordering::SeqCst), 1);
-        server.abort();
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_skill_package_download_separates_run_snapshot_from_session_current_package(
-        pool: PgPool,
-    ) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM agents WHERE id = $1")
-            .bind(fixture.agent_id)
-            .fetch_one(&fixture.state.pool)
-            .await
-            .unwrap();
-        let skill_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO skills
-                 (id, owner_id, name, description, content, content_checksum_sha256)
-             VALUES ($1, $2, 'Download Skill', 'download', 'read package', $3)",
-        )
-        .bind(skill_id)
-        .bind(owner_id)
-        .bind(sha256_hex("read package"))
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-        sqlx::query("INSERT INTO agent_skills (agent_id, skill_id) VALUES ($1, $2)")
-            .bind(fixture.agent_id)
-            .bind(skill_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
-
-        let object_root = tempfile::tempdir().unwrap();
-        let source_root = tempfile::tempdir().unwrap();
-        let store = Arc::new(SkillPackageStore::local(object_root.path().to_path_buf()).unwrap());
-        let file_manifest = vec![SkillPackageFileDto {
-            path: "bin/client".into(),
-            size_bytes: 6,
-            checksum_sha256: sha256_hex("client"),
-            executable: true,
-        }];
-        let first_bytes = b"run-package";
-        let first_checksum = format!("{:x}", Sha256::digest(first_bytes));
-        let first_package_id = Uuid::new_v4();
-        let first_object_key =
-            format!("skill-packages/{owner_id}/{skill_id}/{first_package_id}.tar.zst");
-        let first_source = source_root.path().join("first.tar.zst");
-        tokio::fs::write(&first_source, first_bytes).await.unwrap();
-        store
-            .put_file(
-                &first_object_key,
-                &first_source,
-                first_bytes.len() as u64,
-                &first_checksum,
+            sqlx::query_as::<_, (i64, Option<String>)>(
+                "SELECT attempts, last_error FROM user_erasure_bundle_objects
+                 WHERE user_id = $1 AND object_key = $2",
             )
-            .await
-            .unwrap();
-        sqlx::query(
-            "INSERT INTO skill_packages
-                 (id, skill_id, owner_id, object_key, format_version,
-                  size_bytes, checksum_sha256, files)
-             VALUES ($1, $2, $3, $4, 1, $5, $6, $7)",
-        )
-        .bind(first_package_id)
-        .bind(skill_id)
-        .bind(owner_id)
-        .bind(&first_object_key)
-        .bind(first_bytes.len() as i64)
-        .bind(&first_checksum)
-        .bind(serde_json::to_value(&file_manifest).unwrap())
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-        sqlx::query("UPDATE skills SET current_package_id = $1 WHERE id = $2")
-            .bind(first_package_id)
-            .bind(skill_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
-
-        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-        assert_eq!(
-            claim.execution_configuration.skills[0]
-                .package
-                .as_ref()
-                .map(|package| package.id),
-            Some(first_package_id)
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, Uuid>(
-                "SELECT package_id FROM run_skill_packages
-                 WHERE run_id = $1 AND skill_id = $2",
-            )
-            .bind(claim.run.id)
-            .bind(skill_id)
+            .bind(target_id)
+            .bind(&object_key)
             .fetch_one(&fixture.state.pool)
             .await
             .unwrap(),
-            first_package_id
+            (1, Some("object store delete failed".into()))
         );
 
-        let second_bytes = b"session-package";
-        let second_checksum = format!("{:x}", Sha256::digest(second_bytes));
-        let second_package_id = Uuid::new_v4();
-        let second_object_key =
-            format!("skill-packages/{owner_id}/{skill_id}/{second_package_id}.tar.zst");
-        let second_source = source_root.path().join("second.tar.zst");
-        tokio::fs::write(&second_source, second_bytes)
-            .await
-            .unwrap();
-        store
-            .put_file(
-                &second_object_key,
-                &second_source,
-                second_bytes.len() as u64,
-                &second_checksum,
-            )
-            .await
-            .unwrap();
-        sqlx::query(
-            "INSERT INTO skill_packages
-                 (id, skill_id, owner_id, object_key, format_version,
-                  size_bytes, checksum_sha256, files)
-             VALUES ($1, $2, $3, $4, 1, $5, $6, $7)",
-        )
-        .bind(second_package_id)
-        .bind(skill_id)
-        .bind(owner_id)
-        .bind(&second_object_key)
-        .bind(second_bytes.len() as i64)
-        .bind(&second_checksum)
-        .bind(serde_json::to_value(&file_manifest).unwrap())
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-        sqlx::query("UPDATE skills SET current_package_id = $1 WHERE id = $2")
-            .bind(second_package_id)
-            .bind(skill_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
-        sqlx::query("DELETE FROM skill_packages WHERE id = $1")
-            .bind(first_package_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
-
-        let mut state = (*fixture.state).clone();
-        state.skill_package_store = Some(store);
-        let state = Arc::new(state);
-        let package_headers = |token: &str, generation: i64| {
-            let mut headers = bearer_headers(token);
-            headers.insert(
-                "x-agent-hub-ownership-generation",
-                HeaderValue::from_str(&generation.to_string()).unwrap(),
-            );
-            headers
+        let cleanup = RuntimeOwnedSessionGenerationDto {
+            session_id: fixture.hub_session_id,
+            ownership_generation: 1,
         };
-        let stale_run = runtime_download_run_skill_package(
-            State(state.clone()),
-            package_headers(&fixture.runtime_token, 2),
-            Path((claim.run.id, skill_id)),
+        let dispatched = runtime_heartbeat(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Json(RuntimeHeartbeatRequest::default()),
         )
         .await
-        .unwrap_err();
-        assert_eq!(stale_run.status, StatusCode::FORBIDDEN);
+        .unwrap()
+        .0;
+        assert_eq!(dispatched.cleanup_sessions, vec![cleanup.clone()]);
+        let acknowledged = runtime_heartbeat(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Json(RuntimeHeartbeatRequest {
+                cleaned_sessions: vec![cleanup],
+                ..RuntimeHeartbeatRequest::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(acknowledged.cleanup_sessions.is_empty());
 
-        let other_runtime_token = format!("ahrt_{}", Uuid::new_v4().simple());
-        sqlx::query(
-            "INSERT INTO runtimes
-                 (id, token_hash, hostname, labels, engine_version, capabilities,
-                  sandbox_mode, status)
-             VALUES ($1, $2, $3, '{}', 'test', '{}'::jsonb,
-                     'workspace-write', 'online')",
-        )
-        .bind(Uuid::new_v4())
-        .bind(sha256_hex(&other_runtime_token))
-        .bind(format!("skill-download-{}", Uuid::new_v4().simple()))
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-        let foreign_run = runtime_download_run_skill_package(
-            State(state.clone()),
-            package_headers(&other_runtime_token, 1),
-            Path((claim.run.id, skill_id)),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(foreign_run.status, StatusCode::FORBIDDEN);
+        process_user_erasure_job(&state, target_id).await.unwrap();
+        assert_eq!(delete_count.load(Ordering::SeqCst), 2);
+        object_server.abort();
 
-        let run_response = runtime_download_run_skill_package(
-            State(state.clone()),
-            package_headers(&fixture.runtime_token, 1),
-            Path((claim.run.id, skill_id)),
-        )
-        .await
-        .unwrap();
         assert_eq!(
-            run_response.headers()["x-agent-hub-skill-package-id"],
-            first_package_id.to_string()
-        );
-        assert_eq!(
-            axum::body::to_bytes(run_response.into_body(), 1024)
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users WHERE id = $1")
+                .bind(target_id)
+                .fetch_one(&fixture.state.pool)
                 .await
                 .unwrap(),
-            first_bytes.as_slice()
+            0
         );
-
-        let stale_session = runtime_download_session_skill_package(
-            State(state.clone()),
-            package_headers(&fixture.runtime_token, 2),
-            Path((fixture.hub_session_id, skill_id, second_package_id)),
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM users WHERE id = $1")
+                .bind(external_owner_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap(),
+            1
+        );
+        for (table, id) in [
+            ("agents", fixture.agent_id),
+            ("hub_sessions", fixture.hub_session_id),
+            ("runs", fixture.run_id),
+            ("integration_sessions", fixture.session_id),
+            ("skills", owned_skill_id),
+        ] {
+            let count: i64 =
+                sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE id = $1"))
+                    .bind(id)
+                    .fetch_one(&fixture.state.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(count, 0, "{table} retained erased ownership data");
+        }
+        assert_eq!(
+            sqlx::query_as::<_, (Vec<Uuid>, i64)>(
+                "SELECT public_to, execution_config_revision FROM agents WHERE id = $1",
+            )
+            .bind(unaffected_agent_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            (Vec::new(), 2)
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM agent_skills WHERE agent_id = $1",)
+                .bind(unaffected_agent_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (Uuid, Uuid)>(
+                "SELECT erased_user_id, acting_administrator_id
+                 FROM user_erasure_audit WHERE erased_user_id = $1",
+            )
+            .bind(target_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            (target_id, acting_administrator_id)
+        );
+        let audit_columns: Vec<String> = sqlx::query_scalar(
+            "SELECT column_name FROM information_schema.columns
+             WHERE table_schema = current_schema() AND table_name = 'user_erasure_audit'
+             ORDER BY ordinal_position",
         )
-        .await
-        .unwrap_err();
-        assert_eq!(stale_session.status, StatusCode::FORBIDDEN);
-        let old_session = runtime_download_session_skill_package(
-            State(state.clone()),
-            package_headers(&fixture.runtime_token, 1),
-            Path((fixture.hub_session_id, skill_id, first_package_id)),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(old_session.status, StatusCode::NOT_FOUND);
-
-        let session_response = runtime_download_session_skill_package(
-            State(state),
-            package_headers(&fixture.runtime_token, 1),
-            Path((fixture.hub_session_id, skill_id, second_package_id)),
-        )
+        .fetch_all(&fixture.state.pool)
         .await
         .unwrap();
         assert_eq!(
-            session_response.headers()["x-agent-hub-skill-package-id"],
-            second_package_id.to_string()
+            audit_columns,
+            vec![
+                "erased_user_id",
+                "acting_administrator_id",
+                "erased_at",
+                "erased_role"
+            ]
         );
         assert_eq!(
-            axum::body::to_bytes(session_response.into_body(), 1024)
-                .await
-                .unwrap(),
-            second_bytes.as_slice()
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM user_erasure_jobs WHERE user_id = $1",
+            )
+            .bind(target_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap(),
+            0
         );
+
+        let replacement = create_hub_user(
+            &fixture.state.pool,
+            Some(&target_email),
+            Some(&target_display_name),
+            Some("replacement-password"),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replacement.display_name, target_display_name);
+        assert_eq!(replacement.email, target_email);
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -12603,103 +10817,6 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_bundle_object_failure_keeps_pointer_uncommitted_and_session_saving(
-        pool: PgPool,
-    ) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-        let _ = runtime_complete_run(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(claim.run.id),
-            runtime_write_generation(
-                1,
-                CompleteRunRequest {
-                    status: "completed".into(),
-                    native_session_id: Some("bundle-failure-thread".into()),
-                    work_dir_ref: Some("bundle-failure-workdir".into()),
-                },
-            ),
-        )
-        .await
-        .unwrap();
-        let attempt = runtime_begin_session_checkpoint(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(fixture.hub_session_id),
-            Json(BeginRuntimeSessionCheckpointRequest {
-                ownership_generation: 1,
-                reason: "idle".into(),
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        let app = Router::new().route(
-            "/bundle-bucket/{*key}",
-            axum::routing::put(|| async { StatusCode::INTERNAL_SERVER_ERROR })
-                .delete(|| async { StatusCode::NO_CONTENT }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let store = crate::session_bundle_store::S3BundleStore::new(
-            crate::session_bundle_store::S3BundleStoreConfig {
-                endpoint: format!("http://{address}").parse().unwrap(),
-                bucket: "bundle-bucket".into(),
-                region: "us-test-1".into(),
-                access_key_id: "test-access".into(),
-                secret_access_key: "test-secret".into(),
-                session_token: None,
-                server_side_encryption: None,
-                kms_key_id: None,
-                allow_http: true,
-            },
-        )
-        .unwrap();
-        let mut state = (*fixture.state).clone();
-        state.session_bundle_store = Some(Arc::new(store));
-        state.session_bundle_max_bytes = 1024;
-        let state = Arc::new(state);
-        let bytes = Bytes::from_static(b"failed bundle");
-        let checksum = format!("{:x}", Sha256::digest(&bytes));
-        let headers = runtime_bundle_upload_headers(
-            &fixture.runtime_token,
-            1,
-            &attempt,
-            &checksum,
-            bytes.len(),
-            Utc::now(),
-        );
-
-        let error = runtime_upload_session_bundle(
-            State(state),
-            Path(fixture.hub_session_id),
-            headers,
-            Body::from(bytes),
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
-        let row: (Option<i64>, Option<String>, Option<Uuid>, String) = sqlx::query_as(
-            "SELECT current_bundle_generation, current_bundle_object_key,
-                    runtime_owner_id, lifecycle_status
-             FROM hub_sessions WHERE id = $1",
-        )
-        .bind(fixture.hub_session_id)
-        .fetch_one(&fixture.state.pool)
-        .await
-        .unwrap();
-        assert_eq!(row.0, None);
-        assert_eq!(row.1, None);
-        assert_eq!(row.2, Some(fixture.runtime_id));
-        assert_eq!(row.3, "saving");
-        server.abort();
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn session_bundle_commit_uses_the_frozen_checkpoint_with_newer_queued_history(
         pool: PgPool,
     ) {
@@ -13094,141 +11211,6 @@ mod tests {
             .unwrap();
         pointer_tx.rollback().await.unwrap();
         assert_eq!(after_stale.current_bundle, Some(initial_bundle));
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_claim_rejects_a_bundle_with_unreplayable_history(pool: PgPool) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-        let _ = runtime_complete_run(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(claim.run.id),
-            runtime_write_generation(
-                1,
-                CompleteRunRequest {
-                    status: "completed".into(),
-                    native_session_id: Some("stale-restore-thread".into()),
-                    work_dir_ref: Some("stale-restore-workdir".into()),
-                },
-            ),
-        )
-        .await
-        .unwrap();
-        let attempt = runtime_begin_session_checkpoint(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(fixture.hub_session_id),
-            Json(BeginRuntimeSessionCheckpointRequest {
-                ownership_generation: 1,
-                reason: "idle".into(),
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        let mut commit_tx = fixture.state.pool.begin().await.unwrap();
-        commit_session_bundle_metadata_tx(
-            &mut commit_tx,
-            fixture.runtime_id,
-            fixture.hub_session_id,
-            1,
-            "hub/bundles/stale-restore.tar.zst",
-            &SessionBundleCommitMetadata {
-                checkpoint_attempt_id: attempt.checkpoint_attempt_id,
-                bundle_generation: 1,
-                checksum_sha256: "stale-restore".into(),
-                size_bytes: 1024,
-                history_checkpoint: attempt.history_checkpoint,
-                producing_engine_version: "test".into(),
-                created_at: Utc::now(),
-            },
-        )
-        .await
-        .unwrap();
-        commit_tx.commit().await.unwrap();
-        sqlx::query(
-            "UPDATE hub_sessions
-             SET runtime_owner_id = NULL, lifecycle_status = 'waiting_for_runtime',
-                 saving_history_checkpoint = NULL,
-                 saving_ownership_generation = NULL,
-                 saving_reason = NULL,
-                 saving_checkpoint_attempt_id = NULL
-             WHERE id = $1",
-        )
-        .bind(fixture.hub_session_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-        let delivered_sequence: i64 = sqlx::query_scalar(
-            "INSERT INTO hub_session_messages
-                 (id, session_id, role, message_kind, content, delivery_mode, delivery_state)
-             VALUES ($1, $2, 'user', 'message', 'not present in Bundle',
-                     'record_only', 'delivered')
-             RETURNING sequence",
-        )
-        .bind(Uuid::new_v4())
-        .bind(fixture.hub_session_id)
-        .fetch_one(&fixture.state.pool)
-        .await
-        .unwrap();
-        sqlx::query("UPDATE hub_sessions SET history_checkpoint = $1 WHERE id = $2")
-            .bind(delivered_sequence)
-            .bind(fixture.hub_session_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
-        let pending_run_id =
-            insert_pending_session_run(&fixture.state.pool, fixture.hub_session_id).await;
-        sqlx::query("UPDATE agents SET runtime_id = NULL WHERE id = $1")
-            .bind(fixture.agent_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
-
-        let replacement_runtime_id = Uuid::new_v4();
-        let replacement_token = format!("ahrt_{}", Uuid::new_v4().simple());
-        sqlx::query(
-            "INSERT INTO runtimes
-                 (id, token_hash, hostname, labels, engine_version, capabilities,
-                  sandbox_mode, status)
-             VALUES ($1, $2, 'stale-restore-replacement', '{}', 'test',
-                     '{\"model_proxy\":true}'::jsonb, 'workspace-write', 'online')",
-        )
-        .bind(replacement_runtime_id)
-        .bind(sha256_hex(&replacement_token))
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-
-        let response = runtime_claim_run(
-            State(fixture.state.clone()),
-            bearer_headers(&replacement_token),
-            runtime_claim_request(1, Vec::new()),
-        )
-        .await
-        .unwrap()
-        .into_response();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        assert_eq!(
-            sqlx::query_as::<_, (Option<Uuid>, String)>(
-                "SELECT runtime_owner_id, lifecycle_status FROM hub_sessions WHERE id = $1",
-            )
-            .bind(fixture.hub_session_id)
-            .fetch_one(&fixture.state.pool)
-            .await
-            .unwrap(),
-            (None, "waiting_for_runtime".into())
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, String>("SELECT status FROM runs WHERE id = $1")
-                .bind(pending_run_id)
-                .fetch_one(&fixture.state.pool)
-                .await
-                .unwrap(),
-            "pending"
-        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -13987,216 +11969,6 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_heartbeat_cannot_idle_checkpoint_an_active_turn(pool: PgPool) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let _ = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-        let _ = runtime_heartbeat(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Json(RuntimeHeartbeatRequest {
-                pending_credential_hash: None,
-                accepts_session_commands: true,
-                owned_sessions: vec![RuntimeOwnedSessionStateRequest {
-                    session_id: fixture.hub_session_id,
-                    ownership_generation: 1,
-                    lifecycle_status: "online".into(),
-                    checkpoint_reason: None,
-                }],
-                cleaned_sessions: Vec::new(),
-            }),
-        )
-        .await
-        .unwrap();
-
-        let error = runtime_heartbeat(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Json(RuntimeHeartbeatRequest {
-                pending_credential_hash: None,
-                accepts_session_commands: true,
-                owned_sessions: vec![RuntimeOwnedSessionStateRequest {
-                    session_id: fixture.hub_session_id,
-                    ownership_generation: 1,
-                    lifecycle_status: "saving".into(),
-                    checkpoint_reason: Some("idle".into()),
-                }],
-                cleaned_sessions: Vec::new(),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error.status, StatusCode::CONFLICT);
-
-        let session: (
-            String,
-            Option<i64>,
-            Option<i64>,
-            Option<String>,
-            Option<Uuid>,
-        ) = sqlx::query_as(
-            "SELECT lifecycle_status, saving_history_checkpoint,
-                        saving_ownership_generation, saving_reason,
-                        saving_checkpoint_attempt_id
-                 FROM hub_sessions WHERE id = $1",
-        )
-        .bind(fixture.hub_session_id)
-        .fetch_one(&fixture.state.pool)
-        .await
-        .unwrap();
-        assert_eq!(session, ("online".into(), None, None, None, None));
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_heartbeat_atomically_freezes_a_new_saving_checkpoint(pool: PgPool) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-        let _ = runtime_complete_run(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(claim.run.id),
-            runtime_write_generation(
-                1,
-                CompleteRunRequest {
-                    status: "completed".into(),
-                    native_session_id: Some("heartbeat-saving-thread".into()),
-                    work_dir_ref: Some("heartbeat-saving-workdir".into()),
-                },
-            ),
-        )
-        .await
-        .unwrap();
-        let heartbeat = || RuntimeHeartbeatRequest {
-            pending_credential_hash: None,
-            accepts_session_commands: true,
-            owned_sessions: vec![RuntimeOwnedSessionStateRequest {
-                session_id: fixture.hub_session_id,
-                ownership_generation: 1,
-                lifecycle_status: "saving".into(),
-                checkpoint_reason: Some("idle".into()),
-            }],
-            cleaned_sessions: Vec::new(),
-        };
-
-        let _ = runtime_heartbeat(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Json(heartbeat()),
-        )
-        .await
-        .unwrap();
-        let first: (i64, i64, String, Uuid) = sqlx::query_as(
-            "SELECT saving_history_checkpoint, saving_ownership_generation,
-                    saving_reason, saving_checkpoint_attempt_id
-             FROM hub_sessions WHERE id = $1",
-        )
-        .bind(fixture.hub_session_id)
-        .fetch_one(&fixture.state.pool)
-        .await
-        .unwrap();
-        assert_eq!((first.0, first.1, first.2.as_str()), (3, 1, "idle"));
-
-        let _ = runtime_heartbeat(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Json(heartbeat()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            sqlx::query_scalar::<_, Uuid>(
-                "SELECT saving_checkpoint_attempt_id FROM hub_sessions WHERE id = $1"
-            )
-            .bind(fixture.hub_session_id)
-            .fetch_one(&fixture.state.pool)
-            .await
-            .unwrap(),
-            first.3
-        );
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_heartbeat_cannot_undo_admin_drain_checkpoint(pool: PgPool) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-        let _ = runtime_complete_run(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(claim.run.id),
-            runtime_write_generation(
-                1,
-                CompleteRunRequest {
-                    status: "completed".into(),
-                    native_session_id: Some("drain-heartbeat-thread".into()),
-                    work_dir_ref: Some("drain-heartbeat-workdir".into()),
-                },
-            ),
-        )
-        .await
-        .unwrap();
-        let admin_token = create_super_admin_session(&fixture.state.pool).await;
-        let admin_state = Arc::new(test_state_with_browser_session_auth(
-            fixture.state.pool.clone(),
-        ));
-        let hostname: String = sqlx::query_scalar("SELECT hostname FROM runtimes WHERE id = $1")
-            .bind(fixture.runtime_id)
-            .fetch_one(&fixture.state.pool)
-            .await
-            .unwrap();
-        let _ = drain_runtime(
-            State(admin_state),
-            session_headers(&admin_token),
-            Path(fixture.runtime_id),
-            Json(ConfirmRuntimeHostnameRequest { hostname }),
-        )
-        .await
-        .unwrap();
-        let attempt_before: Uuid = sqlx::query_scalar(
-            "SELECT saving_checkpoint_attempt_id FROM hub_sessions WHERE id = $1",
-        )
-        .bind(fixture.hub_session_id)
-        .fetch_one(&fixture.state.pool)
-        .await
-        .unwrap();
-
-        let response = runtime_heartbeat(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Json(RuntimeHeartbeatRequest {
-                pending_credential_hash: None,
-                accepts_session_commands: true,
-                owned_sessions: vec![RuntimeOwnedSessionStateRequest {
-                    session_id: fixture.hub_session_id,
-                    ownership_generation: 1,
-                    lifecycle_status: "online".into(),
-                    checkpoint_reason: None,
-                }],
-                cleaned_sessions: Vec::new(),
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-
-        assert_eq!(response.owned_sessions[0].lifecycle_status, "saving");
-        assert!(response.session_commands.iter().any(|command| {
-            command.command == "checkpoint" && command.session_id == fixture.hub_session_id
-        }));
-        assert_eq!(
-            sqlx::query_scalar::<_, Uuid>(
-                "SELECT saving_checkpoint_attempt_id FROM hub_sessions WHERE id = $1"
-            )
-            .bind(fixture.hub_session_id)
-            .fetch_one(&fixture.state.pool)
-            .await
-            .unwrap(),
-            attempt_before
-        );
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn draining_runtime_claim_is_idle_without_mutating_pending_work(pool: PgPool) {
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
         let admin_token = create_super_admin_session(&fixture.state.pool).await;
@@ -14258,224 +12030,6 @@ mod tests {
             .await
             .unwrap(),
             session_before
-        );
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_drain_handles_active_and_idle_sessions_and_can_be_cancelled(pool: PgPool) {
-        let fixture = integration_runtime_fixture(pool).await;
-        let idle_session_id = insert_idle_owned_session(
-            &fixture.state.pool,
-            fixture.hub_session_id,
-            fixture.runtime_id,
-        )
-        .await;
-        let admin_token = create_super_admin_session(&fixture.state.pool).await;
-        let member_token = create_user_session_with_role(&fixture.state.pool, "member").await;
-        let admin_state = Arc::new(test_state_with_browser_session_auth(
-            fixture.state.pool.clone(),
-        ));
-        let hostname: String = sqlx::query_scalar("SELECT hostname FROM runtimes WHERE id = $1")
-            .bind(fixture.runtime_id)
-            .fetch_one(&fixture.state.pool)
-            .await
-            .unwrap();
-
-        let forbidden = drain_runtime(
-            State(admin_state.clone()),
-            session_headers(&member_token),
-            Path(fixture.runtime_id),
-            Json(ConfirmRuntimeHostnameRequest {
-                hostname: hostname.clone(),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(forbidden.status, StatusCode::FORBIDDEN);
-
-        let mismatch = drain_runtime(
-            State(admin_state.clone()),
-            session_headers(&admin_token),
-            Path(fixture.runtime_id),
-            Json(ConfirmRuntimeHostnameRequest {
-                hostname: format!("{hostname} "),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(mismatch.status, StatusCode::CONFLICT);
-        assert_eq!(
-            sqlx::query_scalar::<_, String>("SELECT status FROM runtimes WHERE id = $1")
-                .bind(fixture.runtime_id)
-                .fetch_one(&fixture.state.pool)
-                .await
-                .unwrap(),
-            "online"
-        );
-
-        let drained = drain_runtime(
-            State(admin_state.clone()),
-            session_headers(&admin_token),
-            Path(fixture.runtime_id),
-            Json(ConfirmRuntimeHostnameRequest {
-                hostname: hostname.clone(),
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(drained.runtime.status, "draining");
-        assert_eq!(drained.owned_sessions.len(), 2);
-        let states = drained
-            .owned_sessions
-            .iter()
-            .map(|session| (session.id, session.lifecycle_status.as_str()))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        assert_eq!(states[&fixture.hub_session_id], "online");
-        assert_eq!(states[&idle_session_id], "saving");
-
-        let claim_response = runtime_claim_run(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            runtime_claim_request(1, Vec::new()),
-        )
-        .await
-        .unwrap()
-        .into_response();
-        assert_eq!(claim_response.status(), StatusCode::NO_CONTENT);
-        let heartbeat = runtime_heartbeat(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Json(RuntimeHeartbeatRequest {
-                accepts_session_commands: true,
-                ..RuntimeHeartbeatRequest::default()
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(heartbeat.runtime_status, "draining");
-        assert_eq!(heartbeat.session_commands.len(), 2);
-        assert!(heartbeat.session_commands.iter().all(|command| {
-            command.command == "checkpoint" && command.ownership_generation == 1
-        }));
-
-        let _ = runtime_complete_run(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(fixture.run_id),
-            runtime_write(CompleteRunRequest {
-                status: "completed".into(),
-                native_session_id: Some("drained-thread".into()),
-                work_dir_ref: Some("drained-workdir".into()),
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            sqlx::query_scalar::<_, String>(
-                "SELECT lifecycle_status FROM hub_sessions WHERE id = $1"
-            )
-            .bind(fixture.hub_session_id)
-            .fetch_one(&fixture.state.pool)
-            .await
-            .unwrap(),
-            "saving"
-        );
-
-        let cancelled = cancel_runtime_drain(
-            State(admin_state),
-            session_headers(&admin_token),
-            Path(fixture.runtime_id),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(cancelled.runtime.status, "online");
-        assert!(cancelled
-            .owned_sessions
-            .iter()
-            .all(|session| session.lifecycle_status == "saving"));
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_completion_preserves_an_existing_drain_checkpoint_attempt(pool: PgPool) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-        let checkpoint_attempt_id = Uuid::new_v4();
-        sqlx::query("UPDATE runtimes SET status = 'draining' WHERE id = $1")
-            .bind(fixture.runtime_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
-        sqlx::query(
-            "UPDATE hub_sessions
-             SET lifecycle_status = 'saving',
-                 saving_history_checkpoint = history_checkpoint,
-                 saving_ownership_generation = ownership_generation,
-                 saving_reason = 'drain', saving_checkpoint_attempt_id = $1
-             WHERE id = $2",
-        )
-        .bind(checkpoint_attempt_id)
-        .bind(fixture.hub_session_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-
-        let _ = runtime_complete_run(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(claim.run.id),
-            runtime_write_generation(
-                1,
-                CompleteRunRequest {
-                    status: "completed".into(),
-                    native_session_id: Some("existing-drain-thread".into()),
-                    work_dir_ref: Some("existing-drain-workdir".into()),
-                },
-            ),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            sqlx::query_as::<_, (i64, i64, String, Uuid)>(
-                "SELECT saving_history_checkpoint, saving_ownership_generation,
-                        saving_reason, saving_checkpoint_attempt_id
-                 FROM hub_sessions WHERE id = $1",
-            )
-            .bind(fixture.hub_session_id)
-            .fetch_one(&fixture.state.pool)
-            .await
-            .unwrap(),
-            (3, 1, "drain".into(), checkpoint_attempt_id)
-        );
-
-        let _ = runtime_complete_run(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(claim.run.id),
-            runtime_write_generation(
-                1,
-                CompleteRunRequest {
-                    status: "completed".into(),
-                    native_session_id: Some("existing-drain-thread".into()),
-                    work_dir_ref: Some("existing-drain-workdir".into()),
-                },
-            ),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            sqlx::query_scalar::<_, Uuid>(
-                "SELECT saving_checkpoint_attempt_id FROM hub_sessions WHERE id = $1",
-            )
-            .bind(fixture.hub_session_id)
-            .fetch_one(&fixture.state.pool)
-            .await
-            .unwrap(),
-            checkpoint_attempt_id
         );
     }
 
@@ -16076,197 +13630,605 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_list_is_read_only_and_redacts_unknown_capabilities(pool: PgPool) {
-        let user_id = Uuid::new_v4();
-        let runtime_id = Uuid::new_v4();
-        let session_token = "runtime-list-session";
-        sqlx::query(
-            "INSERT INTO users (id, email, password, display_name, role)
-             VALUES ($1, 'runtime-list@example.com', 'unused',
-                     'Runtime List', 'member')",
+    async fn skill_bulk_delete_is_owner_scoped_and_all_or_nothing(pool: PgPool) {
+        let owner = create_hub_user(
+            &pool,
+            Some("skills-owner@example.com"),
+            None,
+            Some("x"),
+            true,
         )
-        .bind(user_id)
-        .execute(&pool)
         .await
         .unwrap();
+        let other = create_hub_user(
+            &pool,
+            Some("skills-other@example.com"),
+            None,
+            Some("x"),
+            true,
+        )
+        .await
+        .unwrap();
+        let token = "skills-owner-session";
         sqlx::query(
             "INSERT INTO sessions (token_hash, user_id, expires_at)
              VALUES ($1, $2, now() + interval '1 hour')",
         )
-        .bind(sha256_hex(session_token))
-        .bind(user_id)
+        .bind(sha256_hex(token))
+        .bind(owner.id)
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query(
-            "INSERT INTO runtimes
-             (id, token_hash, hostname, labels, engine_version, capabilities, sandbox_mode,
-              status, last_heartbeat_at)
-             VALUES ($1, 'unused', 'stale-console-runtime', '{}', 'test', $2,
-                     'read-only', 'online', now() - interval '1 minute')",
-        )
-        .bind(runtime_id)
-        .bind(json!({
-            "driver": "pi",
-            "model_proxy": true,
-            "sandbox_downgraded": true,
-            "sandbox_downgrade_reason": "workspace is read-only",
-            "unknown_secret": "do-not-return",
-            "sandbox": { "mount_token": "secret" }
-        }))
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let state = Arc::new(test_state_with_browser_session_auth(pool.clone()));
-        let listed = list_runtimes(State(state), session_headers(session_token))
+        let owned = [Uuid::new_v4(), Uuid::new_v4()];
+        let foreign = Uuid::new_v4();
+        for (id, user_id, name) in [
+            (owned[0], owner.id, "one"),
+            (owned[1], owner.id, "two"),
+            (foreign, other.id, "foreign"),
+        ] {
+            sqlx::query(
+                "INSERT INTO skills
+                     (id, owner_id, name, description, content, content_checksum_sha256)
+                 VALUES ($1, $2, $3, '', 'content', $4)",
+            )
+            .bind(id)
+            .bind(user_id)
+            .bind(name)
+            .bind(sha256_hex("content"))
+            .execute(&pool)
             .await
-            .unwrap()
-            .0;
-
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].status, "online");
-        assert_eq!(listed[0].capabilities["driver"], "pi");
-        assert_eq!(listed[0].capabilities["model_proxy"], true);
-        assert!(listed[0].capabilities.get("unknown_secret").is_none());
-        assert!(listed[0].capabilities.get("sandbox").is_none());
+            .unwrap();
+        }
+        let state = Arc::new(test_state_with_browser_session_auth(pool.clone()));
+        let error = bulk_delete_skills(
+            State(state.clone()),
+            session_headers(token),
+            Json(BulkDeleteSkillsRequest {
+                skill_ids: vec![owned[0], foreign],
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
         assert_eq!(
-            sqlx::query_scalar::<_, String>("SELECT status FROM runtimes WHERE id = $1")
-                .bind(runtime_id)
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM skills WHERE id = ANY($1)")
+                .bind(owned)
                 .fetch_one(&pool)
                 .await
                 .unwrap(),
-            "online"
+            2
         );
 
-        reap_stale_runtimes(&pool).await.unwrap();
-        assert_eq!(
-            sqlx::query_scalar::<_, String>("SELECT status FROM runtimes WHERE id = $1")
-                .bind(runtime_id)
-                .fetch_one(&pool)
+        let deleted = bulk_delete_skills(
+            State(state),
+            session_headers(token),
+            Json(BulkDeleteSkillsRequest {
+                skill_ids: owned.to_vec(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let mut expected = owned.to_vec();
+        expected.sort_unstable();
+        assert_eq!(deleted.deleted_skill_ids, expected);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn api_key_list_paginates_with_stable_order_and_owner_isolation(pool: PgPool) {
+        let owner_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        for (id, email) in [
+            (owner_id, "page-owner@example.com"),
+            (other_id, "page-other@example.com"),
+        ] {
+            sqlx::query(
+                "INSERT INTO users (id, email, password, display_name, role)
+                 VALUES ($1, $2, 'x', 'Test', 'member')",
+            )
+            .bind(id)
+            .bind(email)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO sessions (token_hash, user_id, expires_at)
+             VALUES ($1, $2, now() + interval '1 hour')",
+        )
+        .bind(sha256_hex("page-owner-session"))
+        .bind(owner_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let created_at = Utc::now();
+        let ids = [Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)];
+        for (index, id) in ids.into_iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO api_keys
+                 (id, user_id, name, prefix, token_hash, created_at)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(id)
+            .bind(owner_id)
+            .bind(format!("owner-{index}"))
+            .bind(format!("prefix-{index}"))
+            .bind(format!("hash-{index}"))
+            .bind(if index == 0 {
+                created_at + ChronoDuration::seconds(1)
+            } else {
+                created_at
+            })
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO api_keys (id, user_id, name, prefix, token_hash, created_at)
+             VALUES ($1, $2, 'foreign', 'foreign', 'foreign', $3)",
+        )
+        .bind(Uuid::from_u128(4))
+        .bind(other_id)
+        .bind(created_at + ChronoDuration::seconds(1))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = Arc::new(test_state_with_browser_session_auth(pool));
+        let app = build_router((*state).clone());
+        for uri in [
+            "/api/auth/api-keys?page=0",
+            "/api/auth/api-keys?page=-1",
+            "/api/auth/api-keys?page=1.5",
+            "/api/auth/api-keys?page_size=0",
+            "/api/auth/api-keys?page_size=101",
+            "/api/auth/api-keys?page=999999999999999999999999999999999999",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .header(header::COOKIE, "agent_hub_session=page-owner-session")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
                 .await
-                .unwrap(),
-            "offline"
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "URI: {uri}");
+        }
+        let first = list_api_keys(
+            State(state.clone()),
+            session_headers("page-owner-session"),
+            Query(ApiKeyListQuery {
+                page: Some(1),
+                page_size: Some(2),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(first.total, 3);
+        assert_eq!(first.page, 1);
+        assert_eq!(first.page_size, 2);
+        assert_eq!(
+            first.items.iter().map(|key| key.id).collect::<Vec<_>>(),
+            [ids[0], ids[2]]
+        );
+
+        let second = list_api_keys(
+            State(state.clone()),
+            session_headers("page-owner-session"),
+            Query(ApiKeyListQuery {
+                page: Some(2),
+                page_size: Some(2),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            second.items.iter().map(|key| key.id).collect::<Vec<_>>(),
+            [ids[1]]
+        );
+
+        let empty = list_api_keys(
+            State(state),
+            session_headers("page-owner-session"),
+            Query(ApiKeyListQuery {
+                page: Some(3),
+                page_size: Some(2),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(empty.items.is_empty());
+        assert_eq!(empty.total, 3);
+    }
+
+    #[test]
+    fn api_key_pagination_defaults_and_rejects_invalid_or_overflowing_values() {
+        assert_eq!(ApiKeyListQuery::default().validated().unwrap(), (1, 20, 0));
+        for query in [
+            ApiKeyListQuery {
+                page: Some(0),
+                page_size: Some(20),
+            },
+            ApiKeyListQuery {
+                page: Some(-1),
+                page_size: Some(20),
+            },
+            ApiKeyListQuery {
+                page: Some(1),
+                page_size: Some(0),
+            },
+            ApiKeyListQuery {
+                page: Some(1),
+                page_size: Some(101),
+            },
+            ApiKeyListQuery {
+                page: Some(i64::MAX),
+                page_size: Some(100),
+            },
+        ] {
+            assert_eq!(
+                query.validated().unwrap_err().status,
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
+
+    #[test]
+    fn api_key_validity_defaults_to_ninety_days_and_renewal_only_moves_forward() {
+        let now = Utc::now();
+        assert_eq!(
+            api_key_expiration(None, now).unwrap(),
+            Some(now + ChronoDuration::days(90))
+        );
+        assert_eq!(
+            api_key_expiration(Some(&ApiKeyValidity::Days { days: 30 }), now).unwrap(),
+            Some(now + ChronoDuration::days(30))
+        );
+        assert_eq!(
+            api_key_expiration(Some(&ApiKeyValidity::Never), now).unwrap(),
+            None
+        );
+        assert_eq!(
+            api_key_expiration(
+                Some(&ApiKeyValidity::Date {
+                    expires_at: now + ChronoDuration::hours(1),
+                }),
+                now,
+            )
+            .unwrap(),
+            Some(now + ChronoDuration::hours(1))
+        );
+        assert_eq!(
+            renewed_api_key_expiration(
+                &ApiKeyValidity::Days { days: 180 },
+                Some(now + ChronoDuration::days(90)),
+                now,
+            )
+            .unwrap(),
+            Some(now + ChronoDuration::days(180))
+        );
+        assert_eq!(
+            renewed_api_key_expiration(
+                &ApiKeyValidity::Never,
+                Some(now + ChronoDuration::days(90)),
+                now,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            renewed_api_key_expiration(
+                &ApiKeyValidity::Days { days: 30 },
+                Some(now + ChronoDuration::days(90)),
+                now,
+            )
+            .unwrap_err()
+            .status,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            renewed_api_key_expiration(&ApiKeyValidity::Never, None, now)
+                .unwrap_err()
+                .status,
+            StatusCode::BAD_REQUEST
         );
     }
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_reaper_preserves_session_owner_and_draining_state(pool: PgPool) {
-        let fixture = integration_runtime_fixture(pool).await;
-        sqlx::query(
-            "UPDATE runtimes
-             SET last_heartbeat_at = now() - interval '1 minute'
-             WHERE id = $1",
-        )
-        .bind(fixture.runtime_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-        reap_stale_runtimes(&fixture.state.pool).await.unwrap();
-        assert_eq!(
-            sqlx::query_scalar::<_, String>("SELECT status FROM runtimes WHERE id = $1")
-                .bind(fixture.runtime_id)
-                .fetch_one(&fixture.state.pool)
-                .await
-                .unwrap(),
-            "offline"
-        );
-        assert_eq!(
-            sqlx::query_as::<_, (Option<Uuid>, i64)>(
-                "SELECT runtime_owner_id, ownership_generation
-                 FROM hub_sessions WHERE id = $1"
+    async fn api_key_create_renew_and_delete_preserve_token_and_ownership(pool: PgPool) {
+        let owner_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        for (id, email) in [
+            (owner_id, "key-owner@example.com"),
+            (other_id, "other@example.com"),
+        ] {
+            sqlx::query(
+                "INSERT INTO users (id, email, password, display_name, role)
+                 VALUES ($1, $2, 'x', 'Test', 'member')",
             )
-            .bind(fixture.hub_session_id)
-            .fetch_one(&fixture.state.pool)
+            .bind(id)
+            .bind(email)
+            .execute(&pool)
             .await
-            .unwrap(),
-            (None, 2)
-        );
-        assert_eq!(
-            runtime_completion_run_state(&fixture.state.pool, fixture.run_id)
-                .await
-                .0,
-            "failed"
-        );
-        assert_eq!(
-            sqlx::query_as::<_, (i64, i64, i64)>(
-                "SELECT ownership_generation, history_checkpoint, bundle_generation
-                 FROM runtime_session_salvage_obligations
-                 WHERE runtime_id = $1 AND session_id = $2",
+            .unwrap();
+        }
+        for (token, user_id) in [("owner-session", owner_id), ("other-session", other_id)] {
+            sqlx::query(
+                "INSERT INTO sessions (token_hash, user_id, expires_at) VALUES ($1, $2, now() + interval '1 hour')",
             )
-            .bind(fixture.runtime_id)
-            .bind(fixture.hub_session_id)
-            .fetch_one(&fixture.state.pool)
+            .bind(sha256_hex(token))
+            .bind(user_id)
+            .execute(&pool)
             .await
-            .unwrap(),
-            (1, 0, 1)
-        );
-
-        let recovered = runtime_heartbeat(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Json(RuntimeHeartbeatRequest::default()),
+            .unwrap();
+        }
+        let state = Arc::new(test_state_with_browser_session_auth(pool.clone()));
+        let headers = session_headers("owner-session");
+        let created = create_api_key(
+            State(state.clone()),
+            headers.clone(),
+            Json(CreateApiKeyRequest {
+                name: "CI key".into(),
+                validity: None,
+            }),
         )
         .await
         .unwrap()
         .0;
-        assert_eq!(recovered.runtime_status, "online");
-        assert!(recovered.session_commands.is_empty());
-        assert!(recovered.owned_sessions.is_empty());
-        assert_eq!(recovered.salvage_sessions.len(), 1);
-        assert_eq!(
-            recovered.salvage_sessions[0].session_id,
-            fixture.hub_session_id
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT ownership_generation FROM hub_sessions WHERE id = $1"
-            )
-            .bind(fixture.hub_session_id)
-            .fetch_one(&fixture.state.pool)
-            .await
-            .unwrap(),
-            2
-        );
+        let key_id = created.api_key.id;
+        let created_at = created.api_key.created_at;
+        let token = created.token;
+        let original_prefix = created.api_key.prefix.clone();
+        let original_hash: String =
+            sqlx::query_scalar("SELECT token_hash FROM api_keys WHERE id = $1")
+                .bind(key_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let default_expiration = created.api_key.expires_at.unwrap();
+        assert!(default_expiration >= created_at + ChronoDuration::days(89));
 
-        sqlx::query(
-            "UPDATE runtimes
-             SET status = 'draining', last_heartbeat_at = now() - interval '1 minute'
-             WHERE id = $1",
+        let foreign = renew_api_key(
+            State(state.clone()),
+            session_headers("other-session"),
+            Path(key_id),
+            Json(RenewApiKeyRequest {
+                validity: ApiKeyValidity::Days { days: 180 },
+            }),
         )
-        .bind(fixture.runtime_id)
-        .execute(&fixture.state.pool)
         .await
-        .unwrap();
-        reap_stale_runtimes(&fixture.state.pool).await.unwrap();
+        .unwrap_err();
+        assert_eq!(foreign.status, StatusCode::NOT_FOUND);
+
+        let renewed = renew_api_key(
+            State(state.clone()),
+            headers.clone(),
+            Path(key_id),
+            Json(RenewApiKeyRequest {
+                validity: ApiKeyValidity::Days { days: 180 },
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(renewed.id, key_id);
+        assert_eq!(renewed.name, "CI key");
+        assert_eq!(renewed.created_at, created_at);
+        assert_eq!(renewed.prefix, original_prefix);
+        assert!(renewed.expires_at.unwrap() > default_expiration);
         assert_eq!(
-            sqlx::query_scalar::<_, String>("SELECT status FROM runtimes WHERE id = $1")
-                .bind(fixture.runtime_id)
-                .fetch_one(&fixture.state.pool)
+            sqlx::query_scalar::<_, String>("SELECT token_hash FROM api_keys WHERE id = $1")
+                .bind(key_id)
+                .fetch_one(&pool)
                 .await
                 .unwrap(),
-            "draining"
+            original_hash
         );
+        assert!(load_user_by_api_key(&pool, &token).await.is_ok());
+
+        delete_api_key(State(state), headers, Path(key_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM api_keys WHERE id = $1")
+                .bind(key_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(load_user_by_api_key(&pool, &token).await.is_err());
     }
 
-    #[test]
-    fn runtime_capability_sql_requires_model_proxy_mcp_subagents_and_effective_sandbox() {
-        assert!(RUNTIME_CAPABILITY_SQL.contains(
-            "a.model_policy->>'provider' IS DISTINCT FROM 'hub-proxy'\n             OR COALESCE((rt.capabilities->>'model_proxy')::boolean, false) = true"
-        ));
-        assert!(RUNTIME_CAPABILITY_SQL.contains(
-            "subagent.agent_id = a.id AND subagent.enabled = true\n             )\n             OR COALESCE((rt.capabilities->>'subagents')::boolean, false) = true"
-        ));
-        assert!(RUNTIME_CAPABILITY_SQL.contains(
-            "a.sandbox_policy->>'mode' IS DISTINCT FROM 'workspace-write'\n             OR rt.sandbox_mode LIKE 'workspace-write%'"
-        ));
-        assert!(RUNTIME_CAPABILITY_SQL.contains(
-            "a.sandbox_policy->>'mode' IS DISTINCT FROM 'danger-full-access'\n             OR rt.sandbox_mode LIKE 'danger-full-access%'"
-        ));
-        assert!(!RUNTIME_CAPABILITY_SQL.contains("direct_fallback"));
-        assert!(!RUNTIME_CAPABILITY_SQL.contains("direct_model_enabled"));
-        assert!(!RUNTIME_CAPABILITY_SQL.contains("rt.sandbox_mode LIKE '%danger%'"));
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn api_key_mutations_reject_self_and_allow_another_owner_key(pool: PgPool) {
+        let owner_id = Uuid::new_v4();
+        let foreign_id = Uuid::new_v4();
+        for (id, email) in [
+            (owner_id, "key-owner-2@example.com"),
+            (foreign_id, "foreign-key-owner@example.com"),
+        ] {
+            sqlx::query(
+                "INSERT INTO users (id, email, password, display_name, role)
+                 VALUES ($1, $2, 'x', 'Test', 'member')",
+            )
+            .bind(id)
+            .bind(email)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let target_id = Uuid::new_v4();
+        let caller_id = Uuid::new_v4();
+        let unaffected_id = Uuid::new_v4();
+        let foreign_key_id = Uuid::new_v4();
+        let target_token = new_api_key_token();
+        let caller_token = new_api_key_token();
+        let unaffected_token = new_api_key_token();
+        let foreign_token = new_api_key_token();
+        for (id, user_id, name, token) in [
+            (target_id, owner_id, "target", target_token.as_str()),
+            (caller_id, owner_id, "caller", caller_token.as_str()),
+            (
+                unaffected_id,
+                owner_id,
+                "unaffected",
+                unaffected_token.as_str(),
+            ),
+            (
+                foreign_key_id,
+                foreign_id,
+                "foreign",
+                foreign_token.as_str(),
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO api_keys (id, user_id, name, prefix, token_hash, expires_at)
+                 VALUES ($1, $2, $3, $4, $5, now() + interval '90 days')",
+            )
+            .bind(id)
+            .bind(user_id)
+            .bind(name)
+            .bind(token.chars().take(12).collect::<String>())
+            .bind(sha256_hex(token))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let expired_token = new_api_key_token();
+        sqlx::query(
+            "INSERT INTO api_keys
+                 (id, user_id, name, prefix, token_hash, expires_at, created_at)
+             VALUES ($1, $2, 'expired', $3, $4,
+                     now() - interval '1 day', now() - interval '2 days')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(owner_id)
+        .bind(expired_token.chars().take(12).collect::<String>())
+        .bind(sha256_hex(&expired_token))
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(load_user_by_api_key(&pool, &expired_token).await.is_err());
+        let mut state = test_state_with_pool(pool.clone());
+        state.auth_providers = vec![Arc::new(ApiKeyAuthProvider)];
+        let app = build_router(state);
+
+        let self_renew = api_key_http_request(
+            &app,
+            Method::POST,
+            &format!("/api/auth/api-keys/{target_id}/renew"),
+            &target_token,
+            json!({ "validity": { "kind": "days", "days": 180 } }),
+        )
+        .await;
+        assert_api_key_http_error(self_renew, StatusCode::NOT_FOUND).await;
+        assert_eq!(api_key_record_count(&pool, target_id).await, 1);
+        assert!(load_user_by_api_key(&pool, &target_token).await.is_ok());
+
+        let self_delete = api_key_http_request(
+            &app,
+            Method::DELETE,
+            &format!("/api/auth/api-keys/{target_id}"),
+            &target_token,
+            json!({}),
+        )
+        .await;
+        assert_api_key_http_error(self_delete, StatusCode::NOT_FOUND).await;
+        assert_eq!(api_key_record_count(&pool, target_id).await, 1);
+        assert!(load_user_by_api_key(&pool, &target_token).await.is_ok());
+
+        let foreign_delete = api_key_http_request(
+            &app,
+            Method::DELETE,
+            &format!("/api/auth/api-keys/{target_id}"),
+            &foreign_token,
+            json!({}),
+        )
+        .await;
+        assert_api_key_http_error(foreign_delete, StatusCode::NOT_FOUND).await;
+        assert_eq!(api_key_record_count(&pool, target_id).await, 1);
+
+        let renewed_response = api_key_http_request(
+            &app,
+            Method::POST,
+            &format!("/api/auth/api-keys/{target_id}/renew"),
+            &caller_token,
+            json!({ "validity": { "kind": "days", "days": 180 } }),
+        )
+        .await;
+        assert_eq!(renewed_response.status(), StatusCode::OK);
+        assert_eq!(
+            renewed_response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .unwrap(),
+            "application/json"
+        );
+        let renewed_body = axum::body::to_bytes(renewed_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let renewed: ApiKeyDto = serde_json::from_slice(&renewed_body).unwrap();
+        assert_eq!(renewed.id, target_id);
+        assert_eq!(renewed.name, "target");
+        assert!(load_user_by_api_key(&pool, &target_token).await.is_ok());
+        assert!(load_user_by_api_key(&pool, &caller_token).await.is_ok());
+        assert!(load_user_by_api_key(&pool, &unaffected_token).await.is_ok());
+
+        let permanent_response = api_key_http_request(
+            &app,
+            Method::POST,
+            &format!("/api/auth/api-keys/{target_id}/renew"),
+            &caller_token,
+            json!({ "validity": { "kind": "never" } }),
+        )
+        .await;
+        assert_eq!(permanent_response.status(), StatusCode::OK);
+        let permanent_body = axum::body::to_bytes(permanent_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let permanent_json: Value = serde_json::from_slice(&permanent_body).unwrap();
+        assert!(permanent_json.get("token").is_none());
+        assert!(permanent_json["expires_at"].is_null());
+        let permanent_again = api_key_http_request(
+            &app,
+            Method::POST,
+            &format!("/api/auth/api-keys/{target_id}/renew"),
+            &caller_token,
+            json!({ "validity": { "kind": "days", "days": 365 } }),
+        )
+        .await;
+        assert_eq!(permanent_again.status(), StatusCode::BAD_REQUEST);
+        assert!(load_user_by_api_key(&pool, &target_token).await.is_ok());
+
+        let deleted = api_key_http_request(
+            &app,
+            Method::DELETE,
+            &format!("/api/auth/api-keys/{target_id}"),
+            &caller_token,
+            json!({}),
+        )
+        .await;
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+        assert!(deleted.headers().get(header::CONTENT_TYPE).is_none());
+        assert!(axum::body::to_bytes(deleted.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(api_key_record_count(&pool, target_id).await, 0);
+        assert!(load_user_by_api_key(&pool, &target_token).await.is_err());
+        assert!(load_user_by_api_key(&pool, &caller_token).await.is_ok());
+        assert!(load_user_by_api_key(&pool, &unaffected_token).await.is_ok());
     }
 
     #[test]
@@ -16367,65 +14329,6 @@ mod tests {
             .0;
         assert!(background.contains("Duration::from_secs(5)"));
         assert!(background.contains("reap_stale_runtimes(&pool).await"));
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    async fn run_model_bindings_distinguish_same_connection_model_with_different_settings(
-        pool: PgPool,
-    ) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        sqlx::query(
-            "INSERT INTO subagent_definitions
-                 (id, agent_id, name, description, developer_instructions,
-                  model_settings_override)
-             VALUES ($1, $2, 'reviewer', 'Reviews output', 'Review carefully.',
-                     '{\"reasoning_effort\":\"high\",\"provider_request_timeout_ms\":120000}'::jsonb)",
-        )
-        .bind(Uuid::new_v4())
-        .bind(fixture.agent_id)
-        .execute(&fixture.state.pool)
-        .await
-        .unwrap();
-
-        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-        let main = claim
-            .execution_configuration
-            .model_bindings
-            .iter()
-            .find(|binding| binding.binding_key == "main")
-            .unwrap();
-        let reviewer = claim
-            .execution_configuration
-            .model_bindings
-            .iter()
-            .find(|binding| binding.binding_key == "reviewer")
-            .unwrap();
-        assert_ne!(main.id, reviewer.id);
-        assert_eq!(main.model_connection_id, reviewer.model_connection_id);
-        assert_eq!(main.model_id, reviewer.model_id);
-        assert_eq!(
-            main.model_settings.reasoning_effort,
-            ReasoningEffort::Default
-        );
-        assert_eq!(
-            reviewer.model_settings.reasoning_effort,
-            ReasoningEffort::High
-        );
-        assert_eq!(main.model_settings.provider_request_timeout_ms, None);
-        assert_eq!(
-            reviewer.model_settings.provider_request_timeout_ms,
-            Some(120_000)
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM run_model_bindings WHERE run_id = $1",
-            )
-            .bind(fixture.run_id)
-            .fetch_one(&fixture.state.pool)
-            .await
-            .unwrap(),
-            2
-        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -19328,70 +17231,6 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_ownership_change_wins_without_orphan_tool_request_event(pool: PgPool) {
-        let fixture = integration_runtime_fixture(pool).await;
-        let mut ownership_tx = fixture.state.pool.begin().await.unwrap();
-        sqlx::query("SELECT id FROM runs WHERE id = $1 FOR NO KEY UPDATE")
-            .bind(fixture.run_id)
-            .fetch_one(&mut *ownership_tx)
-            .await
-            .unwrap();
-
-        let application_name = format!("ownership-tool-append-{}", Uuid::new_v4().simple());
-        let append_state = Arc::new(test_state_with_pool(
-            postgres_test_pool_with_application_name(&fixture.state.pool, &application_name).await,
-        ));
-        let append_headers = bearer_headers(&fixture.runtime_token);
-        let run_id = fixture.run_id;
-        let batch = tool_request_batch(&fixture, [fixture.tool_request_id]);
-        let append = tokio::spawn(async move {
-            runtime_finalize_tool_requests(
-                State(append_state),
-                append_headers,
-                Path(run_id),
-                runtime_write(batch),
-            )
-            .await
-        });
-        let append_wait_observed = wait_for_application_lock(
-            &fixture.state.pool,
-            &application_name,
-            "SELECT r.integration_session_id, r.hub_session_id",
-        )
-        .await;
-        let visible_before_ownership_commit =
-            run_event_count(&fixture.state.pool, fixture.run_id).await;
-
-        sqlx::query("UPDATE runs SET runtime_id = $1 WHERE id = $2")
-            .bind(fixture.other_runtime_id)
-            .bind(fixture.run_id)
-            .execute(&mut *ownership_tx)
-            .await
-            .unwrap();
-        ownership_tx.commit().await.unwrap();
-
-        let append_result = tokio::time::timeout(Duration::from_secs(3), append)
-            .await
-            .expect("runtime append should unblock after ownership changes")
-            .expect("runtime append task should not panic");
-        assert!(
-            append_wait_observed,
-            "runtime append must wait on the owned run lock"
-        );
-        assert_eq!(visible_before_ownership_commit, 0);
-        assert!(append_result.is_err());
-        assert_eq!(
-            run_event_count(&fixture.state.pool, fixture.run_id).await,
-            0
-        );
-        assert_eq!(
-            tool_request_count(&fixture.state.pool, fixture.tool_request_id).await,
-            0
-        );
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn duplicate_tool_request_rolls_back_its_run_event(pool: PgPool) {
         let fixture = integration_runtime_fixture(pool).await;
         sqlx::query(
@@ -19436,160 +17275,358 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_claim_rolls_back_target_when_claim_event_insert_fails(pool: PgPool) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let (trigger_name, function_name) =
-            install_run_event_failure_trigger(&fixture.state.pool, fixture.run_id).await;
+    async fn automation_update_enforces_owner_validation_and_webhook_secrecy(pool: PgPool) {
+        let fixture = automation_update_fixture(pool).await;
+        let state = Arc::new(test_state_with_browser_session_auth(fixture.pool.clone()));
+        let update =
+            |trigger_type: &str, schedule: Option<&str>, enabled: bool| UpdateAutomationRequest {
+                name: " Updated automation ".into(),
+                trigger_type: trigger_type.into(),
+                prompt: " Updated prompt ".into(),
+                schedule: schedule.map(str::to_owned),
+                enabled,
+            };
 
-        let claim_result = runtime_claim_run(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            runtime_claim_request(1, Vec::new()),
+        let Json(manual) = update_automation(
+            State(state.clone()),
+            session_headers(&fixture.owner_session),
+            Path(fixture.automation_id),
+            Json(update("manual", None, false)),
         )
-        .await;
-        remove_run_event_failure_trigger(&fixture.state.pool, &trigger_name, &function_name).await;
-
-        assert!(claim_result.is_err());
-        assert_eq!(
-            runtime_claim_run_state(&fixture.state.pool, fixture.run_id).await,
-            ("pending".into(), None, None)
-        );
-        assert_eq!(
-            run_event_count(&fixture.state.pool, fixture.run_id).await,
-            0
-        );
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_claim_rolls_back_capability_mismatch_when_status_event_insert_fails(
-        pool: PgPool,
-    ) {
-        let fixture = runtime_claim_fixture(pool, "read-only", "workspace-write").await;
-        let (trigger_name, function_name) =
-            install_run_event_failure_trigger(&fixture.state.pool, fixture.run_id).await;
-
-        let claim_result = runtime_claim_run(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            runtime_claim_request(1, Vec::new()),
-        )
-        .await;
-        remove_run_event_failure_trigger(&fixture.state.pool, &trigger_name, &function_name).await;
-
-        assert!(claim_result.is_err());
-        assert_eq!(
-            runtime_claim_run_state(&fixture.state.pool, fixture.run_id).await,
-            ("pending".into(), None, None)
-        );
-        assert_eq!(
-            run_event_count(&fixture.state.pool, fixture.run_id).await,
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn runtime_complete_rejects_invalid_status_before_database_access() {
-        let pool = PgPoolOptions::new()
-            .acquire_timeout(Duration::from_millis(100))
-            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
-            .unwrap();
-        let result = runtime_complete_run(
-            State(Arc::new(test_state_with_pool(pool))),
-            HeaderMap::new(),
-            Path(Uuid::new_v4()),
-            runtime_write(CompleteRunRequest {
-                status: "cancelled".into(),
-                native_session_id: None,
-                work_dir_ref: None,
-            }),
-        )
-        .await;
-
-        let error = result.expect_err("invalid completion status must be rejected");
-        assert_eq!(error.status, StatusCode::BAD_REQUEST);
-        assert_eq!(error.message, "invalid run completion status");
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_complete_cannot_bypass_atomic_waiting_tool_finalize(pool: PgPool) {
-        let fixture = integration_runtime_fixture(pool).await;
-
-        let completion = runtime_complete_run(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(fixture.run_id),
-            runtime_write(CompleteRunRequest {
-                status: "waiting_tool".into(),
-                native_session_id: Some("bypass-session".into()),
-                work_dir_ref: Some("bypass-workdir".into()),
-            }),
-        )
-        .await;
-
-        let error = completion.expect_err("running runs must use atomic tool-request finalize");
-        assert_eq!(error.status, StatusCode::CONFLICT);
-        assert_eq!(
-            runtime_completion_run_state(&fixture.state.pool, fixture.run_id).await,
-            ("running".into(), Some(fixture.runtime_id), None, None, None)
-        );
-        assert_eq!(
-            run_event_count(&fixture.state.pool, fixture.run_id).await,
-            0
-        );
-        assert_eq!(
-            tool_request_count(&fixture.state.pool, fixture.tool_request_id).await,
-            0
-        );
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_complete_rolls_back_when_status_event_insert_fails(pool: PgPool) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        sqlx::query(
-            "UPDATE runs
-             SET status = 'running', runtime_id = $1, model_proxy_token_hash = 'original-token',
-                 native_session_id = 'original-session', work_dir_ref = 'original-workdir'
-             WHERE id = $2",
-        )
-        .bind(fixture.runtime_id)
-        .bind(fixture.run_id)
-        .execute(&fixture.state.pool)
         .await
         .unwrap();
-        let (trigger_name, function_name) =
-            install_run_event_failure_trigger(&fixture.state.pool, fixture.run_id).await;
+        assert_eq!(manual.name, "Updated automation");
+        assert_eq!(manual.prompt, "Updated prompt");
+        assert!(!manual.enabled);
+        assert!(manual.webhook_token.is_none());
 
-        let completion_result = runtime_complete_run(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(fixture.run_id),
-            runtime_write(CompleteRunRequest {
-                status: "completed".into(),
-                native_session_id: Some("new-session".into()),
-                work_dir_ref: Some("new-workdir".into()),
+        let foreign = update_automation(
+            State(state.clone()),
+            session_headers(&fixture.foreign_session),
+            Path(fixture.automation_id),
+            Json(update("manual", None, true)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(foreign.status, StatusCode::NOT_FOUND);
+
+        for invalid in [
+            UpdateAutomationRequest {
+                name: " ".into(),
+                ..update("manual", None, true)
+            },
+            UpdateAutomationRequest {
+                prompt: " ".into(),
+                ..update("manual", None, true)
+            },
+            update("unknown", None, true),
+            update("interval", Some("later"), true),
+            update("cron", None, true),
+        ] {
+            let error = update_automation(
+                State(state.clone()),
+                session_headers(&fixture.owner_session),
+                Path(fixture.automation_id),
+                Json(invalid),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        }
+
+        let Json(webhook) = update_automation(
+            State(state.clone()),
+            session_headers(&fixture.owner_session),
+            Path(fixture.automation_id),
+            Json(update("webhook", None, true)),
+        )
+        .await
+        .unwrap();
+        let token = webhook.webhook_token.expect("new webhook token");
+        let first_hash: Option<String> =
+            sqlx::query_scalar("SELECT webhook_token_hash FROM automations WHERE id = $1")
+                .bind(fixture.automation_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+        assert_eq!(first_hash.as_deref(), Some(sha256_hex(&token).as_str()));
+
+        let Json(webhook_again) = update_automation(
+            State(state.clone()),
+            session_headers(&fixture.owner_session),
+            Path(fixture.automation_id),
+            Json(update("webhook", None, true)),
+        )
+        .await
+        .unwrap();
+        assert!(webhook_again.webhook_token.is_none());
+        let preserved_hash: Option<String> =
+            sqlx::query_scalar("SELECT webhook_token_hash FROM automations WHERE id = $1")
+                .bind(fixture.automation_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+        assert_eq!(preserved_hash, first_hash);
+
+        let Json(interval) = update_automation(
+            State(state.clone()),
+            session_headers(&fixture.owner_session),
+            Path(fixture.automation_id),
+            Json(update("interval", Some("5m"), true)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(interval.schedule.as_deref(), Some("5m"));
+        let cleared_hash: Option<String> =
+            sqlx::query_scalar("SELECT webhook_token_hash FROM automations WHERE id = $1")
+                .bind(fixture.automation_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+        assert!(cleared_hash.is_none());
+        let listed = list_automations(State(state), session_headers(&fixture.owner_session))
+            .await
+            .unwrap()
+            .0;
+        assert!(listed.iter().all(|item| item.webhook_token.is_none()));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn automation_run_history_tracks_sources_owner_pagination_and_deletion(pool: PgPool) {
+        let owner_id = Uuid::new_v4();
+        let foreign_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let owner_session = format!("ahs_{}", Uuid::new_v4().simple());
+        let foreign_session = format!("ahs_{}", Uuid::new_v4().simple());
+        let unique = Uuid::new_v4().simple().to_string();
+        for (id, label) in [(owner_id, "owner"), (foreign_id, "foreign")] {
+            sqlx::query(
+                "INSERT INTO users (id, email, password, display_name, role)
+                 VALUES ($1, $2, 'unused', $3, 'member')",
+            )
+            .bind(id)
+            .bind(format!("automation-history-{label}-{unique}@example.com"))
+            .bind(format!("automation-history-{label}-{unique}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for (token, user_id) in [(&owner_session, owner_id), (&foreign_session, foreign_id)] {
+            sqlx::query(
+                "INSERT INTO sessions (token_hash, user_id, expires_at)
+                 VALUES ($1, $2, now() + interval '1 hour')",
+            )
+            .bind(sha256_hex(token))
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO agents (id, owner_id, name, instructions, visibility)
+             VALUES ($1, $2, 'Automation History Agent', 'test', 'private')",
+        )
+        .bind(agent_id)
+        .bind(owner_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        attach_test_model_connection(&pool, agent_id, owner_id, "automation-history-model").await;
+        let history_index: String = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes
+             WHERE schemaname = current_schema() AND indexname = 'runs_automation_created_idx'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(history_index.contains("automation_id, created_at DESC, id DESC"));
+
+        let manual_id = Uuid::new_v4();
+        let webhook_id = Uuid::new_v4();
+        let interval_id = Uuid::new_v4();
+        let cron_id = Uuid::new_v4();
+        let webhook_token = format!("ahw_{}", Uuid::new_v4().simple());
+        for (id, trigger_type, schedule, token_hash) in [
+            (manual_id, "manual", None, None),
+            (
+                webhook_id,
+                "webhook",
+                None,
+                Some(sha256_hex(&webhook_token)),
+            ),
+            (interval_id, "interval", Some("1s"), None),
+            (cron_id, "cron", Some("* * * * *"), None),
+        ] {
+            sqlx::query(
+                "INSERT INTO automations
+                 (id, agent_id, owner_id, name, trigger_type, prompt, schedule,
+                  webhook_token_hash, enabled, created_at)
+                 VALUES ($1, $2, $3, $4, $5, 'history prompt', $6, $7, true,
+                         now() - interval '2 minutes')",
+            )
+            .bind(id)
+            .bind(agent_id)
+            .bind(owner_id)
+            .bind(format!("{trigger_type} history"))
+            .bind(trigger_type)
+            .bind(schedule)
+            .bind(token_hash)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let manual = load_automation_for_user(&pool, manual_id, owner_id)
+            .await
+            .unwrap();
+        let manual_run = trigger_loaded_automation(
+            &pool,
+            manual,
+            Some("manual history".into()),
+            "automation:manual",
+            None,
+        )
+        .await
+        .unwrap();
+        let webhook = load_automation_by_webhook_token(&pool, &webhook_token)
+            .await
+            .unwrap();
+        let webhook_run = trigger_loaded_automation(
+            &pool,
+            webhook,
+            Some("webhook history".into()),
+            "automation:webhook",
+            Some(&sha256_hex(&webhook_token)),
+        )
+        .await
+        .unwrap();
+        let interval_run = trigger_scheduled_automation_if_due(&pool, interval_id, Utc::now())
+            .await
+            .unwrap()
+            .unwrap();
+        let cron_run = trigger_scheduled_automation_if_due(&pool, cron_id, Utc::now())
+            .await
+            .unwrap()
+            .unwrap();
+        let ordinary_run = create_run_for_agent(
+            &pool,
+            agent_id,
+            owner_id,
+            "ordinary run".into(),
+            "console",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(manual_run.automation_id, Some(manual_id));
+        assert_eq!(webhook_run.automation_id, Some(webhook_id));
+        assert_eq!(interval_run.automation_id, Some(interval_id));
+        assert_eq!(cron_run.automation_id, Some(cron_id));
+        assert!(ordinary_run.automation_id.is_none());
+        let automation_sessions = [
+            manual_run.hub_session_id.unwrap(),
+            webhook_run.hub_session_id.unwrap(),
+            interval_run.hub_session_id.unwrap(),
+            cron_run.hub_session_id.unwrap(),
+        ];
+        assert_eq!(automation_sessions.iter().collect::<BTreeSet<_>>().len(), 4);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM hub_sessions
+                 WHERE id = ANY($1) AND origin_kind = 'hub_native'",
+            )
+            .bind(automation_sessions.to_vec())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            4,
+        );
+
+        let second_manual = trigger_loaded_automation(
+            &pool,
+            load_automation_for_user(&pool, manual_id, owner_id)
+                .await
+                .unwrap(),
+            Some("manual history two".into()),
+            "automation:manual",
+            None,
+        )
+        .await
+        .unwrap();
+        let stable_time = Utc::now() - ChronoDuration::seconds(10);
+        sqlx::query("UPDATE runs SET created_at = $1 WHERE automation_id = $2")
+            .bind(stable_time)
+            .bind(manual_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let state = Arc::new(test_state_with_browser_session_auth(pool.clone()));
+        let Json(page_one) = list_automation_runs(
+            State(state.clone()),
+            session_headers(&owner_session),
+            Path(manual_id),
+            Query(AutomationRunListQuery {
+                page: Some(1),
+                page_size: Some(1),
             }),
         )
-        .await;
-        remove_run_event_failure_trigger(&fixture.state.pool, &trigger_name, &function_name).await;
+        .await
+        .unwrap();
+        assert_eq!(page_one.total, 2);
+        assert_eq!(page_one.items.len(), 1);
+        assert_eq!(page_one.items[0].automation_id, Some(manual_id));
+        let expected_latest = if manual_run.id > second_manual.id {
+            &manual_run
+        } else {
+            &second_manual
+        };
+        assert_eq!(
+            page_one.items[0].hub_session_id,
+            expected_latest.hub_session_id
+        );
+        assert_eq!(page_one.items[0].hub_turn_id, expected_latest.hub_turn_id);
+        assert_eq!(
+            page_one.items[0].session_ownership_generation,
+            expected_latest.session_ownership_generation
+        );
+        assert_eq!(
+            page_one.items[0].id,
+            std::cmp::max(manual_run.id, second_manual.id)
+        );
+        let foreign = list_automation_runs(
+            State(state),
+            session_headers(&foreign_session),
+            Path(manual_id),
+            Query(AutomationRunListQuery::default()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(foreign.status, StatusCode::NOT_FOUND);
+        let missing = list_automation_runs(
+            State(Arc::new(test_state_with_browser_session_auth(pool.clone()))),
+            session_headers(&owner_session),
+            Path(Uuid::new_v4()),
+            Query(AutomationRunListQuery::default()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing.status, StatusCode::NOT_FOUND);
 
-        assert!(completion_result.is_err());
-        assert_eq!(
-            runtime_completion_run_state(&fixture.state.pool, fixture.run_id).await,
-            (
-                "running".into(),
-                Some(fixture.runtime_id),
-                Some("original-token".into()),
-                Some("original-session".into()),
-                Some("original-workdir".into())
-            )
-        );
-        assert_eq!(
-            run_event_count(&fixture.state.pool, fixture.run_id).await,
-            0
-        );
+        sqlx::query("DELETE FROM automations WHERE id = $1")
+            .bind(manual_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let retained: (i64, i64) =
+            sqlx::query_as("SELECT count(*), count(automation_id) FROM runs WHERE id = ANY($1)")
+                .bind(vec![manual_run.id, second_manual.id])
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(retained, (2, 0));
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -20041,237 +18078,6 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_enrollment_is_atomic_single_use_and_hostname_is_not_identity(pool: PgPool) {
-        let state = Arc::new(test_state_with_pool(pool));
-        let enrollment = format!(
-            "ahre_{}{}",
-            Uuid::new_v4().simple(),
-            Uuid::new_v4().simple()
-        );
-        sqlx::query(
-            "INSERT INTO runtime_enrollment_tokens
-                 (id, token_hash, expires_at)
-             VALUES ($1, $2, now() + interval '30 minutes')",
-        )
-        .bind(Uuid::new_v4())
-        .bind(sha256_hex(&enrollment))
-        .execute(&state.pool)
-        .await
-        .unwrap();
-        let request = RuntimeRegisterRequest {
-            hostname: "shared-hostname".into(),
-            labels: vec!["test".into()],
-            engine_version: "test".into(),
-            capabilities: json!({}),
-            sandbox_mode: "workspace-write".into(),
-        };
-
-        let first_state = Arc::clone(&state);
-        let first_token = enrollment.clone();
-        let first_request = request.clone();
-        let first = tokio::spawn(async move {
-            runtime_register(
-                State(first_state),
-                bearer_headers(&first_token),
-                Json(first_request),
-            )
-            .await
-        });
-        let second_state = Arc::clone(&state);
-        let second_token = enrollment.clone();
-        let second_request = request.clone();
-        let second = tokio::spawn(async move {
-            runtime_register(
-                State(second_state),
-                bearer_headers(&second_token),
-                Json(second_request),
-            )
-            .await
-        });
-        let results = [first.await.unwrap(), second.await.unwrap()];
-        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
-        let enrolled = results
-            .into_iter()
-            .find_map(Result::ok)
-            .expect("one enrollment must win")
-            .0;
-        assert_ne!(enrolled.runtime_credential, enrollment);
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM runtimes")
-                .fetch_one(&state.pool)
-                .await
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM runtimes WHERE token_hash = $1",)
-                .bind(sha256_hex(&enrolled.runtime_credential))
-                .fetch_one(&state.pool)
-                .await
-                .unwrap(),
-            1
-        );
-        let stored_plaintext: i64 = sqlx::query_scalar(
-            "SELECT
-                (SELECT count(*) FROM runtimes WHERE token_hash = $1) +
-                (SELECT count(*) FROM runtime_enrollment_tokens WHERE token_hash = $1)",
-        )
-        .bind(&enrollment)
-        .fetch_one(&state.pool)
-        .await
-        .unwrap();
-        assert_eq!(stored_plaintext, 0);
-
-        let second_enrollment = format!(
-            "ahre_{}{}",
-            Uuid::new_v4().simple(),
-            Uuid::new_v4().simple()
-        );
-        sqlx::query(
-            "INSERT INTO runtime_enrollment_tokens
-                 (id, token_hash, expires_at)
-             VALUES ($1, $2, now() + interval '30 minutes')",
-        )
-        .bind(Uuid::new_v4())
-        .bind(sha256_hex(&second_enrollment))
-        .execute(&state.pool)
-        .await
-        .unwrap();
-        let second_runtime = runtime_register(
-            State(Arc::clone(&state)),
-            bearer_headers(&second_enrollment),
-            Json(request),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert_ne!(enrolled.runtime_id, second_runtime.runtime_id);
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM runtimes WHERE hostname = 'shared-hostname'",
-            )
-            .fetch_one(&state.pool)
-            .await
-            .unwrap(),
-            2
-        );
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_enrollment_admin_api_expires_revokes_and_redacts_tokens(pool: PgPool) {
-        let admin_id = Uuid::new_v4();
-        let session_token = format!("ahs_{}", Uuid::new_v4().simple());
-        sqlx::query(
-            "INSERT INTO users (id, email, password, display_name, role)
-             VALUES ($1, $2, 'unused', 'Runtime Admin', 'super_admin')",
-        )
-        .bind(admin_id)
-        .bind(format!(
-            "runtime-admin-{}@example.com",
-            Uuid::new_v4().simple()
-        ))
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO sessions (token_hash, user_id, expires_at)
-             VALUES ($1, $2, now() + interval '1 hour')",
-        )
-        .bind(sha256_hex(&session_token))
-        .bind(admin_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-        let state = Arc::new(test_state_with_browser_session_auth(pool));
-        let before = Utc::now();
-
-        let created = create_runtime_enrollment_token(
-            State(Arc::clone(&state)),
-            session_headers(&session_token),
-        )
-        .await
-        .unwrap()
-        .0;
-
-        let lifetime = created.enrollment.expires_at - before;
-        assert!(lifetime >= ChronoDuration::minutes(29));
-        assert!(lifetime <= ChronoDuration::minutes(31));
-        assert_eq!(created.enrollment.created_by, Some(admin_id));
-        let stored_hash: String =
-            sqlx::query_scalar("SELECT token_hash FROM runtime_enrollment_tokens WHERE id = $1")
-                .bind(created.enrollment.id)
-                .fetch_one(&state.pool)
-                .await
-                .unwrap();
-        assert_eq!(stored_hash, sha256_hex(&created.token));
-        assert_ne!(stored_hash, created.token);
-
-        let listed = list_runtime_enrollment_tokens(
-            State(Arc::clone(&state)),
-            session_headers(&session_token),
-        )
-        .await
-        .unwrap()
-        .0;
-        let listed_json = serde_json::to_string(&listed).unwrap();
-        assert!(!listed_json.contains(&created.token));
-        assert!(!listed_json.contains("token_hash"));
-        assert_eq!(listed.len(), 1);
-
-        let revoked = revoke_runtime_enrollment_token(
-            State(Arc::clone(&state)),
-            session_headers(&session_token),
-            Path(created.enrollment.id),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert!(revoked.revoked_at.is_some());
-        let request = RuntimeRegisterRequest {
-            hostname: "revoked-enrollment".into(),
-            labels: Vec::new(),
-            engine_version: "test".into(),
-            capabilities: json!({}),
-            sandbox_mode: "workspace-write".into(),
-        };
-        let revoked_error = runtime_register(
-            State(Arc::clone(&state)),
-            bearer_headers(&created.token),
-            Json(request.clone()),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(revoked_error.status, StatusCode::UNAUTHORIZED);
-
-        let expired = format!(
-            "ahre_{}{}",
-            Uuid::new_v4().simple(),
-            Uuid::new_v4().simple()
-        );
-        sqlx::query(
-            "INSERT INTO runtime_enrollment_tokens
-                 (id, token_hash, expires_at, created_at)
-             VALUES ($1, $2, now() - interval '1 second', now() - interval '31 minutes')",
-        )
-        .bind(Uuid::new_v4())
-        .bind(sha256_hex(&expired))
-        .execute(&state.pool)
-        .await
-        .unwrap();
-        let expired_error = runtime_register(
-            State(Arc::clone(&state)),
-            bearer_headers(&expired),
-            Json(request),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(expired_error.status, StatusCode::UNAUTHORIZED);
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn dev_runtime_bootstrap_is_idempotent_but_not_replayable(pool: PgPool) {
         let bootstrap_token = "dev-only-one-time-runtime-enrollment";
         ensure_dev_runtime_enrollment_token(&pool, bootstrap_token)
@@ -20327,169 +18133,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(row, (1, true));
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_rotation_request_remains_pending_while_runtime_is_offline(pool: PgPool) {
-        let admin_id = Uuid::new_v4();
-        let runtime_id = Uuid::new_v4();
-        let session_token = format!("ahs_{}", Uuid::new_v4().simple());
-        sqlx::query(
-            "INSERT INTO users (id, email, password, display_name, role)
-             VALUES ($1, $2, 'unused', 'Runtime Admin', 'super_admin')",
-        )
-        .bind(admin_id)
-        .bind(format!(
-            "rotation-admin-{}@example.com",
-            Uuid::new_v4().simple()
-        ))
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO sessions (token_hash, user_id, expires_at)
-             VALUES ($1, $2, now() + interval '1 hour')",
-        )
-        .bind(sha256_hex(&session_token))
-        .bind(admin_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO runtimes
-                 (id, token_hash, hostname, labels, engine_version, capabilities,
-                  sandbox_mode, status)
-             VALUES ($1, $2, 'offline-runtime', '{}', 'test', '{}'::jsonb,
-                     'workspace-write', 'offline')",
-        )
-        .bind(runtime_id)
-        .bind(sha256_hex("offline-runtime-credential"))
-        .execute(&pool)
-        .await
-        .unwrap();
-        let state = Arc::new(test_state_with_browser_session_auth(pool));
-
-        let runtime = request_runtime_credential_rotation(
-            State(Arc::clone(&state)),
-            session_headers(&session_token),
-            Path(runtime_id),
-        )
-        .await
-        .unwrap()
-        .0;
-
-        assert_eq!(runtime.status, "offline");
-        assert!(runtime.credential_rotation_requested_at.is_some());
-        let pending: Option<DateTime<Utc>> =
-            sqlx::query_scalar("SELECT rotation_requested_at FROM runtimes WHERE id = $1")
-                .bind(runtime_id)
-                .fetch_one(&state.pool)
-                .await
-                .unwrap();
-        assert!(pending.is_some());
-    }
-
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn runtime_rotation_keeps_old_credential_until_pending_authenticates(pool: PgPool) {
-        let state = Arc::new(test_state_with_pool(pool));
-        let runtime_id = Uuid::new_v4();
-        let old_credential = format!(
-            "ahrc_{}{}",
-            Uuid::new_v4().simple(),
-            Uuid::new_v4().simple()
-        );
-        let new_credential = format!(
-            "ahrc_{}{}",
-            Uuid::new_v4().simple(),
-            Uuid::new_v4().simple()
-        );
-        sqlx::query(
-            "INSERT INTO runtimes
-                 (id, token_hash, hostname, labels, engine_version, capabilities,
-                  sandbox_mode, status, rotation_requested_at)
-             VALUES ($1, $2, 'rotation-test', '{}', 'test', '{}'::jsonb,
-                     'workspace-write', 'offline', now())",
-        )
-        .bind(runtime_id)
-        .bind(sha256_hex(&old_credential))
-        .execute(&state.pool)
-        .await
-        .unwrap();
-
-        let requested = runtime_heartbeat(
-            State(Arc::clone(&state)),
-            bearer_headers(&old_credential),
-            Json(RuntimeHeartbeatRequest::default()),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert!(requested.rotation_requested);
-
-        let staged = runtime_heartbeat(
-            State(Arc::clone(&state)),
-            bearer_headers(&old_credential),
-            Json(RuntimeHeartbeatRequest {
-                pending_credential_hash: Some(sha256_hex(&new_credential)),
-                ..RuntimeHeartbeatRequest::default()
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert!(staged.pending_credential_accepted);
-        assert!(require_runtime(&state, &bearer_headers(&old_credential))
-            .await
-            .is_ok());
-        assert!(require_runtime(&state, &bearer_headers(&new_credential))
-            .await
-            .is_err());
-
-        let activated = runtime_heartbeat(
-            State(Arc::clone(&state)),
-            bearer_headers(&new_credential),
-            Json(RuntimeHeartbeatRequest::default()),
-        )
-        .await
-        .unwrap()
-        .0;
-        assert!(activated.credential_activated);
-        assert!(require_runtime(&state, &bearer_headers(&old_credential))
-            .await
-            .is_err());
-        assert!(require_runtime(&state, &bearer_headers(&new_credential))
-            .await
-            .is_ok());
-
-        sqlx::query("DELETE FROM runtimes WHERE id = $1")
-            .bind(runtime_id)
-            .execute(&state.pool)
-            .await
-            .unwrap();
-        assert!(require_runtime(&state, &bearer_headers(&new_credential))
-            .await
-            .is_err());
-        let deleted_heartbeat = runtime_heartbeat(
-            State(Arc::clone(&state)),
-            bearer_headers(&new_credential),
-            Json(RuntimeHeartbeatRequest::default()),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(deleted_heartbeat.status, StatusCode::UNAUTHORIZED);
-        let deleted_claim = match runtime_claim_run(
-            State(Arc::clone(&state)),
-            bearer_headers(&new_credential),
-            runtime_claim_request(1, Vec::new()),
-        )
-        .await
-        {
-            Ok(_) => panic!("deleted Runtime credential unexpectedly claimed a Run"),
-            Err(error) => error,
-        };
-        assert_eq!(deleted_claim.status, StatusCode::UNAUTHORIZED);
     }
 
     #[sqlx::test(migrations = "./migrations")]
