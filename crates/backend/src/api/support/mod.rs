@@ -8,6 +8,8 @@ pub mod error;
 pub mod rows;
 pub mod seed;
 pub mod state;
+#[cfg(test)]
+pub mod test_util;
 
 pub use authn::*;
 pub use common::*;
@@ -17,3 +19,5 @@ pub use error::*;
 pub use rows::*;
 pub use seed::*;
 pub use state::*;
+#[cfg(test)]
+pub use test_util::*;
