@@ -245,6 +245,8 @@ export type Skill = {
   name: string;
   description: string;
   content: string;
+  visibility: string;
+  public_to: string[];
   revision: number;
   content_checksum_sha256: string;
   package: SkillPackage | null;
@@ -1284,15 +1286,15 @@ export const api = {
   skills: (signal?: AbortSignal) => request<Skill[]>('/api/skills', { signal }),
   skill: (skillId: string, signal?: AbortSignal) =>
     request<Skill>(`/api/skills/${skillId}`, { signal }),
-  createSkill: (name: string, description: string, content: string) =>
+  createSkill: (name: string, description: string, content: string, visibility: string, publicTo: string[]) =>
     request<Skill>('/api/skills', {
       method: 'POST',
-      body: JSON.stringify({ name, description, content })
+      body: JSON.stringify({ name, description, content, visibility, public_to: publicTo })
     }),
-  updateSkill: (skillId: string, name: string, description: string, content: string) =>
+  updateSkill: (skillId: string, name: string, description: string, content: string, visibility: string, publicTo: string[]) =>
     request<Skill>(`/api/skills/${skillId}`, {
       method: 'PATCH',
-      body: JSON.stringify({ name, description, content })
+      body: JSON.stringify({ name, description, content, visibility, public_to: publicTo })
     }),
   replaceSkillPackage: (skillId: string, files: readonly SkillPackageUploadFile[]) => {
     const body = new FormData();

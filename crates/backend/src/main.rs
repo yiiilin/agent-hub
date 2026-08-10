@@ -1391,10 +1391,10 @@ fn openapi_schemas() -> Value {
         "ClientToolErrorEvent": { "allOf": [{ "$ref": "#/components/schemas/RunEvent" }, { "type": "object", "properties": { "event_type": { "type": "string", "const": "client_tool_interrupted" }, "payload": { "type": "object", "additionalProperties": false, "required": ["tool_call_id", "tool_name", "status", "message"], "properties": { "tool_call_id": uuid(), "tool_name": { "type": "string" }, "status": { "type": "string", "enum": ["unknown", "cancelled"] }, "message": { "type": "string" } } } } }] },
         "ClientGenericSessionEvent": { "allOf": [{ "$ref": "#/components/schemas/RunEvent" }, { "type": "object", "properties": { "event_type": { "type": "string", "not": { "enum": ["tool_request", "client_tool_result", "client_tool_timeout", "client_tool_interrupted"] } } } }] },
         "ClientSessionEvent": { "oneOf": [{ "$ref": "#/components/schemas/ClientToolRequestEvent" }, { "$ref": "#/components/schemas/ClientToolResultEvent" }, { "$ref": "#/components/schemas/ClientToolTimeoutEvent" }, { "$ref": "#/components/schemas/ClientToolErrorEvent" }, { "$ref": "#/components/schemas/ClientGenericSessionEvent" }] },
-        "Skill": { "type": "object", "required": ["id", "owner_id", "name", "description", "content", "revision", "content_checksum_sha256", "package", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": uuid(), "owner_email": { "anyOf": [{ "type": "string" }, { "type": "null" }] }, "name": { "type": "string" }, "description": { "type": "string" }, "content": { "type": "string" }, "revision": { "type": "integer", "minimum": 1 }, "content_checksum_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "package": { "anyOf": [{ "$ref": "#/components/schemas/SkillPackage" }, { "type": "null" }] }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
+        "Skill": { "type": "object", "required": ["id", "owner_id", "name", "description", "content", "visibility", "public_to", "revision", "content_checksum_sha256", "package", "created_at", "updated_at"], "properties": { "id": uuid(), "owner_id": uuid(), "owner_email": { "anyOf": [{ "type": "string" }, { "type": "null" }] }, "name": { "type": "string" }, "description": { "type": "string" }, "content": { "type": "string" }, "visibility": { "type": "string", "enum": ["private", "public", "public_to"] }, "public_to": { "type": "array", "items": uuid() }, "revision": { "type": "integer", "minimum": 1 }, "content_checksum_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "package": { "anyOf": [{ "$ref": "#/components/schemas/SkillPackage" }, { "type": "null" }] }, "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" } } },
         "SkillPackage": { "type": "object", "additionalProperties": false, "required": ["id", "format_version", "size_bytes", "checksum_sha256", "files"], "properties": { "id": uuid(), "format_version": { "type": "integer", "enum": [1] }, "size_bytes": { "type": "integer", "minimum": 1, "maximum": 268435456 }, "checksum_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "files": { "type": "array", "maxItems": 1024, "items": { "$ref": "#/components/schemas/SkillPackageFile" } } } },
         "SkillPackageFile": { "type": "object", "additionalProperties": false, "required": ["path", "size_bytes", "checksum_sha256", "executable"], "properties": { "path": { "type": "string" }, "size_bytes": { "type": "integer", "minimum": 0 }, "checksum_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }, "executable": { "type": "boolean" } } },
-        "SkillWriteRequest": { "type": "object", "required": ["name", "description", "content"], "properties": { "name": { "type": "string" }, "description": { "type": "string" }, "content": { "type": "string" } } },
+        "SkillWriteRequest": { "type": "object", "required": ["name", "description", "content", "visibility", "public_to"], "properties": { "name": { "type": "string" }, "description": { "type": "string" }, "content": { "type": "string" }, "visibility": { "type": "string", "enum": ["private", "public", "public_to"] }, "public_to": { "type": "array", "items": uuid() } } },
         "BulkDeleteSkillsRequest": { "type": "object", "additionalProperties": false, "required": ["skill_ids"], "properties": { "skill_ids": { "type": "array", "minItems": 1, "maxItems": 100, "uniqueItems": true, "items": uuid() } } },
         "BulkDeleteSkillsResponse": { "type": "object", "additionalProperties": false, "required": ["deleted_skill_ids"], "properties": { "deleted_skill_ids": { "type": "array", "items": uuid() } } },
         "Automation": { "type": "object", "required": ["id", "agent_id", "name", "trigger_type", "prompt", "enabled"], "properties": { "id": uuid(), "agent_id": uuid(), "name": { "type": "string" }, "trigger_type": { "type": "string" }, "prompt": { "type": "string" }, "schedule": { "type": ["string", "null"] }, "enabled": { "type": "boolean" } } },
@@ -5583,7 +5583,7 @@ async fn update_agent(
     if let Some(runtime_id) = req.runtime_id {
         ensure_runtime_online(&state.pool, runtime_id).await?;
     }
-    ensure_skills_owned_by_user(&state.pool, &req.managed_skill_ids, existing_agent.owner_id)
+    ensure_skills_visible_by_user(&state.pool, &req.managed_skill_ids, existing_agent.owner_id)
         .await?;
     validate_subagent_definitions(&req.subagents)?;
     let execution_configuration_changed =
@@ -8760,7 +8760,7 @@ async fn list_skills(
     let rows = sqlx::query(
         "SELECT skills.id, skills.owner_id,
                 (SELECT email FROM users WHERE id = skills.owner_id) AS owner_email,
-                skills.name, skills.description,
+                skills.name, skills.description, skills.visibility, skills.public_to,
                 skills.content, skills.revision, skills.content_checksum_sha256,
                 skills.created_at, skills.updated_at,
                 packages.id AS package_id, packages.format_version AS package_format_version,
@@ -8769,7 +8769,12 @@ async fn list_skills(
                 packages.files AS package_files
          FROM skills
          LEFT JOIN skill_packages AS packages ON packages.id = skills.current_package_id
-         WHERE skills.owner_id = $1
+         WHERE skills.owner_id = $1 OR skills.visibility = 'public'
+            OR (skills.visibility = 'public_to' AND $1 = ANY(skills.public_to))
+            OR EXISTS (
+                SELECT 1 FROM users
+                WHERE users.id = $1 AND users.role IN ('admin', 'super_admin')
+            )
          ORDER BY skills.created_at DESC",
     )
     .bind(user.id)
@@ -8785,23 +8790,26 @@ async fn create_skill(
 ) -> Result<Json<SkillDto>, ApiError> {
     let user = require_user(&state, &headers).await?;
     validate_skill_payload(&req.name, &req.content)?;
+    let visibility = normalize_visibility(&req.visibility)?;
     let content = req.content.trim();
     let skill_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO skills
-             (id, owner_id, name, description, content, content_checksum_sha256)
-         VALUES ($1, $2, $3, $4, $5, $6)",
+             (id, owner_id, name, description, content, visibility, public_to, content_checksum_sha256)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(skill_id)
     .bind(user.id)
     .bind(req.name.trim())
     .bind(req.description.trim())
     .bind(content)
+    .bind(visibility)
+    .bind(&req.public_to)
     .bind(sha256_hex(content))
     .execute(&state.pool)
     .await?;
     Ok(Json(
-        load_skill_owned_by_user(&state.pool, skill_id, user.id).await?,
+        load_skill_visible_by_user(&state.pool, skill_id, user.id).await?,
     ))
 }
 
@@ -8812,7 +8820,7 @@ async fn get_skill(
 ) -> Result<Json<SkillDto>, ApiError> {
     let user = require_user(&state, &headers).await?;
     Ok(Json(
-        load_skill_owned_by_user(&state.pool, skill_id, user.id).await?,
+        load_skill_visible_by_user(&state.pool, skill_id, user.id).await?,
     ))
 }
 
@@ -8824,18 +8832,23 @@ async fn update_skill(
 ) -> Result<Json<SkillDto>, ApiError> {
     let user = require_user(&state, &headers).await?;
     validate_skill_payload(&req.name, &req.content)?;
+    let visibility = normalize_visibility(&req.visibility)?;
     let content = req.content.trim();
     let mut tx = state.pool.begin().await?;
     let locked = lock_skill_change_tx(&mut tx, skill_id, user.id).await?;
     let updated = sqlx::query(
         "UPDATE skills
-         SET name = $1, description = $2, content = $3,
-             revision = revision + 1, content_checksum_sha256 = $4, updated_at = now()
-         WHERE id = $5 AND owner_id = $6",
+         SET name = $1, description = $2, content = $3, visibility = $4, public_to = $5,
+             revision = revision + 1, content_checksum_sha256 = $6, updated_at = now()
+         WHERE id = $7 AND (owner_id = $8 OR EXISTS (
+             SELECT 1 FROM users WHERE users.id = $8 AND users.role IN ('admin', 'super_admin')
+         ))",
     )
     .bind(req.name.trim())
     .bind(req.description.trim())
     .bind(content)
+    .bind(visibility)
+    .bind(&req.public_to)
     .bind(sha256_hex(content))
     .bind(skill_id)
     .bind(user.id)
@@ -8847,7 +8860,7 @@ async fn update_skill(
     publish_skill_configuration_change_tx(&mut tx, &locked.affected_agent_ids).await?;
     tx.commit().await?;
     Ok(Json(
-        load_skill_owned_by_user(&state.pool, skill_id, user.id).await?,
+        load_skill_visible_by_user(&state.pool, skill_id, user.id).await?,
     ))
 }
 
@@ -8858,7 +8871,7 @@ async fn replace_skill_package(
     multipart: Multipart,
 ) -> Result<Json<SkillDto>, ApiError> {
     let user = require_user(&state, &headers).await?;
-    load_skill_owned_by_user(&state.pool, skill_id, user.id).await?;
+    load_skill_visible_by_user(&state.pool, skill_id, user.id).await?;
     let upload = stage_skill_package_upload(multipart).await?;
     let store =
         state
@@ -8908,7 +8921,7 @@ async fn replace_skill_package(
     }
     process_skill_package_deletion_queue(&state).await;
     Ok(Json(
-        load_skill_owned_by_user(&state.pool, skill_id, user.id).await?,
+        load_skill_visible_by_user(&state.pool, skill_id, user.id).await?,
     ))
 }
 
@@ -8923,7 +8936,7 @@ async fn delete_skill_package(
     let Some(package_id) = locked.current_package_id else {
         tx.commit().await?;
         return Ok(Json(
-            load_skill_owned_by_user(&state.pool, skill_id, user.id).await?,
+            load_skill_visible_by_user(&state.pool, skill_id, user.id).await?,
         ));
     };
     sqlx::query(
@@ -8946,7 +8959,7 @@ async fn delete_skill_package(
     tx.commit().await?;
     process_skill_package_deletion_queue(&state).await;
     Ok(Json(
-        load_skill_owned_by_user(&state.pool, skill_id, user.id).await?,
+        load_skill_visible_by_user(&state.pool, skill_id, user.id).await?,
     ))
 }
 
@@ -8972,7 +8985,9 @@ async fn lock_skill_change_tx(
         "SELECT skills.current_package_id, packages.object_key
          FROM skills
          LEFT JOIN skill_packages AS packages ON packages.id = skills.current_package_id
-         WHERE skills.id = $1 AND skills.owner_id = $2
+         WHERE skills.id = $1 AND (skills.owner_id = $2 OR EXISTS (
+             SELECT 1 FROM users WHERE users.id = $2 AND users.role IN ('admin', 'super_admin')
+         ))
          FOR UPDATE OF skills",
     )
     .bind(skill_id)
@@ -9482,7 +9497,9 @@ async fn delete_skills_for_user(
     }
     let owned_ids = sqlx::query_scalar::<_, Uuid>(
         "SELECT id FROM skills
-         WHERE id = ANY($1) AND owner_id = $2
+         WHERE id = ANY($1) AND (owner_id = $2 OR EXISTS (
+             SELECT 1 FROM users WHERE users.id = $2 AND users.role IN ('admin', 'super_admin')
+         ))
          ORDER BY id
          FOR UPDATE",
     )
@@ -14493,7 +14510,11 @@ async fn runtime_claim_run(
          LEFT JOIN skill_packages AS packages ON packages.id = s.current_package_id
          LEFT JOIN run_skill_packages AS snapshots
            ON snapshots.run_id = $3 AND snapshots.skill_id = s.id
-         WHERE a_s.agent_id = $1 AND s.owner_id = $2
+         LEFT JOIN users AS agent_owner ON agent_owner.id = $2
+         WHERE a_s.agent_id = $1
+           AND (s.owner_id = $2 OR s.visibility = 'public'
+                OR (s.visibility = 'public_to' AND $2 = ANY(s.public_to))
+                OR agent_owner.role IN ('admin', 'super_admin'))
          ORDER BY s.name, s.id
          FOR SHARE OF s",
     )
@@ -17821,7 +17842,7 @@ fn normalize_visibility(visibility: &str) -> Result<&'static str, ApiError> {
         "private" => Ok("private"),
         "public_to" => Ok("public_to"),
         "public" => Ok("public"),
-        _ => Err(ApiError::bad_request("unsupported agent visibility")),
+        _ => Err(ApiError::bad_request("unsupported visibility")),
     }
 }
 
@@ -20597,7 +20618,7 @@ fn normalized_unordered_entries(value: &Value) -> Vec<String> {
     entries
 }
 
-async fn load_skill_owned_by_user(
+async fn load_skill_visible_by_user(
     pool: &PgPool,
     skill_id: Uuid,
     user_id: Uuid,
@@ -20605,7 +20626,7 @@ async fn load_skill_owned_by_user(
     let row = sqlx::query(
         "SELECT skills.id, skills.owner_id,
                 (SELECT email FROM users WHERE id = skills.owner_id) AS owner_email,
-                skills.name, skills.description,
+                skills.name, skills.description, skills.visibility, skills.public_to,
                 skills.content, skills.revision, skills.content_checksum_sha256,
                 skills.created_at, skills.updated_at,
                 packages.id AS package_id, packages.format_version AS package_format_version,
@@ -20614,7 +20635,13 @@ async fn load_skill_owned_by_user(
                 packages.files AS package_files
          FROM skills
          LEFT JOIN skill_packages AS packages ON packages.id = skills.current_package_id
-         WHERE skills.id = $1 AND skills.owner_id = $2",
+         WHERE skills.id = $1
+           AND (skills.owner_id = $2 OR skills.visibility = 'public'
+                OR (skills.visibility = 'public_to' AND $2 = ANY(skills.public_to))
+                OR EXISTS (
+                    SELECT 1 FROM users
+                    WHERE users.id = $2 AND users.role IN ('admin', 'super_admin')
+                ))",
     )
     .bind(skill_id)
     .bind(user_id)
@@ -20624,13 +20651,13 @@ async fn load_skill_owned_by_user(
         .ok_or(ApiError::not_found("skill not found"))
 }
 
-async fn ensure_skills_owned_by_user(
+async fn ensure_skills_visible_by_user(
     pool: &PgPool,
     skill_ids: &[Uuid],
     user_id: Uuid,
 ) -> Result<(), ApiError> {
     for skill_id in skill_ids {
-        load_skill_owned_by_user(pool, *skill_id, user_id).await?;
+        load_skill_visible_by_user(pool, *skill_id, user_id).await?;
     }
     Ok(())
 }
@@ -20641,7 +20668,11 @@ async fn load_managed_skill_ids(pool: &PgPool, agent_id: Uuid) -> Result<Vec<Uui
          FROM agent_skills a_s
          JOIN agents a ON a.id = a_s.agent_id
          JOIN skills s ON s.id = a_s.skill_id
-         WHERE a_s.agent_id = $1 AND s.owner_id = a.owner_id
+         LEFT JOIN users AS owner ON owner.id = a.owner_id
+         WHERE a_s.agent_id = $1
+           AND (s.owner_id = a.owner_id OR s.visibility = 'public'
+                OR (s.visibility = 'public_to' AND a.owner_id = ANY(s.public_to))
+                OR owner.role IN ('admin', 'super_admin'))
          ORDER BY s.created_at ASC",
     )
     .bind(agent_id)
@@ -25035,6 +25066,8 @@ fn skill_from_row(row: sqlx::postgres::PgRow) -> SkillDto {
         name: row.get("name"),
         description: row.get("description"),
         content: row.get("content"),
+        visibility: row.get("visibility"),
+        public_to: row.get("public_to"),
         revision: row.get("revision"),
         content_checksum_sha256: row.get("content_checksum_sha256"),
         package: package_id.map(|id| SkillPackageDto {
@@ -28081,6 +28114,8 @@ mod tests {
                 name: "review".into(),
                 description: "Review changes".into(),
                 content: "check the diff".into(),
+                visibility: "private".into(),
+                public_to: Vec::new(),
             }),
         )
         .await
@@ -28101,6 +28136,8 @@ mod tests {
                 name: "review".into(),
                 description: "Review carefully".into(),
                 content: "check tests too".into(),
+                visibility: "private".into(),
+                public_to: Vec::new(),
             }),
         )
         .await
@@ -28122,6 +28159,231 @@ mod tests {
             .unwrap(),
             (2, sha256_hex("check tests too"))
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn skill_visibility_controls_sharing_and_attachment(pool: PgPool) {
+        let owner_token = create_user_session_with_role(&pool, "member").await;
+        let caller_token = create_user_session_with_role(&pool, "member").await;
+        let other_token = create_user_session_with_role(&pool, "member").await;
+        let admin_token = create_user_session_with_role(&pool, "admin").await;
+        let state = Arc::new(test_state_with_browser_session_auth(pool.clone()));
+        let caller = require_user(&state, &session_headers(&caller_token))
+            .await
+            .unwrap();
+
+        // member 可以创建 public 技能（不要求管理员权限）。
+        let shared = create_skill(
+            State(state.clone()),
+            session_headers(&owner_token),
+            Json(CreateSkillRequest {
+                name: "shared skill".into(),
+                description: "shared".into(),
+                content: "shared content".into(),
+                visibility: "public".into(),
+                public_to: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(shared.visibility, "public");
+
+        // 其他用户可见（列表与单查）。
+        let listed = list_skills(State(state.clone()), session_headers(&caller_token))
+            .await
+            .unwrap()
+            .0;
+        assert!(listed.iter().any(|skill| skill.id == shared.id));
+        let fetched = get_skill(
+            State(state.clone()),
+            session_headers(&caller_token),
+            Path(shared.id),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(fetched.id, shared.id);
+
+        // 其他用户可把共享技能挂载到自己的 Agent。
+        let agent = create_agent(
+            State(state.clone()),
+            session_headers(&caller_token),
+            Json(CreateAgentRequest {
+                name: "Caller Agent".into(),
+                instructions: "run".into(),
+                visibility: "private".into(),
+                public_to: Vec::new(),
+                model_selection: None,
+                model_settings: Some(AgentModelSettings::default()),
+                subagents: Vec::new(),
+                secret_declarations: Some(Vec::new()),
+                tool_allowlist: default_agent_tool_allowlist(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let attached = update_agent(
+            State(state.clone()),
+            session_headers(&caller_token),
+            Path(agent.id),
+            Json(UpdateAgentRequest {
+                name: agent.name.clone(),
+                instructions: agent.instructions.clone(),
+                visibility: agent.visibility.clone(),
+                public_to: Vec::new(),
+                runtime_id: None,
+                model_selection: agent.model_selection.clone(),
+                model_settings: agent.model_settings.clone(),
+                subagents: agent.subagents.clone(),
+                model_policy: agent.model_policy.clone(),
+                sandbox_policy: agent.sandbox_policy.clone(),
+                managed_skill_ids: vec![shared.id],
+                secret_declarations: Some(agent.secret_declarations.clone()),
+                mcp_allowlist: agent.mcp_allowlist.clone(),
+                tool_allowlist: agent.tool_allowlist.clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(attached.managed_skill_ids, vec![shared.id]);
+
+        // 非 owner 只有可读权限：不能编辑或删除。
+        assert!(update_skill(
+            State(state.clone()),
+            session_headers(&caller_token),
+            Path(shared.id),
+            Json(UpdateSkillRequest {
+                name: "hijack".into(),
+                description: "x".into(),
+                content: "y".into(),
+                visibility: "private".into(),
+                public_to: Vec::new(),
+            }),
+        )
+        .await
+        .is_err());
+        assert!(delete_skill(
+            State(state.clone()),
+            session_headers(&caller_token),
+            Path(shared.id),
+        )
+        .await
+        .is_err());
+
+        // admin 拥有可写权限：可以编辑和删除。
+        assert!(update_skill(
+            State(state.clone()),
+            session_headers(&admin_token),
+            Path(shared.id),
+            Json(UpdateSkillRequest {
+                name: "admin edit".into(),
+                description: "shared".into(),
+                content: "shared content".into(),
+                visibility: "public".into(),
+                public_to: Vec::new(),
+            }),
+        )
+        .await
+        .is_ok());
+        assert!(delete_skill(
+            State(state.clone()),
+            session_headers(&admin_token),
+            Path(shared.id),
+        )
+        .await
+        .is_ok());
+
+        // private 技能对其他用户不可见、不可挂载。
+        let private_skill = create_skill(
+            State(state.clone()),
+            session_headers(&owner_token),
+            Json(CreateSkillRequest {
+                name: "private skill".into(),
+                description: "mine".into(),
+                content: "secret".into(),
+                visibility: "private".into(),
+                public_to: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let listed_after = list_skills(State(state.clone()), session_headers(&caller_token))
+            .await
+            .unwrap()
+            .0;
+        assert!(!listed_after
+            .iter()
+            .any(|skill| skill.id == private_skill.id));
+        assert!(get_skill(
+            State(state.clone()),
+            session_headers(&caller_token),
+            Path(private_skill.id),
+        )
+        .await
+        .is_err());
+        assert!(update_agent(
+            State(state.clone()),
+            session_headers(&caller_token),
+            Path(agent.id),
+            Json(UpdateAgentRequest {
+                name: agent.name.clone(),
+                instructions: agent.instructions.clone(),
+                visibility: agent.visibility.clone(),
+                public_to: Vec::new(),
+                runtime_id: None,
+                model_selection: agent.model_selection.clone(),
+                model_settings: agent.model_settings.clone(),
+                subagents: agent.subagents.clone(),
+                model_policy: agent.model_policy.clone(),
+                sandbox_policy: agent.sandbox_policy.clone(),
+                managed_skill_ids: vec![private_skill.id],
+                secret_declarations: Some(agent.secret_declarations.clone()),
+                mcp_allowlist: agent.mcp_allowlist.clone(),
+                tool_allowlist: agent.tool_allowlist.clone(),
+            }),
+        )
+        .await
+        .is_err());
+
+        // public_to 技能：指定用户可见，其他用户不可见。
+        let targeted = create_skill(
+            State(state.clone()),
+            session_headers(&owner_token),
+            Json(CreateSkillRequest {
+                name: "targeted skill".into(),
+                description: "targeted".into(),
+                content: "targeted content".into(),
+                visibility: "public_to".into(),
+                public_to: vec![caller.id],
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(get_skill(
+            State(state.clone()),
+            session_headers(&caller_token),
+            Path(targeted.id),
+        )
+        .await
+        .is_ok());
+        let listed_other = list_skills(State(state.clone()), session_headers(&other_token))
+            .await
+            .unwrap()
+            .0;
+        assert!(!listed_other.iter().any(|skill| skill.id == targeted.id));
+        assert!(get_skill(
+            State(state.clone()),
+            session_headers(&other_token),
+            Path(targeted.id),
+        )
+        .await
+        .is_err());
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -1001,6 +1001,10 @@ pub struct SkillDto {
     pub name: String,
     pub description: String,
     pub content: String,
+    #[serde(default = "default_skill_visibility")]
+    pub visibility: String,
+    #[serde(default)]
+    pub public_to: Vec<Uuid>,
     pub revision: i64,
     pub content_checksum_sha256: String,
     #[serde(default)]
@@ -1891,6 +1895,10 @@ pub struct CreateSkillRequest {
     pub name: String,
     pub description: String,
     pub content: String,
+    #[serde(default = "default_skill_visibility")]
+    pub visibility: String,
+    #[serde(default)]
+    pub public_to: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1898,6 +1906,14 @@ pub struct UpdateSkillRequest {
     pub name: String,
     pub description: String,
     pub content: String,
+    #[serde(default = "default_skill_visibility")]
+    pub visibility: String,
+    #[serde(default)]
+    pub public_to: Vec<Uuid>,
+}
+
+fn default_skill_visibility() -> String {
+    "private".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -1,6 +1,6 @@
 import { ArrowLeft, Files, FolderOpen, PackageOpen, Plus, Save, Search, Sparkles, Trash2, Upload } from 'lucide-react';
 import { FormEvent, MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Agent, api, ApiError, Skill, SkillPackageUploadFile } from './api/client';
+import { Agent, api, ApiError, Skill, SkillPackageUploadFile, User } from './api/client';
 import { FormDialog } from './components/form-dialog';
 import { MarkdownEditor } from './components/markdown-editor';
 import { useI18n } from './i18n';
@@ -49,12 +49,31 @@ function CreateSkillModal({ onClose, onCreated }: { onClose: () => void; onCreat
   const [name, setName] = useState(() => t('defaultSkillName'));
   const [description, setDescription] = useState(() => t('defaultSkillDescription'));
   const [content, setContent] = useState(() => t('defaultSkillContent'));
+  const [visibility, setVisibility] = useState('private');
+  const [publicTo, setPublicTo] = useState<string[]>([]);
+  const [users, setUsers] = useState<User[]>([]);
+  const [usersLoading, setUsersLoading] = useState(true);
+  const [usersError, setUsersError] = useState(false);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState(false);
 
   useEffect(() => {
     return () => { mountedRef.current = false; };
   }, []);
+
+  const loadUsers = useCallback(() => {
+    setUsersLoading(true);
+    setUsersError(false);
+    api.users().then((loaded) => {
+      if (mountedRef.current) setUsers(loaded);
+    }).catch(() => {
+      if (mountedRef.current) setUsersError(true);
+    }).finally(() => {
+      if (mountedRef.current) setUsersLoading(false);
+    });
+  }, []);
+
+  useEffect(() => { loadUsers(); }, [loadUsers]);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -63,7 +82,7 @@ function CreateSkillModal({ onClose, onCreated }: { onClose: () => void; onCreat
     setPending(true);
     setError(false);
     try {
-      const created = await api.createSkill(name, description, content);
+      const created = await api.createSkill(name, description, content, visibility, visibility === 'public_to' ? publicTo : []);
       if (mountedRef.current) onCreated(created);
     } catch {
       if (mountedRef.current) setError(true);
@@ -87,6 +106,9 @@ function CreateSkillModal({ onClose, onCreated }: { onClose: () => void; onCreat
           <label>{t('name')}<input ref={nameRef} required value={name} onChange={(event) => setName(event.target.value)} /></label>
           <label>{t('description')}<input value={description} onChange={(event) => setDescription(event.target.value)} /></label>
           <MarkdownEditor label={t('content')} required value={content} onChange={setContent} />
+          <label>{t('visibility')}<select value={visibility} onChange={(event) => { setVisibility(event.target.value); if (event.target.value !== 'public_to') setPublicTo([]); }}><option value="private">{t('private')}</option><option value="public_to">{t('specificUsers')}</option><option value="public">{t('public')}</option></select></label>
+          {visibility === 'public_to' && <fieldset className="agent-user-picker" disabled={pending || usersLoading}><legend>{t('agentPublicTo')}</legend>
+            {usersLoading ? <span>{t('loadingUsers')}</span> : usersError ? <div role="alert"><span>{t('usersLoadFailed')}</span><button type="button" className="text-button" onClick={loadUsers}>{t('retry')}</button></div> : users.map((user) => <label className="check-row" key={user.id}><input type="checkbox" checked={publicTo.includes(user.id)} onChange={(event) => setPublicTo((current) => event.target.checked ? [...current, user.id] : current.filter((id) => id !== user.id))} /> {user.display_name} ({user.email})</label>)}</fieldset>}
           {error && <div className="error" role="alert">{t('skillSaveFailed')}</div>}
         </form>
     </FormDialog>
@@ -320,11 +342,17 @@ export function SkillDetailPage({ skillId, navigate, setNavigationBlocker }: { s
   const mountedRef = useRef(true);
   const generationRef = useRef(0);
   const mutationRef = useRef(false);
+  const usersControllerRef = useRef<AbortController | null>(null);
   const [skill, setSkill] = useState<Skill | null>(null);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [content, setContent] = useState('');
+  const [visibility, setVisibility] = useState('private');
+  const [publicTo, setPublicTo] = useState<string[]>([]);
+  const [users, setUsers] = useState<User[]>([]);
+  const [usersLoading, setUsersLoading] = useState(true);
+  const [usersError, setUsersError] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
   const [notFound, setNotFound] = useState(false);
@@ -341,10 +369,13 @@ export function SkillDetailPage({ skillId, navigate, setNavigationBlocker }: { s
     const generation = ++generationRef.current;
     const detailController = new AbortController();
     const agentsController = new AbortController();
+    const usersController = new AbortController();
+    usersControllerRef.current = usersController;
     setLoading(true); setLoadError(false); setNotFound(false); setAgentsError(false);
     api.skill(skillId, detailController.signal).then((response) => {
       if (!mountedRef.current || generation !== generationRef.current) return;
       setSkill(response); setName(response.name); setDescription(response.description); setContent(response.content);
+      setVisibility(response.visibility ?? 'private'); setPublicTo(response.public_to ?? []);
     }).catch((loadFailure) => {
       if (!mountedRef.current || generation !== generationRef.current || loadFailure?.name === 'AbortError') return;
       if (loadFailure instanceof ApiError && loadFailure.status === 404) setNotFound(true);
@@ -357,7 +388,16 @@ export function SkillDetailPage({ skillId, navigate, setNavigationBlocker }: { s
     }).catch((loadFailure) => {
       if (mountedRef.current && generation === generationRef.current && loadFailure?.name !== 'AbortError') setAgentsError(true);
     });
-    return () => { detailController.abort(); agentsController.abort(); };
+    setUsersLoading(true);
+    setUsersError(false);
+    api.users(usersController.signal).then((loaded) => {
+      if (mountedRef.current && generation === generationRef.current) setUsers(loaded);
+    }).catch((loadFailure) => {
+      if (mountedRef.current && generation === generationRef.current && loadFailure?.name !== 'AbortError') setUsersError(true);
+    }).finally(() => {
+      if (mountedRef.current && generation === generationRef.current) setUsersLoading(false);
+    });
+    return () => { detailController.abort(); agentsController.abort(); usersController.abort(); };
   }, [skillId]);
 
   useEffect(() => {
@@ -366,7 +406,7 @@ export function SkillDetailPage({ skillId, navigate, setNavigationBlocker }: { s
     return () => { mountedRef.current = false; generationRef.current += 1; cancel(); };
   }, [load]);
 
-  const dirty = Boolean(skill) && (name !== skill?.name || description !== skill?.description || content !== skill?.content);
+  const dirty = Boolean(skill) && (name !== skill?.name || description !== skill?.description || content !== skill?.content || visibility !== (skill?.visibility ?? 'private') || publicTo.join('\u0000') !== (skill?.public_to ?? []).join('\u0000'));
   const busy = pending || packagePending;
   useEffect(() => {
     if (!dirty && !busy) { setNavigationBlocker(null); return; }
@@ -382,8 +422,8 @@ export function SkillDetailPage({ skillId, navigate, setNavigationBlocker }: { s
     if (mutationRef.current || !skill) return;
     mutationRef.current = true; setPending(true); setError(null); setSaved(false); setPackageNotice(null);
     try {
-      const response = await api.updateSkill(skill.id, name, description, content);
-      if (mountedRef.current) { setSkill(response); setName(response.name); setDescription(response.description); setContent(response.content); setSaved(true); }
+      const response = await api.updateSkill(skill.id, name, description, content, visibility, visibility === 'public_to' ? publicTo : []);
+      if (mountedRef.current) { setSkill(response); setName(response.name); setDescription(response.description); setContent(response.content); setVisibility(response.visibility ?? 'private'); setPublicTo(response.public_to ?? []); setSaved(true); }
     } catch { if (mountedRef.current) setError('skillSaveFailed'); }
     finally { mutationRef.current = false; if (mountedRef.current) setPending(false); }
   }
@@ -462,6 +502,9 @@ export function SkillDetailPage({ skillId, navigate, setNavigationBlocker }: { s
             <label>{t('name')}<input required disabled={busy} value={name} onChange={(event) => { setName(event.target.value); setSaved(false); }} /></label>
             <label>{t('description')}<input disabled={busy} value={description} onChange={(event) => { setDescription(event.target.value); setSaved(false); }} /></label>
             <MarkdownEditor className="skill-content" label={t('content')} required disabled={busy} value={content} onChange={(markdown) => { setContent(markdown); setSaved(false); }} />
+            <label>{t('visibility')}<select disabled={busy} value={visibility} onChange={(event) => { setVisibility(event.target.value); setSaved(false); if (event.target.value !== 'public_to') setPublicTo([]); }}><option value="private">{t('private')}</option><option value="public_to">{t('specificUsers')}</option><option value="public">{t('public')}</option></select></label>
+            {visibility === 'public_to' && <fieldset className="agent-user-picker" disabled={busy || usersLoading}><legend>{t('agentPublicTo')}</legend>
+              {usersLoading ? <span>{t('loadingUsers')}</span> : usersError ? <div role="alert"><span>{t('usersLoadFailed')}</span><button type="button" className="text-button" onClick={load}>{t('retry')}</button></div> : users.map((user) => <label className="check-row" key={user.id}><input type="checkbox" checked={publicTo.includes(user.id)} onChange={(event) => { setPublicTo((current) => event.target.checked ? [...current, user.id] : current.filter((id) => id !== user.id)); setSaved(false); }} /> {user.display_name} ({user.email})</label>)}</fieldset>}
             {error && <div className="error" role="alert">{t(error)}</div>}
             {saved && <div className="success" role="status">{t('changesSaved')}</div>}
             <div className="button-row"><button className="primary" disabled={busy || !dirty}><Save size={16} /> {pending ? t('saving') : t('saveSkill')}</button><button className="secondary danger" type="button" disabled={busy} onClick={remove}><Trash2 size={16} /> {t('deleteSkill')}</button></div>
