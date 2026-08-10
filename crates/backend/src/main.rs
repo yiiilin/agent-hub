@@ -3,57 +3,46 @@
 mod api;
 use api::*;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     env,
-    io::Read,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    path::{Path as FsPath, PathBuf},
+    net::SocketAddr,
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+#[cfg(test)]
+use std::net::IpAddr;
+#[cfg(test)]
+use axum::extract::{Form, Multipart};
+#[cfg(test)]
+use chrono::Duration as ChronoDuration;
+
 
 use agent_hub_backend::ModelSecretCipher;
 use agent_hub_shared::*;
 use anyhow::Context;
-use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
-    Argon2,
-};
 use async_stream::stream;
-use async_trait::async_trait;
 use axum::{
     body::{Body, Bytes},
-    extract::{
-        ConnectInfo, DefaultBodyLimit, Form, FromRequestParts, Multipart, Path, Query, State,
-    },
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
-    response::{
-        sse::{Event, KeepAlive, Sse},
-        IntoResponse, Redirect, Response,
-    },
+    response::{IntoResponse, Response},
     routing::{any, delete, get, post, put},
     Json, Router,
 };
-use base64::{
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-    Engine,
-};
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, Timelike, Utc};
-use futures_util::{Stream, StreamExt};
-use hmac::{Hmac, Mac};
-use ipnet::IpNet;
-use ldap3::{
-    dn_escape, ldap_escape, result::LdapError, LdapConnAsync, LdapConnSettings, Scope, SearchEntry,
-};
+use base64::Engine;
+use chrono::{DateTime, Utc};
+use futures_util::StreamExt;
+use hmac::Hmac;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Number, Value};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Row, Transaction};
-use tokio::io::AsyncWriteExt;
 use tower::ServiceBuilder;
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
@@ -63,16 +52,28 @@ use tower_http::{
     ServiceExt,
 };
 use tracing::{info, warn};
-use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroizing;
+
+#[cfg(test)]
+use ldap3::result::LdapError;
+
+#[cfg(test)]
+use crate::skill_package_store::SkillPackageStore;
+#[cfg(test)]
+use base64::engine::general_purpose::STANDARD;
+#[cfg(test)]
+use ipnet::IpNet;
+#[cfg(test)]
+use std::collections::HashMap;
+#[cfg(test)]
+use std::io::Read;
+#[cfg(test)]
+use url::Url;
 
 pub(crate) mod run_event_bus;
 mod session_bundle_store;
 mod skill_package_store;
-
-use session_bundle_store::{S3BundleStore, S3BundleStoreConfig};
-use skill_package_store::SkillPackageStore;
 
 type HmacSha256 = Hmac<Sha256>;
 pub(crate) const REDACTED_SECRET: &str = "********";
@@ -156,7 +157,6 @@ pub(crate) const INTEGRATION_TOOL_REQUEST_INSERT_SQL: &str = "
         (id, session_id, hub_session_id, run_id, position,
          tool_name, arguments, status, expires_at)
     VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8)";
-
 
 #[tokio::main]
 pub(crate) async fn main() -> anyhow::Result<()> {
@@ -1424,126 +1424,8 @@ pub(crate) async fn readiness_response(pool: &PgPool, timeout: Duration) -> Resp
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #[allow(clippy::too_many_arguments)]
-
 #[allow(clippy::too_many_arguments)]
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 struct ModelGatewayForwardRequest<'a> {
     request_id: Uuid,
@@ -1556,49 +1438,9 @@ struct ModelGatewayForwardRequest<'a> {
     api_key: &'a str,
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)] // Keep every optional run association explicit at call sites.
-
 #[allow(clippy::too_many_arguments)] // Keep every optional run association explicit at call sites.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #[derive(Debug)]
 struct OAuthAppRecord {
     id: Uuid,
@@ -1614,40 +1456,12 @@ struct OAuthAppRecord {
     client_tool_definitions: Vec<ClientToolDefinitionDto>,
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #[derive(Debug, Deserialize)]
 struct SecretGrantListQuery {
     agent_id: Option<Uuid>,
 }
 
-
-
-
-
-
-
-
-
-
 #[cfg(test)]
-
-
-
 
 pub(crate) fn existing_mcp_secret<'a>(
     existing: &'a Value,
@@ -1666,18 +1480,6 @@ pub(crate) fn existing_mcp_secret<'a>(
             .as_str()
     })
 }
-
-
-
-
-
-
-
-
-
-
-
-
 
 pub(crate) async fn load_run_for_user(
     pool: &PgPool,
@@ -1705,7 +1507,6 @@ pub(crate) async fn load_run_for_user(
     row.map(run_from_row)
         .ok_or(ApiError::not_found("run not found"))
 }
-
 
 pub(crate) async fn authorize_run_stream(
     state: &AppState,
@@ -1750,10 +1551,6 @@ pub(crate) async fn authorize_run_stream(
     load_run_for_user(&state.pool, run_id, &user).await?;
     Ok(())
 }
-
-
-
-
 
 #[cfg(test)]
 mod tests {
