@@ -295,6 +295,11 @@ export default async function clientSdkBrowserScenario(scenarioContext) {
           'authenticated warmup assistant event through the real SDK SSE subscription'
         );
 
+        // 回归：Client SDK 可删除自己的历史会话（DELETE /api/client/sessions/{id}）。
+        // warmup 会话已结束（历史会话），删除应成功且 Hub 侧会话随之消失。
+        await page.evaluate((sessionId) => window.qaSdk.deleteSession(sessionId), warmup.sessionId);
+        await adminClient.get(`/api/sessions/${warmup.sessionId}`, { expectedStatus: 404 });
+
         const holdSent = await page.evaluate((message) => window.qaSdk.send(message), HOLD_MESSAGE);
         await poll(async () => {
           const { data: events } = await adminClient.get(`/api/runs/${holdSent.runId}/events`);

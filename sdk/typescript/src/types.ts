@@ -272,3 +272,7 @@ export interface AnonymousClientOptions extends CommonClientOptions {
   clientId: string;
   localStorage?: Storage;
 }
+
+export interface SessionDeleteOptions {
+  signal?: AbortSignal;
+}

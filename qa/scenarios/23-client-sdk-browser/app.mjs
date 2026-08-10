@@ -197,6 +197,11 @@ async function stop(runId) {
   return session.stop(runId);
 }
 
+async function deleteSession(sessionId) {
+  if (!client) throw new Error('Client is not connected');
+  await client.sessions.delete(sessionId);
+}
+
 async function listSessionsError() {
   try {
     await client.listSessions();
@@ -241,6 +246,7 @@ window.qaSdk = {
   subscribe,
   messages,
   stop,
+  deleteSession,
   listSessionsError,
   release,
   dispose

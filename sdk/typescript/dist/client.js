@@ -581,6 +581,69 @@ export class ClientSession {
             signal: combinedSignal(this.#disposeController.signal, options.signal),
         });
     }
+    /**
+     * 恢复本会话中未完成的客户端工具调用，让页面刷新/重连后的操作无缝续上。
+     * 覆盖两类场景：
+     * 1. journal 中遗留的 executing/unknown 条目（工具执行中刷新）；
+     * 2. 页面关闭后 Hub 才发出的工具请求（事件流中无对应结果的 tool_request）。
+     * Hub 端已结束或属于其他 Client Instance 的调用会被跳过。
+     */
+    async recoverPendingTools(options = {}) {
+        this.#assertUsable();
+        const sessionId = this.#id;
+        if (sessionId === null)
+            return;
+        const signal = combinedSignal(this.#disposeController.signal, options.signal);
+        const seen = new Set();
+        // 1. journal 遗留条目
+        let entries = [];
+        try {
+            entries = await this.#operations.journal.list(this.#operations.clientInstanceId);
+        }
+        catch {
+            entries = [];
+        }
+        for (const entry of entries) {
+            if (entry.sessionId !== sessionId)
+                continue;
+            if (!["recorded", "executing", "unknown"].includes(entry.state))
+                continue;
+            seen.add(entry.toolCallId);
+            await this.#operations.recoverToolInvocation(entry, signal);
+        }
+        // 2. 事件流扫描：tool_request 无对应 tool_result/timeout 的调用
+        let events;
+        try {
+            events = await this.events({ limit: 200, signal });
+        }
+        catch {
+            return;
+        }
+        const completedCalls = new Set();
+        for (const event of events) {
+            if (event.type === "tool_result" || event.type === "timeout") {
+                completedCalls.add(event.toolCallId);
+            }
+        }
+        for (const event of events) {
+            if (event.type !== "tool_request")
+                continue;
+            if (seen.has(event.toolCallId) || completedCalls.has(event.toolCallId))
+                continue;
+            seen.add(event.toolCallId);
+            await this.#operations.recoverToolInvocation({
+                clientInstanceId: this.#operations.clientInstanceId,
+                toolCallId: event.toolCallId,
+                sessionId,
+                ...(event.runId ? { runId: event.runId } : {}),
+                toolName: event.toolName,
+                input: event.input,
+                state: "recorded",
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+            }, signal);
+        }
+    }
     async send(content, options = {}) {
         this.#assertUsable();
         const pending = this.#sendQueue.then(() => this.#operations.send(this, content, {
@@ -726,11 +789,15 @@ export class AgentHubClient {
             stop: (runId, signal) => this.stop(runId, signal),
             openStream: (sessionId, after, signal) => this.#openStream(sessionId, after, signal),
             handleToolRequest: (sessionId, event, signal) => this.#handleToolRequest(sessionId, event, signal),
+            clientInstanceId: this.clientInstanceId,
+            journal: this.#journal,
+            recoverToolInvocation: (entry, signal) => this.#recoverToolInvocation(entry, signal),
         };
         this.sessions = {
             list: (requestOptions) => this.listSessions(requestOptions),
             existing: (sessionId) => this.existing(sessionId),
             draft: () => this.draft(),
+            delete: (sessionId, requestOptions) => this.deleteSession(sessionId, requestOptions),
         };
     }
     static async connect(options) {
@@ -851,6 +918,15 @@ export class AgentHubClient {
     unregisterTool(name) {
         this.#handlers.delete(name);
     }
+    async deleteSession(sessionId, options = {}) {
+        this.#assertUsable();
+        if (!sessionId.trim())
+            throw new AgentHubError(400, "invalid_session_id", "sessionId is required");
+        if (this.#mode.kind === "anonymous") {
+            throw new AgentHubError(403, "anonymous_history_disabled", "Anonymous clients cannot delete Sessions");
+        }
+        await this.#requestJson(`${PATHS.sessions}/${encodeURIComponent(sessionId)}`, { method: "DELETE" }, { signal: options.signal, transientRetries: 1 });
+    }
     async reauthorize() {
         this.#assertUsable();
         if (this.#credentialOperation)
@@ -884,6 +960,102 @@ export class AgentHubClient {
         if (handlers)
             this.registerTools(handlers);
         await this.#cleanupJournal();
+        await this.#recoverPendingTools();
+    }
+    /**
+     * 刷新/重连后恢复未完成的客户端工具调用：页面在工具执行中关闭/刷新时，
+     * journal 会遗留 executing/unknown 状态的条目。重新认领（Hub 幂等）并
+     * 执行 handler、提交结果，让操作无缝续上；Hub 侧已结束或属于其他
+     * Client Instance 的调用会被跳过或清理。
+     */
+    async #recoverPendingTools() {
+        let entries;
+        try {
+            entries = await this.#journal.list(this.clientInstanceId);
+        }
+        catch {
+            return;
+        }
+        const pending = entries.filter((entry) => ["recorded", "executing", "unknown"].includes(entry.state));
+        for (const entry of pending) {
+            await this.#recoverToolInvocation(entry);
+        }
+    }
+    /** 认领并执行一个遗留的工具调用（幂等；Hub 侧已结束或属于其他实例则跳过）。 */
+    async #recoverToolInvocation(entry, signal) {
+        try {
+            const claim = await this.#requestJson(`/api/client/tool-calls/${encodeURIComponent(entry.toolCallId)}/claim`, { method: "POST", body: "{}" }, { transientRetries: 1 });
+            const claimStatus = claim.status ?? claim.claim_status ?? (claim.terminal ? "terminal" : "claimed");
+            if (claim.terminal || ["completed", "failed", "expired", "timed_out", "terminal"].includes(claimStatus)) {
+                await this.#journal.delete(this.clientInstanceId, entry.toolCallId);
+                return;
+            }
+            if (["completed", "acknowledged"].includes(entry.state)) {
+                return;
+            }
+            const handler = this.#handlers.get(entry.toolName);
+            let result;
+            if (!handler) {
+                result = {
+                    status: "error",
+                    error: {
+                        code: "tool_handler_not_registered",
+                        message: `No handler is registered for Client Tool "${entry.toolName}"`,
+                        retryable: false,
+                    },
+                };
+            }
+            else {
+                const controller = new AbortController();
+                let deadlineTimer;
+                const deadline = new Promise((_resolve, reject) => {
+                    deadlineTimer = globalThis.setTimeout(() => {
+                        controller.abort(new DOMException("Client Tool deadline reached", "TimeoutError"));
+                        reject(new DOMException("Client Tool deadline reached", "TimeoutError"));
+                    }, 5 * 60_000);
+                });
+                try {
+                    const output = await Promise.race([
+                        handler(entry.input, {
+                            toolCallId: entry.toolCallId,
+                            sessionId: entry.sessionId,
+                            ...(entry.runId ? { runId: entry.runId } : {}),
+                            signal: combinedSignal(controller.signal, this.#lifetime.signal, signal),
+                            recovering: true,
+                        }),
+                        deadline,
+                    ]);
+                    controller.abort();
+                    result = checkedToolResult(output);
+                }
+                catch (error) {
+                    controller.abort();
+                    result = {
+                        status: "error",
+                        error: {
+                            code: "tool_handler_failed",
+                            message: error instanceof Error ? error.message : "Client Tool handler failed",
+                            retryable: false,
+                        },
+                    };
+                }
+                finally {
+                    if (deadlineTimer !== undefined)
+                        globalThis.clearTimeout(deadlineTimer);
+                }
+            }
+            await this.#submitToolResult(entry.toolCallId, result);
+            const completed = { ...entry, result, state: "completed", updatedAt: Date.now() };
+            await this.#journal.put(completed);
+            await this.#acknowledgeEntry(completed);
+        }
+        catch (error) {
+            if (error instanceof AgentHubError && (error.status === 404 || error.status === 403)) {
+                await this.#journal.delete(this.clientInstanceId, entry.toolCallId).catch(() => undefined);
+                return;
+            }
+            await this.#journal.put({ ...entry, state: "unknown", updatedAt: Date.now() }).catch(() => undefined);
+        }
     }
     async #authorizeFresh() {
         let value;
@@ -1059,7 +1231,11 @@ export class AgentHubClient {
         const after = options.after ?? 0;
         if (!Number.isInteger(after) || after < 0)
             throw new Error("event cursor must be a non-negative integer");
-        const value = await this.#requestJson(pathWithQuery(`${PATHS.sessions}/${encodeURIComponent(sessionId)}/events`, { after: after > 0 ? after : undefined }), {}, { signal: options.signal });
+        const limit = options.limit;
+        const value = await this.#requestJson(pathWithQuery(`${PATHS.sessions}/${encodeURIComponent(sessionId)}/events`, {
+            after: after > 0 ? after : undefined,
+            ...(limit !== undefined ? { limit: String(limit) } : {}),
+        }), {}, { signal: options.signal });
         if (!Array.isArray(value)) {
             throw new AgentHubError(500, "invalid_response", "Agent Hub returned an invalid event list");
         }

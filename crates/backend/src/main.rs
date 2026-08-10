@@ -3588,7 +3588,9 @@ async fn list_model_connections(
 ) -> Result<Json<Vec<ModelConnectionDto>>, ApiError> {
     let user = require_user(&state, &headers).await?;
     let rows = sqlx::query(
-        "SELECT c.id, c.owner_id, c.scope, c.name, c.base_url, c.api_type,
+        "SELECT c.id, c.owner_id,
+                (SELECT email FROM users WHERE id = c.owner_id) AS owner_email,
+                c.scope, c.name, c.base_url, c.api_type,
                 c.allowed_model_ids, c.enabled, c.vision_model_id,
                 (c.api_key_ciphertext IS NOT NULL) AS has_api_key,
                 c.created_at, c.updated_at
@@ -4516,6 +4518,7 @@ fn model_connection_from_row(row: &sqlx::postgres::PgRow) -> ModelConnectionDto 
     ModelConnectionDto {
         id: row.get("id"),
         owner_id: row.get("owner_id"),
+        owner_email: row.get("owner_email"),
         scope: match row.get::<String, _>("scope").as_str() {
             "global" => ModelConnectionScope::Global,
             _ => ModelConnectionScope::Personal,
@@ -4546,7 +4549,9 @@ async fn load_visible_model_connection(
     user_id: Uuid,
 ) -> Result<ModelConnectionDto, ApiError> {
     let row = sqlx::query(
-        "SELECT c.id, c.owner_id, c.scope, c.name, c.base_url, c.api_type,
+        "SELECT c.id, c.owner_id,
+                (SELECT email FROM users WHERE id = c.owner_id) AS owner_email,
+                c.scope, c.name, c.base_url, c.api_type,
                 c.allowed_model_ids, c.enabled, c.vision_model_id,
                 (c.api_key_ciphertext IS NOT NULL) AS has_api_key,
                 c.created_at, c.updated_at
@@ -4623,7 +4628,9 @@ async fn load_model_connection_secret_for_test(
 ) -> Result<ModelConnectionSecretRecord, ApiError> {
     authorize_model_connection_mutation(pool, model_connection_id, user).await?;
     let row = sqlx::query(
-        "SELECT c.id, c.owner_id, c.scope, c.name, c.base_url, c.api_type,
+        "SELECT c.id, c.owner_id,
+                (SELECT email FROM users WHERE id = c.owner_id) AS owner_email,
+                c.scope, c.name, c.base_url, c.api_type,
                 c.allowed_model_ids, c.enabled, c.vision_model_id,
                 (c.api_key_ciphertext IS NOT NULL) AS has_api_key,
                 c.created_at, c.updated_at,
@@ -5351,7 +5358,7 @@ async fn list_agents(
 ) -> Result<Json<Vec<AgentDto>>, ApiError> {
     let user = require_user(&state, &headers).await?;
     let rows = sqlx::query(
-        "SELECT a.id, a.owner_id, a.name, a.instructions, a.visibility, a.public_to,
+        "SELECT a.id, a.owner_id, owner.email AS owner_email, a.name, a.instructions, a.visibility, a.public_to,
                 a.runtime_id, a.model_connection_id, a.model_id, a.model_settings,
                 a.model_policy, a.sandbox_policy, a.mcp_allowlist, a.tool_allowlist,
                 a.created_at, a.updated_at
@@ -8751,7 +8758,9 @@ async fn list_skills(
 ) -> Result<Json<Vec<SkillDto>>, ApiError> {
     let user = require_user(&state, &headers).await?;
     let rows = sqlx::query(
-        "SELECT skills.id, skills.owner_id, skills.name, skills.description,
+        "SELECT skills.id, skills.owner_id,
+                (SELECT email FROM users WHERE id = skills.owner_id) AS owner_email,
+                skills.name, skills.description,
                 skills.content, skills.revision, skills.content_checksum_sha256,
                 skills.created_at, skills.updated_at,
                 packages.id AS package_id, packages.format_version AS package_format_version,
@@ -14218,7 +14227,9 @@ fn runtime_claim_candidate_sql() -> String {
 
 fn runtime_claim_agent_sql() -> String {
     format!(
-        "SELECT a.id AS a_id, a.owner_id, a.name, a.instructions, a.visibility, a.public_to,
+        "SELECT a.id AS a_id, a.owner_id,
+                (SELECT email FROM users WHERE id = a.owner_id) AS owner_email,
+                a.name, a.instructions, a.visibility, a.public_to,
                 a.runtime_id AS a_runtime_id, a.model_policy AS a_model_policy,
                 a.model_connection_id AS a_model_connection_id,
                 a.model_id AS a_model_id, a.model_settings AS a_model_settings,
@@ -19482,7 +19493,7 @@ async fn load_agent_for_user(
     user: &UserDto,
 ) -> Result<AgentDto, ApiError> {
     let row = sqlx::query(
-        "SELECT a.id, a.owner_id, a.name, a.instructions, a.visibility, a.public_to,
+        "SELECT a.id, a.owner_id, owner.email AS owner_email, a.name, a.instructions, a.visibility, a.public_to,
                 a.runtime_id, a.model_connection_id, a.model_id, a.model_settings,
                 a.model_policy, a.sandbox_policy, a.mcp_allowlist, a.tool_allowlist,
                 a.created_at, a.updated_at
@@ -19541,7 +19552,9 @@ async fn load_agent_manageable_by_user(
     user: &UserDto,
 ) -> Result<AgentDto, ApiError> {
     let row = sqlx::query(
-        "SELECT a.id, a.owner_id, a.name, a.instructions, a.visibility, a.public_to,
+        "SELECT a.id, a.owner_id,
+                (SELECT email FROM users WHERE id = a.owner_id) AS owner_email,
+                a.name, a.instructions, a.visibility, a.public_to,
                 a.runtime_id, a.model_connection_id, a.model_id, a.model_settings,
                 a.model_policy, a.sandbox_policy, a.mcp_allowlist, a.tool_allowlist,
                 a.created_at, a.updated_at
@@ -20589,7 +20602,9 @@ async fn load_skill_owned_by_user(
     user_id: Uuid,
 ) -> Result<SkillDto, ApiError> {
     let row = sqlx::query(
-        "SELECT skills.id, skills.owner_id, skills.name, skills.description,
+        "SELECT skills.id, skills.owner_id,
+                (SELECT email FROM users WHERE id = skills.owner_id) AS owner_email,
+                skills.name, skills.description,
                 skills.content, skills.revision, skills.content_checksum_sha256,
                 skills.created_at, skills.updated_at,
                 packages.id AS package_id, packages.format_version AS package_format_version,
@@ -20923,7 +20938,9 @@ async fn load_agent_execution_configuration_tx(
     agent_id: Uuid,
 ) -> Result<AgentExecutionConfigurationDto, ApiError> {
     let row = sqlx::query(
-        "SELECT id, owner_id, name, instructions, visibility, public_to, runtime_id,
+        "SELECT id, owner_id,
+                (SELECT email FROM users WHERE id = agents.owner_id) AS owner_email,
+                name, instructions, visibility, public_to, runtime_id,
                 model_connection_id, model_id, model_settings,
                 model_policy, sandbox_policy, mcp_allowlist, tool_allowlist, execution_config_revision,
                 created_at, updated_at
@@ -21829,6 +21846,7 @@ fn oauth_app_record_from_row(row: sqlx::postgres::PgRow) -> Result<OAuthAppRecor
     Ok(OAuthAppRecord {
         id: row.get("id"),
         owner_id: row.get("owner_id"),
+        owner_email: row.get("owner_email"),
         client_secret_hash: row.get("client_secret_hash"),
         redirect_uris: row.get("redirect_uris"),
         external_platform_id: row.get("external_platform_id"),
@@ -23269,6 +23287,7 @@ fn widget_credential_from_row(row: sqlx::postgres::PgRow) -> Result<WidgetCreden
         agent_id: row.get("agent_id"),
         agent_owner_id: row.get("agent_owner_id"),
         owner_id: row.get("owner_id"),
+        owner_email: row.get("owner_email"),
         hub_session_id: row.get("hub_session_id"),
         oauth_app_id: row.get("oauth_app_id"),
         external_platform_id: row.get("external_platform_id"),
@@ -24971,6 +24990,7 @@ fn agent_from_row(row: sqlx::postgres::PgRow) -> AgentDto {
     AgentDto {
         id: row.get("id"),
         owner_id: row.get("owner_id"),
+        owner_email: row.get("owner_email"),
         name: row.get("name"),
         instructions: row.get("instructions"),
         visibility: row.get("visibility"),
@@ -25012,6 +25032,7 @@ fn skill_from_row(row: sqlx::postgres::PgRow) -> SkillDto {
     SkillDto {
         id: row.get("id"),
         owner_id: row.get("owner_id"),
+        owner_email: row.get("owner_email"),
         name: row.get("name"),
         description: row.get("description"),
         content: row.get("content"),
@@ -25094,6 +25115,7 @@ fn automation_from_row(row: sqlx::postgres::PgRow) -> AutomationDto {
         id: row.get("id"),
         agent_id: row.get("agent_id"),
         owner_id: row.get("owner_id"),
+        owner_email: row.get("owner_email"),
         name: row.get("name"),
         trigger_type,
         prompt: row.get("prompt"),
@@ -25120,6 +25142,7 @@ fn integration_app_from_row(row: sqlx::postgres::PgRow, agent_ids: Vec<Uuid>) ->
     IntegrationAppDto {
         id: row.get("id"),
         owner_id: row.get("owner_id"),
+        owner_email: row.get("owner_email"),
         name: row.get("name"),
         client_id: row.get("client_id"),
         external_platform_id: row.get("external_platform_id"),
@@ -25251,6 +25274,7 @@ fn hub_session_from_row(row: sqlx::postgres::PgRow) -> HubSessionDto {
     HubSessionDto {
         id: row.get("id"),
         owner_id: row.get("owner_id"),
+        owner_email: row.get("owner_email"),
         agent_id: row.get("agent_id"),
         agent_name: row.get("agent_name"),
         agent_deleted_at: row.get("agent_deleted_at"),

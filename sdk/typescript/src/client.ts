@@ -16,6 +16,7 @@ import type {
   SendResult,
   SecretGrantRequirement,
   SessionEvent,
+  SessionDeleteOptions,
   SessionEventListener,
   SessionListOptions,
   SessionMessage,
@@ -874,6 +875,7 @@ export class AgentHubClient {
     list: (options?: SessionListOptions) => Promise<SessionSummary[]>;
     existing: (sessionId: string) => ClientSession;
     draft: () => ClientSession;
+    delete: (sessionId: string, options?: SessionDeleteOptions) => Promise<void>;
   };
 
   readonly #baseUrl: string;
@@ -924,6 +926,7 @@ export class AgentHubClient {
       list: (requestOptions) => this.listSessions(requestOptions),
       existing: (sessionId) => this.existing(sessionId),
       draft: () => this.draft(),
+      delete: (sessionId, requestOptions) => this.deleteSession(sessionId, requestOptions),
     };
   }
 
@@ -1060,6 +1063,19 @@ export class AgentHubClient {
 
   unregisterTool(name: string): void {
     this.#handlers.delete(name);
+  }
+
+  async deleteSession(sessionId: string, options: SessionDeleteOptions = {}): Promise<void> {
+    this.#assertUsable();
+    if (!sessionId.trim()) throw new AgentHubError(400, "invalid_session_id", "sessionId is required");
+    if (this.#mode.kind === "anonymous") {
+      throw new AgentHubError(403, "anonymous_history_disabled", "Anonymous clients cannot delete Sessions");
+    }
+    await this.#requestJson<unknown>(
+      `${PATHS.sessions}/${encodeURIComponent(sessionId)}`,
+      { method: "DELETE" },
+      { signal: options.signal, transientRetries: 1 },
+    );
   }
 
   async reauthorize(): Promise<void> {

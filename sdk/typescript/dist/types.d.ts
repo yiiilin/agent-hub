@@ -86,6 +86,8 @@ export interface MessagePage {
 }
 export interface EventListOptions {
     after?: number;
+    /** 最多返回的事件条数（用于历史恢复时限制拉取量；省略则返回全部）。 */
+    limit?: number;
     signal?: AbortSignal;
 }
 export interface Run {
@@ -181,6 +183,8 @@ export interface ToolHandlerContext {
     sessionId: string;
     runId?: string;
     signal: AbortSignal;
+    /** 是否为会话恢复（刷新/重连）时补执行遗留调用；此时 handler 不应阻塞等待用户交互。 */
+    recovering?: boolean;
 }
 export type ToolHandler = (input: JsonValue, context: ToolHandlerContext) => JsonValue | ToolResult | Promise<JsonValue | ToolResult>;
 export type ToolHandlers = Readonly<Record<string, ToolHandler>>;
@@ -219,5 +223,8 @@ export interface AgentHubClientOptions extends CommonClientOptions {
 export interface AnonymousClientOptions extends CommonClientOptions {
     clientId: string;
     localStorage?: Storage;
+}
+export interface SessionDeleteOptions {
+    signal?: AbortSignal;
 }
 //# sourceMappingURL=types.d.ts.map
