@@ -1,12 +1,8 @@
 //! models 领域模块：Model API Connection / 模型用量台账 的 handler 与私有辅助函数。
 
 use super::*;
-use crate::{REDACTED_SECRET, ModelGatewayForwardRequest, send_model_gateway_request};
-use std::{
-    collections::BTreeSet,
-    sync::Arc,
-    time::Instant,
-};
+use crate::{send_model_gateway_request, ModelGatewayForwardRequest, REDACTED_SECRET};
+use std::{collections::BTreeSet, sync::Arc, time::Instant};
 
 use agent_hub_shared::*;
 use axum::{

@@ -1,6 +1,5 @@
 //! 通用小工具：角色判定与 JSON 规范化。
 
-use agent_hub_shared::*;
 use serde_json::Value;
 
 pub(crate) fn is_admin_role(role: &str) -> bool {

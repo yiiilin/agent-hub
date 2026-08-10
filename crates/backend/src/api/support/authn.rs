@@ -1,8 +1,8 @@
 //! 认证：principal、provider 实现与请求身份校验。
 
 use super::*;
-use crate::{load_agent_owned_by_user, load_auth_policy, verify_embed_jwt_claims};
-use crate::{ApplicationPrincipal, IntegrationPrincipal, RunModelAttribution, WidgetScopedSession};
+use crate::{load_auth_policy, verify_embed_jwt_claims};
+use crate::{ApplicationPrincipal, IntegrationPrincipal};
 use agent_hub_shared::*;
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
@@ -457,7 +457,6 @@ pub(crate) async fn require_runtime(
 }
 
 use super::error::ApiError;
-use agent_hub_shared::*;
 use axum::http::{header, HeaderMap, HeaderValue};
 
 pub(crate) fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {

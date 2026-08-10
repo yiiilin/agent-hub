@@ -12,16 +12,18 @@ use axum::{
         Redirect, Response,
     },
 };
-use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures_util::Stream;
 use hmac::Mac;
 use serde::Deserialize;
-use serde_json::{json, Number, Value};
+use serde_json::{json, Value};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use url::Url;
 use uuid::Uuid;
-
 
 pub(crate) async fn list_integration_apps(
     State(state): State<Arc<AppState>>,
@@ -3057,7 +3059,6 @@ pub(crate) struct OAuthAppRecord {
     pub(crate) client_tool_definitions: Vec<ClientToolDefinitionDto>,
 }
 
-
 #[derive(Debug)]
 pub(crate) struct WidgetCredential {
     pub(crate) id: Uuid,
@@ -5327,4 +5328,3 @@ pub(crate) fn validate_embed_jwt_iat(payload: &Value, now: i64) -> Result<(), Ap
     }
     Ok(())
 }
-

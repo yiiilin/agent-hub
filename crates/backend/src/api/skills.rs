@@ -1015,4 +1015,3 @@ pub(crate) async fn load_managed_skill_ids(
     .await?;
     Ok(rows.into_iter().map(|row| row.get("id")).collect())
 }
-

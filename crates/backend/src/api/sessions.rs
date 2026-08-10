@@ -32,10 +32,8 @@ use zeroize::Zeroizing;
 
 use crate::authorize_run_stream;
 use crate::extract_model_usage;
-use crate::model_test_response_text;
-use crate::send_model_gateway_request;
-use crate::load_agent_for_user;
 use crate::insert_hub_native_session_tx;
+use crate::load_agent_for_user;
 use crate::load_run_for_user;
 use crate::load_run_public_tx;
 use crate::load_widget_credential_tx;
@@ -43,17 +41,19 @@ use crate::load_widget_scoped_session_tx;
 use crate::missing_secret_grants;
 use crate::model_connection_scope_name;
 use crate::model_request_settings_value;
+use crate::model_response_status;
+use crate::model_test_response_text;
+use crate::model_upstream_protocol_from_name;
 use crate::model_upstream_protocol_name;
+use crate::normalize_client_message_key;
+use crate::record_runtime_session_cleanup_tx;
+use crate::send_model_gateway_request;
+use crate::widget_session_locator;
+use crate::ModelGatewayForwardRequest;
+use crate::ObservedModelUsage;
 use crate::MAX_ATTACHMENT_BYTES_PER_SESSION;
 use crate::MAX_ATTACHMENT_UPLOAD_BYTES;
-use crate::ModelGatewayForwardRequest;
-use crate::model_response_status;
-use crate::model_upstream_protocol_from_name;
-use crate::normalize_client_message_key;
-use crate::ObservedModelUsage;
-use crate::record_runtime_session_cleanup_tx;
 use crate::SESSION_MESSAGE_PAGE_SQL;
-use crate::widget_session_locator;
 
 #[derive(Debug, Clone)]
 pub(crate) struct AcceptSessionMessage {
@@ -2933,4 +2933,3 @@ pub(crate) async fn load_events_after(
     .await?;
     Ok(rows.into_iter().map(event_from_row).collect())
 }
-

@@ -1,9 +1,7 @@
 //! 开发环境种子数据。
 
 use crate::api::validate_model_connection_fields;
-use crate::{
-    build_skill_package_archive, parse_uploaded_skill_markdown, StagedSkillPackageFile,
-};
+use crate::{build_skill_package_archive, parse_uploaded_skill_markdown, StagedSkillPackageFile};
 use crate::{
     commit_skill_package_upload, enqueue_skill_package_deletion,
     publish_skill_configuration_change_tx, StagedSkillPackageUpload,
@@ -11,7 +9,7 @@ use crate::{
 use anyhow::Context;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 use uuid::Uuid;
 

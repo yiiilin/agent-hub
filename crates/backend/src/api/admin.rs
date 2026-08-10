@@ -2,8 +2,7 @@
 
 use super::*;
 use crate::{
-    normalize_display_name, normalize_email, record_runtime_session_cleanup_tx,
-    validate_user_role,
+    normalize_display_name, normalize_email, record_runtime_session_cleanup_tx, validate_user_role,
 };
 use agent_hub_shared::*;
 use axum::extract::{Path, State};
@@ -1088,4 +1087,3 @@ pub(crate) async fn user_erasure_loop(state: Arc<AppState>) {
         }
     }
 }
-

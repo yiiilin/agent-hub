@@ -1,6 +1,5 @@
 //! 加密与凭据哈希工具。
 
-use agent_hub_shared::*;
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,

@@ -207,7 +207,6 @@ pub(crate) async fn list_users(
     Ok(Json(rows.into_iter().map(user_from_row).collect()))
 }
 
-
 pub(crate) async fn auth_providers(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<AuthProvidersResponse>, ApiError> {
@@ -742,7 +741,11 @@ pub(crate) struct LdapDirectoryFailure {
 }
 
 impl LdapDirectoryFailure {
-    pub(crate) fn invalid(stage: &'static str, category: &'static str, diagnostic: &'static str) -> Self {
+    pub(crate) fn invalid(
+        stage: &'static str,
+        category: &'static str,
+        diagnostic: &'static str,
+    ) -> Self {
         Self {
             stage,
             category,
@@ -751,7 +754,11 @@ impl LdapDirectoryFailure {
         }
     }
 
-    pub(crate) fn unavailable(stage: &'static str, category: &'static str, diagnostic: &'static str) -> Self {
+    pub(crate) fn unavailable(
+        stage: &'static str,
+        category: &'static str,
+        diagnostic: &'static str,
+    ) -> Self {
         Self {
             stage,
             category,
@@ -1687,4 +1694,3 @@ pub(crate) fn validate_identity_name(value: &str, field: &str) -> Result<String,
     }
     Ok(value.to_owned())
 }
-
