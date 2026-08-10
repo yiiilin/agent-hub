@@ -191,6 +191,30 @@ test("authenticated clients reuse a tab ID and never persist credentials", async
   });
   const sessions = await first.sessions.list({ limit: 10 });
   assert.equal(sessions[0].id, "session-1");
+
+test("sessions.delete issues a DELETE request and resolves on 204", async () => {
+  const requests = [];
+  const authorize = async () => credential("secret-client-token");
+  const fetch = async (input, init = {}) => {
+    requests.push({ input: String(input), init });
+    return new Response(null, { status: 204 });
+  };
+
+  const client = await connect({
+    baseUrl: "https://hub.example",
+    authorize,
+    fetch,
+    sessionStorage: new MemoryStorage(),
+    storage: new MemoryToolJournalStorage(),
+  });
+  await client.sessions.delete("session-9");
+  assert.equal(requests.length, 1);
+  assert.equal(pathOf(requests[0].input), "/api/client/sessions/session-9");
+  assert.equal(requests[0].init.method, "DELETE");
+  assert.equal(new Headers(requests[0].init.headers).get("Authorization"), "Bearer secret-client-token");
+  client.dispose();
+});
+
   assert.equal(pathOf(requests[0].input), "/api/client/sessions");
   assert.equal(new Headers(requests[0].init.headers).get("Authorization"), "Bearer secret-client-token");
   const firstInstanceId = first.clientInstanceId;
