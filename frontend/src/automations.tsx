@@ -157,9 +157,9 @@ export function AutomationsPage({ RunConsole }: { RunConsole: ComponentType<{ ru
     const generation = ++loadGeneration.current;
     setLoading(true);
     try {
-      const [user, loadedAgents, loadedAutomations] = await Promise.all([api.me(), api.agents(), api.automations()]);
+      const [, loadedAgents, loadedAutomations] = await Promise.all([api.me(), api.agents(), api.automations()]);
       if (generation !== loadGeneration.current) return;
-      setAgents(loadedAgents.filter((agent) => agent.owner_id === user.id));
+      setAgents(loadedAgents);
       setAutomations(loadedAutomations.map((automation) => ({ ...automation, webhook_token: null })));
       setError(null);
     } catch {

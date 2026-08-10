@@ -4,7 +4,7 @@
 
 本阶段实现 plan.md 中 Automations 的最小完整闭环：
 
-1. 登录用户可以为自己可管理的 Agent 创建 Automation。
+1. 登录用户可以为自己的 Agent，或当前用户可调用的公共（`public` / `public_to`）Agent 创建 Automation；自动化归创建者所有，触发时以 Agent 自身配置运行。
 2. Automation 支持 `manual`、`webhook`、`interval`、`cron` 四种 trigger 类型的配置落库。
 3. `manual` trigger 通过管理台按钮启动指定 Agent run。
 4. `webhook` trigger 通过 scoped token 启动指定 Agent run。
@@ -31,7 +31,8 @@
 - 点击 manual trigger 后，Automation 对应 Agent 出现新 run，并由 runtime 完成。
 - webhook URL 在未登录情况下可以用 token 触发 run。
 - disabled Automation 不能触发。
-- Automation 不能为不属于当前用户的 private Agent 创建。
+- Automation 不能为不属于当前用户的 private Agent 创建；public / public_to 且未归档的 Agent 可创建。
+- Agent 对 Automation owner 失去可见性（如撤销 public）后，该 Automation 的新创建、编辑与触发均被拒绝；owner 本人不受影响。
 - owner 更新返回当前持久化状态；foreign 或不存在统一返回 404，归档后的 Agent 不接受更新。
 - 非 webhook 转为 webhook 时生成一次性明文 token；webhook 保持 webhook 时保留原 hash 且不再次返回 token；转出 webhook 时清除 hash。
 - Automation 列表和后续读取永不包含明文 webhook token。

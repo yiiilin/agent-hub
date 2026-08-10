@@ -672,6 +672,10 @@ fn build_router(state: AppState) -> Router {
         .route("/api/client/session", get(get_widget_session))
         .route("/api/client/sessions", get(list_widget_sessions))
         .route(
+            "/api/client/sessions/{session_id}",
+            delete(delete_widget_session),
+        )
+        .route(
             "/api/client/sessions/{session_id}/messages",
             get(list_widget_session_messages),
         )
@@ -7080,21 +7084,63 @@ async fn delete_hub_session(
 ) -> Result<StatusCode, ApiError> {
     let user = require_user(&state, &headers).await?;
     let mut tx = state.pool.begin().await?;
-    let session = sqlx::query(
+    let guard = load_session_deletion_guard_tx(&mut tx, session_id, Some(user.id)).await?;
+    let outcome = delete_session_rows_tx(&mut tx, session_id, guard).await?;
+    tx.commit().await?;
+    delete_session_object_store_entries(&state, session_id, &outcome).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 删除前校验所需的会话行快照（调用方必须持有 FOR UPDATE 行锁）。
+struct SessionDeletionGuard {
+    lifecycle_status: String,
+    runtime_owner_id: Option<Uuid>,
+    ownership_generation: i64,
+    current_bundle_object_key: Option<String>,
+}
+
+struct SessionDeletionOutcome {
+    attachment_object_keys: Vec<String>,
+    bundle_object_key: Option<String>,
+}
+
+/// 按 owner 查询会话删除守卫行（用户态 /api/sessions 删除路径）。
+async fn load_session_deletion_guard_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: Uuid,
+    owner_id: Option<Uuid>,
+) -> Result<SessionDeletionGuard, ApiError> {
+    let row = sqlx::query(
         "SELECT lifecycle_status, runtime_owner_id, ownership_generation,
                 current_bundle_object_key
          FROM hub_sessions
-         WHERE id = $1 AND owner_id = $2
+         WHERE id = $1 AND ($2::uuid IS NULL OR owner_id = $2)
          FOR UPDATE",
     )
     .bind(session_id)
-    .bind(user.id)
-    .fetch_optional(&mut *tx)
+    .bind(owner_id)
+    .fetch_optional(&mut **tx)
     .await?
     .ok_or_else(|| ApiError::not_found("session not found"))?;
-    let lifecycle_status: String = session.get("lifecycle_status");
+    Ok(SessionDeletionGuard {
+        lifecycle_status: row.get("lifecycle_status"),
+        runtime_owner_id: row.get("runtime_owner_id"),
+        ownership_generation: row.get("ownership_generation"),
+        current_bundle_object_key: row.get("current_bundle_object_key"),
+    })
+}
+
+/// 删除会话的全部关联数据（runs、消息、附件、集成记录、turns 等）。
+/// 调用方负责：先锁定会话行并通过 load_session_deletion_guard_tx 构造守卫，
+/// 随后在本函数返回后提交事务，再调用 delete_session_object_store_entries 清理对象存储。
+async fn delete_session_rows_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: Uuid,
+    guard: SessionDeletionGuard,
+) -> Result<SessionDeletionOutcome, ApiError> {
+    let lifecycle_status: &str = guard.lifecycle_status.as_str();
     if matches!(
-        lifecycle_status.as_str(),
+        lifecycle_status,
         "waiting_for_runtime" | "restoring" | "online" | "saving"
     ) {
         return Err(ApiError::conflict(
@@ -7109,19 +7155,17 @@ async fn delete_hub_session(
          )",
     )
     .bind(session_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
     if has_active_run {
         return Err(ApiError::conflict("session has an active run"));
     }
-    let runtime_owner_id: Option<Uuid> = session.get("runtime_owner_id");
-    let ownership_generation: i64 = session.get("ownership_generation");
-    if let Some(runtime_id) = runtime_owner_id {
+    if let Some(runtime_id) = guard.runtime_owner_id {
         record_runtime_session_cleanup_tx(
-            &mut tx,
+            &mut *tx,
             runtime_id,
             session_id,
-            ownership_generation,
+            guard.ownership_generation,
             None,
         )
         .await?;
@@ -7129,7 +7173,7 @@ async fn delete_hub_session(
 
     sqlx::query("UPDATE hub_sessions SET active_turn_id = NULL WHERE id = $1")
         .bind(session_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     sqlx::query(
         "UPDATE hub_session_messages
@@ -7137,7 +7181,7 @@ async fn delete_hub_session(
          WHERE session_id = $1",
     )
     .bind(session_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     sqlx::query(
         "DELETE FROM integration_attachments
@@ -7148,7 +7192,7 @@ async fn delete_hub_session(
          )",
     )
     .bind(session_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     sqlx::query(
         "DELETE FROM integration_messages
@@ -7159,11 +7203,11 @@ async fn delete_hub_session(
          )",
     )
     .bind(session_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     sqlx::query("DELETE FROM embed_sessions WHERE hub_session_id = $1")
         .bind(session_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     sqlx::query(
         "DELETE FROM integration_tool_requests
@@ -7171,19 +7215,19 @@ async fn delete_hub_session(
             OR run_id IN (SELECT id FROM runs WHERE hub_session_id = $1)",
     )
     .bind(session_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     sqlx::query("DELETE FROM integration_sessions WHERE hub_session_id = $1")
         .bind(session_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     sqlx::query("DELETE FROM session_bundle_deletion_queue WHERE session_id = $1")
         .bind(session_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     sqlx::query("DELETE FROM runs WHERE hub_session_id = $1")
         .bind(session_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     let attachment_object_keys = sqlx::query_scalar::<_, String>(
         "SELECT object_key
@@ -7191,43 +7235,73 @@ async fn delete_hub_session(
          ORDER BY object_key",
     )
     .bind(session_id)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut **tx)
     .await?;
     sqlx::query("DELETE FROM hub_session_attachments WHERE session_id = $1")
         .bind(session_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     sqlx::query("DELETE FROM hub_session_messages WHERE session_id = $1")
         .bind(session_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     sqlx::query("DELETE FROM hub_session_turns WHERE session_id = $1")
         .bind(session_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     sqlx::query("DELETE FROM hub_sessions WHERE id = $1")
         .bind(session_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-    tx.commit().await?;
+    Ok(SessionDeletionOutcome {
+        attachment_object_keys,
+        bundle_object_key: guard.current_bundle_object_key,
+    })
+}
 
-    let bundle_object_key: Option<String> = session.get("current_bundle_object_key");
+/// 事务提交后清理会话关联的对象存储条目（bundle 与附件）。
+async fn delete_session_object_store_entries(
+    state: &Arc<AppState>,
+    session_id: Uuid,
+    outcome: &SessionDeletionOutcome,
+) {
     if let (Some(object_key), Some(store)) =
-        (bundle_object_key, state.session_bundle_store.as_ref())
+        (outcome.bundle_object_key.as_deref(), state.session_bundle_store.as_ref())
     {
-        if let Err(error) = store.delete(&object_key).await {
+        if let Err(error) = store.delete(object_key).await {
             warn!(session_id = %session_id, object_key = %object_key, error = %error,
                 "failed to delete Session Bundle object after Session deletion");
         }
     }
     if let Some(store) = state.session_bundle_store.as_ref() {
-        for object_key in attachment_object_keys {
-            if let Err(error) = store.delete(&object_key).await {
+        for object_key in &outcome.attachment_object_keys {
+            if let Err(error) = store.delete(object_key).await {
                 warn!(session_id = %session_id, object_key = %object_key, error = %error,
                     "failed to delete Attachment object after Session deletion");
             }
         }
     }
+}
+
+/// Client（Widget）侧删除会话：按 client 凭证作用域定位会话后执行删除。
+async fn delete_widget_session(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(session_id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let token = client_access_token_from_headers(&headers)
+        .ok_or(ApiError::unauthorized("missing embed session"))?;
+    let mut tx = state.pool.begin().await?;
+    let credential = load_widget_credential_tx(&mut tx, &token, &headers).await?;
+    if !credential.history_enabled {
+        return Err(ApiError::forbidden("Widget history is disabled"));
+    }
+    let scoped = load_widget_scoped_session_tx(&mut tx, &credential, None, Some(session_id), true)
+        .await?;
+    let guard = load_session_deletion_guard_tx(&mut tx, scoped.hub_session_id, None).await?;
+    let outcome = delete_session_rows_tx(&mut tx, scoped.hub_session_id, guard).await?;
+    tx.commit().await?;
+    delete_session_object_store_entries(&state, scoped.hub_session_id, &outcome).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -9636,9 +9710,12 @@ async fn create_automation(
     let webhook_token_hash = webhook_token.as_deref().map(sha256_hex);
     let mut tx = state.pool.begin().await?;
     // 先锁 Agent，再插入 Automation；归档、手动触发和 scheduler 都遵循这一顺序。
+    // Automation 可绑定当前用户可调用（owner/public/public_to）的 Agent。
     let agent = sqlx::query(
         "SELECT id, owner_id FROM agents
-         WHERE id = $1 AND owner_id = $2 AND deleted_at IS NULL
+         WHERE id = $1 AND deleted_at IS NULL
+           AND (owner_id = $2 OR visibility = 'public'
+                OR (visibility = 'public_to' AND $2 = ANY(public_to)))
          FOR UPDATE",
     )
     .bind(req.agent_id)
@@ -9646,7 +9723,7 @@ async fn create_automation(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(ApiError::forbidden(
-        "automation requires active agent owner",
+        "automation requires an accessible agent",
     ))?;
     let row = sqlx::query(
         "INSERT INTO automations (id, agent_id, owner_id, name, trigger_type, prompt, schedule, webhook_token_hash, enabled)
@@ -9690,9 +9767,12 @@ async fn update_automation(
     };
 
     // All Automation mutations and triggers lock Agent before Automation.
+    // Agent 必须仍对 Automation owner 可调用（owner/public/public_to）。
     let active_agent: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM agents
-         WHERE id = $1 AND owner_id = $2 AND deleted_at IS NULL
+         WHERE id = $1 AND deleted_at IS NULL
+           AND (owner_id = $2 OR visibility = 'public'
+                OR (visibility = 'public_to' AND $2 = ANY(public_to)))
          FOR UPDATE",
     )
     .bind(agent_id)
@@ -18173,10 +18253,13 @@ async fn trigger_loaded_automation(
         .to_owned();
     let mut tx = pool.begin().await?;
     // 归档和所有触发路径均先锁 Agent，消除 agent/automation 交叉死锁。
+    // Agent 必须仍对 Automation owner 可调用（owner/public/public_to）。
     let active_agent = sqlx::query(
         "SELECT id
          FROM agents
-         WHERE id = $1 AND owner_id = $2 AND deleted_at IS NULL
+         WHERE id = $1 AND deleted_at IS NULL
+           AND (owner_id = $2 OR visibility = 'public'
+                OR (visibility = 'public_to' AND $2 = ANY(public_to)))
          FOR UPDATE",
     )
     .bind(automation.agent_id)
@@ -31163,7 +31246,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let events = load_widget_session_events_after_tx(&mut events_tx, &scoped, 0)
+        let events = load_widget_session_events_after_tx(&mut events_tx, &scoped, 0, None)
             .await
             .unwrap();
         events_tx.commit().await.unwrap();
@@ -54524,6 +54607,170 @@ mod tests {
             app_attribution,
             ("integration_app".into(), None, Some(app.id))
         );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn member_can_create_edit_and_trigger_automation_for_public_agent(pool: PgPool) {
+        let owner_token = create_user_session_with_role(&pool, "member").await;
+        let caller_token = create_user_session_with_role(&pool, "member").await;
+        let admin_token = create_user_session_with_role(&pool, "admin").await;
+        let state = Arc::new(test_state_with_browser_session_auth(pool.clone()));
+        let owner = require_user(&state, &session_headers(&owner_token))
+            .await
+            .unwrap();
+        let caller = require_user(&state, &session_headers(&caller_token))
+            .await
+            .unwrap();
+        let connection = create_test_model_connection_for_token(
+            &state,
+            &admin_token,
+            ModelConnectionScope::Global,
+            "Public Agent Automation",
+        )
+        .await;
+        let agent_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO agents
+                 (id, owner_id, name, instructions, visibility,
+                  model_policy, model_connection_id, model_id)
+             VALUES ($1, $2, 'Public Automation Agent', '', 'public',
+                     '{\"provider\":\"hub-proxy\"}'::jsonb, $3, $4)",
+        )
+        .bind(agent_id)
+        .bind(owner.id)
+        .bind(connection.id)
+        .bind(&connection.allowed_model_ids[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // 非 owner 的 caller 可以创建、编辑并手动触发公共 Agent 的 automation。
+        let automation = create_automation(
+            State(state.clone()),
+            session_headers(&caller_token),
+            Json(CreateAutomationRequest {
+                agent_id,
+                name: "Shared Manual".into(),
+                trigger_type: "manual".into(),
+                prompt: "shared manual run".into(),
+                schedule: None,
+                enabled: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(automation.agent_id, agent_id);
+        assert_eq!(automation.owner_id, caller.id);
+
+        let updated = update_automation(
+            State(state.clone()),
+            session_headers(&caller_token),
+            Path(automation.id),
+            Json(UpdateAutomationRequest {
+                name: "Shared Manual Renamed".into(),
+                trigger_type: "manual".into(),
+                prompt: "shared manual run".into(),
+                schedule: None,
+                enabled: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(updated.name, "Shared Manual Renamed");
+
+        let manual_run = trigger_automation(
+            State(state.clone()),
+            session_headers(&caller_token),
+            Path(automation.id),
+            Json(TriggerAutomationRequest { message: None }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(manual_run.automation_id, Some(automation.id));
+        assert_eq!(manual_run.agent_id, agent_id);
+
+        // webhook automation 同样可以创建并触发。
+        let webhook = create_automation(
+            State(state.clone()),
+            session_headers(&caller_token),
+            Json(CreateAutomationRequest {
+                agent_id,
+                name: "Shared Webhook".into(),
+                trigger_type: "webhook".into(),
+                prompt: "shared webhook run".into(),
+                schedule: None,
+                enabled: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let token = webhook
+            .webhook_token
+            .expect("webhook token is returned once");
+        let mut webhook_headers = HeaderMap::new();
+        webhook_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Webhook {token}")).unwrap(),
+        );
+        let webhook_run = trigger_automation_webhook(
+            State(state.clone()),
+            webhook_headers,
+            Json(TriggerAutomationRequest { message: None }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(webhook_run.automation_id, Some(webhook.id));
+
+        // 撤销 public 后：新创建、编辑与触发全部被拒；owner 本人不受影响。
+        sqlx::query("UPDATE agents SET visibility = 'private' WHERE id = $1")
+            .bind(agent_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let denied = create_automation(
+            State(state.clone()),
+            session_headers(&caller_token),
+            Json(CreateAutomationRequest {
+                agent_id,
+                name: "Denied".into(),
+                trigger_type: "manual".into(),
+                prompt: "denied".into(),
+                schedule: None,
+                enabled: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(denied
+            .message
+            .contains("automation requires an accessible agent"));
+        assert!(update_automation(
+            State(state.clone()),
+            session_headers(&caller_token),
+            Path(automation.id),
+            Json(UpdateAutomationRequest {
+                name: "Denied Rename".into(),
+                trigger_type: "manual".into(),
+                prompt: "shared manual run".into(),
+                schedule: None,
+                enabled: true,
+            }),
+        )
+        .await
+        .is_err());
+        assert!(trigger_automation(
+            State(state.clone()),
+            session_headers(&caller_token),
+            Path(automation.id),
+            Json(TriggerAutomationRequest { message: None }),
+        )
+        .await
+        .is_err());
     }
 
     async fn create_test_model_connection_for_token(
