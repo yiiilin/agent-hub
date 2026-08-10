@@ -7309,8 +7309,17 @@ async fn delete_widget_session(
     if !credential.history_enabled {
         return Err(ApiError::forbidden("Widget history is disabled"));
     }
-    let scoped = load_widget_scoped_session_tx(&mut tx, &credential, None, Some(session_id), true)
-        .await?;
+    // Client 会话的规范 id 是 integration_session_id（external 模式），
+    // 与 list/messages/events 等端点保持一致，否则删除时作用域定位会 404。
+    let (integration_session_id, hub_session_id) = widget_session_locator(&credential, session_id);
+    let scoped = load_widget_scoped_session_tx(
+        &mut tx,
+        &credential,
+        integration_session_id,
+        hub_session_id,
+        true,
+    )
+    .await?;
     let guard = load_session_deletion_guard_tx(&mut tx, scoped.hub_session_id, None).await?;
     let outcome = delete_session_rows_tx(&mut tx, scoped.hub_session_id, guard).await?;
     tx.commit().await?;
