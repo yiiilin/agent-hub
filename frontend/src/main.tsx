@@ -245,8 +245,8 @@ type LoginMethod = 'password' | 'ldap';
 
 function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
   const { language, setLanguage, t } = useI18n();
-  const [email, setEmail] = useState('admin@example.com');
-  const [password, setPassword] = useState('admin123');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [displayName, setDisplayName] = useState('');
   const [providers, setProviders] = useState<AuthProviders | null>(null);
   const [providersLoading, setProvidersLoading] = useState(true);
@@ -295,7 +295,7 @@ function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
 
   const ordinaryMethodAvailable = Boolean(providers?.password_login_enabled || providers?.ldap_login_enabled);
   const showForm = emergencyPassword || (!providersLoading && !providersError && ordinaryMethodAvailable);
-  const passwordLabel = method === 'ldap' && !emergencyPassword ? t('directoryPassword') : t('password');
+  const passwordLabel = t('password');
 
   return (
     <div className="login-screen">
@@ -312,9 +312,9 @@ function LoginPage({ onLogin }: { onLogin: (user: User) => void }) {
           </div>}
           {!emergencyPassword && !registering && providers && providers.password_login_enabled !== providers.ldap_login_enabled && <div className="login-method-label"><span>{method === 'ldap' ? <Building2 size={16} /> : <LockKeyhole size={16} />}</span>{method === 'ldap' ? t('ldapDirectory') : t('localPassword')}</div>}
           {registering && <div className="login-method-label"><span><UserRound size={16} /></span>{t('createAccount')}</div>}
-          <label>{t('email')}<input aria-label={t('email')} type="email" autoComplete="username" required disabled={busy} value={email} onChange={(event) => setEmail(event.target.value)} /></label>
+          <label>{t('email')}<input aria-label={t('email')} type="email" autoComplete="username" placeholder={t('emailPlaceholder')} required disabled={busy} value={email} onChange={(event) => setEmail(event.target.value)} /></label>
           {registering && <label>{t('displayNameOptional')}<input aria-label={t('displayNameOptional')} autoComplete="name" maxLength={128} disabled={busy} value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></label>}
-          <label>{passwordLabel}<input aria-label={passwordLabel} type="password" autoComplete={registering ? 'new-password' : 'current-password'} minLength={method === 'ldap' && !emergencyPassword && !registering ? 1 : 8} maxLength={1024} required disabled={busy} value={password} onChange={(event) => setPassword(event.target.value)} /></label>
+          <label>{passwordLabel}<input aria-label={passwordLabel} type="password" autoComplete={registering ? 'new-password' : 'current-password'} placeholder={t('passwordPlaceholder')} minLength={method === 'ldap' && !emergencyPassword && !registering ? 1 : 8} maxLength={1024} required disabled={busy} value={password} onChange={(event) => setPassword(event.target.value)} /></label>
           {error && <div className="error" role="alert">{t(error)}</div>}
           <div className="login-actions">
             <button className="primary" type="submit" disabled={busy}>{busy ? t(registering ? 'creating' : 'signingIn') : t(registering ? 'createAccount' : 'signIn')}</button>
