@@ -1439,108 +1439,182 @@ pub(crate) async fn readiness_response(pool: &PgPool, timeout: Duration) -> Resp
     }
 }
 
-pub(crate) async fn login(
+pub(crate) async fn list_admin_users(
     State(state): State<Arc<AppState>>,
-    MaybeConnectInfo(peer_address): MaybeConnectInfo,
     headers: HeaderMap,
-    Json(req): Json<LoginRequest>,
-) -> Result<impl IntoResponse, ApiError> {
-    let source_ip = login_source_ip(
-        &headers,
-        peer_address.map(|address| address.ip()),
-        state.trusted_proxy_cidrs.as_deref(),
-    );
-    record_ip_login_attempt(&state.pool, source_ip).await?;
-    let rate_email = login_rate_email(&req.email);
-    if let Some(email) = rate_email.as_deref() {
-        reserve_email_login_attempt(&state.pool, email).await?;
-    }
-    let principal = match authenticate_with_providers(
-        &state,
-        AuthCredential::Password {
-            email: req.email,
-            password: req.password,
-        },
+) -> Result<Json<Vec<AdminUserDetailDto>>, ApiError> {
+    let administrator = require_administrator(&state, &headers).await?;
+    let rows = sqlx::query(
+        "SELECT id, email, display_name, role,
+                password IS NOT NULL AS has_password, created_at
+         FROM users
+         WHERE deletion_requested_at IS NULL
+           AND ($1 = 'super_admin' OR role <> 'super_admin')
+         ORDER BY created_at, id",
     )
-    .await
-    {
-        Ok(principal) => principal,
-        Err(error) => return Err(error),
-    };
-    let AuthPrincipal::User { user, .. } = principal else {
-        return Err(ApiError::unauthorized("invalid credentials"));
-    };
-    if let Some(email) = rate_email.as_deref() {
-        clear_email_login_failures(&state.pool, email).await?;
-    }
-    let headers = state.session_issuer.issue(&state, user.id).await?;
-    Ok((headers, Json(LoginResponse { user })))
+    .bind(&administrator.role)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(
+        rows.into_iter().map(admin_user_detail_from_row).collect(),
+    ))
 }
 
-pub(crate) async fn ldap_login(
+pub(crate) async fn create_admin_user(
     State(state): State<Arc<AppState>>,
-    MaybeConnectInfo(peer_address): MaybeConnectInfo,
     headers: HeaderMap,
-    Json(req): Json<LoginRequest>,
-) -> Result<impl IntoResponse, ApiError> {
-    let request_id = Uuid::new_v4();
-    let started_at = Instant::now();
-    let source_ip = login_source_ip(
-        &headers,
-        peer_address.map(|address| address.ip()),
-        state.trusted_proxy_cidrs.as_deref(),
-    );
-    record_ip_login_attempt(&state.pool, source_ip).await?;
-    let rate_email = login_rate_email(&req.email);
-    if let Some(email) = rate_email.as_deref() {
-        reserve_email_login_attempt(&state.pool, email).await?;
+    Json(req): Json<AdminCreateUserRequest>,
+) -> Result<Json<AdminUserDetailDto>, ApiError> {
+    let administrator = require_administrator(&state, &headers).await?;
+    let email = normalize_email(&req.email)?;
+    let display_name = normalize_display_name(req.display_name.as_deref(), &email)?;
+    let role = validate_user_role(&req.role)?;
+    if administrator.role != "super_admin" && role != "member" {
+        return Err(ApiError::forbidden(
+            "only a Super Administrator can create administrator accounts",
+        ));
     }
-    if !load_auth_policy(&state.pool).await?.ldap_login_enabled {
-        return Err(ApiError::forbidden("LDAP login is disabled"));
-    }
-    let configuration =
-        load_ldap_configuration(&state.pool)
-            .await?
-            .ok_or(ApiError::service_unavailable(
-                "LDAP service is temporarily unavailable",
-            ))?;
-    let identity = match query_ldap_directory(&configuration, &req.email, &req.password).await {
-        Ok(identity) => identity,
-        Err(error) => {
-            warn!(
-                request_id = %request_id,
-                stage = error.stage,
-                category = error.category,
-                duration_ms = started_at.elapsed().as_millis(),
-                "LDAP login failed"
-            );
-            return Err(error.for_login());
+    let password = match req.password.as_deref() {
+        Some(password) => {
+            if !(8..=1024).contains(&password.len()) {
+                return Err(ApiError::bad_request(
+                    "password must be between 8 and 1024 bytes",
+                ));
+            }
+            Some(
+                password_hash(password)
+                    .map_err(|_| ApiError::internal("password hashing failed"))?,
+            )
         }
+        None => None,
     };
-    let user = resolve_ldap_user(&state.pool, &identity).await?;
-    if let Some(email) = rate_email.as_deref() {
-        clear_email_login_failures(&state.pool, email).await?;
+
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('agent-hub-user-create', 0))")
+        .execute(&mut *tx)
+        .await?;
+    let actor_role: Option<String> = sqlx::query_scalar(
+        "SELECT role FROM users
+         WHERE id = $1 AND role IN ('admin', 'super_admin')
+           AND deletion_requested_at IS NULL
+         FOR UPDATE",
+    )
+    .bind(administrator.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let actor_role =
+        actor_role.ok_or(ApiError::forbidden("administrator permission is required"))?;
+    if actor_role != "super_admin" && role != "member" {
+        return Err(ApiError::forbidden(
+            "only a Super Administrator can create administrator accounts",
+        ));
     }
-    info!(
-        request_id = %request_id,
-        stage = "complete",
-        category = "success",
-        duration_ms = started_at.elapsed().as_millis(),
-        "LDAP login completed"
-    );
-    let headers = state.session_issuer.issue(&state, user.id).await?;
-    Ok((headers, Json(LoginResponse { user })))
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM users WHERE lower(btrim(email)) = lower(btrim($1))
+         )",
+    )
+    .bind(&email)
+    .fetch_one(&mut *tx)
+    .await?;
+    if exists {
+        return Err(ApiError::conflict("email already exists"));
+    }
+    let row = sqlx::query(
+        "INSERT INTO users (id, email, password, display_name, role)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id, email, display_name, role,
+                   password IS NOT NULL AS has_password, created_at",
+    )
+    .bind(Uuid::new_v4())
+    .bind(email)
+    .bind(password)
+    .bind(display_name)
+    .bind(role)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Json(admin_user_detail_from_row(row)))
 }
 
-pub(crate) async fn register_password_user(
+pub(crate) async fn get_admin_user(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<PasswordRegistrationRequest>,
-) -> Result<impl IntoResponse, ApiError> {
-    let policy = load_auth_policy(&state.pool).await?;
-    if !policy.password_registration_enabled {
-        return Err(ApiError::forbidden("password registration is disabled"));
-    }
+    headers: HeaderMap,
+    Path(user_id): Path<Uuid>,
+) -> Result<Json<AdminUserDetailDto>, ApiError> {
+    let administrator = require_administrator(&state, &headers).await?;
+    Ok(Json(
+        load_admin_user(&state.pool, user_id, &administrator.role).await?,
+    ))
+}
+
+pub(crate) async fn update_admin_user(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(user_id): Path<Uuid>,
+    Json(req): Json<AdminUpdateUserRequest>,
+) -> Result<Json<AdminUserDetailDto>, ApiError> {
+    let administrator = require_administrator(&state, &headers).await?;
     let email = normalize_email(&req.email)?;
+    let display_name = normalize_display_name(Some(&req.display_name), &email)?;
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('agent-hub-user-create', 0))")
+        .execute(&mut *tx)
+        .await?;
+    let administrator_role = require_administrator_role_tx(&mut tx, administrator.id).await?;
+    let target = sqlx::query(
+        "SELECT email, role FROM users
+         WHERE id = $1 AND deletion_requested_at IS NULL
+           AND ($2 = 'super_admin' OR role <> 'super_admin')
+         FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(&administrator_role)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::not_found("user not found"))?;
+    let existing_email: String = target.get("email");
+    let conflict: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM users
+             WHERE id <> $1 AND lower(btrim(email)) = lower(btrim($2))
+         )",
+    )
+    .bind(user_id)
+    .bind(&email)
+    .fetch_one(&mut *tx)
+    .await?;
+    if conflict {
+        return Err(ApiError::conflict("email already exists"));
+    }
+    let row = sqlx::query(
+        "UPDATE users SET email = $1, display_name = $2
+         WHERE id = $3
+         RETURNING id, email, display_name, role,
+                   password IS NOT NULL AS has_password, created_at",
+    )
+    .bind(&email)
+    .bind(display_name)
+    .bind(user_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if existing_email != email {
+        sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(Json(admin_user_detail_from_row(row)))
+}
+
+pub(crate) async fn set_admin_user_password(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(user_id): Path<Uuid>,
+    Json(req): Json<AdminSetUserPasswordRequest>,
+) -> Result<Json<AdminUserDetailDto>, ApiError> {
+    let administrator = require_administrator(&state, &headers).await?;
     if !(8..=1024).contains(&req.password.len()) {
         return Err(ApiError::bad_request(
             "password must be between 8 and 1024 bytes",
@@ -1548,587 +1622,1194 @@ pub(crate) async fn register_password_user(
     }
     let password =
         password_hash(&req.password).map_err(|_| ApiError::internal("password hashing failed"))?;
-    let user = create_password_registration_user(
-        &state.pool,
-        &email,
-        req.display_name.as_deref(),
-        Some(&password),
-    )
-    .await?;
-    let headers = state.session_issuer.issue(&state, user.id).await?;
-    Ok((headers, Json(PasswordRegistrationResponse { user })))
-}
-
-pub(crate) async fn logout(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, ApiError> {
-    if let Some(token) = session_token_from_headers(&headers) {
-        sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
-            .bind(sha256_hex(&token))
-            .execute(&state.pool)
-            .await?;
-    }
-    let mut response_headers = HeaderMap::new();
-    response_headers.insert(
-        header::SET_COOKIE,
-        HeaderValue::from_static("agent_hub_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
-    );
-    Ok((response_headers, StatusCode::NO_CONTENT))
-}
-
-pub(crate) async fn me(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<UserDto>, ApiError> {
-    Ok(Json(require_user(&state, &headers).await?))
-}
-
-pub(crate) async fn update_current_user(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(req): Json<UpdateCurrentUserRequest>,
-) -> Result<Json<UserDto>, ApiError> {
-    let user = require_user(&state, &headers).await?;
-    let display_name = normalize_display_name(Some(&req.display_name), &user.email)?;
-    let row = sqlx::query(
-        "UPDATE users SET display_name = $1
-         WHERE id = $2 AND deletion_requested_at IS NULL
-         RETURNING id, email, display_name, role",
-    )
-    .bind(display_name)
-    .bind(user.id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or(ApiError::unauthorized("user account is unavailable"))?;
-    Ok(Json(user_from_row(row)))
-}
-
-pub(crate) async fn list_users(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<UserDto>>, ApiError> {
-    let user = require_user(&state, &headers).await?;
-    let rows = sqlx::query(
-        "SELECT id, email, display_name, role
-         FROM users
-         WHERE deletion_requested_at IS NULL
-           AND (role <> 'super_admin' OR $1 = 'super_admin' OR id = $2)
-         ORDER BY display_name, email",
-    )
-    .bind(&user.role)
-    .bind(user.id)
-    .fetch_all(&state.pool)
-    .await?;
-    Ok(Json(rows.into_iter().map(user_from_row).collect()))
-}
-
-pub(crate) async fn auth_providers(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<AuthProvidersResponse>, ApiError> {
-    let policy = load_auth_policy(&state.pool).await?;
-    Ok(Json(AuthProvidersResponse {
-        password_registration_enabled: policy.password_registration_enabled,
-        password_login_enabled: policy.password_login_enabled,
-        ldap_login_enabled: policy.ldap_login_enabled,
-        email_placeholder: policy.email_placeholder,
-        password_placeholder: policy.password_placeholder,
-    }))
-}
-
-pub(crate) async fn get_auth_policy(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<AuthPolicyDto>, ApiError> {
-    require_administrator(&state, &headers).await?;
-    Ok(Json(load_auth_policy(&state.pool).await?))
-}
-
-pub(crate) async fn update_auth_policy(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(policy): Json<AuthPolicyDto>,
-) -> Result<Json<AuthPolicyDto>, ApiError> {
-    let user = require_administrator(&state, &headers).await?;
-    if policy.password_registration_enabled && !policy.password_login_enabled {
-        return Err(ApiError::conflict(
-            "password registration requires password login",
-        ));
-    }
-    if !policy.password_login_enabled && !policy.ldap_login_enabled {
-        return Err(ApiError::conflict(
-            "at least one ordinary login method must remain enabled",
-        ));
-    }
     let mut tx = state.pool.begin().await?;
-    require_administrator_role_tx(&mut tx, user.id).await?;
-    let current = sqlx::query(
-        "SELECT password_login_enabled, ldap_login_enabled
-         FROM auth_policy WHERE singleton = true FOR UPDATE",
+    let administrator_role = require_administrator_role_tx(&mut tx, administrator.id).await?;
+    let row = sqlx::query(
+        "UPDATE users
+         SET password = $1
+         WHERE id = $2 AND deletion_requested_at IS NULL
+           AND ($3 = 'super_admin' OR role <> 'super_admin')
+         RETURNING id, email, display_name, role,
+                   password IS NOT NULL AS has_password, created_at",
     )
+    .bind(password)
+    .bind(user_id)
+    .bind(&administrator_role)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::not_found("user not found"))?;
+    sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Json(admin_user_detail_from_row(row)))
+}
+
+pub(crate) async fn set_admin_user_role(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(user_id): Path<Uuid>,
+    Json(req): Json<AdminSetUserRoleRequest>,
+) -> Result<Json<AdminUserDetailDto>, ApiError> {
+    let administrator = require_super_admin(&state, &headers).await?;
+    let role = match req.role.trim() {
+        "member" => "member",
+        "admin" => "admin",
+        "super_admin" => "super_admin",
+        _ => return Err(ApiError::bad_request("unsupported user role")),
+    };
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('agent-hub-user-create', 0))")
+        .execute(&mut *tx)
+        .await?;
+    let actor_still_super: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM users
+             WHERE id = $1 AND role = 'super_admin'
+               AND deletion_requested_at IS NULL
+         )",
+    )
+    .bind(administrator.id)
     .fetch_one(&mut *tx)
     .await?;
-    if policy.ldap_login_enabled {
-        let configured: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM ldap_configuration WHERE singleton = true)",
-        )
-        .fetch_one(&mut *tx)
-        .await?;
-        if !configured {
-            return Err(ApiError::conflict(
-                "LDAP must be configured before LDAP login is enabled",
-            ));
-        }
+    if !actor_still_super {
+        return Err(ApiError::forbidden(
+            "super administrator permission is required",
+        ));
     }
-    let disables_login_method = (current.get::<bool, _>("password_login_enabled")
-        && !policy.password_login_enabled)
-        || (current.get::<bool, _>("ldap_login_enabled") && !policy.ldap_login_enabled);
-    if disables_login_method {
-        let emergency_access_exists: bool = sqlx::query_scalar(
+    let existing = sqlx::query(
+        "SELECT role FROM users
+         WHERE id = $1 AND deletion_requested_at IS NULL
+         FOR UPDATE",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::not_found("user not found"))?;
+    let existing_role: String = existing.get("role");
+    if existing_role == "super_admin" && role != "super_admin" {
+        let remaining: bool = sqlx::query_scalar(
             "SELECT EXISTS(
                  SELECT 1 FROM users
-                 WHERE role = 'super_admin' AND password IS NOT NULL
+                 WHERE role = 'super_admin'
                    AND deletion_requested_at IS NULL
+                   AND id <> $1
              )",
         )
+        .bind(user_id)
         .fetch_one(&mut *tx)
         .await?;
-        if !emergency_access_exists {
+        if !remaining {
             return Err(ApiError::conflict(
-                "a Super Administrator with a local password is required",
+                "at least one Super Administrator must remain",
             ));
         }
     }
     let row = sqlx::query(
-        "UPDATE auth_policy
-         SET password_registration_enabled = $1,
-             password_login_enabled = $2,
-             ldap_login_enabled = $3,
-             email_placeholder = $4,
-             password_placeholder = $5,
-             updated_by = $6,
-             updated_at = now()
-         WHERE singleton = true
-         RETURNING password_registration_enabled, password_login_enabled,
-                   ldap_login_enabled, email_placeholder, password_placeholder",
+        "UPDATE users SET role = $1
+         WHERE id = $2
+         RETURNING id, email, display_name, role,
+                   password IS NOT NULL AS has_password, created_at",
     )
-    .bind(policy.password_registration_enabled)
-    .bind(policy.password_login_enabled)
-    .bind(policy.ldap_login_enabled)
-    .bind(policy.email_placeholder.trim())
-    .bind(policy.password_placeholder.trim())
-    .bind(user.id)
+    .bind(role)
+    .bind(user_id)
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(Json(auth_policy_from_row(row)))
+    Ok(Json(admin_user_detail_from_row(row)))
 }
 
-pub(crate) async fn get_ldap_configuration(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<Option<LdapConfigurationDto>>, ApiError> {
-    require_administrator(&state, &headers).await?;
-    Ok(Json(load_ldap_configuration(&state.pool).await?))
-}
-
-pub(crate) async fn update_ldap_configuration(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(configuration): Json<LdapConfigurationDto>,
-) -> Result<Json<LdapConfigurationDto>, ApiError> {
-    let administrator = require_administrator(&state, &headers).await?;
-    let configuration = validate_ldap_configuration(configuration)?;
-    let mut tx = state.pool.begin().await?;
-    require_administrator_role_tx(&mut tx, administrator.id).await?;
-    sqlx::query(
-        "INSERT INTO ldap_configuration
-             (singleton, url, security_mode, base_dn, bind_identity_template, user_filter,
-              email_attribute, display_name_attribute, allow_insecure,
-              skip_tls_verify, updated_by, updated_at)
-         VALUES (true, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
-         ON CONFLICT (singleton) DO UPDATE
-         SET url = EXCLUDED.url,
-             security_mode = EXCLUDED.security_mode,
-             base_dn = EXCLUDED.base_dn,
-             bind_identity_template = EXCLUDED.bind_identity_template,
-             user_filter = EXCLUDED.user_filter,
-             email_attribute = EXCLUDED.email_attribute,
-             display_name_attribute = EXCLUDED.display_name_attribute,
-             allow_insecure = EXCLUDED.allow_insecure,
-             skip_tls_verify = EXCLUDED.skip_tls_verify,
-             updated_by = EXCLUDED.updated_by,
-             updated_at = now()",
+pub(crate) async fn load_admin_user(
+    pool: &PgPool,
+    user_id: Uuid,
+    administrator_role: &str,
+) -> Result<AdminUserDetailDto, ApiError> {
+    let row = sqlx::query(
+        "SELECT id, email, display_name, role,
+                password IS NOT NULL AS has_password, created_at
+         FROM users
+         WHERE id = $1 AND deletion_requested_at IS NULL
+           AND ($2 = 'super_admin' OR role <> 'super_admin')",
     )
-    .bind(&configuration.url)
-    .bind(ldap_security_mode_name(configuration.security))
-    .bind(&configuration.base_dn)
-    .bind(&configuration.bind_identity_template)
-    .bind(&configuration.user_filter)
-    .bind(&configuration.email_attribute)
-    .bind(&configuration.display_name_attribute)
-    .bind(configuration.allow_insecure)
-    .bind(configuration.skip_tls_verify)
-    .bind(administrator.id)
+    .bind(user_id)
+    .bind(administrator_role)
+    .fetch_optional(pool)
+    .await?;
+    row.map(admin_user_detail_from_row)
+        .ok_or(ApiError::not_found("user not found"))
+}
+
+pub(crate) async fn list_user_erasures(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<UserErasureDto>>, ApiError> {
+    let administrator = require_administrator(&state, &headers).await?;
+    let rows = sqlx::query(
+        "SELECT user_id, requested_email, requested_at
+         FROM user_erasure_jobs
+         WHERE $1 = 'super_admin' OR target_role <> 'super_admin'
+         ORDER BY requested_at DESC, user_id",
+    )
+    .bind(&administrator.role)
+    .fetch_all(&state.pool)
+    .await?;
+    let mut items = rows
+        .into_iter()
+        .map(|row| UserErasureDto {
+            user_id: row.get("user_id"),
+            email: Some(row.get("requested_email")),
+            status: "pending".into(),
+            requested_at: row.get("requested_at"),
+            completed_at: None,
+        })
+        .collect::<Vec<_>>();
+    let completed = sqlx::query(
+        "SELECT erased_user_id, erased_at
+         FROM user_erasure_audit
+         WHERE $1 = 'super_admin' OR erased_role <> 'super_admin'
+         ORDER BY erased_at DESC, erased_user_id",
+    )
+    .bind(&administrator.role)
+    .fetch_all(&state.pool)
+    .await?;
+    items.extend(completed.into_iter().map(|row| {
+        let erased_at = row.get("erased_at");
+        UserErasureDto {
+            user_id: row.get("erased_user_id"),
+            email: None,
+            status: "completed".into(),
+            requested_at: erased_at,
+            completed_at: Some(erased_at),
+        }
+    }));
+    items.sort_by_key(|item| std::cmp::Reverse((item.requested_at, item.user_id)));
+    Ok(Json(items))
+}
+
+pub(crate) async fn erase_user(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(user_id): Path<Uuid>,
+    Json(req): Json<EraseUserRequest>,
+) -> Result<(StatusCode, Json<UserErasureDto>), ApiError> {
+    let administrator = require_administrator(&state, &headers).await?;
+    begin_user_erasure(&state.pool, administrator.id, user_id, &req.email).await?;
+    if let Err(error) = process_user_erasure_job(&state, user_id).await {
+        warn!(user_id = %user_id, error = %error.message, "user erasure remains pending");
+    }
+    let erasure = load_user_erasure(&state.pool, user_id)
+        .await?
+        .ok_or(ApiError::internal("user erasure status disappeared"))?;
+    Ok((StatusCode::ACCEPTED, Json(erasure)))
+}
+
+pub(crate) async fn begin_user_erasure(
+    pool: &PgPool,
+    administrator_id: Uuid,
+    user_id: Uuid,
+    confirmed_email: &str,
+) -> Result<(), ApiError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('agent-hub-user-create', 0))")
+        .execute(&mut *tx)
+        .await?;
+    let administrator_role: String = sqlx::query_scalar(
+        "SELECT role FROM users
+         WHERE id = $1 AND role IN ('admin', 'super_admin')
+           AND deletion_requested_at IS NULL",
+    )
+    .bind(administrator_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::forbidden("administrator permission is required"))?;
+    let user = sqlx::query(
+        "SELECT email, role, deletion_requested_at
+         FROM users WHERE id = $1 FOR UPDATE",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(user) = user else {
+        let completed: Option<String> = sqlx::query_scalar(
+            "SELECT erased_role
+             FROM user_erasure_audit WHERE erased_user_id = $1",
+        )
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        return if completed
+            .is_some_and(|role| administrator_role == "super_admin" || role != "super_admin")
+        {
+            Ok(())
+        } else {
+            Err(ApiError::not_found("user not found"))
+        };
+    };
+    let email: String = user.get("email");
+    let target_role: String = user.get("role");
+    if administrator_role != "super_admin" && target_role == "super_admin" {
+        return Err(ApiError::not_found("user not found"));
+    }
+    if email != confirmed_email.trim() {
+        return Err(ApiError::conflict(
+            "email confirmation does not match exactly",
+        ));
+    }
+    if user
+        .get::<Option<DateTime<Utc>>, _>("deletion_requested_at")
+        .is_some()
+    {
+        tx.commit().await?;
+        return Ok(());
+    }
+    if target_role == "super_admin" {
+        let remaining: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM users
+                 WHERE role = 'super_admin'
+                   AND deletion_requested_at IS NULL
+                   AND id <> $1
+             )",
+        )
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !remaining {
+            return Err(ApiError::conflict(
+                "at least one Super Administrator must remain",
+            ));
+        }
+    }
+
+    let agent_ids = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM agents WHERE owner_id = $1 ORDER BY id FOR UPDATE",
+    )
+    .bind(user_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    sqlx::query(
+        "SELECT id FROM automations
+         WHERE owner_id = $1 OR agent_id = ANY($2)
+         ORDER BY id FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(&agent_ids)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO user_erasure_jobs
+             (user_id, requested_by, requested_email, target_role)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (user_id) DO NOTHING",
+    )
+    .bind(user_id)
+    .bind(administrator_id)
+    .bind(&email)
+    .bind(&target_role)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE users
+         SET deletion_requested_at = now(), password = NULL
+         WHERE id = $1",
+    )
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM api_keys WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query(
+        "INSERT INTO user_erasure_bundle_objects (user_id, object_key)
+         SELECT $1, object_key
+         FROM (
+             SELECT current_bundle_object_key AS object_key
+             FROM hub_sessions
+             WHERE (owner_id = $1 OR agent_id = ANY($2))
+               AND current_bundle_object_key IS NOT NULL
+             UNION
+             SELECT queue.object_key
+             FROM session_bundle_deletion_queue AS queue
+             JOIN hub_sessions AS session ON session.id = queue.session_id
+             WHERE session.owner_id = $1 OR session.agent_id = ANY($2)
+         ) AS objects
+         ON CONFLICT (user_id, object_key) DO NOTHING",
+    )
+    .bind(user_id)
+    .bind(&agent_ids)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO user_erasure_skill_objects (user_id, object_key)
+         SELECT $1, object_key FROM skill_packages WHERE owner_id = $1
+         UNION
+         SELECT $1, object_key FROM skill_package_deletion_queue WHERE owner_id = $1
+         ON CONFLICT (user_id, object_key) DO NOTHING",
+    )
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "UPDATE runtime_session_cleanup_obligations AS cleanup
+         SET erasure_user_id = $1
+         WHERE cleanup.session_id IN (
+             SELECT id FROM hub_sessions
+             WHERE owner_id = $1 OR agent_id = ANY($2)
+         )",
+    )
+    .bind(user_id)
+    .bind(&agent_ids)
+    .execute(&mut *tx)
+    .await?;
+    let owned = sqlx::query(
+        "SELECT id, runtime_owner_id, ownership_generation
+         FROM hub_sessions
+         WHERE (owner_id = $1 OR agent_id = ANY($2))
+           AND runtime_owner_id IS NOT NULL
+         ORDER BY id FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(&agent_ids)
+    .fetch_all(&mut *tx)
+    .await?;
+    for session in owned {
+        record_runtime_session_cleanup_tx(
+            &mut tx,
+            session.get("runtime_owner_id"),
+            session.get("id"),
+            session.get("ownership_generation"),
+            Some(user_id),
+        )
+        .await?;
+    }
+
+    sqlx::query(
+        "DELETE FROM oauth_authorization_codes AS code
+         USING oauth_apps AS app
+         WHERE code.oauth_app_id = app.id
+           AND (app.owner_id = $1 OR code.subject_user_id = $1)",
+    )
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM oauth_access_tokens AS token
+         USING oauth_apps AS app
+         WHERE token.oauth_app_id = app.id
+           AND (app.owner_id = $1 OR token.subject_user_id = $1)",
+    )
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE authentication_channels AS channel
+         SET enabled = false, updated_at = now()
+         FROM oauth_apps AS app
+         WHERE channel.id = app.authentication_channel_id
+           AND app.owner_id = $1",
+    )
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE oauth_apps
+         SET client_secret_hash = NULL, redirect_uris = '[]'::jsonb,
+             deleted_at = COALESCE(deleted_at, now()), updated_at = now()
+         WHERE owner_id = $1",
+    )
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM integration_app_agents WHERE agent_id = ANY($1)")
+        .bind(&agent_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "DELETE FROM automations
+         WHERE owner_id = $1 OR agent_id = ANY($2)",
+    )
+    .bind(user_id)
+    .bind(&agent_ids)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM embed_sessions
+         WHERE owner_id = $1 OR agent_id = ANY($2)",
+    )
+    .bind(user_id)
+    .bind(&agent_ids)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE integration_tool_requests AS request
+         SET status = 'cancelled', responded_at = COALESCE(responded_at, now())
+         FROM integration_sessions AS integration
+         WHERE request.session_id = integration.id
+           AND (integration.owner_id = $1 OR integration.agent_id = ANY($2))
+           AND request.status <> 'completed'",
+    )
+    .bind(user_id)
+    .bind(&agent_ids)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE runs
+         SET status = 'failed', runtime_id = NULL,
+             model_proxy_token_hash = NULL, work_dir_ref = NULL, updated_at = now()
+         WHERE (owner_id = $1 OR agent_id = ANY($2))
+           AND status IN ('pending', 'running', 'waiting_tool')",
+    )
+    .bind(user_id)
+    .bind(&agent_ids)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE runs
+         SET model_proxy_token_hash = NULL, work_dir_ref = NULL, updated_at = now()
+         WHERE owner_id = $1 OR agent_id = ANY($2)",
+    )
+    .bind(user_id)
+    .bind(&agent_ids)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE hub_session_turns AS turn
+         SET status = 'failed', ended_at = COALESCE(ended_at, now()), updated_at = now()
+         FROM hub_sessions AS session
+         WHERE turn.session_id = session.id
+           AND (session.owner_id = $1 OR session.agent_id = ANY($2))
+           AND turn.status NOT IN ('completed', 'failed', 'interrupted')",
+    )
+    .bind(user_id)
+    .bind(&agent_ids)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE hub_session_messages AS message
+         SET delivery_state = 'failed'
+         FROM hub_sessions AS session
+         WHERE message.session_id = session.id
+           AND (session.owner_id = $1 OR session.agent_id = ANY($2))
+           AND message.delivery_state IN ('queued', 'deferred', 'delivering')",
+    )
+    .bind(user_id)
+    .bind(&agent_ids)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE hub_sessions
+         SET lifecycle_status = 'historical', active_turn_id = NULL,
+             configuration_fingerprint = NULL,
+             runtime_owner_id = NULL, ownership_generation = ownership_generation + 1,
+             recovery_error = NULL,
+             current_bundle_generation = NULL, current_bundle_object_key = NULL,
+             current_bundle_checksum_sha256 = NULL, current_bundle_size_bytes = NULL,
+             current_bundle_history_checkpoint = NULL,
+             current_bundle_ownership_generation = NULL,
+             current_bundle_producing_engine_version = NULL,
+             current_bundle_created_at = NULL, current_bundle_runtime_id = NULL,
+             current_bundle_checkpoint_attempt_id = NULL,
+             saving_history_checkpoint = NULL, saving_ownership_generation = NULL,
+             saving_reason = NULL, saving_checkpoint_attempt_id = NULL,
+             last_checkpoint_attempt_id = NULL,
+             last_checkpoint_ownership_generation = NULL,
+             last_checkpoint_disposition = NULL,
+             last_checkpoint_has_queued_work = NULL
+         WHERE owner_id = $1 OR agent_id = ANY($2)",
+    )
+    .bind(user_id)
+    .bind(&agent_ids)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE agents
+         SET instructions = '', visibility = 'private', public_to = '{}',
+             runtime_id = NULL, model_policy = '{}'::jsonb,
+             sandbox_policy = '{}'::jsonb, mcp_allowlist = '[]'::jsonb,
+             execution_config_revision = execution_config_revision + 1,
+             deleted_at = COALESCE(deleted_at, now()), updated_at = now()
+         WHERE owner_id = $1",
+    )
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE agents
+         SET public_to = array_remove(public_to, $1), updated_at = now()
+         WHERE $1 = ANY(public_to)",
+    )
+    .bind(user_id)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(Json(configuration))
+    Ok(())
 }
 
-pub(crate) async fn test_ldap_configuration(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(req): Json<TestLdapConfigurationRequest>,
-) -> Result<Json<TestLdapConfigurationResponse>, ApiError> {
-    require_administrator(&state, &headers).await?;
-    let configuration = validate_ldap_configuration(req.configuration)?;
-    let rate_email =
-        login_rate_email(&req.email).ok_or(ApiError::bad_request("valid email is required"))?;
-    reserve_email_login_attempt(&state.pool, &rate_email).await?;
-    let request_id = Uuid::new_v4();
-    let started_at = Instant::now();
-    let identity = match query_ldap_directory(&configuration, &req.email, &req.password).await {
-        Ok(identity) => identity,
-        Err(error) => {
-            warn!(
-                request_id = %request_id,
-                stage = error.stage,
-                category = error.category,
-                duration_ms = started_at.elapsed().as_millis(),
-                "LDAP configuration test failed"
-            );
-            return Err(error.for_administrator());
-        }
-    };
-    clear_email_login_failures(&state.pool, &rate_email).await?;
-    let display_name = identity
-        .display_name
-        .unwrap_or_else(|| email_local_part(&identity.email).to_owned());
-    Ok(Json(TestLdapConfigurationResponse {
-        email: identity.email,
-        display_name,
-        duration_ms: started_at.elapsed().as_millis().min(i64::MAX as u128) as i64,
-    }))
-}
-
-pub(crate) async fn list_external_platforms(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<ExternalPlatformDto>>, ApiError> {
-    require_administrator(&state, &headers).await?;
-    let rows = sqlx::query("SELECT id, key, name FROM external_platforms ORDER BY key")
-        .fetch_all(&state.pool)
-        .await?;
-    Ok(Json(
-        rows.into_iter().map(external_platform_from_row).collect(),
-    ))
-}
-
-pub(crate) async fn create_external_platform(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(req): Json<CreateExternalPlatformRequest>,
-) -> Result<Json<ExternalPlatformDto>, ApiError> {
-    require_administrator(&state, &headers).await?;
-    let key = validate_identity_key(&req.key, "platform key")?;
-    let name = validate_identity_name(&req.name, "platform name")?;
-    let row = sqlx::query(
-        "INSERT INTO external_platforms (id, key, name)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (key) DO NOTHING
-         RETURNING id, key, name",
+pub(crate) async fn load_user_erasure(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Option<UserErasureDto>, ApiError> {
+    if let Some(row) = sqlx::query(
+        "SELECT requested_email, requested_at
+         FROM user_erasure_jobs WHERE user_id = $1",
     )
-    .bind(Uuid::new_v4())
-    .bind(key)
-    .bind(name)
-    .fetch_optional(&state.pool)
-    .await?;
-    row.map(external_platform_from_row)
-        .map(Json)
-        .ok_or_else(|| ApiError::conflict("external platform key already exists"))
-}
-
-pub(crate) async fn update_external_platform(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(platform_id): Path<Uuid>,
-    Json(req): Json<UpdateExternalPlatformRequest>,
-) -> Result<Json<ExternalPlatformDto>, ApiError> {
-    require_administrator(&state, &headers).await?;
-    let name = validate_identity_name(&req.name, "platform name")?;
-    let row = sqlx::query(
-        "UPDATE external_platforms
-         SET name = $1, updated_at = now()
-         WHERE id = $2
-         RETURNING id, key, name",
-    )
-    .bind(name)
-    .bind(platform_id)
-    .fetch_optional(&state.pool)
-    .await?;
-    row.map(external_platform_from_row)
-        .map(Json)
-        .ok_or(ApiError::not_found("external platform not found"))
-}
-
-pub(crate) async fn list_authentication_channels(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(platform_id): Path<Uuid>,
-) -> Result<Json<Vec<AuthenticationChannelDto>>, ApiError> {
-    require_administrator(&state, &headers).await?;
-    require_external_platform(&state.pool, platform_id).await?;
-    let rows = sqlx::query(
-        "SELECT id, platform_id, key, name, enabled, trusted_email
-         FROM authentication_channels
-         WHERE platform_id = $1
-         ORDER BY key",
-    )
-    .bind(platform_id)
-    .fetch_all(&state.pool)
-    .await?;
-    Ok(Json(
-        rows.into_iter()
-            .map(authentication_channel_from_row)
-            .collect(),
-    ))
-}
-
-pub(crate) async fn create_authentication_channel(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(platform_id): Path<Uuid>,
-    Json(req): Json<CreateAuthenticationChannelRequest>,
-) -> Result<Json<AuthenticationChannelDto>, ApiError> {
-    require_administrator(&state, &headers).await?;
-    require_external_platform(&state.pool, platform_id).await?;
-    let key = validate_identity_key(&req.key, "channel key")?;
-    let name = validate_identity_name(&req.name, "channel name")?;
-    let row = sqlx::query(
-        "INSERT INTO authentication_channels
-             (id, platform_id, key, name, enabled, trusted_email)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT (platform_id, key) DO NOTHING
-         RETURNING id, platform_id, key, name, enabled, trusted_email",
-    )
-    .bind(Uuid::new_v4())
-    .bind(platform_id)
-    .bind(key)
-    .bind(name)
-    .bind(req.enabled)
-    .bind(req.trusted_email)
-    .fetch_optional(&state.pool)
-    .await?;
-    row.map(authentication_channel_from_row)
-        .map(Json)
-        .ok_or_else(|| ApiError::conflict("authentication channel key already exists"))
-}
-
-pub(crate) async fn update_authentication_channel(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(channel_id): Path<Uuid>,
-    Json(req): Json<UpdateAuthenticationChannelRequest>,
-) -> Result<Json<AuthenticationChannelDto>, ApiError> {
-    require_administrator(&state, &headers).await?;
-    let name = validate_identity_name(&req.name, "channel name")?;
-    let row = sqlx::query(
-        "UPDATE authentication_channels
-         SET name = $1, enabled = $2, trusted_email = $3, updated_at = now()
-         WHERE id = $4
-         RETURNING id, platform_id, key, name, enabled, trusted_email",
-    )
-    .bind(name)
-    .bind(req.enabled)
-    .bind(req.trusted_email)
-    .bind(channel_id)
-    .fetch_optional(&state.pool)
-    .await?;
-    row.map(authentication_channel_from_row)
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found("authentication channel not found"))
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct ApiKeyListQuery {
-    page: Option<i64>,
-    page_size: Option<i64>,
-}
-
-impl ApiKeyListQuery {
-    fn validated(self) -> Result<(i64, i64, i64), ApiError> {
-        let page = self.page.unwrap_or(1);
-        let page_size = self.page_size.unwrap_or(20);
-        if page < 1 || !(1..=100).contains(&page_size) {
-            return Err(ApiError::bad_request("invalid API key pagination"));
-        }
-        let offset = page
-            .checked_sub(1)
-            .and_then(|value| value.checked_mul(page_size))
-            .ok_or_else(|| ApiError::bad_request("invalid API key pagination"))?;
-        Ok((page, page_size, offset))
-    }
-}
-
-pub(crate) async fn list_api_keys(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Query(query): Query<ApiKeyListQuery>,
-) -> Result<Json<ApiKeyListResponse>, ApiError> {
-    let user = require_user(&state, &headers).await?;
-    let (page, page_size, offset) = query.validated()?;
-    let total = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM api_keys WHERE user_id = $1")
-        .bind(user.id)
-        .fetch_one(&state.pool)
-        .await?;
-    let rows = sqlx::query(
-        "SELECT id, name, prefix, last_used_at, expires_at, created_at
-         FROM api_keys
-         WHERE user_id = $1
-         ORDER BY created_at DESC, id DESC
-         LIMIT $2 OFFSET $3",
-    )
-    .bind(user.id)
-    .bind(page_size)
-    .bind(offset)
-    .fetch_all(&state.pool)
-    .await?;
-    Ok(Json(ApiKeyListResponse {
-        items: rows.into_iter().map(api_key_from_row).collect(),
-        total,
-        page,
-        page_size,
-    }))
-}
-
-pub(crate) async fn create_api_key(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(req): Json<CreateApiKeyRequest>,
-) -> Result<Json<CreateApiKeyResponse>, ApiError> {
-    let user = require_user(&state, &headers).await?;
-    if req.name.trim().is_empty() {
-        return Err(ApiError::bad_request("api key name is required"));
-    }
-    let token = new_api_key_token();
-    let prefix = token.chars().take(12).collect::<String>();
-    let token_hash = sha256_hex(&token);
-    let expires_at = api_key_expiration(req.validity.as_ref(), Utc::now())?;
-    let row = sqlx::query(
-        "INSERT INTO api_keys (id, user_id, name, prefix, token_hash, expires_at)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         RETURNING id, name, prefix, last_used_at, expires_at, created_at",
-    )
-    .bind(Uuid::new_v4())
-    .bind(user.id)
-    .bind(req.name.trim())
-    .bind(prefix)
-    .bind(token_hash)
-    .bind(expires_at)
-    .fetch_one(&state.pool)
-    .await?;
-    Ok(Json(CreateApiKeyResponse {
-        api_key: api_key_from_row(row),
-        token,
-    }))
-}
-
-pub(crate) fn new_api_key_token() -> String {
-    format!("ahk_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
-}
-
-pub(crate) async fn renew_api_key(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(api_key_id): Path<Uuid>,
-    Json(req): Json<RenewApiKeyRequest>,
-) -> Result<Json<ApiKeyDto>, ApiError> {
-    let (user, credential_api_key_id) = require_user_with_api_key_id(&state, &headers).await?;
-    if credential_api_key_id == Some(api_key_id) {
-        return Err(ApiError::not_found("api key not found"));
-    }
-    let mut tx = state.pool.begin().await?;
-    let current_expiration = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
-        "SELECT expires_at FROM api_keys
-         WHERE id = $1 AND user_id = $2
-         FOR UPDATE",
-    )
-    .bind(api_key_id)
-    .bind(user.id)
-    .fetch_optional(&mut *tx)
+    .bind(user_id)
+    .fetch_optional(pool)
     .await?
-    .ok_or(ApiError::not_found("api key not found"))?;
-    let expires_at = renewed_api_key_expiration(&req.validity, current_expiration, Utc::now())?;
-    let row = sqlx::query(
-        "UPDATE api_keys
-         SET expires_at = $1
-         WHERE id = $2 AND user_id = $3
-         RETURNING id, name, prefix, last_used_at, expires_at, created_at",
+    {
+        return Ok(Some(UserErasureDto {
+            user_id,
+            email: Some(row.get("requested_email")),
+            status: "pending".into(),
+            requested_at: row.get("requested_at"),
+            completed_at: None,
+        }));
+    }
+    Ok(sqlx::query_scalar::<_, DateTime<Utc>>(
+        "SELECT erased_at FROM user_erasure_audit WHERE erased_user_id = $1",
     )
-    .bind(expires_at)
-    .bind(api_key_id)
-    .bind(user.id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?
+    .map(|erased_at| UserErasureDto {
+        user_id,
+        email: None,
+        status: "completed".into(),
+        requested_at: erased_at,
+        completed_at: Some(erased_at),
+    }))
+}
+
+pub(crate) async fn process_user_erasure_job(
+    state: &AppState,
+    user_id: Uuid,
+) -> Result<(), ApiError> {
+    let objects = sqlx::query_scalar::<_, String>(
+        "SELECT object_key FROM user_erasure_bundle_objects
+         WHERE user_id = $1 ORDER BY created_at, object_key",
+    )
+    .bind(user_id)
+    .fetch_all(&state.pool)
+    .await?;
+    if !objects.is_empty() {
+        let store = state.session_bundle_store.as_ref().ok_or_else(|| {
+            ApiError::service_unavailable("Session Bundle object storage is not configured")
+        })?;
+        for object_key in objects {
+            match store.delete(&object_key).await {
+                Ok(()) => {
+                    sqlx::query(
+                        "DELETE FROM user_erasure_bundle_objects
+                         WHERE user_id = $1 AND object_key = $2",
+                    )
+                    .bind(user_id)
+                    .bind(&object_key)
+                    .execute(&state.pool)
+                    .await?;
+                }
+                Err(error) => {
+                    sqlx::query(
+                        "UPDATE user_erasure_bundle_objects
+                         SET attempts = attempts + 1,
+                             last_error = 'object store delete failed', updated_at = now()
+                         WHERE user_id = $1 AND object_key = $2",
+                    )
+                    .bind(user_id)
+                    .bind(&object_key)
+                    .execute(&state.pool)
+                    .await?;
+                    warn!(user_id = %user_id, object_key = %object_key, error = %error,
+                        "failed to delete erased user's Session Bundle object");
+                    return Err(ApiError::bad_gateway(
+                        "failed to delete one or more Session Bundle objects",
+                    ));
+                }
+            }
+        }
+    }
+    let skill_objects = sqlx::query_scalar::<_, String>(
+        "SELECT object_key FROM user_erasure_skill_objects
+         WHERE user_id = $1 ORDER BY created_at, object_key",
+    )
+    .bind(user_id)
+    .fetch_all(&state.pool)
+    .await?;
+    if !skill_objects.is_empty() {
+        let store = state.skill_package_store.as_ref().ok_or_else(|| {
+            ApiError::service_unavailable("Skill package object storage is not configured")
+        })?;
+        for object_key in skill_objects {
+            match store.delete(&object_key).await {
+                Ok(()) => {
+                    let mut tx = state.pool.begin().await?;
+                    sqlx::query(
+                        "DELETE FROM user_erasure_skill_objects
+                         WHERE user_id = $1 AND object_key = $2",
+                    )
+                    .bind(user_id)
+                    .bind(&object_key)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query("DELETE FROM skill_package_deletion_queue WHERE object_key = $1")
+                        .bind(&object_key)
+                        .execute(&mut *tx)
+                        .await?;
+                    tx.commit().await?;
+                }
+                Err(error) => {
+                    sqlx::query(
+                        "UPDATE user_erasure_skill_objects
+                         SET attempts = attempts + 1,
+                             last_error = 'object store delete failed', updated_at = now()
+                         WHERE user_id = $1 AND object_key = $2",
+                    )
+                    .bind(user_id)
+                    .bind(&object_key)
+                    .execute(&state.pool)
+                    .await?;
+                    warn!(user_id = %user_id, object_key = %object_key, error = %error,
+                        "failed to delete erased user's Skill package object");
+                    return Err(ApiError::bad_gateway(
+                        "failed to delete one or more Skill package objects",
+                    ));
+                }
+            }
+        }
+    }
+    finalize_user_erasure(state, user_id).await
+}
+
+pub(crate) async fn finalize_user_erasure(state: &AppState, user_id: Uuid) -> Result<(), ApiError> {
+    let mut tx = state.pool.begin().await?;
+    let job = sqlx::query(
+        "SELECT requested_by, target_role FROM user_erasure_jobs
+         WHERE user_id = $1 FOR UPDATE",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(job) = job else {
+        tx.commit().await?;
+        return Ok(());
+    };
+    let pending_objects: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM user_erasure_bundle_objects WHERE user_id = $1
+             UNION ALL
+             SELECT 1 FROM user_erasure_skill_objects WHERE user_id = $1
+         )",
+    )
+    .bind(user_id)
     .fetch_one(&mut *tx)
     .await?;
+    let pending_workspaces: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM runtime_session_cleanup_obligations
+             WHERE erasure_user_id = $1
+         )",
+    )
+    .bind(user_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if pending_objects || pending_workspaces {
+        tx.commit().await?;
+        return Ok(());
+    }
+
+    let agent_ids = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM agents WHERE owner_id = $1 ORDER BY id FOR UPDATE",
+    )
+    .bind(user_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let session_ids = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM hub_sessions
+         WHERE owner_id = $1 OR agent_id = ANY($2)
+         ORDER BY id FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(&agent_ids)
+    .fetch_all(&mut *tx)
+    .await?;
+    let run_ids = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM runs
+         WHERE owner_id = $1 OR agent_id = ANY($2) OR hub_session_id = ANY($3)",
+    )
+    .bind(user_id)
+    .bind(&agent_ids)
+    .bind(&session_ids)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "UPDATE agents
+         SET execution_config_revision = execution_config_revision + 1, updated_at = now()
+         WHERE id IN (
+             SELECT agent_skills.agent_id
+             FROM agent_skills
+             JOIN skills ON skills.id = agent_skills.skill_id
+             WHERE skills.owner_id = $1 AND agent_skills.agent_id <> ALL($2)
+         )",
+    )
+    .bind(user_id)
+    .bind(&agent_ids)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE hub_sessions SET active_turn_id = NULL
+         WHERE id = ANY($1)",
+    )
+    .bind(&session_ids)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE hub_session_messages
+         SET run_id = NULL, turn_id = NULL
+         WHERE session_id = ANY($1)",
+    )
+    .bind(&session_ids)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM integration_attachments
+         WHERE hub_message_id IN (
+             SELECT id FROM hub_session_messages WHERE session_id = ANY($1)
+         ) OR run_id = ANY($2)",
+    )
+    .bind(&session_ids)
+    .bind(&run_ids)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM integration_messages
+         WHERE hub_message_id IN (
+             SELECT id FROM hub_session_messages WHERE session_id = ANY($1)
+         ) OR run_id = ANY($2)",
+    )
+    .bind(&session_ids)
+    .bind(&run_ids)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM run_events
+         WHERE run_id = ANY($1) OR hub_message_id IN (
+             SELECT id FROM hub_session_messages WHERE session_id = ANY($2)
+         )",
+    )
+    .bind(&run_ids)
+    .bind(&session_ids)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM embed_sessions WHERE hub_session_id = ANY($1)")
+        .bind(&session_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM integration_sessions WHERE hub_session_id = ANY($1)")
+        .bind(&session_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM session_bundle_deletion_queue WHERE session_id = ANY($1)")
+        .bind(&session_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM runs WHERE id = ANY($1)")
+        .bind(&run_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM hub_session_messages WHERE session_id = ANY($1)")
+        .bind(&session_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM hub_session_turns WHERE session_id = ANY($1)")
+        .bind(&session_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM hub_sessions WHERE id = ANY($1)")
+        .bind(&session_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "WITH deleted_apps AS (
+             DELETE FROM oauth_apps
+             WHERE owner_id = $1 OR agent_id = ANY($2)
+             RETURNING external_platform_id
+         )
+         DELETE FROM external_platforms
+         WHERE id IN (SELECT external_platform_id FROM deleted_apps)",
+    )
+    .bind(user_id)
+    .bind(&agent_ids)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM agents WHERE id = ANY($1)")
+        .bind(&agent_ids)
+        .execute(&mut *tx)
+        .await?;
+    let erased_at = Utc::now();
+    sqlx::query(
+        "INSERT INTO user_erasure_audit
+             (erased_user_id, acting_administrator_id, erased_at, erased_role)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (erased_user_id) DO NOTHING",
+    )
+    .bind(user_id)
+    .bind(job.get::<Uuid, _>("requested_by"))
+    .bind(erased_at)
+    .bind(job.get::<String, _>("target_role"))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM user_erasure_jobs WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
-    Ok(Json(api_key_from_row(row)))
+    Ok(())
 }
 
-pub(crate) fn api_key_expiration(
-    validity: Option<&ApiKeyValidity>,
-    now: DateTime<Utc>,
-) -> Result<Option<DateTime<Utc>>, ApiError> {
-    match validity.unwrap_or(&ApiKeyValidity::Days { days: 90 }) {
-        ApiKeyValidity::Days { days } if matches!(days, 30 | 90 | 180 | 365) => {
-            Ok(Some(now + ChronoDuration::days(i64::from(*days))))
+pub(crate) async fn user_erasure_loop(state: Arc<AppState>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(5));
+    loop {
+        tick.tick().await;
+        let user_ids = match sqlx::query_scalar::<_, Uuid>(
+            "SELECT user_id FROM user_erasure_jobs ORDER BY requested_at, user_id",
+        )
+        .fetch_all(&state.pool)
+        .await
+        {
+            Ok(user_ids) => user_ids,
+            Err(error) => {
+                warn!(error = %error, "failed to list pending user erasures");
+                continue;
+            }
+        };
+        for user_id in user_ids {
+            if let Err(error) = process_user_erasure_job(&state, user_id).await {
+                let _ = sqlx::query(
+                    "UPDATE user_erasure_jobs
+                     SET attempts = attempts + 1, last_error = $1, updated_at = now()
+                     WHERE user_id = $2",
+                )
+                .bind(&error.message)
+                .bind(user_id)
+                .execute(&state.pool)
+                .await;
+                warn!(user_id = %user_id, error = %error.message, "user erasure retry failed");
+            }
         }
-        ApiKeyValidity::Days { .. } => Err(ApiError::bad_request(
-            "api key validity days must be 30, 90, 180, or 365",
-        )),
-        ApiKeyValidity::Date { expires_at } if *expires_at > now => Ok(Some(*expires_at)),
-        ApiKeyValidity::Date { .. } => Err(ApiError::bad_request(
-            "api key expiration must be in the future",
-        )),
-        ApiKeyValidity::Never => Ok(None),
     }
 }
 
-pub(crate) fn renewed_api_key_expiration(
-    validity: &ApiKeyValidity,
-    current_expiration: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
-) -> Result<Option<DateTime<Utc>>, ApiError> {
-    let current_expiration = current_expiration.ok_or(ApiError::bad_request(
-        "permanent api keys cannot be renewed",
-    ))?;
-    let requested = api_key_expiration(Some(validity), now)?;
-    if requested.is_some_and(|expires_at| expires_at <= current_expiration) {
-        return Err(ApiError::bad_request(
-            "api key renewal must extend its expiration",
-        ));
-    }
-    Ok(requested)
+#[derive(Debug, Deserialize)]
+struct UpdateHubSessionTitleRequest {
+    title: String,
 }
 
-pub(crate) async fn delete_api_key(
+pub(crate) async fn update_hub_session_title(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path(api_key_id): Path<Uuid>,
-) -> Result<StatusCode, ApiError> {
-    let (user, credential_api_key_id) = require_user_with_api_key_id(&state, &headers).await?;
-    if credential_api_key_id == Some(api_key_id) {
-        return Err(ApiError::not_found("api key not found"));
+    Path(session_id): Path<Uuid>,
+    Json(req): Json<UpdateHubSessionTitleRequest>,
+) -> Result<Json<HubSessionDto>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    let title = req.title.trim();
+    if title.is_empty() || title.chars().count() > 40 {
+        return Err(ApiError::bad_request(
+            "Session title must be 1 to 40 characters",
+        ));
     }
-    let deleted = sqlx::query("DELETE FROM api_keys WHERE id = $1 AND user_id = $2")
-        .bind(api_key_id)
+    let updated = sqlx::query("UPDATE hub_sessions SET title = $1 WHERE id = $2 AND owner_id = $3")
+        .bind(title)
+        .bind(session_id)
         .bind(user.id)
         .execute(&state.pool)
         .await?;
-    if deleted.rows_affected() == 0 {
-        return Err(ApiError::not_found("api key not found"));
+    if updated.rows_affected() == 0 {
+        return Err(ApiError::not_found("session not found"));
     }
-    Ok(StatusCode::NO_CONTENT)
+    get_hub_session(axum::extract::State(state), headers, Path(session_id)).await
+}
+
+pub(crate) async fn generate_session_title_in_background(
+    state: Arc<AppState>,
+    session_id: Uuid,
+    agent_id: Uuid,
+    user_id: Uuid,
+    first_message: String,
+) {
+    info!(session_id = %session_id, agent_id = %agent_id, "session title generation started");
+    let outcome: anyhow::Result<()> = async {
+        let model = sqlx::query(
+            "SELECT a.name AS agent_name, a.model_connection_id, a.model_id,
+                    c.scope, c.name AS connection_name, c.base_url, c.api_type,
+                    c.api_key_ciphertext, c.api_key_nonce
+             FROM agents a
+             JOIN model_connections c ON c.id = a.model_connection_id
+             WHERE a.id = $1 AND a.deleted_at IS NULL
+               AND c.deleted_at IS NULL AND c.enabled",
+        )
+        .bind(agent_id)
+        .fetch_optional(&state.pool)
+        .await?;
+        let Some(model) = model else {
+            warn!(session_id = %session_id, agent_id = %agent_id,
+                "session title generation skipped: no enabled model connection");
+            return Ok(());
+        };
+        let api_type =
+            model_upstream_protocol_from_name(&model.get::<String, _>("api_type"));
+        if api_type != ModelUpstreamProtocol::OpenaiResponses {
+            return Ok(());
+        }
+        let connection_id: Uuid = model.get("model_connection_id");
+        let model_id: String = model.get("model_id");
+        let base_url: String = model.get("base_url");
+        let connection_name: String = model.get("connection_name");
+        let connection_scope = match model.get::<String, _>("scope").as_str() {
+            "global" => ModelConnectionScope::Global,
+            _ => ModelConnectionScope::Personal,
+        };
+        let agent_name: String = model.get("agent_name");
+        let ciphertext: Vec<u8> = model.get("api_key_ciphertext");
+        let nonce: Vec<u8> = model.get("api_key_nonce");
+        let api_key = Zeroizing::new(
+            state
+                .model_secret_cipher
+                .decrypt(&ciphertext, &nonce)
+                .map_err(|_| anyhow::anyhow!("model secret decryption failed"))?,
+        );
+        let request_settings = ModelRequestSettings::for_protocol(api_type);
+        let prompt = format!(
+            "根据用户的第一条消息，为这段对话生成一个简洁的中文标题（15 字以内），概括用户的意图或任务主题。\n要求：不要写问候语或自我介绍；不要写“我能做什么”之类的回应；直接输出标题本身；不要引号，不要解释。\n\n示例：\n用户消息：帮我看看如何排查网络延迟问题\n标题：网络延迟问题排查\n\n用户消息：你好\n标题：日常问候\n\n用户消息：帮我规划一下数据库备份策略\n标题：数据库备份策略规划\n\n用户消息：{}\n标题：",
+            first_message.chars().take(400).collect::<String>()
+        );
+        let request_body = serde_json::to_vec(&json!({
+            "model": model_id,
+            "input": prompt,
+            "max_output_tokens": 64,
+            "temperature": 0.3
+        }))?;
+        let request_id = Uuid::new_v4();
+        let response = send_model_gateway_request(
+            &state,
+            ModelGatewayForwardRequest {
+                request_id,
+                upstream_protocol: api_type,
+                request_settings: &request_settings,
+                upstream_url: &base_url,
+                query: None,
+                headers: &HeaderMap::new(),
+                body: &request_body,
+                api_key: &api_key,
+            },
+        )
+        .await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        let value = serde_json::from_slice::<Value>(&body)?;
+        if status.is_success() {
+            if let Some(usage) = extract_model_usage(&value) {
+                record_session_title_usage(
+                    &state,
+                    request_id,
+                    &value,
+                    usage,
+                    connection_id,
+                    &connection_scope,
+                    &connection_name,
+                    &model_id,
+                    &request_settings,
+                    agent_id,
+                    &agent_name,
+                    user_id,
+                )
+                .await?;
+            }
+            if let Some(text) = model_test_response_text(&value) {
+                let title = sanitize_session_title(&text);
+                if !title.is_empty() {
+                    sqlx::query(
+                        "UPDATE hub_sessions
+                         SET title = $1
+                         WHERE id = $2 AND title IS NULL",
+                    )
+                    .bind(&title)
+                    .bind(session_id)
+                    .execute(&state.pool)
+                    .await?;
+                    info!(session_id = %session_id, title = %title,
+                        "session title generated");
+                }
+            } else {
+                warn!(session_id = %session_id, "session title generation got no text in the model response");
+            }
+        } else {
+            record_session_title_error(
+                &state,
+                request_id,
+                Some(status.as_u16()),
+                "upstream_http",
+                "upstream_error",
+                "Session title generation failed",
+                connection_id,
+                &connection_scope,
+                &connection_name,
+                &model_id,
+                &request_settings,
+                agent_id,
+                &agent_name,
+                user_id,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = outcome {
+        warn!(session_id = %session_id, agent_id = %agent_id, error = %error,
+            "Session title generation failed");
+    }
+}
+
+pub(crate) fn sanitize_session_title(text: &str) -> String {
+    let title = text
+        .trim()
+        .trim_matches(['"', '\'', '“', '”', '「', '」', '《', '》'])
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim();
+    title.chars().take(40).collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn record_session_title_usage(
+    state: &AppState,
+    request_id: Uuid,
+    response: &Value,
+    usage: ObservedModelUsage,
+    connection_id: Uuid,
+    connection_scope: &ModelConnectionScope,
+    connection_name: &str,
+    model_id: &str,
+    request_settings: &ModelRequestSettings,
+    agent_id: Uuid,
+    agent_name: &str,
+    user_id: Uuid,
+) -> anyhow::Result<()> {
+    let display_name: Option<String> =
+        sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    let response_status = model_response_status(Some(response), true);
+    sqlx::query(
+        "INSERT INTO model_token_usage
+             (id, request_id, response_status, model_connection_id,
+              model_connection_scope_snapshot, model_connection_name_snapshot,
+              model_id_snapshot, api_type_snapshot,
+              request_settings_snapshot,
+              agent_id, agent_name_snapshot,
+              subject_type, subject_user_id, subject_display_name_snapshot,
+              input_tokens, output_tokens, total_tokens, cached_tokens,
+              reasoning_tokens)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                 'user', $12, $13, $14, $15, $16, $17, $18)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(request_id)
+    .bind(response_status)
+    .bind(connection_id)
+    .bind(model_connection_scope_name(*connection_scope))
+    .bind(connection_name)
+    .bind(model_id)
+    .bind(model_upstream_protocol_name(
+        ModelUpstreamProtocol::OpenaiResponses,
+    ))
+    .bind(model_request_settings_value(request_settings))
+    .bind(agent_id)
+    .bind(agent_name)
+    .bind(user_id)
+    .bind(display_name)
+    .bind(usage.input_tokens)
+    .bind(usage.output_tokens)
+    .bind(usage.total_tokens)
+    .bind(usage.cached_tokens)
+    .bind(usage.reasoning_tokens)
+    .execute(&state.pool)
+    .await?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn record_session_title_error(
+    state: &AppState,
+    request_id: Uuid,
+    upstream_http_status: Option<u16>,
+    error_kind: &str,
+    error_code: &str,
+    message: &str,
+    connection_id: Uuid,
+    connection_scope: &ModelConnectionScope,
+    connection_name: &str,
+    model_id: &str,
+    request_settings: &ModelRequestSettings,
+    agent_id: Uuid,
+    agent_name: &str,
+    user_id: Uuid,
+) -> anyhow::Result<()> {
+    let display_name: Option<String> =
+        sqlx::query_scalar("SELECT display_name FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    sqlx::query(
+        "INSERT INTO model_call_errors
+             (id, request_id, response_status, upstream_http_status,
+              error_kind, error_code, message, model_connection_id,
+              model_connection_scope_snapshot, model_connection_name_snapshot,
+              model_id_snapshot, api_type_snapshot,
+              request_settings_snapshot,
+              agent_id, agent_name_snapshot,
+              subject_type, subject_user_id, subject_display_name_snapshot)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                 $13, $14, $15, 'user', $16, $17)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(request_id)
+    .bind("failed")
+    .bind(upstream_http_status.map(i32::from))
+    .bind(error_kind)
+    .bind(error_code)
+    .bind(message)
+    .bind(connection_id)
+    .bind(model_connection_scope_name(*connection_scope))
+    .bind(connection_name)
+    .bind(model_id)
+    .bind(model_upstream_protocol_name(
+        ModelUpstreamProtocol::OpenaiResponses,
+    ))
+    .bind(model_request_settings_value(request_settings))
+    .bind(agent_id)
+    .bind(agent_name)
+    .bind(user_id)
+    .bind(display_name)
+    .execute(&state.pool)
+    .await?;
+    Ok(())
 }
 
 pub(crate) async fn list_model_connections(
@@ -12028,976 +12709,112 @@ pub(crate) async fn authorize_run_stream(
 }
 
 
-pub(crate) async fn load_auth_policy(pool: &PgPool) -> Result<AuthPolicyDto, ApiError> {
-    let row = sqlx::query(
-        "SELECT password_registration_enabled, password_login_enabled,
-                ldap_login_enabled, email_placeholder, password_placeholder
-         FROM auth_policy WHERE singleton = true",
+pub(crate) async fn verify_embed_jwt_claims(
+    state: &AppState,
+    jwt: &str,
+) -> Result<AuthPrincipal, ApiError> {
+    let parts = jwt.split('.').collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return Err(ApiError::unauthorized("invalid embed jwt"));
+    }
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    let mut mac = HmacSha256::new_from_slice(state.embed_jwt_secret.as_bytes())
+        .map_err(|_| ApiError::internal("invalid embed jwt secret"))?;
+    mac.update(signing_input.as_bytes());
+    let expected = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    if !constant_time_eq(expected.as_bytes(), parts[2].as_bytes()) {
+        return Err(ApiError::unauthorized("invalid embed jwt signature"));
+    }
+
+    let payload = URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .map_err(|_| ApiError::unauthorized("invalid embed jwt payload"))?;
+    let payload: Value = serde_json::from_slice(&payload)
+        .map_err(|_| ApiError::unauthorized("invalid embed jwt payload"))?;
+    let header = URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .map_err(|_| ApiError::unauthorized("invalid embed jwt header"))?;
+    let header: Value = serde_json::from_slice(&header)
+        .map_err(|_| ApiError::unauthorized("invalid embed jwt header"))?;
+    if header.get("alg").and_then(Value::as_str) != Some("HS256") {
+        return Err(ApiError::unauthorized("invalid embed jwt alg"));
+    }
+    let issuer = payload
+        .get("iss")
+        .and_then(Value::as_str)
+        .ok_or(ApiError::unauthorized("missing embed jwt issuer"))?;
+    if issuer != state.embed_jwt_issuer {
+        return Err(ApiError::unauthorized("invalid embed jwt issuer"));
+    }
+    if !jwt_audience_matches(payload.get("aud"), &state.embed_jwt_audience) {
+        return Err(ApiError::unauthorized("invalid embed jwt audience"));
+    }
+    let exp = payload
+        .get("exp")
+        .and_then(Value::as_i64)
+        .ok_or(ApiError::unauthorized("missing embed jwt expiry"))?;
+    if exp <= Utc::now().timestamp() {
+        return Err(ApiError::unauthorized("embed jwt expired"));
+    }
+    validate_embed_jwt_iat(&payload, Utc::now().timestamp())?;
+    let jti = payload
+        .get("jti")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(ApiError::unauthorized("missing embed jwt jti"))?
+        .to_owned();
+    let agent_id = payload
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or(ApiError::unauthorized("missing embed jwt agent"))?;
+    let owner_id = payload
+        .get("owner_id")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or(ApiError::unauthorized("missing embed jwt owner"))?;
+    let subject = payload
+        .get("sub")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(ApiError::unauthorized("missing embed jwt subject"))?
+        .to_owned();
+    let inserted = sqlx::query(
+        "INSERT INTO embed_jwt_replays (jti, expires_at)
+         VALUES ($1, to_timestamp($2))
+         ON CONFLICT DO NOTHING",
     )
-    .fetch_one(pool)
+    .bind(&jti)
+    .bind(exp as f64)
+    .execute(&state.pool)
     .await?;
-    Ok(auth_policy_from_row(row))
-}
-
-#[derive(Debug)]
-struct LdapDirectoryIdentity {
-    email: String,
-    display_name: Option<String>,
-}
-
-#[derive(Debug)]
-struct LdapDirectoryFailure {
-    stage: &'static str,
-    category: &'static str,
-    diagnostic: &'static str,
-    unavailable: bool,
-}
-
-impl LdapDirectoryFailure {
-    fn invalid(stage: &'static str, category: &'static str, diagnostic: &'static str) -> Self {
-        Self {
-            stage,
-            category,
-            diagnostic,
-            unavailable: false,
-        }
+    if inserted.rows_affected() == 0 {
+        return Err(ApiError::unauthorized("embed jwt replayed"));
     }
-
-    fn unavailable(stage: &'static str, category: &'static str, diagnostic: &'static str) -> Self {
-        Self {
-            stage,
-            category,
-            diagnostic,
-            unavailable: true,
-        }
-    }
-
-    fn for_login(self) -> ApiError {
-        if self.unavailable {
-            ApiError::service_unavailable("LDAP service is temporarily unavailable")
-        } else {
-            ApiError::unauthorized("invalid email or password")
-        }
-    }
-
-    fn for_administrator(self) -> ApiError {
-        let message = format!("LDAP {} failed: {}", self.stage, self.diagnostic);
-        if self.unavailable {
-            ApiError::service_unavailable(message)
-        } else {
-            ApiError::bad_request(message)
-        }
-    }
-}
-
-pub(crate) async fn load_ldap_configuration(
-    pool: &PgPool,
-) -> Result<Option<LdapConfigurationDto>, ApiError> {
-    let row = sqlx::query(
-        "SELECT url, security_mode, base_dn, bind_identity_template, user_filter, email_attribute,
-                display_name_attribute, allow_insecure, skip_tls_verify
-         FROM ldap_configuration WHERE singleton = true",
-    )
-    .fetch_optional(pool)
-    .await?;
-    row.map(ldap_configuration_from_row).transpose()
-}
-
-pub(crate) fn ldap_configuration_from_row(
-    row: sqlx::postgres::PgRow,
-) -> Result<LdapConfigurationDto, ApiError> {
-    let security = match row.get::<String, _>("security_mode").as_str() {
-        "ldaps" => LdapSecurityMode::Ldaps,
-        "starttls" => LdapSecurityMode::Starttls,
-        "plain" => LdapSecurityMode::Plain,
-        _ => return Err(ApiError::internal("stored LDAP security mode is invalid")),
-    };
-    Ok(LdapConfigurationDto {
-        url: row.get("url"),
-        security,
-        base_dn: row.get("base_dn"),
-        bind_identity_template: row.get("bind_identity_template"),
-        user_filter: row.get("user_filter"),
-        email_attribute: row.get("email_attribute"),
-        display_name_attribute: row.get("display_name_attribute"),
-        allow_insecure: row.get("allow_insecure"),
-        skip_tls_verify: row.get("skip_tls_verify"),
+    Ok(AuthPrincipal::Embed {
+        owner_id,
+        agent_id,
+        _subject: subject,
     })
 }
 
-pub(crate) fn ldap_security_mode_name(mode: LdapSecurityMode) -> &'static str {
-    match mode {
-        LdapSecurityMode::Ldaps => "ldaps",
-        LdapSecurityMode::Starttls => "starttls",
-        LdapSecurityMode::Plain => "plain",
+pub(crate) fn jwt_audience_matches(audience: Option<&Value>, expected: &str) -> bool {
+    match audience {
+        Some(Value::String(value)) => value == expected,
+        Some(Value::Array(values)) => values.iter().any(|value| value.as_str() == Some(expected)),
+        _ => false,
     }
 }
 
-pub(crate) fn validate_ldap_configuration(
-    mut configuration: LdapConfigurationDto,
-) -> Result<LdapConfigurationDto, ApiError> {
-    configuration.url = configuration.url.trim().to_owned();
-    configuration.base_dn = configuration.base_dn.trim().to_owned();
-    configuration.bind_identity_template = configuration.bind_identity_template.trim().to_owned();
-    configuration.user_filter = configuration.user_filter.trim().to_owned();
-    configuration.email_attribute = configuration.email_attribute.trim().to_owned();
-    configuration.display_name_attribute = configuration.display_name_attribute.trim().to_owned();
-    let url =
-        Url::parse(&configuration.url).map_err(|_| ApiError::bad_request("LDAP URL is invalid"))?;
-    if url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-        || !(url.path().is_empty() || url.path() == "/")
-    {
-        return Err(ApiError::bad_request(
-            "LDAP URL must contain only a server address without credentials",
-        ));
-    }
-    let expected_scheme = match configuration.security {
-        LdapSecurityMode::Ldaps => "ldaps",
-        LdapSecurityMode::Starttls | LdapSecurityMode::Plain => "ldap",
-    };
-    if url.scheme() != expected_scheme {
-        return Err(ApiError::bad_request(
-            "LDAP URL scheme does not match the security mode",
-        ));
-    }
-    if configuration.security == LdapSecurityMode::Plain && !configuration.allow_insecure {
-        return Err(ApiError::bad_request(
-            "plain LDAP requires explicit insecure transport approval",
-        ));
-    }
-    if configuration.security == LdapSecurityMode::Plain && configuration.skip_tls_verify {
-        return Err(ApiError::bad_request(
-            "TLS verification can only be skipped for TLS connections",
-        ));
-    }
-    if configuration.base_dn.is_empty()
-        || configuration.base_dn.len() > 4096
-        || configuration.base_dn.chars().any(char::is_control)
-    {
-        return Err(ApiError::bad_request("valid LDAP Base DN is required"));
-    }
-    if configuration.bind_identity_template.len() > 4096
-        || configuration
-            .bind_identity_template
-            .matches("{email}")
-            .count()
-            != 1
-        || configuration
-            .bind_identity_template
-            .chars()
-            .any(char::is_control)
-    {
-        return Err(ApiError::bad_request(
-            "LDAP Bind identity template must contain exactly one {email} placeholder",
-        ));
-    }
-    if configuration.user_filter.len() > 4096
-        || configuration.user_filter.matches("{email}").count() != 1
-        || configuration.user_filter.chars().any(char::is_control)
-    {
-        return Err(ApiError::bad_request(
-            "LDAP user filter must contain exactly one {email} placeholder",
-        ));
-    }
-    validate_ldap_attribute_name(&configuration.email_attribute, "email attribute")?;
-    validate_ldap_attribute_name(
-        &configuration.display_name_attribute,
-        "display name attribute",
-    )?;
-    Ok(configuration)
-}
-
-pub(crate) fn validate_ldap_attribute_name(value: &str, field: &str) -> Result<(), ApiError> {
-    if value.is_empty()
-        || value.len() > 128
-        || !value.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '-' | '.' | '_')
-        })
-    {
-        return Err(ApiError::bad_request(format!(
-            "valid LDAP {field} is required"
-        )));
+pub(crate) fn validate_embed_jwt_iat(payload: &Value, now: i64) -> Result<(), ApiError> {
+    let issued_at = payload
+        .get("iat")
+        .and_then(Value::as_i64)
+        .ok_or(ApiError::unauthorized("missing embed jwt issued-at"))?;
+    if issued_at > now + 60 {
+        return Err(ApiError::unauthorized("embed jwt issued in the future"));
     }
     Ok(())
-}
-
-pub(crate) async fn query_ldap_directory(
-    configuration: &LdapConfigurationDto,
-    email: &str,
-    password: &str,
-) -> Result<LdapDirectoryIdentity, LdapDirectoryFailure> {
-    match tokio::time::timeout(
-        Duration::from_secs(10),
-        query_ldap_directory_once(configuration, email, password),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(LdapDirectoryFailure::unavailable(
-            "timeout",
-            "deadline_exceeded",
-            "the ten-second LDAP deadline was exceeded",
-        )),
-    }
-}
-
-pub(crate) async fn query_ldap_directory_once(
-    configuration: &LdapConfigurationDto,
-    email: &str,
-    password: &str,
-) -> Result<LdapDirectoryIdentity, LdapDirectoryFailure> {
-    let bind_email = normalize_email(email).map_err(|_| {
-        LdapDirectoryFailure::invalid("bind", "invalid_credentials", "email is invalid")
-    })?;
-    if password.is_empty() {
-        return Err(LdapDirectoryFailure::invalid(
-            "bind",
-            "invalid_credentials",
-            "password is empty",
-        ));
-    }
-    let settings = LdapConnSettings::new()
-        .set_conn_timeout(Duration::from_secs(5))
-        .set_starttls(configuration.security == LdapSecurityMode::Starttls)
-        .set_no_tls_verify(configuration.skip_tls_verify);
-    let (connection, mut ldap) = LdapConnAsync::with_settings(settings, &configuration.url)
-        .await
-        .map_err(|_| {
-            LdapDirectoryFailure::unavailable(
-                "connect",
-                "connection_failed",
-                "connection or TLS negotiation failed",
-            )
-        })?;
-    ldap3::drive!(connection);
-    ldap.with_timeout(Duration::from_secs(5));
-    let bind_identity = ldap_bind_identity(&configuration.bind_identity_template, &bind_email);
-    let bind_result = ldap
-        .simple_bind(&bind_identity, password)
-        .await
-        .map_err(|error| classify_ldap_bind_error(&error))?;
-    bind_result
-        .success()
-        .map_err(|error| classify_ldap_bind_error(&error))?;
-
-    let filter = ldap_user_filter(&configuration.user_filter, &bind_email);
-    let search = ldap
-        .search(
-            &configuration.base_dn,
-            Scope::Subtree,
-            &filter,
-            vec![
-                configuration.email_attribute.as_str(),
-                configuration.display_name_attribute.as_str(),
-            ],
-        )
-        .await
-        .map_err(|_| {
-            LdapDirectoryFailure::unavailable("search", "search_failed", "directory search failed")
-        })?;
-    let (entries, _) = search.success().map_err(|_| {
-        LdapDirectoryFailure::unavailable(
-            "search",
-            "search_failed",
-            "directory search was rejected",
-        )
-    })?;
-    let _ = ldap.unbind().await;
-    if entries.len() != 1 {
-        return Err(LdapDirectoryFailure::invalid(
-            "search",
-            "result_cardinality",
-            "directory search did not return exactly one entry",
-        ));
-    }
-    let entry = SearchEntry::construct(entries.into_iter().next().expect("one LDAP entry"));
-    let email_values = ldap_attribute_values(&entry, &configuration.email_attribute)
-        .map(|values| {
-            values
-                .iter()
-                .map(|value| value.trim())
-                .filter(|value| !value.is_empty())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    if email_values.len() != 1 {
-        return Err(LdapDirectoryFailure::invalid(
-            "mapping",
-            "email_attribute",
-            "email attribute must contain exactly one value",
-        ));
-    }
-    let authoritative_email = normalize_email(email_values[0]).map_err(|_| {
-        LdapDirectoryFailure::invalid(
-            "mapping",
-            "email_attribute",
-            "email attribute is not a valid email address",
-        )
-    })?;
-    let display_name = ldap_attribute_values(&entry, &configuration.display_name_attribute)
-        .and_then(|values| {
-            values
-                .iter()
-                .map(|value| value.trim())
-                .find(|value| !value.is_empty())
-        })
-        .map(|value| normalize_display_name(Some(value), &authoritative_email))
-        .transpose()
-        .map_err(|_| {
-            LdapDirectoryFailure::invalid(
-                "mapping",
-                "display_name_attribute",
-                "display name attribute is invalid",
-            )
-        })?;
-    Ok(LdapDirectoryIdentity {
-        email: authoritative_email,
-        display_name,
-    })
-}
-
-pub(crate) fn ldap_user_filter(template: &str, email: &str) -> String {
-    let escaped_email = ldap_escape(email);
-    template.replacen("{email}", escaped_email.as_ref(), 1)
-}
-
-pub(crate) fn ldap_bind_identity(template: &str, email: &str) -> String {
-    let escaped_email = dn_escape(email);
-    template.replacen("{email}", escaped_email.as_ref(), 1)
-}
-
-pub(crate) fn classify_ldap_bind_error(error: &LdapError) -> LdapDirectoryFailure {
-    if matches!(error, LdapError::LdapResult { result } if matches!(result.rc, 32 | 34 | 49)) {
-        LdapDirectoryFailure::invalid(
-            "bind",
-            "invalid_credentials",
-            "directory rejected the credentials",
-        )
-    } else {
-        LdapDirectoryFailure::unavailable("bind", "bind_failed", "LDAP Bind failed")
-    }
-}
-
-pub(crate) fn ldap_attribute_values<'a>(
-    entry: &'a SearchEntry,
-    name: &str,
-) -> Option<&'a Vec<String>> {
-    entry
-        .attrs
-        .iter()
-        .find(|(attribute, _)| attribute.eq_ignore_ascii_case(name))
-        .map(|(_, values)| values)
-}
-
-pub(crate) async fn resolve_ldap_user(
-    pool: &PgPool,
-    identity: &LdapDirectoryIdentity,
-) -> Result<UserDto, ApiError> {
-    let mut tx = pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('agent-hub-user-create', 0))")
-        .execute(&mut *tx)
-        .await?;
-    let row = sqlx::query(
-        "SELECT id, email, display_name, role, deletion_requested_at
-         FROM users WHERE lower(btrim(email)) = lower(btrim($1))
-         FOR UPDATE",
-    )
-    .bind(&identity.email)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let user = match row {
-        Some(row)
-            if row
-                .get::<Option<DateTime<Utc>>, _>("deletion_requested_at")
-                .is_some() =>
-        {
-            return Err(ApiError::unauthorized("invalid email or password"));
-        }
-        Some(row) => {
-            if let Some(display_name) = identity.display_name.as_deref() {
-                let row = sqlx::query(
-                    "UPDATE users SET display_name = $1 WHERE id = $2
-                     RETURNING id, email, display_name, role",
-                )
-                .bind(display_name)
-                .bind(row.get::<Uuid, _>("id"))
-                .fetch_one(&mut *tx)
-                .await?;
-                user_from_row(row)
-            } else {
-                user_from_row(row)
-            }
-        }
-        None => {
-            create_hub_user_in_locked_tx(
-                &mut tx,
-                &identity.email,
-                identity.display_name.as_deref(),
-                None,
-            )
-            .await?
-        }
-    };
-    tx.commit().await?;
-    Ok(user)
-}
-
-pub(crate) fn email_local_part(email: &str) -> &str {
-    email
-        .split_once('@')
-        .map(|(local, _)| local)
-        .unwrap_or(email)
-}
-
-pub(crate) async fn require_external_platform(
-    pool: &PgPool,
-    platform_id: Uuid,
-) -> Result<(), ApiError> {
-    let exists: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM external_platforms WHERE id = $1)")
-            .bind(platform_id)
-            .fetch_one(pool)
-            .await?;
-    if !exists {
-        return Err(ApiError::not_found("external platform not found"));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_external_username(value: Option<&str>) -> Result<Option<String>, ApiError> {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(None);
-    };
-    if value.len() > 128 || value.chars().any(char::is_control) {
-        return Err(ApiError::bad_request("valid external username is required"));
-    }
-    Ok(Some(value.to_owned()))
-}
-
-struct ResolvedExternalIdentity {
-    user: UserDto,
-    identity_id: Uuid,
-}
-
-#[cfg(test)]
-pub(crate) async fn resolve_external_identity(
-    pool: &PgPool,
-    platform_id: Uuid,
-    channel_id: Uuid,
-    tenant_id: &str,
-    external_user_id: &str,
-    email: Option<&str>,
-    external_username: Option<&str>,
-) -> Result<UserDto, ApiError> {
-    let mut tx = pool.begin().await?;
-    let resolved = resolve_external_identity_tx(
-        &mut tx,
-        platform_id,
-        channel_id,
-        tenant_id,
-        external_user_id,
-        email,
-        external_username,
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(resolved.user)
-}
-
-pub(crate) async fn resolve_external_identity_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    platform_id: Uuid,
-    channel_id: Uuid,
-    tenant_id: &str,
-    external_user_id: &str,
-    email: Option<&str>,
-    external_username: Option<&str>,
-) -> Result<ResolvedExternalIdentity, ApiError> {
-    let tenant_id = normalize_origin_tenant(Some(tenant_id))?;
-    let external_user_id = external_user_id.trim();
-    if external_user_id.is_empty()
-        || external_user_id.len() > 128
-        || external_user_id.chars().any(char::is_control)
-    {
-        return Err(ApiError::bad_request("valid external user id is required"));
-    }
-    let email = email.map(normalize_email).transpose()?;
-    let external_username = validate_external_username(external_username)?;
-
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('agent-hub-user-create', 0))")
-        .execute(&mut **tx)
-        .await?;
-    let channel_exists: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM authentication_channels
-         WHERE id = $1 AND platform_id = $2
-           AND enabled = true AND trusted_email = true
-         FOR SHARE",
-    )
-    .bind(channel_id)
-    .bind(platform_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    if channel_exists.is_none() {
-        return Err(ApiError::forbidden("authentication channel is unavailable"));
-    }
-
-    let existing = sqlx::query(
-        "SELECT i.id AS identity_id, u.id, u.email, u.display_name, u.role,
-                u.deletion_requested_at
-         FROM external_identities i
-         JOIN users u ON u.id = i.user_id
-         WHERE i.platform_id = $1 AND i.tenant_id = $2 AND i.external_user_id = $3
-         FOR UPDATE OF i, u",
-    )
-    .bind(platform_id)
-    .bind(&tenant_id)
-    .bind(external_user_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    if let Some(row) = existing {
-        if row
-            .get::<Option<DateTime<Utc>>, _>("deletion_requested_at")
-            .is_some()
-        {
-            return Err(ApiError::forbidden("user account is unavailable"));
-        }
-        let identity_id = row.get("identity_id");
-        sqlx::query(
-            "UPDATE external_identities
-             SET authentication_channel_id = $1,
-                 last_email = COALESCE($2, last_email),
-                 last_username = COALESCE($3, last_username), updated_at = now()
-             WHERE platform_id = $4 AND tenant_id = $5 AND external_user_id = $6",
-        )
-        .bind(channel_id)
-        .bind(email.as_deref())
-        .bind(external_username.as_deref())
-        .bind(platform_id)
-        .bind(&tenant_id)
-        .bind(external_user_id)
-        .execute(&mut **tx)
-        .await?;
-        return Ok(ResolvedExternalIdentity {
-            user: user_from_row(row),
-            identity_id,
-        });
-    }
-
-    let matched_user = if let Some(email) = email.as_deref() {
-        let row = sqlx::query(
-            "SELECT id, email, display_name, role, deletion_requested_at
-             FROM users
-             WHERE lower(btrim(email)) = lower(btrim($1))
-             FOR UPDATE",
-        )
-        .bind(email)
-        .fetch_optional(&mut **tx)
-        .await?;
-        match row {
-            Some(row)
-                if row
-                    .get::<Option<DateTime<Utc>>, _>("deletion_requested_at")
-                    .is_some() =>
-            {
-                return Err(ApiError::forbidden("user account is unavailable"));
-            }
-            Some(row) => Some(user_from_row(row)),
-            None => None,
-        }
-    } else {
-        None
-    };
-    let user = match matched_user {
-        Some(user) => user,
-        None => {
-            let email = email
-                .as_deref()
-                .ok_or(ApiError::bad_request("trusted email is required"))?;
-            create_hub_user_in_locked_tx(tx, email, None, None).await?
-        }
-    };
-    let identity_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO external_identities
-             (id, platform_id, tenant_id, external_user_id, user_id,
-              authentication_channel_id, last_email, last_username)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-    )
-    .bind(identity_id)
-    .bind(platform_id)
-    .bind(&tenant_id)
-    .bind(external_user_id)
-    .bind(user.id)
-    .bind(channel_id)
-    .bind(email.as_deref())
-    .bind(external_username.as_deref())
-    .execute(&mut **tx)
-    .await?;
-    Ok(ResolvedExternalIdentity { user, identity_id })
-}
-
-pub(crate) async fn update_external_identity_widget_profile_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    identity_id: Uuid,
-    profile: &WidgetUserProfileDto,
-) -> Result<(), ApiError> {
-    let updated = sqlx::query(
-        "UPDATE external_identities
-         SET last_email = COALESCE($1, last_email),
-             last_username = COALESCE($2, last_username),
-             last_display_name = COALESCE($3, last_display_name),
-             attributes = $4, updated_at = now()
-         WHERE id = $5",
-    )
-    .bind(profile.email.as_deref())
-    .bind(profile.username.as_deref())
-    .bind(profile.display_name.as_deref())
-    .bind(&profile.attributes)
-    .bind(identity_id)
-    .execute(&mut **tx)
-    .await?;
-    if updated.rows_affected() != 1 {
-        return Err(ApiError::unauthorized("external identity is unavailable"));
-    }
-    Ok(())
-}
-
-pub(crate) async fn create_password_registration_user(
-    pool: &PgPool,
-    email: &str,
-    display_name: Option<&str>,
-    password: Option<&str>,
-) -> Result<UserDto, ApiError> {
-    let email = normalize_email(email)?;
-    let display_name = normalize_display_name(display_name, &email)?;
-    let mut tx = pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('agent-hub-user-create', 0))")
-        .execute(&mut *tx)
-        .await?;
-    let registration_enabled: bool = sqlx::query_scalar(
-        "SELECT password_registration_enabled
-         FROM auth_policy WHERE singleton = true FOR UPDATE",
-    )
-    .fetch_one(&mut *tx)
-    .await?;
-    if !registration_enabled {
-        return Err(ApiError::forbidden("password registration is disabled"));
-    }
-    let email_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS (
-             SELECT 1 FROM users WHERE lower(btrim(email)) = lower(btrim($1))
-         )",
-    )
-    .bind(&email)
-    .fetch_one(&mut *tx)
-    .await?;
-    if email_exists {
-        return Err(ApiError::conflict("email already exists"));
-    }
-    let user = create_hub_user_in_locked_tx(&mut tx, &email, Some(&display_name), password).await?;
-    tx.commit().await?;
-    Ok(user)
-}
-
-#[cfg(test)]
-pub(crate) async fn create_hub_user(
-    pool: &PgPool,
-    email: Option<&str>,
-    display_name: Option<&str>,
-    password: Option<&str>,
-    _test_identity_is_trusted: bool,
-) -> Result<UserDto, ApiError> {
-    let email = email.ok_or(ApiError::bad_request("trusted email is required"))?;
-    let email = normalize_email(email)?;
-    let display_name = normalize_display_name(display_name, &email)?;
-    let mut tx = pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('agent-hub-user-create', 0))")
-        .execute(&mut *tx)
-        .await?;
-    let exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(
-             SELECT 1 FROM users WHERE lower(btrim(email)) = lower(btrim($1))
-         )",
-    )
-    .bind(&email)
-    .fetch_one(&mut *tx)
-    .await?;
-    if exists {
-        return Err(ApiError::conflict("email already exists"));
-    }
-    let user = create_hub_user_in_locked_tx(&mut tx, &email, Some(&display_name), password).await?;
-    tx.commit().await?;
-    Ok(user)
-}
-
-pub(crate) async fn create_hub_user_in_locked_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    email: &str,
-    display_name: Option<&str>,
-    password: Option<&str>,
-) -> Result<UserDto, ApiError> {
-    let email = normalize_email(email)?;
-    let display_name = normalize_display_name(display_name, &email)?;
-    let user_id = Uuid::new_v4();
-    let first_user: bool = sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM users)")
-        .fetch_one(&mut **tx)
-        .await?;
-    let role = if first_user { "super_admin" } else { "member" };
-    sqlx::query(
-        "INSERT INTO users (id, email, password, display_name, role)
-         VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(user_id)
-    .bind(&email)
-    .bind(password)
-    .bind(&display_name)
-    .bind(role)
-    .execute(&mut **tx)
-    .await?;
-    if first_user {
-        sqlx::query(
-            "UPDATE auth_policy
-             SET password_registration_enabled = false, updated_at = now()
-             WHERE singleton = true",
-        )
-        .execute(&mut **tx)
-        .await?;
-    }
-    Ok(UserDto {
-        id: user_id,
-        email,
-        display_name,
-        role: role.to_owned(),
-    })
-}
-
-pub(crate) fn normalize_display_name(value: Option<&str>, email: &str) -> Result<String, ApiError> {
-    let fallback = email
-        .split_once('@')
-        .map(|(local, _)| local)
-        .unwrap_or(email);
-    let display_name = value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(fallback);
-    if display_name.len() > 128 || display_name.chars().any(char::is_control) {
-        return Err(ApiError::bad_request("valid display name is required"));
-    }
-    Ok(display_name.to_owned())
-}
-
-pub(crate) fn validate_user_role(value: &str) -> Result<&'static str, ApiError> {
-    match value.trim() {
-        "member" => Ok("member"),
-        "admin" => Ok("admin"),
-        "super_admin" => Ok("super_admin"),
-        _ => Err(ApiError::bad_request("unsupported user role")),
-    }
-}
-
-pub(crate) fn normalize_email(email: &str) -> Result<String, ApiError> {
-    let email = email.trim().to_ascii_lowercase();
-    let valid = email.len() <= 254
-        && !email.chars().any(char::is_whitespace)
-        && email
-            .split_once('@')
-            .is_some_and(|(local, domain)| !local.is_empty() && domain.contains('.'));
-    if !valid {
-        return Err(ApiError::bad_request("valid email is required"));
-    }
-    Ok(email)
-}
-
-pub(crate) fn login_rate_email(email: &str) -> Option<String> {
-    let email = email.trim().to_ascii_lowercase();
-    (!email.is_empty() && email.len() <= 254 && !email.chars().any(char::is_whitespace))
-        .then_some(email)
-}
-
-pub(crate) fn login_source_ip(
-    headers: &HeaderMap,
-    peer_ip: Option<IpAddr>,
-    trusted_proxy_cidrs: Option<&[IpNet]>,
-) -> IpAddr {
-    let trust_forwarded = match trusted_proxy_cidrs {
-        None => true,
-        Some(cidrs) => peer_ip.is_some_and(|ip| cidrs.iter().any(|cidr| cidr.contains(&ip))),
-    };
-    if trust_forwarded {
-        if let Some(ip) = forwarded_client_ip(headers) {
-            return ip;
-        }
-    }
-    peer_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
-}
-
-pub(crate) fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
-    headers
-        .get(header::FORWARDED)
-        .and_then(|value| value.to_str().ok())
-        .and_then(parse_forwarded_header)
-        .or_else(|| {
-            headers
-                .get("x-forwarded-for")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.split(',').next())
-                .and_then(parse_forwarded_ip)
-        })
-}
-
-pub(crate) fn parse_forwarded_header(value: &str) -> Option<IpAddr> {
-    value
-        .split(',')
-        .next()?
-        .split(';')
-        .filter_map(|part| part.trim().split_once('='))
-        .find(|(name, _)| name.eq_ignore_ascii_case("for"))
-        .and_then(|(_, value)| parse_forwarded_ip(value))
-}
-
-pub(crate) fn parse_forwarded_ip(value: &str) -> Option<IpAddr> {
-    let value = value.trim().trim_matches('"');
-    if value.eq_ignore_ascii_case("unknown") || value.starts_with('_') {
-        return None;
-    }
-    if let Ok(ip) = value.parse::<IpAddr>() {
-        return Some(ip);
-    }
-    if let Ok(address) = value.parse::<SocketAddr>() {
-        return Some(address.ip());
-    }
-    if let Some(rest) = value.strip_prefix('[') {
-        let end = rest.find(']')?;
-        return rest[..end].parse().ok();
-    }
-    None
-}
-
-pub(crate) async fn record_ip_login_attempt(
-    pool: &PgPool,
-    source_ip: IpAddr,
-) -> Result<(), ApiError> {
-    cleanup_expired_login_throttles(pool).await?;
-    let row = sqlx::query(
-        "INSERT INTO login_ip_attempts
-             (source_ip, attempts, window_started_at, updated_at)
-         VALUES ($1::inet, 1, now(), now())
-         ON CONFLICT (source_ip) DO UPDATE
-         SET attempts = CASE
-                 WHEN login_ip_attempts.window_started_at <= now() - interval '5 minutes'
-                 THEN 1 ELSE login_ip_attempts.attempts + 1 END,
-             window_started_at = CASE
-                 WHEN login_ip_attempts.window_started_at <= now() - interval '5 minutes'
-                 THEN now() ELSE login_ip_attempts.window_started_at END,
-             updated_at = now()
-         RETURNING attempts, window_started_at",
-    )
-    .bind(source_ip.to_string())
-    .fetch_one(pool)
-    .await?;
-    let attempts: i32 = row.get("attempts");
-    if attempts > 20 {
-        return Err(ApiError::too_many_requests(
-            "too many login attempts",
-            retry_after_seconds(row.get("window_started_at")),
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) async fn reserve_email_login_attempt(
-    pool: &PgPool,
-    email: &str,
-) -> Result<(), ApiError> {
-    cleanup_expired_login_throttles(pool).await?;
-    // Reserve before credential verification so concurrent requests cannot all pass the limit check.
-    let row = sqlx::query(
-        "INSERT INTO login_email_failures
-             (normalized_email, failed_attempts, window_started_at, updated_at)
-         VALUES ($1, 1, now(), now())
-         ON CONFLICT (normalized_email) DO UPDATE
-         SET failed_attempts = CASE
-                 WHEN login_email_failures.window_started_at <= now() - interval '5 minutes'
-                 THEN 1 ELSE LEAST(login_email_failures.failed_attempts, 3) + 1 END,
-             window_started_at = CASE
-                 WHEN login_email_failures.window_started_at <= now() - interval '5 minutes'
-                 THEN now() ELSE login_email_failures.window_started_at END,
-             updated_at = now()
-         RETURNING failed_attempts, window_started_at",
-    )
-    .bind(email)
-    .fetch_one(pool)
-    .await?;
-    if row.get::<i32, _>("failed_attempts") > 3 {
-        return Err(ApiError::too_many_requests(
-            "too many failed login attempts",
-            retry_after_seconds(row.get("window_started_at")),
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) async fn clear_email_login_failures(pool: &PgPool, email: &str) -> Result<(), ApiError> {
-    sqlx::query("DELETE FROM login_email_failures WHERE normalized_email = $1")
-        .bind(email.trim().to_ascii_lowercase())
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
-pub(crate) async fn cleanup_expired_login_throttles(pool: &PgPool) -> Result<(), ApiError> {
-    sqlx::query(
-        "DELETE FROM login_email_failures
-         WHERE ctid IN (
-             SELECT ctid FROM login_email_failures
-             WHERE window_started_at <= now() - interval '1 hour'
-             ORDER BY window_started_at LIMIT 100
-         )",
-    )
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "DELETE FROM login_ip_attempts
-         WHERE ctid IN (
-             SELECT ctid FROM login_ip_attempts
-             WHERE window_started_at <= now() - interval '1 hour'
-             ORDER BY window_started_at LIMIT 100
-         )",
-    )
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-pub(crate) fn retry_after_seconds(window_started_at: DateTime<Utc>) -> u64 {
-    (window_started_at + ChronoDuration::minutes(5) - Utc::now())
-        .num_seconds()
-        .max(1) as u64
-}
-
-pub(crate) fn validate_identity_key(value: &str, field: &str) -> Result<String, ApiError> {
-    let value = value.trim().to_ascii_lowercase();
-    if value.is_empty()
-        || value.len() > 64
-        || !value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-    {
-        return Err(ApiError::bad_request(format!("valid {field} is required")));
-    }
-    Ok(value)
-}
-
-pub(crate) fn validate_identity_name(value: &str, field: &str) -> Result<String, ApiError> {
-    let value = value.trim();
-    if value.is_empty() || value.chars().count() > 128 || value.chars().any(char::is_control) {
-        return Err(ApiError::bad_request(format!("valid {field} is required")));
-    }
-    Ok(value.to_owned())
 }
 
 #[cfg(test)]
