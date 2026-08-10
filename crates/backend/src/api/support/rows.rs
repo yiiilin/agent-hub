@@ -1,11 +1,11 @@
 //! 数据库行到 DTO 的转换。
 
-use uuid::Uuid;
-use serde_json::json;
 use agent_hub_shared::*;
 use chrono::DateTime;
+use serde_json::json;
 use serde_json::Value;
 use sqlx::Row;
+use uuid::Uuid;
 
 pub(crate) fn user_from_row(row: sqlx::postgres::PgRow) -> UserDto {
     UserDto {
@@ -47,7 +47,9 @@ pub(crate) fn external_platform_from_row(row: sqlx::postgres::PgRow) -> External
     }
 }
 
-pub(crate) fn authentication_channel_from_row(row: sqlx::postgres::PgRow) -> AuthenticationChannelDto {
+pub(crate) fn authentication_channel_from_row(
+    row: sqlx::postgres::PgRow,
+) -> AuthenticationChannelDto {
     AuthenticationChannelDto {
         id: row.get("id"),
         platform_id: row.get("platform_id"),
@@ -213,7 +215,10 @@ pub(crate) fn api_key_from_row(row: sqlx::postgres::PgRow) -> ApiKeyDto {
     }
 }
 
-pub(crate) fn integration_app_from_row(row: sqlx::postgres::PgRow, agent_ids: Vec<Uuid>) -> IntegrationAppDto {
+pub(crate) fn integration_app_from_row(
+    row: sqlx::postgres::PgRow,
+    agent_ids: Vec<Uuid>,
+) -> IntegrationAppDto {
     IntegrationAppDto {
         id: row.get("id"),
         owner_id: row.get("owner_id"),

@@ -1,13 +1,12 @@
 //! 加密与凭据哈希工具。
 
-use uuid::Uuid;
 use agent_hub_shared::*;
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
 use sha2::{Digest, Sha256};
-
+use uuid::Uuid;
 
 pub(crate) fn sha256_hex(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());

@@ -1,23 +1,26 @@
 //! 开发环境种子数据。
 
-use anyhow::Context;
 use crate::{
-    StagedSkillPackageUpload, commit_skill_package_upload, enqueue_skill_package_deletion,
-    publish_skill_configuration_change_tx,
+    build_skill_package_archive, parse_uploaded_skill_markdown, validate_model_connection_fields,
+    StagedSkillPackageFile,
 };
-use std::path::{Path, PathBuf};
+use crate::{
+    commit_skill_package_upload, enqueue_skill_package_deletion,
+    publish_skill_configuration_change_tx, StagedSkillPackageUpload,
+};
+use anyhow::Context;
 use sha2::{Digest, Sha256};
-use crate::{StagedSkillPackageFile, build_skill_package_archive, parse_uploaded_skill_markdown, validate_model_connection_fields};
 use sqlx::PgPool;
-use uuid::Uuid;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+use uuid::Uuid;
 
-use tracing::{info, warn};
+use super::crypto::{password_hash, sha256_hex};
+use crate::AppState;
 use agent_hub_backend::ModelSecretCipher;
 use agent_hub_shared::*;
 use std::sync::Arc;
-use super::crypto::{password_hash, sha256_hex};
-use crate::AppState;
+use tracing::{info, warn};
 
 pub(crate) async fn seed_dev_user(pool: &PgPool) -> anyhow::Result<()> {
     let user_id = Uuid::new_v4();
@@ -347,7 +350,10 @@ pub(crate) async fn seed_builtin_maintenance_skill(
     Ok(BuiltinSkillSeedStatus::Seeded)
 }
 
-pub(crate) async fn ensure_dev_runtime_enrollment_token(pool: &PgPool, token: &str) -> anyhow::Result<()> {
+pub(crate) async fn ensure_dev_runtime_enrollment_token(
+    pool: &PgPool,
+    token: &str,
+) -> anyhow::Result<()> {
     let token = token.trim();
     if token.is_empty() {
         anyhow::bail!("DEV_RUNTIME_ENROLLMENT_TOKEN must not be empty");

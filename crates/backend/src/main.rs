@@ -93,7 +93,8 @@ pub(crate) const MAX_RUNTIME_EVENT_BYTES: usize = 256 * 1024;
 pub(crate) const EMBEDDED_ORIGIN_HEADER: &str = "x-agent-hub-embedded-origin";
 pub(crate) const MAX_ATTACHMENT_UPLOAD_BYTES: u64 = 104_857_600;
 pub(crate) const MAX_ATTACHMENT_BYTES_PER_SESSION: i64 = 524_288_000;
-pub(crate) const ATTACHMENT_UPLOAD_BODY_LIMIT: usize = MAX_ATTACHMENT_UPLOAD_BYTES as usize + 64 * 1024;
+pub(crate) const ATTACHMENT_UPLOAD_BODY_LIMIT: usize =
+    MAX_ATTACHMENT_UPLOAD_BYTES as usize + 64 * 1024;
 pub(crate) const VISION_PROXY_HEADER: &str = "x-agent-hub-vision";
 pub(crate) const CLIENT_ACCESS_TTL_SECONDS: i64 = 15 * 60;
 pub(crate) const CLIENT_TOOL_DEADLINE_MINUTES: i64 = 5;
@@ -2463,7 +2464,10 @@ pub(crate) async fn load_user_erasure(
     }))
 }
 
-pub(crate) async fn process_user_erasure_job(state: &AppState, user_id: Uuid) -> Result<(), ApiError> {
+pub(crate) async fn process_user_erasure_job(
+    state: &AppState,
+    user_id: Uuid,
+) -> Result<(), ApiError> {
     let objects = sqlx::query_scalar::<_, String>(
         "SELECT object_key FROM user_erasure_bundle_objects
          WHERE user_id = $1 ORDER BY created_at, object_key",
@@ -4513,7 +4517,10 @@ pub(crate) fn validate_model_request_number(
     Ok(())
 }
 
-pub(crate) fn validate_model_request_token_limit(name: &str, value: Option<u32>) -> Result<(), ApiError> {
+pub(crate) fn validate_model_request_token_limit(
+    name: &str,
+    value: Option<u32>,
+) -> Result<(), ApiError> {
     if value == Some(0) {
         return Err(ApiError::bad_request(format!(
             "Agent request setting {name} must be a positive integer"
@@ -5279,7 +5286,9 @@ pub(crate) fn model_token_totals_from_row(row: &sqlx::postgres::PgRow) -> ModelT
     }
 }
 
-pub(crate) fn model_connection_snapshot_from_row(row: &sqlx::postgres::PgRow) -> ModelConnectionSnapshotDto {
+pub(crate) fn model_connection_snapshot_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> ModelConnectionSnapshotDto {
     ModelConnectionSnapshotDto {
         id: row.get("model_connection_id"),
         scope: match row
@@ -5905,7 +5914,10 @@ pub(crate) async fn delete_agent(
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub(crate) async fn delete_queued_agent_bundles(state: &AppState, agent_id: Uuid) -> Result<(), ApiError> {
+pub(crate) async fn delete_queued_agent_bundles(
+    state: &AppState,
+    agent_id: Uuid,
+) -> Result<(), ApiError> {
     let object_keys = sqlx::query_scalar::<_, String>(
         "SELECT object_key
          FROM session_bundle_deletion_queue
@@ -7280,9 +7292,10 @@ pub(crate) async fn delete_session_object_store_entries(
     session_id: Uuid,
     outcome: &SessionDeletionOutcome,
 ) {
-    if let (Some(object_key), Some(store)) =
-        (outcome.bundle_object_key.as_deref(), state.session_bundle_store.as_ref())
-    {
+    if let (Some(object_key), Some(store)) = (
+        outcome.bundle_object_key.as_deref(),
+        state.session_bundle_store.as_ref(),
+    ) {
         if let Err(error) = store.delete(object_key).await {
             warn!(session_id = %session_id, object_key = %object_key, error = %error,
                 "failed to delete Session Bundle object after Session deletion");
@@ -7931,7 +7944,9 @@ pub(crate) fn attachment_filename_encoding(name: &str) -> String {
     encoded
 }
 
-pub(crate) fn hub_session_attachment_from_row(row: sqlx::postgres::PgRow) -> HubSessionAttachmentDto {
+pub(crate) fn hub_session_attachment_from_row(
+    row: sqlx::postgres::PgRow,
+) -> HubSessionAttachmentDto {
     HubSessionAttachmentDto {
         id: row.get("id"),
         session_id: row.get("session_id"),
@@ -9357,7 +9372,9 @@ pub(crate) fn validate_skill_package_paths(paths: &[String]) -> Result<(), ApiEr
     Ok(())
 }
 
-pub(crate) fn parse_uploaded_skill_markdown(bytes: &[u8]) -> Result<(String, String, String), ApiError> {
+pub(crate) fn parse_uploaded_skill_markdown(
+    bytes: &[u8],
+) -> Result<(String, String, String), ApiError> {
     #[derive(Deserialize)]
     struct Frontmatter {
         name: String,
@@ -11763,7 +11780,9 @@ pub(crate) async fn submit_client_tool_result(
     Ok(Json(SubmitClientToolResultResponse { run, tool_request }))
 }
 
-pub(crate) fn validate_client_tool_result(result: &ClientToolResultDto) -> Result<(Value, String), ApiError> {
+pub(crate) fn validate_client_tool_result(
+    result: &ClientToolResultDto,
+) -> Result<(Value, String), ApiError> {
     let value = serde_json::to_value(result)
         .map_err(|_| ApiError::bad_request("Client Tool result must be JSON"))?;
     let encoded = serde_json::to_vec(&value)
@@ -16322,7 +16341,10 @@ pub(crate) fn is_sensitive_model_response_header(name: &HeaderName) -> bool {
             .any(|marker| name.contains(marker))
 }
 
-pub(crate) fn is_hop_by_hop_header(name: &HeaderName, connection_header_names: &BTreeSet<String>) -> bool {
+pub(crate) fn is_hop_by_hop_header(
+    name: &HeaderName,
+    connection_header_names: &BTreeSet<String>,
+) -> bool {
     matches!(
         name.as_str(),
         "connection"
@@ -16894,7 +16916,9 @@ pub(crate) async fn insert_widget_access_session_tx(
     .map_err(Into::into)
 }
 
-pub(crate) fn normalize_client_message_key(value: Option<&str>) -> Result<Option<String>, ApiError> {
+pub(crate) fn normalize_client_message_key(
+    value: Option<&str>,
+) -> Result<Option<String>, ApiError> {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
@@ -17863,7 +17887,10 @@ pub(crate) fn normalize_visibility(visibility: &str) -> Result<&'static str, Api
     }
 }
 
-pub(crate) fn validate_public_visibility_role(visibility: &str, role: &str) -> Result<(), ApiError> {
+pub(crate) fn validate_public_visibility_role(
+    visibility: &str,
+    role: &str,
+) -> Result<(), ApiError> {
     if visibility == "public" && !is_admin_role(role) {
         return Err(ApiError::forbidden(
             "administrator permission is required for public agents",
@@ -18976,7 +19003,9 @@ struct RunModelAttribution {
     source_integration_app_id: Option<Uuid>,
 }
 
-pub(crate) fn integration_run_model_attribution(principal: &IntegrationPrincipal) -> RunModelAttribution {
+pub(crate) fn integration_run_model_attribution(
+    principal: &IntegrationPrincipal,
+) -> RunModelAttribution {
     if principal.grant_type == "client_credentials" {
         RunModelAttribution {
             subject_type: "integration_app",
@@ -18992,7 +19021,10 @@ pub(crate) fn integration_run_model_attribution(principal: &IntegrationPrincipal
     }
 }
 
-pub(crate) async fn require_user(state: &AppState, headers: &HeaderMap) -> Result<UserDto, ApiError> {
+pub(crate) async fn require_user(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<UserDto, ApiError> {
     match require_principal(state, headers).await? {
         AuthPrincipal::User { user, .. } => Ok(user),
         AuthPrincipal::Embed { .. } => Err(ApiError::forbidden(
@@ -19001,7 +19033,10 @@ pub(crate) async fn require_user(state: &AppState, headers: &HeaderMap) -> Resul
     }
 }
 
-pub(crate) async fn require_super_admin(state: &AppState, headers: &HeaderMap) -> Result<UserDto, ApiError> {
+pub(crate) async fn require_super_admin(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<UserDto, ApiError> {
     let user = require_user(state, headers).await?;
     if user.role != "super_admin" {
         return Err(ApiError::forbidden(
@@ -19011,7 +19046,10 @@ pub(crate) async fn require_super_admin(state: &AppState, headers: &HeaderMap) -
     Ok(user)
 }
 
-pub(crate) async fn require_administrator(state: &AppState, headers: &HeaderMap) -> Result<UserDto, ApiError> {
+pub(crate) async fn require_administrator(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<UserDto, ApiError> {
     let user = require_user(state, headers).await?;
     if !is_admin_role(&user.role) {
         return Err(ApiError::forbidden("administrator permission is required"));
@@ -19253,7 +19291,10 @@ pub(crate) async fn load_user_and_key_id_by_api_key(
         .ok_or(ApiError::unauthorized("invalid api key"))
 }
 
-pub(crate) async fn require_runtime(state: &AppState, headers: &HeaderMap) -> Result<Uuid, ApiError> {
+pub(crate) async fn require_runtime(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Uuid, ApiError> {
     let token = bearer_token(headers).ok_or(ApiError::unauthorized("missing runtime token"))?;
     let row = sqlx::query(
         "SELECT id FROM runtimes
@@ -19399,7 +19440,10 @@ pub(crate) async fn reap_expired_client_tool_batches(pool: &PgPool) -> Result<()
     Ok(())
 }
 
-pub(crate) async fn fail_expired_client_tool_batch(pool: &PgPool, run_id: Uuid) -> Result<(), ApiError> {
+pub(crate) async fn fail_expired_client_tool_batch(
+    pool: &PgPool,
+    run_id: Uuid,
+) -> Result<(), ApiError> {
     let mut tx = pool.begin().await?;
     let preview = sqlx::query(
         "SELECT agent_id, hub_session_id FROM runs
@@ -19633,7 +19677,9 @@ pub(crate) fn validate_skill_payload(name: &str, content: &str) -> Result<(), Ap
     Ok(())
 }
 
-pub(crate) fn validate_subagent_definitions(definitions: &[SubagentDefinition]) -> Result<(), ApiError> {
+pub(crate) fn validate_subagent_definitions(
+    definitions: &[SubagentDefinition],
+) -> Result<(), ApiError> {
     if definitions.len() > 32 {
         return Err(ApiError::bad_request(
             "an Agent supports at most 32 Subagents",
@@ -20009,7 +20055,10 @@ pub(crate) async fn load_subagents_tx(
     Ok(rows.into_iter().map(subagent_from_row).collect())
 }
 
-pub(crate) async fn hydrate_agent_configuration(pool: &PgPool, agent: &mut AgentDto) -> Result<(), ApiError> {
+pub(crate) async fn hydrate_agent_configuration(
+    pool: &PgPool,
+    agent: &mut AgentDto,
+) -> Result<(), ApiError> {
     agent.managed_skill_ids = load_managed_skill_ids(pool, agent.id).await?;
     agent.secret_declarations = load_agent_secret_declarations(pool, agent.id).await?;
     agent.subagents = load_subagents(pool, agent.id).await?;
@@ -20609,7 +20658,9 @@ pub(crate) fn agent_execution_configuration_changed(
             })
 }
 
-pub(crate) fn normalized_secret_declarations(declarations: &[AgentSecretDeclarationDto]) -> Vec<String> {
+pub(crate) fn normalized_secret_declarations(
+    declarations: &[AgentSecretDeclarationDto],
+) -> Vec<String> {
     let mut entries = declarations
         .iter()
         .map(|declaration| {
@@ -20679,7 +20730,10 @@ pub(crate) async fn ensure_skills_visible_by_user(
     Ok(())
 }
 
-pub(crate) async fn load_managed_skill_ids(pool: &PgPool, agent_id: Uuid) -> Result<Vec<Uuid>, ApiError> {
+pub(crate) async fn load_managed_skill_ids(
+    pool: &PgPool,
+    agent_id: Uuid,
+) -> Result<Vec<Uuid>, ApiError> {
     let rows = sqlx::query(
         "SELECT s.id
          FROM agent_skills a_s
@@ -20860,7 +20914,9 @@ pub(crate) fn build_agent_execution_configuration(
     })
 }
 
-pub(crate) fn execution_skill_package_from_row(row: &sqlx::postgres::PgRow) -> Option<SkillPackageDto> {
+pub(crate) fn execution_skill_package_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Option<SkillPackageDto> {
     let id = row
         .try_get::<Option<Uuid>, _>("package_id")
         .ok()
@@ -21539,7 +21595,10 @@ pub(crate) async fn replace_integration_app_agents_tx(
     Ok(())
 }
 
-pub(crate) fn parse_oauth_scopes(raw: Option<&str>, default_profile: bool) -> Result<Vec<String>, ApiError> {
+pub(crate) fn parse_oauth_scopes(
+    raw: Option<&str>,
+    default_profile: bool,
+) -> Result<Vec<String>, ApiError> {
     let mut scopes = BTreeSet::new();
     match raw {
         None if default_profile => {
@@ -21891,7 +21950,9 @@ pub(crate) async fn load_oauth_app_by_client_id_tx(
     oauth_app_record_from_row(row)
 }
 
-pub(crate) fn oauth_app_record_from_row(row: sqlx::postgres::PgRow) -> Result<OAuthAppRecord, ApiError> {
+pub(crate) fn oauth_app_record_from_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<OAuthAppRecord, ApiError> {
     Ok(OAuthAppRecord {
         id: row.get("id"),
         owner_id: row.get("owner_id"),
@@ -22245,7 +22306,10 @@ pub(crate) async fn load_integration_session(
         .ok_or(ApiError::not_found("integration session not found"))
 }
 
-pub(crate) async fn integration_session_agent_id(pool: &PgPool, session_id: Uuid) -> Result<Uuid, ApiError> {
+pub(crate) async fn integration_session_agent_id(
+    pool: &PgPool,
+    session_id: Uuid,
+) -> Result<Uuid, ApiError> {
     sqlx::query_scalar("SELECT agent_id FROM integration_sessions WHERE id = $1")
         .bind(session_id)
         .fetch_optional(pool)
@@ -23260,11 +23324,11 @@ pub(crate) async fn load_widget_session_events_after_tx(
             query.push_str(" ORDER BY event.seq ASC");
         }
         sqlx::query(&query)
-        .bind(integration_session_id)
-        .bind(session.hub_session_id)
-        .bind(after)
-        .fetch_all(&mut **tx)
-        .await?
+            .bind(integration_session_id)
+            .bind(session.hub_session_id)
+            .bind(after)
+            .fetch_all(&mut **tx)
+            .await?
     } else {
         let mut query = String::from(
             "SELECT event.seq, event.event_id, event.run_id, event.event_type,
@@ -23284,10 +23348,10 @@ pub(crate) async fn load_widget_session_events_after_tx(
             query.push_str(" ORDER BY event.seq ASC");
         }
         sqlx::query(&query)
-        .bind(session.hub_session_id)
-        .bind(after)
-        .fetch_all(&mut **tx)
-        .await?
+            .bind(session.hub_session_id)
+            .bind(after)
+            .fetch_all(&mut **tx)
+            .await?
     };
     Ok(rows.into_iter().map(event_from_row).collect())
 }
@@ -23329,7 +23393,9 @@ pub(crate) async fn lock_widget_credential_tx(
     Ok(credential)
 }
 
-pub(crate) fn widget_credential_from_row(row: sqlx::postgres::PgRow) -> Result<WidgetCredential, ApiError> {
+pub(crate) fn widget_credential_from_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<WidgetCredential, ApiError> {
     Ok(WidgetCredential {
         id: row.get("id"),
         agent_id: row.get("agent_id"),
@@ -23415,7 +23481,9 @@ impl LdapDirectoryFailure {
     }
 }
 
-pub(crate) async fn load_ldap_configuration(pool: &PgPool) -> Result<Option<LdapConfigurationDto>, ApiError> {
+pub(crate) async fn load_ldap_configuration(
+    pool: &PgPool,
+) -> Result<Option<LdapConfigurationDto>, ApiError> {
     let row = sqlx::query(
         "SELECT url, security_mode, base_dn, bind_identity_template, user_filter, email_attribute,
                 display_name_attribute, allow_insecure, skip_tls_verify
@@ -23705,7 +23773,10 @@ pub(crate) fn classify_ldap_bind_error(error: &LdapError) -> LdapDirectoryFailur
     }
 }
 
-pub(crate) fn ldap_attribute_values<'a>(entry: &'a SearchEntry, name: &str) -> Option<&'a Vec<String>> {
+pub(crate) fn ldap_attribute_values<'a>(
+    entry: &'a SearchEntry,
+    name: &str,
+) -> Option<&'a Vec<String>> {
     entry
         .attrs
         .iter()
@@ -23773,7 +23844,10 @@ pub(crate) fn email_local_part(email: &str) -> &str {
         .unwrap_or(email)
 }
 
-pub(crate) async fn require_external_platform(pool: &PgPool, platform_id: Uuid) -> Result<(), ApiError> {
+pub(crate) async fn require_external_platform(
+    pool: &PgPool,
+    platform_id: Uuid,
+) -> Result<(), ApiError> {
     let exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM external_platforms WHERE id = $1)")
             .bind(platform_id)
@@ -24194,7 +24268,10 @@ pub(crate) fn parse_forwarded_ip(value: &str) -> Option<IpAddr> {
     None
 }
 
-pub(crate) async fn record_ip_login_attempt(pool: &PgPool, source_ip: IpAddr) -> Result<(), ApiError> {
+pub(crate) async fn record_ip_login_attempt(
+    pool: &PgPool,
+    source_ip: IpAddr,
+) -> Result<(), ApiError> {
     cleanup_expired_login_throttles(pool).await?;
     let row = sqlx::query(
         "INSERT INTO login_ip_attempts
@@ -24223,7 +24300,10 @@ pub(crate) async fn record_ip_login_attempt(pool: &PgPool, source_ip: IpAddr) ->
     Ok(())
 }
 
-pub(crate) async fn reserve_email_login_attempt(pool: &PgPool, email: &str) -> Result<(), ApiError> {
+pub(crate) async fn reserve_email_login_attempt(
+    pool: &PgPool,
+    email: &str,
+) -> Result<(), ApiError> {
     cleanup_expired_login_throttles(pool).await?;
     // Reserve before credential verification so concurrent requests cannot all pass the limit check.
     let row = sqlx::query(
@@ -24311,7 +24391,10 @@ pub(crate) fn validate_identity_name(value: &str, field: &str) -> Result<String,
     Ok(value.to_owned())
 }
 
-pub(crate) async fn verify_embed_jwt_claims(state: &AppState, jwt: &str) -> Result<AuthPrincipal, ApiError> {
+pub(crate) async fn verify_embed_jwt_claims(
+    state: &AppState,
+    jwt: &str,
+) -> Result<AuthPrincipal, ApiError> {
     let parts = jwt.split('.').collect::<Vec<_>>();
     if parts.len() != 3 {
         return Err(ApiError::unauthorized("invalid embed jwt"));
@@ -29562,13 +29645,12 @@ mod tests {
         assert_eq!(continuation.parent_run_id, Some(fixture.run.id));
 
         // runtime 认领续跑 run 后，模型在续跑 turn 中再次请求工具。
-        let generation: i64 = sqlx::query_scalar(
-            "SELECT ownership_generation FROM hub_sessions WHERE id = $1",
-        )
-        .bind(fixture.run.hub_session_id.unwrap())
-        .fetch_one(&fixture.app.state.pool)
-        .await
-        .unwrap();
+        let generation: i64 =
+            sqlx::query_scalar("SELECT ownership_generation FROM hub_sessions WHERE id = $1")
+                .bind(fixture.run.hub_session_id.unwrap())
+                .fetch_one(&fixture.app.state.pool)
+                .await
+                .unwrap();
         let claimed_response = runtime_claim_run(
             State(fixture.app.state.clone()),
             bearer_headers(&fixture.runtime_token),
@@ -29590,12 +29672,11 @@ mod tests {
                 .fetch_one(&fixture.app.state.pool)
                 .await
                 .unwrap();
-        let agent_runtime: Uuid =
-            sqlx::query_scalar("SELECT runtime_id FROM agents WHERE id = $1")
-                .bind(fixture.app.agent_id)
-                .fetch_one(&fixture.app.state.pool)
-                .await
-                .unwrap();
+        let agent_runtime: Uuid = sqlx::query_scalar("SELECT runtime_id FROM agents WHERE id = $1")
+            .bind(fixture.app.agent_id)
+            .fetch_one(&fixture.app.state.pool)
+            .await
+            .unwrap();
         assert_eq!(continuation_runtime, agent_runtime);
 
         // 续跑 run 保留 Run Tool Executor（发起方浏览器）。
@@ -29613,9 +29694,12 @@ mod tests {
             State(fixture.app.state.clone()),
             bearer_headers(&fixture.runtime_token),
             Path(continuation.id),
-            runtime_write_generation(generation, BeginRuntimeTurnRequest {
-                configuration_fingerprint: fingerprint,
-            }),
+            runtime_write_generation(
+                generation,
+                BeginRuntimeTurnRequest {
+                    configuration_fingerprint: fingerprint,
+                },
+            ),
         )
         .await
         .unwrap()

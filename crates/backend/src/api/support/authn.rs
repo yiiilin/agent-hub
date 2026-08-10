@@ -1,8 +1,8 @@
 //! 认证凭据提取（session/bearer/embed/client/webhook token）。
 
-use agent_hub_shared::*;
-use axum::http::{HeaderMap, HeaderValue, header};
 use super::error::ApiError;
+use agent_hub_shared::*;
+use axum::http::{header, HeaderMap, HeaderValue};
 
 pub(crate) fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
     let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
@@ -64,4 +64,3 @@ pub(crate) fn cookie_header(token: &str, secure: bool) -> Result<HeaderValue, Ap
     ))
     .map_err(|_| ApiError::internal("failed to build session cookie"))
 }
-

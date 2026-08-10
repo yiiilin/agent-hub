@@ -1,10 +1,10 @@
 //! HTTP API 统一错误类型。
 
 use agent_hub_shared::SecretGrantRequirementDto;
-use axum::Json;
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use serde_json::{Value, json};
+use axum::Json;
+use serde_json::{json, Value};
 
 #[derive(Debug)]
 pub(crate) struct ApiError {
