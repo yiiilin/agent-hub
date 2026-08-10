@@ -261,7 +261,7 @@ struct ApiKeyAuthProvider;
 struct EmbedJwtAuthProvider;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+pub(crate) async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             env::var("RUST_LOG")
@@ -386,7 +386,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_router(state: AppState) -> Router {
+pub(crate) fn build_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(|origin, request| {
             let path = request.uri.path();
@@ -831,7 +831,7 @@ fn build_router(state: AppState) -> Router {
         .with_state(Arc::new(state))
 }
 
-fn with_frontend<S>(router: Router<S>, frontend_dist_dir: PathBuf) -> Router<S>
+pub(crate) fn with_frontend<S>(router: Router<S>, frontend_dist_dir: PathBuf) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
@@ -863,7 +863,7 @@ struct WidgetPageQuery {
     app: Option<String>,
 }
 
-async fn widget_page(
+pub(crate) async fn widget_page(
     State(state): State<Arc<AppState>>,
     Query(query): Query<WidgetPageQuery>,
 ) -> Result<Response, ApiError> {
@@ -891,19 +891,19 @@ async fn widget_page(
     Ok((headers, contents).into_response())
 }
 
-async fn api_not_found() -> StatusCode {
+pub(crate) async fn api_not_found() -> StatusCode {
     StatusCode::NOT_FOUND
 }
 
-async fn healthz() -> Json<Value> {
+pub(crate) async fn healthz() -> Json<Value> {
     Json(json!({ "ok": true }))
 }
 
-async fn openapi() -> Json<Value> {
+pub(crate) async fn openapi() -> Json<Value> {
     Json(openapi_document())
 }
 
-fn openapi_document() -> Value {
+pub(crate) fn openapi_document() -> Value {
     let id = |name: &str| {
         json!({
             "name": name, "in": "path", "required": true,
@@ -1260,7 +1260,7 @@ fn openapi_document() -> Value {
     document
 }
 
-fn apply_openapi_security(document: &mut Value) {
+pub(crate) fn apply_openapi_security(document: &mut Value) {
     let user = json!([{ "sessionCookie": [] }, { "userBearer": [] }]);
     let integration = json!([{ "integrationBearer": [] }]);
     let paths = document["paths"].as_object_mut().expect("OpenAPI paths");
@@ -1282,7 +1282,7 @@ fn apply_openapi_security(document: &mut Value) {
     }
 }
 
-fn openapi_schemas() -> Value {
+pub(crate) fn openapi_schemas() -> Value {
     let uuid = || json!({ "type": "string", "format": "uuid" });
     let date = || json!({ "type": ["string", "null"], "format": "date-time" });
     json!({
@@ -1501,11 +1501,11 @@ fn openapi_schemas() -> Value {
     })
 }
 
-async fn readiness(State(state): State<Arc<AppState>>) -> Response {
+pub(crate) async fn readiness(State(state): State<Arc<AppState>>) -> Response {
     readiness_response(&state.pool, DATABASE_READINESS_TIMEOUT).await
 }
 
-async fn readiness_response(pool: &PgPool, timeout: Duration) -> Response {
+pub(crate) async fn readiness_response(pool: &PgPool, timeout: Duration) -> Response {
     let ready = matches!(
         tokio::time::timeout(
             timeout,
@@ -1526,7 +1526,7 @@ async fn readiness_response(pool: &PgPool, timeout: Duration) -> Response {
     }
 }
 
-async fn login(
+pub(crate) async fn login(
     State(state): State<Arc<AppState>>,
     MaybeConnectInfo(peer_address): MaybeConnectInfo,
     headers: HeaderMap,
@@ -1564,7 +1564,7 @@ async fn login(
     Ok((headers, Json(LoginResponse { user })))
 }
 
-async fn ldap_login(
+pub(crate) async fn ldap_login(
     State(state): State<Arc<AppState>>,
     MaybeConnectInfo(peer_address): MaybeConnectInfo,
     headers: HeaderMap,
@@ -1619,7 +1619,7 @@ async fn ldap_login(
     Ok((headers, Json(LoginResponse { user })))
 }
 
-async fn register_password_user(
+pub(crate) async fn register_password_user(
     State(state): State<Arc<AppState>>,
     Json(req): Json<PasswordRegistrationRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -1646,7 +1646,7 @@ async fn register_password_user(
     Ok((headers, Json(PasswordRegistrationResponse { user })))
 }
 
-async fn logout(
+pub(crate) async fn logout(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
@@ -1664,14 +1664,14 @@ async fn logout(
     Ok((response_headers, StatusCode::NO_CONTENT))
 }
 
-async fn me(
+pub(crate) async fn me(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<UserDto>, ApiError> {
     Ok(Json(require_user(&state, &headers).await?))
 }
 
-async fn update_current_user(
+pub(crate) async fn update_current_user(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<UpdateCurrentUserRequest>,
@@ -1691,7 +1691,7 @@ async fn update_current_user(
     Ok(Json(user_from_row(row)))
 }
 
-async fn list_users(
+pub(crate) async fn list_users(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<UserDto>>, ApiError> {
@@ -1710,7 +1710,7 @@ async fn list_users(
     Ok(Json(rows.into_iter().map(user_from_row).collect()))
 }
 
-async fn list_admin_users(
+pub(crate) async fn list_admin_users(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<AdminUserDetailDto>>, ApiError> {
@@ -1731,7 +1731,7 @@ async fn list_admin_users(
     ))
 }
 
-async fn create_admin_user(
+pub(crate) async fn create_admin_user(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<AdminCreateUserRequest>,
@@ -1808,7 +1808,7 @@ async fn create_admin_user(
     Ok(Json(admin_user_detail_from_row(row)))
 }
 
-async fn get_admin_user(
+pub(crate) async fn get_admin_user(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(user_id): Path<Uuid>,
@@ -1819,7 +1819,7 @@ async fn get_admin_user(
     ))
 }
 
-async fn update_admin_user(
+pub(crate) async fn update_admin_user(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(user_id): Path<Uuid>,
@@ -1879,7 +1879,7 @@ async fn update_admin_user(
     Ok(Json(admin_user_detail_from_row(row)))
 }
 
-async fn set_admin_user_password(
+pub(crate) async fn set_admin_user_password(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(user_id): Path<Uuid>,
@@ -1917,7 +1917,7 @@ async fn set_admin_user_password(
     Ok(Json(admin_user_detail_from_row(row)))
 }
 
-async fn set_admin_user_role(
+pub(crate) async fn set_admin_user_role(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(user_id): Path<Uuid>,
@@ -1991,7 +1991,7 @@ async fn set_admin_user_role(
     Ok(Json(admin_user_detail_from_row(row)))
 }
 
-async fn load_admin_user(
+pub(crate) async fn load_admin_user(
     pool: &PgPool,
     user_id: Uuid,
     administrator_role: &str,
@@ -2011,7 +2011,7 @@ async fn load_admin_user(
         .ok_or(ApiError::not_found("user not found"))
 }
 
-async fn list_user_erasures(
+pub(crate) async fn list_user_erasures(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<UserErasureDto>>, ApiError> {
@@ -2058,7 +2058,7 @@ async fn list_user_erasures(
     Ok(Json(items))
 }
 
-async fn erase_user(
+pub(crate) async fn erase_user(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(user_id): Path<Uuid>,
@@ -2075,7 +2075,7 @@ async fn erase_user(
     Ok((StatusCode::ACCEPTED, Json(erasure)))
 }
 
-async fn begin_user_erasure(
+pub(crate) async fn begin_user_erasure(
     pool: &PgPool,
     administrator_id: Uuid,
     user_id: Uuid,
@@ -2426,7 +2426,7 @@ async fn begin_user_erasure(
     Ok(())
 }
 
-async fn load_user_erasure(
+pub(crate) async fn load_user_erasure(
     pool: &PgPool,
     user_id: Uuid,
 ) -> Result<Option<UserErasureDto>, ApiError> {
@@ -2461,7 +2461,7 @@ async fn load_user_erasure(
     }))
 }
 
-async fn process_user_erasure_job(state: &AppState, user_id: Uuid) -> Result<(), ApiError> {
+pub(crate) async fn process_user_erasure_job(state: &AppState, user_id: Uuid) -> Result<(), ApiError> {
     let objects = sqlx::query_scalar::<_, String>(
         "SELECT object_key FROM user_erasure_bundle_objects
          WHERE user_id = $1 ORDER BY created_at, object_key",
@@ -2557,7 +2557,7 @@ async fn process_user_erasure_job(state: &AppState, user_id: Uuid) -> Result<(),
     finalize_user_erasure(state, user_id).await
 }
 
-async fn finalize_user_erasure(state: &AppState, user_id: Uuid) -> Result<(), ApiError> {
+pub(crate) async fn finalize_user_erasure(state: &AppState, user_id: Uuid) -> Result<(), ApiError> {
     let mut tx = state.pool.begin().await?;
     let job = sqlx::query(
         "SELECT requested_by, target_role FROM user_erasure_jobs
@@ -2748,7 +2748,7 @@ async fn finalize_user_erasure(state: &AppState, user_id: Uuid) -> Result<(), Ap
     Ok(())
 }
 
-async fn user_erasure_loop(state: Arc<AppState>) {
+pub(crate) async fn user_erasure_loop(state: Arc<AppState>) {
     let mut tick = tokio::time::interval(Duration::from_secs(5));
     loop {
         tick.tick().await;
@@ -2781,7 +2781,7 @@ async fn user_erasure_loop(state: Arc<AppState>) {
     }
 }
 
-async fn auth_providers(
+pub(crate) async fn auth_providers(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<AuthProvidersResponse>, ApiError> {
     let policy = load_auth_policy(&state.pool).await?;
@@ -2794,7 +2794,7 @@ async fn auth_providers(
     }))
 }
 
-async fn get_auth_policy(
+pub(crate) async fn get_auth_policy(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<AuthPolicyDto>, ApiError> {
@@ -2802,7 +2802,7 @@ async fn get_auth_policy(
     Ok(Json(load_auth_policy(&state.pool).await?))
 }
 
-async fn update_auth_policy(
+pub(crate) async fn update_auth_policy(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(policy): Json<AuthPolicyDto>,
@@ -2882,7 +2882,7 @@ async fn update_auth_policy(
     Ok(Json(auth_policy_from_row(row)))
 }
 
-async fn get_ldap_configuration(
+pub(crate) async fn get_ldap_configuration(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Option<LdapConfigurationDto>>, ApiError> {
@@ -2890,7 +2890,7 @@ async fn get_ldap_configuration(
     Ok(Json(load_ldap_configuration(&state.pool).await?))
 }
 
-async fn update_ldap_configuration(
+pub(crate) async fn update_ldap_configuration(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(configuration): Json<LdapConfigurationDto>,
@@ -2934,7 +2934,7 @@ async fn update_ldap_configuration(
     Ok(Json(configuration))
 }
 
-async fn test_ldap_configuration(
+pub(crate) async fn test_ldap_configuration(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<TestLdapConfigurationRequest>,
@@ -2970,7 +2970,7 @@ async fn test_ldap_configuration(
     }))
 }
 
-async fn list_external_platforms(
+pub(crate) async fn list_external_platforms(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<ExternalPlatformDto>>, ApiError> {
@@ -2983,7 +2983,7 @@ async fn list_external_platforms(
     ))
 }
 
-async fn create_external_platform(
+pub(crate) async fn create_external_platform(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<CreateExternalPlatformRequest>,
@@ -3007,7 +3007,7 @@ async fn create_external_platform(
         .ok_or_else(|| ApiError::conflict("external platform key already exists"))
 }
 
-async fn update_external_platform(
+pub(crate) async fn update_external_platform(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(platform_id): Path<Uuid>,
@@ -3030,7 +3030,7 @@ async fn update_external_platform(
         .ok_or(ApiError::not_found("external platform not found"))
 }
 
-async fn list_authentication_channels(
+pub(crate) async fn list_authentication_channels(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(platform_id): Path<Uuid>,
@@ -3053,7 +3053,7 @@ async fn list_authentication_channels(
     ))
 }
 
-async fn create_authentication_channel(
+pub(crate) async fn create_authentication_channel(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(platform_id): Path<Uuid>,
@@ -3083,7 +3083,7 @@ async fn create_authentication_channel(
         .ok_or_else(|| ApiError::conflict("authentication channel key already exists"))
 }
 
-async fn update_authentication_channel(
+pub(crate) async fn update_authentication_channel(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(channel_id): Path<Uuid>,
@@ -3129,7 +3129,7 @@ impl ApiKeyListQuery {
     }
 }
 
-async fn list_api_keys(
+pub(crate) async fn list_api_keys(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<ApiKeyListQuery>,
@@ -3160,7 +3160,7 @@ async fn list_api_keys(
     }))
 }
 
-async fn create_api_key(
+pub(crate) async fn create_api_key(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<CreateApiKeyRequest>,
@@ -3192,11 +3192,11 @@ async fn create_api_key(
     }))
 }
 
-fn new_api_key_token() -> String {
+pub(crate) fn new_api_key_token() -> String {
     format!("ahk_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
-async fn renew_api_key(
+pub(crate) async fn renew_api_key(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(api_key_id): Path<Uuid>,
@@ -3233,7 +3233,7 @@ async fn renew_api_key(
     Ok(Json(api_key_from_row(row)))
 }
 
-fn api_key_expiration(
+pub(crate) fn api_key_expiration(
     validity: Option<&ApiKeyValidity>,
     now: DateTime<Utc>,
 ) -> Result<Option<DateTime<Utc>>, ApiError> {
@@ -3252,7 +3252,7 @@ fn api_key_expiration(
     }
 }
 
-fn renewed_api_key_expiration(
+pub(crate) fn renewed_api_key_expiration(
     validity: &ApiKeyValidity,
     current_expiration: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
@@ -3269,7 +3269,7 @@ fn renewed_api_key_expiration(
     Ok(requested)
 }
 
-async fn delete_api_key(
+pub(crate) async fn delete_api_key(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(api_key_id): Path<Uuid>,
@@ -3294,7 +3294,7 @@ struct UpdateHubSessionTitleRequest {
     title: String,
 }
 
-async fn update_hub_session_title(
+pub(crate) async fn update_hub_session_title(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(session_id): Path<Uuid>,
@@ -3319,7 +3319,7 @@ async fn update_hub_session_title(
     get_hub_session(axum::extract::State(state), headers, Path(session_id)).await
 }
 
-async fn generate_session_title_in_background(
+pub(crate) async fn generate_session_title_in_background(
     state: Arc<AppState>,
     session_id: Uuid,
     agent_id: Uuid,
@@ -3460,7 +3460,7 @@ async fn generate_session_title_in_background(
     }
 }
 
-fn sanitize_session_title(text: &str) -> String {
+pub(crate) fn sanitize_session_title(text: &str) -> String {
     let title = text
         .trim()
         .trim_matches(['"', '\'', '“', '”', '「', '」', '《', '》'])
@@ -3472,7 +3472,7 @@ fn sanitize_session_title(text: &str) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn record_session_title_usage(
+pub(crate) async fn record_session_title_usage(
     state: &AppState,
     request_id: Uuid,
     response: &Value,
@@ -3531,7 +3531,7 @@ async fn record_session_title_usage(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn record_session_title_error(
+pub(crate) async fn record_session_title_error(
     state: &AppState,
     request_id: Uuid,
     upstream_http_status: Option<u16>,
@@ -3588,7 +3588,7 @@ async fn record_session_title_error(
     Ok(())
 }
 
-async fn list_model_connections(
+pub(crate) async fn list_model_connections(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<ModelConnectionDto>>, ApiError> {
@@ -3615,7 +3615,7 @@ async fn list_model_connections(
     ))
 }
 
-async fn get_model_connection_options(
+pub(crate) async fn get_model_connection_options(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<ModelConnectionOptionsDto>, ApiError> {
@@ -3654,7 +3654,7 @@ async fn get_model_connection_options(
     }))
 }
 
-fn validate_vision_model_id(
+pub(crate) fn validate_vision_model_id(
     vision_model_id: Option<String>,
     allowed_model_ids: &[String],
 ) -> Result<Option<String>, ApiError> {
@@ -3681,7 +3681,7 @@ fn validate_vision_model_id(
     Ok(Some(vision_model_id.to_owned()))
 }
 
-async fn create_model_connection(
+pub(crate) async fn create_model_connection(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<CreateModelConnectionRequest>,
@@ -3736,7 +3736,7 @@ async fn create_model_connection(
     ))
 }
 
-async fn get_model_connection(
+pub(crate) async fn get_model_connection(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(model_connection_id): Path<Uuid>,
@@ -3753,7 +3753,7 @@ struct UpdateModelConnectionQuery {
     force: bool,
 }
 
-async fn update_model_connection(
+pub(crate) async fn update_model_connection(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(model_connection_id): Path<Uuid>,
@@ -3850,7 +3850,7 @@ async fn update_model_connection(
     ))
 }
 
-async fn update_model_connection_status(
+pub(crate) async fn update_model_connection_status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(model_connection_id): Path<Uuid>,
@@ -3882,7 +3882,7 @@ async fn update_model_connection_status(
     ))
 }
 
-async fn delete_model_connection(
+pub(crate) async fn delete_model_connection(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(model_connection_id): Path<Uuid>,
@@ -3890,7 +3890,7 @@ async fn delete_model_connection(
     delete_model_connection_impl(&state, &headers, model_connection_id, false).await
 }
 
-async fn force_delete_model_connection(
+pub(crate) async fn force_delete_model_connection(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(model_connection_id): Path<Uuid>,
@@ -3898,7 +3898,7 @@ async fn force_delete_model_connection(
     delete_model_connection_impl(&state, &headers, model_connection_id, true).await
 }
 
-async fn bump_agents_for_model_connection_tx(
+pub(crate) async fn bump_agents_for_model_connection_tx(
     tx: &mut Transaction<'_, Postgres>,
     model_connection_id: Uuid,
 ) -> Result<(), ApiError> {
@@ -3922,7 +3922,7 @@ async fn bump_agents_for_model_connection_tx(
     Ok(())
 }
 
-async fn clear_model_selection_references_tx(
+pub(crate) async fn clear_model_selection_references_tx(
     tx: &mut Transaction<'_, Postgres>,
     model_connection_id: Uuid,
     removed_model_ids: &[String],
@@ -3989,7 +3989,7 @@ async fn clear_model_selection_references_tx(
     Ok(())
 }
 
-async fn delete_model_connection_impl(
+pub(crate) async fn delete_model_connection_impl(
     state: &AppState,
     headers: &HeaderMap,
     model_connection_id: Uuid,
@@ -4059,7 +4059,7 @@ async fn delete_model_connection_impl(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn get_system_default_model_selection(
+pub(crate) async fn get_system_default_model_selection(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<SystemDefaultModelSelectionDto>, ApiError> {
@@ -4078,7 +4078,7 @@ async fn get_system_default_model_selection(
     Ok(Json(SystemDefaultModelSelectionDto { selection }))
 }
 
-async fn set_system_default_model_selection(
+pub(crate) async fn set_system_default_model_selection(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<SetSystemDefaultModelSelectionRequest>,
@@ -4132,7 +4132,7 @@ async fn set_system_default_model_selection(
     }))
 }
 
-async fn test_model_connection(
+pub(crate) async fn test_model_connection(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(model_connection_id): Path<Uuid>,
@@ -4317,11 +4317,11 @@ async fn test_model_connection(
     }))
 }
 
-fn model_test_response_time_ms(started_at: Instant) -> u64 {
+pub(crate) fn model_test_response_time_ms(started_at: Instant) -> u64 {
     u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-fn model_test_response_text(value: &Value) -> Option<String> {
+pub(crate) fn model_test_response_text(value: &Value) -> Option<String> {
     if let Some(text) = value
         .get("output_text")
         .and_then(Value::as_str)
@@ -4356,7 +4356,7 @@ struct ValidatedModelConnectionFields {
     allowed_model_ids: Vec<String>,
 }
 
-fn validate_model_connection_fields(
+pub(crate) fn validate_model_connection_fields(
     name: &str,
     base_url: &str,
     allowed_model_ids: Vec<String>,
@@ -4403,7 +4403,7 @@ fn validate_model_connection_fields(
     })
 }
 
-fn validate_agent_model_settings(
+pub(crate) fn validate_agent_model_settings(
     mut settings: AgentModelSettings,
     protocol: ModelUpstreamProtocol,
 ) -> Result<AgentModelSettings, ApiError> {
@@ -4456,7 +4456,7 @@ fn validate_agent_model_settings(
     Ok(settings)
 }
 
-fn validate_model_request_settings(
+pub(crate) fn validate_model_request_settings(
     protocol: ModelUpstreamProtocol,
     settings: ModelRequestSettings,
 ) -> Result<ModelRequestSettings, ApiError> {
@@ -4494,7 +4494,7 @@ fn validate_model_request_settings(
     Ok(settings)
 }
 
-fn validate_model_request_number(
+pub(crate) fn validate_model_request_number(
     name: &str,
     value: Option<&Number>,
     maximum: f64,
@@ -4511,7 +4511,7 @@ fn validate_model_request_number(
     Ok(())
 }
 
-fn validate_model_request_token_limit(name: &str, value: Option<u32>) -> Result<(), ApiError> {
+pub(crate) fn validate_model_request_token_limit(name: &str, value: Option<u32>) -> Result<(), ApiError> {
     if value == Some(0) {
         return Err(ApiError::bad_request(format!(
             "Agent request setting {name} must be a positive integer"
@@ -4520,7 +4520,7 @@ fn validate_model_request_token_limit(name: &str, value: Option<u32>) -> Result<
     Ok(())
 }
 
-fn model_connection_from_row(row: &sqlx::postgres::PgRow) -> ModelConnectionDto {
+pub(crate) fn model_connection_from_row(row: &sqlx::postgres::PgRow) -> ModelConnectionDto {
     ModelConnectionDto {
         id: row.get("id"),
         owner_id: row.get("owner_id"),
@@ -4545,11 +4545,11 @@ fn model_connection_from_row(row: &sqlx::postgres::PgRow) -> ModelConnectionDto 
     }
 }
 
-fn model_request_settings_value(settings: &ModelRequestSettings) -> Value {
+pub(crate) fn model_request_settings_value(settings: &ModelRequestSettings) -> Value {
     serde_json::to_value(settings).expect("validated Model request settings are serializable")
 }
 
-async fn load_visible_model_connection(
+pub(crate) async fn load_visible_model_connection(
     pool: &PgPool,
     model_connection_id: Uuid,
     user_id: Uuid,
@@ -4574,7 +4574,7 @@ async fn load_visible_model_connection(
         .ok_or(ApiError::not_found("model connection not found"))
 }
 
-async fn authorize_model_connection_mutation(
+pub(crate) async fn authorize_model_connection_mutation(
     pool: &PgPool,
     model_connection_id: Uuid,
     user: &UserDto,
@@ -4597,7 +4597,7 @@ async fn authorize_model_connection_mutation(
     Ok(())
 }
 
-async fn load_mutable_model_connection_tx(
+pub(crate) async fn load_mutable_model_connection_tx(
     tx: &mut Transaction<'_, Postgres>,
     model_connection_id: Uuid,
     user: &UserDto,
@@ -4627,7 +4627,7 @@ struct ModelConnectionSecretRecord {
     nonce: Vec<u8>,
 }
 
-async fn load_model_connection_secret_for_test(
+pub(crate) async fn load_model_connection_secret_for_test(
     pool: &PgPool,
     model_connection_id: Uuid,
     user: &UserDto,
@@ -4655,7 +4655,7 @@ async fn load_model_connection_secret_for_test(
     })
 }
 
-fn map_model_connection_write_error(error: sqlx::Error) -> ApiError {
+pub(crate) fn map_model_connection_write_error(error: sqlx::Error) -> ApiError {
     if let sqlx::Error::Database(database) = &error {
         return match database.code().as_deref() {
             Some("23505") => ApiError::conflict("Model Connection name already exists"),
@@ -4689,7 +4689,7 @@ struct ModelTestLedgerContext<'a> {
     user: &'a UserDto,
 }
 
-fn extract_model_usage(response: &Value) -> Option<ObservedModelUsage> {
+pub(crate) fn extract_model_usage(response: &Value) -> Option<ObservedModelUsage> {
     let usage = response.get("usage")?;
     let observed = ObservedModelUsage {
         input_tokens: usage.get("input_tokens")?.as_i64()?,
@@ -4712,7 +4712,7 @@ fn extract_model_usage(response: &Value) -> Option<ObservedModelUsage> {
     .then_some(observed)
 }
 
-fn model_response_status(response: Option<&Value>, http_success: bool) -> &'static str {
+pub(crate) fn model_response_status(response: Option<&Value>, http_success: bool) -> &'static str {
     match response
         .and_then(|value| value.get("status"))
         .and_then(Value::as_str)
@@ -4726,7 +4726,7 @@ fn model_response_status(response: Option<&Value>, http_success: bool) -> &'stat
     }
 }
 
-async fn record_model_test_usage(
+pub(crate) async fn record_model_test_usage(
     context: &ModelTestLedgerContext<'_>,
     response_status: &str,
     usage: &ObservedModelUsage,
@@ -4765,7 +4765,7 @@ async fn record_model_test_usage(
     Ok(())
 }
 
-async fn record_model_test_error(
+pub(crate) async fn record_model_test_error(
     context: &ModelTestLedgerContext<'_>,
     response_status: &str,
     upstream_http_status: Option<u16>,
@@ -4805,14 +4805,14 @@ async fn record_model_test_error(
     Ok(())
 }
 
-fn model_connection_scope_name(scope: ModelConnectionScope) -> &'static str {
+pub(crate) fn model_connection_scope_name(scope: ModelConnectionScope) -> &'static str {
     match scope {
         ModelConnectionScope::Global => "global",
         ModelConnectionScope::Personal => "personal",
     }
 }
 
-fn model_upstream_protocol_name(protocol: ModelUpstreamProtocol) -> &'static str {
+pub(crate) fn model_upstream_protocol_name(protocol: ModelUpstreamProtocol) -> &'static str {
     match protocol {
         ModelUpstreamProtocol::OpenaiResponses => "openai_responses",
         ModelUpstreamProtocol::OpenaiChatCompletions => "openai_chat_completions",
@@ -4820,7 +4820,7 @@ fn model_upstream_protocol_name(protocol: ModelUpstreamProtocol) -> &'static str
     }
 }
 
-fn model_upstream_protocol_from_name(value: &str) -> ModelUpstreamProtocol {
+pub(crate) fn model_upstream_protocol_from_name(value: &str) -> ModelUpstreamProtocol {
     match value {
         "openai_responses" => ModelUpstreamProtocol::OpenaiResponses,
         "openai_chat_completions" => ModelUpstreamProtocol::OpenaiChatCompletions,
@@ -4829,7 +4829,7 @@ fn model_upstream_protocol_from_name(value: &str) -> ModelUpstreamProtocol {
     }
 }
 
-fn sanitize_model_error_message(message: &str, secret: &str) -> String {
+pub(crate) fn sanitize_model_error_message(message: &str, secret: &str) -> String {
     message
         .replace(secret, REDACTED_SECRET)
         .chars()
@@ -4899,7 +4899,7 @@ impl From<ModelCallErrorQueryDto> for ModelLedgerQueryInput {
     }
 }
 
-fn validate_model_ledger_query(
+pub(crate) fn validate_model_ledger_query(
     query: ModelLedgerQueryInput,
     user: &UserDto,
 ) -> Result<ValidatedModelLedgerQuery, ApiError> {
@@ -4958,7 +4958,7 @@ fn validate_model_ledger_query(
     })
 }
 
-fn model_ledger_source(table: &str, include_owned_agent_aggregates: bool) -> String {
+pub(crate) fn model_ledger_source(table: &str, include_owned_agent_aggregates: bool) -> String {
     let member_visibility = if include_owned_agent_aggregates {
         "(ledger.subject_user_id = $1 OR agent.owner_id = $1)"
     } else {
@@ -4996,7 +4996,7 @@ fn model_ledger_source(table: &str, include_owned_agent_aggregates: bool) -> Str
     )
 }
 
-async fn get_model_usage_summary(
+pub(crate) async fn get_model_usage_summary(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<ModelTokenUsageQueryDto>,
@@ -5152,7 +5152,7 @@ async fn get_model_usage_summary(
     }))
 }
 
-async fn list_model_token_usage(
+pub(crate) async fn list_model_token_usage(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<ModelTokenUsageQueryDto>,
@@ -5210,7 +5210,7 @@ async fn list_model_token_usage(
     Ok(Json(ModelTokenUsagePageDto { items, next_cursor }))
 }
 
-async fn list_model_call_errors(
+pub(crate) async fn list_model_call_errors(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<ModelCallErrorQueryDto>,
@@ -5267,7 +5267,7 @@ async fn list_model_call_errors(
     Ok(Json(ModelCallErrorPageDto { items, next_cursor }))
 }
 
-fn model_token_totals_from_row(row: &sqlx::postgres::PgRow) -> ModelTokenUsageTotalsDto {
+pub(crate) fn model_token_totals_from_row(row: &sqlx::postgres::PgRow) -> ModelTokenUsageTotalsDto {
     ModelTokenUsageTotalsDto {
         input_tokens: row.get("input_tokens"),
         output_tokens: row.get("output_tokens"),
@@ -5277,7 +5277,7 @@ fn model_token_totals_from_row(row: &sqlx::postgres::PgRow) -> ModelTokenUsageTo
     }
 }
 
-fn model_connection_snapshot_from_row(row: &sqlx::postgres::PgRow) -> ModelConnectionSnapshotDto {
+pub(crate) fn model_connection_snapshot_from_row(row: &sqlx::postgres::PgRow) -> ModelConnectionSnapshotDto {
     ModelConnectionSnapshotDto {
         id: row.get("model_connection_id"),
         scope: match row
@@ -5296,7 +5296,7 @@ fn model_connection_snapshot_from_row(row: &sqlx::postgres::PgRow) -> ModelConne
     }
 }
 
-fn model_agent_snapshot_from_row(row: &sqlx::postgres::PgRow) -> ModelAgentSnapshotDto {
+pub(crate) fn model_agent_snapshot_from_row(row: &sqlx::postgres::PgRow) -> ModelAgentSnapshotDto {
     ModelAgentSnapshotDto {
         id: row.get("agent_id"),
         name: row
@@ -5305,7 +5305,7 @@ fn model_agent_snapshot_from_row(row: &sqlx::postgres::PgRow) -> ModelAgentSnaps
     }
 }
 
-fn model_usage_subject_from_row(row: &sqlx::postgres::PgRow) -> ModelUsageSubjectDto {
+pub(crate) fn model_usage_subject_from_row(row: &sqlx::postgres::PgRow) -> ModelUsageSubjectDto {
     match row.get::<String, _>("subject_type").as_str() {
         "user" => ModelUsageSubjectDto {
             kind: ModelUsageSubjectKind::User,
@@ -5326,7 +5326,7 @@ fn model_usage_subject_from_row(row: &sqlx::postgres::PgRow) -> ModelUsageSubjec
     }
 }
 
-fn model_token_usage_from_row(row: sqlx::postgres::PgRow) -> ModelTokenUsageDto {
+pub(crate) fn model_token_usage_from_row(row: sqlx::postgres::PgRow) -> ModelTokenUsageDto {
     ModelTokenUsageDto {
         id: row.get("id"),
         occurred_at: row.get("occurred_at"),
@@ -5342,7 +5342,7 @@ fn model_token_usage_from_row(row: sqlx::postgres::PgRow) -> ModelTokenUsageDto 
     }
 }
 
-fn model_call_error_from_row(row: sqlx::postgres::PgRow) -> ModelCallErrorDto {
+pub(crate) fn model_call_error_from_row(row: sqlx::postgres::PgRow) -> ModelCallErrorDto {
     ModelCallErrorDto {
         id: row.get("id"),
         occurred_at: row.get("occurred_at"),
@@ -5358,7 +5358,7 @@ fn model_call_error_from_row(row: sqlx::postgres::PgRow) -> ModelCallErrorDto {
     }
 }
 
-async fn list_agents(
+pub(crate) async fn list_agents(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<AgentDto>>, ApiError> {
@@ -5398,7 +5398,7 @@ async fn list_agents(
     Ok(Json(agents))
 }
 
-async fn create_agent(
+pub(crate) async fn create_agent(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(mut req): Json<CreateAgentRequest>,
@@ -5489,7 +5489,7 @@ async fn create_agent(
     Ok(Json(load_agent_for_user(&state.pool, id, &user).await?))
 }
 
-async fn get_agent(
+pub(crate) async fn get_agent(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(agent_id): Path<Uuid>,
@@ -5500,7 +5500,7 @@ async fn get_agent(
     ))
 }
 
-async fn get_agent_model_connection_options(
+pub(crate) async fn get_agent_model_connection_options(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(agent_id): Path<Uuid>,
@@ -5571,7 +5571,7 @@ async fn get_agent_model_connection_options(
     }))
 }
 
-async fn update_agent(
+pub(crate) async fn update_agent(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(agent_id): Path<Uuid>,
@@ -5706,7 +5706,7 @@ async fn update_agent(
     ))
 }
 
-async fn delete_agent(
+pub(crate) async fn delete_agent(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(agent_id): Path<Uuid>,
@@ -5903,7 +5903,7 @@ async fn delete_agent(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn delete_queued_agent_bundles(state: &AppState, agent_id: Uuid) -> Result<(), ApiError> {
+pub(crate) async fn delete_queued_agent_bundles(state: &AppState, agent_id: Uuid) -> Result<(), ApiError> {
     let object_keys = sqlx::query_scalar::<_, String>(
         "SELECT object_key
          FROM session_bundle_deletion_queue
@@ -5957,7 +5957,7 @@ async fn delete_queued_agent_bundles(state: &AppState, agent_id: Uuid) -> Result
     }
 }
 
-async fn list_integration_apps(
+pub(crate) async fn list_integration_apps(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<IntegrationAppDto>>, ApiError> {
@@ -5977,7 +5977,7 @@ async fn list_integration_apps(
     Ok(Json(apps))
 }
 
-async fn get_integration_app_options(
+pub(crate) async fn get_integration_app_options(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<IntegrationAppOptionsDto>, ApiError> {
@@ -6023,7 +6023,7 @@ async fn get_integration_app_options(
     }))
 }
 
-async fn get_integration_app(
+pub(crate) async fn get_integration_app(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(app_id): Path<Uuid>,
@@ -6034,7 +6034,7 @@ async fn get_integration_app(
     ))
 }
 
-async fn create_integration_app(
+pub(crate) async fn create_integration_app(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<CreateIntegrationAppRequest>,
@@ -6109,7 +6109,7 @@ async fn create_integration_app(
     }))
 }
 
-async fn update_integration_app(
+pub(crate) async fn update_integration_app(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(app_id): Path<Uuid>,
@@ -6183,7 +6183,7 @@ async fn update_integration_app(
     ))
 }
 
-async fn rotate_integration_app_secret(
+pub(crate) async fn rotate_integration_app_secret(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(app_id): Path<Uuid>,
@@ -6209,7 +6209,7 @@ async fn rotate_integration_app_secret(
     }))
 }
 
-async fn create_integration_app_widget_session(
+pub(crate) async fn create_integration_app_widget_session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((app_id, agent_id)): Path<(Uuid, Uuid)>,
@@ -6292,7 +6292,7 @@ struct OAuthAuthorizeQuery {
     tenant_id: String,
 }
 
-async fn oauth_authorize(
+pub(crate) async fn oauth_authorize(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<OAuthAuthorizeQuery>,
@@ -6362,7 +6362,7 @@ struct OAuthTokenForm {
     scope: Option<String>,
 }
 
-async fn oauth_token(
+pub(crate) async fn oauth_token(
     State(state): State<Arc<AppState>>,
     Form(form): Form<OAuthTokenForm>,
 ) -> Result<Json<OAuthTokenResponse>, ApiError> {
@@ -6462,7 +6462,7 @@ async fn oauth_token(
     }))
 }
 
-async fn oauth_userinfo(
+pub(crate) async fn oauth_userinfo(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<OAuthUserInfoDto>, ApiError> {
@@ -6502,7 +6502,7 @@ async fn oauth_userinfo(
     )))
 }
 
-async fn list_agent_runs(
+pub(crate) async fn list_agent_runs(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(agent_id): Path<Uuid>,
@@ -6532,7 +6532,7 @@ async fn list_agent_runs(
     Ok(Json(rows.into_iter().map(run_from_row).collect()))
 }
 
-async fn create_run(
+pub(crate) async fn create_run(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(agent_id): Path<Uuid>,
@@ -6677,7 +6677,7 @@ async fn create_run(
     Ok(Json(run))
 }
 
-async fn list_hub_sessions(
+pub(crate) async fn list_hub_sessions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<HubSessionDto>>, ApiError> {
@@ -6717,7 +6717,7 @@ struct ParsedMessageMultipart {
     files: Vec<StagedAttachmentUpload>,
 }
 
-async fn parse_message_multipart(
+pub(crate) async fn parse_message_multipart(
     mut multipart: Multipart,
 ) -> Result<ParsedMessageMultipart, ApiError> {
     let mut agent_id = None;
@@ -6830,7 +6830,7 @@ async fn parse_message_multipart(
     })
 }
 
-async fn store_attachments_for_message(
+pub(crate) async fn store_attachments_for_message(
     state: &AppState,
     session_id: Uuid,
     owner_id: Uuid,
@@ -6934,7 +6934,7 @@ async fn store_attachments_for_message(
     }
 }
 
-async fn create_session_with_message(
+pub(crate) async fn create_session_with_message(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     multipart: Multipart,
@@ -6993,7 +6993,7 @@ async fn create_session_with_message(
     Ok(Json(accepted))
 }
 
-async fn create_session_message_with_attachments(
+pub(crate) async fn create_session_message_with_attachments(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(session_id): Path<Uuid>,
@@ -7054,7 +7054,7 @@ async fn create_session_message_with_attachments(
     Ok(Json(accepted))
 }
 
-async fn get_hub_session(
+pub(crate) async fn get_hub_session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(session_id): Path<Uuid>,
@@ -7090,7 +7090,7 @@ async fn get_hub_session(
     Ok(Json(hub_session_from_row(row)))
 }
 
-async fn delete_hub_session(
+pub(crate) async fn delete_hub_session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(session_id): Path<Uuid>,
@@ -7118,7 +7118,7 @@ struct SessionDeletionOutcome {
 }
 
 /// 按 owner 查询会话删除守卫行（用户态 /api/sessions 删除路径）。
-async fn load_session_deletion_guard_tx(
+pub(crate) async fn load_session_deletion_guard_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: Uuid,
     owner_id: Option<Uuid>,
@@ -7146,7 +7146,7 @@ async fn load_session_deletion_guard_tx(
 /// 删除会话的全部关联数据（runs、消息、附件、集成记录、turns 等）。
 /// 调用方负责：先锁定会话行并通过 load_session_deletion_guard_tx 构造守卫，
 /// 随后在本函数返回后提交事务，再调用 delete_session_object_store_entries 清理对象存储。
-async fn delete_session_rows_tx(
+pub(crate) async fn delete_session_rows_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: Uuid,
     guard: SessionDeletionGuard,
@@ -7273,7 +7273,7 @@ async fn delete_session_rows_tx(
 }
 
 /// 事务提交后清理会话关联的对象存储条目（bundle 与附件）。
-async fn delete_session_object_store_entries(
+pub(crate) async fn delete_session_object_store_entries(
     state: &Arc<AppState>,
     session_id: Uuid,
     outcome: &SessionDeletionOutcome,
@@ -7297,7 +7297,7 @@ async fn delete_session_object_store_entries(
 }
 
 /// Client（Widget）侧删除会话：按 client 凭证作用域定位会话后执行删除。
-async fn delete_widget_session(
+pub(crate) async fn delete_widget_session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(session_id): Path<Uuid>,
@@ -7344,7 +7344,7 @@ impl SessionMessageListQuery {
     }
 }
 
-async fn list_hub_session_messages(
+pub(crate) async fn list_hub_session_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(session_id): Path<Uuid>,
@@ -7378,7 +7378,7 @@ async fn list_hub_session_messages(
     Ok(Json(messages))
 }
 
-async fn create_hub_session_message(
+pub(crate) async fn create_hub_session_message(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(session_id): Path<Uuid>,
@@ -7441,7 +7441,7 @@ struct BindMessageAttachmentsRequest {
     attachment_ids: Vec<Uuid>,
 }
 
-async fn bind_message_attachments(
+pub(crate) async fn bind_message_attachments(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((session_id, message_id)): Path<(Uuid, Uuid)>,
@@ -7525,7 +7525,7 @@ struct StagedAttachmentUpload {
     checksum_sha256: String,
 }
 
-async fn upload_attachment(
+pub(crate) async fn upload_attachment(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<AttachmentUploadQuery>,
@@ -7537,7 +7537,7 @@ async fn upload_attachment(
     upload_attachment_to_session(&state, session_id, user.id, staged).await
 }
 
-async fn upload_widget_attachment(
+pub(crate) async fn upload_widget_attachment(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<AttachmentUploadQuery>,
@@ -7564,7 +7564,7 @@ async fn upload_widget_attachment(
     upload_attachment_to_session(&state, scoped.hub_session_id, credential.owner_id, staged).await
 }
 
-async fn download_attachment(
+pub(crate) async fn download_attachment(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(attachment_id): Path<Uuid>,
@@ -7578,7 +7578,7 @@ async fn download_attachment(
     serve_attachment_row(&state, row).await
 }
 
-async fn download_runtime_attachment(
+pub(crate) async fn download_runtime_attachment(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(attachment_id): Path<Uuid>,
@@ -7598,7 +7598,7 @@ async fn download_runtime_attachment(
     serve_attachment_row(&state, row).await
 }
 
-async fn download_widget_attachment(
+pub(crate) async fn download_widget_attachment(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(attachment_id): Path<Uuid>,
@@ -7636,7 +7636,7 @@ async fn download_widget_attachment(
     serve_attachment_row(&state, row).await
 }
 
-async fn stage_attachment_upload(
+pub(crate) async fn stage_attachment_upload(
     mut multipart: Multipart,
 ) -> Result<StagedAttachmentUpload, ApiError> {
     let mut session_id = None;
@@ -7730,7 +7730,7 @@ async fn stage_attachment_upload(
     })
 }
 
-fn sanitize_attachment_file_name(value: Option<&str>) -> Result<String, ApiError> {
+pub(crate) fn sanitize_attachment_file_name(value: Option<&str>) -> Result<String, ApiError> {
     let value = value
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -7742,7 +7742,7 @@ fn sanitize_attachment_file_name(value: Option<&str>) -> Result<String, ApiError
     Ok(value.to_owned())
 }
 
-fn sanitize_attachment_content_type(value: Option<&str>) -> Result<String, ApiError> {
+pub(crate) fn sanitize_attachment_content_type(value: Option<&str>) -> Result<String, ApiError> {
     let value = value
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -7753,7 +7753,7 @@ fn sanitize_attachment_content_type(value: Option<&str>) -> Result<String, ApiEr
     Ok(value.to_owned())
 }
 
-fn resolve_attachment_session_id(
+pub(crate) fn resolve_attachment_session_id(
     query_session_id: Option<Uuid>,
     field_session_id: Option<Uuid>,
 ) -> Result<Uuid, ApiError> {
@@ -7767,7 +7767,7 @@ fn resolve_attachment_session_id(
     }
 }
 
-async fn upload_attachment_to_session(
+pub(crate) async fn upload_attachment_to_session(
     state: &AppState,
     session_id: Uuid,
     owner_id: Uuid,
@@ -7842,7 +7842,7 @@ async fn upload_attachment_to_session(
     Ok(Json(hub_session_attachment_from_row(row)))
 }
 
-async fn load_attachment_with_session_owner(
+pub(crate) async fn load_attachment_with_session_owner(
     pool: &PgPool,
     attachment_id: Uuid,
 ) -> Result<sqlx::postgres::PgRow, ApiError> {
@@ -7859,7 +7859,7 @@ async fn load_attachment_with_session_owner(
     .ok_or(ApiError::not_found("attachment not found"))
 }
 
-async fn serve_attachment_row(
+pub(crate) async fn serve_attachment_row(
     state: &AppState,
     row: sqlx::postgres::PgRow,
 ) -> Result<Response, ApiError> {
@@ -7913,7 +7913,7 @@ async fn serve_attachment_row(
     Ok(response)
 }
 
-fn attachment_filename_encoding(name: &str) -> String {
+pub(crate) fn attachment_filename_encoding(name: &str) -> String {
     let mut encoded = String::new();
     for byte in name.bytes() {
         match byte {
@@ -7929,7 +7929,7 @@ fn attachment_filename_encoding(name: &str) -> String {
     encoded
 }
 
-fn hub_session_attachment_from_row(row: sqlx::postgres::PgRow) -> HubSessionAttachmentDto {
+pub(crate) fn hub_session_attachment_from_row(row: sqlx::postgres::PgRow) -> HubSessionAttachmentDto {
     HubSessionAttachmentDto {
         id: row.get("id"),
         session_id: row.get("session_id"),
@@ -7940,7 +7940,7 @@ fn hub_session_attachment_from_row(row: sqlx::postgres::PgRow) -> HubSessionAtta
     }
 }
 
-async fn load_attachments_for_session_messages<'e, E>(
+pub(crate) async fn load_attachments_for_session_messages<'e, E>(
     executor: E,
     message_ids: &[Uuid],
 ) -> Result<HashMap<Uuid, Vec<HubSessionAttachmentDto>>, sqlx::Error>
@@ -7969,7 +7969,7 @@ where
     Ok(by_message)
 }
 
-async fn fill_message_attachments<'e, E>(
+pub(crate) async fn fill_message_attachments<'e, E>(
     executor: E,
     messages: &mut [HubSessionMessageDto],
 ) -> Result<(), sqlx::Error>
@@ -7987,7 +7987,7 @@ where
     Ok(())
 }
 
-async fn runtime_attachment_orphan_loop(state: Arc<AppState>) {
+pub(crate) async fn runtime_attachment_orphan_loop(state: Arc<AppState>) {
     let mut tick = tokio::time::interval(Duration::from_secs(30 * 60));
     loop {
         tick.tick().await;
@@ -7997,7 +7997,7 @@ async fn runtime_attachment_orphan_loop(state: Arc<AppState>) {
     }
 }
 
-async fn cleanup_attachment_orphans(state: &AppState) -> Result<(), anyhow::Error> {
+pub(crate) async fn cleanup_attachment_orphans(state: &AppState) -> Result<(), anyhow::Error> {
     let mut tx = state.pool.begin().await?;
     let object_keys = sqlx::query_scalar::<_, String>(
         "SELECT object_key
@@ -8025,7 +8025,7 @@ async fn cleanup_attachment_orphans(state: &AppState) -> Result<(), anyhow::Erro
     Ok(())
 }
 
-async fn get_run(
+pub(crate) async fn get_run(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(run_id): Path<Uuid>,
@@ -8034,7 +8034,7 @@ async fn get_run(
     Ok(Json(load_run_for_user(&state.pool, run_id, &user).await?))
 }
 
-async fn stop_hub_run(
+pub(crate) async fn stop_hub_run(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(run_id): Path<Uuid>,
@@ -8063,7 +8063,7 @@ async fn stop_hub_run(
     Ok(Json(run))
 }
 
-async fn list_run_events(
+pub(crate) async fn list_run_events(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(run_id): Path<Uuid>,
@@ -8079,7 +8079,7 @@ struct EventStreamQuery {
     limit: Option<i64>,
 }
 
-async fn stream_run_events(
+pub(crate) async fn stream_run_events(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(run_id): Path<Uuid>,
@@ -8151,7 +8151,7 @@ async fn stream_run_events(
     Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
 }
 
-async fn list_runtimes(
+pub(crate) async fn list_runtimes(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<RuntimeDto>>, ApiError> {
@@ -8166,7 +8166,7 @@ async fn list_runtimes(
     Ok(Json(rows.into_iter().map(runtime_from_row).collect()))
 }
 
-async fn create_runtime_enrollment_token(
+pub(crate) async fn create_runtime_enrollment_token(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<CreateRuntimeEnrollmentTokenResponse>, ApiError> {
@@ -8190,7 +8190,7 @@ async fn create_runtime_enrollment_token(
     }))
 }
 
-async fn list_runtime_enrollment_tokens(
+pub(crate) async fn list_runtime_enrollment_tokens(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<RuntimeEnrollmentTokenDto>>, ApiError> {
@@ -8208,7 +8208,7 @@ async fn list_runtime_enrollment_tokens(
     ))
 }
 
-async fn revoke_runtime_enrollment_token(
+pub(crate) async fn revoke_runtime_enrollment_token(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(enrollment_id): Path<Uuid>,
@@ -8241,7 +8241,7 @@ async fn revoke_runtime_enrollment_token(
     }
 }
 
-async fn request_runtime_credential_rotation(
+pub(crate) async fn request_runtime_credential_rotation(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(runtime_id): Path<Uuid>,
@@ -8261,7 +8261,7 @@ async fn request_runtime_credential_rotation(
         .ok_or(ApiError::not_found("runtime not found"))
 }
 
-async fn drain_runtime(
+pub(crate) async fn drain_runtime(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(runtime_id): Path<Uuid>,
@@ -8312,7 +8312,7 @@ async fn drain_runtime(
     Ok(Json(response))
 }
 
-async fn cancel_runtime_drain(
+pub(crate) async fn cancel_runtime_drain(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(runtime_id): Path<Uuid>,
@@ -8345,7 +8345,7 @@ async fn cancel_runtime_drain(
     Ok(Json(response))
 }
 
-async fn delete_drained_runtime(
+pub(crate) async fn delete_drained_runtime(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(runtime_id): Path<Uuid>,
@@ -8401,7 +8401,7 @@ struct RuntimeDeletionImpactSessionState {
     recoverable: bool,
 }
 
-async fn require_runtime_session_authority_tx(
+pub(crate) async fn require_runtime_session_authority_tx(
     tx: &mut Transaction<'_, Postgres>,
     runtime_id: Uuid,
     administrator: &UserDto,
@@ -8432,7 +8432,7 @@ async fn require_runtime_session_authority_tx(
     Ok(())
 }
 
-async fn get_runtime_deletion_impact(
+pub(crate) async fn get_runtime_deletion_impact(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(runtime_id): Path<Uuid>,
@@ -8462,7 +8462,7 @@ async fn get_runtime_deletion_impact(
     Ok(Json(impact))
 }
 
-async fn load_runtime_deletion_impact_sessions_tx(
+pub(crate) async fn load_runtime_deletion_impact_sessions_tx(
     tx: &mut Transaction<'_, Postgres>,
     runtime_id: Uuid,
     lock_for_update: bool,
@@ -8529,7 +8529,7 @@ async fn load_runtime_deletion_impact_sessions_tx(
     Ok(sessions)
 }
 
-async fn force_delete_runtime(
+pub(crate) async fn force_delete_runtime(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(runtime_id): Path<Uuid>,
@@ -8692,7 +8692,7 @@ async fn force_delete_runtime(
     }))
 }
 
-fn confirm_runtime_hostname(expected: &str, supplied: &str) -> Result<(), ApiError> {
+pub(crate) fn confirm_runtime_hostname(expected: &str, supplied: &str) -> Result<(), ApiError> {
     if expected == supplied {
         Ok(())
     } else {
@@ -8735,7 +8735,7 @@ struct LockedSkillChange {
     current_package_object_key: Option<String>,
 }
 
-async fn load_runtime_drain_response_tx(
+pub(crate) async fn load_runtime_drain_response_tx(
     tx: &mut Transaction<'_, Postgres>,
     runtime_id: Uuid,
 ) -> Result<RuntimeDrainResponse, ApiError> {
@@ -8767,7 +8767,7 @@ async fn load_runtime_drain_response_tx(
     })
 }
 
-async fn list_skills(
+pub(crate) async fn list_skills(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<SkillDto>>, ApiError> {
@@ -8798,7 +8798,7 @@ async fn list_skills(
     Ok(Json(rows.into_iter().map(skill_from_row).collect()))
 }
 
-async fn create_skill(
+pub(crate) async fn create_skill(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<CreateSkillRequest>,
@@ -8828,7 +8828,7 @@ async fn create_skill(
     ))
 }
 
-async fn get_skill(
+pub(crate) async fn get_skill(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(skill_id): Path<Uuid>,
@@ -8839,7 +8839,7 @@ async fn get_skill(
     ))
 }
 
-async fn update_skill(
+pub(crate) async fn update_skill(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(skill_id): Path<Uuid>,
@@ -8879,7 +8879,7 @@ async fn update_skill(
     ))
 }
 
-async fn replace_skill_package(
+pub(crate) async fn replace_skill_package(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(skill_id): Path<Uuid>,
@@ -8940,7 +8940,7 @@ async fn replace_skill_package(
     ))
 }
 
-async fn delete_skill_package(
+pub(crate) async fn delete_skill_package(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(skill_id): Path<Uuid>,
@@ -8978,7 +8978,7 @@ async fn delete_skill_package(
     ))
 }
 
-async fn lock_skill_change_tx(
+pub(crate) async fn lock_skill_change_tx(
     tx: &mut Transaction<'_, Postgres>,
     skill_id: Uuid,
     owner_id: Uuid,
@@ -9017,7 +9017,7 @@ async fn lock_skill_change_tx(
     })
 }
 
-async fn publish_skill_configuration_change_tx(
+pub(crate) async fn publish_skill_configuration_change_tx(
     tx: &mut Transaction<'_, Postgres>,
     affected_agent_ids: &[Uuid],
 ) -> Result<(), ApiError> {
@@ -9050,7 +9050,7 @@ async fn publish_skill_configuration_change_tx(
     Ok(())
 }
 
-async fn enqueue_skill_package_deletion_tx(
+pub(crate) async fn enqueue_skill_package_deletion_tx(
     tx: &mut Transaction<'_, Postgres>,
     owner_id: Uuid,
     object_key: &str,
@@ -9066,7 +9066,7 @@ async fn enqueue_skill_package_deletion_tx(
     Ok(())
 }
 
-async fn enqueue_skill_package_deletion(
+pub(crate) async fn enqueue_skill_package_deletion(
     pool: &PgPool,
     owner_id: Uuid,
     object_key: &str,
@@ -9077,7 +9077,7 @@ async fn enqueue_skill_package_deletion(
     Ok(())
 }
 
-async fn commit_skill_package_upload(
+pub(crate) async fn commit_skill_package_upload(
     pool: &PgPool,
     skill_id: Uuid,
     owner_id: Uuid,
@@ -9145,7 +9145,7 @@ async fn commit_skill_package_upload(
     Ok(())
 }
 
-async fn stage_skill_package_upload(
+pub(crate) async fn stage_skill_package_upload(
     mut multipart: Multipart,
 ) -> Result<StagedSkillPackageUpload, ApiError> {
     let mut manifest_field = multipart
@@ -9314,7 +9314,7 @@ async fn stage_skill_package_upload(
     })
 }
 
-fn validate_skill_package_paths(paths: &[String]) -> Result<(), ApiError> {
+pub(crate) fn validate_skill_package_paths(paths: &[String]) -> Result<(), ApiError> {
     if paths.is_empty() || paths.len() > MAX_SKILL_PACKAGE_FILES {
         return Err(ApiError::bad_request(
             "Skill package must contain 1 to 1024 files",
@@ -9355,7 +9355,7 @@ fn validate_skill_package_paths(paths: &[String]) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn parse_uploaded_skill_markdown(bytes: &[u8]) -> Result<(String, String, String), ApiError> {
+pub(crate) fn parse_uploaded_skill_markdown(bytes: &[u8]) -> Result<(String, String, String), ApiError> {
     #[derive(Deserialize)]
     struct Frontmatter {
         name: String,
@@ -9411,7 +9411,7 @@ fn parse_uploaded_skill_markdown(bytes: &[u8]) -> Result<(String, String, String
     ))
 }
 
-fn build_skill_package_archive(
+pub(crate) fn build_skill_package_archive(
     archive_path: &FsPath,
     files: &[StagedSkillPackageFile],
 ) -> anyhow::Result<(u64, String)> {
@@ -9455,7 +9455,7 @@ fn build_skill_package_archive(
     Ok((size_bytes, format!("{:x}", hasher.finalize())))
 }
 
-async fn delete_skill(
+pub(crate) async fn delete_skill(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(skill_id): Path<Uuid>,
@@ -9466,7 +9466,7 @@ async fn delete_skill(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn bulk_delete_skills(
+pub(crate) async fn bulk_delete_skills(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<BulkDeleteSkillsRequest>,
@@ -9477,7 +9477,7 @@ async fn bulk_delete_skills(
     Ok(Json(BulkDeleteSkillsResponse { deleted_skill_ids }))
 }
 
-async fn delete_skills_for_user(
+pub(crate) async fn delete_skills_for_user(
     pool: &PgPool,
     user_id: Uuid,
     skill_ids: &[Uuid],
@@ -9570,7 +9570,7 @@ async fn delete_skills_for_user(
     Ok(ordered_skill_ids)
 }
 
-async fn process_skill_package_deletion_queue(state: &AppState) {
+pub(crate) async fn process_skill_package_deletion_queue(state: &AppState) {
     let object_keys = match sqlx::query_scalar::<_, String>(
         "SELECT queue.object_key
          FROM skill_package_deletion_queue AS queue
@@ -9637,7 +9637,7 @@ async fn process_skill_package_deletion_queue(state: &AppState) {
     }
 }
 
-async fn skill_package_deletion_loop(state: Arc<AppState>) {
+pub(crate) async fn skill_package_deletion_loop(state: Arc<AppState>) {
     let mut tick = tokio::time::interval(Duration::from_secs(30));
     loop {
         tick.tick().await;
@@ -9645,7 +9645,7 @@ async fn skill_package_deletion_loop(state: Arc<AppState>) {
     }
 }
 
-async fn list_automations(
+pub(crate) async fn list_automations(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<AutomationDto>>, ApiError> {
@@ -9682,7 +9682,7 @@ impl AutomationRunListQuery {
     }
 }
 
-async fn list_automation_runs(
+pub(crate) async fn list_automation_runs(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(automation_id): Path<Uuid>,
@@ -9725,7 +9725,7 @@ async fn list_automation_runs(
     }))
 }
 
-async fn create_automation(
+pub(crate) async fn create_automation(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<CreateAutomationRequest>,
@@ -9789,7 +9789,7 @@ async fn create_automation(
     Ok(Json(automation))
 }
 
-async fn update_automation(
+pub(crate) async fn update_automation(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(automation_id): Path<Uuid>,
@@ -9881,7 +9881,7 @@ async fn update_automation(
     Ok(Json(automation))
 }
 
-async fn trigger_automation(
+pub(crate) async fn trigger_automation(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(automation_id): Path<Uuid>,
@@ -9900,7 +9900,7 @@ async fn trigger_automation(
     .map(Json)
 }
 
-async fn trigger_automation_webhook(
+pub(crate) async fn trigger_automation_webhook(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<TriggerAutomationRequest>,
@@ -9920,7 +9920,7 @@ async fn trigger_automation_webhook(
     .map(Json)
 }
 
-async fn create_embed_session(
+pub(crate) async fn create_embed_session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<CreateEmbedSessionRequest>,
@@ -9936,7 +9936,7 @@ async fn create_embed_session(
     Ok(Json(CreateEmbedSessionResponse { token }))
 }
 
-async fn create_integration_embed_session(
+pub(crate) async fn create_integration_embed_session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<CreateEmbedSessionRequest>,
@@ -9963,7 +9963,7 @@ async fn create_integration_embed_session(
     Ok(Json(CreateEmbedSessionResponse { token }))
 }
 
-async fn exchange_embed_jwt(
+pub(crate) async fn exchange_embed_jwt(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ExchangeEmbedJwtRequest>,
 ) -> Result<Json<CreateEmbedSessionResponse>, ApiError> {
@@ -9984,7 +9984,7 @@ async fn exchange_embed_jwt(
     Ok(Json(CreateEmbedSessionResponse { token }))
 }
 
-async fn create_client_access(
+pub(crate) async fn create_client_access(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<CreateWidgetAccessRequest>,
@@ -9993,7 +9993,7 @@ async fn create_client_access(
     Ok(Json(access))
 }
 
-async fn create_widget_access(
+pub(crate) async fn create_widget_access(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<CreateWidgetAccessRequest>,
@@ -10007,7 +10007,7 @@ async fn create_widget_access(
     }))
 }
 
-async fn issue_authenticated_client_access(
+pub(crate) async fn issue_authenticated_client_access(
     state: &AppState,
     headers: &HeaderMap,
     req: CreateWidgetAccessRequest,
@@ -10125,7 +10125,7 @@ async fn issue_authenticated_client_access(
     ))
 }
 
-async fn create_anonymous_client_access(
+pub(crate) async fn create_anonymous_client_access(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<CreatePublicWidgetAccessRequest>,
@@ -10134,7 +10134,7 @@ async fn create_anonymous_client_access(
     Ok(Json(access))
 }
 
-async fn create_public_widget_access(
+pub(crate) async fn create_public_widget_access(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<CreatePublicWidgetAccessRequest>,
@@ -10149,7 +10149,7 @@ async fn create_public_widget_access(
     }))
 }
 
-async fn issue_anonymous_client_access(
+pub(crate) async fn issue_anonymous_client_access(
     state: &AppState,
     headers: &HeaderMap,
     req: CreatePublicWidgetAccessRequest,
@@ -10261,7 +10261,7 @@ async fn issue_anonymous_client_access(
     ))
 }
 
-async fn get_widget_session(
+pub(crate) async fn get_widget_session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
@@ -10292,7 +10292,7 @@ async fn get_widget_session(
     Ok(Json(agent).into_response())
 }
 
-async fn renew_client_access(
+pub(crate) async fn renew_client_access(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<RenewWidgetSessionRequest>,
@@ -10300,7 +10300,7 @@ async fn renew_client_access(
     Ok(Json(rotate_client_access(&state, &headers, req).await?))
 }
 
-async fn renew_widget_session(
+pub(crate) async fn renew_widget_session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<RenewWidgetSessionRequest>,
@@ -10312,7 +10312,7 @@ async fn renew_widget_session(
     }))
 }
 
-async fn rotate_client_access(
+pub(crate) async fn rotate_client_access(
     state: &AppState,
     headers: &HeaderMap,
     req: RenewWidgetSessionRequest,
@@ -10422,7 +10422,7 @@ async fn rotate_client_access(
     })
 }
 
-async fn list_widget_sessions(
+pub(crate) async fn list_widget_sessions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<WidgetHistorySessionDto>>, ApiError> {
@@ -10495,7 +10495,7 @@ async fn list_widget_sessions(
     ))
 }
 
-async fn list_widget_session_messages(
+pub(crate) async fn list_widget_session_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(session_id): Path<Uuid>,
@@ -10530,7 +10530,7 @@ async fn list_widget_session_messages(
     Ok(Json(messages))
 }
 
-async fn list_widget_session_events(
+pub(crate) async fn list_widget_session_events(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(session_id): Path<Uuid>,
@@ -10555,7 +10555,7 @@ async fn list_widget_session_events(
     Ok(Json(events))
 }
 
-async fn stream_widget_session_events(
+pub(crate) async fn stream_widget_session_events(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(session_id): Path<Uuid>,
@@ -10616,7 +10616,7 @@ async fn stream_widget_session_events(
     Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
 }
 
-fn widget_event_cursor(after: Option<i64>) -> Result<i64, ApiError> {
+pub(crate) fn widget_event_cursor(after: Option<i64>) -> Result<i64, ApiError> {
     let after = after.unwrap_or(0);
     if after < 0 {
         return Err(ApiError::bad_request("event cursor must be nonnegative"));
@@ -10624,7 +10624,7 @@ fn widget_event_cursor(after: Option<i64>) -> Result<i64, ApiError> {
     Ok(after)
 }
 
-async fn create_widget_run(
+pub(crate) async fn create_widget_run(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<CreateWidgetRunRequest>,
@@ -10907,7 +10907,7 @@ async fn create_widget_run(
     Ok(Json(run))
 }
 
-async fn stop_widget_run(
+pub(crate) async fn stop_widget_run(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(run_id): Path<Uuid>,
@@ -10977,7 +10977,7 @@ async fn stop_widget_run(
     Ok(Json(run))
 }
 
-async fn create_integration_session(
+pub(crate) async fn create_integration_session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<CreateIntegrationSessionRequest>,
@@ -11093,7 +11093,7 @@ async fn create_integration_session(
     Ok(Json(session))
 }
 
-async fn get_integration_session(
+pub(crate) async fn get_integration_session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(session_id): Path<Uuid>,
@@ -11105,7 +11105,7 @@ async fn get_integration_session(
     ))
 }
 
-async fn create_integration_message(
+pub(crate) async fn create_integration_message(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(session_id): Path<Uuid>,
@@ -11220,7 +11220,7 @@ async fn create_integration_message(
     }))
 }
 
-async fn stop_integration_run(
+pub(crate) async fn stop_integration_run(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((session_id, run_id)): Path<(Uuid, Uuid)>,
@@ -11265,7 +11265,7 @@ async fn stop_integration_run(
     Ok(Json(run))
 }
 
-async fn list_integration_messages(
+pub(crate) async fn list_integration_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(session_id): Path<Uuid>,
@@ -11321,7 +11321,7 @@ struct IntegrationEventsQuery {
     after: Option<i64>,
 }
 
-async fn list_integration_events(
+pub(crate) async fn list_integration_events(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(session_id): Path<Uuid>,
@@ -11341,7 +11341,7 @@ async fn list_integration_events(
     ))
 }
 
-async fn stream_integration_events(
+pub(crate) async fn stream_integration_events(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(session_id): Path<Uuid>,
@@ -11390,7 +11390,7 @@ async fn stream_integration_events(
     Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
 }
 
-async fn submit_integration_tool_result(
+pub(crate) async fn submit_integration_tool_result(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(tool_request_id): Path<Uuid>,
@@ -11558,7 +11558,7 @@ struct ClientToolRunScope {
     model_source_integration_app_id: Option<Uuid>,
 }
 
-async fn claim_client_tool_call(
+pub(crate) async fn claim_client_tool_call(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(tool_call_id): Path<Uuid>,
@@ -11638,7 +11638,7 @@ async fn claim_client_tool_call(
     Ok(Json(response))
 }
 
-async fn submit_client_tool_result(
+pub(crate) async fn submit_client_tool_result(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(tool_call_id): Path<Uuid>,
@@ -11761,7 +11761,7 @@ async fn submit_client_tool_result(
     Ok(Json(SubmitClientToolResultResponse { run, tool_request }))
 }
 
-fn validate_client_tool_result(result: &ClientToolResultDto) -> Result<(Value, String), ApiError> {
+pub(crate) fn validate_client_tool_result(result: &ClientToolResultDto) -> Result<(Value, String), ApiError> {
     let value = serde_json::to_value(result)
         .map_err(|_| ApiError::bad_request("Client Tool result must be JSON"))?;
     let encoded = serde_json::to_vec(&value)
@@ -11773,7 +11773,7 @@ fn validate_client_tool_result(result: &ClientToolResultDto) -> Result<(Value, S
     Ok((value, checksum))
 }
 
-async fn lock_client_tool_batch_tx(
+pub(crate) async fn lock_client_tool_batch_tx(
     tx: &mut Transaction<'_, Postgres>,
     credential: &WidgetCredential,
     tool_call_id: Uuid,
@@ -11879,7 +11879,7 @@ async fn lock_client_tool_batch_tx(
     ))
 }
 
-async fn create_client_tool_continuation_tx(
+pub(crate) async fn create_client_tool_continuation_tx(
     tx: &mut Transaction<'_, Postgres>,
     scope: &ClientToolRunScope,
 ) -> Result<RunDto, ApiError> {
@@ -12033,7 +12033,7 @@ async fn create_client_tool_continuation_tx(
     load_run_public_tx(tx, run.id).await
 }
 
-async fn fail_client_tool_batch_tx(
+pub(crate) async fn fail_client_tool_batch_tx(
     tx: &mut Transaction<'_, Postgres>,
     scope: &ClientToolRunScope,
     request_status: &str,
@@ -12108,7 +12108,7 @@ async fn fail_client_tool_batch_tx(
     load_run_public_tx(tx, scope.run_id).await
 }
 
-async fn load_client_tool_request_tx(
+pub(crate) async fn load_client_tool_request_tx(
     tx: &mut Transaction<'_, Postgres>,
     tool_call_id: Uuid,
 ) -> Result<IntegrationToolRequestDto, ApiError> {
@@ -12125,7 +12125,7 @@ async fn load_client_tool_request_tx(
     Ok(tool_request_from_row(row))
 }
 
-async fn runtime_register(
+pub(crate) async fn runtime_register(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<RuntimeRegisterRequest>,
@@ -12188,7 +12188,7 @@ async fn runtime_register(
     }))
 }
 
-async fn runtime_heartbeat(
+pub(crate) async fn runtime_heartbeat(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<RuntimeHeartbeatRequest>,
@@ -12785,7 +12785,7 @@ async fn runtime_heartbeat(
     }))
 }
 
-fn configuration_command_id(session_id: Uuid, revision: i64) -> Uuid {
+pub(crate) fn configuration_command_id(session_id: Uuid, revision: i64) -> Uuid {
     let mut hasher = Sha256::new();
     hasher.update(session_id.as_bytes());
     hasher.update(revision.to_be_bytes());
@@ -12795,7 +12795,7 @@ fn configuration_command_id(session_id: Uuid, revision: i64) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-async fn runtime_release_session(
+pub(crate) async fn runtime_release_session(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(session_id): Path<Uuid>,
@@ -12817,7 +12817,7 @@ async fn runtime_release_session(
     Ok(Json(released))
 }
 
-async fn release_session_ownership_tx(
+pub(crate) async fn release_session_ownership_tx(
     tx: &mut Transaction<'_, Postgres>,
     runtime_id: Uuid,
     session_id: Uuid,
@@ -12951,7 +12951,7 @@ async fn release_session_ownership_tx(
     Ok(())
 }
 
-fn checkpoint_reason_priority(reason: &str) -> Option<u8> {
+pub(crate) fn checkpoint_reason_priority(reason: &str) -> Option<u8> {
     match reason {
         "idle" => Some(0),
         "drain" => Some(1),
@@ -12959,7 +12959,7 @@ fn checkpoint_reason_priority(reason: &str) -> Option<u8> {
     }
 }
 
-async fn runtime_begin_session_checkpoint(
+pub(crate) async fn runtime_begin_session_checkpoint(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(session_id): Path<Uuid>,
@@ -13096,7 +13096,7 @@ async fn runtime_begin_session_checkpoint(
     Ok(Json(response))
 }
 
-async fn runtime_fail_session_checkpoint(
+pub(crate) async fn runtime_fail_session_checkpoint(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(session_id): Path<Uuid>,
@@ -13233,7 +13233,7 @@ struct SessionBundleUploadHeaders {
     created_at: DateTime<Utc>,
 }
 
-async fn runtime_upload_session_bundle(
+pub(crate) async fn runtime_upload_session_bundle(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<Uuid>,
     headers: HeaderMap,
@@ -13340,7 +13340,7 @@ async fn runtime_upload_session_bundle(
     Ok(Json(response))
 }
 
-async fn runtime_salvage_session_bundle(
+pub(crate) async fn runtime_salvage_session_bundle(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<Uuid>,
     headers: HeaderMap,
@@ -13501,7 +13501,7 @@ async fn runtime_salvage_session_bundle(
     }))
 }
 
-async fn runtime_abandon_session_salvage(
+pub(crate) async fn runtime_abandon_session_salvage(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<Uuid>,
     headers: HeaderMap,
@@ -13521,7 +13521,7 @@ async fn runtime_abandon_session_salvage(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn runtime_download_session_bundle(
+pub(crate) async fn runtime_download_session_bundle(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<Uuid>,
     headers: HeaderMap,
@@ -13616,7 +13616,7 @@ async fn runtime_download_session_bundle(
     Ok(response)
 }
 
-fn parse_session_bundle_upload_headers(
+pub(crate) fn parse_session_bundle_upload_headers(
     headers: &HeaderMap,
     max_size_bytes: u64,
 ) -> Result<SessionBundleUploadHeaders, ApiError> {
@@ -13680,7 +13680,7 @@ fn parse_session_bundle_upload_headers(
     })
 }
 
-fn required_header(headers: &HeaderMap, name: &str) -> Result<String, ApiError> {
+pub(crate) fn required_header(headers: &HeaderMap, name: &str) -> Result<String, ApiError> {
     let value = headers
         .get(name)
         .ok_or_else(|| ApiError::bad_request(format!("missing required header {name}")))?
@@ -13695,7 +13695,7 @@ fn required_header(headers: &HeaderMap, name: &str) -> Result<String, ApiError> 
     Ok(value.to_owned())
 }
 
-fn parse_required_header<T>(headers: &HeaderMap, name: &str) -> Result<T, ApiError>
+pub(crate) fn parse_required_header<T>(headers: &HeaderMap, name: &str) -> Result<T, ApiError>
 where
     T: std::str::FromStr,
 {
@@ -13704,7 +13704,7 @@ where
         .map_err(|_| ApiError::bad_request(format!("invalid header {name}")))
 }
 
-fn validate_bundle_sha256(value: &str) -> Result<(), ApiError> {
+pub(crate) fn validate_bundle_sha256(value: &str) -> Result<(), ApiError> {
     if value.len() == 64
         && value
             .bytes()
@@ -13718,7 +13718,7 @@ fn validate_bundle_sha256(value: &str) -> Result<(), ApiError> {
     }
 }
 
-fn session_bundle_object_key(
+pub(crate) fn session_bundle_object_key(
     session_id: Uuid,
     bundle_generation: i64,
     checkpoint_attempt_id: Uuid,
@@ -13726,7 +13726,7 @@ fn session_bundle_object_key(
     format!("sessions/{session_id}/bundle-{bundle_generation}-{checkpoint_attempt_id}.tar.zst")
 }
 
-async fn validate_session_bundle_upload_preflight(
+pub(crate) async fn validate_session_bundle_upload_preflight(
     pool: &PgPool,
     runtime_id: Uuid,
     session_id: Uuid,
@@ -13811,7 +13811,7 @@ async fn validate_session_bundle_upload_preflight(
     Ok(false)
 }
 
-async fn commit_and_finalize_session_bundle(
+pub(crate) async fn commit_and_finalize_session_bundle(
     pool: &PgPool,
     runtime_id: Uuid,
     session_id: Uuid,
@@ -13954,7 +13954,7 @@ async fn commit_and_finalize_session_bundle(
     Ok((response, old_object_key, false))
 }
 
-async fn record_runtime_session_cleanup_tx(
+pub(crate) async fn record_runtime_session_cleanup_tx(
     tx: &mut Transaction<'_, Postgres>,
     runtime_id: Uuid,
     session_id: Uuid,
@@ -13980,7 +13980,7 @@ async fn record_runtime_session_cleanup_tx(
     Ok(())
 }
 
-async fn session_has_queued_work_tx(
+pub(crate) async fn session_has_queued_work_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: Uuid,
     history_checkpoint: i64,
@@ -13999,7 +13999,7 @@ async fn session_has_queued_work_tx(
     .await?)
 }
 
-fn insert_response_header<T: ToString>(
+pub(crate) fn insert_response_header<T: ToString>(
     headers: &mut HeaderMap,
     name: HeaderName,
     value: T,
@@ -14012,7 +14012,7 @@ fn insert_response_header<T: ToString>(
     Ok(())
 }
 
-async fn commit_session_bundle_metadata_tx(
+pub(crate) async fn commit_session_bundle_metadata_tx(
     tx: &mut Transaction<'_, Postgres>,
     runtime_id: Uuid,
     session_id: Uuid,
@@ -14164,7 +14164,7 @@ async fn commit_session_bundle_metadata_tx(
     load_hub_session_tx(tx, session_id).await
 }
 
-fn validate_sha256_hex(value: &str) -> Result<(), ApiError> {
+pub(crate) fn validate_sha256_hex(value: &str) -> Result<(), ApiError> {
     if value.len() == 64
         && value
             .as_bytes()
@@ -14179,7 +14179,7 @@ fn validate_sha256_hex(value: &str) -> Result<(), ApiError> {
     }
 }
 
-fn validate_ownership_generation(generation: i64) -> Result<(), ApiError> {
+pub(crate) fn validate_ownership_generation(generation: i64) -> Result<(), ApiError> {
     if generation > 0 {
         Ok(())
     } else {
@@ -14189,7 +14189,7 @@ fn validate_ownership_generation(generation: i64) -> Result<(), ApiError> {
     }
 }
 
-fn validate_execution_configuration_fingerprint(value: &str) -> Result<(), ApiError> {
+pub(crate) fn validate_execution_configuration_fingerprint(value: &str) -> Result<(), ApiError> {
     let digest = value.strip_prefix("sha256:").ok_or(ApiError::bad_request(
         "valid execution configuration fingerprint is required",
     ))?;
@@ -14232,7 +14232,7 @@ const RUNTIME_CLAIM_SESSION_ELIGIBILITY_SQL: &str = "(($2::bigint > 0
           )
       )";
 
-fn runtime_claim_candidate_sql() -> String {
+pub(crate) fn runtime_claim_candidate_sql() -> String {
     format!(
         "SELECT r.id AS run_id, r.agent_id
          FROM runs r
@@ -14257,7 +14257,7 @@ fn runtime_claim_candidate_sql() -> String {
     )
 }
 
-fn runtime_claim_agent_sql() -> String {
+pub(crate) fn runtime_claim_agent_sql() -> String {
     format!(
         "SELECT a.id AS a_id, a.owner_id,
                 (SELECT email FROM users WHERE id = a.owner_id) AS owner_email,
@@ -14287,7 +14287,7 @@ fn runtime_claim_agent_sql() -> String {
     )
 }
 
-fn runtime_claim_run_sql() -> String {
+pub(crate) fn runtime_claim_run_sql() -> String {
     format!(
         "SELECT r.id, r.agent_id, r.automation_id, r.integration_session_id,
                 r.parent_run_id, r.runtime_id, r.hub_session_id, r.hub_message_id,
@@ -14304,7 +14304,7 @@ fn runtime_claim_run_sql() -> String {
     )
 }
 
-async fn runtime_claim_run(
+pub(crate) async fn runtime_claim_run(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(request): Json<RuntimeClaimRunRequest>,
@@ -14716,7 +14716,7 @@ async fn runtime_claim_run(
     .into_response())
 }
 
-async fn runtime_download_run_secret_file(
+pub(crate) async fn runtime_download_run_secret_file(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((run_id, secret_name)): Path<(Uuid, String)>,
@@ -14803,7 +14803,7 @@ async fn runtime_download_run_secret_file(
         .into_response())
 }
 
-async fn runtime_download_run_skill_package(
+pub(crate) async fn runtime_download_run_skill_package(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((run_id, skill_id)): Path<(Uuid, Uuid)>,
@@ -14846,7 +14846,7 @@ async fn runtime_download_run_skill_package(
     .await
 }
 
-async fn runtime_download_session_skill_package(
+pub(crate) async fn runtime_download_session_skill_package(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((session_id, skill_id, package_id)): Path<(Uuid, Uuid, Uuid)>,
@@ -14894,7 +14894,7 @@ async fn runtime_download_session_skill_package(
     .await
 }
 
-async fn skill_package_download_response(
+pub(crate) async fn skill_package_download_response(
     state: &AppState,
     package_id: Uuid,
     object_key: String,
@@ -14933,7 +14933,7 @@ async fn skill_package_download_response(
     Ok(response)
 }
 
-async fn runtime_append_event(
+pub(crate) async fn runtime_append_event(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(run_id): Path<Uuid>,
@@ -15028,7 +15028,7 @@ async fn runtime_append_event(
     Ok(Json(event))
 }
 
-async fn runtime_begin_turn(
+pub(crate) async fn runtime_begin_turn(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(run_id): Path<Uuid>,
@@ -15170,7 +15170,7 @@ async fn runtime_begin_turn(
     }))
 }
 
-async fn runtime_complete_session_command(
+pub(crate) async fn runtime_complete_session_command(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((session_id, command_id)): Path<(Uuid, Uuid)>,
@@ -15560,7 +15560,7 @@ async fn runtime_complete_session_command(
     }))
 }
 
-async fn runtime_finalize_tool_requests(
+pub(crate) async fn runtime_finalize_tool_requests(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(run_id): Path<Uuid>,
@@ -15586,7 +15586,7 @@ async fn runtime_finalize_tool_requests(
     Ok(Json(run))
 }
 
-async fn runtime_complete_run(
+pub(crate) async fn runtime_complete_run(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(run_id): Path<Uuid>,
@@ -15802,7 +15802,7 @@ async fn runtime_complete_run(
     Ok(Json(run))
 }
 
-async fn runtime_model_proxy(
+pub(crate) async fn runtime_model_proxy(
     State(state): State<Arc<AppState>>,
     uri: Uri,
     headers: HeaderMap,
@@ -15896,7 +15896,7 @@ struct ModelProxyAccountingContext {
     source_integration_app_name: Option<String>,
 }
 
-async fn resolve_model_proxy_request(
+pub(crate) async fn resolve_model_proxy_request(
     state: &AppState,
     headers: &HeaderMap,
     run_id: Uuid,
@@ -16001,7 +16001,7 @@ async fn resolve_model_proxy_request(
     })
 }
 
-fn model_proxy_path_supported(path: &str) -> bool {
+pub(crate) fn model_proxy_path_supported(path: &str) -> bool {
     path == "responses"
 }
 
@@ -16042,7 +16042,7 @@ struct ModelGatewayForwardRequest<'a> {
     api_key: &'a str,
 }
 
-async fn send_model_gateway_request(
+pub(crate) async fn send_model_gateway_request(
     state: &AppState,
     request: ModelGatewayForwardRequest<'_>,
 ) -> Result<reqwest::Response, reqwest::Error> {
@@ -16085,7 +16085,7 @@ async fn send_model_gateway_request(
 }
 
 #[cfg(test)]
-async fn proxy_model_request_to_upstream(
+pub(crate) async fn proxy_model_request_to_upstream(
     state: &AppState,
     upstream_url: &str,
     path: &str,
@@ -16108,7 +16108,7 @@ async fn proxy_model_request_to_upstream(
     .await
 }
 
-async fn proxy_model_request_to_upstream_with_options(
+pub(crate) async fn proxy_model_request_to_upstream_with_options(
     state: &AppState,
     request: ModelProxyForwardRequest,
 ) -> Result<Response, ApiError> {
@@ -16250,7 +16250,7 @@ async fn proxy_model_request_to_upstream_with_options(
     Ok(response)
 }
 
-fn copy_upstream_response_headers(target: &mut HeaderMap, upstream: &HeaderMap) {
+pub(crate) fn copy_upstream_response_headers(target: &mut HeaderMap, upstream: &HeaderMap) {
     let connection_header_names = connection_header_names(upstream);
     for (name, value) in upstream {
         if !is_hop_by_hop_header(name, &connection_header_names)
@@ -16262,7 +16262,7 @@ fn copy_upstream_response_headers(target: &mut HeaderMap, upstream: &HeaderMap) 
     }
 }
 
-fn filtered_model_request_headers(source: &HeaderMap) -> HeaderMap {
+pub(crate) fn filtered_model_request_headers(source: &HeaderMap) -> HeaderMap {
     let connection_header_names = connection_header_names(source);
     let mut filtered = HeaderMap::new();
     for (name, value) in source {
@@ -16291,7 +16291,7 @@ fn filtered_model_request_headers(source: &HeaderMap) -> HeaderMap {
     filtered
 }
 
-fn connection_header_names(headers: &HeaderMap) -> BTreeSet<String> {
+pub(crate) fn connection_header_names(headers: &HeaderMap) -> BTreeSet<String> {
     headers
         .get_all(header::CONNECTION)
         .iter()
@@ -16303,7 +16303,7 @@ fn connection_header_names(headers: &HeaderMap) -> BTreeSet<String> {
         .collect()
 }
 
-fn is_sensitive_model_response_header(name: &HeaderName) -> bool {
+pub(crate) fn is_sensitive_model_response_header(name: &HeaderName) -> bool {
     let name = name.as_str();
     matches!(
         name,
@@ -16320,7 +16320,7 @@ fn is_sensitive_model_response_header(name: &HeaderName) -> bool {
             .any(|marker| name.contains(marker))
 }
 
-fn is_hop_by_hop_header(name: &HeaderName, connection_header_names: &BTreeSet<String>) -> bool {
+pub(crate) fn is_hop_by_hop_header(name: &HeaderName, connection_header_names: &BTreeSet<String>) -> bool {
     matches!(
         name.as_str(),
         "connection"
@@ -16568,7 +16568,7 @@ impl ModelResponseObserver {
     }
 }
 
-fn model_proxy_terminal_from_value(
+pub(crate) fn model_proxy_terminal_from_value(
     value: &Value,
     event_type: Option<&str>,
     fallback_status: Option<&str>,
@@ -16631,7 +16631,7 @@ fn model_proxy_terminal_from_value(
     })
 }
 
-fn normalized_model_response_status(value: &str) -> Option<&'static str> {
+pub(crate) fn normalized_model_response_status(value: &str) -> Option<&'static str> {
     match value {
         "completed" => Some("completed"),
         "failed" => Some("failed"),
@@ -16641,7 +16641,7 @@ fn normalized_model_response_status(value: &str) -> Option<&'static str> {
     }
 }
 
-fn model_response_status_from_event(value: &str) -> Option<&'static str> {
+pub(crate) fn model_response_status_from_event(value: &str) -> Option<&'static str> {
     match value {
         "response.completed" => Some("completed"),
         "response.failed" => Some("failed"),
@@ -16652,7 +16652,7 @@ fn model_response_status_from_event(value: &str) -> Option<&'static str> {
     }
 }
 
-fn sanitize_model_proxy_text(
+pub(crate) fn sanitize_model_proxy_text(
     value: &str,
     api_key: Option<&str>,
     max_chars: usize,
@@ -16678,7 +16678,7 @@ fn sanitize_model_proxy_text(
     }
 }
 
-async fn persist_model_proxy_observation(
+pub(crate) async fn persist_model_proxy_observation(
     pool: &PgPool,
     context: &ModelProxyAccountingContext,
     observation: ModelProxyObservation,
@@ -16695,7 +16695,7 @@ async fn persist_model_proxy_observation(
     }
 }
 
-async fn try_persist_model_proxy_observation(
+pub(crate) async fn try_persist_model_proxy_observation(
     pool: &PgPool,
     context: &ModelProxyAccountingContext,
     observation: ModelProxyObservation,
@@ -16795,7 +16795,7 @@ async fn try_persist_model_proxy_observation(
     tx.commit().await
 }
 
-async fn insert_hub_native_session_tx(
+pub(crate) async fn insert_hub_native_session_tx(
     tx: &mut Transaction<'_, Postgres>,
     owner_id: Uuid,
     agent_id: Uuid,
@@ -16814,7 +16814,7 @@ async fn insert_hub_native_session_tx(
     Ok(session_id)
 }
 
-async fn insert_embed_session_tx(
+pub(crate) async fn insert_embed_session_tx(
     tx: &mut Transaction<'_, Postgres>,
     agent_id: Uuid,
     owner_id: Uuid,
@@ -16852,7 +16852,7 @@ struct WidgetAccessSessionInsert<'a> {
     expires_at: DateTime<Utc>,
 }
 
-async fn insert_widget_access_session_tx(
+pub(crate) async fn insert_widget_access_session_tx(
     tx: &mut Transaction<'_, Postgres>,
     session: WidgetAccessSessionInsert<'_>,
 ) -> Result<Uuid, ApiError> {
@@ -16892,7 +16892,7 @@ async fn insert_widget_access_session_tx(
     .map_err(Into::into)
 }
 
-fn normalize_client_message_key(value: Option<&str>) -> Result<Option<String>, ApiError> {
+pub(crate) fn normalize_client_message_key(value: Option<&str>) -> Result<Option<String>, ApiError> {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
@@ -16904,7 +16904,7 @@ fn normalize_client_message_key(value: Option<&str>) -> Result<Option<String>, A
     Ok(Some(value.to_owned()))
 }
 
-fn normalize_origin_tenant(value: Option<&str>) -> Result<String, ApiError> {
+pub(crate) fn normalize_origin_tenant(value: Option<&str>) -> Result<String, ApiError> {
     let value = value.map(str::trim).filter(|value| !value.is_empty());
     let value = value.unwrap_or("default");
     if value.len() > 128 || value.chars().any(char::is_control) {
@@ -16915,7 +16915,7 @@ fn normalize_origin_tenant(value: Option<&str>) -> Result<String, ApiError> {
     Ok(value.to_owned())
 }
 
-fn require_origin_tenant(value: Option<&str>) -> Result<String, ApiError> {
+pub(crate) fn require_origin_tenant(value: Option<&str>) -> Result<String, ApiError> {
     let value = value
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -16923,7 +16923,7 @@ fn require_origin_tenant(value: Option<&str>) -> Result<String, ApiError> {
     normalize_origin_tenant(Some(value))
 }
 
-fn normalize_external_user_id(value: &str) -> Result<String, ApiError> {
+pub(crate) fn normalize_external_user_id(value: &str) -> Result<String, ApiError> {
     let value = value.trim();
     if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
         return Err(ApiError::bad_request("valid external user id is required"));
@@ -16931,7 +16931,7 @@ fn normalize_external_user_id(value: &str) -> Result<String, ApiError> {
     Ok(value.to_owned())
 }
 
-fn widget_client_credentials(headers: &HeaderMap) -> Result<(String, String), ApiError> {
+pub(crate) fn widget_client_credentials(headers: &HeaderMap) -> Result<(String, String), ApiError> {
     let authorization = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -16956,7 +16956,7 @@ fn widget_client_credentials(headers: &HeaderMap) -> Result<(String, String), Ap
     Ok((client_id.to_owned(), client_secret.to_owned()))
 }
 
-fn normalize_widget_user_profile(
+pub(crate) fn normalize_widget_user_profile(
     mut profile: WidgetUserProfileDto,
 ) -> Result<WidgetUserProfileDto, ApiError> {
     profile.username = validate_external_username(profile.username.as_deref())?;
@@ -16967,7 +16967,7 @@ fn normalize_widget_user_profile(
     Ok(profile)
 }
 
-fn normalize_widget_profile_text(
+pub(crate) fn normalize_widget_profile_text(
     value: Option<&str>,
     field: &str,
 ) -> Result<Option<String>, ApiError> {
@@ -16982,7 +16982,7 @@ fn normalize_widget_profile_text(
     Ok(Some(value.to_owned()))
 }
 
-fn normalize_widget_attributes(value: Value) -> Result<Value, ApiError> {
+pub(crate) fn normalize_widget_attributes(value: Value) -> Result<Value, ApiError> {
     let value = if value.is_null() { json!({}) } else { value };
     if !value.is_object() {
         return Err(ApiError::bad_request(
@@ -17003,7 +17003,7 @@ fn normalize_widget_attributes(value: Value) -> Result<Value, ApiError> {
     Ok(value)
 }
 
-fn validate_widget_attribute_value(
+pub(crate) fn validate_widget_attribute_value(
     value: &Value,
     depth: usize,
     value_count: &mut usize,
@@ -17060,7 +17060,7 @@ fn validate_widget_attribute_value(
     }
 }
 
-async fn accept_session_message_tx(
+pub(crate) async fn accept_session_message_tx(
     tx: &mut Transaction<'_, Postgres>,
     mut request: AcceptSessionMessage,
 ) -> Result<SessionMessageAcceptanceDto, ApiError> {
@@ -17363,7 +17363,7 @@ async fn accept_session_message_tx(
     Ok(SessionMessageAcceptanceDto { message, run })
 }
 
-async fn request_run_interrupt_tx(
+pub(crate) async fn request_run_interrupt_tx(
     tx: &mut Transaction<'_, Postgres>,
     run_id: Uuid,
     expected_session_id: Uuid,
@@ -17445,7 +17445,7 @@ async fn request_run_interrupt_tx(
     load_run_public_tx(tx, run_id).await
 }
 
-async fn move_queued_steers_to_next_turn_tx(
+pub(crate) async fn move_queued_steers_to_next_turn_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: Uuid,
     terminal_run_id: Uuid,
@@ -17635,7 +17635,7 @@ async fn move_queued_steers_to_next_turn_tx(
     Ok(())
 }
 
-async fn insert_session_run_tx(
+pub(crate) async fn insert_session_run_tx(
     tx: &mut Transaction<'_, Postgres>,
     request: &AcceptSessionMessage,
     turn_id: Uuid,
@@ -17686,7 +17686,7 @@ async fn insert_session_run_tx(
     Ok(run_id)
 }
 
-async fn load_hub_message_by_client_key_tx(
+pub(crate) async fn load_hub_message_by_client_key_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: Uuid,
     client_message_key: &str,
@@ -17715,7 +17715,7 @@ async fn load_hub_message_by_client_key_tx(
 
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)] // Keep every optional run association explicit at call sites.
-async fn create_run_for_agent(
+pub(crate) async fn create_run_for_agent(
     pool: &PgPool,
     agent_id: Uuid,
     owner_id: Uuid,
@@ -17742,7 +17742,7 @@ async fn create_run_for_agent(
 }
 
 #[allow(clippy::too_many_arguments)] // Keep every optional run association explicit at call sites.
-async fn insert_run_for_agent_tx(
+pub(crate) async fn insert_run_for_agent_tx(
     tx: &mut Transaction<'_, Postgres>,
     agent_id: Uuid,
     owner_id: Uuid,
@@ -17805,7 +17805,7 @@ async fn insert_run_for_agent_tx(
         .ok_or(ApiError::internal("message did not schedule a run"))
 }
 
-async fn ensure_agent_can_start_run_tx(
+pub(crate) async fn ensure_agent_can_start_run_tx(
     tx: &mut Transaction<'_, Postgres>,
     agent_id: Uuid,
     caller_id: Uuid,
@@ -17826,7 +17826,7 @@ async fn ensure_agent_can_start_run_tx(
     ensure_agent_has_configured_model_tx(tx, agent_id).await
 }
 
-async fn ensure_agent_has_configured_model_tx(
+pub(crate) async fn ensure_agent_has_configured_model_tx(
     tx: &mut Transaction<'_, Postgres>,
     agent_id: Uuid,
 ) -> Result<(), ApiError> {
@@ -17852,7 +17852,7 @@ async fn ensure_agent_has_configured_model_tx(
     Ok(())
 }
 
-fn normalize_visibility(visibility: &str) -> Result<&'static str, ApiError> {
+pub(crate) fn normalize_visibility(visibility: &str) -> Result<&'static str, ApiError> {
     match visibility.trim() {
         "private" => Ok("private"),
         "public_to" => Ok("public_to"),
@@ -17861,7 +17861,7 @@ fn normalize_visibility(visibility: &str) -> Result<&'static str, ApiError> {
     }
 }
 
-fn validate_public_visibility_role(visibility: &str, role: &str) -> Result<(), ApiError> {
+pub(crate) fn validate_public_visibility_role(visibility: &str, role: &str) -> Result<(), ApiError> {
     if visibility == "public" && !is_admin_role(role) {
         return Err(ApiError::forbidden(
             "administrator permission is required for public agents",
@@ -17870,7 +17870,7 @@ fn validate_public_visibility_role(visibility: &str, role: &str) -> Result<(), A
     Ok(())
 }
 
-async fn validate_public_to(
+pub(crate) async fn validate_public_to(
     pool: &PgPool,
     visibility: &str,
     public_to: &[Uuid],
@@ -17906,7 +17906,7 @@ async fn validate_public_to(
     Ok(())
 }
 
-fn validate_agent_payload(req: &UpdateAgentRequest) -> Result<(), ApiError> {
+pub(crate) fn validate_agent_payload(req: &UpdateAgentRequest) -> Result<(), ApiError> {
     if req.name.trim().is_empty() {
         return Err(ApiError::bad_request("agent name is required"));
     }
@@ -18004,7 +18004,7 @@ fn validate_agent_payload(req: &UpdateAgentRequest) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn normalize_automation_trigger(trigger_type: &str) -> Result<&'static str, ApiError> {
+pub(crate) fn normalize_automation_trigger(trigger_type: &str) -> Result<&'static str, ApiError> {
     match trigger_type.trim() {
         "manual" => Ok("manual"),
         "webhook" => Ok("webhook"),
@@ -18014,7 +18014,7 @@ fn normalize_automation_trigger(trigger_type: &str) -> Result<&'static str, ApiE
     }
 }
 
-fn validate_automation_schedule(
+pub(crate) fn validate_automation_schedule(
     trigger_type: &str,
     schedule: Option<&str>,
 ) -> Result<(), ApiError> {
@@ -18035,7 +18035,7 @@ fn validate_automation_schedule(
     }
 }
 
-async fn automation_scheduler_loop(pool: PgPool) {
+pub(crate) async fn automation_scheduler_loop(pool: PgPool) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         tick.tick().await;
@@ -18045,7 +18045,7 @@ async fn automation_scheduler_loop(pool: PgPool) {
     }
 }
 
-async fn trigger_due_scheduled_automations(pool: &PgPool) -> Result<(), ApiError> {
+pub(crate) async fn trigger_due_scheduled_automations(pool: &PgPool) -> Result<(), ApiError> {
     let now = Utc::now();
     let rows = sqlx::query(
         "SELECT au.id
@@ -18070,7 +18070,7 @@ async fn trigger_due_scheduled_automations(pool: &PgPool) -> Result<(), ApiError
     Ok(())
 }
 
-async fn trigger_scheduled_automation_if_due(
+pub(crate) async fn trigger_scheduled_automation_if_due(
     pool: &PgPool,
     automation_id: Uuid,
     now: DateTime<Utc>,
@@ -18135,7 +18135,7 @@ async fn trigger_scheduled_automation_if_due(
     Ok(Some(run))
 }
 
-fn scheduled_automation_due(automation: &AutomationDto, now: DateTime<Utc>) -> bool {
+pub(crate) fn scheduled_automation_due(automation: &AutomationDto, now: DateTime<Utc>) -> bool {
     if !automation.enabled {
         return false;
     }
@@ -18161,7 +18161,7 @@ fn scheduled_automation_due(automation: &AutomationDto, now: DateTime<Utc>) -> b
     }
 }
 
-fn parse_interval_schedule(schedule: &str) -> Result<ChronoDuration, ApiError> {
+pub(crate) fn parse_interval_schedule(schedule: &str) -> Result<ChronoDuration, ApiError> {
     let trimmed = schedule.trim();
     if trimmed.len() < 2 {
         return Err(ApiError::bad_request("interval schedule must be like 5m"));
@@ -18183,7 +18183,7 @@ fn parse_interval_schedule(schedule: &str) -> Result<ChronoDuration, ApiError> {
     }
 }
 
-fn checked_interval_duration(
+pub(crate) fn checked_interval_duration(
     amount: i64,
     seconds_per_unit: i64,
 ) -> Result<ChronoDuration, ApiError> {
@@ -18193,7 +18193,7 @@ fn checked_interval_duration(
         .ok_or_else(|| ApiError::bad_request("interval schedule is too large"))
 }
 
-fn validate_cron_schedule(schedule: &str) -> Result<(), ApiError> {
+pub(crate) fn validate_cron_schedule(schedule: &str) -> Result<(), ApiError> {
     let fields = cron_fields(schedule)?;
     for (index, field) in fields.iter().enumerate() {
         if *field == "*" {
@@ -18217,7 +18217,7 @@ fn validate_cron_schedule(schedule: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn cron_schedule_matches(schedule: &str, now: DateTime<Utc>) -> bool {
+pub(crate) fn cron_schedule_matches(schedule: &str, now: DateTime<Utc>) -> bool {
     let Ok(fields) = cron_fields(schedule) else {
         return false;
     };
@@ -18228,7 +18228,7 @@ fn cron_schedule_matches(schedule: &str, now: DateTime<Utc>) -> bool {
         && cron_field_matches(fields[4], now.weekday().num_days_from_sunday(), 4)
 }
 
-fn cron_fields(schedule: &str) -> Result<Vec<&str>, ApiError> {
+pub(crate) fn cron_fields(schedule: &str) -> Result<Vec<&str>, ApiError> {
     let fields = schedule.split_whitespace().collect::<Vec<_>>();
     if fields.len() != 5 {
         return Err(ApiError::bad_request("cron schedule must have 5 fields"));
@@ -18236,7 +18236,7 @@ fn cron_fields(schedule: &str) -> Result<Vec<&str>, ApiError> {
     Ok(fields)
 }
 
-fn cron_field_matches(field: &str, value: u32, index: usize) -> bool {
+pub(crate) fn cron_field_matches(field: &str, value: u32, index: usize) -> bool {
     if field == "*" {
         return true;
     }
@@ -18258,11 +18258,11 @@ fn cron_field_matches(field: &str, value: u32, index: usize) -> bool {
     })
 }
 
-fn minute_key(value: DateTime<Utc>) -> i64 {
+pub(crate) fn minute_key(value: DateTime<Utc>) -> i64 {
     value.timestamp() / 60
 }
 
-async fn trigger_loaded_automation(
+pub(crate) async fn trigger_loaded_automation(
     pool: &PgPool,
     automation: AutomationDto,
     message: Option<String>,
@@ -18371,7 +18371,7 @@ async fn trigger_loaded_automation(
     Ok(run)
 }
 
-async fn insert_run_event_for_active_runtime(
+pub(crate) async fn insert_run_event_for_active_runtime(
     tx: &mut Transaction<'_, Postgres>,
     run_id: Uuid,
     runtime_id: Uuid,
@@ -18515,13 +18515,13 @@ async fn insert_run_event_for_active_runtime(
     Ok(event)
 }
 
-fn sanitize_run_event_text(text: &mut String) {
+pub(crate) fn sanitize_run_event_text(text: &mut String) {
     if text.contains('\0') {
         *text = text.replace('\0', "\u{FFFD}");
     }
 }
 
-fn sanitize_run_event_payload(value: Value) -> Value {
+pub(crate) fn sanitize_run_event_payload(value: Value) -> Value {
     match value {
         Value::String(mut text) => {
             sanitize_run_event_text(&mut text);
@@ -18542,7 +18542,7 @@ fn sanitize_run_event_payload(value: Value) -> Value {
     }
 }
 
-async fn insert_run_event_with_id_tx(
+pub(crate) async fn insert_run_event_with_id_tx(
     tx: &mut Transaction<'_, Postgres>,
     event_id: Uuid,
     run_id: Uuid,
@@ -18586,7 +18586,7 @@ async fn insert_run_event_with_id_tx(
     Ok(event_from_row(existing))
 }
 
-async fn lock_owned_session_for_run_tx(
+pub(crate) async fn lock_owned_session_for_run_tx(
     tx: &mut Transaction<'_, Postgres>,
     run_id: Uuid,
     runtime_id: Uuid,
@@ -18612,7 +18612,7 @@ async fn lock_owned_session_for_run_tx(
     ))
 }
 
-async fn insert_run_event_tx(
+pub(crate) async fn insert_run_event_tx(
     tx: &mut Transaction<'_, Postgres>,
     run_id: Uuid,
     mut event_type: String,
@@ -18644,7 +18644,7 @@ async fn insert_run_event_tx(
     Ok(event_from_row(row))
 }
 
-async fn load_events_after(
+pub(crate) async fn load_events_after(
     pool: &PgPool,
     run_id: Uuid,
     after: i64,
@@ -18674,7 +18674,7 @@ enum AuthPrincipal {
     },
 }
 
-async fn authenticate_with_providers(
+pub(crate) async fn authenticate_with_providers(
     state: &AppState,
     credential: AuthCredential,
 ) -> Result<AuthPrincipal, ApiError> {
@@ -18893,7 +18893,7 @@ impl WidgetCredential {
     }
 }
 
-fn widget_session_locator(
+pub(crate) fn widget_session_locator(
     credential: &WidgetCredential,
     session_id: Uuid,
 ) -> (Option<Uuid>, Option<Uuid>) {
@@ -18904,7 +18904,7 @@ fn widget_session_locator(
     }
 }
 
-fn merge_client_session_id(
+pub(crate) fn merge_client_session_id(
     canonical: Option<Uuid>,
     compatibility: Option<Uuid>,
 ) -> Result<Option<Uuid>, ApiError> {
@@ -18914,7 +18914,7 @@ fn merge_client_session_id(
     Ok(canonical.or(compatibility))
 }
 
-fn widget_run_session_locator(
+pub(crate) fn widget_run_session_locator(
     credential: &WidgetCredential,
     request: &CreateWidgetRunRequest,
 ) -> Result<(Option<Uuid>, Option<Uuid>), ApiError> {
@@ -18974,7 +18974,7 @@ struct RunModelAttribution {
     source_integration_app_id: Option<Uuid>,
 }
 
-fn integration_run_model_attribution(principal: &IntegrationPrincipal) -> RunModelAttribution {
+pub(crate) fn integration_run_model_attribution(principal: &IntegrationPrincipal) -> RunModelAttribution {
     if principal.grant_type == "client_credentials" {
         RunModelAttribution {
             subject_type: "integration_app",
@@ -18990,7 +18990,7 @@ fn integration_run_model_attribution(principal: &IntegrationPrincipal) -> RunMod
     }
 }
 
-async fn require_user(state: &AppState, headers: &HeaderMap) -> Result<UserDto, ApiError> {
+pub(crate) async fn require_user(state: &AppState, headers: &HeaderMap) -> Result<UserDto, ApiError> {
     match require_principal(state, headers).await? {
         AuthPrincipal::User { user, .. } => Ok(user),
         AuthPrincipal::Embed { .. } => Err(ApiError::forbidden(
@@ -18999,7 +18999,7 @@ async fn require_user(state: &AppState, headers: &HeaderMap) -> Result<UserDto, 
     }
 }
 
-async fn require_super_admin(state: &AppState, headers: &HeaderMap) -> Result<UserDto, ApiError> {
+pub(crate) async fn require_super_admin(state: &AppState, headers: &HeaderMap) -> Result<UserDto, ApiError> {
     let user = require_user(state, headers).await?;
     if user.role != "super_admin" {
         return Err(ApiError::forbidden(
@@ -19009,7 +19009,7 @@ async fn require_super_admin(state: &AppState, headers: &HeaderMap) -> Result<Us
     Ok(user)
 }
 
-async fn require_administrator(state: &AppState, headers: &HeaderMap) -> Result<UserDto, ApiError> {
+pub(crate) async fn require_administrator(state: &AppState, headers: &HeaderMap) -> Result<UserDto, ApiError> {
     let user = require_user(state, headers).await?;
     if !is_admin_role(&user.role) {
         return Err(ApiError::forbidden("administrator permission is required"));
@@ -19017,7 +19017,7 @@ async fn require_administrator(state: &AppState, headers: &HeaderMap) -> Result<
     Ok(user)
 }
 
-async fn require_administrator_role_tx(
+pub(crate) async fn require_administrator_role_tx(
     tx: &mut Transaction<'_, Postgres>,
     user_id: Uuid,
 ) -> Result<String, ApiError> {
@@ -19033,7 +19033,7 @@ async fn require_administrator_role_tx(
     .ok_or(ApiError::forbidden("administrator permission is required"))
 }
 
-async fn require_user_with_api_key_id(
+pub(crate) async fn require_user_with_api_key_id(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(UserDto, Option<Uuid>), ApiError> {
@@ -19047,14 +19047,14 @@ async fn require_user_with_api_key_id(
     }
 }
 
-async fn require_principal(
+pub(crate) async fn require_principal(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<AuthPrincipal, ApiError> {
     authenticate_with_providers(state, AuthCredential::Headers(headers.clone())).await
 }
 
-async fn require_integration(
+pub(crate) async fn require_integration(
     state: &AppState,
     headers: &HeaderMap,
     agent_id: Uuid,
@@ -19099,7 +19099,7 @@ async fn require_integration(
     })
 }
 
-async fn require_application_token(
+pub(crate) async fn require_application_token(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<ApplicationPrincipal, ApiError> {
@@ -19150,7 +19150,7 @@ async fn require_application_token(
     })
 }
 
-async fn lock_active_integration_agent_tx(
+pub(crate) async fn lock_active_integration_agent_tx(
     tx: &mut Transaction<'_, Postgres>,
     agent_id: Uuid,
     owner_id: Uuid,
@@ -19172,7 +19172,7 @@ async fn lock_active_integration_agent_tx(
         .ok_or(ApiError::unauthorized("invalid integration credential"))
 }
 
-async fn load_user_by_session(pool: &PgPool, token: &str) -> Result<UserDto, ApiError> {
+pub(crate) async fn load_user_by_session(pool: &PgPool, token: &str) -> Result<UserDto, ApiError> {
     let row = sqlx::query(
         "SELECT u.id, u.email, u.display_name, u.role
          FROM sessions s
@@ -19187,7 +19187,7 @@ async fn load_user_by_session(pool: &PgPool, token: &str) -> Result<UserDto, Api
         .ok_or(ApiError::unauthorized("invalid session"))
 }
 
-async fn load_active_user(pool: &PgPool, user_id: Uuid) -> Result<UserDto, ApiError> {
+pub(crate) async fn load_active_user(pool: &PgPool, user_id: Uuid) -> Result<UserDto, ApiError> {
     let row = sqlx::query(
         "SELECT id, email, display_name, role
          FROM users WHERE id = $1 AND deletion_requested_at IS NULL",
@@ -19199,7 +19199,7 @@ async fn load_active_user(pool: &PgPool, user_id: Uuid) -> Result<UserDto, ApiEr
         .ok_or(ApiError::unauthorized("user is unavailable"))
 }
 
-async fn load_active_user_tx(
+pub(crate) async fn load_active_user_tx(
     tx: &mut Transaction<'_, Postgres>,
     user_id: Uuid,
 ) -> Result<UserDto, ApiError> {
@@ -19215,13 +19215,13 @@ async fn load_active_user_tx(
 }
 
 #[cfg(test)]
-async fn load_user_by_api_key(pool: &PgPool, token: &str) -> Result<UserDto, ApiError> {
+pub(crate) async fn load_user_by_api_key(pool: &PgPool, token: &str) -> Result<UserDto, ApiError> {
     load_user_and_key_id_by_api_key(pool, token)
         .await
         .map(|(_, user)| user)
 }
 
-async fn load_user_and_key_id_by_api_key(
+pub(crate) async fn load_user_and_key_id_by_api_key(
     pool: &PgPool,
     token: &str,
 ) -> Result<(Uuid, UserDto), ApiError> {
@@ -19251,7 +19251,7 @@ async fn load_user_and_key_id_by_api_key(
         .ok_or(ApiError::unauthorized("invalid api key"))
 }
 
-async fn require_runtime(state: &AppState, headers: &HeaderMap) -> Result<Uuid, ApiError> {
+pub(crate) async fn require_runtime(state: &AppState, headers: &HeaderMap) -> Result<Uuid, ApiError> {
     let token = bearer_token(headers).ok_or(ApiError::unauthorized("missing runtime token"))?;
     let row = sqlx::query(
         "SELECT id FROM runtimes
@@ -19267,7 +19267,7 @@ async fn require_runtime(state: &AppState, headers: &HeaderMap) -> Result<Uuid, 
     ))
 }
 
-async fn reap_stale_runtimes(pool: &PgPool) -> Result<(), ApiError> {
+pub(crate) async fn reap_stale_runtimes(pool: &PgPool) -> Result<(), ApiError> {
     let mut tx = pool.begin().await?;
     let acquired: bool = sqlx::query_scalar(
         "SELECT pg_try_advisory_xact_lock(hashtextextended('agent-hub-runtime-reaper', 0))",
@@ -19366,7 +19366,7 @@ async fn reap_stale_runtimes(pool: &PgPool) -> Result<(), ApiError> {
     Ok(())
 }
 
-async fn runtime_reaper_loop(pool: PgPool) {
+pub(crate) async fn runtime_reaper_loop(pool: PgPool) {
     let mut tick = tokio::time::interval(Duration::from_secs(5));
     loop {
         tick.tick().await;
@@ -19379,7 +19379,7 @@ async fn runtime_reaper_loop(pool: PgPool) {
     }
 }
 
-async fn reap_expired_client_tool_batches(pool: &PgPool) -> Result<(), ApiError> {
+pub(crate) async fn reap_expired_client_tool_batches(pool: &PgPool) -> Result<(), ApiError> {
     let run_ids = sqlx::query_scalar::<_, Uuid>(
         "SELECT DISTINCT request.run_id
          FROM integration_tool_requests AS request
@@ -19397,7 +19397,7 @@ async fn reap_expired_client_tool_batches(pool: &PgPool) -> Result<(), ApiError>
     Ok(())
 }
 
-async fn fail_expired_client_tool_batch(pool: &PgPool, run_id: Uuid) -> Result<(), ApiError> {
+pub(crate) async fn fail_expired_client_tool_batch(pool: &PgPool, run_id: Uuid) -> Result<(), ApiError> {
     let mut tx = pool.begin().await?;
     let preview = sqlx::query(
         "SELECT agent_id, hub_session_id FROM runs
@@ -19488,7 +19488,7 @@ async fn fail_expired_client_tool_batch(pool: &PgPool, run_id: Uuid) -> Result<(
     Ok(())
 }
 
-async fn fail_capability_mismatched_runs_for_runtime_tx(
+pub(crate) async fn fail_capability_mismatched_runs_for_runtime_tx(
     tx: &mut Transaction<'_, Postgres>,
     runtime_id: Uuid,
 ) -> Result<Vec<Uuid>, ApiError> {
@@ -19524,7 +19524,7 @@ async fn fail_capability_mismatched_runs_for_runtime_tx(
     Ok(rows.into_iter().map(|row| row.get("id")).collect())
 }
 
-async fn load_agent_for_user(
+pub(crate) async fn load_agent_for_user(
     pool: &PgPool,
     agent_id: Uuid,
     user: &UserDto,
@@ -19561,7 +19561,7 @@ async fn load_agent_for_user(
     Ok(apply_agent_access(agent, user))
 }
 
-async fn load_agent_owned_by_user(
+pub(crate) async fn load_agent_owned_by_user(
     pool: &PgPool,
     agent_id: Uuid,
     user_id: Uuid,
@@ -19583,7 +19583,7 @@ async fn load_agent_owned_by_user(
     Ok(agent)
 }
 
-async fn load_agent_manageable_by_user(
+pub(crate) async fn load_agent_manageable_by_user(
     pool: &PgPool,
     agent_id: Uuid,
     user: &UserDto,
@@ -19610,7 +19610,7 @@ async fn load_agent_manageable_by_user(
     Ok(agent)
 }
 
-async fn ensure_runtime_online(pool: &PgPool, runtime_id: Uuid) -> Result<(), ApiError> {
+pub(crate) async fn ensure_runtime_online(pool: &PgPool, runtime_id: Uuid) -> Result<(), ApiError> {
     let exists: Option<(Uuid,)> =
         sqlx::query_as("SELECT id FROM runtimes WHERE id = $1 AND status = 'online'")
             .bind(runtime_id)
@@ -19621,7 +19621,7 @@ async fn ensure_runtime_online(pool: &PgPool, runtime_id: Uuid) -> Result<(), Ap
         .ok_or(ApiError::bad_request("runtime is not online"))
 }
 
-fn validate_skill_payload(name: &str, content: &str) -> Result<(), ApiError> {
+pub(crate) fn validate_skill_payload(name: &str, content: &str) -> Result<(), ApiError> {
     if name.trim().is_empty() {
         return Err(ApiError::bad_request("skill name is required"));
     }
@@ -19631,7 +19631,7 @@ fn validate_skill_payload(name: &str, content: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn validate_subagent_definitions(definitions: &[SubagentDefinition]) -> Result<(), ApiError> {
+pub(crate) fn validate_subagent_definitions(definitions: &[SubagentDefinition]) -> Result<(), ApiError> {
     if definitions.len() > 32 {
         return Err(ApiError::bad_request(
             "an Agent supports at most 32 Subagents",
@@ -19692,7 +19692,7 @@ fn validate_subagent_definitions(definitions: &[SubagentDefinition]) -> Result<(
     Ok(())
 }
 
-async fn load_permitted_model_selection_api_type_tx(
+pub(crate) async fn load_permitted_model_selection_api_type_tx(
     tx: &mut Transaction<'_, Postgres>,
     owner_id: Uuid,
     selection: &ModelSelectionDto,
@@ -19717,7 +19717,7 @@ async fn load_permitted_model_selection_api_type_tx(
     Ok(model_upstream_protocol_from_name(&api_type))
 }
 
-fn apply_enum_model_setting_override<T: Clone + Default>(
+pub(crate) fn apply_enum_model_setting_override<T: Clone + Default>(
     value: &mut T,
     setting_override: &ModelSettingOverride<T>,
 ) {
@@ -19728,7 +19728,7 @@ fn apply_enum_model_setting_override<T: Clone + Default>(
     }
 }
 
-fn apply_optional_model_setting_override<T: Clone>(
+pub(crate) fn apply_optional_model_setting_override<T: Clone>(
     value: &mut Option<T>,
     setting_override: &ModelSettingOverride<T>,
 ) {
@@ -19739,7 +19739,7 @@ fn apply_optional_model_setting_override<T: Clone>(
     }
 }
 
-fn effective_subagent_model_settings(
+pub(crate) fn effective_subagent_model_settings(
     parent: &AgentModelSettings,
     overrides: &AgentModelSettingsOverride,
     protocol: ModelUpstreamProtocol,
@@ -19790,7 +19790,7 @@ fn effective_subagent_model_settings(
     validate_agent_model_settings(effective, protocol)
 }
 
-async fn check_admin_agent_model_selection_tx(
+pub(crate) async fn check_admin_agent_model_selection_tx(
     tx: &mut Transaction<'_, Postgres>,
     retained: &[(Uuid, String)],
     selection: Option<&ModelSelectionDto>,
@@ -19823,7 +19823,7 @@ async fn check_admin_agent_model_selection_tx(
     }
 }
 
-async fn enforce_admin_agent_model_selection_tx(
+pub(crate) async fn enforce_admin_agent_model_selection_tx(
     tx: &mut Transaction<'_, Postgres>,
     existing: &AgentDto,
     requested: Option<&ModelSelectionDto>,
@@ -19849,7 +19849,7 @@ async fn enforce_admin_agent_model_selection_tx(
     Ok(())
 }
 
-async fn validate_agent_model_configuration_tx(
+pub(crate) async fn validate_agent_model_configuration_tx(
     tx: &mut Transaction<'_, Postgres>,
     owner_id: Uuid,
     model_selection: Option<&ModelSelectionDto>,
@@ -19887,7 +19887,7 @@ async fn validate_agent_model_configuration_tx(
     Ok(model_settings)
 }
 
-async fn replace_subagents_tx(
+pub(crate) async fn replace_subagents_tx(
     tx: &mut Transaction<'_, Postgres>,
     agent_id: Uuid,
     definitions: &[SubagentDefinition],
@@ -19953,7 +19953,7 @@ async fn replace_subagents_tx(
     Ok(())
 }
 
-fn subagent_from_row(row: sqlx::postgres::PgRow) -> SubagentDefinition {
+pub(crate) fn subagent_from_row(row: sqlx::postgres::PgRow) -> SubagentDefinition {
     let connection_id: Option<Uuid> = row.get("model_connection_id");
     let model_id: Option<String> = row.get("model_id");
     SubagentDefinition {
@@ -19973,7 +19973,7 @@ fn subagent_from_row(row: sqlx::postgres::PgRow) -> SubagentDefinition {
     }
 }
 
-async fn load_subagents(
+pub(crate) async fn load_subagents(
     pool: &PgPool,
     agent_id: Uuid,
 ) -> Result<Vec<SubagentDefinition>, ApiError> {
@@ -19990,7 +19990,7 @@ async fn load_subagents(
     Ok(rows.into_iter().map(subagent_from_row).collect())
 }
 
-async fn load_subagents_tx(
+pub(crate) async fn load_subagents_tx(
     tx: &mut Transaction<'_, Postgres>,
     agent_id: Uuid,
 ) -> Result<Vec<SubagentDefinition>, ApiError> {
@@ -20007,14 +20007,14 @@ async fn load_subagents_tx(
     Ok(rows.into_iter().map(subagent_from_row).collect())
 }
 
-async fn hydrate_agent_configuration(pool: &PgPool, agent: &mut AgentDto) -> Result<(), ApiError> {
+pub(crate) async fn hydrate_agent_configuration(pool: &PgPool, agent: &mut AgentDto) -> Result<(), ApiError> {
     agent.managed_skill_ids = load_managed_skill_ids(pool, agent.id).await?;
     agent.secret_declarations = load_agent_secret_declarations(pool, agent.id).await?;
     agent.subagents = load_subagents(pool, agent.id).await?;
     Ok(())
 }
 
-fn validate_secret_name(name: &str) -> bool {
+pub(crate) fn validate_secret_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 128
         && name
@@ -20023,7 +20023,7 @@ fn validate_secret_name(name: &str) -> bool {
         && (name.starts_with(|byte: char| byte.is_ascii_uppercase()) || name.starts_with('_'))
 }
 
-fn validate_secret_declarations(
+pub(crate) fn validate_secret_declarations(
     declarations: &[AgentSecretDeclarationDto],
 ) -> Result<(), ApiError> {
     let mut names = BTreeSet::new();
@@ -20041,7 +20041,7 @@ fn validate_secret_declarations(
     Ok(())
 }
 
-async fn load_agent_secret_declarations(
+pub(crate) async fn load_agent_secret_declarations(
     pool: &PgPool,
     agent_id: Uuid,
 ) -> Result<Vec<AgentSecretDeclarationDto>, ApiError> {
@@ -20064,7 +20064,7 @@ async fn load_agent_secret_declarations(
         .collect())
 }
 
-async fn replace_agent_secret_declarations_tx(
+pub(crate) async fn replace_agent_secret_declarations_tx(
     tx: &mut Transaction<'_, Postgres>,
     agent_id: Uuid,
     declarations: &[AgentSecretDeclarationDto],
@@ -20089,7 +20089,7 @@ async fn replace_agent_secret_declarations_tx(
     Ok(())
 }
 
-async fn missing_secret_grants(
+pub(crate) async fn missing_secret_grants(
     pool: &PgPool,
     user_id: Uuid,
     agent_id: Uuid,
@@ -20134,7 +20134,7 @@ async fn missing_secret_grants(
     Ok(missing)
 }
 
-fn user_secret_from_row(row: sqlx::postgres::PgRow) -> UserSecretDto {
+pub(crate) fn user_secret_from_row(row: sqlx::postgres::PgRow) -> UserSecretDto {
     UserSecretDto {
         id: row.get("id"),
         owner_id: row.get("owner_id"),
@@ -20148,7 +20148,7 @@ fn user_secret_from_row(row: sqlx::postgres::PgRow) -> UserSecretDto {
     }
 }
 
-async fn list_user_secrets(
+pub(crate) async fn list_user_secrets(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<UserSecretDto>>, ApiError> {
@@ -20166,7 +20166,7 @@ async fn list_user_secrets(
     Ok(Json(rows.into_iter().map(user_secret_from_row).collect()))
 }
 
-async fn create_user_secret(
+pub(crate) async fn create_user_secret(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<CreateUserSecretRequest>,
@@ -20276,7 +20276,7 @@ async fn create_user_secret(
     Ok(Json(user_secret_from_row(row)))
 }
 
-async fn update_user_secret(
+pub(crate) async fn update_user_secret(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(secret_id): Path<Uuid>,
@@ -20371,7 +20371,7 @@ async fn update_user_secret(
     Ok(Json(user_secret_from_row(row)))
 }
 
-async fn delete_user_secret(
+pub(crate) async fn delete_user_secret(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(secret_id): Path<Uuid>,
@@ -20405,7 +20405,7 @@ struct SecretGrantListQuery {
     agent_id: Option<Uuid>,
 }
 
-async fn list_secret_grants(
+pub(crate) async fn list_secret_grants(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<SecretGrantListQuery>,
@@ -20433,7 +20433,7 @@ async fn list_secret_grants(
     ))
 }
 
-async fn create_secret_grants(
+pub(crate) async fn create_secret_grants(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(req): Json<CreateSecretGrantRequest>,
@@ -20517,7 +20517,7 @@ async fn create_secret_grants(
     ))
 }
 
-async fn require_secret_grant_user(
+pub(crate) async fn require_secret_grant_user(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(UserDto, Option<Uuid>), ApiError> {
@@ -20540,7 +20540,7 @@ async fn require_secret_grant_user(
     Ok((require_user(state, headers).await?, None))
 }
 
-async fn delete_secret_grant(
+pub(crate) async fn delete_secret_grant(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path((agent_id, secret_name)): Path<(Uuid, String)>,
@@ -20561,7 +20561,7 @@ async fn delete_secret_grant(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn normalized_subagents(definitions: &[SubagentDefinition]) -> Vec<String> {
+pub(crate) fn normalized_subagents(definitions: &[SubagentDefinition]) -> Vec<String> {
     let mut definitions = definitions
         .iter()
         .map(|definition| {
@@ -20574,7 +20574,7 @@ fn normalized_subagents(definitions: &[SubagentDefinition]) -> Vec<String> {
     definitions
 }
 
-fn agent_execution_configuration_changed(
+pub(crate) fn agent_execution_configuration_changed(
     existing: &AgentDto,
     request: &UpdateAgentRequest,
 ) -> bool {
@@ -20607,7 +20607,7 @@ fn agent_execution_configuration_changed(
             })
 }
 
-fn normalized_secret_declarations(declarations: &[AgentSecretDeclarationDto]) -> Vec<String> {
+pub(crate) fn normalized_secret_declarations(declarations: &[AgentSecretDeclarationDto]) -> Vec<String> {
     let mut entries = declarations
         .iter()
         .map(|declaration| {
@@ -20622,7 +20622,7 @@ fn normalized_secret_declarations(declarations: &[AgentSecretDeclarationDto]) ->
     entries
 }
 
-fn normalized_unordered_entries(value: &Value) -> Vec<String> {
+pub(crate) fn normalized_unordered_entries(value: &Value) -> Vec<String> {
     let mut entries = value
         .as_array()
         .into_iter()
@@ -20633,7 +20633,7 @@ fn normalized_unordered_entries(value: &Value) -> Vec<String> {
     entries
 }
 
-async fn load_skill_visible_by_user(
+pub(crate) async fn load_skill_visible_by_user(
     pool: &PgPool,
     skill_id: Uuid,
     user_id: Uuid,
@@ -20666,7 +20666,7 @@ async fn load_skill_visible_by_user(
         .ok_or(ApiError::not_found("skill not found"))
 }
 
-async fn ensure_skills_visible_by_user(
+pub(crate) async fn ensure_skills_visible_by_user(
     pool: &PgPool,
     skill_ids: &[Uuid],
     user_id: Uuid,
@@ -20677,7 +20677,7 @@ async fn ensure_skills_visible_by_user(
     Ok(())
 }
 
-async fn load_managed_skill_ids(pool: &PgPool, agent_id: Uuid) -> Result<Vec<Uuid>, ApiError> {
+pub(crate) async fn load_managed_skill_ids(pool: &PgPool, agent_id: Uuid) -> Result<Vec<Uuid>, ApiError> {
     let rows = sqlx::query(
         "SELECT s.id
          FROM agent_skills a_s
@@ -20703,7 +20703,7 @@ struct AgentAccess {
     can_invoke: bool,
 }
 
-fn agent_access(agent: &AgentDto, user: &UserDto) -> AgentAccess {
+pub(crate) fn agent_access(agent: &AgentDto, user: &UserDto) -> AgentAccess {
     let is_owner = agent.owner_id == user.id;
     AgentAccess {
         can_manage: is_owner || is_admin_role(&user.role),
@@ -20714,12 +20714,12 @@ fn agent_access(agent: &AgentDto, user: &UserDto) -> AgentAccess {
     }
 }
 
-fn is_admin_role(role: &str) -> bool {
+pub(crate) fn is_admin_role(role: &str) -> bool {
     matches!(role, "admin" | "super_admin")
 }
 
 #[cfg(test)]
-fn widget_agent_from_agent(agent: AgentDto) -> WidgetAgentDto {
+pub(crate) fn widget_agent_from_agent(agent: AgentDto) -> WidgetAgentDto {
     // iframe widget 只需要展示和发起消息，不暴露控制面的私有配置。
     WidgetAgentDto {
         id: agent.id,
@@ -20728,7 +20728,7 @@ fn widget_agent_from_agent(agent: AgentDto) -> WidgetAgentDto {
     }
 }
 
-fn apply_agent_access(mut agent: AgentDto, user: &UserDto) -> AgentDto {
+pub(crate) fn apply_agent_access(mut agent: AgentDto, user: &UserDto) -> AgentDto {
     let access = agent_access(&agent, user);
     agent.is_owner = agent.owner_id == user.id;
     agent.can_manage = access.can_manage;
@@ -20750,7 +20750,7 @@ fn apply_agent_access(mut agent: AgentDto, user: &UserDto) -> AgentDto {
     agent
 }
 
-fn redact_mcp_secrets(value: &Value) -> Value {
+pub(crate) fn redact_mcp_secrets(value: &Value) -> Value {
     let Some(servers) = value.as_array() else {
         return json!([]);
     };
@@ -20770,7 +20770,7 @@ fn redact_mcp_secrets(value: &Value) -> Value {
     )
 }
 
-fn merge_mcp_secrets(existing: &Value, incoming: &Value) -> Value {
+pub(crate) fn merge_mcp_secrets(existing: &Value, incoming: &Value) -> Value {
     let Some(incoming_servers) = incoming.as_array() else {
         return incoming.clone();
     };
@@ -20797,7 +20797,7 @@ fn merge_mcp_secrets(existing: &Value, incoming: &Value) -> Value {
     Value::Array(merged)
 }
 
-fn existing_mcp_secret<'a>(
+pub(crate) fn existing_mcp_secret<'a>(
     existing: &'a Value,
     server_name: Option<&str>,
     key: &str,
@@ -20815,7 +20815,7 @@ fn existing_mcp_secret<'a>(
     })
 }
 
-fn build_agent_execution_configuration(
+pub(crate) fn build_agent_execution_configuration(
     agent: &AgentDto,
     revision: i64,
     managed_rows: Vec<sqlx::postgres::PgRow>,
@@ -20858,7 +20858,7 @@ fn build_agent_execution_configuration(
     })
 }
 
-fn execution_skill_package_from_row(row: &sqlx::postgres::PgRow) -> Option<SkillPackageDto> {
+pub(crate) fn execution_skill_package_from_row(row: &sqlx::postgres::PgRow) -> Option<SkillPackageDto> {
     let id = row
         .try_get::<Option<Uuid>, _>("package_id")
         .ok()
@@ -20881,7 +20881,7 @@ struct SessionToolPolicy {
     app_tool_allowlist: Option<Vec<String>>,
 }
 
-async fn load_session_tool_policy_tx(
+pub(crate) async fn load_session_tool_policy_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: Uuid,
 ) -> Result<SessionToolPolicy, ApiError> {
@@ -20925,7 +20925,7 @@ async fn load_session_tool_policy_tx(
     })
 }
 
-fn apply_session_tool_policy(
+pub(crate) fn apply_session_tool_policy(
     tools: &mut Vec<String>,
     sandbox_policy: &mut Value,
     mcp_allowlist: &mut Value,
@@ -20952,7 +20952,7 @@ fn apply_session_tool_policy(
     Ok(())
 }
 
-async fn apply_session_tool_policy_to_agent_tx(
+pub(crate) async fn apply_session_tool_policy_to_agent_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: Uuid,
     agent: &mut AgentDto,
@@ -20966,7 +20966,7 @@ async fn apply_session_tool_policy_to_agent_tx(
     )
 }
 
-async fn apply_session_tool_policy_to_configuration_tx(
+pub(crate) async fn apply_session_tool_policy_to_configuration_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: Uuid,
     configuration: &mut AgentExecutionConfigurationDto,
@@ -20980,7 +20980,7 @@ async fn apply_session_tool_policy_to_configuration_tx(
     )
 }
 
-async fn load_agent_execution_configuration_tx(
+pub(crate) async fn load_agent_execution_configuration_tx(
     tx: &mut Transaction<'_, Postgres>,
     agent_id: Uuid,
 ) -> Result<AgentExecutionConfigurationDto, ApiError> {
@@ -21031,7 +21031,7 @@ async fn load_agent_execution_configuration_tx(
     Ok(configuration)
 }
 
-async fn create_run_model_binding_tx(
+pub(crate) async fn create_run_model_binding_tx(
     tx: &mut Transaction<'_, Postgres>,
     run_id: Uuid,
     binding_key: &str,
@@ -21098,7 +21098,7 @@ async fn create_run_model_binding_tx(
     Ok(binding)
 }
 
-async fn load_run_model_bindings_tx(
+pub(crate) async fn load_run_model_bindings_tx(
     tx: &mut Transaction<'_, Postgres>,
     run_id: Uuid,
 ) -> Result<Vec<RunModelBindingDto>, ApiError> {
@@ -21137,7 +21137,7 @@ async fn load_run_model_bindings_tx(
         .collect())
 }
 
-async fn create_run_model_bindings_tx(
+pub(crate) async fn create_run_model_bindings_tx(
     tx: &mut Transaction<'_, Postgres>,
     run_id: Uuid,
     agent: &AgentDto,
@@ -21187,7 +21187,7 @@ async fn create_run_model_bindings_tx(
     Ok(bindings)
 }
 
-fn validate_integration_app_payload(
+pub(crate) fn validate_integration_app_payload(
     name: &str,
     redirect_uris: &Value,
     agent_ids: &[Uuid],
@@ -21216,7 +21216,7 @@ fn validate_integration_app_payload(
     Ok(())
 }
 
-fn normalize_agent_tool_allowlist(value: &[String]) -> Result<Vec<String>, ApiError> {
+pub(crate) fn normalize_agent_tool_allowlist(value: &[String]) -> Result<Vec<String>, ApiError> {
     let requested = value
         .iter()
         .map(|name| name.trim())
@@ -21240,7 +21240,7 @@ fn normalize_agent_tool_allowlist(value: &[String]) -> Result<Vec<String>, ApiEr
         .collect())
 }
 
-fn normalize_allowed_origins(value: &[String]) -> Result<Vec<String>, ApiError> {
+pub(crate) fn normalize_allowed_origins(value: &[String]) -> Result<Vec<String>, ApiError> {
     let mut origins = BTreeSet::new();
     for raw in value {
         let raw = raw.trim();
@@ -21267,7 +21267,7 @@ fn normalize_allowed_origins(value: &[String]) -> Result<Vec<String>, ApiError> 
     Ok(origins.into_iter().collect())
 }
 
-fn request_origin(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+pub(crate) fn request_origin(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
     if headers.contains_key(EMBEDDED_ORIGIN_HEADER) {
         if headers
             .get("sec-fetch-site")
@@ -21299,7 +21299,7 @@ fn request_origin(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
     parse_request_origin(value)
 }
 
-fn parse_request_origin(value: &HeaderValue) -> Result<Option<String>, ApiError> {
+pub(crate) fn parse_request_origin(value: &HeaderValue) -> Result<Option<String>, ApiError> {
     let raw = value
         .to_str()
         .map_err(|_| ApiError::forbidden("request Origin is not allowed"))?;
@@ -21317,7 +21317,7 @@ fn parse_request_origin(value: &HeaderValue) -> Result<Option<String>, ApiError>
     Ok(Some(url.origin().ascii_serialization()))
 }
 
-fn validate_client_request_origin(
+pub(crate) fn validate_client_request_origin(
     headers: &HeaderMap,
     allowed_origins: &[String],
     required: bool,
@@ -21336,7 +21336,7 @@ fn validate_client_request_origin(
     }
 }
 
-fn validate_client_tool_definitions(
+pub(crate) fn validate_client_tool_definitions(
     definitions: &[ClientToolDefinitionDto],
 ) -> Result<Value, ApiError> {
     if definitions.len() > MAX_CLIENT_TOOL_COUNT {
@@ -21381,7 +21381,7 @@ fn validate_client_tool_definitions(
         .map_err(|_| ApiError::internal("Client Tool definitions could not be encoded"))
 }
 
-fn validate_public_widget_settings(
+pub(crate) fn validate_public_widget_settings(
     login_required: bool,
     widget_history_enabled: bool,
     allowed_origins: &[String],
@@ -21422,7 +21422,7 @@ fn validate_public_widget_settings(
     Ok(())
 }
 
-async fn validate_integration_app_tool_allowlist_tx(
+pub(crate) async fn validate_integration_app_tool_allowlist_tx(
     tx: &mut Transaction<'_, Postgres>,
     agent_ids: &[Uuid],
     tool_allowlist: Option<&[String]>,
@@ -21463,7 +21463,7 @@ async fn validate_integration_app_tool_allowlist_tx(
     Ok(())
 }
 
-async fn require_integration_authentication_channel_tx(
+pub(crate) async fn require_integration_authentication_channel_tx(
     tx: &mut Transaction<'_, Postgres>,
     platform_id: Uuid,
     channel_id: Uuid,
@@ -21487,7 +21487,7 @@ async fn require_integration_authentication_channel_tx(
     Ok(())
 }
 
-async fn validate_integration_app_agents_tx(
+pub(crate) async fn validate_integration_app_agents_tx(
     tx: &mut Transaction<'_, Postgres>,
     user: &UserDto,
     agent_ids: &[Uuid],
@@ -21515,7 +21515,7 @@ async fn validate_integration_app_agents_tx(
     Ok(())
 }
 
-async fn replace_integration_app_agents_tx(
+pub(crate) async fn replace_integration_app_agents_tx(
     tx: &mut Transaction<'_, Postgres>,
     app_id: Uuid,
     agent_ids: &[Uuid],
@@ -21537,7 +21537,7 @@ async fn replace_integration_app_agents_tx(
     Ok(())
 }
 
-fn parse_oauth_scopes(raw: Option<&str>, default_profile: bool) -> Result<Vec<String>, ApiError> {
+pub(crate) fn parse_oauth_scopes(raw: Option<&str>, default_profile: bool) -> Result<Vec<String>, ApiError> {
     let mut scopes = BTreeSet::new();
     match raw {
         None if default_profile => {
@@ -21565,7 +21565,7 @@ fn parse_oauth_scopes(raw: Option<&str>, default_profile: bool) -> Result<Vec<St
     Ok(scopes.into_iter().collect())
 }
 
-fn oauth_agent_scope_ids(scopes: &[String]) -> Result<Vec<Uuid>, ApiError> {
+pub(crate) fn oauth_agent_scope_ids(scopes: &[String]) -> Result<Vec<Uuid>, ApiError> {
     scopes
         .iter()
         .filter_map(|scope| scope.strip_prefix("agent:"))
@@ -21575,7 +21575,7 @@ fn oauth_agent_scope_ids(scopes: &[String]) -> Result<Vec<Uuid>, ApiError> {
         .collect()
 }
 
-async fn validate_oauth_agent_scopes_tx(
+pub(crate) async fn validate_oauth_agent_scopes_tx(
     tx: &mut Transaction<'_, Postgres>,
     app: &OAuthAppRecord,
     scopes: &[String],
@@ -21612,7 +21612,7 @@ async fn validate_oauth_agent_scopes_tx(
     Ok(())
 }
 
-fn project_oauth_userinfo(
+pub(crate) fn project_oauth_userinfo(
     scopes: &BTreeSet<String>,
     user: &UserDto,
     mut external: OAuthExternalProfileDto,
@@ -21630,7 +21630,7 @@ fn project_oauth_userinfo(
     }
 }
 
-fn validate_oauth_redirect_uri(value: &str) -> Result<(), ApiError> {
+pub(crate) fn validate_oauth_redirect_uri(value: &str) -> Result<(), ApiError> {
     let url = Url::parse(value).map_err(|_| ApiError::bad_request("redirect uri is invalid"))?;
     if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
         return Err(ApiError::bad_request(
@@ -21653,7 +21653,7 @@ fn validate_oauth_redirect_uri(value: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn oauth_redirect_location(
+pub(crate) fn oauth_redirect_location(
     redirect_uri: &str,
     code: &str,
     state: Option<&str>,
@@ -21670,14 +21670,14 @@ fn oauth_redirect_location(
     Ok(location.to_string())
 }
 
-fn redirect_uri_allowed(redirect_uris: &Value, redirect_uri: &str) -> bool {
+pub(crate) fn redirect_uri_allowed(redirect_uris: &Value, redirect_uri: &str) -> bool {
     redirect_uris
         .as_array()
         .map(|items| items.iter().any(|item| item.as_str() == Some(redirect_uri)))
         .unwrap_or(false)
 }
 
-fn validate_tool_definitions(tools: &Value) -> Result<(), ApiError> {
+pub(crate) fn validate_tool_definitions(tools: &Value) -> Result<(), ApiError> {
     let Some(items) = tools.as_array() else {
         return Err(ApiError::bad_request("tools must be an array"));
     };
@@ -21692,7 +21692,7 @@ fn validate_tool_definitions(tools: &Value) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn validate_integration_attachments(attachments: &Value) -> Result<(), ApiError> {
+pub(crate) fn validate_integration_attachments(attachments: &Value) -> Result<(), ApiError> {
     let Some(items) = attachments.as_array() else {
         return Err(ApiError::bad_request("attachments must be an array"));
     };
@@ -21748,7 +21748,7 @@ fn validate_integration_attachments(attachments: &Value) -> Result<(), ApiError>
     Ok(())
 }
 
-fn validate_tool_result(result: &Value) -> Result<(), ApiError> {
+pub(crate) fn validate_tool_result(result: &Value) -> Result<(), ApiError> {
     if result.is_null() {
         return Err(ApiError::bad_request("tool result is required"));
     }
@@ -21760,7 +21760,7 @@ fn validate_tool_result(result: &Value) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn compact_json(value: &Value) -> String {
+pub(crate) fn compact_json(value: &Value) -> String {
     let text = serde_json::to_string(value).unwrap_or_else(|_| "{}".into());
     let mut chars = text.chars();
     let truncated = chars.by_ref().take(1000).collect::<String>();
@@ -21771,7 +21771,7 @@ fn compact_json(value: &Value) -> String {
     }
 }
 
-async fn insert_integration_attachments_tx(
+pub(crate) async fn insert_integration_attachments_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: Uuid,
     run_id: Uuid,
@@ -21822,7 +21822,7 @@ async fn insert_integration_attachments_tx(
     Ok(())
 }
 
-async fn load_integration_app(
+pub(crate) async fn load_integration_app(
     pool: &PgPool,
     app_id: Uuid,
     owner_id: Uuid,
@@ -21850,7 +21850,7 @@ async fn load_integration_app(
     Ok(integration_app_from_row(row, agent_ids))
 }
 
-async fn load_oauth_app_by_client_id(
+pub(crate) async fn load_oauth_app_by_client_id(
     pool: &PgPool,
     client_id: &str,
 ) -> Result<OAuthAppRecord, ApiError> {
@@ -21869,7 +21869,7 @@ async fn load_oauth_app_by_client_id(
     oauth_app_record_from_row(row)
 }
 
-async fn load_oauth_app_by_client_id_tx(
+pub(crate) async fn load_oauth_app_by_client_id_tx(
     tx: &mut Transaction<'_, Postgres>,
     client_id: &str,
 ) -> Result<OAuthAppRecord, ApiError> {
@@ -21889,7 +21889,7 @@ async fn load_oauth_app_by_client_id_tx(
     oauth_app_record_from_row(row)
 }
 
-fn oauth_app_record_from_row(row: sqlx::postgres::PgRow) -> Result<OAuthAppRecord, ApiError> {
+pub(crate) fn oauth_app_record_from_row(row: sqlx::postgres::PgRow) -> Result<OAuthAppRecord, ApiError> {
     Ok(OAuthAppRecord {
         id: row.get("id"),
         owner_id: row.get("owner_id"),
@@ -21911,7 +21911,7 @@ fn oauth_app_record_from_row(row: sqlx::postgres::PgRow) -> Result<OAuthAppRecor
     })
 }
 
-fn validate_public_widget_app_record(app: &OAuthAppRecord) -> Result<(), ApiError> {
+pub(crate) fn validate_public_widget_app_record(app: &OAuthAppRecord) -> Result<(), ApiError> {
     if app.login_required {
         return Err(ApiError::not_found("public Widget application not found"));
     }
@@ -21928,7 +21928,7 @@ fn validate_public_widget_app_record(app: &OAuthAppRecord) -> Result<(), ApiErro
     Ok(())
 }
 
-async fn load_public_widget_app_by_client_id(
+pub(crate) async fn load_public_widget_app_by_client_id(
     pool: &PgPool,
     client_id: &str,
 ) -> Result<OAuthAppRecord, ApiError> {
@@ -21951,7 +21951,7 @@ async fn load_public_widget_app_by_client_id(
     Ok(app)
 }
 
-async fn load_public_widget_app_by_client_id_tx(
+pub(crate) async fn load_public_widget_app_by_client_id_tx(
     tx: &mut Transaction<'_, Postgres>,
     client_id: &str,
 ) -> Result<OAuthAppRecord, ApiError> {
@@ -21975,7 +21975,7 @@ async fn load_public_widget_app_by_client_id_tx(
     Ok(app)
 }
 
-fn visitor_key_hash(visitor_key: &str) -> Result<String, ApiError> {
+pub(crate) fn visitor_key_hash(visitor_key: &str) -> Result<String, ApiError> {
     let visitor_key = visitor_key.trim();
     if !(16..=512).contains(&visitor_key.len()) || visitor_key.chars().any(char::is_control) {
         return Err(ApiError::bad_request(
@@ -21985,7 +21985,7 @@ fn visitor_key_hash(visitor_key: &str) -> Result<String, ApiError> {
     Ok(sha256_hex(visitor_key))
 }
 
-async fn load_claim_session_context_tx(
+pub(crate) async fn load_claim_session_context_tx(
     tx: &mut Transaction<'_, Postgres>,
     run: &RunDto,
 ) -> Result<ClaimSessionContextDto, ApiError> {
@@ -22059,7 +22059,7 @@ async fn load_claim_session_context_tx(
     })
 }
 
-async fn load_hub_session_tx(
+pub(crate) async fn load_hub_session_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: Uuid,
 ) -> Result<HubSessionDto, ApiError> {
@@ -22091,7 +22091,7 @@ async fn load_hub_session_tx(
     Ok(hub_session_from_row(row))
 }
 
-async fn load_integration_context_for_run(
+pub(crate) async fn load_integration_context_for_run(
     tx: &mut Transaction<'_, Postgres>,
     run: &RunDto,
 ) -> Result<Option<IntegrationContextDto>, ApiError> {
@@ -22197,7 +22197,7 @@ async fn load_integration_context_for_run(
     }))
 }
 
-async fn load_integration_session(
+pub(crate) async fn load_integration_session(
     pool: &PgPool,
     session_id: Uuid,
     principal: &IntegrationPrincipal,
@@ -22243,7 +22243,7 @@ async fn load_integration_session(
         .ok_or(ApiError::not_found("integration session not found"))
 }
 
-async fn integration_session_agent_id(pool: &PgPool, session_id: Uuid) -> Result<Uuid, ApiError> {
+pub(crate) async fn integration_session_agent_id(pool: &PgPool, session_id: Uuid) -> Result<Uuid, ApiError> {
     sqlx::query_scalar("SELECT agent_id FROM integration_sessions WHERE id = $1")
         .bind(session_id)
         .fetch_optional(pool)
@@ -22251,7 +22251,7 @@ async fn integration_session_agent_id(pool: &PgPool, session_id: Uuid) -> Result
         .ok_or(ApiError::not_found("integration session not found"))
 }
 
-async fn integration_tool_request_agent_id(
+pub(crate) async fn integration_tool_request_agent_id(
     pool: &PgPool,
     tool_request_id: Uuid,
 ) -> Result<Uuid, ApiError> {
@@ -22267,7 +22267,7 @@ async fn integration_tool_request_agent_id(
     .ok_or(ApiError::not_found("tool request not found"))
 }
 
-async fn load_integration_session_tx(
+pub(crate) async fn load_integration_session_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: Uuid,
     principal: &IntegrationPrincipal,
@@ -22312,7 +22312,7 @@ async fn load_integration_session_tx(
         .ok_or(ApiError::not_found("integration session not found"))
 }
 
-async fn load_run_public_tx(
+pub(crate) async fn load_run_public_tx(
     tx: &mut Transaction<'_, Postgres>,
     run_id: Uuid,
 ) -> Result<RunDto, ApiError> {
@@ -22329,7 +22329,7 @@ async fn load_run_public_tx(
     Ok(run_from_row(row))
 }
 
-async fn load_integration_events_after(
+pub(crate) async fn load_integration_events_after(
     pool: &PgPool,
     session_id: Uuid,
     after: i64,
@@ -22374,7 +22374,7 @@ async fn load_integration_events_after(
     Ok(rows.into_iter().map(event_from_row).collect())
 }
 
-async fn load_tool_request_for_update(
+pub(crate) async fn load_tool_request_for_update(
     tx: &mut Transaction<'_, Postgres>,
     tool_request_id: Uuid,
     session_id: Uuid,
@@ -22421,7 +22421,7 @@ async fn load_tool_request_for_update(
         .ok_or(ApiError::not_found("tool request not found"))
 }
 
-async fn lock_tool_request_session_for_update(
+pub(crate) async fn lock_tool_request_session_for_update(
     tx: &mut Transaction<'_, Postgres>,
     tool_request_id: Uuid,
     principal: &IntegrationPrincipal,
@@ -22461,7 +22461,7 @@ async fn lock_tool_request_session_for_update(
     session_id.ok_or(ApiError::not_found("tool request not found"))
 }
 
-async fn load_tool_request(
+pub(crate) async fn load_tool_request(
     pool: &PgPool,
     tool_request_id: Uuid,
     principal: &IntegrationPrincipal,
@@ -22513,7 +22513,7 @@ struct RuntimeToolRequestRegistration {
     event: FinalizeToolRequestEvent,
 }
 
-fn parse_tool_request_batch(
+pub(crate) fn parse_tool_request_batch(
     request: &FinalizeToolRequestsRequest,
 ) -> Result<Vec<RuntimeToolRequestRegistration>, ApiError> {
     if request.native_session_id.trim().is_empty() || request.work_dir_ref.trim().is_empty() {
@@ -22567,7 +22567,7 @@ fn parse_tool_request_batch(
         .collect()
 }
 
-fn tool_request_batch_fingerprint(
+pub(crate) fn tool_request_batch_fingerprint(
     run_id: Uuid,
     request: &FinalizeToolRequestsRequest,
 ) -> Result<String, ApiError> {
@@ -22576,7 +22576,7 @@ fn tool_request_batch_fingerprint(
     Ok(sha256_hex(&format!("{run_id}:{}", canonical_json(&value))))
 }
 
-fn canonical_json(value: &Value) -> String {
+pub(crate) fn canonical_json(value: &Value) -> String {
     fn write(value: &Value, output: &mut String) {
         match value {
             Value::Null => output.push_str("null"),
@@ -22619,7 +22619,7 @@ fn canonical_json(value: &Value) -> String {
     output
 }
 
-async fn finalize_tool_request_batch_tx(
+pub(crate) async fn finalize_tool_request_batch_tx(
     tx: &mut Transaction<'_, Postgres>,
     run_id: Uuid,
     runtime_id: Uuid,
@@ -22824,7 +22824,7 @@ async fn finalize_tool_request_batch_tx(
     load_run_public_tx(tx, run_id).await
 }
 
-async fn verify_tool_request_batch_replay(
+pub(crate) async fn verify_tool_request_batch_replay(
     tx: &mut Transaction<'_, Postgres>,
     run_id: Uuid,
     integration_session_id: Option<Uuid>,
@@ -22899,7 +22899,7 @@ async fn verify_tool_request_batch_replay(
     Ok(())
 }
 
-async fn record_integration_tool_request(
+pub(crate) async fn record_integration_tool_request(
     tx: &mut Transaction<'_, Postgres>,
     run_id: Uuid,
     integration_session_id: Option<Uuid>,
@@ -22926,7 +22926,7 @@ async fn record_integration_tool_request(
     Ok(())
 }
 
-async fn load_run_for_user(
+pub(crate) async fn load_run_for_user(
     pool: &PgPool,
     run_id: Uuid,
     user: &UserDto,
@@ -22953,7 +22953,7 @@ async fn load_run_for_user(
         .ok_or(ApiError::not_found("run not found"))
 }
 
-async fn load_automation_for_user(
+pub(crate) async fn load_automation_for_user(
     pool: &PgPool,
     automation_id: Uuid,
     user_id: Uuid,
@@ -22971,7 +22971,7 @@ async fn load_automation_for_user(
         .ok_or(ApiError::not_found("automation not found"))
 }
 
-async fn load_automation_by_webhook_token(
+pub(crate) async fn load_automation_by_webhook_token(
     pool: &PgPool,
     token: &str,
 ) -> Result<AutomationDto, ApiError> {
@@ -22987,7 +22987,7 @@ async fn load_automation_by_webhook_token(
         .ok_or(ApiError::unauthorized("invalid automation webhook token"))
 }
 
-async fn authorize_run_stream(
+pub(crate) async fn authorize_run_stream(
     state: &AppState,
     headers: &HeaderMap,
     run_id: Uuid,
@@ -23031,7 +23031,7 @@ async fn authorize_run_stream(
     Ok(())
 }
 
-async fn load_widget_credential_tx(
+pub(crate) async fn load_widget_credential_tx(
     tx: &mut Transaction<'_, Postgres>,
     token: &str,
     headers: &HeaderMap,
@@ -23111,7 +23111,7 @@ async fn load_widget_credential_tx(
     Ok(credential)
 }
 
-async fn load_widget_scoped_session_tx(
+pub(crate) async fn load_widget_scoped_session_tx(
     tx: &mut Transaction<'_, Postgres>,
     credential: &WidgetCredential,
     integration_session_id: Option<Uuid>,
@@ -23210,7 +23210,7 @@ async fn load_widget_scoped_session_tx(
     })
 }
 
-async fn authorize_widget_session(
+pub(crate) async fn authorize_widget_session(
     state: &AppState,
     headers: &HeaderMap,
     session_id: Uuid,
@@ -23232,7 +23232,7 @@ async fn authorize_widget_session(
     Ok(())
 }
 
-async fn load_widget_session_events_after_tx(
+pub(crate) async fn load_widget_session_events_after_tx(
     tx: &mut Transaction<'_, Postgres>,
     session: &WidgetScopedSession,
     after: i64,
@@ -23290,7 +23290,7 @@ async fn load_widget_session_events_after_tx(
     Ok(rows.into_iter().map(event_from_row).collect())
 }
 
-async fn lock_widget_credential_tx(
+pub(crate) async fn lock_widget_credential_tx(
     tx: &mut Transaction<'_, Postgres>,
     token: &str,
     headers: &HeaderMap,
@@ -23327,7 +23327,7 @@ async fn lock_widget_credential_tx(
     Ok(credential)
 }
 
-fn widget_credential_from_row(row: sqlx::postgres::PgRow) -> Result<WidgetCredential, ApiError> {
+pub(crate) fn widget_credential_from_row(row: sqlx::postgres::PgRow) -> Result<WidgetCredential, ApiError> {
     Ok(WidgetCredential {
         id: row.get("id"),
         agent_id: row.get("agent_id"),
@@ -23351,7 +23351,7 @@ fn widget_credential_from_row(row: sqlx::postgres::PgRow) -> Result<WidgetCreden
     })
 }
 
-async fn load_auth_policy(pool: &PgPool) -> Result<AuthPolicyDto, ApiError> {
+pub(crate) async fn load_auth_policy(pool: &PgPool) -> Result<AuthPolicyDto, ApiError> {
     let row = sqlx::query(
         "SELECT password_registration_enabled, password_login_enabled,
                 ldap_login_enabled, email_placeholder, password_placeholder
@@ -23413,7 +23413,7 @@ impl LdapDirectoryFailure {
     }
 }
 
-async fn load_ldap_configuration(pool: &PgPool) -> Result<Option<LdapConfigurationDto>, ApiError> {
+pub(crate) async fn load_ldap_configuration(pool: &PgPool) -> Result<Option<LdapConfigurationDto>, ApiError> {
     let row = sqlx::query(
         "SELECT url, security_mode, base_dn, bind_identity_template, user_filter, email_attribute,
                 display_name_attribute, allow_insecure, skip_tls_verify
@@ -23424,7 +23424,7 @@ async fn load_ldap_configuration(pool: &PgPool) -> Result<Option<LdapConfigurati
     row.map(ldap_configuration_from_row).transpose()
 }
 
-fn ldap_configuration_from_row(
+pub(crate) fn ldap_configuration_from_row(
     row: sqlx::postgres::PgRow,
 ) -> Result<LdapConfigurationDto, ApiError> {
     let security = match row.get::<String, _>("security_mode").as_str() {
@@ -23446,7 +23446,7 @@ fn ldap_configuration_from_row(
     })
 }
 
-fn ldap_security_mode_name(mode: LdapSecurityMode) -> &'static str {
+pub(crate) fn ldap_security_mode_name(mode: LdapSecurityMode) -> &'static str {
     match mode {
         LdapSecurityMode::Ldaps => "ldaps",
         LdapSecurityMode::Starttls => "starttls",
@@ -23454,7 +23454,7 @@ fn ldap_security_mode_name(mode: LdapSecurityMode) -> &'static str {
     }
 }
 
-fn validate_ldap_configuration(
+pub(crate) fn validate_ldap_configuration(
     mut configuration: LdapConfigurationDto,
 ) -> Result<LdapConfigurationDto, ApiError> {
     configuration.url = configuration.url.trim().to_owned();
@@ -23532,7 +23532,7 @@ fn validate_ldap_configuration(
     Ok(configuration)
 }
 
-fn validate_ldap_attribute_name(value: &str, field: &str) -> Result<(), ApiError> {
+pub(crate) fn validate_ldap_attribute_name(value: &str, field: &str) -> Result<(), ApiError> {
     if value.is_empty()
         || value.len() > 128
         || !value.chars().all(|character| {
@@ -23546,7 +23546,7 @@ fn validate_ldap_attribute_name(value: &str, field: &str) -> Result<(), ApiError
     Ok(())
 }
 
-async fn query_ldap_directory(
+pub(crate) async fn query_ldap_directory(
     configuration: &LdapConfigurationDto,
     email: &str,
     password: &str,
@@ -23566,7 +23566,7 @@ async fn query_ldap_directory(
     }
 }
 
-async fn query_ldap_directory_once(
+pub(crate) async fn query_ldap_directory_once(
     configuration: &LdapConfigurationDto,
     email: &str,
     password: &str,
@@ -23681,17 +23681,17 @@ async fn query_ldap_directory_once(
     })
 }
 
-fn ldap_user_filter(template: &str, email: &str) -> String {
+pub(crate) fn ldap_user_filter(template: &str, email: &str) -> String {
     let escaped_email = ldap_escape(email);
     template.replacen("{email}", escaped_email.as_ref(), 1)
 }
 
-fn ldap_bind_identity(template: &str, email: &str) -> String {
+pub(crate) fn ldap_bind_identity(template: &str, email: &str) -> String {
     let escaped_email = dn_escape(email);
     template.replacen("{email}", escaped_email.as_ref(), 1)
 }
 
-fn classify_ldap_bind_error(error: &LdapError) -> LdapDirectoryFailure {
+pub(crate) fn classify_ldap_bind_error(error: &LdapError) -> LdapDirectoryFailure {
     if matches!(error, LdapError::LdapResult { result } if matches!(result.rc, 32 | 34 | 49)) {
         LdapDirectoryFailure::invalid(
             "bind",
@@ -23703,7 +23703,7 @@ fn classify_ldap_bind_error(error: &LdapError) -> LdapDirectoryFailure {
     }
 }
 
-fn ldap_attribute_values<'a>(entry: &'a SearchEntry, name: &str) -> Option<&'a Vec<String>> {
+pub(crate) fn ldap_attribute_values<'a>(entry: &'a SearchEntry, name: &str) -> Option<&'a Vec<String>> {
     entry
         .attrs
         .iter()
@@ -23711,7 +23711,7 @@ fn ldap_attribute_values<'a>(entry: &'a SearchEntry, name: &str) -> Option<&'a V
         .map(|(_, values)| values)
 }
 
-async fn resolve_ldap_user(
+pub(crate) async fn resolve_ldap_user(
     pool: &PgPool,
     identity: &LdapDirectoryIdentity,
 ) -> Result<UserDto, ApiError> {
@@ -23764,14 +23764,14 @@ async fn resolve_ldap_user(
     Ok(user)
 }
 
-fn email_local_part(email: &str) -> &str {
+pub(crate) fn email_local_part(email: &str) -> &str {
     email
         .split_once('@')
         .map(|(local, _)| local)
         .unwrap_or(email)
 }
 
-async fn require_external_platform(pool: &PgPool, platform_id: Uuid) -> Result<(), ApiError> {
+pub(crate) async fn require_external_platform(pool: &PgPool, platform_id: Uuid) -> Result<(), ApiError> {
     let exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM external_platforms WHERE id = $1)")
             .bind(platform_id)
@@ -23783,7 +23783,7 @@ async fn require_external_platform(pool: &PgPool, platform_id: Uuid) -> Result<(
     Ok(())
 }
 
-fn validate_external_username(value: Option<&str>) -> Result<Option<String>, ApiError> {
+pub(crate) fn validate_external_username(value: Option<&str>) -> Result<Option<String>, ApiError> {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
@@ -23799,7 +23799,7 @@ struct ResolvedExternalIdentity {
 }
 
 #[cfg(test)]
-async fn resolve_external_identity(
+pub(crate) async fn resolve_external_identity(
     pool: &PgPool,
     platform_id: Uuid,
     channel_id: Uuid,
@@ -23823,7 +23823,7 @@ async fn resolve_external_identity(
     Ok(resolved.user)
 }
 
-async fn resolve_external_identity_tx(
+pub(crate) async fn resolve_external_identity_tx(
     tx: &mut Transaction<'_, Postgres>,
     platform_id: Uuid,
     channel_id: Uuid,
@@ -23955,7 +23955,7 @@ async fn resolve_external_identity_tx(
     Ok(ResolvedExternalIdentity { user, identity_id })
 }
 
-async fn update_external_identity_widget_profile_tx(
+pub(crate) async fn update_external_identity_widget_profile_tx(
     tx: &mut Transaction<'_, Postgres>,
     identity_id: Uuid,
     profile: &WidgetUserProfileDto,
@@ -23981,7 +23981,7 @@ async fn update_external_identity_widget_profile_tx(
     Ok(())
 }
 
-async fn create_password_registration_user(
+pub(crate) async fn create_password_registration_user(
     pool: &PgPool,
     email: &str,
     display_name: Option<&str>,
@@ -24019,7 +24019,7 @@ async fn create_password_registration_user(
 }
 
 #[cfg(test)]
-async fn create_hub_user(
+pub(crate) async fn create_hub_user(
     pool: &PgPool,
     email: Option<&str>,
     display_name: Option<&str>,
@@ -24049,7 +24049,7 @@ async fn create_hub_user(
     Ok(user)
 }
 
-async fn create_hub_user_in_locked_tx(
+pub(crate) async fn create_hub_user_in_locked_tx(
     tx: &mut Transaction<'_, Postgres>,
     email: &str,
     display_name: Option<&str>,
@@ -24090,7 +24090,7 @@ async fn create_hub_user_in_locked_tx(
     })
 }
 
-fn normalize_display_name(value: Option<&str>, email: &str) -> Result<String, ApiError> {
+pub(crate) fn normalize_display_name(value: Option<&str>, email: &str) -> Result<String, ApiError> {
     let fallback = email
         .split_once('@')
         .map(|(local, _)| local)
@@ -24105,7 +24105,7 @@ fn normalize_display_name(value: Option<&str>, email: &str) -> Result<String, Ap
     Ok(display_name.to_owned())
 }
 
-fn validate_user_role(value: &str) -> Result<&'static str, ApiError> {
+pub(crate) fn validate_user_role(value: &str) -> Result<&'static str, ApiError> {
     match value.trim() {
         "member" => Ok("member"),
         "admin" => Ok("admin"),
@@ -24114,7 +24114,7 @@ fn validate_user_role(value: &str) -> Result<&'static str, ApiError> {
     }
 }
 
-fn normalize_email(email: &str) -> Result<String, ApiError> {
+pub(crate) fn normalize_email(email: &str) -> Result<String, ApiError> {
     let email = email.trim().to_ascii_lowercase();
     let valid = email.len() <= 254
         && !email.chars().any(char::is_whitespace)
@@ -24127,13 +24127,13 @@ fn normalize_email(email: &str) -> Result<String, ApiError> {
     Ok(email)
 }
 
-fn login_rate_email(email: &str) -> Option<String> {
+pub(crate) fn login_rate_email(email: &str) -> Option<String> {
     let email = email.trim().to_ascii_lowercase();
     (!email.is_empty() && email.len() <= 254 && !email.chars().any(char::is_whitespace))
         .then_some(email)
 }
 
-fn login_source_ip(
+pub(crate) fn login_source_ip(
     headers: &HeaderMap,
     peer_ip: Option<IpAddr>,
     trusted_proxy_cidrs: Option<&[IpNet]>,
@@ -24150,7 +24150,7 @@ fn login_source_ip(
     peer_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
 }
 
-fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
+pub(crate) fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
     headers
         .get(header::FORWARDED)
         .and_then(|value| value.to_str().ok())
@@ -24164,7 +24164,7 @@ fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
         })
 }
 
-fn parse_forwarded_header(value: &str) -> Option<IpAddr> {
+pub(crate) fn parse_forwarded_header(value: &str) -> Option<IpAddr> {
     value
         .split(',')
         .next()?
@@ -24174,7 +24174,7 @@ fn parse_forwarded_header(value: &str) -> Option<IpAddr> {
         .and_then(|(_, value)| parse_forwarded_ip(value))
 }
 
-fn parse_forwarded_ip(value: &str) -> Option<IpAddr> {
+pub(crate) fn parse_forwarded_ip(value: &str) -> Option<IpAddr> {
     let value = value.trim().trim_matches('"');
     if value.eq_ignore_ascii_case("unknown") || value.starts_with('_') {
         return None;
@@ -24192,7 +24192,7 @@ fn parse_forwarded_ip(value: &str) -> Option<IpAddr> {
     None
 }
 
-async fn record_ip_login_attempt(pool: &PgPool, source_ip: IpAddr) -> Result<(), ApiError> {
+pub(crate) async fn record_ip_login_attempt(pool: &PgPool, source_ip: IpAddr) -> Result<(), ApiError> {
     cleanup_expired_login_throttles(pool).await?;
     let row = sqlx::query(
         "INSERT INTO login_ip_attempts
@@ -24221,7 +24221,7 @@ async fn record_ip_login_attempt(pool: &PgPool, source_ip: IpAddr) -> Result<(),
     Ok(())
 }
 
-async fn reserve_email_login_attempt(pool: &PgPool, email: &str) -> Result<(), ApiError> {
+pub(crate) async fn reserve_email_login_attempt(pool: &PgPool, email: &str) -> Result<(), ApiError> {
     cleanup_expired_login_throttles(pool).await?;
     // Reserve before credential verification so concurrent requests cannot all pass the limit check.
     let row = sqlx::query(
@@ -24250,7 +24250,7 @@ async fn reserve_email_login_attempt(pool: &PgPool, email: &str) -> Result<(), A
     Ok(())
 }
 
-async fn clear_email_login_failures(pool: &PgPool, email: &str) -> Result<(), ApiError> {
+pub(crate) async fn clear_email_login_failures(pool: &PgPool, email: &str) -> Result<(), ApiError> {
     sqlx::query("DELETE FROM login_email_failures WHERE normalized_email = $1")
         .bind(email.trim().to_ascii_lowercase())
         .execute(pool)
@@ -24258,7 +24258,7 @@ async fn clear_email_login_failures(pool: &PgPool, email: &str) -> Result<(), Ap
     Ok(())
 }
 
-async fn cleanup_expired_login_throttles(pool: &PgPool) -> Result<(), ApiError> {
+pub(crate) async fn cleanup_expired_login_throttles(pool: &PgPool) -> Result<(), ApiError> {
     sqlx::query(
         "DELETE FROM login_email_failures
          WHERE ctid IN (
@@ -24282,13 +24282,13 @@ async fn cleanup_expired_login_throttles(pool: &PgPool) -> Result<(), ApiError> 
     Ok(())
 }
 
-fn retry_after_seconds(window_started_at: DateTime<Utc>) -> u64 {
+pub(crate) fn retry_after_seconds(window_started_at: DateTime<Utc>) -> u64 {
     (window_started_at + ChronoDuration::minutes(5) - Utc::now())
         .num_seconds()
         .max(1) as u64
 }
 
-fn validate_identity_key(value: &str, field: &str) -> Result<String, ApiError> {
+pub(crate) fn validate_identity_key(value: &str, field: &str) -> Result<String, ApiError> {
     let value = value.trim().to_ascii_lowercase();
     if value.is_empty()
         || value.len() > 64
@@ -24301,7 +24301,7 @@ fn validate_identity_key(value: &str, field: &str) -> Result<String, ApiError> {
     Ok(value)
 }
 
-fn validate_identity_name(value: &str, field: &str) -> Result<String, ApiError> {
+pub(crate) fn validate_identity_name(value: &str, field: &str) -> Result<String, ApiError> {
     let value = value.trim();
     if value.is_empty() || value.chars().count() > 128 || value.chars().any(char::is_control) {
         return Err(ApiError::bad_request(format!("valid {field} is required")));
@@ -24309,15 +24309,15 @@ fn validate_identity_name(value: &str, field: &str) -> Result<String, ApiError> 
     Ok(value.to_owned())
 }
 
-fn model_proxy_timeout_from_env() -> anyhow::Result<Duration> {
+pub(crate) fn model_proxy_timeout_from_env() -> anyhow::Result<Duration> {
     parse_model_proxy_timeout(env::var("HUB_MODEL_PROXY_TIMEOUT_SECS").ok().as_deref())
 }
 
-fn trusted_proxy_cidrs_from_env() -> anyhow::Result<Option<Vec<IpNet>>> {
+pub(crate) fn trusted_proxy_cidrs_from_env() -> anyhow::Result<Option<Vec<IpNet>>> {
     parse_trusted_proxy_cidrs(env::var("TRUSTED_PROXY_CIDRS").ok().as_deref())
 }
 
-fn parse_trusted_proxy_cidrs(value: Option<&str>) -> anyhow::Result<Option<Vec<IpNet>>> {
+pub(crate) fn parse_trusted_proxy_cidrs(value: Option<&str>) -> anyhow::Result<Option<Vec<IpNet>>> {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
@@ -24334,14 +24334,14 @@ fn parse_trusted_proxy_cidrs(value: Option<&str>) -> anyhow::Result<Option<Vec<I
     Ok(Some(cidrs))
 }
 
-fn model_gateway_config_from_env() -> anyhow::Result<(String, Arc<Zeroizing<String>>)> {
+pub(crate) fn model_gateway_config_from_env() -> anyhow::Result<(String, Arc<Zeroizing<String>>)> {
     let url = env::var("HUB_MODEL_GATEWAY_URL").context("HUB_MODEL_GATEWAY_URL is required")?;
     let auth_token = env::var("HUB_MODEL_GATEWAY_AUTH_TOKEN")
         .context("HUB_MODEL_GATEWAY_AUTH_TOKEN is required")?;
     validate_model_gateway_config(&url, &auth_token)
 }
 
-fn validate_model_gateway_config(
+pub(crate) fn validate_model_gateway_config(
     url: &str,
     auth_token: &str,
 ) -> anyhow::Result<(String, Arc<Zeroizing<String>>)> {
@@ -24380,7 +24380,7 @@ fn validate_model_gateway_config(
     ))
 }
 
-fn session_bundle_max_bytes_from_env() -> anyhow::Result<u64> {
+pub(crate) fn session_bundle_max_bytes_from_env() -> anyhow::Result<u64> {
     let value = env::var("HUB_SESSION_BUNDLE_MAX_BYTES")
         .ok()
         .map(|value| {
@@ -24398,7 +24398,7 @@ fn session_bundle_max_bytes_from_env() -> anyhow::Result<u64> {
     Ok(value)
 }
 
-fn session_bundle_store_from_env() -> anyhow::Result<Option<Arc<S3BundleStore>>> {
+pub(crate) fn session_bundle_store_from_env() -> anyhow::Result<Option<Arc<S3BundleStore>>> {
     let endpoint = match env::var("HUB_BUNDLE_S3_ENDPOINT") {
         Ok(value) if !value.trim().is_empty() => value,
         Ok(_) | Err(env::VarError::NotPresent) => return Ok(None),
@@ -24438,7 +24438,7 @@ fn session_bundle_store_from_env() -> anyhow::Result<Option<Arc<S3BundleStore>>>
     Ok(Some(Arc::new(store)))
 }
 
-fn skill_package_store_from_env(
+pub(crate) fn skill_package_store_from_env(
     s3_store: Option<Arc<S3BundleStore>>,
 ) -> anyhow::Result<Arc<SkillPackageStore>> {
     let backend = env::var("HUB_SKILL_PACKAGE_STORAGE").unwrap_or_else(|_| {
@@ -24461,7 +24461,7 @@ fn skill_package_store_from_env(
     Ok(Arc::new(store))
 }
 
-fn parse_model_proxy_timeout(value: Option<&str>) -> anyhow::Result<Duration> {
+pub(crate) fn parse_model_proxy_timeout(value: Option<&str>) -> anyhow::Result<Duration> {
     let Some(value) = value else {
         return Ok(DEFAULT_MODEL_PROXY_TIMEOUT);
     };
@@ -24476,7 +24476,7 @@ fn parse_model_proxy_timeout(value: Option<&str>) -> anyhow::Result<Duration> {
     Ok(timeout)
 }
 
-async fn verify_embed_jwt_claims(state: &AppState, jwt: &str) -> Result<AuthPrincipal, ApiError> {
+pub(crate) async fn verify_embed_jwt_claims(state: &AppState, jwt: &str) -> Result<AuthPrincipal, ApiError> {
     let parts = jwt.split('.').collect::<Vec<_>>();
     if parts.len() != 3 {
         return Err(ApiError::unauthorized("invalid embed jwt"));
@@ -24562,7 +24562,7 @@ async fn verify_embed_jwt_claims(state: &AppState, jwt: &str) -> Result<AuthPrin
     })
 }
 
-fn jwt_audience_matches(audience: Option<&Value>, expected: &str) -> bool {
+pub(crate) fn jwt_audience_matches(audience: Option<&Value>, expected: &str) -> bool {
     match audience {
         Some(Value::String(value)) => value == expected,
         Some(Value::Array(values)) => values.iter().any(|value| value.as_str() == Some(expected)),
@@ -24570,7 +24570,7 @@ fn jwt_audience_matches(audience: Option<&Value>, expected: &str) -> bool {
     }
 }
 
-fn validate_embed_jwt_iat(payload: &Value, now: i64) -> Result<(), ApiError> {
+pub(crate) fn validate_embed_jwt_iat(payload: &Value, now: i64) -> Result<(), ApiError> {
     let issued_at = payload
         .get("iat")
         .and_then(Value::as_i64)
@@ -24581,12 +24581,12 @@ fn validate_embed_jwt_iat(payload: &Value, now: i64) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn sha256_hex(value: &str) -> String {
+pub(crate) fn sha256_hex(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn opaque_secret(prefix: &str) -> String {
+pub(crate) fn opaque_secret(prefix: &str) -> String {
     format!(
         "{prefix}{}{}",
         Uuid::new_v4().simple(),
@@ -24594,7 +24594,7 @@ fn opaque_secret(prefix: &str) -> String {
     )
 }
 
-fn password_hash(password: &str) -> anyhow::Result<String> {
+pub(crate) fn password_hash(password: &str) -> anyhow::Result<String> {
     let salt = SaltString::generate(&mut OsRng);
     Ok(Argon2::default()
         .hash_password(password.as_bytes(), &salt)
@@ -24602,7 +24602,7 @@ fn password_hash(password: &str) -> anyhow::Result<String> {
         .to_string())
 }
 
-fn verify_password(stored: &str, candidate: &str) -> bool {
+pub(crate) fn verify_password(stored: &str, candidate: &str) -> bool {
     if stored.starts_with("$argon2") {
         return PasswordHash::new(stored).ok().is_some_and(|hash| {
             Argon2::default()
@@ -24621,11 +24621,11 @@ fn verify_password(stored: &str, candidate: &str) -> bool {
     constant_time_eq(stored.as_bytes(), candidate.as_bytes())
 }
 
-fn password_needs_upgrade(stored: &str) -> bool {
+pub(crate) fn password_needs_upgrade(stored: &str) -> bool {
     !stored.starts_with("$argon2id$")
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
     }
@@ -24635,7 +24635,7 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
-async fn seed_dev_user(pool: &PgPool) -> anyhow::Result<()> {
+pub(crate) async fn seed_dev_user(pool: &PgPool) -> anyhow::Result<()> {
     let user_id = Uuid::new_v4();
     let password = password_hash("admin123")?;
     sqlx::query(
@@ -24657,7 +24657,7 @@ async fn seed_dev_user(pool: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn seed_dev_model_connection(
+pub(crate) async fn seed_dev_model_connection(
     pool: &PgPool,
     cipher: &ModelSecretCipher,
     base_url: &str,
@@ -24739,7 +24739,7 @@ enum BuiltinSkillSeedStatus {
 const BUILTIN_MAINTENANCE_SKILL_DIR: &str = "/usr/share/agent-hub/builtin/agent-hub-maintenance";
 const BUILTIN_MAINTENANCE_SKILL_NAME: &str = "agent-hub-maintenance";
 
-async fn builtin_skill_seed_loop(state: Arc<AppState>) {
+pub(crate) async fn builtin_skill_seed_loop(state: Arc<AppState>) {
     loop {
         match seed_builtin_maintenance_skill(&state).await {
             Ok(BuiltinSkillSeedStatus::Seeded) => {
@@ -24761,7 +24761,7 @@ async fn builtin_skill_seed_loop(state: Arc<AppState>) {
     }
 }
 
-async fn seed_builtin_maintenance_skill(
+pub(crate) async fn seed_builtin_maintenance_skill(
     state: &AppState,
 ) -> anyhow::Result<BuiltinSkillSeedStatus> {
     if env::var("HUB_BUILTIN_MAINTENANCE_SKILL")
@@ -24963,7 +24963,7 @@ async fn seed_builtin_maintenance_skill(
     Ok(BuiltinSkillSeedStatus::Seeded)
 }
 
-async fn ensure_dev_runtime_enrollment_token(pool: &PgPool, token: &str) -> anyhow::Result<()> {
+pub(crate) async fn ensure_dev_runtime_enrollment_token(pool: &PgPool, token: &str) -> anyhow::Result<()> {
     let token = token.trim();
     if token.is_empty() {
         anyhow::bail!("DEV_RUNTIME_ENROLLMENT_TOKEN must not be empty");
@@ -24980,7 +24980,7 @@ async fn ensure_dev_runtime_enrollment_token(pool: &PgPool, token: &str) -> anyh
     Ok(())
 }
 
-fn user_from_row(row: sqlx::postgres::PgRow) -> UserDto {
+pub(crate) fn user_from_row(row: sqlx::postgres::PgRow) -> UserDto {
     UserDto {
         id: row.get("id"),
         email: row.get("email"),
@@ -24989,7 +24989,7 @@ fn user_from_row(row: sqlx::postgres::PgRow) -> UserDto {
     }
 }
 
-fn admin_user_detail_from_row(row: sqlx::postgres::PgRow) -> AdminUserDetailDto {
+pub(crate) fn admin_user_detail_from_row(row: sqlx::postgres::PgRow) -> AdminUserDetailDto {
     AdminUserDetailDto {
         user: UserDto {
             id: row.get("id"),
@@ -25002,7 +25002,7 @@ fn admin_user_detail_from_row(row: sqlx::postgres::PgRow) -> AdminUserDetailDto 
     }
 }
 
-fn auth_policy_from_row(row: sqlx::postgres::PgRow) -> AuthPolicyDto {
+pub(crate) fn auth_policy_from_row(row: sqlx::postgres::PgRow) -> AuthPolicyDto {
     AuthPolicyDto {
         password_registration_enabled: row.get("password_registration_enabled"),
         password_login_enabled: row.get("password_login_enabled"),
@@ -25012,7 +25012,7 @@ fn auth_policy_from_row(row: sqlx::postgres::PgRow) -> AuthPolicyDto {
     }
 }
 
-fn external_platform_from_row(row: sqlx::postgres::PgRow) -> ExternalPlatformDto {
+pub(crate) fn external_platform_from_row(row: sqlx::postgres::PgRow) -> ExternalPlatformDto {
     ExternalPlatformDto {
         id: row.get("id"),
         key: row.get("key"),
@@ -25020,7 +25020,7 @@ fn external_platform_from_row(row: sqlx::postgres::PgRow) -> ExternalPlatformDto
     }
 }
 
-fn authentication_channel_from_row(row: sqlx::postgres::PgRow) -> AuthenticationChannelDto {
+pub(crate) fn authentication_channel_from_row(row: sqlx::postgres::PgRow) -> AuthenticationChannelDto {
     AuthenticationChannelDto {
         id: row.get("id"),
         platform_id: row.get("platform_id"),
@@ -25031,7 +25031,7 @@ fn authentication_channel_from_row(row: sqlx::postgres::PgRow) -> Authentication
     }
 }
 
-fn agent_from_row(row: sqlx::postgres::PgRow) -> AgentDto {
+pub(crate) fn agent_from_row(row: sqlx::postgres::PgRow) -> AgentDto {
     let connection_id: Option<Uuid> = row.try_get("model_connection_id").unwrap_or_default();
     let model_id: Option<String> = row.try_get("model_id").unwrap_or_default();
     AgentDto {
@@ -25074,7 +25074,7 @@ fn agent_from_row(row: sqlx::postgres::PgRow) -> AgentDto {
     }
 }
 
-fn skill_from_row(row: sqlx::postgres::PgRow) -> SkillDto {
+pub(crate) fn skill_from_row(row: sqlx::postgres::PgRow) -> SkillDto {
     let package_id = row.try_get::<Option<Uuid>, _>("package_id").ok().flatten();
     SkillDto {
         id: row.get("id"),
@@ -25102,7 +25102,7 @@ fn skill_from_row(row: sqlx::postgres::PgRow) -> SkillDto {
     }
 }
 
-fn runtime_from_row(row: sqlx::postgres::PgRow) -> RuntimeDto {
+pub(crate) fn runtime_from_row(row: sqlx::postgres::PgRow) -> RuntimeDto {
     let capabilities: Value = row.get("capabilities");
     RuntimeDto {
         id: row.get("id"),
@@ -25117,7 +25117,7 @@ fn runtime_from_row(row: sqlx::postgres::PgRow) -> RuntimeDto {
     }
 }
 
-fn runtime_enrollment_from_row(row: sqlx::postgres::PgRow) -> RuntimeEnrollmentTokenDto {
+pub(crate) fn runtime_enrollment_from_row(row: sqlx::postgres::PgRow) -> RuntimeEnrollmentTokenDto {
     RuntimeEnrollmentTokenDto {
         id: row.get("id"),
         created_by: row.get("created_by"),
@@ -25129,7 +25129,7 @@ fn runtime_enrollment_from_row(row: sqlx::postgres::PgRow) -> RuntimeEnrollmentT
     }
 }
 
-fn console_runtime_capabilities(capabilities: &Value) -> Value {
+pub(crate) fn console_runtime_capabilities(capabilities: &Value) -> Value {
     let Some(source) = capabilities.as_object() else {
         return json!({});
     };
@@ -25153,7 +25153,7 @@ fn console_runtime_capabilities(capabilities: &Value) -> Value {
     Value::Object(visible)
 }
 
-fn automation_from_row(row: sqlx::postgres::PgRow) -> AutomationDto {
+pub(crate) fn automation_from_row(row: sqlx::postgres::PgRow) -> AutomationDto {
     let trigger_type: String = row.get("trigger_type");
     let webhook_token = if trigger_type == "webhook" {
         row.get("webhook_token")
@@ -25175,7 +25175,7 @@ fn automation_from_row(row: sqlx::postgres::PgRow) -> AutomationDto {
     }
 }
 
-fn api_key_from_row(row: sqlx::postgres::PgRow) -> ApiKeyDto {
+pub(crate) fn api_key_from_row(row: sqlx::postgres::PgRow) -> ApiKeyDto {
     ApiKeyDto {
         id: row.get("id"),
         name: row.get("name"),
@@ -25186,7 +25186,7 @@ fn api_key_from_row(row: sqlx::postgres::PgRow) -> ApiKeyDto {
     }
 }
 
-fn integration_app_from_row(row: sqlx::postgres::PgRow, agent_ids: Vec<Uuid>) -> IntegrationAppDto {
+pub(crate) fn integration_app_from_row(row: sqlx::postgres::PgRow, agent_ids: Vec<Uuid>) -> IntegrationAppDto {
     IntegrationAppDto {
         id: row.get("id"),
         owner_id: row.get("owner_id"),
@@ -25215,7 +25215,7 @@ fn integration_app_from_row(row: sqlx::postgres::PgRow, agent_ids: Vec<Uuid>) ->
     }
 }
 
-fn integration_session_from_row(row: sqlx::postgres::PgRow) -> IntegrationSessionDto {
+pub(crate) fn integration_session_from_row(row: sqlx::postgres::PgRow) -> IntegrationSessionDto {
     IntegrationSessionDto {
         id: row.get("id"),
         hub_session_id: row.try_get("hub_session_id").unwrap_or_default(),
@@ -25231,7 +25231,7 @@ fn integration_session_from_row(row: sqlx::postgres::PgRow) -> IntegrationSessio
     }
 }
 
-fn tool_request_from_row(row: sqlx::postgres::PgRow) -> IntegrationToolRequestDto {
+pub(crate) fn tool_request_from_row(row: sqlx::postgres::PgRow) -> IntegrationToolRequestDto {
     IntegrationToolRequestDto {
         id: row.get("id"),
         session_id: row.get("session_id"),
@@ -25253,7 +25253,7 @@ fn tool_request_from_row(row: sqlx::postgres::PgRow) -> IntegrationToolRequestDt
     }
 }
 
-fn run_from_row(row: sqlx::postgres::PgRow) -> RunDto {
+pub(crate) fn run_from_row(row: sqlx::postgres::PgRow) -> RunDto {
     RunDto {
         id: row.get("id"),
         agent_id: row.get("agent_id"),
@@ -25275,7 +25275,7 @@ fn run_from_row(row: sqlx::postgres::PgRow) -> RunDto {
     }
 }
 
-fn hub_message_from_row(row: sqlx::postgres::PgRow) -> HubSessionMessageDto {
+pub(crate) fn hub_message_from_row(row: sqlx::postgres::PgRow) -> HubSessionMessageDto {
     HubSessionMessageDto {
         id: row.get("id"),
         session_id: row.get("session_id"),
@@ -25295,7 +25295,7 @@ fn hub_message_from_row(row: sqlx::postgres::PgRow) -> HubSessionMessageDto {
     }
 }
 
-fn hub_session_from_row(row: sqlx::postgres::PgRow) -> HubSessionDto {
+pub(crate) fn hub_session_from_row(row: sqlx::postgres::PgRow) -> HubSessionDto {
     let origin = match row.get::<String, _>("origin_kind").as_str() {
         "hub_native" => HubSessionOriginDto::HubNative,
         "public_widget" => HubSessionOriginDto::PublicWidget,
@@ -25341,7 +25341,7 @@ fn hub_session_from_row(row: sqlx::postgres::PgRow) -> HubSessionDto {
     }
 }
 
-fn hub_turn_from_row(row: sqlx::postgres::PgRow) -> HubSessionTurnDto {
+pub(crate) fn hub_turn_from_row(row: sqlx::postgres::PgRow) -> HubSessionTurnDto {
     HubSessionTurnDto {
         id: row.get("id"),
         session_id: row.get("session_id"),
@@ -25356,7 +25356,7 @@ fn hub_turn_from_row(row: sqlx::postgres::PgRow) -> HubSessionTurnDto {
     }
 }
 
-fn event_from_row(row: sqlx::postgres::PgRow) -> RunEventDto {
+pub(crate) fn event_from_row(row: sqlx::postgres::PgRow) -> RunEventDto {
     RunEventDto {
         seq: row.get("seq"),
         event_id: row.get("event_id"),
@@ -25369,7 +25369,7 @@ fn event_from_row(row: sqlx::postgres::PgRow) -> RunEventDto {
     }
 }
 
-fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
     let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
     cookie.split(';').map(str::trim).find_map(|part| {
         part.strip_prefix("agent_hub_session=")
@@ -25377,7 +25377,7 @@ fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
     })
 }
 
-fn bearer_token(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::AUTHORIZATION)?
         .to_str()
@@ -25386,11 +25386,11 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn embed_token_from_headers(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn embed_token_from_headers(headers: &HeaderMap) -> Option<String> {
     scoped_token_from_headers(headers, "x-agent-hub-embed-token", "Embed ")
 }
 
-fn client_access_token_from_headers(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn client_access_token_from_headers(headers: &HeaderMap) -> Option<String> {
     embed_token_from_headers(headers).or_else(|| {
         bearer_token(headers).filter(|token| {
             token.starts_with("ahe_") || token.starts_with("ahw_") || token.starts_with("ahp_")
@@ -25398,11 +25398,11 @@ fn client_access_token_from_headers(headers: &HeaderMap) -> Option<String> {
     })
 }
 
-fn webhook_token_from_headers(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn webhook_token_from_headers(headers: &HeaderMap) -> Option<String> {
     scoped_token_from_headers(headers, "x-agent-hub-webhook-token", "Webhook ")
 }
 
-fn scoped_token_from_headers(
+pub(crate) fn scoped_token_from_headers(
     headers: &HeaderMap,
     header_name: &'static str,
     authorization_prefix: &str,
@@ -25421,7 +25421,7 @@ fn scoped_token_from_headers(
         .map(str::to_owned)
 }
 
-fn cookie_header(token: &str, secure: bool) -> Result<HeaderValue, ApiError> {
+pub(crate) fn cookie_header(token: &str, secure: bool) -> Result<HeaderValue, ApiError> {
     // V1 使用 HttpOnly cookie，前端通过 credentials 发送，不把 session 暴露给 JS。
     let secure_attr = if secure { "; Secure" } else { "" };
     HeaderValue::from_str(&format!(
