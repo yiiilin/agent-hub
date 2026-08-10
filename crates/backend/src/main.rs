@@ -2453,659 +2453,910 @@ pub(crate) async fn record_session_title_error(
 }
 
 
-pub(crate) fn validate_agent_model_settings(
-    mut settings: AgentModelSettings,
+pub(crate) fn validate_model_request_settings(
     protocol: ModelUpstreamProtocol,
-) -> Result<AgentModelSettings, ApiError> {
-    let max_database_integer =
-        u64::try_from(i64::MAX).expect("i64 maximum is representable as u64");
-    for (name, value) in [
-        ("context window", settings.context_window_tokens),
-        ("automatic compact limit", settings.auto_compact_token_limit),
-        (
-            "provider request timeout",
-            settings.provider_request_timeout_ms,
-        ),
-        ("stream idle timeout", settings.stream_idle_timeout_ms),
-    ] {
-        if value.is_some_and(|value| value == 0 || value > max_database_integer) {
-            return Err(ApiError::bad_request(format!(
-                "Agent Model Settings {name} must be a positive signed 64-bit integer"
-            )));
+    settings: ModelRequestSettings,
+) -> Result<ModelRequestSettings, ApiError> {
+    if settings.protocol() != protocol {
+        return Err(ApiError::bad_request(
+            "Agent request settings protocol must match the selected API Type",
+        ));
+    }
+    match &settings {
+        ModelRequestSettings::OpenaiResponses {} => {}
+        ModelRequestSettings::OpenaiChatCompletions {
+            temperature,
+            top_p,
+            max_completion_tokens,
+        } => {
+            validate_model_request_number("temperature", temperature.as_ref(), 2.0)?;
+            validate_model_request_number("top_p", top_p.as_ref(), 1.0)?;
+            validate_model_request_token_limit("max_completion_tokens", *max_completion_tokens)?;
+        }
+        ModelRequestSettings::AnthropicMessages {
+            temperature,
+            top_p,
+            max_tokens,
+        } => {
+            if temperature.is_some() && top_p.is_some() {
+                return Err(ApiError::bad_request(
+                    "Anthropic request settings cannot set both temperature and top_p",
+                ));
+            }
+            validate_model_request_number("temperature", temperature.as_ref(), 1.0)?;
+            validate_model_request_number("top_p", top_p.as_ref(), 1.0)?;
+            validate_model_request_token_limit("max_tokens", *max_tokens)?;
         }
     }
-    if settings
-        .context_window_tokens
-        .zip(settings.auto_compact_token_limit)
-        .is_some_and(|(context_window, compact_limit)| compact_limit > context_window)
-    {
-        return Err(ApiError::bad_request(
-            "Agent Model Settings automatic compact limit cannot exceed the context window",
-        ));
-    }
-    if settings.stream_max_retries.is_some_and(|value| value > 100) {
-        return Err(ApiError::bad_request(
-            "Agent Model Settings retry counts must be between 0 and 100",
-        ));
-    }
-    settings.service_tier = settings.service_tier.and_then(|value| {
-        let trimmed = value.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_owned())
-    });
-    if settings
-        .service_tier
-        .as_ref()
-        .is_some_and(|value| value.chars().count() > 64 || value.chars().any(char::is_control))
-    {
-        return Err(ApiError::bad_request(
-            "Agent Model Settings service tier must not exceed 64 characters or contain controls",
-        ));
-    }
-    settings.request_settings =
-        validate_model_request_settings(protocol, settings.request_settings)?;
     Ok(settings)
 }
 
-
-pub(crate) async fn list_agents(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<AgentDto>>, ApiError> {
-    let user = require_user(&state, &headers).await?;
-    let rows = sqlx::query(
-        "SELECT a.id, a.owner_id, owner.email AS owner_email, a.name, a.instructions, a.visibility, a.public_to,
-                a.runtime_id, a.model_connection_id, a.model_id, a.model_settings,
-                a.model_policy, a.sandbox_policy, a.mcp_allowlist, a.tool_allowlist,
-                a.created_at, a.updated_at
-         FROM agents AS a
-         JOIN users AS owner ON owner.id = a.owner_id
-         WHERE a.deleted_at IS NULL
-           AND (
-               a.owner_id = $1
-               OR a.visibility = 'public'
-               OR (a.visibility = 'public_to' AND $1 = ANY(a.public_to))
-               OR owner.role <> 'super_admin'
-               OR $2 IN ('admin', 'super_admin')
-           )
-           AND (a.owner_id = $1 OR a.visibility = 'public'
-                OR (a.visibility = 'public_to' AND $1 = ANY(a.public_to))
-                OR $2 IN ('admin', 'super_admin'))
-         ORDER BY a.created_at DESC",
-    )
-    .bind(user.id)
-    .bind(&user.role)
-    .fetch_all(&state.pool)
-    .await?;
-    let mut agents = Vec::with_capacity(rows.len());
-    for row in rows {
-        let mut agent = agent_from_row(row);
-        if agent.owner_id == user.id || is_admin_role(&user.role) {
-            hydrate_agent_configuration(&state.pool, &mut agent).await?;
-        }
-        agents.push(apply_agent_access(agent, &user));
+pub(crate) fn validate_model_request_number(
+    name: &str,
+    value: Option<&Number>,
+    maximum: f64,
+) -> Result<(), ApiError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let value = value.as_f64().filter(|value| value.is_finite());
+    if !value.is_some_and(|value| (0.0..=maximum).contains(&value)) {
+        return Err(ApiError::bad_request(format!(
+            "Agent request setting {name} must be a finite number between 0 and {maximum}"
+        )));
     }
-    Ok(Json(agents))
+    Ok(())
 }
 
-pub(crate) async fn create_agent(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(mut req): Json<CreateAgentRequest>,
-) -> Result<Json<AgentDto>, ApiError> {
-    let user = require_user(&state, &headers).await?;
-    if req.name.trim().is_empty() {
-        return Err(ApiError::bad_request("agent name is required"));
+pub(crate) fn validate_model_request_token_limit(
+    name: &str,
+    value: Option<u32>,
+) -> Result<(), ApiError> {
+    if value == Some(0) {
+        return Err(ApiError::bad_request(format!(
+            "Agent request setting {name} must be a positive integer"
+        )));
     }
-    let visibility = normalize_visibility(&req.visibility)?;
-    validate_public_visibility_role(visibility, &user.role)?;
-    validate_public_to(&state.pool, visibility, &req.public_to, user.id).await?;
-    validate_subagent_definitions(&req.subagents)?;
-    let tool_allowlist = normalize_agent_tool_allowlist(&req.tool_allowlist)?;
-    let model_policy = json!({ "provider": "hub-proxy" });
-    let id = Uuid::new_v4();
-    let mut tx = state.pool.begin().await?;
-    let model_selection = match req.model_selection {
-        Some(selection) => Some(selection),
-        None => sqlx::query(
-            "SELECT model_connection_id, model_id
-             FROM system_default_model_selection WHERE singleton = true",
-        )
-        .fetch_optional(&mut *tx)
-        .await?
-        .map(|row| ModelSelectionDto {
-            connection_id: row.get("model_connection_id"),
-            model_id: row.get("model_id"),
-        }),
-    };
-    let mut model_settings = match req.model_settings {
-        Some(settings) => settings,
-        None => {
-            let mut settings = AgentModelSettings::default();
-            if let Some(selection) = model_selection.as_ref() {
-                let api_type =
-                    load_permitted_model_selection_api_type_tx(&mut tx, user.id, selection).await?;
-                settings.request_settings = ModelRequestSettings::for_protocol(api_type);
-            }
-            settings
-        }
-    };
-    model_settings = validate_agent_model_configuration_tx(
-        &mut tx,
-        user.id,
-        model_selection.as_ref(),
-        model_settings,
-        &mut req.subagents,
+    Ok(())
+}
+
+pub(crate) fn model_connection_from_row(row: &sqlx::postgres::PgRow) -> ModelConnectionDto {
+    ModelConnectionDto {
+        id: row.get("id"),
+        owner_id: row.get("owner_id"),
+        owner_email: row.get("owner_email"),
+        scope: match row.get::<String, _>("scope").as_str() {
+            "global" => ModelConnectionScope::Global,
+            _ => ModelConnectionScope::Personal,
+        },
+        name: row.get("name"),
+        base_url: row.get("base_url"),
+        api_type: model_upstream_protocol_from_name(&row.get::<String, _>("api_type")),
+        allowed_model_ids: row.get("allowed_model_ids"),
+        vision_model_id: row.get("vision_model_id"),
+        status: if row.get("enabled") {
+            ModelConnectionStatus::Enabled
+        } else {
+            ModelConnectionStatus::Disabled
+        },
+        has_api_key: row.get("has_api_key"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+pub(crate) fn model_request_settings_value(settings: &ModelRequestSettings) -> Value {
+    serde_json::to_value(settings).expect("validated Model request settings are serializable")
+}
+
+pub(crate) async fn load_visible_model_connection(
+    pool: &PgPool,
+    model_connection_id: Uuid,
+    user_id: Uuid,
+) -> Result<ModelConnectionDto, ApiError> {
+    let row = sqlx::query(
+        "SELECT c.id, c.owner_id,
+                (SELECT email FROM users WHERE id = c.owner_id) AS owner_email,
+                c.scope, c.name, c.base_url, c.api_type,
+                c.allowed_model_ids, c.enabled, c.vision_model_id,
+                (c.api_key_ciphertext IS NOT NULL) AS has_api_key,
+                c.created_at, c.updated_at
+         FROM model_connections c
+         WHERE c.id = $1 AND c.deleted_at IS NULL
+           AND (c.scope = 'global' OR c.owner_id = $2)",
     )
-    .await?;
-    let model_connection_id = model_selection
-        .as_ref()
-        .map(|selection| selection.connection_id);
-    let model_id = model_selection
-        .as_ref()
-        .map(|selection| selection.model_id.as_str());
-    let model_settings_value = serde_json::to_value(&model_settings)
-        .map_err(|_| ApiError::internal("Agent Model Settings could not be encoded"))?;
-    sqlx::query(
-        "INSERT INTO agents
-             (id, owner_id, name, instructions, visibility, public_to, model_policy,
-              model_connection_id, model_id, model_settings, tool_allowlist)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-    )
-    .bind(id)
-    .bind(user.id)
-    .bind(req.name.trim())
-    .bind(req.instructions.trim())
-    .bind(visibility)
-    .bind(req.public_to)
-    .bind(model_policy)
     .bind(model_connection_id)
-    .bind(model_id)
-    .bind(model_settings_value)
-    .bind(
-        serde_json::to_value(tool_allowlist)
-            .map_err(|_| ApiError::internal("Agent tool policy could not be encoded"))?,
-    )
-    .execute(&mut *tx)
+    .bind(user_id)
+    .fetch_optional(pool)
     .await?;
-    replace_subagents_tx(&mut tx, id, &req.subagents).await?;
-    replace_agent_secret_declarations_tx(
-        &mut tx,
-        id,
-        req.secret_declarations.as_deref().unwrap_or_default(),
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(Json(load_agent_for_user(&state.pool, id, &user).await?))
+    row.as_ref()
+        .map(model_connection_from_row)
+        .ok_or(ApiError::not_found("model connection not found"))
 }
 
-pub(crate) async fn get_agent(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(agent_id): Path<Uuid>,
-) -> Result<Json<AgentDto>, ApiError> {
-    let user = require_user(&state, &headers).await?;
-    Ok(Json(
-        load_agent_for_user(&state.pool, agent_id, &user).await?,
-    ))
+pub(crate) async fn authorize_model_connection_mutation(
+    pool: &PgPool,
+    model_connection_id: Uuid,
+    user: &UserDto,
+) -> Result<(), ApiError> {
+    let scope: String = sqlx::query_scalar(
+        "SELECT scope FROM model_connections
+         WHERE id = $1 AND deleted_at IS NULL
+           AND (scope = 'global' OR owner_id = $2)",
+    )
+    .bind(model_connection_id)
+    .bind(user.id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or(ApiError::not_found("model connection not found"))?;
+    if scope == "global" && !is_admin_role(&user.role) {
+        return Err(ApiError::forbidden(
+            "administrator permission is required for Global Model Connections",
+        ));
+    }
+    Ok(())
 }
 
-pub(crate) async fn get_agent_model_connection_options(
+pub(crate) async fn load_mutable_model_connection_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    model_connection_id: Uuid,
+    user: &UserDto,
+) -> Result<(), ApiError> {
+    let scope: String = sqlx::query_scalar(
+        "SELECT scope FROM model_connections
+         WHERE id = $1 AND deleted_at IS NULL
+           AND (scope = 'global' OR owner_id = $2)
+         FOR UPDATE",
+    )
+    .bind(model_connection_id)
+    .bind(user.id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ApiError::not_found("model connection not found"))?;
+    if scope == "global" && !is_admin_role(&user.role) {
+        return Err(ApiError::forbidden(
+            "administrator permission is required for Global Model Connections",
+        ));
+    }
+    Ok(())
+}
+
+struct ModelConnectionSecretRecord {
+    dto: ModelConnectionDto,
+    ciphertext: Vec<u8>,
+    nonce: Vec<u8>,
+}
+
+pub(crate) async fn load_model_connection_secret_for_test(
+    pool: &PgPool,
+    model_connection_id: Uuid,
+    user: &UserDto,
+) -> Result<ModelConnectionSecretRecord, ApiError> {
+    authorize_model_connection_mutation(pool, model_connection_id, user).await?;
+    let row = sqlx::query(
+        "SELECT c.id, c.owner_id,
+                (SELECT email FROM users WHERE id = c.owner_id) AS owner_email,
+                c.scope, c.name, c.base_url, c.api_type,
+                c.allowed_model_ids, c.enabled, c.vision_model_id,
+                (c.api_key_ciphertext IS NOT NULL) AS has_api_key,
+                c.created_at, c.updated_at,
+                c.api_key_ciphertext, c.api_key_nonce
+         FROM model_connections c
+         WHERE c.id = $1 AND c.deleted_at IS NULL",
+    )
+    .bind(model_connection_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or(ApiError::not_found("model connection not found"))?;
+    Ok(ModelConnectionSecretRecord {
+        dto: model_connection_from_row(&row),
+        ciphertext: row.get("api_key_ciphertext"),
+        nonce: row.get("api_key_nonce"),
+    })
+}
+
+pub(crate) fn map_model_connection_write_error(error: sqlx::Error) -> ApiError {
+    if let sqlx::Error::Database(database) = &error {
+        return match database.code().as_deref() {
+            Some("23505") => ApiError::conflict("Model Connection name already exists"),
+            Some("23503") => ApiError::conflict("Model API Connection is still referenced"),
+            Some("23514") => ApiError::bad_request("invalid Model Connection reference"),
+            _ => {
+                tracing::error!(error = %error, "database error");
+                ApiError::internal("database error")
+            }
+        };
+    }
+    tracing::error!(error = %error, "database error");
+    ApiError::internal("database error")
+}
+
+#[derive(Debug, Clone)]
+struct ObservedModelUsage {
+    input_tokens: i64,
+    output_tokens: i64,
+    total_tokens: i64,
+    cached_tokens: i64,
+    reasoning_tokens: i64,
+}
+
+struct ModelTestLedgerContext<'a> {
+    pool: &'a PgPool,
+    request_id: Uuid,
+    connection: &'a ModelConnectionDto,
+    model_id: &'a str,
+    request_settings: &'a ModelRequestSettings,
+    user: &'a UserDto,
+}
+
+pub(crate) fn extract_model_usage(response: &Value) -> Option<ObservedModelUsage> {
+    let usage = response.get("usage")?;
+    let observed = ObservedModelUsage {
+        input_tokens: usage.get("input_tokens")?.as_i64()?,
+        output_tokens: usage.get("output_tokens")?.as_i64()?,
+        total_tokens: usage.get("total_tokens")?.as_i64()?,
+        cached_tokens: usage
+            .pointer("/input_tokens_details/cached_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        reasoning_tokens: usage
+            .pointer("/output_tokens_details/reasoning_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+    };
+    (observed.input_tokens >= 0
+        && observed.output_tokens >= 0
+        && observed.total_tokens == observed.input_tokens + observed.output_tokens
+        && (0..=observed.input_tokens).contains(&observed.cached_tokens)
+        && (0..=observed.output_tokens).contains(&observed.reasoning_tokens))
+    .then_some(observed)
+}
+
+pub(crate) fn model_response_status(response: Option<&Value>, http_success: bool) -> &'static str {
+    match response
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+    {
+        Some("completed") => "completed",
+        Some("failed") => "failed",
+        Some("incomplete") => "incomplete",
+        Some("cancelled") => "cancelled",
+        _ if http_success => "completed",
+        _ => "failed",
+    }
+}
+
+pub(crate) async fn record_model_test_usage(
+    context: &ModelTestLedgerContext<'_>,
+    response_status: &str,
+    usage: &ObservedModelUsage,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "INSERT INTO model_token_usage
+             (id, request_id, response_status, model_connection_id,
+              model_connection_scope_snapshot, model_connection_name_snapshot,
+              model_id_snapshot, api_type_snapshot,
+              request_settings_snapshot,
+              agent_id, agent_name_snapshot,
+              subject_type, subject_user_id, subject_display_name_snapshot,
+              input_tokens, output_tokens, total_tokens, cached_tokens,
+              reasoning_tokens)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NULL,
+                 'user', $10, $11, $12, $13, $14, $15, $16)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(context.request_id)
+    .bind(response_status)
+    .bind(context.connection.id)
+    .bind(model_connection_scope_name(context.connection.scope))
+    .bind(&context.connection.name)
+    .bind(context.model_id)
+    .bind(model_upstream_protocol_name(context.connection.api_type))
+    .bind(model_request_settings_value(context.request_settings))
+    .bind(context.user.id)
+    .bind(&context.user.display_name)
+    .bind(usage.input_tokens)
+    .bind(usage.output_tokens)
+    .bind(usage.total_tokens)
+    .bind(usage.cached_tokens)
+    .bind(usage.reasoning_tokens)
+    .execute(context.pool)
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn record_model_test_error(
+    context: &ModelTestLedgerContext<'_>,
+    response_status: &str,
+    upstream_http_status: Option<u16>,
+    error_kind: &str,
+    error_code: Option<&str>,
+    message: &str,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        "INSERT INTO model_call_errors
+             (id, request_id, response_status, upstream_http_status,
+              error_kind, error_code, message, model_connection_id,
+              model_connection_scope_snapshot, model_connection_name_snapshot,
+              model_id_snapshot, api_type_snapshot,
+              request_settings_snapshot,
+              agent_id, agent_name_snapshot,
+              subject_type, subject_user_id, subject_display_name_snapshot)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                 $13, NULL, NULL, 'user', $14, $15)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(context.request_id)
+    .bind(response_status)
+    .bind(upstream_http_status.map(i32::from))
+    .bind(error_kind)
+    .bind(error_code.map(|value| value.chars().take(256).collect::<String>()))
+    .bind(message.chars().take(2048).collect::<String>())
+    .bind(context.connection.id)
+    .bind(model_connection_scope_name(context.connection.scope))
+    .bind(&context.connection.name)
+    .bind(context.model_id)
+    .bind(model_upstream_protocol_name(context.connection.api_type))
+    .bind(model_request_settings_value(context.request_settings))
+    .bind(context.user.id)
+    .bind(&context.user.display_name)
+    .execute(context.pool)
+    .await?;
+    Ok(())
+}
+
+pub(crate) fn model_connection_scope_name(scope: ModelConnectionScope) -> &'static str {
+    match scope {
+        ModelConnectionScope::Global => "global",
+        ModelConnectionScope::Personal => "personal",
+    }
+}
+
+pub(crate) fn model_upstream_protocol_name(protocol: ModelUpstreamProtocol) -> &'static str {
+    match protocol {
+        ModelUpstreamProtocol::OpenaiResponses => "openai_responses",
+        ModelUpstreamProtocol::OpenaiChatCompletions => "openai_chat_completions",
+        ModelUpstreamProtocol::AnthropicMessages => "anthropic_messages",
+    }
+}
+
+pub(crate) fn model_upstream_protocol_from_name(value: &str) -> ModelUpstreamProtocol {
+    match value {
+        "openai_responses" => ModelUpstreamProtocol::OpenaiResponses,
+        "openai_chat_completions" => ModelUpstreamProtocol::OpenaiChatCompletions,
+        "anthropic_messages" => ModelUpstreamProtocol::AnthropicMessages,
+        _ => unreachable!("model upstream protocol is constrained"),
+    }
+}
+
+pub(crate) fn sanitize_model_error_message(message: &str, secret: &str) -> String {
+    message
+        .replace(secret, REDACTED_SECRET)
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(2048)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedModelLedgerQuery {
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+    model_connection_id: Option<Uuid>,
+    agent_id: Option<Uuid>,
+    user_id: Option<Uuid>,
+    cursor_occurred_at: Option<DateTime<Utc>>,
+    cursor_id: Option<Uuid>,
+    page_size: i64,
+}
+
+struct ModelLedgerQueryInput {
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
+    model_connection_id: Option<Uuid>,
+    agent_id: Option<Uuid>,
+    user_id: Option<Uuid>,
+    cursor_occurred_at_ms: Option<i64>,
+    cursor_id: Option<Uuid>,
+    page_size: Option<u32>,
+}
+
+impl From<ModelTokenUsageQueryDto> for ModelLedgerQueryInput {
+    fn from(query: ModelTokenUsageQueryDto) -> Self {
+        Self {
+            from_ms: query.from_ms,
+            to_ms: query.to_ms,
+            model_connection_id: query.model_connection_id,
+            agent_id: query.agent_id,
+            user_id: query.user_id,
+            cursor_occurred_at_ms: query.cursor_occurred_at_ms,
+            cursor_id: query.cursor_id,
+            page_size: query.page_size,
+        }
+    }
+}
+
+impl From<ModelCallErrorQueryDto> for ModelLedgerQueryInput {
+    fn from(query: ModelCallErrorQueryDto) -> Self {
+        Self {
+            from_ms: query.from_ms,
+            to_ms: query.to_ms,
+            model_connection_id: query.model_connection_id,
+            agent_id: query.agent_id,
+            user_id: query.user_id,
+            cursor_occurred_at_ms: query.cursor_occurred_at_ms,
+            cursor_id: query.cursor_id,
+            page_size: query.page_size,
+        }
+    }
+}
+
+pub(crate) fn validate_model_ledger_query(
+    query: ModelLedgerQueryInput,
+    user: &UserDto,
+) -> Result<ValidatedModelLedgerQuery, ApiError> {
+    let parse_ms = |value: Option<i64>, name: &str| {
+        value
+            .map(|value| {
+                DateTime::<Utc>::from_timestamp_millis(value)
+                    .ok_or_else(|| ApiError::bad_request(format!("invalid {name}")))
+            })
+            .transpose()
+    };
+    let from = parse_ms(query.from_ms, "from_ms")?;
+    let to = parse_ms(query.to_ms, "to_ms")?;
+    if from.zip(to).is_some_and(|(from, to)| from >= to) {
+        return Err(ApiError::bad_request("from_ms must be earlier than to_ms"));
+    }
+    let (cursor_occurred_at, cursor_id) = match (query.cursor_occurred_at_ms, query.cursor_id) {
+        (None, None) => (None, None),
+        (Some(occurred_at_ms), Some(id)) => (
+            Some(
+                DateTime::<Utc>::from_timestamp_millis(occurred_at_ms)
+                    .ok_or(ApiError::bad_request("invalid cursor_occurred_at_ms"))?,
+            ),
+            Some(id),
+        ),
+        _ => {
+            return Err(ApiError::bad_request(
+                "cursor_occurred_at_ms and cursor_id must be provided together",
+            ))
+        }
+    };
+    if !is_admin_role(&user.role)
+        && query
+            .user_id
+            .is_some_and(|requested_user_id| requested_user_id != user.id)
+    {
+        return Err(ApiError::forbidden(
+            "another user's model usage is not visible",
+        ));
+    }
+    let page_size = i64::from(query.page_size.unwrap_or(50));
+    if !(1..=100).contains(&page_size) {
+        return Err(ApiError::bad_request(
+            "model ledger page_size must be between 1 and 100",
+        ));
+    }
+    Ok(ValidatedModelLedgerQuery {
+        from,
+        to,
+        model_connection_id: query.model_connection_id,
+        agent_id: query.agent_id,
+        user_id: query.user_id,
+        cursor_occurred_at,
+        cursor_id,
+        page_size,
+    })
+}
+
+pub(crate) fn model_ledger_source(table: &str, include_owned_agent_aggregates: bool) -> String {
+    let member_visibility = if include_owned_agent_aggregates {
+        "(ledger.subject_user_id = $1 OR agent.owner_id = $1)"
+    } else {
+        "ledger.subject_user_id = $1"
+    };
+    format!(
+        "FROM {table} AS ledger
+         LEFT JOIN users AS subject_user ON subject_user.id = ledger.subject_user_id
+         LEFT JOIN agents AS agent ON agent.id = ledger.agent_id
+         LEFT JOIN users AS agent_owner ON agent_owner.id = agent.owner_id
+         LEFT JOIN model_connections AS model
+           ON model.id = ledger.model_connection_id
+         LEFT JOIN users AS model_owner ON model_owner.id = model.owner_id
+         LEFT JOIN oauth_apps AS source_app
+           ON source_app.id = ledger.source_integration_app_id
+         LEFT JOIN users AS source_app_owner
+           ON source_app_owner.id = source_app.owner_id
+         WHERE ($3::timestamptz IS NULL OR ledger.occurred_at >= $3)
+           AND ($4::timestamptz IS NULL OR ledger.occurred_at < $4)
+           AND ($5::uuid IS NULL OR ledger.model_connection_id = $5)
+           AND ($6::uuid IS NULL OR ledger.agent_id = $6)
+           AND ($7::uuid IS NULL OR ledger.subject_user_id = $7)
+           AND (
+               $2 = 'super_admin'
+               OR (
+                   $2 = 'admin'
+                   AND ledger.super_admin_protected = false
+                   AND COALESCE(subject_user.role, '') <> 'super_admin'
+                   AND COALESCE(agent_owner.role, '') <> 'super_admin'
+                   AND COALESCE(model_owner.role, '') <> 'super_admin'
+                   AND COALESCE(source_app_owner.role, '') <> 'super_admin'
+               )
+               OR ($2 NOT IN ('admin', 'super_admin') AND {member_visibility})
+           )"
+    )
+}
+
+pub(crate) async fn get_model_usage_summary(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path(agent_id): Path<Uuid>,
-) -> Result<Json<ModelConnectionOptionsDto>, ApiError> {
+    Query(query): Query<ModelTokenUsageQueryDto>,
+) -> Result<Json<ModelUsageSummaryDto>, ApiError> {
     let user = require_user(&state, &headers).await?;
-    let agent = load_agent_manageable_by_user(&state.pool, agent_id, &user).await?;
-    let owner_role: String = sqlx::query_scalar("SELECT role FROM users WHERE id = $1")
-        .bind(agent.owner_id)
-        .fetch_one(&state.pool)
+    let query = validate_model_ledger_query(query.into(), &user)?;
+    let source = model_ledger_source("model_token_usage", true);
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
         .await?;
-    // Personal connections stay visible to the Agent owner and super admins;
-    // an ordinary admin managing another user's Agent only sees Global
-    // connections (mirrors the Model Connection administration boundary).
-    let include_owner_personal =
-        user.id == agent.owner_id || user.role == "super_admin" || owner_role != "super_admin";
-    let rows = sqlx::query(
-        "SELECT id, name, api_type, allowed_model_ids, scope, enabled
-         FROM model_connections
-         WHERE deleted_at IS NULL
-           AND (scope = 'global' OR (owner_id = $1 AND $2))
-         ORDER BY scope, lower(name), id",
-    )
-    .bind(agent.owner_id)
-    .bind(include_owner_personal)
-    .fetch_all(&state.pool)
-    .await?;
-    let items = rows
+
+    let overall_sql = format!(
+        "SELECT COALESCE(sum(ledger.input_tokens), 0)::bigint AS input_tokens,
+                COALESCE(sum(ledger.output_tokens), 0)::bigint AS output_tokens,
+                COALESCE(sum(ledger.total_tokens), 0)::bigint AS total_tokens,
+                COALESCE(sum(ledger.cached_tokens), 0)::bigint AS cached_tokens,
+                COALESCE(sum(ledger.reasoning_tokens), 0)::bigint AS reasoning_tokens
+         {source}"
+    );
+    let overall = sqlx::query(&overall_sql)
+        .bind(user.id)
+        .bind(&user.role)
+        .bind(query.from)
+        .bind(query.to)
+        .bind(query.model_connection_id)
+        .bind(query.agent_id)
+        .bind(query.user_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+    let by_model_sql = format!(
+        "SELECT ledger.model_connection_id,
+                ledger.model_connection_scope_snapshot,
+                ledger.model_connection_name_snapshot,
+                ledger.model_id_snapshot,
+                ledger.api_type_snapshot,
+                ledger.request_settings_snapshot,
+                sum(ledger.input_tokens)::bigint AS input_tokens,
+                sum(ledger.output_tokens)::bigint AS output_tokens,
+                sum(ledger.total_tokens)::bigint AS total_tokens,
+                sum(ledger.cached_tokens)::bigint AS cached_tokens,
+                sum(ledger.reasoning_tokens)::bigint AS reasoning_tokens
+         {source}
+         GROUP BY ledger.model_connection_id,
+                  ledger.model_connection_scope_snapshot,
+                  ledger.model_connection_name_snapshot,
+                  ledger.model_id_snapshot,
+                  ledger.api_type_snapshot,
+                  ledger.request_settings_snapshot
+         ORDER BY total_tokens DESC, ledger.model_connection_name_snapshot,
+                  ledger.model_id_snapshot, ledger.model_connection_id NULLS LAST"
+    );
+    let by_model = sqlx::query(&by_model_sql)
+        .bind(user.id)
+        .bind(&user.role)
+        .bind(query.from)
+        .bind(query.to)
+        .bind(query.model_connection_id)
+        .bind(query.agent_id)
+        .bind(query.user_id)
+        .fetch_all(&mut *tx)
+        .await?
         .into_iter()
-        .flat_map(|row| {
-            let connection_id = row.get("id");
-            let connection_name: String = row.get("name");
-            let api_type = model_upstream_protocol_from_name(&row.get::<String, _>("api_type"));
-            let scope = if row.get::<String, _>("scope") == "global" {
-                ModelConnectionScope::Global
-            } else {
-                ModelConnectionScope::Personal
-            };
-            let status = if row.get("enabled") {
-                ModelConnectionStatus::Enabled
-            } else {
-                ModelConnectionStatus::Disabled
-            };
-            row.get::<Vec<String>, _>("allowed_model_ids")
-                .into_iter()
-                .map(move |model_id| ModelConnectionOptionDto {
-                    connection_id,
-                    connection_name: connection_name.clone(),
-                    model_id,
-                    api_type,
-                    scope,
-                    status,
-                })
+        .map(|row| ModelUsageModelSummaryDto {
+            model: model_connection_snapshot_from_row(&row),
+            totals: model_token_totals_from_row(&row),
         })
         .collect();
-    let system_default = sqlx::query(
-        "SELECT model_connection_id, model_id
-         FROM system_default_model_selection WHERE singleton = true",
-    )
-    .fetch_optional(&state.pool)
-    .await?
-    .map(|row| ModelSelectionDto {
-        connection_id: row.get("model_connection_id"),
-        model_id: row.get("model_id"),
-    });
-    Ok(Json(ModelConnectionOptionsDto {
-        items,
-        system_default,
+
+    let by_agent_sql = format!(
+        "SELECT ledger.agent_id,
+                COALESCE(ledger.agent_name_snapshot, 'Model Connection test')
+                    AS agent_name_snapshot,
+                sum(ledger.input_tokens)::bigint AS input_tokens,
+                sum(ledger.output_tokens)::bigint AS output_tokens,
+                sum(ledger.total_tokens)::bigint AS total_tokens,
+                sum(ledger.cached_tokens)::bigint AS cached_tokens,
+                sum(ledger.reasoning_tokens)::bigint AS reasoning_tokens
+         {source}
+         GROUP BY ledger.agent_id,
+                  COALESCE(ledger.agent_name_snapshot, 'Model Connection test')
+         ORDER BY total_tokens DESC, agent_name_snapshot, ledger.agent_id NULLS LAST"
+    );
+    let by_agent = sqlx::query(&by_agent_sql)
+        .bind(user.id)
+        .bind(&user.role)
+        .bind(query.from)
+        .bind(query.to)
+        .bind(query.model_connection_id)
+        .bind(query.agent_id)
+        .bind(query.user_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|row| ModelUsageAgentSummaryDto {
+            agent: ModelAgentSnapshotDto {
+                id: row.get("agent_id"),
+                name: row.get("agent_name_snapshot"),
+            },
+            totals: model_token_totals_from_row(&row),
+        })
+        .collect();
+
+    let by_user_sql = format!(
+        "SELECT CASE
+                    WHEN $2 NOT IN ('admin', 'super_admin')
+                         AND ledger.subject_user_id IS DISTINCT FROM $1
+                    THEN NULL
+                    ELSE ledger.subject_user_id
+                END AS grouped_user_id,
+                CASE
+                    WHEN $2 NOT IN ('admin', 'super_admin')
+                         AND ledger.subject_user_id IS DISTINCT FROM $1
+                    THEN NULL
+                    ELSE ledger.subject_display_name_snapshot
+                END AS grouped_display_name,
+                sum(ledger.input_tokens)::bigint AS input_tokens,
+                sum(ledger.output_tokens)::bigint AS output_tokens,
+                sum(ledger.total_tokens)::bigint AS total_tokens,
+                sum(ledger.cached_tokens)::bigint AS cached_tokens,
+                sum(ledger.reasoning_tokens)::bigint AS reasoning_tokens
+         {source}
+           AND ledger.subject_type = 'user'
+         GROUP BY grouped_user_id, grouped_display_name
+         ORDER BY total_tokens DESC, grouped_display_name NULLS LAST,
+                  grouped_user_id NULLS LAST"
+    );
+    let by_user = sqlx::query(&by_user_sql)
+        .bind(user.id)
+        .bind(&user.role)
+        .bind(query.from)
+        .bind(query.to)
+        .bind(query.model_connection_id)
+        .bind(query.agent_id)
+        .bind(query.user_id)
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|row| ModelUsageUserSummaryDto {
+            user_id: row.get("grouped_user_id"),
+            display_name: row.get("grouped_display_name"),
+            totals: model_token_totals_from_row(&row),
+        })
+        .collect();
+    tx.commit().await?;
+
+    Ok(Json(ModelUsageSummaryDto {
+        overall: model_token_totals_from_row(&overall),
+        by_model,
+        by_agent,
+        by_user,
     }))
 }
 
-pub(crate) async fn update_agent(
+pub(crate) async fn list_model_token_usage(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path(agent_id): Path<Uuid>,
-    Json(mut req): Json<UpdateAgentRequest>,
-) -> Result<Json<AgentDto>, ApiError> {
+    Query(query): Query<ModelTokenUsageQueryDto>,
+) -> Result<Json<ModelTokenUsagePageDto>, ApiError> {
     let user = require_user(&state, &headers).await?;
-    let existing_agent = load_agent_manageable_by_user(&state.pool, agent_id, &user).await?;
-    let secret_declarations = req
-        .secret_declarations
-        .clone()
-        .unwrap_or_else(|| existing_agent.secret_declarations.clone());
-    req.mcp_allowlist = merge_mcp_secrets(&existing_agent.mcp_allowlist, &req.mcp_allowlist);
-    req.tool_allowlist = normalize_agent_tool_allowlist(&req.tool_allowlist)?;
-    validate_agent_payload(&req)?;
-    if let Some(runtime_id) = req.runtime_id {
-        ensure_runtime_online(&state.pool, runtime_id).await?;
-    }
-    ensure_skills_visible_by_user(&state.pool, &req.managed_skill_ids, existing_agent.owner_id)
+    let query = validate_model_ledger_query(query.into(), &user)?;
+    let source = model_ledger_source("model_token_usage", false);
+    let sql = format!(
+        "SELECT ledger.id, ledger.occurred_at, ledger.response_status,
+                ledger.model_connection_id,
+                ledger.model_connection_scope_snapshot,
+                ledger.model_connection_name_snapshot, ledger.model_id_snapshot,
+                ledger.api_type_snapshot, ledger.request_settings_snapshot,
+                ledger.agent_id, ledger.agent_name_snapshot,
+                ledger.subject_type, ledger.subject_user_id,
+                ledger.subject_display_name_snapshot,
+                ledger.source_integration_app_id,
+                ledger.source_integration_app_name_snapshot,
+                ledger.input_tokens, ledger.output_tokens, ledger.total_tokens,
+                ledger.cached_tokens, ledger.reasoning_tokens
+         {source}
+           AND ($8::timestamptz IS NULL
+                OR (ledger.occurred_at, ledger.id) < ($8, $9))
+         ORDER BY ledger.occurred_at DESC, ledger.id DESC
+         LIMIT $10"
+    );
+    let mut rows = sqlx::query(&sql)
+        .bind(user.id)
+        .bind(&user.role)
+        .bind(query.from)
+        .bind(query.to)
+        .bind(query.model_connection_id)
+        .bind(query.agent_id)
+        .bind(query.user_id)
+        .bind(query.cursor_occurred_at)
+        .bind(query.cursor_id)
+        .bind(query.page_size + 1)
+        .fetch_all(&state.pool)
         .await?;
-    validate_subagent_definitions(&req.subagents)?;
-    let execution_configuration_changed =
-        agent_execution_configuration_changed(&existing_agent, &req);
-
-    let visibility = normalize_visibility(&req.visibility)?;
-    validate_public_visibility_role(visibility, &user.role)?;
-    validate_public_to(
-        &state.pool,
-        visibility,
-        &req.public_to,
-        existing_agent.owner_id,
-    )
-    .await?;
-    let mut tx = state.pool.begin().await?;
-    req.model_settings = validate_agent_model_configuration_tx(
-        &mut tx,
-        existing_agent.owner_id,
-        req.model_selection.as_ref(),
-        req.model_settings,
-        &mut req.subagents,
-    )
-    .await?;
-    if user.id != existing_agent.owner_id && user.role != "super_admin" {
-        enforce_admin_agent_model_selection_tx(
-            &mut tx,
-            &existing_agent,
-            req.model_selection.as_ref(),
-            &req.subagents,
-        )
-        .await?;
+    let has_more = rows.len() > query.page_size as usize;
+    if has_more {
+        rows.pop();
     }
-    let model_connection_id = req
-        .model_selection
-        .as_ref()
-        .map(|selection| selection.connection_id);
-    let model_id = req
-        .model_selection
-        .as_ref()
-        .map(|selection| selection.model_id.as_str());
-    let model_settings_value = serde_json::to_value(&req.model_settings)
-        .map_err(|_| ApiError::internal("Agent Model Settings could not be encoded"))?;
-    let updated = sqlx::query(
-        "UPDATE agents
-         SET name = $1, instructions = $2, visibility = $3, public_to = $4, runtime_id = $5,
-             model_connection_id = $6, model_id = $7, model_settings = $8,
-             model_policy = $9, sandbox_policy = $10, mcp_allowlist = $11,
-             tool_allowlist = $12,
-             execution_config_revision = execution_config_revision
-                 + CASE WHEN $13 THEN 1 ELSE 0 END,
-             updated_at = now()
-         WHERE id = $14 AND deleted_at IS NULL
-         ",
-    )
-    .bind(req.name.trim())
-    .bind(req.instructions.trim())
-    .bind(visibility)
-    .bind(req.public_to)
-    .bind(req.runtime_id)
-    .bind(model_connection_id)
-    .bind(model_id)
-    .bind(model_settings_value)
-    .bind(req.model_policy)
-    .bind(req.sandbox_policy)
-    .bind(req.mcp_allowlist)
-    .bind(
-        serde_json::to_value(&req.tool_allowlist)
-            .map_err(|_| ApiError::internal("Agent tool policy could not be encoded"))?,
-    )
-    .bind(execution_configuration_changed)
-    .bind(agent_id)
-    .execute(&mut *tx)
-    .await?;
-    if updated.rows_affected() == 0 {
-        return Err(ApiError::not_found("agent not found"));
-    }
-    if execution_configuration_changed {
-        sqlx::query(
-            "UPDATE hub_sessions AS sessions
-             SET configuration_refresh_revision = GREATEST(
-                     sessions.configuration_refresh_revision,
-                     agents.execution_config_revision
-                 )
-             FROM agents
-             WHERE sessions.agent_id = agents.id
-               AND agents.id = $1
-               AND sessions.runtime_owner_id IS NOT NULL
-               AND sessions.lifecycle_status IN ('restoring', 'online')",
-        )
-        .bind(agent_id)
-        .execute(&mut *tx)
-        .await?;
-    }
-    sqlx::query("DELETE FROM agent_skills WHERE agent_id = $1")
-        .bind(agent_id)
-        .execute(&mut *tx)
-        .await?;
-    for skill_id in &req.managed_skill_ids {
-        sqlx::query(
-            "INSERT INTO agent_skills (agent_id, skill_id)
-             VALUES ($1, $2)
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(agent_id)
-        .bind(skill_id)
-        .execute(&mut *tx)
-        .await?;
-    }
-    replace_subagents_tx(&mut tx, agent_id, &req.subagents).await?;
-    replace_agent_secret_declarations_tx(&mut tx, agent_id, &secret_declarations).await?;
-    tx.commit().await?;
-    Ok(Json(
-        load_agent_for_user(&state.pool, agent_id, &user).await?,
-    ))
+    let items = rows
+        .into_iter()
+        .map(model_token_usage_from_row)
+        .collect::<Vec<_>>();
+    let next_cursor = has_more.then(|| {
+        let last = items.last().expect("a page with more rows is non-empty");
+        ModelLedgerCursorDto {
+            occurred_at_ms: last.occurred_at.timestamp_millis(),
+            id: last.id,
+        }
+    });
+    Ok(Json(ModelTokenUsagePageDto { items, next_cursor }))
 }
 
-pub(crate) async fn delete_agent(
+pub(crate) async fn list_model_call_errors(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path(agent_id): Path<Uuid>,
-) -> Result<StatusCode, ApiError> {
+    Query(query): Query<ModelCallErrorQueryDto>,
+) -> Result<Json<ModelCallErrorPageDto>, ApiError> {
     let user = require_user(&state, &headers).await?;
-    let mut tx = state.pool.begin().await?;
-    let agent = sqlx::query(
-        "SELECT agents.owner_id, agents.deleted_at
-         FROM agents
-         WHERE agents.id = $1
-         FOR UPDATE",
-    )
-    .bind(agent_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let Some(agent) = agent else {
-        return Err(ApiError::not_found("agent not found"));
-    };
-    let owner_id: Uuid = agent.get("owner_id");
-    if owner_id != user.id && !is_admin_role(&user.role) {
-        return Err(ApiError::forbidden(
-            "agent management permission is required",
-        ));
+    let query = validate_model_ledger_query(query.into(), &user)?;
+    let source = model_ledger_source("model_call_errors", false);
+    let sql = format!(
+        "SELECT ledger.id, ledger.occurred_at, ledger.response_status,
+                ledger.upstream_http_status, ledger.error_code, ledger.message,
+                ledger.model_connection_id,
+                ledger.model_connection_scope_snapshot,
+                ledger.model_connection_name_snapshot, ledger.model_id_snapshot,
+                ledger.api_type_snapshot, ledger.request_settings_snapshot,
+                ledger.agent_id, ledger.agent_name_snapshot,
+                ledger.subject_type, ledger.subject_user_id,
+                ledger.subject_display_name_snapshot,
+                ledger.source_integration_app_id,
+                ledger.source_integration_app_name_snapshot
+         {source}
+           AND ($8::timestamptz IS NULL
+                OR (ledger.occurred_at, ledger.id) < ($8, $9))
+         ORDER BY ledger.occurred_at DESC, ledger.id DESC
+         LIMIT $10"
+    );
+    let mut rows = sqlx::query(&sql)
+        .bind(user.id)
+        .bind(&user.role)
+        .bind(query.from)
+        .bind(query.to)
+        .bind(query.model_connection_id)
+        .bind(query.agent_id)
+        .bind(query.user_id)
+        .bind(query.cursor_occurred_at)
+        .bind(query.cursor_id)
+        .bind(query.page_size + 1)
+        .fetch_all(&state.pool)
+        .await?;
+    let has_more = rows.len() > query.page_size as usize;
+    if has_more {
+        rows.pop();
     }
-    if agent
-        .get::<Option<DateTime<Utc>>, _>("deleted_at")
-        .is_none()
-    {
-        sqlx::query(
-            "INSERT INTO session_bundle_deletion_queue (object_key, agent_id, session_id)
-             SELECT current_bundle_object_key, agent_id, id
-             FROM hub_sessions
-             WHERE agent_id = $1 AND current_bundle_object_key IS NOT NULL
-             ON CONFLICT (object_key) DO NOTHING",
-        )
-        .bind(agent_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("DELETE FROM integration_app_agents WHERE agent_id = $1")
-            .bind(agent_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM agent_skills WHERE agent_id = $1")
-            .bind(agent_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM subagent_definitions WHERE agent_id = $1")
-            .bind(agent_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM automations WHERE agent_id = $1")
-            .bind(agent_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM embed_sessions WHERE agent_id = $1")
-            .bind(agent_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query(
-            "UPDATE integration_tool_requests AS requests
-             SET status = 'cancelled', responded_at = COALESCE(responded_at, now())
-             FROM integration_sessions AS integration
-             WHERE requests.session_id = integration.id
-               AND integration.agent_id = $1
-               AND requests.status <> 'completed'",
-        )
-        .bind(agent_id)
-        .execute(&mut *tx)
-        .await?;
-        let interrupted = sqlx::query(
-            "UPDATE runs
-             SET status = 'failed', runtime_id = NULL,
-                 model_proxy_token_hash = NULL, work_dir_ref = NULL, updated_at = now()
-             WHERE agent_id = $1 AND status IN ('pending', 'running', 'waiting_tool')
-             RETURNING id",
-        )
-        .bind(agent_id)
-        .fetch_all(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE runs
-             SET model_proxy_token_hash = NULL, work_dir_ref = NULL, updated_at = now()
-             WHERE agent_id = $1",
-        )
-        .bind(agent_id)
-        .execute(&mut *tx)
-        .await?;
-        for row in interrupted {
-            insert_run_event_tx(
-                &mut tx,
-                row.get("id"),
-                "status".into(),
-                None,
-                Some("failed".into()),
-                json!({ "status": "failed", "reason": "agent deleted" }),
-            )
-            .await?;
+    let items = rows
+        .into_iter()
+        .map(model_call_error_from_row)
+        .collect::<Vec<_>>();
+    let next_cursor = has_more.then(|| {
+        let last = items.last().expect("a page with more rows is non-empty");
+        ModelLedgerCursorDto {
+            occurred_at_ms: last.occurred_at.timestamp_millis(),
+            id: last.id,
         }
-        sqlx::query(
-            "UPDATE hub_session_turns AS turns
-             SET status = 'failed', ended_at = COALESCE(ended_at, now()), updated_at = now()
-             FROM hub_sessions AS sessions
-             WHERE turns.session_id = sessions.id
-               AND sessions.agent_id = $1
-               AND turns.status NOT IN ('completed', 'failed', 'interrupted')",
-        )
-        .bind(agent_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE hub_session_messages AS messages
-             SET delivery_state = 'failed'
-             FROM hub_sessions AS sessions
-             WHERE messages.session_id = sessions.id
-               AND sessions.agent_id = $1
-               AND messages.delivery_state IN ('queued', 'deferred', 'delivering')",
-        )
-        .bind(agent_id)
-        .execute(&mut *tx)
-        .await?;
-        // Runtime writes lock Runtime before Session; keep the same order before
-        // the cleanup obligation foreign key and owned Session row locks below.
-        sqlx::query(
-            "SELECT runtimes.id
-             FROM runtimes
-             JOIN hub_sessions AS sessions ON sessions.runtime_owner_id = runtimes.id
-             WHERE sessions.agent_id = $1
-             ORDER BY runtimes.id
-             FOR UPDATE OF runtimes",
-        )
-        .bind(agent_id)
-        .fetch_all(&mut *tx)
-        .await?;
-        let owned_sessions = sqlx::query(
-            "SELECT id, runtime_owner_id, ownership_generation
-             FROM hub_sessions
-             WHERE agent_id = $1 AND runtime_owner_id IS NOT NULL
-             ORDER BY id FOR UPDATE",
-        )
-        .bind(agent_id)
-        .fetch_all(&mut *tx)
-        .await?;
-        for session in owned_sessions {
-            record_runtime_session_cleanup_tx(
-                &mut tx,
-                session.get("runtime_owner_id"),
-                session.get("id"),
-                session.get("ownership_generation"),
-                None,
-            )
-            .await?;
-        }
-        sqlx::query(
-            "UPDATE hub_sessions
-             SET lifecycle_status = 'historical', active_turn_id = NULL,
-                 configuration_fingerprint = NULL,
-                 runtime_owner_id = NULL, ownership_generation = ownership_generation + 1,
-                 recovery_error = NULL,
-                 current_bundle_generation = NULL, current_bundle_object_key = NULL,
-                 current_bundle_checksum_sha256 = NULL, current_bundle_size_bytes = NULL,
-                 current_bundle_history_checkpoint = NULL,
-                 current_bundle_ownership_generation = NULL,
-                 current_bundle_producing_engine_version = NULL,
-                 current_bundle_created_at = NULL, current_bundle_runtime_id = NULL,
-                 current_bundle_checkpoint_attempt_id = NULL,
-                 saving_history_checkpoint = NULL, saving_ownership_generation = NULL,
-                 saving_reason = NULL, saving_checkpoint_attempt_id = NULL,
-                 last_checkpoint_attempt_id = NULL,
-                 last_checkpoint_ownership_generation = NULL,
-                 last_checkpoint_disposition = NULL,
-                 last_checkpoint_has_queued_work = NULL
-             WHERE agent_id = $1",
-        )
-        .bind(agent_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE agents
-             SET instructions = '', visibility = 'private', public_to = '{}',
-                 runtime_id = NULL, model_policy = '{}'::jsonb,
-                 model_connection_id = NULL, model_id = NULL,
-                 model_settings = '{\"reasoning_effort\":\"default\",\"reasoning_summary\":\"default\",\"verbosity\":\"default\",\"context_window_tokens\":null,\"auto_compact_token_limit\":null,\"reasoning_summary_support\":\"auto\",\"service_tier\":null,\"provider_request_timeout_ms\":null,\"stream_max_retries\":null,\"stream_idle_timeout_ms\":null,\"request_settings\":{\"protocol\":\"openai_responses\"}}'::jsonb,
-                 sandbox_policy = '{}'::jsonb, mcp_allowlist = '[]'::jsonb,
-                 execution_config_revision = execution_config_revision + 1,
-                 deleted_at = now(), updated_at = now()
-             WHERE id = $1 AND deleted_at IS NULL",
-        )
-        .bind(agent_id)
-        .execute(&mut *tx)
-        .await?;
-    }
-    tx.commit().await?;
-    delete_queued_agent_bundles(&state, agent_id).await?;
-    Ok(StatusCode::NO_CONTENT)
+    });
+    Ok(Json(ModelCallErrorPageDto { items, next_cursor }))
 }
 
-pub(crate) async fn delete_queued_agent_bundles(
-    state: &AppState,
-    agent_id: Uuid,
-) -> Result<(), ApiError> {
-    let object_keys = sqlx::query_scalar::<_, String>(
-        "SELECT object_key
-         FROM session_bundle_deletion_queue
-         WHERE agent_id = $1
-         ORDER BY created_at, object_key",
-    )
-    .bind(agent_id)
-    .fetch_all(&state.pool)
-    .await?;
-    if object_keys.is_empty() {
-        return Ok(());
+pub(crate) fn model_token_totals_from_row(row: &sqlx::postgres::PgRow) -> ModelTokenUsageTotalsDto {
+    ModelTokenUsageTotalsDto {
+        input_tokens: row.get("input_tokens"),
+        output_tokens: row.get("output_tokens"),
+        total_tokens: row.get("total_tokens"),
+        cached_tokens: row.get("cached_tokens"),
+        reasoning_tokens: row.get("reasoning_tokens"),
     }
-    let store = state.session_bundle_store.as_ref().ok_or_else(|| {
-        ApiError::service_unavailable("Session Bundle object storage is not configured")
-    })?;
-    let mut first_error = None;
-    for object_key in object_keys {
-        match store.delete(&object_key).await {
-            Ok(()) => {
-                sqlx::query(
-                    "DELETE FROM session_bundle_deletion_queue
-                     WHERE object_key = $1 AND agent_id = $2",
-                )
-                .bind(&object_key)
-                .bind(agent_id)
-                .execute(&state.pool)
-                .await?;
-            }
-            Err(error) => {
-                sqlx::query(
-                    "UPDATE session_bundle_deletion_queue
-                     SET attempts = attempts + 1, last_error = $1, updated_at = now()
-                     WHERE object_key = $2 AND agent_id = $3",
-                )
-                .bind("object store delete failed")
-                .bind(&object_key)
-                .bind(agent_id)
-                .execute(&state.pool)
-                .await?;
-                warn!(agent_id = %agent_id, object_key = %object_key, error = %error,
-                    "failed to delete historical Session Bundle object");
-                first_error.get_or_insert_with(|| {
-                    ApiError::bad_gateway("failed to delete one or more Session Bundle objects")
-                });
-            }
-        }
+}
+
+pub(crate) fn model_connection_snapshot_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> ModelConnectionSnapshotDto {
+    ModelConnectionSnapshotDto {
+        id: row.get("model_connection_id"),
+        scope: match row
+            .get::<String, _>("model_connection_scope_snapshot")
+            .as_str()
+        {
+            "global" => ModelConnectionScope::Global,
+            "personal" => ModelConnectionScope::Personal,
+            _ => unreachable!("model ledger scope is constrained"),
+        },
+        name: row.get("model_connection_name_snapshot"),
+        model_id: row.get("model_id_snapshot"),
+        api_type: model_upstream_protocol_from_name(&row.get::<String, _>("api_type_snapshot")),
+        request_settings: serde_json::from_value(row.get("request_settings_snapshot"))
+            .expect("model ledger request settings are constrained"),
     }
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(()),
+}
+
+pub(crate) fn model_agent_snapshot_from_row(row: &sqlx::postgres::PgRow) -> ModelAgentSnapshotDto {
+    ModelAgentSnapshotDto {
+        id: row.get("agent_id"),
+        name: row
+            .get::<Option<String>, _>("agent_name_snapshot")
+            .unwrap_or_else(|| "Model Connection test".into()),
+    }
+}
+
+pub(crate) fn model_usage_subject_from_row(row: &sqlx::postgres::PgRow) -> ModelUsageSubjectDto {
+    match row.get::<String, _>("subject_type").as_str() {
+        "user" => ModelUsageSubjectDto {
+            kind: ModelUsageSubjectKind::User,
+            id: row.get("subject_user_id"),
+            display_name: row.get("subject_display_name_snapshot"),
+        },
+        "integration_app" => ModelUsageSubjectDto {
+            kind: ModelUsageSubjectKind::IntegrationApp,
+            id: row.get("source_integration_app_id"),
+            display_name: row.get("source_integration_app_name_snapshot"),
+        },
+        "system" => ModelUsageSubjectDto {
+            kind: ModelUsageSubjectKind::System,
+            id: None,
+            display_name: row.get("subject_display_name_snapshot"),
+        },
+        _ => unreachable!("model ledger subject type is constrained"),
+    }
+}
+
+pub(crate) fn model_token_usage_from_row(row: sqlx::postgres::PgRow) -> ModelTokenUsageDto {
+    ModelTokenUsageDto {
+        id: row.get("id"),
+        occurred_at: row.get("occurred_at"),
+        response_status: row.get("response_status"),
+        model: model_connection_snapshot_from_row(&row),
+        agent: model_agent_snapshot_from_row(&row),
+        subject: model_usage_subject_from_row(&row),
+        input_tokens: row.get("input_tokens"),
+        output_tokens: row.get("output_tokens"),
+        total_tokens: row.get("total_tokens"),
+        cached_tokens: row.get("cached_tokens"),
+        reasoning_tokens: row.get("reasoning_tokens"),
+    }
+}
+
+pub(crate) fn model_call_error_from_row(row: sqlx::postgres::PgRow) -> ModelCallErrorDto {
+    ModelCallErrorDto {
+        id: row.get("id"),
+        occurred_at: row.get("occurred_at"),
+        response_status: row.get("response_status"),
+        model: model_connection_snapshot_from_row(&row),
+        agent: model_agent_snapshot_from_row(&row),
+        subject: model_usage_subject_from_row(&row),
+        upstream_status: row
+            .get::<Option<i32>, _>("upstream_http_status")
+            .map(|status| status as u16),
+        error_code: row.get("error_code"),
+        message: row.get::<String, _>("message").into(),
     }
 }
 
@@ -3652,181 +3903,6 @@ pub(crate) async fn oauth_userinfo(
         &user,
         external,
     )))
-}
-
-pub(crate) async fn list_agent_runs(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(agent_id): Path<Uuid>,
-) -> Result<Json<Vec<RunDto>>, ApiError> {
-    let user = require_user(&state, &headers).await?;
-    load_agent_for_user(&state.pool, agent_id, &user).await?;
-    let rows = sqlx::query(
-        "SELECT runs.id, runs.agent_id, runs.automation_id, runs.integration_session_id,
-                runs.parent_run_id, runs.runtime_id, runs.hub_session_id,
-                runs.hub_message_id, runs.hub_turn_id,
-                runs.session_ownership_generation, runs.status, runs.initial_message,
-                runs.native_session_id, runs.work_dir_ref, runs.source, runs.created_at,
-                runs.updated_at
-         FROM runs
-         JOIN users AS run_owner ON run_owner.id = runs.owner_id
-         WHERE runs.agent_id = $1
-           AND (runs.owner_id = $2 OR $3 IN ('admin', 'super_admin'))
-           AND (runs.owner_id = $2 OR run_owner.role <> 'super_admin'
-                OR $3 IN ('admin', 'super_admin'))
-         ORDER BY runs.created_at DESC LIMIT 50",
-    )
-    .bind(agent_id)
-    .bind(user.id)
-    .bind(&user.role)
-    .fetch_all(&state.pool)
-    .await?;
-    Ok(Json(rows.into_iter().map(run_from_row).collect()))
-}
-
-pub(crate) async fn create_run(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Path(agent_id): Path<Uuid>,
-    Json(req): Json<CreateRunRequest>,
-) -> Result<Json<RunDto>, ApiError> {
-    let user = require_user(&state, &headers).await?;
-    let requested_origin_kind: Option<String> = match req.hub_session_id {
-        Some(session_id) => {
-            sqlx::query_scalar(
-                "SELECT origin_kind
-             FROM hub_sessions
-             WHERE id = $1 AND owner_id = $2 AND agent_id = $3",
-            )
-            .bind(session_id)
-            .bind(user.id)
-            .bind(agent_id)
-            .fetch_optional(&state.pool)
-            .await?
-        }
-        None => match req.parent_run_id {
-            Some(parent_run_id) => {
-                sqlx::query_scalar(
-                    "SELECT sessions.origin_kind
-                 FROM runs
-                 JOIN hub_sessions AS sessions ON sessions.id = runs.hub_session_id
-                 WHERE runs.id = $1 AND runs.owner_id = $2 AND runs.agent_id = $3
-                   AND sessions.owner_id = $2 AND sessions.agent_id = $3",
-                )
-                .bind(parent_run_id)
-                .bind(user.id)
-                .bind(agent_id)
-                .fetch_optional(&state.pool)
-                .await?
-            }
-            None => None,
-        },
-    };
-    if requested_origin_kind
-        .as_deref()
-        .is_some_and(|origin_kind| origin_kind != "hub_native")
-    {
-        return Err(ApiError::conflict(
-            "External Sessions are read-only in the Hub console",
-        ));
-    }
-    let agent = load_agent_for_user(&state.pool, agent_id, &user).await?;
-    let missing_grants = missing_secret_grants(&state.pool, user.id, agent_id).await?;
-    if !missing_grants.is_empty() {
-        return Err(ApiError::requires_secret_grants(missing_grants));
-    }
-    let mut tx = state.pool.begin().await?;
-    let existing_session_id = match req.hub_session_id {
-        Some(session_id) => Some(session_id),
-        None => match req.parent_run_id {
-            Some(parent_run_id) => Some(
-                sqlx::query_scalar(
-                    "SELECT hub_session_id
-                 FROM runs
-                 WHERE id = $1 AND owner_id = $2 AND agent_id = $3",
-                )
-                .bind(parent_run_id)
-                .bind(user.id)
-                .bind(agent.id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or(ApiError::bad_request("resume parent run is not available"))?,
-            ),
-            None => None,
-        },
-    };
-    let is_new_session = existing_session_id.is_none();
-    let first_message = req.message.clone();
-    let session_id = if let Some(session_id) = existing_session_id {
-        let origin_kind: String = sqlx::query_scalar(
-            "SELECT origin_kind
-             FROM hub_sessions
-             WHERE id = $1 AND owner_id = $2 AND agent_id = $3",
-        )
-        .bind(session_id)
-        .bind(user.id)
-        .bind(agent.id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(ApiError::bad_request("Session is not available"))?;
-        if origin_kind != "hub_native" {
-            return Err(ApiError::conflict(
-                "External Sessions are read-only in the Hub console",
-            ));
-        }
-        ensure_agent_can_start_run_tx(&mut tx, agent.id, user.id).await?;
-        session_id
-    } else {
-        ensure_agent_can_start_run_tx(&mut tx, agent.id, user.id).await?;
-        insert_hub_native_session_tx(&mut tx, user.id, agent.id).await?
-    };
-    let accepted = accept_session_message_tx(
-        &mut tx,
-        AcceptSessionMessage {
-            session_id,
-            agent_id: agent.id,
-            owner_id: user.id,
-            content: req.message,
-            payload: json!({}),
-            role: "user".into(),
-            message_kind: "message".into(),
-            requested_delivery_mode: "next_turn".into(),
-            client_message_key: req.client_message_key,
-            source: "console".into(),
-            automation_id: None,
-            integration_session_id: None,
-            parent_run_id: req.parent_run_id,
-            continuation_turn_id: None,
-            model_subject_type: "user".into(),
-            model_subject_user_id: Some(user.id),
-            model_source_integration_app_id: None,
-            external_user_context: None,
-            attachment_ids: Vec::new(),
-        },
-    )
-    .await?;
-    let run = accepted
-        .run
-        .ok_or(ApiError::internal("console message did not schedule a run"))?;
-    tx.commit().await?;
-    if is_new_session {
-        let background_state = state.clone();
-        let background_session_id = session_id;
-        let background_agent_id = agent.id;
-        let background_user_id = user.id;
-        let background_message = first_message;
-        tokio::spawn(async move {
-            generate_session_title_in_background(
-                background_state,
-                background_session_id,
-                background_agent_id,
-                background_user_id,
-                background_message,
-            )
-            .await;
-        });
-    }
-    Ok(Json(run))
 }
 
 pub(crate) async fn list_hub_sessions(
@@ -14103,161 +14179,372 @@ pub(crate) async fn ensure_agent_has_configured_model_tx(
     Ok(())
 }
 
-pub(crate) fn normalize_visibility(visibility: &str) -> Result<&'static str, ApiError> {
-    match visibility.trim() {
-        "private" => Ok("private"),
-        "public_to" => Ok("public_to"),
-        "public" => Ok("public"),
-        _ => Err(ApiError::bad_request("unsupported visibility")),
+pub(crate) fn normalize_automation_trigger(trigger_type: &str) -> Result<&'static str, ApiError> {
+    match trigger_type.trim() {
+        "manual" => Ok("manual"),
+        "webhook" => Ok("webhook"),
+        "interval" => Ok("interval"),
+        "cron" => Ok("cron"),
+        _ => Err(ApiError::bad_request("unsupported automation trigger type")),
     }
 }
 
-pub(crate) fn validate_public_visibility_role(
-    visibility: &str,
-    role: &str,
+pub(crate) fn validate_automation_schedule(
+    trigger_type: &str,
+    schedule: Option<&str>,
 ) -> Result<(), ApiError> {
-    if visibility == "public" && !is_admin_role(role) {
-        return Err(ApiError::forbidden(
-            "administrator permission is required for public agents",
-        ));
+    let has_schedule = schedule.is_some_and(|value| !value.trim().is_empty());
+    match trigger_type {
+        "manual" | "webhook" if has_schedule => Err(ApiError::bad_request(
+            "schedule is only valid for cron or interval automation",
+        )),
+        "cron" | "interval" if !has_schedule => Err(ApiError::bad_request(
+            "schedule is required for cron or interval automation",
+        )),
+        "interval" => {
+            parse_interval_schedule(schedule.unwrap_or_default())?;
+            Ok(())
+        }
+        "cron" => validate_cron_schedule(schedule.unwrap_or_default()),
+        _ => Ok(()),
+    }
+}
+
+pub(crate) async fn automation_scheduler_loop(pool: PgPool) {
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tick.tick().await;
+        if let Err(error) = trigger_due_scheduled_automations(&pool).await {
+            warn!(error = %error.message, "automation scheduler scan failed");
+        }
+    }
+}
+
+pub(crate) async fn trigger_due_scheduled_automations(pool: &PgPool) -> Result<(), ApiError> {
+    let now = Utc::now();
+    let rows = sqlx::query(
+        "SELECT au.id
+         FROM automations au
+         JOIN agents ag ON ag.id = au.agent_id AND ag.deleted_at IS NULL
+         WHERE au.enabled = true AND au.trigger_type IN ('interval', 'cron')
+         ORDER BY au.created_at ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    for row in rows {
+        let automation_id: Uuid = row.get("id");
+        if let Err(error) = trigger_scheduled_automation_if_due(pool, automation_id, now).await {
+            warn!(
+                automation_id = %automation_id,
+                error = %error.message,
+                "scheduled automation trigger failed"
+            );
+        }
     }
     Ok(())
 }
 
-pub(crate) async fn validate_public_to(
+pub(crate) async fn trigger_scheduled_automation_if_due(
     pool: &PgPool,
-    visibility: &str,
-    public_to: &[Uuid],
-    owner_id: Uuid,
-) -> Result<(), ApiError> {
-    if visibility != "public_to" && !public_to.is_empty() {
-        return Err(ApiError::bad_request(
-            "public_to users require public_to visibility",
-        ));
+    automation_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<Option<RunDto>, ApiError> {
+    let mut tx = pool.begin().await?;
+    // 先用稳定的 Agent 锁避免与归档的反向锁顺序，再锁 Automation 重判 due。
+    let agent_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT agent_id FROM automations
+         WHERE id = $1 AND enabled = true AND trigger_type IN ('interval', 'cron')",
+    )
+    .bind(automation_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(agent_id) = agent_id else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    let active_agent: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM agents WHERE id = $1 AND deleted_at IS NULL FOR UPDATE")
+            .bind(agent_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if active_agent.is_none() {
+        tx.commit().await?;
+        return Ok(None);
     }
-    if visibility == "public_to" && public_to.is_empty() {
-        return Err(ApiError::bad_request(
-            "public_to visibility requires at least one user",
-        ));
+    let row = sqlx::query(
+        "SELECT id, agent_id, owner_id, name, trigger_type, prompt, schedule,
+                NULL::text AS webhook_token, enabled, last_triggered_at, created_at
+         FROM automations
+         WHERE id = $1 AND enabled = true AND trigger_type IN ('interval', 'cron')
+         FOR UPDATE SKIP LOCKED",
+    )
+    .bind(automation_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let automation = automation_from_row(row);
+    if !scheduled_automation_due(&automation, now) {
+        tx.commit().await?;
+        return Ok(None);
     }
-    let unique = public_to.iter().copied().collect::<BTreeSet<_>>();
-    if unique.len() != public_to.len() || unique.contains(&owner_id) {
-        return Err(ApiError::bad_request(
-            "public_to users must be unique and exclude the owner",
-        ));
-    }
-    if unique.is_empty() {
-        return Ok(());
-    }
-    let ids = unique.into_iter().collect::<Vec<_>>();
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE id = ANY($1)")
-        .bind(&ids)
-        .fetch_one(pool)
+    let run = insert_run_for_agent_tx(
+        &mut tx,
+        automation.agent_id,
+        automation.owner_id,
+        automation.prompt.clone(),
+        "automation:scheduler",
+        Some(automation.id),
+        None,
+        None,
+    )
+    .await?;
+    sqlx::query("UPDATE automations SET last_triggered_at = $1, updated_at = now() WHERE id = $2")
+        .bind(now)
+        .bind(automation.id)
+        .execute(&mut *tx)
         .await?;
-    if count != ids.len() as i64 {
-        return Err(ApiError::bad_request("public_to user does not exist"));
-    }
-    Ok(())
+    tx.commit().await?;
+    Ok(Some(run))
 }
 
-pub(crate) fn validate_agent_payload(req: &UpdateAgentRequest) -> Result<(), ApiError> {
-    if req.name.trim().is_empty() {
-        return Err(ApiError::bad_request("agent name is required"));
+pub(crate) fn scheduled_automation_due(automation: &AutomationDto, now: DateTime<Utc>) -> bool {
+    if !automation.enabled {
+        return false;
     }
-    normalize_agent_tool_allowlist(&req.tool_allowlist)?;
-    let Some(model_policy) = req.model_policy.as_object() else {
-        return Err(ApiError::bad_request("model policy must be a JSON object"));
-    };
-    match model_policy
-        .get("provider")
-        .and_then(|value| value.as_str())
-    {
-        Some("hub-proxy") => {}
-        Some(_) => return Err(ApiError::bad_request("unsupported model provider")),
-        None => return Err(ApiError::bad_request("model provider is required")),
+    match automation.trigger_type.as_str() {
+        "interval" => automation
+            .schedule
+            .as_deref()
+            .ok_or_else(|| ApiError::bad_request("schedule is required"))
+            .and_then(parse_interval_schedule)
+            .is_ok_and(|interval| {
+                let last = automation
+                    .last_triggered_at
+                    .unwrap_or(automation.created_at);
+                now.signed_duration_since(last) >= interval
+            }),
+        "cron" => automation.schedule.as_deref().is_some_and(|schedule| {
+            cron_schedule_matches(schedule, now)
+                && automation
+                    .last_triggered_at
+                    .is_none_or(|last| minute_key(last) != minute_key(now))
+        }),
+        _ => false,
     }
-    if let Some(base_url) = model_policy.get("base_url") {
-        if base_url.as_str().is_none_or(str::is_empty) {
-            return Err(ApiError::bad_request("model base_url must be a string"));
+}
+
+pub(crate) fn parse_interval_schedule(schedule: &str) -> Result<ChronoDuration, ApiError> {
+    let trimmed = schedule.trim();
+    if trimmed.len() < 2 {
+        return Err(ApiError::bad_request("interval schedule must be like 5m"));
+    }
+    let (amount, unit) = trimmed.split_at(trimmed.len() - 1);
+    let amount: i64 = amount
+        .parse()
+        .map_err(|_| ApiError::bad_request("interval amount must be a number"))?;
+    if amount <= 0 {
+        return Err(ApiError::bad_request("interval amount must be positive"));
+    }
+    match unit {
+        "s" => checked_interval_duration(amount, 1),
+        "m" => checked_interval_duration(amount, 60),
+        "h" => checked_interval_duration(amount, 60 * 60),
+        _ => Err(ApiError::bad_request(
+            "interval schedule must use s, m, or h",
+        )),
+    }
+}
+
+pub(crate) fn checked_interval_duration(
+    amount: i64,
+    seconds_per_unit: i64,
+) -> Result<ChronoDuration, ApiError> {
+    amount
+        .checked_mul(seconds_per_unit)
+        .and_then(ChronoDuration::try_seconds)
+        .ok_or_else(|| ApiError::bad_request("interval schedule is too large"))
+}
+
+pub(crate) fn validate_cron_schedule(schedule: &str) -> Result<(), ApiError> {
+    let fields = cron_fields(schedule)?;
+    for (index, field) in fields.iter().enumerate() {
+        if *field == "*" {
+            continue;
         }
-    }
-    let Some(sandbox_policy) = req.sandbox_policy.as_object() else {
-        return Err(ApiError::bad_request(
-            "sandbox policy must be a JSON object",
-        ));
-    };
-    match sandbox_policy.get("mode").and_then(|value| value.as_str()) {
-        Some("workspace-write") | Some("read-only") => {}
-        Some(_) => return Err(ApiError::bad_request("unsupported sandbox mode")),
-        None => return Err(ApiError::bad_request("sandbox mode is required")),
-    }
-    if !sandbox_policy
-        .get("network_access")
-        .is_some_and(|value| value.is_boolean())
-    {
-        return Err(ApiError::bad_request(
-            "sandbox network_access must be a boolean",
-        ));
-    }
-    let Some(mcp_servers) = req.mcp_allowlist.as_array() else {
-        return Err(ApiError::bad_request("MCP allowlist must be a JSON array"));
-    };
-    let mut mcp_names = BTreeSet::new();
-    for server in mcp_servers {
-        let Some(server) = server.as_object() else {
-            return Err(ApiError::bad_request("MCP entries must be JSON objects"));
+        let value: u32 = field
+            .parse()
+            .map_err(|_| ApiError::bad_request("cron fields must be * or a number"))?;
+        let valid = match index {
+            0 => value <= 59,
+            1 => value <= 23,
+            2 => (1..=31).contains(&value),
+            3 => (1..=12).contains(&value),
+            4 => value <= 7,
+            _ => false,
         };
-        for key in server.keys() {
-            if !matches!(key.as_str(), "name" | "command" | "args" | "secrets") {
-                return Err(ApiError::bad_request(
-                    "MCP entries only support name, command, args, and secrets",
-                ));
-            }
-        }
-        let Some(name) = server
-            .get("name")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            return Err(ApiError::bad_request("MCP name is required"));
-        };
-        if !mcp_names.insert(name.to_owned()) {
-            return Err(ApiError::bad_request("MCP names must be unique"));
-        }
-        if server
-            .get("command")
-            .is_some_and(|value| value.as_str().is_none_or(str::is_empty))
-        {
-            return Err(ApiError::bad_request("MCP command must be a string"));
-        }
-        if let Some(args) = server.get("args") {
-            let Some(args) = args.as_array() else {
-                return Err(ApiError::bad_request("MCP args must be a JSON array"));
-            };
-            if args.iter().any(|value| value.as_str().is_none()) {
-                return Err(ApiError::bad_request("MCP args must be strings"));
-            }
-        }
-        if let Some(secrets) = server.get("secrets") {
-            let Some(secrets) = secrets.as_object() else {
-                return Err(ApiError::bad_request("MCP secrets must be a JSON object"));
-            };
-            for value in secrets.values() {
-                let Some(value) = value.as_str() else {
-                    return Err(ApiError::bad_request("MCP secret values must be strings"));
-                };
-                if value == REDACTED_SECRET {
-                    return Err(ApiError::bad_request(
-                        "MCP redacted secret cannot be saved without an existing value",
-                    ));
-                }
-            }
+        if !valid {
+            return Err(ApiError::bad_request("cron field is out of range"));
         }
     }
     Ok(())
 }
 
+pub(crate) fn cron_schedule_matches(schedule: &str, now: DateTime<Utc>) -> bool {
+    let Ok(fields) = cron_fields(schedule) else {
+        return false;
+    };
+    cron_field_matches(fields[0], now.minute(), 0)
+        && cron_field_matches(fields[1], now.hour(), 1)
+        && cron_field_matches(fields[2], now.day(), 2)
+        && cron_field_matches(fields[3], now.month(), 3)
+        && cron_field_matches(fields[4], now.weekday().num_days_from_sunday(), 4)
+}
+
+pub(crate) fn cron_fields(schedule: &str) -> Result<Vec<&str>, ApiError> {
+    let fields = schedule.split_whitespace().collect::<Vec<_>>();
+    if fields.len() != 5 {
+        return Err(ApiError::bad_request("cron schedule must have 5 fields"));
+    }
+    Ok(fields)
+}
+
+pub(crate) fn cron_field_matches(field: &str, value: u32, index: usize) -> bool {
+    if field == "*" {
+        return true;
+    }
+    field.parse::<u32>().is_ok_and(|expected| {
+        let expected = if index == 4 && expected == 7 {
+            0
+        } else {
+            expected
+        };
+        let valid = match index {
+            0 => expected <= 59,
+            1 => expected <= 23,
+            2 => (1..=31).contains(&expected),
+            3 => (1..=12).contains(&expected),
+            4 => expected <= 6,
+            _ => false,
+        };
+        valid && expected == value
+    })
+}
+
+pub(crate) fn minute_key(value: DateTime<Utc>) -> i64 {
+    value.timestamp() / 60
+}
+
+pub(crate) async fn trigger_loaded_automation(
+    pool: &PgPool,
+    automation: AutomationDto,
+    message: Option<String>,
+    source: &str,
+    expected_webhook_token_hash: Option<&str>,
+) -> Result<RunDto, ApiError> {
+    match (source, automation.trigger_type.as_str()) {
+        ("automation:manual", "manual") | ("automation:webhook", "webhook") => {}
+        ("automation:scheduler", "interval") | ("automation:scheduler", "cron") => {}
+        ("automation:manual", _) => {
+            return Err(ApiError::forbidden(
+                "only manual automation can be triggered here",
+            ));
+        }
+        ("automation:webhook", _) => {
+            return Err(ApiError::forbidden(
+                "only webhook automation can be triggered here",
+            ));
+        }
+        ("automation:scheduler", _) => {
+            return Err(ApiError::forbidden(
+                "only scheduled automation can be triggered here",
+            ));
+        }
+        _ => {
+            return Err(ApiError::bad_request(
+                "unsupported automation trigger source",
+            ))
+        }
+    }
+    let message = message
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&automation.prompt)
+        .to_owned();
+    let mut tx = pool.begin().await?;
+    // 归档和所有触发路径均先锁 Agent，消除 agent/automation 交叉死锁。
+    // Agent 必须仍对 Automation owner 可调用（owner/public/public_to）。
+    let active_agent = sqlx::query(
+        "SELECT id
+         FROM agents
+         WHERE id = $1 AND deleted_at IS NULL
+           AND (owner_id = $2 OR visibility = 'public'
+                OR (visibility = 'public_to' AND $2 = ANY(public_to)))
+         FOR UPDATE",
+    )
+    .bind(automation.agent_id)
+    .bind(automation.owner_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let active_automation = sqlx::query(
+        "SELECT enabled, trigger_type, webhook_token_hash
+         FROM automations
+         WHERE id = $1 AND owner_id = $2
+         FOR UPDATE",
+    )
+    .bind(automation.id)
+    .bind(automation.owner_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if active_agent.is_none() {
+        return Err(ApiError::forbidden(
+            "automation is disabled or agent is deleted",
+        ));
+    }
+    let Some(active_automation) = active_automation else {
+        return Err(ApiError::forbidden(
+            "automation is disabled or agent is deleted",
+        ));
+    };
+    let token_matches = expected_webhook_token_hash.is_none_or(|expected| {
+        active_automation
+            .get::<Option<String>, _>("webhook_token_hash")
+            .as_deref()
+            == Some(expected)
+    });
+    if !active_automation.get::<bool, _>("enabled")
+        || active_automation.get::<String, _>("trigger_type") != automation.trigger_type
+        || !token_matches
+    {
+        return Err(if expected_webhook_token_hash.is_some() {
+            ApiError::unauthorized("invalid automation webhook token")
+        } else {
+            ApiError::forbidden("automation is disabled or agent is deleted")
+        });
+    }
+    let run = insert_run_for_agent_tx(
+        &mut tx,
+        automation.agent_id,
+        automation.owner_id,
+        message,
+        source,
+        Some(automation.id),
+        None,
+        None,
+    )
+    .await?;
+    sqlx::query(
+        "UPDATE automations SET last_triggered_at = now(), updated_at = now() WHERE id = $1",
+    )
+    .bind(automation.id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(run)
+}
 
 pub(crate) async fn insert_run_event_for_active_runtime(
     tx: &mut Transaction<'_, Postgres>,
@@ -14970,1052 +15257,627 @@ pub(crate) async fn fail_capability_mismatched_runs_for_runtime_tx(
     Ok(rows.into_iter().map(|row| row.get("id")).collect())
 }
 
-pub(crate) async fn load_agent_for_user(
-    pool: &PgPool,
-    agent_id: Uuid,
-    user: &UserDto,
-) -> Result<AgentDto, ApiError> {
-    let row = sqlx::query(
-        "SELECT a.id, a.owner_id, owner.email AS owner_email, a.name, a.instructions, a.visibility, a.public_to,
-                a.runtime_id, a.model_connection_id, a.model_id, a.model_settings,
-                a.model_policy, a.sandbox_policy, a.mcp_allowlist, a.tool_allowlist,
-                a.created_at, a.updated_at
-         FROM agents AS a
-         JOIN users AS owner ON owner.id = a.owner_id
-         WHERE a.id = $1 AND a.deleted_at IS NULL
-           AND (
-               a.owner_id = $2
-               OR a.visibility = 'public'
-               OR (a.visibility = 'public_to' AND $2 = ANY(a.public_to))
-               OR owner.role <> 'super_admin'
-               OR $3 IN ('admin', 'super_admin')
-           )
-           AND (a.owner_id = $2 OR a.visibility = 'public'
-                OR (a.visibility = 'public_to' AND $2 = ANY(a.public_to))
-                OR $3 IN ('admin', 'super_admin'))",
-    )
-    .bind(agent_id)
-    .bind(user.id)
-    .bind(&user.role)
-    .fetch_optional(pool)
-    .await?;
-    let row = row.ok_or(ApiError::not_found("agent not found"))?;
-    let mut agent = agent_from_row(row);
-    if agent.owner_id == user.id || is_admin_role(&user.role) {
-        hydrate_agent_configuration(pool, &mut agent).await?;
+pub(crate) fn validate_skill_payload(name: &str, content: &str) -> Result<(), ApiError> {
+    if name.trim().is_empty() {
+        return Err(ApiError::bad_request("skill name is required"));
     }
-    Ok(apply_agent_access(agent, user))
+    if content.trim().is_empty() {
+        return Err(ApiError::bad_request("skill content is required"));
+    }
+    Ok(())
 }
 
-pub(crate) async fn load_agent_owned_by_user(
-    pool: &PgPool,
-    agent_id: Uuid,
-    user_id: Uuid,
-) -> Result<AgentDto, ApiError> {
-    let row = sqlx::query(
-        "SELECT id, owner_id, name, instructions, visibility, public_to, runtime_id,
-                model_connection_id, model_id, model_settings,
-                model_policy, sandbox_policy, mcp_allowlist, tool_allowlist, created_at, updated_at
-         FROM agents
-         WHERE id = $1 AND owner_id = $2 AND deleted_at IS NULL",
-    )
-    .bind(agent_id)
-    .bind(user_id)
-    .fetch_optional(pool)
-    .await?;
-    let row = row.ok_or(ApiError::not_found("agent not found"))?;
-    let mut agent = agent_from_row(row);
-    hydrate_agent_configuration(pool, &mut agent).await?;
-    Ok(agent)
+pub(crate) fn validate_secret_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        && (name.starts_with(|byte: char| byte.is_ascii_uppercase()) || name.starts_with('_'))
 }
 
-pub(crate) async fn load_agent_manageable_by_user(
-    pool: &PgPool,
-    agent_id: Uuid,
-    user: &UserDto,
-) -> Result<AgentDto, ApiError> {
-    let row = sqlx::query(
-        "SELECT a.id, a.owner_id,
-                (SELECT email FROM users WHERE id = a.owner_id) AS owner_email,
-                a.name, a.instructions, a.visibility, a.public_to,
-                a.runtime_id, a.model_connection_id, a.model_id, a.model_settings,
-                a.model_policy, a.sandbox_policy, a.mcp_allowlist, a.tool_allowlist,
-                a.created_at, a.updated_at
-         FROM agents AS a
-         WHERE a.id = $1 AND a.deleted_at IS NULL
-           AND (a.owner_id = $2 OR $3 IN ('admin', 'super_admin'))",
-    )
-    .bind(agent_id)
-    .bind(user.id)
-    .bind(&user.role)
-    .fetch_optional(pool)
-    .await?;
-    let row = row.ok_or(ApiError::not_found("agent not found"))?;
-    let mut agent = agent_from_row(row);
-    hydrate_agent_configuration(pool, &mut agent).await?;
-    Ok(agent)
-}
-
-pub(crate) async fn ensure_runtime_online(pool: &PgPool, runtime_id: Uuid) -> Result<(), ApiError> {
-    let exists: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM runtimes WHERE id = $1 AND status = 'online'")
-            .bind(runtime_id)
-            .fetch_optional(pool)
-            .await?;
-    exists
-        .map(|_| ())
-        .ok_or(ApiError::bad_request("runtime is not online"))
-}
-
-pub(crate) fn validate_subagent_definitions(
-    definitions: &[SubagentDefinition],
+pub(crate) fn validate_secret_declarations(
+    declarations: &[AgentSecretDeclarationDto],
 ) -> Result<(), ApiError> {
-    if definitions.len() > 32 {
-        return Err(ApiError::bad_request(
-            "an Agent supports at most 32 Subagents",
-        ));
-    }
     let mut names = BTreeSet::new();
-    for definition in definitions {
-        let name = definition.name.trim();
-        if name.is_empty()
-            || name.len() > 64
-            || !name.chars().all(|character| {
-                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
-            })
+    for declaration in declarations {
+        if !validate_secret_name(&declaration.name)
+            || !matches!(declaration.kind.as_str(), "value" | "file")
+            || declaration.description.len() > 512
+            || !names.insert(declaration.name.clone())
         {
             return Err(ApiError::bad_request(
-                "Subagent name must use 1 to 64 letters, digits, hyphens, or underscores",
-            ));
-        }
-        if !names.insert(name.to_ascii_lowercase()) {
-            return Err(ApiError::bad_request("Subagent names must be unique"));
-        }
-        if name.eq_ignore_ascii_case("main") {
-            return Err(ApiError::bad_request("Subagent name 'main' is reserved"));
-        }
-        let description = definition.description.trim();
-        if description.is_empty()
-            || description.chars().count() > 512
-            || description.chars().any(char::is_control)
-        {
-            return Err(ApiError::bad_request(
-                "Subagent description must be 1 to 512 characters",
-            ));
-        }
-        if definition.developer_instructions.trim().is_empty()
-            || definition.developer_instructions.len() > 100_000
-        {
-            return Err(ApiError::bad_request(
-                "Subagent developer instructions are required and must not exceed 100000 bytes",
-            ));
-        }
-        if definition.enabled {
-            if definition.disabled_reason.is_some() {
-                return Err(ApiError::bad_request(
-                    "enabled Subagents cannot have a disabled reason",
-                ));
-            }
-        } else if definition.model_selection.is_some()
-            || !matches!(
-                definition.disabled_reason.as_deref(),
-                Some("model_connection_deleted" | "model_selection_removed")
-            )
-        {
-            return Err(ApiError::bad_request(
-                "disabled Subagents must retain the deleted-model reason without an override",
+                "Agent Secret Declarations must have unique valid names and kinds",
             ));
         }
     }
     Ok(())
 }
 
-pub(crate) async fn load_permitted_model_selection_api_type_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    owner_id: Uuid,
-    selection: &ModelSelectionDto,
-) -> Result<ModelUpstreamProtocol, ApiError> {
-    let api_type: String = sqlx::query_scalar(
-        "SELECT api_type FROM model_connections
-         WHERE id = $1 AND enabled = true AND deleted_at IS NULL
-           AND $2 = ANY(allowed_model_ids)
-           AND (scope = 'global' OR owner_id = $3)
-         FOR SHARE",
-    )
-    .bind(selection.connection_id)
-    .bind(&selection.model_id)
-    .bind(owner_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or_else(|| {
-        ApiError::bad_request(
-            "Agent model selection must be an allowed model on an enabled Global or Agent-owner Personal Model API Connection",
-        )
-    })?;
-    Ok(model_upstream_protocol_from_name(&api_type))
-}
-
-pub(crate) fn apply_enum_model_setting_override<T: Clone + Default>(
-    value: &mut T,
-    setting_override: &ModelSettingOverride<T>,
-) {
-    match setting_override {
-        ModelSettingOverride::Inherit => {}
-        ModelSettingOverride::Automatic => *value = T::default(),
-        ModelSettingOverride::Value(overridden) => *value = overridden.clone(),
-    }
-}
-
-pub(crate) fn apply_optional_model_setting_override<T: Clone>(
-    value: &mut Option<T>,
-    setting_override: &ModelSettingOverride<T>,
-) {
-    match setting_override {
-        ModelSettingOverride::Inherit => {}
-        ModelSettingOverride::Automatic => *value = None,
-        ModelSettingOverride::Value(overridden) => *value = Some(overridden.clone()),
-    }
-}
-
-pub(crate) fn effective_subagent_model_settings(
-    parent: &AgentModelSettings,
-    overrides: &AgentModelSettingsOverride,
-    protocol: ModelUpstreamProtocol,
-    selection_protocol_changed: bool,
-) -> Result<AgentModelSettings, ApiError> {
-    let mut effective = parent.clone();
-    apply_enum_model_setting_override(&mut effective.reasoning_effort, &overrides.reasoning_effort);
-    apply_enum_model_setting_override(
-        &mut effective.reasoning_summary,
-        &overrides.reasoning_summary,
-    );
-    apply_enum_model_setting_override(&mut effective.verbosity, &overrides.verbosity);
-    apply_optional_model_setting_override(
-        &mut effective.context_window_tokens,
-        &overrides.context_window_tokens,
-    );
-    apply_optional_model_setting_override(
-        &mut effective.auto_compact_token_limit,
-        &overrides.auto_compact_token_limit,
-    );
-    apply_enum_model_setting_override(
-        &mut effective.reasoning_summary_support,
-        &overrides.reasoning_summary_support,
-    );
-    apply_optional_model_setting_override(&mut effective.service_tier, &overrides.service_tier);
-    apply_optional_model_setting_override(
-        &mut effective.provider_request_timeout_ms,
-        &overrides.provider_request_timeout_ms,
-    );
-    apply_optional_model_setting_override(
-        &mut effective.stream_max_retries,
-        &overrides.stream_max_retries,
-    );
-    apply_optional_model_setting_override(
-        &mut effective.stream_idle_timeout_ms,
-        &overrides.stream_idle_timeout_ms,
-    );
-    match &overrides.request_settings {
-        ModelSettingOverride::Inherit if selection_protocol_changed => {
-            effective.request_settings = ModelRequestSettings::for_protocol(protocol);
-        }
-        ModelSettingOverride::Inherit => {}
-        ModelSettingOverride::Automatic => {
-            effective.request_settings = ModelRequestSettings::for_protocol(protocol);
-        }
-        ModelSettingOverride::Value(settings) => effective.request_settings = settings.clone(),
-    }
-    validate_agent_model_settings(effective, protocol)
-}
-
-pub(crate) async fn check_admin_agent_model_selection_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    retained: &[(Uuid, String)],
-    selection: Option<&ModelSelectionDto>,
-) -> Result<(), ApiError> {
-    let Some(selection) = selection else {
-        return Ok(());
-    };
-    if retained.iter().any(|(connection_id, model_id)| {
-        *connection_id == selection.connection_id && model_id == &selection.model_id
-    }) {
-        return Ok(());
-    }
-    let global: bool = sqlx::query_scalar(
-        "SELECT EXISTS(
-             SELECT 1 FROM model_connections
-             WHERE id = $1 AND scope = 'global' AND enabled = true AND deleted_at IS NULL
-               AND $2 = ANY(allowed_model_ids)
-         )",
-    )
-    .bind(selection.connection_id)
-    .bind(&selection.model_id)
-    .fetch_one(&mut **tx)
-    .await?;
-    if global {
-        Ok(())
-    } else {
-        Err(ApiError::bad_request(
-            "admin model changes are limited to Global connections",
-        ))
-    }
-}
-
-pub(crate) async fn enforce_admin_agent_model_selection_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    existing: &AgentDto,
-    requested: Option<&ModelSelectionDto>,
-    subagents: &[SubagentDefinition],
-) -> Result<(), ApiError> {
-    // An ordinary admin may retain the Agent owner's existing Personal model
-    // selections, but may not point the Agent at a different Personal
-    // connection: the owner's Personal connections stay owner/super-only.
-    let mut retained = Vec::new();
-    if let Some(selection) = existing.model_selection.as_ref() {
-        retained.push((selection.connection_id, selection.model_id.clone()));
-    }
-    for subagent in &existing.subagents {
-        if let Some(selection) = subagent.model_selection.as_ref() {
-            retained.push((selection.connection_id, selection.model_id.clone()));
-        }
-    }
-    check_admin_agent_model_selection_tx(tx, &retained, requested).await?;
-    for subagent in subagents.iter().filter(|subagent| subagent.enabled) {
-        check_admin_agent_model_selection_tx(tx, &retained, subagent.model_selection.as_ref())
-            .await?;
-    }
-    Ok(())
-}
-
-pub(crate) async fn validate_agent_model_configuration_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    owner_id: Uuid,
-    model_selection: Option<&ModelSelectionDto>,
-    model_settings: AgentModelSettings,
-    subagents: &mut [SubagentDefinition],
-) -> Result<AgentModelSettings, ApiError> {
-    let parent_protocol = match model_selection {
-        Some(selection) => {
-            load_permitted_model_selection_api_type_tx(tx, owner_id, selection).await?
-        }
-        None => model_settings.request_settings.protocol(),
-    };
-    let model_settings = validate_agent_model_settings(model_settings, parent_protocol)?;
-    for subagent in subagents.iter_mut().filter(|subagent| subagent.enabled) {
-        let protocol = match subagent.model_selection.as_ref() {
-            Some(selection) => {
-                load_permitted_model_selection_api_type_tx(tx, owner_id, selection).await?
-            }
-            None => parent_protocol,
-        };
-        let selection_protocol_changed =
-            subagent.model_selection.is_some() && protocol != parent_protocol;
-        if let ModelSettingOverride::Value(service_tier) =
-            &mut subagent.model_settings_override.service_tier
-        {
-            *service_tier = service_tier.trim().to_owned();
-        }
-        effective_subagent_model_settings(
-            &model_settings,
-            &subagent.model_settings_override,
-            protocol,
-            selection_protocol_changed,
-        )?;
-    }
-    Ok(model_settings)
-}
-
-pub(crate) async fn replace_subagents_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    agent_id: Uuid,
-    definitions: &[SubagentDefinition],
-) -> Result<(), ApiError> {
-    let existing = sqlx::query(
-        "SELECT id, lower(btrim(name)) AS normalized_name
-         FROM subagent_definitions
-         WHERE agent_id = $1 FOR UPDATE",
-    )
-    .bind(agent_id)
-    .fetch_all(&mut **tx)
-    .await?
-    .into_iter()
-    .map(|row| {
-        (
-            row.get::<String, _>("normalized_name"),
-            row.get::<Uuid, _>("id"),
-        )
-    })
-    .collect::<BTreeMap<_, _>>();
-    sqlx::query("DELETE FROM subagent_definitions WHERE agent_id = $1")
-        .bind(agent_id)
-        .execute(&mut **tx)
-        .await?;
-    for definition in definitions {
-        let id = existing
-            .get(&definition.name.trim().to_ascii_lowercase())
-            .copied()
-            .unwrap_or_else(Uuid::new_v4);
-        sqlx::query(
-            "INSERT INTO subagent_definitions
-                 (id, agent_id, name, description, developer_instructions,
-                  model_connection_id, model_id, model_settings_override,
-                  enabled, disabled_reason)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-        )
-        .bind(id)
-        .bind(agent_id)
-        .bind(definition.name.trim())
-        .bind(definition.description.trim())
-        .bind(definition.developer_instructions.trim())
-        .bind(
-            definition
-                .model_selection
-                .as_ref()
-                .map(|selection| selection.connection_id),
-        )
-        .bind(
-            definition
-                .model_selection
-                .as_ref()
-                .map(|selection| selection.model_id.as_str()),
-        )
-        .bind(
-            serde_json::to_value(&definition.model_settings_override)
-                .map_err(|_| ApiError::internal("subagent Model Settings could not be encoded"))?,
-        )
-        .bind(definition.enabled)
-        .bind(definition.disabled_reason.as_deref())
-        .execute(&mut **tx)
-        .await?;
-    }
-    Ok(())
-}
-
-pub(crate) fn subagent_from_row(row: sqlx::postgres::PgRow) -> SubagentDefinition {
-    let connection_id: Option<Uuid> = row.get("model_connection_id");
-    let model_id: Option<String> = row.get("model_id");
-    SubagentDefinition {
-        name: row.get("name"),
-        description: row.get("description"),
-        developer_instructions: row.get("developer_instructions"),
-        model_selection: connection_id
-            .zip(model_id)
-            .map(|(connection_id, model_id)| ModelSelectionDto {
-                connection_id,
-                model_id,
-            }),
-        model_settings_override: serde_json::from_value(row.get("model_settings_override"))
-            .expect("subagent Model Settings are constrained"),
-        enabled: row.get("enabled"),
-        disabled_reason: row.get("disabled_reason"),
-    }
-}
-
-pub(crate) async fn load_subagents(
+pub(crate) async fn load_agent_secret_declarations(
     pool: &PgPool,
     agent_id: Uuid,
-) -> Result<Vec<SubagentDefinition>, ApiError> {
+) -> Result<Vec<AgentSecretDeclarationDto>, ApiError> {
     let rows = sqlx::query(
-        "SELECT name, description, developer_instructions, model_connection_id,
-                model_id, model_settings_override, enabled, disabled_reason
-         FROM subagent_definitions
+        "SELECT name, kind, description
+         FROM agent_secret_declarations
          WHERE agent_id = $1
-         ORDER BY lower(name), id",
+         ORDER BY name",
     )
     .bind(agent_id)
     .fetch_all(pool)
     .await?;
-    Ok(rows.into_iter().map(subagent_from_row).collect())
-}
-
-pub(crate) async fn load_subagents_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    agent_id: Uuid,
-) -> Result<Vec<SubagentDefinition>, ApiError> {
-    let rows = sqlx::query(
-        "SELECT name, description, developer_instructions, model_connection_id,
-                model_id, model_settings_override, enabled, disabled_reason
-         FROM subagent_definitions
-         WHERE agent_id = $1
-         ORDER BY lower(name), id",
-    )
-    .bind(agent_id)
-    .fetch_all(&mut **tx)
-    .await?;
-    Ok(rows.into_iter().map(subagent_from_row).collect())
-}
-
-pub(crate) async fn hydrate_agent_configuration(
-    pool: &PgPool,
-    agent: &mut AgentDto,
-) -> Result<(), ApiError> {
-    agent.managed_skill_ids = load_managed_skill_ids(pool, agent.id).await?;
-    agent.secret_declarations = load_agent_secret_declarations(pool, agent.id).await?;
-    agent.subagents = load_subagents(pool, agent.id).await?;
-    Ok(())
-}
-
-pub(crate) fn normalized_subagents(definitions: &[SubagentDefinition]) -> Vec<String> {
-    let mut definitions = definitions
-        .iter()
-        .map(|definition| {
-            serde_json::to_value(definition)
-                .map(|value| canonical_json(&value))
-                .unwrap_or_default()
-        })
-        .collect::<Vec<_>>();
-    definitions.sort();
-    definitions
-}
-
-pub(crate) fn agent_execution_configuration_changed(
-    existing: &AgentDto,
-    request: &UpdateAgentRequest,
-) -> bool {
-    let existing_skill_ids = existing
-        .managed_skill_ids
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    let requested_skill_ids = request
-        .managed_skill_ids
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    existing.instructions != request.instructions.trim()
-        || existing.model_selection != request.model_selection
-        || existing.model_settings != request.model_settings
-        || normalized_subagents(&existing.subagents) != normalized_subagents(&request.subagents)
-        || existing.model_policy != request.model_policy
-        || existing.sandbox_policy != request.sandbox_policy
-        || normalized_unordered_entries(&existing.mcp_allowlist)
-            != normalized_unordered_entries(&request.mcp_allowlist)
-        || existing.tool_allowlist != request.tool_allowlist
-        || existing_skill_ids != requested_skill_ids
-        || request
-            .secret_declarations
-            .as_ref()
-            .is_some_and(|requested| {
-                normalized_secret_declarations(&existing.secret_declarations)
-                    != normalized_secret_declarations(requested)
-            })
-}
-
-pub(crate) fn normalized_secret_declarations(
-    declarations: &[AgentSecretDeclarationDto],
-) -> Vec<String> {
-    let mut entries = declarations
-        .iter()
-        .map(|declaration| {
-            canonical_json(&json!({
-                "name": declaration.name,
-                "kind": declaration.kind,
-                "description": declaration.description,
-            }))
-        })
-        .collect::<Vec<_>>();
-    entries.sort();
-    entries
-}
-
-pub(crate) fn normalized_unordered_entries(value: &Value) -> Vec<String> {
-    let mut entries = value
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(canonical_json)
-        .collect::<Vec<_>>();
-    entries.sort();
-    entries
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AgentAccess {
-    can_manage: bool,
-    can_administer: bool,
-    can_invoke: bool,
-}
-
-pub(crate) fn agent_access(agent: &AgentDto, user: &UserDto) -> AgentAccess {
-    let is_owner = agent.owner_id == user.id;
-    AgentAccess {
-        can_manage: is_owner || is_admin_role(&user.role),
-        can_administer: is_owner || is_admin_role(&user.role),
-        can_invoke: is_owner
-            || agent.visibility == "public"
-            || (agent.visibility == "public_to" && agent.public_to.contains(&user.id)),
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn widget_agent_from_agent(agent: AgentDto) -> WidgetAgentDto {
-    // iframe widget 只需要展示和发起消息，不暴露控制面的私有配置。
-    WidgetAgentDto {
-        id: agent.id,
-        name: agent.name,
-        instructions: agent.instructions,
-    }
-}
-
-pub(crate) fn apply_agent_access(mut agent: AgentDto, user: &UserDto) -> AgentDto {
-    let access = agent_access(&agent, user);
-    agent.is_owner = agent.owner_id == user.id;
-    agent.can_manage = access.can_manage;
-    agent.can_administer = access.can_administer;
-    agent.can_invoke = access.can_invoke;
-    if !agent.is_owner && !is_admin_role(&user.role) {
-        agent.public_to.clear();
-        agent.runtime_id = None;
-        agent.model_selection = None;
-        agent.model_settings = AgentModelSettings::default();
-        agent.subagents.clear();
-        agent.model_policy = json!({});
-        agent.sandbox_policy = json!({});
-        agent.managed_skill_ids.clear();
-        agent.mcp_allowlist = json!([]);
-        return agent;
-    }
-    agent.mcp_allowlist = redact_mcp_secrets(&agent.mcp_allowlist);
-    agent
-}
-
-pub(crate) fn redact_mcp_secrets(value: &Value) -> Value {
-    let Some(servers) = value.as_array() else {
-        return json!([]);
-    };
-    Value::Array(
-        servers
-            .iter()
-            .map(|server| {
-                let mut server = server.clone();
-                if let Some(secrets) = server.get_mut("secrets").and_then(Value::as_object_mut) {
-                    for value in secrets.values_mut() {
-                        *value = json!(REDACTED_SECRET);
-                    }
-                }
-                server
-            })
-            .collect(),
-    )
-}
-
-pub(crate) fn merge_mcp_secrets(existing: &Value, incoming: &Value) -> Value {
-    let Some(incoming_servers) = incoming.as_array() else {
-        return incoming.clone();
-    };
-    let mut merged = Vec::with_capacity(incoming_servers.len());
-    for incoming_server in incoming_servers {
-        let mut server = incoming_server.clone();
-        let name = server
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        if let Some(secrets) = server.get_mut("secrets").and_then(Value::as_object_mut) {
-            for (key, value) in secrets.iter_mut() {
-                if value.as_str() == Some(REDACTED_SECRET) {
-                    if let Some(existing_value) =
-                        existing_mcp_secret(existing, name.as_deref(), key)
-                    {
-                        *value = json!(existing_value);
-                    }
-                }
-            }
-        }
-        merged.push(server);
-    }
-    Value::Array(merged)
-}
-
-pub(crate) fn existing_mcp_secret<'a>(
-    existing: &'a Value,
-    server_name: Option<&str>,
-    key: &str,
-) -> Option<&'a str> {
-    let server_name = server_name?;
-    existing.as_array()?.iter().find_map(|server| {
-        if server.get("name").and_then(Value::as_str) != Some(server_name) {
-            return None;
-        }
-        server
-            .get("secrets")
-            .and_then(Value::as_object)?
-            .get(key)?
-            .as_str()
-    })
-}
-
-pub(crate) fn build_agent_execution_configuration(
-    agent: &AgentDto,
-    revision: i64,
-    managed_rows: Vec<sqlx::postgres::PgRow>,
-) -> Result<AgentExecutionConfigurationDto, ApiError> {
-    let mut skills = std::collections::BTreeMap::new();
-    for row in managed_rows {
-        let name: String = row.get("name");
-        let description: String = row.get("description");
-        skills.insert(
-            name.clone(),
-            AgentExecutionSkillDto {
-                source: "managed".into(),
-                source_id: Some(row.get("id")),
-                name: name.clone(),
-                description: if description.trim().is_empty() {
-                    name
-                } else {
-                    description
-                },
-                content: row.get("content"),
-                revision: row.get("revision"),
-                content_checksum_sha256: row.get("content_checksum_sha256"),
-                package: execution_skill_package_from_row(&row),
-            },
-        );
-    }
-    Ok(AgentExecutionConfigurationDto {
-        revision,
-        instructions: agent.instructions.clone(),
-        model_selection: agent.model_selection.clone(),
-        model_settings: agent.model_settings.clone(),
-        subagents: agent.subagents.clone(),
-        model_bindings: Vec::new(),
-        model_policy: agent.model_policy.clone(),
-        sandbox_policy: agent.sandbox_policy.clone(),
-        skills: skills.into_values().collect(),
-        secret_declarations: agent.secret_declarations.clone(),
-        mcp_allowlist: agent.mcp_allowlist.clone(),
-        tool_allowlist: agent.tool_allowlist.clone(),
-    })
-}
-
-pub(crate) fn execution_skill_package_from_row(
-    row: &sqlx::postgres::PgRow,
-) -> Option<SkillPackageDto> {
-    let id = row
-        .try_get::<Option<Uuid>, _>("package_id")
-        .ok()
-        .flatten()?;
-    Some(SkillPackageDto {
-        id,
-        format_version: u32::try_from(row.get::<i32, _>("package_format_version"))
-            .expect("Skill package format version is constrained"),
-        size_bytes: u64::try_from(row.get::<i64, _>("package_size_bytes"))
-            .expect("Skill package size is constrained"),
-        checksum_sha256: row.get("package_checksum_sha256"),
-        files: serde_json::from_value(row.get("package_files"))
-            .expect("Skill package file manifest is constrained"),
-    })
-}
-
-#[derive(Debug)]
-struct SessionToolPolicy {
-    public_widget: bool,
-    app_tool_allowlist: Option<Vec<String>>,
-}
-
-pub(crate) async fn load_session_tool_policy_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    session_id: Uuid,
-) -> Result<SessionToolPolicy, ApiError> {
-    let row = sqlx::query(
-        "SELECT hub.origin_kind,
-                COALESCE(
-                    (
-                        SELECT app.tool_allowlist
-                        FROM integration_sessions AS integration
-                        JOIN oauth_apps AS app ON app.id = integration.oauth_app_id
-                        WHERE integration.hub_session_id = hub.id
-                          AND app.deleted_at IS NULL
-                        ORDER BY integration.created_at DESC
-                        LIMIT 1
-                    ),
-                    (
-                        SELECT app.tool_allowlist
-                        FROM embed_sessions AS embed
-                        JOIN oauth_apps AS app ON app.id = embed.oauth_app_id
-                        WHERE embed.hub_session_id = hub.id
-                          AND app.deleted_at IS NULL
-                        LIMIT 1
-                    )
-                ) AS app_tool_allowlist
-         FROM hub_sessions AS hub
-         WHERE hub.id = $1",
-    )
-    .bind(session_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or(ApiError::not_found("Hub Session not found"))?;
-    let origin_kind: String = row.get("origin_kind");
-    let app_tool_allowlist = row
-        .get::<Option<Value>, _>("app_tool_allowlist")
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|_| ApiError::internal("stored App tool policy is invalid"))?;
-    Ok(SessionToolPolicy {
-        public_widget: origin_kind == "public_widget",
-        app_tool_allowlist,
-    })
-}
-
-pub(crate) fn apply_session_tool_policy(
-    tools: &mut Vec<String>,
-    sandbox_policy: &mut Value,
-    mcp_allowlist: &mut Value,
-    policy: &SessionToolPolicy,
-) -> Result<(), ApiError> {
-    let mut effective = normalize_agent_tool_allowlist(tools)?;
-    if let Some(app_tool_allowlist) = policy.app_tool_allowlist.as_deref() {
-        effective.retain(|tool| app_tool_allowlist.iter().any(|allowed| allowed == tool));
-    }
-    if policy.public_widget {
-        effective.retain(|tool| PUBLIC_WIDGET_TOOL_NAMES.contains(&tool.as_str()));
-        if effective.is_empty() {
-            return Err(ApiError::conflict(
-                "public Widget Agent must enable at least one read-only file tool",
-            ));
-        }
-        *sandbox_policy = json!({ "mode": "read-only", "network_access": false });
-        *mcp_allowlist = json!([]);
-    }
-    if effective.is_empty() {
-        return Err(ApiError::conflict("effective Agent tool policy is empty"));
-    }
-    *tools = effective;
-    Ok(())
-}
-
-pub(crate) async fn apply_session_tool_policy_to_agent_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    session_id: Uuid,
-    agent: &mut AgentDto,
-) -> Result<(), ApiError> {
-    let policy = load_session_tool_policy_tx(tx, session_id).await?;
-    apply_session_tool_policy(
-        &mut agent.tool_allowlist,
-        &mut agent.sandbox_policy,
-        &mut agent.mcp_allowlist,
-        &policy,
-    )
-}
-
-pub(crate) async fn apply_session_tool_policy_to_configuration_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    session_id: Uuid,
-    configuration: &mut AgentExecutionConfigurationDto,
-) -> Result<(), ApiError> {
-    let policy = load_session_tool_policy_tx(tx, session_id).await?;
-    apply_session_tool_policy(
-        &mut configuration.tool_allowlist,
-        &mut configuration.sandbox_policy,
-        &mut configuration.mcp_allowlist,
-        &policy,
-    )
-}
-
-pub(crate) async fn load_agent_execution_configuration_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    agent_id: Uuid,
-) -> Result<AgentExecutionConfigurationDto, ApiError> {
-    let row = sqlx::query(
-        "SELECT id, owner_id,
-                (SELECT email FROM users WHERE id = agents.owner_id) AS owner_email,
-                name, instructions, visibility, public_to, runtime_id,
-                model_connection_id, model_id, model_settings,
-                model_policy, sandbox_policy, mcp_allowlist, tool_allowlist, execution_config_revision,
-                created_at, updated_at
-         FROM agents
-         WHERE id = $1 AND deleted_at IS NULL",
-    )
-    .bind(agent_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or(ApiError::not_found("agent not found"))?;
-    let revision: i64 = row.get("execution_config_revision");
-    let mut agent = agent_from_row(row);
-    agent.subagents = load_subagents_tx(tx, agent.id).await?;
-    let skill_rows = sqlx::query(
-        "SELECT skills.id, skills.name, skills.description, skills.content,
-                skills.revision, skills.content_checksum_sha256,
-                packages.id AS package_id, packages.format_version AS package_format_version,
-                packages.size_bytes AS package_size_bytes,
-                packages.checksum_sha256 AS package_checksum_sha256,
-                packages.files AS package_files
-         FROM agent_skills
-         JOIN skills ON skills.id = agent_skills.skill_id
-         LEFT JOIN skill_packages AS packages ON packages.id = skills.current_package_id
-         WHERE agent_skills.agent_id = $1 AND skills.owner_id = $2
-         ORDER BY skills.name, skills.id",
-    )
-    .bind(agent.id)
-    .bind(agent.owner_id)
-    .fetch_all(&mut **tx)
-    .await?;
-    let mut configuration = build_agent_execution_configuration(&agent, revision, skill_rows)?;
-    // A configuration refresh occurs between Runs. It must not manufacture a
-    // new binding or replace the immutable provider route already materialized
-    // for the online Session; the next claimed Run supplies fresh bindings.
-    configuration.model_selection = None;
-    configuration.model_settings = AgentModelSettings::default();
-    for subagent in &mut configuration.subagents {
-        subagent.model_selection = None;
-        subagent.model_settings_override = AgentModelSettingsOverride::default();
-    }
-    Ok(configuration)
-}
-
-pub(crate) async fn create_run_model_binding_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    run_id: Uuid,
-    binding_key: &str,
-    owner_id: Uuid,
-    selection: &ModelSelectionDto,
-    settings: &AgentModelSettings,
-) -> Result<RunModelBindingDto, ApiError> {
-    let row = sqlx::query(
-        "SELECT id, name, scope, api_type
-         FROM model_connections
-         WHERE id = $1 AND enabled = true AND deleted_at IS NULL
-           AND $2 = ANY(allowed_model_ids)
-           AND (scope = 'global' OR owner_id = $3)
-         FOR SHARE",
-    )
-    .bind(selection.connection_id)
-    .bind(&selection.model_id)
-    .bind(owner_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or(ApiError::conflict(
-        "Agent model configuration is unavailable",
-    ))?;
-    let api_type = model_upstream_protocol_from_name(&row.get::<String, _>("api_type"));
-    let settings = validate_agent_model_settings(settings.clone(), api_type)?;
-    let binding = RunModelBindingDto {
-        id: Uuid::new_v4(),
-        run_id,
-        binding_key: binding_key.to_owned(),
-        model_connection_id: selection.connection_id,
-        connection_name_snapshot: row.get("name"),
-        connection_scope_snapshot: if row.get::<String, _>("scope") == "global" {
-            ModelConnectionScope::Global
-        } else {
-            ModelConnectionScope::Personal
-        },
-        model_id: selection.model_id.clone(),
-        api_type,
-        model_settings: settings,
-    };
-    sqlx::query(
-        "INSERT INTO run_model_bindings
-             (id, run_id, binding_key, model_connection_id,
-              connection_name_snapshot, connection_scope_snapshot,
-              model_id, api_type, model_settings)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-    )
-    .bind(binding.id)
-    .bind(run_id)
-    .bind(&binding.binding_key)
-    .bind(binding.model_connection_id)
-    .bind(&binding.connection_name_snapshot)
-    .bind(model_connection_scope_name(
-        binding.connection_scope_snapshot,
-    ))
-    .bind(&binding.model_id)
-    .bind(model_upstream_protocol_name(binding.api_type))
-    .bind(
-        serde_json::to_value(&binding.model_settings)
-            .map_err(|_| ApiError::internal("Run Model Binding could not be encoded"))?,
-    )
-    .execute(&mut **tx)
-    .await?;
-    Ok(binding)
-}
-
-pub(crate) async fn load_run_model_bindings_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    run_id: Uuid,
-) -> Result<Vec<RunModelBindingDto>, ApiError> {
-    let rows = sqlx::query(
-        "SELECT id, run_id, binding_key, model_connection_id,
-                connection_name_snapshot, connection_scope_snapshot,
-                model_id, api_type, model_settings
-         FROM run_model_bindings
-         WHERE run_id = $1
-         ORDER BY lower(binding_key), id",
-    )
-    .bind(run_id)
-    .fetch_all(&mut **tx)
-    .await?;
     Ok(rows
         .into_iter()
-        .map(|row| RunModelBindingDto {
-            id: row.get("id"),
-            run_id: row.get("run_id"),
-            binding_key: row.get("binding_key"),
-            model_connection_id: row.get("model_connection_id"),
-            connection_name_snapshot: row.get("connection_name_snapshot"),
-            connection_scope_snapshot: match row
-                .get::<String, _>("connection_scope_snapshot")
-                .as_str()
-            {
-                "global" => ModelConnectionScope::Global,
-                "personal" => ModelConnectionScope::Personal,
-                _ => unreachable!("Model Connection scope is constrained"),
-            },
-            model_id: row.get("model_id"),
-            api_type: model_upstream_protocol_from_name(&row.get::<String, _>("api_type")),
-            model_settings: serde_json::from_value(row.get("model_settings"))
-                .expect("Run Model Binding settings are constrained"),
+        .map(|row| AgentSecretDeclarationDto {
+            name: row.get("name"),
+            kind: row.get("kind"),
+            description: row.get("description"),
         })
         .collect())
 }
 
-pub(crate) async fn create_run_model_bindings_tx(
+pub(crate) async fn replace_agent_secret_declarations_tx(
     tx: &mut Transaction<'_, Postgres>,
-    run_id: Uuid,
-    agent: &AgentDto,
-) -> Result<Vec<RunModelBindingDto>, ApiError> {
-    let main_selection = agent
-        .model_selection
-        .as_ref()
-        .ok_or(ApiError::conflict("Agent has no configured model"))?;
-    let mut bindings = vec![
-        create_run_model_binding_tx(
-            tx,
-            run_id,
-            "main",
-            agent.owner_id,
-            main_selection,
-            &agent.model_settings,
+    agent_id: Uuid,
+    declarations: &[AgentSecretDeclarationDto],
+) -> Result<(), ApiError> {
+    validate_secret_declarations(declarations)?;
+    sqlx::query("DELETE FROM agent_secret_declarations WHERE agent_id = $1")
+        .bind(agent_id)
+        .execute(&mut **tx)
+        .await?;
+    for declaration in declarations {
+        sqlx::query(
+            "INSERT INTO agent_secret_declarations (agent_id, name, kind, description)
+             VALUES ($1, $2, $3, $4)",
         )
-        .await?,
-    ];
-    for subagent in agent.subagents.iter().filter(|subagent| {
-        subagent.enabled
-            && (subagent.model_selection.is_some()
-                || subagent.model_settings_override != AgentModelSettingsOverride::default())
-    }) {
-        let selection = subagent.model_selection.as_ref().unwrap_or(main_selection);
-        let protocol =
-            load_permitted_model_selection_api_type_tx(tx, agent.owner_id, selection).await?;
-        let settings = effective_subagent_model_settings(
-            &agent.model_settings,
-            &subagent.model_settings_override,
-            protocol,
-            subagent.model_selection.is_some()
-                && protocol != agent.model_settings.request_settings.protocol(),
-        )?;
-        bindings.push(
-            create_run_model_binding_tx(
-                tx,
-                run_id,
-                subagent.name.trim(),
-                agent.owner_id,
-                selection,
-                &settings,
-            )
-            .await?,
-        );
+        .bind(agent_id)
+        .bind(declaration.name.trim())
+        .bind(&declaration.kind)
+        .bind(declaration.description.trim())
+        .execute(&mut **tx)
+        .await?;
     }
-    Ok(bindings)
+    Ok(())
+}
+
+pub(crate) async fn missing_secret_grants(
+    pool: &PgPool,
+    user_id: Uuid,
+    agent_id: Uuid,
+) -> Result<Vec<SecretGrantRequirementDto>, ApiError> {
+    let declarations = load_agent_secret_declarations(pool, agent_id).await?;
+    let mut missing = Vec::new();
+    for declaration in declarations {
+        let owned = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM user_secrets WHERE owner_id = $1 AND name = $2",
+        )
+        .bind(user_id)
+        .bind(&declaration.name)
+        .fetch_optional(pool)
+        .await?;
+        if owned.is_none() {
+            continue;
+        }
+        let secret_kind =
+            sqlx::query_scalar::<_, String>("SELECT kind FROM user_secrets WHERE id = $1")
+                .bind(owned.unwrap())
+                .fetch_one(pool)
+                .await?;
+        let granted = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                SELECT 1 FROM secret_grants
+                WHERE user_id = $1 AND agent_id = $2 AND secret_name = $3
+             )",
+        )
+        .bind(user_id)
+        .bind(agent_id)
+        .bind(&declaration.name)
+        .fetch_one(pool)
+        .await?;
+        if !granted {
+            missing.push(SecretGrantRequirementDto {
+                name: declaration.name,
+                kind: secret_kind,
+                description: declaration.description,
+            });
+        }
+    }
+    Ok(missing)
+}
+
+pub(crate) fn user_secret_from_row(row: sqlx::postgres::PgRow) -> UserSecretDto {
+    UserSecretDto {
+        id: row.get("id"),
+        owner_id: row.get("owner_id"),
+        name: row.get("name"),
+        kind: row.get("kind"),
+        file_name: row.get("file_name"),
+        file_size_bytes: row.get("file_size_bytes"),
+        file_sha256: row.get("file_sha256"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+pub(crate) async fn list_user_secrets(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<UserSecretDto>>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    let rows = sqlx::query(
+        "SELECT id, owner_id, name, kind, file_name, file_size_bytes, file_sha256,
+                created_at, updated_at
+         FROM user_secrets
+         WHERE owner_id = $1
+         ORDER BY created_at DESC, id",
+    )
+    .bind(user.id)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(rows.into_iter().map(user_secret_from_row).collect()))
+}
+
+pub(crate) async fn create_user_secret(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<CreateUserSecretRequest>,
+) -> Result<Json<UserSecretDto>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    if !validate_secret_name(&req.name) {
+        return Err(ApiError::bad_request("Secret name is invalid"));
+    }
+    let id = Uuid::new_v4();
+    let (
+        value_ciphertext,
+        value_nonce,
+        file_ciphertext,
+        file_nonce,
+        file_name,
+        file_size,
+        file_sha256,
+    ) = match req.kind.as_str() {
+        "value" => {
+            let value = req
+                .value
+                .ok_or(ApiError::bad_request("value is required"))?;
+            if value.is_empty() || value.len() > 8192 {
+                return Err(ApiError::bad_request(
+                    "Secret value must be between 1 and 8192 bytes",
+                ));
+            }
+            let encrypted = state
+                .model_secret_cipher
+                .encrypt(&value)
+                .map_err(|_| ApiError::internal("Secret encryption failed"))?;
+            (
+                Some(encrypted.ciphertext),
+                Some(encrypted.nonce),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        "file" => {
+            let file_name = req
+                .file_name
+                .ok_or(ApiError::bad_request("file_name is required"))?
+                .trim()
+                .to_owned();
+            if file_name.is_empty() || file_name.len() > 255 || file_name.contains('/') {
+                return Err(ApiError::bad_request("file_name is invalid"));
+            }
+            let encoded = req
+                .file_base64
+                .ok_or(ApiError::bad_request("file_base64 is required"))?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|_| ApiError::bad_request("file_base64 is invalid"))?;
+            if bytes.is_empty() || bytes.len() > 1024 * 1024 {
+                return Err(ApiError::bad_request(
+                    "Secret file must be between 1 byte and 1 MiB",
+                ));
+            }
+            let sha = format!("{:x}", Sha256::digest(&bytes));
+            let plaintext = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            let encrypted = state
+                .model_secret_cipher
+                .encrypt(&plaintext)
+                .map_err(|_| ApiError::internal("Secret file encryption failed"))?;
+            (
+                None,
+                None,
+                Some(encrypted.ciphertext),
+                Some(encrypted.nonce),
+                Some(file_name),
+                Some(bytes.len() as i64),
+                Some(sha),
+            )
+        }
+        _ => return Err(ApiError::bad_request("kind must be value or file")),
+    };
+    sqlx::query(
+        "INSERT INTO user_secrets
+             (id, owner_id, name, kind, value_ciphertext, value_nonce,
+              file_ciphertext, file_nonce, file_name, file_size_bytes, file_sha256)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+    )
+    .bind(id)
+    .bind(user.id)
+    .bind(req.name.trim())
+    .bind(&req.kind)
+    .bind(value_ciphertext)
+    .bind(value_nonce)
+    .bind(file_ciphertext)
+    .bind(file_nonce)
+    .bind(file_name)
+    .bind(file_size)
+    .bind(file_sha256)
+    .execute(&state.pool)
+    .await?;
+    let row = sqlx::query(
+        "SELECT id, owner_id, name, kind, file_name, file_size_bytes, file_sha256,
+                created_at, updated_at
+         FROM user_secrets WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&state.pool)
+    .await?;
+    Ok(Json(user_secret_from_row(row)))
+}
+
+pub(crate) async fn update_user_secret(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(secret_id): Path<Uuid>,
+    Json(req): Json<UpdateUserSecretRequest>,
+) -> Result<Json<UserSecretDto>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    let row = sqlx::query("SELECT kind FROM user_secrets WHERE id = $1 AND owner_id = $2")
+        .bind(secret_id)
+        .bind(user.id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(ApiError::not_found("secret not found"))?;
+    let kind: String = row.get("kind");
+    match kind.as_str() {
+        "value" => {
+            let value = req
+                .value
+                .ok_or(ApiError::bad_request("value is required"))?;
+            if value.is_empty() || value.len() > 8192 {
+                return Err(ApiError::bad_request(
+                    "Secret value must be between 1 and 8192 bytes",
+                ));
+            }
+            let encrypted = state
+                .model_secret_cipher
+                .encrypt(&value)
+                .map_err(|_| ApiError::internal("Secret encryption failed"))?;
+            sqlx::query(
+                "UPDATE user_secrets
+                 SET value_ciphertext = $1, value_nonce = $2, updated_at = now()
+                 WHERE id = $3 AND owner_id = $4",
+            )
+            .bind(encrypted.ciphertext)
+            .bind(encrypted.nonce)
+            .bind(secret_id)
+            .bind(user.id)
+            .execute(&state.pool)
+            .await?;
+        }
+        "file" => {
+            let encoded = req
+                .file_base64
+                .ok_or(ApiError::bad_request("file_base64 is required"))?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|_| ApiError::bad_request("file_base64 is invalid"))?;
+            if bytes.is_empty() || bytes.len() > 1024 * 1024 {
+                return Err(ApiError::bad_request(
+                    "Secret file must be between 1 byte and 1 MiB",
+                ));
+            }
+            let file_name = req
+                .file_name
+                .ok_or(ApiError::bad_request("file_name is required"))?
+                .trim()
+                .to_owned();
+            if file_name.is_empty() || file_name.len() > 255 || file_name.contains('/') {
+                return Err(ApiError::bad_request("file_name is invalid"));
+            }
+            let sha = format!("{:x}", Sha256::digest(&bytes));
+            let plaintext = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            let encrypted = state
+                .model_secret_cipher
+                .encrypt(&plaintext)
+                .map_err(|_| ApiError::internal("Secret file encryption failed"))?;
+            sqlx::query(
+                "UPDATE user_secrets
+                 SET file_ciphertext = $1, file_nonce = $2, file_name = $3,
+                     file_size_bytes = $4, file_sha256 = $5, updated_at = now()
+                 WHERE id = $6 AND owner_id = $7",
+            )
+            .bind(encrypted.ciphertext)
+            .bind(encrypted.nonce)
+            .bind(file_name)
+            .bind(bytes.len() as i64)
+            .bind(sha)
+            .bind(secret_id)
+            .bind(user.id)
+            .execute(&state.pool)
+            .await?;
+        }
+        _ => return Err(ApiError::internal("secret kind is invalid")),
+    }
+    let row = sqlx::query(
+        "SELECT id, owner_id, name, kind, file_name, file_size_bytes, file_sha256,
+                created_at, updated_at
+         FROM user_secrets WHERE id = $1",
+    )
+    .bind(secret_id)
+    .fetch_one(&state.pool)
+    .await?;
+    Ok(Json(user_secret_from_row(row)))
+}
+
+pub(crate) async fn delete_user_secret(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(secret_id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    let name = sqlx::query_scalar::<_, String>(
+        "SELECT name FROM user_secrets WHERE id = $1 AND owner_id = $2",
+    )
+    .bind(secret_id)
+    .bind(user.id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(ApiError::not_found("secret not found"))?;
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("DELETE FROM user_secrets WHERE id = $1 AND owner_id = $2")
+        .bind(secret_id)
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM secret_grants WHERE user_id = $1 AND secret_name = $2")
+        .bind(user.id)
+        .bind(&name)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+struct SecretGrantListQuery {
+    agent_id: Option<Uuid>,
+}
+
+pub(crate) async fn list_secret_grants(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<SecretGrantListQuery>,
+) -> Result<Json<Vec<SecretGrantDto>>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    let mut builder = sqlx::QueryBuilder::<Postgres>::new(
+        "SELECT user_id, agent_id, secret_name, granted_at FROM secret_grants WHERE user_id = ",
+    );
+    builder.push_bind(user.id);
+    if let Some(agent_id) = query.agent_id {
+        builder.push(" AND agent_id = ");
+        builder.push_bind(agent_id);
+    }
+    builder.push(" ORDER BY granted_at DESC, secret_name");
+    let rows = builder.build().fetch_all(&state.pool).await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| SecretGrantDto {
+                user_id: row.get("user_id"),
+                agent_id: row.get("agent_id"),
+                secret_name: row.get("secret_name"),
+                granted_at: row.get("granted_at"),
+            })
+            .collect(),
+    ))
+}
+
+pub(crate) async fn create_secret_grants(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<CreateSecretGrantRequest>,
+) -> Result<Json<Vec<SecretGrantDto>>, ApiError> {
+    let (user, client_agent_id) = require_secret_grant_user(&state, &headers).await?;
+    if let Some(allowed_agent_id) = client_agent_id {
+        if allowed_agent_id != req.agent_id {
+            return Err(ApiError::forbidden(
+                "the Widget credential may only grant secrets for its Agent",
+            ));
+        }
+    }
+    load_agent_for_user(&state.pool, req.agent_id, &user).await?;
+    if req.secret_names.is_empty() || req.secret_names.len() > 128 {
+        return Err(ApiError::bad_request(
+            "secret_names must contain between 1 and 128 entries",
+        ));
+    }
+    let mut tx = state.pool.begin().await?;
+    for name in &req.secret_names {
+        if !validate_secret_name(name) {
+            return Err(ApiError::bad_request("secret name is invalid"));
+        }
+        let declared = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                SELECT 1 FROM agent_secret_declarations
+                WHERE agent_id = $1 AND name = $2
+             )",
+        )
+        .bind(req.agent_id)
+        .bind(name)
+        .fetch_one(&mut *tx)
+        .await?;
+        let owned = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                SELECT 1 FROM user_secrets WHERE owner_id = $1 AND name = $2
+             )",
+        )
+        .bind(user.id)
+        .bind(name)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !declared || !owned {
+            return Err(ApiError::bad_request(format!(
+                "secret {name} is not declared by the Agent or not owned by the user"
+            )));
+        }
+        sqlx::query(
+            "INSERT INTO secret_grants (user_id, agent_id, secret_name)
+             VALUES ($1, $2, $3)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(user.id)
+        .bind(req.agent_id)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    let rows = sqlx::query(
+        "SELECT user_id, agent_id, secret_name, granted_at
+         FROM secret_grants
+         WHERE user_id = $1 AND agent_id = $2
+           AND secret_name = ANY($3)
+         ORDER BY granted_at DESC, secret_name",
+    )
+    .bind(user.id)
+    .bind(req.agent_id)
+    .bind(&req.secret_names)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| SecretGrantDto {
+                user_id: row.get("user_id"),
+                agent_id: row.get("agent_id"),
+                secret_name: row.get("secret_name"),
+                granted_at: row.get("granted_at"),
+            })
+            .collect(),
+    ))
+}
+
+pub(crate) async fn require_secret_grant_user(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(UserDto, Option<Uuid>), ApiError> {
+    if let Some(token) = client_access_token_from_headers(headers) {
+        let mut tx = state.pool.begin().await?;
+        let credential = load_widget_credential_tx(&mut tx, &token, headers).await?;
+        if credential.is_anonymous() {
+            return Err(ApiError::forbidden(
+                "anonymous Widgets cannot grant secrets",
+            ));
+        }
+        let row = sqlx::query("SELECT id, email, display_name, role FROM users WHERE id = $1")
+            .bind(credential.owner_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(ApiError::unauthorized("Widget credential user not found"))?;
+        tx.commit().await?;
+        return Ok((user_from_row(row), Some(credential.agent_id)));
+    }
+    Ok((require_user(state, headers).await?, None))
+}
+
+pub(crate) async fn delete_secret_grant(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((agent_id, secret_name)): Path<(Uuid, String)>,
+) -> Result<StatusCode, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    if !validate_secret_name(&secret_name) {
+        return Err(ApiError::bad_request("secret name is invalid"));
+    }
+    sqlx::query(
+        "DELETE FROM secret_grants
+         WHERE user_id = $1 AND agent_id = $2 AND secret_name = $3",
+    )
+    .bind(user.id)
+    .bind(agent_id)
+    .bind(&secret_name)
+    .execute(&state.pool)
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub(crate) async fn load_skill_visible_by_user(
+    pool: &PgPool,
+    skill_id: Uuid,
+    user_id: Uuid,
+) -> Result<SkillDto, ApiError> {
+    let row = sqlx::query(
+        "SELECT skills.id, skills.owner_id,
+                (SELECT email FROM users WHERE id = skills.owner_id) AS owner_email,
+                skills.name, skills.description, skills.visibility, skills.public_to,
+                skills.content, skills.revision, skills.content_checksum_sha256,
+                skills.created_at, skills.updated_at,
+                packages.id AS package_id, packages.format_version AS package_format_version,
+                packages.size_bytes AS package_size_bytes,
+                packages.checksum_sha256 AS package_checksum_sha256,
+                packages.files AS package_files
+         FROM skills
+         LEFT JOIN skill_packages AS packages ON packages.id = skills.current_package_id
+         WHERE skills.id = $1
+           AND (skills.owner_id = $2 OR skills.visibility = 'public'
+                OR (skills.visibility = 'public_to' AND $2 = ANY(skills.public_to))
+                OR EXISTS (
+                    SELECT 1 FROM users
+                    WHERE users.id = $2 AND users.role IN ('admin', 'super_admin')
+                ))",
+    )
+    .bind(skill_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(skill_from_row)
+        .ok_or(ApiError::not_found("skill not found"))
+}
+
+pub(crate) async fn ensure_skills_visible_by_user(
+    pool: &PgPool,
+    skill_ids: &[Uuid],
+    user_id: Uuid,
+) -> Result<(), ApiError> {
+    for skill_id in skill_ids {
+        load_skill_visible_by_user(pool, *skill_id, user_id).await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn load_managed_skill_ids(
+    pool: &PgPool,
+    agent_id: Uuid,
+) -> Result<Vec<Uuid>, ApiError> {
+    let rows = sqlx::query(
+        "SELECT s.id
+         FROM agent_skills a_s
+         JOIN agents a ON a.id = a_s.agent_id
+         JOIN skills s ON s.id = a_s.skill_id
+         LEFT JOIN users AS owner ON owner.id = a.owner_id
+         WHERE a_s.agent_id = $1
+           AND (s.owner_id = a.owner_id OR s.visibility = 'public'
+                OR (s.visibility = 'public_to' AND a.owner_id = ANY(s.public_to))
+                OR owner.role IN ('admin', 'super_admin'))
+         ORDER BY s.created_at ASC",
+    )
+    .bind(agent_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|row| row.get("id")).collect())
 }
 
 pub(crate) fn validate_integration_app_payload(
