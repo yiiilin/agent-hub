@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && vite build && vite build --config vite.embed.config.ts",
     "test:e2e": "playwright test"
   },
   "dependencies": {

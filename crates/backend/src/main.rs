@@ -761,10 +761,18 @@ pub(crate) async fn widget_page(
     State(state): State<Arc<AppState>>,
     Query(query): Query<WidgetPageQuery>,
 ) -> Result<Response, ApiError> {
-    let contents =
-        tokio::fs::read_to_string(PathBuf::from(DEFAULT_FRONTEND_DIST_DIR).join("index.html"))
-            .await
-            .map_err(|_| ApiError::not_found("Widget frontend is unavailable"))?;
+    let contents = r#"<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent Hub Widget</title>
+  </head>
+  <body style="margin: 0">
+    <agent-hub-chat mode="fullscreen"></agent-hub-chat>
+    <script src="/embed/agent-hub-chat.js"></script>
+  </body>
+</html>"#;
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,

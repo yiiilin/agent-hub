@@ -198,7 +198,8 @@ function historyUpdatedAt(summary: SessionSummary) {
   return typeof summary.updated_at === 'string' ? summary.updated_at : summary.created_at;
 }
 
-export function WidgetApp({ token, appClientId }: { token?: string; appClientId?: string }) {
+export function WidgetApp({ token, appClientId, apiBase, embeddedMode }: { token?: string; appClientId?: string; apiBase?: string; embeddedMode?: 'bubble' | 'fullscreen' }) {
+  const baseUrl = apiBase ?? window.location.origin;
   const { language, locale, setLanguage, t } = useI18n();
   const storageKey = useMemo(() => persistedStateKey(appClientId), [appClientId]);
   const initialState = useMemo(() => readPersistedState(storageKey), [storageKey]);
@@ -399,12 +400,12 @@ export function WidgetApp({ token, appClientId }: { token?: string; appClientId?
     try {
       candidateClient = anonymousClientId
         ? await connectAnonymous({
-            baseUrl: window.location.origin,
+            baseUrl,
             clientId: anonymousClientId,
             fetch: widgetFetch
           })
         : await connect({
-            baseUrl: window.location.origin,
+            baseUrl,
             fetch: widgetFetch,
             authorize: async ({ signal }) => {
               if (!nextToken) throw new Error('Widget credential is required');

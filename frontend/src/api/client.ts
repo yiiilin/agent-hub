@@ -825,12 +825,18 @@ export type BulkDeleteSkillsRequest = {
   skill_ids: string[];
 };
 
+let apiBaseUrl = '';
+
+export function configureApiBase(url: string) {
+  apiBaseUrl = url;
+}
+
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   if (!(typeof FormData !== 'undefined' && init.body instanceof FormData) && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json');
   }
-  const response = await fetch(path, {
+  const response = await fetch(`${apiBaseUrl}${path}`, {
     ...init,
     credentials: 'include',
     headers

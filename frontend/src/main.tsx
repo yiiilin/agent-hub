@@ -16,20 +16,13 @@ import { AutomationsPage as AutomationsWorkspacePage } from './automations';
 import { RuntimesPage as RuntimesWorkspacePage } from './runtimes';
 import { ModelsPage } from './models';
 import { clearConversationDrafts } from './session-drafts';
-import { WidgetApp } from './widget';
 import { UsageDocsPage } from './usage-docs';
 import './styles.css';
 
-type Route = { name: 'login' } | { name: 'agents' } | { name: 'agent'; agentId: string } | { name: 'sessions'; sessionId?: string } | { name: 'integrations' } | { name: 'skills' } | { name: 'skill'; skillId: string } | { name: 'secrets' } | { name: 'models' } | { name: 'apiKeys' } | { name: 'guide' } | { name: 'docs' } | { name: 'automations' } | { name: 'runtimes' } | { name: 'administration' } | { name: 'widget'; token?: string; appClientId?: string } | { name: 'notFound' };
+type Route = { name: 'login' } | { name: 'agents' } | { name: 'agent'; agentId: string } | { name: 'sessions'; sessionId?: string } | { name: 'integrations' } | { name: 'skills' } | { name: 'skill'; skillId: string } | { name: 'secrets' } | { name: 'models' } | { name: 'apiKeys' } | { name: 'guide' } | { name: 'docs' } | { name: 'automations' } | { name: 'runtimes' } | { name: 'administration' } | { name: 'notFound' };
 
 function parseRoute(): Route {
   const path = window.location.pathname;
-  if (path.startsWith('/widget')) {
-    const token = new URLSearchParams(window.location.hash.slice(1)).get('token') ?? undefined;
-    if (token) window.history.replaceState(null, '', '/widget');
-    const appClientId = token ? undefined : new URLSearchParams(window.location.search).get('app') || undefined;
-    return { name: 'widget', token, appClientId };
-  }
   if (path.startsWith('/agents/')) {
     return { name: 'agent', agentId: path.split('/')[2] };
   }
@@ -99,14 +92,9 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (route.name === 'widget') {
-      setLoading(false);
-      return;
-    }
     api.me().then(setUser).catch(() => setUser(null)).finally(() => setLoading(false));
   }, [route.name]);
 
-  if (route.name === 'widget') return <WidgetApp token={route.token} appClientId={route.appClientId} />;
   if (loading) return <Shell user={user}><div className="panel">{t('loading')}</div></Shell>;
   if (!user || route.name === 'login') return <LoginPage onLogin={setUser} />;
 
