@@ -59,6 +59,14 @@ export function useChatAttachments(sessionId: string | null, upload: AttachmentU
     };
   }, []);
 
+  const revertSendingUpload = useCallback(() => {
+    // 发送失败时把随消息上传的附件条目从 uploading 恢复为 pending，
+    // 保留文件与顺序，允许用户重试；已单独上传完成的 ready 条目不受影响。
+    setItems((current) => current.map((item) => item.status === 'uploading'
+      ? { ...item, status: 'pending' as const, progress: 0 }
+      : item));
+  }, []);
+
   const clear = useCallback(() => {
     for (const controller of controllersRef.current.values()) controller.abort();
     controllersRef.current.clear();
@@ -158,6 +166,7 @@ export function useChatAttachments(sessionId: string | null, upload: AttachmentU
     openPicker,
     handleInputChange,
     markSendingForUpload,
+    revertSendingUpload,
     remove,
     clear,
     handleDragOver,

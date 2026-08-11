@@ -818,6 +818,7 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
     handleDrop: handleAttachmentDrop,
     addFiles: addAttachmentFiles,
     markSendingForUpload,
+    revertSendingUpload,
   } = useChatAttachments(selectedSession?.id ?? null, attachmentUploader);
   const sessionMessages = useMemo(
     () => messages.filter((message) => message.session_id === selectedId),
@@ -1282,6 +1283,7 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
       followBottomRef.current = true;
     } catch (caught) {
       if (!mountedRef.current) return;
+      revertSendingUpload();
       if (caught instanceof ApiError && caught.code === 'secret_grants_required' && caught.details?.secret_grants_required?.length) {
         const agentId = pendingConversationDraft ? pendingConversationDraft.agentId : selectedSession?.agent_id;
         if (agentId) {
