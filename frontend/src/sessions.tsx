@@ -692,6 +692,10 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
   const [stopping, setStopping] = useState(false);
   const [stopRequestedRunId, setStopRequestedRunId] = useState<string | null>(null);
   const [actionError, setActionError] = useState(false);
+  // Terminal statuses learned outside the event stream (e.g. an idempotent
+  // stop response that arrived after the Run already finished). Keyed by Run
+  // so it never pollutes the event timeline with synthetic entries.
+  const [terminalRunStatusById, setTerminalRunStatusById] = useState<Record<string, string>>({});
   const [conversationCreateError, setConversationCreateError] = useState(false);
   const [sessionListOpen, setSessionListOpen] = useState(false);
   const [sessionContextMenu, setSessionContextMenu] = useState<{ sessionId: string; x: number; y: number } | null>(null);
@@ -867,11 +871,14 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
   const activeRunEvents = activeRunId
     ? sessionEvents.filter((event) => event.run_id === activeRunId)
     : [];
-  const activeRunTerminal = activeRunEvents.some((event) => {
-    if (event.event_type !== 'status') return false;
-    const status = event.content ?? payloadString(event.payload, 'status');
-    return status !== null && terminalRunStatuses.has(status);
-  });
+  const activeRunTerminal = activeRunId !== null && (
+    terminalRunStatusById[activeRunId] !== undefined
+    || activeRunEvents.some((event) => {
+      if (event.event_type !== 'status') return false;
+      const status = event.content ?? payloadString(event.payload, 'status');
+      return status !== null && terminalRunStatuses.has(status);
+    })
+  );
   const activeRunStarted = activeRunEvents.some((event) => {
     if (event.event_type === 'turn_started') return true;
     if (event.event_type !== 'status') return false;
@@ -981,32 +988,38 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
     return () => controller.abort();
   }, [selectedId, sessionRunIdsKey]);
 
+  const selectedSessionRef = useRef(selectedSession);
+  selectedSessionRef.current = selectedSession;
+  const refreshSelectedSession = useCallback(() => {
+    const sessionId = selectedSessionRef.current?.id;
+    if (!sessionId) return;
+    const controller = new AbortController();
+    const refreshGeneration = ++sessionRefreshGeneration.current;
+    void Promise.allSettled([
+      api.session(sessionId, controller.signal),
+      api.sessionMessagePage(sessionId, { limit: sessionMessageRequestLimit }, controller.signal)
+    ]).then(([sessionResult, messageResult]) => {
+      if (!mountedRef.current
+        || sessionId !== selectedSessionRef.current?.id
+        || refreshGeneration !== sessionRefreshGeneration.current) return;
+      if (sessionResult.status === 'fulfilled') {
+        setSessions((current) => current.map((session) => (
+          session.id === sessionResult.value.id ? sessionResult.value : session
+        )));
+      }
+      if (messageResult.status === 'fulfilled') {
+        messageLoadGeneration.current += 1;
+        setMessages((current) => mergeSessionMessages(current, selectSessionMessagePage(messageResult.value).items));
+        setMessagesError(false);
+        setMessagesLoading(false);
+      }
+    });
+  }, []);
+
   useEffect(() => {
     const generation = ++streamGeneration.current;
     const controller = new AbortController();
     if (!activeRunId || !selectedSession || historyReadOnly) return () => controller.abort();
-    const refreshSelectedSession = () => {
-      const refreshGeneration = ++sessionRefreshGeneration.current;
-      void Promise.allSettled([
-        api.session(selectedSession.id, controller.signal),
-        api.sessionMessagePage(selectedSession.id, { limit: sessionMessageRequestLimit }, controller.signal)
-      ]).then(([sessionResult, messageResult]) => {
-        if (!mountedRef.current
-          || generation !== streamGeneration.current
-          || refreshGeneration !== sessionRefreshGeneration.current) return;
-        if (sessionResult.status === 'fulfilled') {
-          setSessions((current) => current.map((session) => (
-            session.id === sessionResult.value.id ? sessionResult.value : session
-          )));
-        }
-        if (messageResult.status === 'fulfilled') {
-          messageLoadGeneration.current += 1;
-          setMessages((current) => mergeSessionMessages(current, selectSessionMessagePage(messageResult.value).items));
-          setMessagesError(false);
-          setMessagesLoading(false);
-        }
-      });
-    };
     void api.streamRunEvents(activeRunId, controller.signal, (event) => {
       if (!mountedRef.current || generation !== streamGeneration.current) return;
       setEvents((current) => mergeRunEvents(current, [event]));
@@ -1228,10 +1241,25 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
     setStopping(true);
     setActionError(false);
     try {
-      await api.stopRun(activeRunId);
+      const run = await api.stopRun(activeRunId);
       if (mountedRef.current) setStopRequestedRunId(activeRunId);
+      if (run && terminalRunStatuses.has(run.status)) {
+        // The Run finished before the stop request landed; the backend returns
+        // it idempotently. Record the terminal status locally and merge the
+        // real event timeline so streaming-independent state clears even if
+        // the SSE terminal event was already missed.
+        setTerminalRunStatusById((current) => ({ ...current, [run.id]: run.status }));
+        void api.runEvents(run.id).then((events) => {
+          if (!mountedRef.current) return;
+          setEvents((current) => mergeRunEvents(current, events));
+        }).catch(() => {});
+      }
+      refreshSelectedSession();
     } catch {
       if (mountedRef.current) setActionError(true);
+      // A conflict (Run already terminal) must still re-sync the Session so
+      // the stale stop button and thinking state do not linger.
+      refreshSelectedSession();
     } finally {
       if (mountedRef.current) setStopping(false);
     }

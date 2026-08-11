@@ -6305,14 +6305,17 @@ mod tests {
         )
         .await
         .unwrap();
-        let stop_error = stop_integration_run(
+        let stop_result = stop_integration_run(
             State(completion_first.state.clone()),
             bearer_headers(&completion_first.integration_token),
             Path((completion_first.session_id, completion_first.run_id)),
         )
         .await
-        .unwrap_err();
-        assert_eq!(stop_error.status, StatusCode::CONFLICT);
+        .unwrap();
+        // Stopping an already-terminal Run is idempotent: it returns the Run
+        // as-is instead of a 409, so a client that raced natural completion
+        // still converges on the authoritative terminal state.
+        assert_eq!(stop_result.0.status, "completed");
     }
 
     #[sqlx::test(migrations = "./migrations")]

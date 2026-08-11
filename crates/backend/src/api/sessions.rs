@@ -2210,6 +2210,16 @@ pub(crate) async fn request_run_interrupt_tx(
     let run_status: String = run.get("status");
     let turn_id: Uuid = run.get("hub_turn_id");
     if !matches!(run_status.as_str(), "running" | "waiting_tool") {
+        // Idempotent stop: a Run that already reached a terminal state has
+        // nothing to interrupt. The Run finished between the UI showing the
+        // stop button and the request landing, so return it instead of a 409
+        // that would leave the client's UI stuck on a stale active Run.
+        if matches!(
+            run_status.as_str(),
+            "completed" | "failed" | "interrupted" | "cancelled"
+        ) {
+            return Ok(load_run_public_tx(tx, run_id).await?);
+        }
         return Err(ApiError::conflict("run has no active Turn to stop"));
     }
     if session_active_turn_id != Some(turn_id) {
@@ -6068,5 +6078,30 @@ mod tests {
         );
         assert!(objects.lock().unwrap().is_empty());
         server.abort();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn stop_on_terminal_run_is_idempotent_and_returns_the_run(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool.clone(), "workspace-write", "workspace-write").await;
+        sqlx::query("UPDATE runs SET status = 'completed' WHERE id = $1")
+            .bind(fixture.run_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        let run = request_run_interrupt_tx(&mut tx, fixture.run_id, fixture.hub_session_id)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(run.status, "completed");
+        let requested = sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+            "SELECT interrupt_requested_at FROM hub_session_turns WHERE id = $1",
+        )
+        .bind(fixture.turn_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(requested.is_none());
     }
 }

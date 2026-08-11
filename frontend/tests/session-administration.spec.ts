@@ -93,8 +93,11 @@ test('Session history hides internal queue state and exposes stop, recovery fail
   });
   await page.route('**/api/runs/run-active/stop', (route) => {
     stopRequests += 1;
-    return route.fulfill({ json: { id: 'run-active', status: 'running' } });
+    // Idempotent stop: the Run already reached a terminal state, so the
+    // backend returns it instead of a 409.
+    return route.fulfill({ json: { id: 'run-active', status: 'completed' } });
   });
+  await page.route('**/api/runs/run-active/events', (route) => route.fulfill({ json: [] }));
   await page.route('**/api/runs/run-queued/stop', (route) => {
     stopQueuedRequests += 1;
     return route.fulfill({ json: { id: 'run-queued', status: 'running' } });
@@ -141,8 +144,11 @@ test('Session history hides internal queue state and exposes stop, recovery fail
   // The newest queued Run must not hijack the stop target: the active Turn's Run
   // keeps owning the stop button while younger Runs are still queued.
   expect(stopQueuedRequests).toBe(0);
-  // Event streaming stays attached to the canonical active Run: its terminal
-  // event must clear the stop button instead of leaving it stuck.
+  // The idempotent stop response (Run already terminal) must clear the stop
+  // button on its own, without waiting for an SSE terminal event.
+  await expect(detail.getByRole('button', { name: 'Stop current run' })).toHaveCount(0);
+  // Event streaming stays attached to the canonical active Run; its terminal
+  // event is harmless on top of the recorded terminal status.
   gateHandle.release?.();
   await expect(detail.getByRole('button', { name: 'Stop current run' })).toHaveCount(0);
 
