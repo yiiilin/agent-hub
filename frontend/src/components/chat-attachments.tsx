@@ -7,6 +7,7 @@ export type PendingAttachment = {
   id: string;
   file: File;
   status: 'pending' | 'uploading' | 'ready' | 'error';
+  progress: number;
   error: string | null;
   attachment: HubSessionAttachment | null;
 };
@@ -14,6 +15,7 @@ export type PendingAttachment = {
 export type AttachmentUploader = (
   sessionId: string,
   file: File,
+  onProgress: ((loaded: number, total: number) => void) | undefined,
   signal?: AbortSignal
 ) => Promise<HubSessionAttachment>;
 
@@ -64,11 +66,16 @@ export function useChatAttachments(sessionId: string | null, upload: AttachmentU
     if (!targetSessionId) return;
     const controller = new AbortController();
     controllersRef.current.set(entry.id, controller);
-    void uploadRef.current(targetSessionId, entry.file, controller.signal)
+    void uploadRef.current(targetSessionId, entry.file, (loaded, total) => {
+      const percent = total > 0 ? Math.round((loaded / total) * 100) : 0;
+      setItems((current) => current.map((item) => item.id === entry.id
+        ? { ...item, progress: percent }
+        : item));
+    }, controller.signal)
       .then((attachment) => {
         controllersRef.current.delete(entry.id);
         setItems((current) => current.map((item) => item.id === entry.id
-          ? { ...item, status: 'ready', error: null, attachment }
+          ? { ...item, status: 'ready', progress: 100, error: null, attachment }
           : item));
       })
       .catch((error) => {
@@ -87,6 +94,7 @@ export function useChatAttachments(sessionId: string | null, upload: AttachmentU
       id: pendingAttachmentId(),
       file,
       status: targetSessionId ? ('uploading' as const) : ('pending' as const),
+      progress: 0,
       error: null,
       attachment: null
     }));
@@ -168,7 +176,7 @@ export function ComposerAttachmentPreview({ items, onRemove }: { items: PendingA
         {item.status === 'pending' && <span className="session-composer-attachment-status">{t('attachmentPending')}</span>}
         <span className="session-composer-attachment-name">{item.file.name}</span>
         <small>{formatAttachmentSize(item.file.size, locale)}</small>
-        {item.status === 'uploading' && <span className="session-composer-attachment-status">{t('attachmentUploading')}</span>}
+        {item.status === 'uploading' && <span className="session-composer-attachment-status">{t('attachmentUploading')}{item.progress > 0 ? ` ${item.progress}%` : ''}</span>}
         {item.status === 'error' && <span className="session-composer-attachment-status error">{t('attachmentUploadFailed')}</span>}
         <button type="button" className="icon-button session-composer-attachment-remove" aria-label={t('attachmentRemove')} title={t('attachmentRemove')} onClick={() => onRemove(item.id)}><X size={13} /></button>
       </div>

@@ -250,10 +250,10 @@ export function WidgetApp({ token, appClientId, apiBase, embeddedMode }: { token
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [hostOrigin, setHostOrigin] = useState<string | null>(initialHostOrigin);
-  const attachmentUploader = useCallback((sessionId: string, file: File, signal?: AbortSignal) => {
+  const attachmentUploader = useCallback((sessionId: string, file: File, onProgress?: (loaded: number, total: number) => void, signal?: AbortSignal) => {
     const token = selectedTokenRef.current ?? clientRef.current?.accessToken ?? '';
     if (!token) return Promise.reject(new Error('Widget credential unavailable'));
-    return api.uploadWidgetAttachment(sessionId, file, token, signal);
+    return api.uploadWidgetAttachment(sessionId, file, token, onProgress, signal);
   }, []);
   const {
     items: pendingAttachments,

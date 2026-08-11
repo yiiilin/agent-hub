@@ -836,6 +836,52 @@ export function configureApiBase(url: string) {
   apiBaseUrl = url;
 }
 
+export type UploadProgressListener = (loaded: number, total: number) => void;
+
+// fetch 没有上传进度事件，上传用 XMLHttpRequest（响应处理与 request 一致）。
+async function uploadRequest<T>(
+  path: string,
+  body: FormData,
+  headers: Record<string, string> | undefined,
+  onProgress: UploadProgressListener | undefined,
+  signal?: AbortSignal
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `${apiBaseUrl}${path}`);
+    if (headers) {
+      for (const [name, value] of Object.entries(headers)) xhr.setRequestHeader(name, value);
+    }
+    xhr.upload.onprogress = (event) => {
+      if (onProgress && event.lengthComputable) onProgress(event.loaded, event.total);
+    };
+    xhr.onload = () => {
+      let parsed: unknown = null;
+      try {
+        parsed = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+      } catch {
+        // 非 JSON 响应按错误处理
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(parsed as T);
+        return;
+      }
+      const message = (parsed as { error?: unknown } | null)?.error;
+      reject(new ApiError(xhr.status, 'request_failed', typeof message === 'string' ? message : 'Request failed', null));
+    };
+    xhr.onerror = () => reject(new ApiError(0, 'request_failed', 'Network error', null));
+    xhr.onabort = () => reject(new DOMException('Aborted', 'AbortError'));
+    if (signal) {
+      if (signal.aborted) {
+        xhr.abort();
+        return;
+      }
+      signal.addEventListener('abort', () => xhr.abort(), { once: true });
+    }
+    xhr.send(body);
+  });
+}
+
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   if (!(typeof FormData !== 'undefined' && init.body instanceof FormData) && !headers.has('Content-Type')) {
@@ -1374,26 +1420,17 @@ export const api = {
       body: JSON.stringify({ attachment_ids: attachmentIds }),
       signal
     }),
-  uploadAttachment: (sessionId: string, file: File, signal?: AbortSignal) => {
+  uploadAttachment: (sessionId: string, file: File, onProgress?: UploadProgressListener, signal?: AbortSignal) => {
     const body = new FormData();
     body.append('file', file);
     body.append('session_id', sessionId);
-    return request<HubSessionAttachment>('/api/attachments', {
-      method: 'POST',
-      body,
-      signal
-    });
+    return uploadRequest<HubSessionAttachment>('/api/attachments', body, undefined, onProgress, signal);
   },
-  uploadWidgetAttachment: (sessionId: string, file: File, token: string, signal?: AbortSignal) => {
+  uploadWidgetAttachment: (sessionId: string, file: File, token: string, onProgress?: UploadProgressListener, signal?: AbortSignal) => {
     const body = new FormData();
     body.append('file', file);
     body.append('session_id', sessionId);
-    return request<HubSessionAttachment>('/api/widget/attachments', {
-      method: 'POST',
-      body,
-      headers: { 'X-Agent-Hub-Embed-Token': token },
-      signal
-    });
+    return uploadRequest<HubSessionAttachment>('/api/widget/attachments', body, { 'X-Agent-Hub-Embed-Token': token }, onProgress, signal);
   },
   stopRun: (runId: string, signal?: AbortSignal) =>
     request<Run>(`/api/runs/${runId}/stop`, { method: 'POST', signal }),

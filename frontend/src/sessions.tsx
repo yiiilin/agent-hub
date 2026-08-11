@@ -800,8 +800,8 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
 
   const selectedSession = sessions.find((session) => session.id === selectedId) ?? null;
   const conversationAgentName = conversationDraft?.agentName ?? selectedSession?.agent_name ?? null;
-  const attachmentUploader = useCallback((sessionId: string, file: File, signal?: AbortSignal) =>
-    api.uploadAttachment(sessionId, file, signal), []);
+  const attachmentUploader = useCallback((sessionId: string, file: File, onProgress?: (loaded: number, total: number) => void, signal?: AbortSignal) =>
+    api.uploadAttachment(sessionId, file, onProgress, signal), []);
   const {
     items: pendingAttachments,
     readyIds: readyAttachmentIds,
