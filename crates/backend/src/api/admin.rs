@@ -1118,6 +1118,13 @@ pub(crate) async fn get_system_settings(
     Ok(Json(load_system_settings(&state.pool).await?))
 }
 
+pub(crate) async fn get_public_attachment_limits(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<SystemSettingsDto>, ApiError> {
+    // 公开接口：前端在文件选择时预检上传上限，无需登录。
+    Ok(Json(load_system_settings(&state.pool).await?))
+}
+
 pub(crate) async fn update_system_settings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,

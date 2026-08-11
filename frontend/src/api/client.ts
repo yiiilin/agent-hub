@@ -1079,6 +1079,8 @@ export const api = {
     }),
   systemSettings: (signal?: AbortSignal) =>
     request<SystemSettings>('/api/admin/system-settings', { signal }),
+  attachmentLimits: (signal?: AbortSignal) =>
+    request<SystemSettings>('/api/config/attachment-limits', { signal }),
   updateSystemSettings: (settings: SystemSettings, signal?: AbortSignal) =>
     request<SystemSettings>('/api/admin/system-settings', {
       method: 'PATCH',

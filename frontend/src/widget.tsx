@@ -265,6 +265,7 @@ export function WidgetApp({ token, appClientId, apiBase, embeddedMode }: { token
     handleInputChange: handleAttachmentInputChange,
     remove: removeAttachment,
     clear: clearAttachments,
+    limitError: attachmentLimitError,
     handleDragOver: handleAttachmentDragOver,
     handleDragLeave: handleAttachmentDragLeave,
     handleDrop: handleAttachmentDrop
@@ -933,6 +934,7 @@ export function WidgetApp({ token, appClientId, apiBase, embeddedMode }: { token
         {showThinking && <ChatThinkingBubble stage={activeThinking?.stage.key ?? 'runStageThinking'} detail={activeThinking?.stage.detail} lastEventAt={activeThinking?.lastEventAt} />}
       </div>
     </div>
+    {attachmentLimitError && <div className="session-banner error session-attachment-limit-error" role="alert">{attachmentLimitError}</div>}
     <form className={`session-composer session-chat-composer widget-composer${attachmentsDragging ? ' session-composer-dragging' : ''}`} onSubmit={submit} onDragOver={handleAttachmentDragOver} onDragLeave={handleAttachmentDragLeave} onDrop={handleAttachmentDrop}>
       <label><span className="sr-only">{t('message')}</span><textarea ref={composerRef} rows={2} aria-label={t('message')} value={draft} onChange={(event) => updateDraft(event.target.value)} onInput={(event) => resizeComposer(event.currentTarget)} onKeyDown={(event) => {
         if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return;

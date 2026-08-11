@@ -71,13 +71,15 @@ test('Session history hides internal queue state and exposes stop, recovery fail
     active: [
       message('active', 1, 'user', 'Inspect the rollout.'),
       message('active', 2, 'assistant', 'The rollout is still active.', { delivery_state: 'delivering' }),
-      message('active', 3, 'user', 'Check the Linux runtime first.', { delivery_mode: 'steer', delivery_state: 'queued' })
+      message('active', 3, 'user', 'Check the Linux runtime first.', { delivery_mode: 'steer', delivery_state: 'queued' }),
+      message('active', 4, 'user', 'Queue this one.', { delivery_mode: 'next_turn', delivery_state: 'queued', run_id: 'run-queued', turn_id: null })
     ],
     saving: [message('saving', 1, 'user', 'Save this workspace.', { delivery_state: 'queued' })],
     failed: [message('failed', 1, 'user', 'Resume after restore.')],
     historical: [message('historical', 1, 'assistant', 'Retained historical answer.')]
   };
   let stopRequests = 0;
+  let stopQueuedRequests = 0;
   await routeMe(page);
   await page.route('**/api/agents', (route) => route.fulfill({ json: [active, saving, failed].map((item) => ({
     id: item.agent_id,
@@ -92,6 +94,10 @@ test('Session history hides internal queue state and exposes stop, recovery fail
   await page.route('**/api/runs/run-active/stop', (route) => {
     stopRequests += 1;
     return route.fulfill({ json: { id: 'run-active', status: 'running' } });
+  });
+  await page.route('**/api/runs/run-queued/stop', (route) => {
+    stopQueuedRequests += 1;
+    return route.fulfill({ json: { id: 'run-queued', status: 'running' } });
   });
 
   await page.goto('/sessions');
@@ -109,6 +115,9 @@ test('Session history hides internal queue state and exposes stop, recovery fail
   await detail.getByRole('button', { name: 'Stop current run' }).click();
   await expect(detail.getByText('Stop requested. Completed actions are retained.')).toBeVisible();
   expect(stopRequests).toBe(1);
+  // The newest queued Run must not hijack the stop target: the active Turn's Run
+  // keeps owning the stop button while younger Runs are still queued.
+  expect(stopQueuedRequests).toBe(0);
 
   await agentFilter.selectOption(failed.agent_id);
   await page.getByRole('button', { name: /Recovery agent/ }).click();

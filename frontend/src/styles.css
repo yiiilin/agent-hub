@@ -1044,7 +1044,9 @@ textarea {
 .session-activity-output > span { color: #77777c; font-size: 10px; font-weight: 650; }
 .session-activity-output pre { min-width: 0; margin: 0; color: #414147; font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .session-activity-collapsible { min-width: 0; margin: 0; color: #414147; font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
-.session-lines-clamped { display: -webkit-box; -webkit-line-clamp: 15; -webkit-box-orient: vertical; overflow: hidden; }
+/* 折叠 = 底部视窗：限高容器由 useLatestLines 钉在 scrollTop 底部，展示最新
+   内容；不用 -webkit-line-clamp（只能从开头截断，会显示旧内容）。 */
+.session-lines-clamped { max-height: 248px; overflow: hidden; }
 .session-activity-content-toggle { align-self: start; border: 0; background: transparent; color: #77777c; font-size: 11px; font-weight: 650; padding: 2px 0 0; cursor: pointer; text-align: left; }
 .session-reasoning-live { margin: 4px 0 0; color: var(--color-muted-foreground); font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
 .session-chat-composer { position: relative; width: min(calc(100% - 32px), 768px); justify-self: center; display: grid; grid-template-columns: minmax(0, 1fr); gap: 2px; margin: 0 auto 16px; border: 1px solid var(--border-regular); border-radius: 22px; padding: 8px 9px 8px 15px; background: rgb(255 255 255 / 94%); box-shadow: 0 8px 24px rgb(0 0 0 / 9%), 0 1px 3px rgb(0 0 0 / 6%); backdrop-filter: blur(16px); }

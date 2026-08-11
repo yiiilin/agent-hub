@@ -372,8 +372,12 @@ function activityFromEvent(event: RunEvent): ActivityEntry | null {
   const endedAt = eventTimestamp(event.created_at);
   let summary: string | null = null;
   if (kind === 'reasoning') summary = payloadTextList(event.payload, 'summary');
-  else if (kind === 'command') summary = payloadString(event.payload, 'command');
-  else if (kind === 'file') summary = fileChangeSummary(event.payload);
+  else if (kind === 'command') {
+    const command = payloadString(event.payload, 'command');
+    // completed 阶段事件的 command 字段可能为空对象序列化（"{}"），
+    // 不能覆盖 started 阶段的真实命令。
+    summary = command && command !== '{}' ? command : null;
+  } else if (kind === 'file') summary = fileChangeSummary(event.payload);
   else if (itemType === 'mcpToolCall') {
     const server = payloadString(event.payload, 'server');
     const tool = payloadString(event.payload, 'tool');
@@ -479,49 +483,43 @@ function ActivityIcon({ kind }: { kind: ActivityKind }) {
 
 function useLatestLines(text: string, maxLines = 15) {
   const [expanded, setExpanded] = useState(false);
-  const [totalLines, setTotalLines] = useState(0);
-  const measureRef = useRef<HTMLPreElement | null>(null);
-  useEffect(() => {
-    const pre = measureRef.current;
-    if (!pre) return;
-    const update = () => {
-      // 测量实际渲染的视觉行数（自动换行、空行均按真实高度计入）。
-      const lineHeight = parseFloat(getComputedStyle(pre).lineHeight);
-      if (lineHeight > 0) setTotalLines(Math.round(pre.scrollHeight / lineHeight));
-    };
-    update();
-    const observer = new ResizeObserver(update);
-    observer.observe(pre);
-    return () => observer.disconnect();
-  }, [text]);
+  const scrollRef = useRef<HTMLPreElement | null>(null);
+  const totalLines = text.split('\n').length;
   const hidden = Math.max(0, totalLines - maxLines);
   const clamped = !expanded && hidden > 0;
+  // 折叠 = 底部视窗：全文仍在 DOM，但容器限高且钉在底部，用户看到的是最新
+  // 内容。不要在折叠时替换渲染文本——那会让 ResizeObserver 在全文/后缀之间
+  // 自激振荡；也不要依赖 -webkit-line-clamp（它只能从开头截断）。
+  useLayoutEffect(() => {
+    const pre = scrollRef.current;
+    if (pre && clamped) pre.scrollTop = pre.scrollHeight;
+  }, [text, clamped]);
   return {
     visible: text,
     hidden,
     clamped,
     expanded,
     toggle: () => setExpanded((value) => !value),
-    measureRef
+    scrollRef
   };
 }
 
 function CollapsibleBlock({ label, text }: { label: string; text: string }) {
   const { t } = useI18n();
-  const { visible, hidden, clamped, expanded, toggle, measureRef } = useLatestLines(text);
+  const { visible, hidden, clamped, expanded, toggle, scrollRef } = useLatestLines(text);
   return <div className="session-activity-output">
     <span>{label}</span>
     {hidden > 0 && <button type="button" className="session-activity-content-toggle" onClick={toggle}>{t(expanded ? 'activityCollapse' : 'activityLinesCollapsed').replace('{count}', String(hidden))}</button>}
-    <pre ref={measureRef} className={`session-activity-collapsible${clamped ? ' session-lines-clamped' : ''}`}>{visible}</pre>
+    <pre ref={scrollRef} className={`session-activity-collapsible${clamped ? ' session-lines-clamped' : ''}`}>{visible}</pre>
   </div>;
 }
 
 function CollapsibleLive({ text, className }: { text: string; className?: string }) {
   const { t } = useI18n();
-  const { visible, hidden, clamped, expanded, toggle, measureRef } = useLatestLines(text);
+  const { visible, hidden, clamped, expanded, toggle, scrollRef } = useLatestLines(text);
   return <>
     {hidden > 0 && <button type="button" className="session-activity-content-toggle" onClick={toggle}>{t(expanded ? 'activityCollapse' : 'activityLinesCollapsed').replace('{count}', String(hidden))}</button>}
-    <pre ref={measureRef} className={`${className ?? 'session-live-activity-output'}${clamped ? ' session-lines-clamped' : ''}`}>{visible}</pre>
+    <pre ref={scrollRef} className={`${className ?? 'session-live-activity-output'}${clamped ? ' session-lines-clamped' : ''}`}>{visible}</pre>
   </>;
 }
 
@@ -819,6 +817,7 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
     addFiles: addAttachmentFiles,
     markSendingForUpload,
     revertSendingUpload,
+    limitError,
   } = useChatAttachments(selectedSession?.id ?? null, attachmentUploader);
   const sessionMessages = useMemo(
     () => messages.filter((message) => message.session_id === selectedId),
@@ -852,6 +851,15 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
     )] as const;
   })), [sessionEvents, sessionMessages, sessionRunIds]);
   const activeRunId = useMemo(() => [...sessionMessages].reverse().find((message) => message.run_id)?.run_id ?? null, [sessionMessages]);
+  // Stop must target the Run owned by the active Turn, not the newest message's
+  // Run: a younger Run may already be queued (pending) while the active Turn is
+  // still executing, and stopping it would fail with "no active Turn to stop".
+  const stopTargetRunId = useMemo(() => {
+    if (!selectedSession?.active_turn_id) return activeRunId;
+    return [...sessionMessages].reverse().find((message) =>
+      message.turn_id === selectedSession.active_turn_id && message.run_id
+    )?.run_id ?? activeRunId;
+  }, [sessionMessages, selectedSession?.active_turn_id, activeRunId]);
   const activeRunUserMessage = activeRunId
     ? [...sessionMessages].reverse().find((message) => message.run_id === activeRunId && message.role === 'user') ?? null
     : null;
@@ -1215,12 +1223,12 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
   }
 
   async function stopCurrentRun() {
-    if (!activeRunId || stopping) return;
+    if (!stopTargetRunId || stopping) return;
     setStopping(true);
     setActionError(false);
     try {
-      await api.stopRun(activeRunId);
-      if (mountedRef.current) setStopRequestedRunId(activeRunId);
+      await api.stopRun(stopTargetRunId);
+      if (mountedRef.current) setStopRequestedRunId(stopTargetRunId);
     } catch {
       if (mountedRef.current) setActionError(true);
     } finally {
@@ -1520,6 +1528,7 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
               {selectedSession?.recovery_error && <div className="session-banner error session-recovery-notice" role="alert"><strong>{selectedSession.lifecycle_status === 'recovery_failed' ? t('sessionStatusRecoveryFailed') : t('sessionEnvironmentLost')}</strong><span>{selectedSession.recovery_error}</span></div>}
             </div>
           </div>
+          {canMutate && limitError && <div className="session-banner error session-attachment-limit-error" role="alert">{limitError}</div>}
           {canMutate && <form className={`session-composer session-chat-composer${attachmentsDragging ? ' session-composer-dragging' : ''}`} onSubmit={submitMessage} onDragOver={handleAttachmentDragOver} onDragLeave={handleAttachmentDragLeave} onDrop={handleAttachmentDrop}>
             <label><span className="sr-only">{t('message')}</span><textarea ref={composerRef} rows={2} aria-label={t('message')} value={draft} onChange={(event) => {
               setDraft(event.target.value);
@@ -1539,7 +1548,7 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
             <div>{canMutate && <span className="session-composer-attachment-controls">
               <input ref={attachmentInputRef} className="sr-only" type="file" multiple tabIndex={-1} aria-hidden="true" onChange={handleAttachmentInputChange} />
               <button type="button" className="icon-button session-attach-button" aria-label={t('attachment')} title={t('attachment')} disabled={sending || attachmentsUploading} onClick={openAttachmentPicker}><Paperclip size={17} /></button>
-            </span>}<span className="session-composer-actions">{selectedSession?.active_turn_id && activeRunId && <button type="button" className="icon-button session-stop-button" aria-label={t('stopCurrentRun')} title={t('stopCurrentRun')} disabled={stopping || stopRequestedRunId === activeRunId} onClick={stopCurrentRun}><Square size={14} /></button>}<button type="submit" className="icon-button session-send-button" aria-label={sending ? t('sending') : t('send')} title={t('send')} disabled={sending || attachmentsUploading || !draft.trim()}><ArrowUp size={18} /></button></span></div>
+            </span>}<span className="session-composer-actions">{activeRunInProgress && stopTargetRunId && (Boolean(selectedSession?.active_turn_id) || activeRunStarted) && <button type="button" className="icon-button session-stop-button" aria-label={t('stopCurrentRun')} title={t('stopCurrentRun')} disabled={stopping || stopRequestedRunId === stopTargetRunId} onClick={stopCurrentRun}><Square size={14} /></button>}<button type="submit" className="icon-button session-send-button" aria-label={sending ? t('sending') : t('send')} title={t('send')} disabled={sending || attachmentsUploading || !draft.trim()}><ArrowUp size={18} /></button></span></div>
           </form>}
         </>}
       </section>

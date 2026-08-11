@@ -7273,6 +7273,56 @@ mod tests {
     }
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn stop_after_claim_requests_interrupt_that_heartbeat_replays(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        assert_eq!(claim.run.status, "running");
+        sqlx::query(
+            "UPDATE hub_session_turns
+             SET native_turn_id = 'native-claimed-stop', status = 'starting'
+             WHERE id = $1",
+        )
+        .bind(fixture.turn_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET native_session_id = 'stop-claimed-thread', active_turn_id = $1
+             WHERE id = $2",
+        )
+        .bind(fixture.turn_id)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let mut tx = fixture.state.pool.begin().await.unwrap();
+        let run = request_run_interrupt_tx(&mut tx, fixture.run_id, fixture.hub_session_id)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(run.status, "running");
+        let heartbeat = runtime_heartbeat(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Json(RuntimeHeartbeatRequest {
+                accepts_session_commands: true,
+                ..RuntimeHeartbeatRequest::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(heartbeat.session_commands.len(), 1);
+        assert_eq!(heartbeat.session_commands[0].command, "interrupt");
+        assert_eq!(heartbeat.session_commands[0].run_id, Some(fixture.run_id));
+        assert_eq!(
+            heartbeat.session_commands[0].native_turn_id.as_deref(),
+            Some("native-claimed-stop")
+        );
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn runtime_interrupt_ack_is_generation_fenced_idempotent_and_stops_replay(pool: PgPool) {
         let fixture = integration_runtime_fixture(pool).await;
         sqlx::query(

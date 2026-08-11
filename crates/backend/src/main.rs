@@ -348,6 +348,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(get_system_settings).patch(update_system_settings),
         )
         .route(
+            "/api/config/attachment-limits",
+            get(get_public_attachment_limits),
+        )
+        .route(
             "/api/admin/external-platforms",
             get(list_external_platforms).post(create_external_platform),
         )

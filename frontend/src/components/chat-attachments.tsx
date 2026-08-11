@@ -1,6 +1,6 @@
 import { Download, FileText, Loader2, X } from 'lucide-react';
 import { type ChangeEvent, type DragEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { HubSessionAttachment } from '../api/client';
+import { api, type HubSessionAttachment } from '../api/client';
 import { useI18n } from '../i18n';
 
 export type PendingAttachment = {
@@ -36,14 +36,29 @@ export function formatAttachmentSize(bytes: number, locale: string) {
 }
 
 export function useChatAttachments(sessionId: string | null, upload: AttachmentUploader) {
+  const { t } = useI18n();
   const [items, setItems] = useState<PendingAttachment[]>([]);
   const [dragging, setDragging] = useState(false);
+  const [maxUploadBytes, setMaxUploadBytes] = useState<number | null>(null);
+  const [limitError, setLimitError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const controllersRef = useRef(new Map<string, AbortController>());
   const sessionIdRef = useRef(sessionId);
   sessionIdRef.current = sessionId;
   const uploadRef = useRef(upload);
   uploadRef.current = upload;
+  const maxUploadBytesRef = useRef(maxUploadBytes);
+  maxUploadBytesRef.current = maxUploadBytes;
+
+  useEffect(() => {
+    let active = true;
+    api.attachmentLimits().then((limits) => {
+      if (active) setMaxUploadBytes(limits.max_attachment_upload_bytes);
+    }).catch(() => {
+      // 预检不可用时跳过；后端仍会按系统配置兜底拒绝。
+    });
+    return () => { active = false; };
+  }, []);
 
   const markSendingForUpload = useCallback(() => {
     // 发送消息时随 multipart 一起提交的 pending 附件：标记为上传中，
@@ -81,6 +96,7 @@ export function useChatAttachments(sessionId: string | null, upload: AttachmentU
     controllersRef.current.get(id)?.abort();
     controllersRef.current.delete(id);
     setItems((current) => current.filter((item) => item.id !== id));
+    setLimitError(null);
   }, []);
 
   const uploadOne = useCallback((entry: PendingAttachment) => {
@@ -111,6 +127,20 @@ export function useChatAttachments(sessionId: string | null, upload: AttachmentU
 
   const addFiles = useCallback((files: readonly File[]) => {
     if (files.length === 0) return;
+    const limit = maxUploadBytesRef.current;
+    if (limit !== null) {
+      const overLimit = files.filter((file) => file.size > limit);
+      if (overLimit.length > 0) {
+        const names = overLimit.map((file) => file.name).join(', ');
+        const sizeMb = Math.round(limit / (1024 * 1024));
+        setLimitError(t('attachmentTooLarge').replace('{name}', names).replace('{size}', String(sizeMb)));
+        const allowed = files.filter((file) => file.size <= limit);
+        if (allowed.length === 0) return;
+        files = allowed;
+      } else {
+        setLimitError(null);
+      }
+    }
     const targetSessionId = sessionIdRef.current;
     const entries = [...files].map((file) => ({
       id: pendingAttachmentId(),
@@ -167,6 +197,7 @@ export function useChatAttachments(sessionId: string | null, upload: AttachmentU
     handleInputChange,
     markSendingForUpload,
     revertSendingUpload,
+    limitError,
     remove,
     clear,
     handleDragOver,
