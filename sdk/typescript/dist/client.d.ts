@@ -1,4 +1,4 @@
-import type { AgentHubClientOptions, AnonymousClientOptions, ClientAgent, ErrorSessionEvent, EventListOptions, MessagePage, MessagePageOptions, Run, SendOptions, SendResult, SessionEvent, SessionDeleteOptions, SessionEventListener, SessionListOptions, SessionMessage, SessionSummary, SubscribeOptions, ToolHandler, ToolHandlers, ToolJournalEntry, ToolJournalStorage, ToolRequestEvent, ToolTimeoutEvent } from "./types.js";
+import type { AgentHubClientOptions, AnonymousClientOptions, ClientAgent, ErrorSessionEvent, EventListOptions, MessagePage, MessagePageOptions, Run, SendOptions, SendResult, SessionEvent, SessionDeleteOptions, SessionEventListener, SessionListOptions, SessionMessage, SessionSummary, SubscribeOptions, ToolHandler, ToolHandlers, ToolJournalEntry, ToolJournalStorage, ToolRequestEvent, ToolResult, ToolTimeoutEvent } from "./types.js";
 interface SessionOperations {
     messages(sessionId: string, options: MessagePageOptions): Promise<MessagePage>;
     events(sessionId: string, options: EventListOptions): Promise<SessionEvent[]>;
@@ -14,6 +14,7 @@ interface ToolDispatchOutcome {
     blocked: boolean;
     event?: ToolTimeoutEvent | ErrorSessionEvent;
 }
+export declare function checkedToolResult(value: unknown): ToolResult;
 export declare class SessionSubscription {
     #private;
     readonly closed: Promise<void>;

@@ -199,6 +199,8 @@ export type ToolResult = ToolSuccessResult | ToolErrorResult;
 export interface ToolSuccessResult {
   status: "success";
   output: JsonValue;
+  /** SDK 因超过单次结果上限（16000 字节）自动截断时置 true，接入端可据此提示不完整。 */
+  truncated?: boolean;
 }
 
 export interface ToolErrorResult {

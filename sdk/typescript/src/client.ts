@@ -597,7 +597,35 @@ function handlerError(error: unknown): ToolResult {
   };
 }
 
-function checkedToolResult(value: unknown): ToolResult {
+/** 结构化截断 JSON 值：数组保留前 N 条+总量，字符串截断，对象递归压缩。 */
+function truncateJsonValue(value: JsonValue, depth = 0): JsonValue {
+  if (typeof value === "string") {
+    return value.length > 1000 ? `${value.slice(0, 1000)}…[truncated]` : value;
+  }
+  if (Array.isArray(value)) {
+    if (depth > 2) return { count: value.length, truncated: true };
+    const preview = value.slice(0, 20).map((item) => truncateJsonValue(item, depth + 1));
+    if (value.length > 20) {
+      return { count: value.length, truncated: true, preview };
+    }
+    return preview;
+  }
+  if (typeof value === "object" && value !== null) {
+    if (depth > 3) return "[object]";
+    const out: Record<string, JsonValue> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = truncateJsonValue(item as JsonValue, depth + 1);
+    }
+    return out;
+  }
+  return value;
+}
+
+function byteLength(value: string): number {
+  return new TextEncoder().encode(value).length;
+}
+
+export function checkedToolResult(value: unknown): ToolResult {
   let result: ToolResult;
   if (isToolResult(value)) {
     result = value;
@@ -624,17 +652,57 @@ function checkedToolResult(value: unknown): ToolResult {
       error: { code: "tool_result_not_json", message: "Client Tool result is not valid JSON", retryable: false },
     };
   }
-  if (new TextEncoder().encode(serialized).byteLength > MAX_TOOL_RESULT_BYTES) {
+  if (byteLength(serialized) > MAX_TOOL_RESULT_BYTES) {
+    // 保底：超过单次结果上限时自动结构化截断（数组保留前 20 条+总量、字符串截断、
+    // 对象递归压缩），并标记 truncated，而不是直接报错——接入端忘记自行处理大结果时
+    // 提交仍能成功，AI 看到 truncated 标记即知内容不完整。
+    if (result.status === "success" && isJsonValue(result.output)) {
+      const truncatedOutput = truncateJsonValue(result.output, 0);
+      const truncated: ToolResult = { status: "success", output: truncatedOutput, truncated: true };
+      const truncatedSerialized = JSON.stringify(truncated);
+      if (truncatedSerialized !== undefined && byteLength(truncatedSerialized) <= 15_000) {
+        return truncated;
+      }
+      // 第二轮更激进：字符串 200 字符、数组前 5 条。
+      const aggressiveOutput = truncateAggressively(result.output);
+      const aggressive: ToolResult = { status: "success", output: aggressiveOutput, truncated: true };
+      const aggressiveSerialized = JSON.stringify(aggressive);
+      if (aggressiveSerialized !== undefined && byteLength(aggressiveSerialized) <= 15_000) {
+        return aggressive;
+      }
+    }
     return {
       status: "error",
       error: {
         code: "tool_result_too_large",
-        message: `Client Tool result exceeds ${MAX_TOOL_RESULT_BYTES} bytes`,
+        message: `Client Tool result exceeds ${MAX_TOOL_RESULT_BYTES} bytes and could not be truncated`,
         retryable: false,
       },
     };
   }
   return result;
+}
+
+/** 激进截断：字符串 200 字符、数组前 5 条、对象仅保留前 8 个键。 */
+function truncateAggressively(value: JsonValue): JsonValue {
+  if (typeof value === "string") {
+    return value.length > 200 ? `${value.slice(0, 200)}…[truncated]` : value;
+  }
+  if (Array.isArray(value)) {
+    return {
+      count: value.length,
+      truncated: true,
+      preview: value.slice(0, 5).map((item) => truncateAggressively(item)),
+    };
+  }
+  if (typeof value === "object" && value !== null) {
+    const out: Record<string, JsonValue> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>).slice(0, 8)) {
+      out[key] = truncateAggressively(item as JsonValue);
+    }
+    return out;
+  }
+  return value;
 }
 
 export class SessionSubscription {

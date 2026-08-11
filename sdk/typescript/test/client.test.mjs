@@ -192,6 +192,34 @@ test("authenticated clients reuse a tab ID and never persist credentials", async
   const sessions = await first.sessions.list({ limit: 10 });
   assert.equal(sessions[0].id, "session-1");
 
+test("checked tool results over the size limit are truncated instead of failing", async () => {
+  const { checkedToolResult } = await import("../dist/client.js");
+
+  // 大数组：结构化截断（前 20 条 preview + count + truncated 标记），不再报 too_large
+  const bigArray = Array.from({ length: 2000 }, (_, i) => ({ id: i, name: `item-${i}-${"x".repeat(20)}` }));
+  const truncated = checkedToolResult({ status: "success", output: bigArray });
+  assert.equal(truncated.status, "success");
+  assert.equal(truncated.truncated, true);
+  assert.ok(Array.isArray(truncated.output.preview), "preview keeps leading items");
+  assert.equal(truncated.output.count, 2000, "count reports the original total");
+
+  // 大字符串：截断到较短长度
+  const truncatedString = checkedToolResult({ status: "success", output: "x".repeat(100_000) });
+  assert.equal(truncatedString.status, "success");
+  assert.equal(truncatedString.truncated, true);
+  assert.ok(String(truncatedString.output).length < 5000, "string output is cut down");
+
+  // 小结果不受影响（无 truncated 标记）
+  const small = checkedToolResult({ status: "success", output: { ok: true } });
+  assert.equal(small.status, "success");
+  assert.equal(small.truncated, undefined);
+
+  // 非 JSON 输出仍显式报错
+  const notJson = checkedToolResult({ status: "success", output: () => 1 });
+  assert.equal(notJson.status, "error");
+  assert.equal(notJson.error.code, "tool_result_not_json");
+});
+
 test("sessions.delete issues a DELETE request and resolves on 204", async () => {
   const requests = [];
   const authorize = async () => credential("secret-client-token");
@@ -602,8 +630,11 @@ test("Client Tool failures are structured and oversized or non-JSON outputs are 
   await waitFor(() => submitted.length === 4);
   subscription.dispose();
   await subscription.closed;
-  assert.deepEqual(submitted.map((result) => result.error.code), [
-    "tool_result_too_large",
+  // 超限结果现在由 SDK 自动截断（success + truncated），不再报 tool_result_too_large
+  assert.equal(submitted[0].status, "success");
+  assert.equal(submitted[0].truncated, true);
+  assert.ok(String(submitted[0].output).length < 5000);
+  assert.deepEqual(submitted.slice(1).map((result) => result.error.code), [
     "user_rejected",
     "tool_handler_failed",
     "tool_result_not_json",
