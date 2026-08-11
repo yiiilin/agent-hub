@@ -87,7 +87,7 @@ pub(crate) const EMBEDDED_ORIGIN_HEADER: &str = "x-agent-hub-embedded-origin";
 pub(crate) const MAX_ATTACHMENT_UPLOAD_BYTES: u64 = 104_857_600;
 pub(crate) const MAX_ATTACHMENT_BYTES_PER_SESSION: i64 = 524_288_000;
 pub(crate) const ATTACHMENT_UPLOAD_BODY_LIMIT: usize =
-    MAX_ATTACHMENT_UPLOAD_BYTES as usize + 64 * 1024;
+    MAX_ATTACHMENT_UPLOAD_BYTES as usize + 1024 * 1024;
 pub(crate) const VISION_PROXY_HEADER: &str = "x-agent-hub-vision";
 pub(crate) const CLIENT_ACCESS_TTL_SECONDS: i64 = 15 * 60;
 pub(crate) const CLIENT_TOOL_DEADLINE_MINUTES: i64 = 5;
@@ -457,7 +457,9 @@ pub(crate) fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/sessions",
-            get(list_hub_sessions).post(create_session_with_message),
+            get(list_hub_sessions)
+                .post(create_session_with_message)
+                .layer(DefaultBodyLimit::max(ATTACHMENT_UPLOAD_BODY_LIMIT)),
         )
         .route(
             "/api/sessions/{session_id}",

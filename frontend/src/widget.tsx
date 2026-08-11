@@ -273,7 +273,10 @@ export function WidgetApp({ token, appClientId, apiBase, embeddedMode }: { token
   const widgetFetch = useCallback<typeof fetch>((input, init) => {
     const headers = new Headers(input instanceof Request ? input.headers : undefined);
     new Headers(init?.headers).forEach((value, name) => headers.set(name, value));
-    const embeddedOrigin = hostOriginRef.current;
+    // 同源页面（顶层或同源 iframe）的 GET 请求不携带 Origin header，
+    // 匿名 API 依赖 Origin 校验，因此统一用 X-Agent-Hub-Embedded-Origin
+    // 上报宿主 Origin（后端要求 sec-fetch-site=same-origin 才接受）。
+    const embeddedOrigin = hostOriginRef.current ?? window.location.origin;
     if (embeddedOrigin) headers.set('X-Agent-Hub-Embedded-Origin', embeddedOrigin);
     return fetch(input, { ...init, headers });
   }, []);

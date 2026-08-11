@@ -486,7 +486,15 @@ pub(crate) async fn parse_message_multipart(
                 while let Some(chunk) = field
                     .chunk()
                     .await
-                    .map_err(|_| ApiError::bad_request("message attachment body is invalid"))?
+                    .map_err(|_| {
+                        if size > MAX_ATTACHMENT_UPLOAD_BYTES {
+                            ApiError::payload_too_large(
+                                "message attachment exceeds the 100MB limit",
+                            )
+                        } else {
+                            ApiError::bad_request("message attachment body is invalid")
+                        }
+                    })?
                 {
                     size = size.checked_add(chunk.len() as u64).ok_or_else(|| {
                         ApiError::bad_request("message attachment exceeds the 100MB limit")
@@ -1390,7 +1398,15 @@ pub(crate) async fn stage_attachment_upload(
                 while let Some(chunk) = field
                     .chunk()
                     .await
-                    .map_err(|_| ApiError::bad_request("attachment file body is invalid"))?
+                    .map_err(|_| {
+                        if size > MAX_ATTACHMENT_UPLOAD_BYTES {
+                            ApiError::payload_too_large(
+                                "attachment file exceeds the 100MB limit",
+                            )
+                        } else {
+                            ApiError::bad_request("attachment file body is invalid")
+                        }
+                    })?
                 {
                     size = size.checked_add(chunk.len() as u64).ok_or_else(|| {
                         ApiError::bad_request("attachment file exceeds the 100MB limit")
