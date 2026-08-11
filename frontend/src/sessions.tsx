@@ -850,16 +850,17 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
       acceptedAt.length > 0 ? Math.min(...acceptedAt) : undefined
     )] as const;
   })), [sessionEvents, sessionMessages, sessionRunIds]);
-  const activeRunId = useMemo(() => [...sessionMessages].reverse().find((message) => message.run_id)?.run_id ?? null, [sessionMessages]);
-  // Stop must target the Run owned by the active Turn, not the newest message's
-  // Run: a younger Run may already be queued (pending) while the active Turn is
-  // still executing, and stopping it would fail with "no active Turn to stop".
-  const stopTargetRunId = useMemo(() => {
-    if (!selectedSession?.active_turn_id) return activeRunId;
-    return [...sessionMessages].reverse().find((message) =>
-      message.turn_id === selectedSession.active_turn_id && message.run_id
-    )?.run_id ?? activeRunId;
-  }, [sessionMessages, selectedSession?.active_turn_id, activeRunId]);
+  const activeRunId = useMemo(() => {
+    if (selectedSession?.active_turn_id) {
+      // The active Turn owns the canonical Run: a younger queued Run must never
+      // hijack event streaming, thinking state, or the stop button. No match
+      // means no active Run (the Turn's messages may not be confirmed yet).
+      return [...sessionMessages].reverse().find((message) =>
+        message.turn_id === selectedSession.active_turn_id && message.run_id
+      )?.run_id ?? null;
+    }
+    return [...sessionMessages].reverse().find((message) => message.run_id)?.run_id ?? null;
+  }, [sessionMessages, selectedSession?.active_turn_id]);
   const activeRunUserMessage = activeRunId
     ? [...sessionMessages].reverse().find((message) => message.run_id === activeRunId && message.role === 'user') ?? null
     : null;
@@ -1223,12 +1224,12 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
   }
 
   async function stopCurrentRun() {
-    if (!stopTargetRunId || stopping) return;
+    if (!activeRunId || stopping) return;
     setStopping(true);
     setActionError(false);
     try {
-      await api.stopRun(stopTargetRunId);
-      if (mountedRef.current) setStopRequestedRunId(stopTargetRunId);
+      await api.stopRun(activeRunId);
+      if (mountedRef.current) setStopRequestedRunId(activeRunId);
     } catch {
       if (mountedRef.current) setActionError(true);
     } finally {
@@ -1548,7 +1549,7 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
             <div>{canMutate && <span className="session-composer-attachment-controls">
               <input ref={attachmentInputRef} className="sr-only" type="file" multiple tabIndex={-1} aria-hidden="true" onChange={handleAttachmentInputChange} />
               <button type="button" className="icon-button session-attach-button" aria-label={t('attachment')} title={t('attachment')} disabled={sending || attachmentsUploading} onClick={openAttachmentPicker}><Paperclip size={17} /></button>
-            </span>}<span className="session-composer-actions">{activeRunInProgress && stopTargetRunId && (Boolean(selectedSession?.active_turn_id) || activeRunStarted) && <button type="button" className="icon-button session-stop-button" aria-label={t('stopCurrentRun')} title={t('stopCurrentRun')} disabled={stopping || stopRequestedRunId === stopTargetRunId} onClick={stopCurrentRun}><Square size={14} /></button>}<button type="submit" className="icon-button session-send-button" aria-label={sending ? t('sending') : t('send')} title={t('send')} disabled={sending || attachmentsUploading || !draft.trim()}><ArrowUp size={18} /></button></span></div>
+            </span>}<span className="session-composer-actions">{activeRunInProgress && activeRunId && (Boolean(selectedSession?.active_turn_id) || activeRunStarted) && <button type="button" className="icon-button session-stop-button" aria-label={t('stopCurrentRun')} title={t('stopCurrentRun')} disabled={stopping || stopRequestedRunId === activeRunId} onClick={stopCurrentRun}><Square size={14} /></button>}<button type="submit" className="icon-button session-send-button" aria-label={sending ? t('sending') : t('send')} title={t('send')} disabled={sending || attachmentsUploading || !draft.trim()}><ArrowUp size={18} /></button></span></div>
           </form>}
         </>}
       </section>

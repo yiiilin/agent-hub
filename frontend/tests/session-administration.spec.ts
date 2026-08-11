@@ -99,6 +99,29 @@ test('Session history hides internal queue state and exposes stop, recovery fail
     stopQueuedRequests += 1;
     return route.fulfill({ json: { id: 'run-queued', status: 'running' } });
   });
+  // The event stream is opened when the detail mounts, so its route must exist
+  // up front. It stays gated until the stop is requested, then emits the
+  // active Run's terminal event; the queued Run's stream stays empty.
+  const gateHandle: { release: (() => void) | null } = { release: null };
+  const streamGate = new Promise<void>((resolve) => { gateHandle.release = () => resolve(); });
+  await page.route('**/api/runs/run-active/events/stream*', async (route) => {
+    await streamGate;
+    return route.fulfill({
+      contentType: 'text/event-stream',
+      body: 'event: run_event\ndata: {"seq":1,"created_at":"2026-07-15T08:00:00.000Z","run_id":"run-active","event_type":"status","content":"interrupted","payload":{"status":"interrupted"}}\n\n'
+    });
+  });
+  await page.route('**/api/runs/run-queued/events/stream*', (route) => route.fulfill({
+    contentType: 'text/event-stream',
+    body: ''
+  }));
+  let sessionDetailCalls = 0;
+  await page.route('**/api/sessions/active', (route) => {
+    sessionDetailCalls += 1;
+    return route.fulfill({
+      json: { ...active, active_turn_id: sessionDetailCalls > 1 ? null : 'turn-active' }
+    });
+  });
 
   await page.goto('/sessions');
   await expect(page.getByRole('heading', { name: 'Sessions', exact: true, level: 1 })).toBeVisible();
@@ -118,6 +141,10 @@ test('Session history hides internal queue state and exposes stop, recovery fail
   // The newest queued Run must not hijack the stop target: the active Turn's Run
   // keeps owning the stop button while younger Runs are still queued.
   expect(stopQueuedRequests).toBe(0);
+  // Event streaming stays attached to the canonical active Run: its terminal
+  // event must clear the stop button instead of leaving it stuck.
+  gateHandle.release?.();
+  await expect(detail.getByRole('button', { name: 'Stop current run' })).toHaveCount(0);
 
   await agentFilter.selectOption(failed.agent_id);
   await page.getByRole('button', { name: /Recovery agent/ }).click();
