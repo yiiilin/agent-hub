@@ -11,6 +11,7 @@ import {
   Settings,
   Shield,
   ShieldCheck,
+  SlidersHorizontal,
   UserX,
   Users,
   X
@@ -25,6 +26,7 @@ import {
   type ExternalPlatform,
   type LdapConfiguration,
   type LdapTestResult,
+  type SystemSettings,
   type User,
   type UserErasure,
   type UserRole
@@ -53,7 +55,7 @@ const emptyLdapConfiguration: LdapConfiguration = {
   skip_tls_verify: false
 };
 
-type AdministrationTab = 'authentication' | 'platforms' | 'users';
+type AdministrationTab = 'authentication' | 'platforms' | 'users' | 'system';
 type PlatformDialogState = { mode: 'create' } | { mode: 'edit'; platform: ExternalPlatform };
 type UserDialogState =
   | { kind: 'create' }
@@ -65,6 +67,69 @@ function Feedback({ error, notice }: { error: boolean; notice: string }) {
     {error && <div className="admin-alert error" role="alert">{t('administrationActionFailed')}</div>}
     {notice && <div className="admin-alert success" role="status">{notice}</div>}
   </>;
+}
+
+function SystemSettingsTab() {
+  const { t } = useI18n();
+  const [uploadMb, setUploadMb] = useState('');
+  const [sessionMb, setSessionMb] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [reload, setReload] = useState(0);
+
+  useEffect(() => {
+    setLoading(true);
+    setLoadError(false);
+    api.systemSettings().then((response) => {
+      setUploadMb(String(Math.round(response.max_attachment_upload_bytes / (1024 * 1024))));
+      setSessionMb(String(Math.round(response.max_attachment_bytes_per_session / (1024 * 1024))));
+    }).catch(() => setLoadError(true))
+      .finally(() => setLoading(false));
+  }, [reload]);
+
+  async function save() {
+    if (saving) return;
+    const upload = Number(uploadMb) * 1024 * 1024;
+    const session = Number(sessionMb) * 1024 * 1024;
+    if (!Number.isFinite(upload) || !Number.isFinite(session) || upload < 1024 * 1024) {
+      setSaveError(true);
+      return;
+    }
+    setSaving(true);
+    setSaveError(false);
+    setSaved(false);
+    try {
+      await api.updateSystemSettings({
+        max_attachment_upload_bytes: Math.round(upload),
+        max_attachment_bytes_per_session: Math.round(session)
+      });
+      setSaved(true);
+    } catch {
+      setSaveError(true);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="administration-tab-content">
+      <section className="admin-section administration-system" aria-labelledby="system-settings-title">
+        <header><SlidersHorizontal size={18} /><div><h2 id="system-settings-title">{t('systemSettings')}</h2><p>{t('systemSettingsHelp')}</p></div></header>
+        {loading ? <div className="compact-empty">{t('loadingSystemSettings')}</div>
+          : loadError ? <div className="error" role="alert"><span>{t('systemSettingsLoadFailed')}</span><button type="button" className="text-button" onClick={() => setReload((value) => value + 1)}>{t('retry')}</button></div>
+            : <form className="stack" onSubmit={(event) => { event.preventDefault(); void save(); }}>
+                <label>{t('maxAttachmentUploadMb')}<input type="number" min={1} max={1024} required value={uploadMb} onChange={(event) => { setUploadMb(event.target.value); setSaved(false); }} /><span className="administration-field-help">{t('maxAttachmentUploadMbHelp')}</span></label>
+                <label>{t('maxAttachmentSessionMb')}<input type="number" min={1} max={10240} required value={sessionMb} onChange={(event) => { setSessionMb(event.target.value); setSaved(false); }} /><span className="administration-field-help">{t('maxAttachmentSessionMbHelp')}</span></label>
+                {saveError && <div className="error" role="alert">{t('systemSettingsSaveFailed')}</div>}
+                {saved && <div className="success" role="status">{t('changesSaved')}</div>}
+                <button type="submit" className="primary admin-save" disabled={saving}><Save size={15} /> {saving ? t('saving') : t('saveSystemSettings')}</button>
+              </form>}
+      </section>
+    </div>
+  );
 }
 
 function AuthenticationTab() {
@@ -791,7 +856,8 @@ export function AdministrationPage({ currentUser }: { currentUser: User }) {
   const tabs = [
     { id: 'authentication' as const, label: t('authentication'), icon: ShieldCheck },
     { id: 'platforms' as const, label: t('externalPlatforms'), icon: Settings },
-    { id: 'users' as const, label: t('userManagement'), icon: Users }
+    { id: 'users' as const, label: t('userManagement'), icon: Users },
+    { id: 'system' as const, label: t('systemSettingsTab'), icon: SlidersHorizontal }
   ];
 
   function handleTabKeyDown(event: KeyboardEvent<HTMLButtonElement>, index: number) {
@@ -831,6 +897,7 @@ export function AdministrationPage({ currentUser }: { currentUser: User }) {
       {activeTab === 'authentication' && <AuthenticationTab />}
       {activeTab === 'platforms' && <ExternalPlatformsTab />}
       {activeTab === 'users' && <UsersTab currentUser={currentUser} />}
+      {activeTab === 'system' && <SystemSettingsTab />}
     </div>
   </div>;
 }

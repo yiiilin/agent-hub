@@ -417,8 +417,10 @@ pub(crate) struct ParsedMessageMultipart {
 }
 
 pub(crate) async fn parse_message_multipart(
+    pool: &PgPool,
     mut multipart: Multipart,
 ) -> Result<ParsedMessageMultipart, ApiError> {
+    let settings = load_system_settings(pool).await?;
     let mut agent_id = None;
     let mut content: Option<String> = None;
     let mut files = Vec::new();
@@ -483,25 +485,21 @@ pub(crate) async fn parse_message_multipart(
                 let mut bytes = Vec::new();
                 let mut hasher = Sha256::new();
                 let mut size = 0_u64;
-                while let Some(chunk) = field
-                    .chunk()
-                    .await
-                    .map_err(|_| {
-                        if size > MAX_ATTACHMENT_UPLOAD_BYTES {
-                            ApiError::payload_too_large(
-                                "message attachment exceeds the 100MB limit",
-                            )
-                        } else {
-                            ApiError::bad_request("message attachment body is invalid")
-                        }
-                    })?
-                {
+                while let Some(chunk) = field.chunk().await.map_err(|_| {
+                    if size > settings.max_attachment_upload_bytes as u64 {
+                        ApiError::payload_too_large(
+                            "message attachment exceeds the upload size limit",
+                        )
+                    } else {
+                        ApiError::bad_request("message attachment body is invalid")
+                    }
+                })? {
                     size = size.checked_add(chunk.len() as u64).ok_or_else(|| {
                         ApiError::bad_request("message attachment exceeds the 100MB limit")
                     })?;
-                    if size > MAX_ATTACHMENT_UPLOAD_BYTES {
+                    if size > settings.max_attachment_upload_bytes as u64 {
                         return Err(ApiError::payload_too_large(
-                            "message attachment exceeds the 100MB limit",
+                            "message attachment exceeds the upload size limit",
                         ));
                     }
                     hasher.update(&chunk);
@@ -647,7 +645,7 @@ pub(crate) async fn create_session_with_message(
     multipart: Multipart,
 ) -> Result<Json<SessionMessageAcceptanceDto>, ApiError> {
     let user = require_user(&state, &headers).await?;
-    let parsed = parse_message_multipart(multipart).await?;
+    let parsed = parse_message_multipart(&state.pool, multipart).await?;
     let agent_id = parsed
         .agent_id
         .ok_or(ApiError::bad_request("agent_id is required"))?;
@@ -707,7 +705,7 @@ pub(crate) async fn create_session_message_with_attachments(
     multipart: Multipart,
 ) -> Result<Json<SessionMessageAcceptanceDto>, ApiError> {
     let user = require_user(&state, &headers).await?;
-    let parsed = parse_message_multipart(multipart).await?;
+    let parsed = parse_message_multipart(&state.pool, multipart).await?;
     let session = sqlx::query(
         "SELECT agent_id, origin_kind
          FROM hub_sessions
@@ -1240,7 +1238,7 @@ pub(crate) async fn upload_attachment(
     multipart: Multipart,
 ) -> Result<Json<HubSessionAttachmentDto>, ApiError> {
     let user = require_user(&state, &headers).await?;
-    let staged = stage_attachment_upload(multipart).await?;
+    let staged = stage_attachment_upload(&state.pool, multipart).await?;
     let session_id = resolve_attachment_session_id(query.session_id, staged.session_id)?;
     upload_attachment_to_session(&state, session_id, user.id, staged).await
 }
@@ -1256,7 +1254,7 @@ pub(crate) async fn upload_widget_attachment(
     let mut tx = state.pool.begin().await?;
     let credential = load_widget_credential_tx(&mut tx, &token, &headers).await?;
     tx.commit().await?;
-    let staged = stage_attachment_upload(multipart).await?;
+    let staged = stage_attachment_upload(&state.pool, multipart).await?;
     let session_id = resolve_attachment_session_id(query.session_id, staged.session_id)?;
     let mut tx = state.pool.begin().await?;
     let scoped = load_widget_scoped_session_tx(&mut tx, &credential, None, Some(session_id), false)
@@ -1345,8 +1343,10 @@ pub(crate) async fn download_widget_attachment(
 }
 
 pub(crate) async fn stage_attachment_upload(
+    pool: &PgPool,
     mut multipart: Multipart,
 ) -> Result<StagedAttachmentUpload, ApiError> {
+    let settings = load_system_settings(pool).await?;
     let mut session_id = None;
     let mut file_name: Option<String> = None;
     let mut content_type: Option<String> = None;
@@ -1395,25 +1395,19 @@ pub(crate) async fn stage_attachment_upload(
                 let mut bytes = Vec::new();
                 let mut hasher = Sha256::new();
                 let mut size = 0_u64;
-                while let Some(chunk) = field
-                    .chunk()
-                    .await
-                    .map_err(|_| {
-                        if size > MAX_ATTACHMENT_UPLOAD_BYTES {
-                            ApiError::payload_too_large(
-                                "attachment file exceeds the 100MB limit",
-                            )
-                        } else {
-                            ApiError::bad_request("attachment file body is invalid")
-                        }
-                    })?
-                {
+                while let Some(chunk) = field.chunk().await.map_err(|_| {
+                    if size > settings.max_attachment_upload_bytes as u64 {
+                        ApiError::payload_too_large("attachment file exceeds the upload size limit")
+                    } else {
+                        ApiError::bad_request("attachment file body is invalid")
+                    }
+                })? {
                     size = size.checked_add(chunk.len() as u64).ok_or_else(|| {
                         ApiError::bad_request("attachment file exceeds the 100MB limit")
                     })?;
-                    if size > MAX_ATTACHMENT_UPLOAD_BYTES {
+                    if size > settings.max_attachment_upload_bytes as u64 {
                         return Err(ApiError::payload_too_large(
-                            "attachment file exceeds the 100MB limit",
+                            "attachment file exceeds the upload size limit",
                         ));
                     }
                     hasher.update(&chunk);
@@ -1508,9 +1502,12 @@ pub(crate) async fn upload_attachment_to_session(
     .await?;
     let size_bytes = i64::try_from(staged.bytes.len())
         .map_err(|_| ApiError::bad_request("attachment file is too large"))?;
+    let session_bytes_limit = load_system_settings(&state.pool)
+        .await?
+        .max_attachment_bytes_per_session;
     if current_total
         .checked_add(size_bytes)
-        .is_none_or(|total| total > MAX_ATTACHMENT_BYTES_PER_SESSION)
+        .is_none_or(|total| total > session_bytes_limit)
     {
         return Err(ApiError::bad_request(
             "session attachment storage limit exceeded",

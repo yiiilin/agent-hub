@@ -86,6 +86,19 @@ pub struct AuthPolicyDto {
     pub password_placeholder: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SystemSettingsDto {
+    pub max_attachment_upload_bytes: i64,
+    pub max_attachment_bytes_per_session: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateSystemSettingsRequest {
+    pub max_attachment_upload_bytes: i64,
+    pub max_attachment_bytes_per_session: i64,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LdapSecurityMode {

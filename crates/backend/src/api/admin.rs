@@ -1088,6 +1088,77 @@ pub(crate) async fn user_erasure_loop(state: Arc<AppState>) {
     }
 }
 
+pub(crate) const DEFAULT_MAX_ATTACHMENT_UPLOAD_BYTES: i64 = 104_857_600;
+pub(crate) const DEFAULT_MAX_ATTACHMENT_BYTES_PER_SESSION: i64 = 524_288_000;
+
+pub(crate) async fn load_system_settings(pool: &PgPool) -> Result<SystemSettingsDto, ApiError> {
+    let row = sqlx::query(
+        "SELECT max_attachment_upload_bytes, max_attachment_bytes_per_session
+         FROM system_settings WHERE singleton = true",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(match row {
+        Some(row) => SystemSettingsDto {
+            max_attachment_upload_bytes: row.get("max_attachment_upload_bytes"),
+            max_attachment_bytes_per_session: row.get("max_attachment_bytes_per_session"),
+        },
+        None => SystemSettingsDto {
+            max_attachment_upload_bytes: DEFAULT_MAX_ATTACHMENT_UPLOAD_BYTES,
+            max_attachment_bytes_per_session: DEFAULT_MAX_ATTACHMENT_BYTES_PER_SESSION,
+        },
+    })
+}
+
+pub(crate) async fn get_system_settings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<SystemSettingsDto>, ApiError> {
+    require_administrator(&state, &headers).await?;
+    Ok(Json(load_system_settings(&state.pool).await?))
+}
+
+pub(crate) async fn update_system_settings(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<UpdateSystemSettingsRequest>,
+) -> Result<Json<SystemSettingsDto>, ApiError> {
+    let user = require_administrator(&state, &headers).await?;
+    if !(1024 * 1024..=1024 * 1024 * 1024).contains(&req.max_attachment_upload_bytes) {
+        return Err(ApiError::bad_request(
+            "max attachment upload size must be between 1MB and 1GB",
+        ));
+    }
+    if req.max_attachment_bytes_per_session < req.max_attachment_upload_bytes {
+        return Err(ApiError::bad_request(
+            "max attachment bytes per session must not be smaller than the single upload limit",
+        ));
+    }
+    if req.max_attachment_bytes_per_session > 10_i64 * 1024 * 1024 * 1024 {
+        return Err(ApiError::bad_request(
+            "max attachment bytes per session must not exceed 10GB",
+        ));
+    }
+    require_administrator_role_tx(&mut state.pool.begin().await?, user.id).await?;
+    let row = sqlx::query(
+        "UPDATE system_settings
+         SET max_attachment_upload_bytes = $1,
+             max_attachment_bytes_per_session = $2,
+             updated_by = $3, updated_at = now()
+         WHERE singleton = true
+         RETURNING max_attachment_upload_bytes, max_attachment_bytes_per_session",
+    )
+    .bind(req.max_attachment_upload_bytes)
+    .bind(req.max_attachment_bytes_per_session)
+    .bind(user.id)
+    .fetch_one(&state.pool)
+    .await?;
+    Ok(Json(SystemSettingsDto {
+        max_attachment_upload_bytes: row.get("max_attachment_upload_bytes"),
+        max_attachment_bytes_per_session: row.get("max_attachment_bytes_per_session"),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1442,5 +1513,77 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn system_settings_require_admin_and_validate_ranges(pool: PgPool) {
+        let admin_token = create_user_session_with_role(&pool, "admin").await;
+        let member_token = create_user_session_with_role(&pool, "member").await;
+        let state = Arc::new(test_state_with_browser_session_auth(pool.clone()));
+
+        let defaults = get_system_settings(State(state.clone()), session_headers(&admin_token))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(defaults.max_attachment_upload_bytes, 104_857_600);
+        assert_eq!(defaults.max_attachment_bytes_per_session, 524_288_000);
+
+        assert!(
+            get_system_settings(State(state.clone()), session_headers(&member_token))
+                .await
+                .is_err()
+        );
+        assert!(update_system_settings(
+            State(state.clone()),
+            session_headers(&member_token),
+            Json(UpdateSystemSettingsRequest {
+                max_attachment_upload_bytes: 10 * 1024 * 1024,
+                max_attachment_bytes_per_session: 20 * 1024 * 1024,
+            }),
+        )
+        .await
+        .is_err());
+
+        // 单文件上限低于 1MB 拒绝；会话上限小于单文件上限拒绝。
+        assert!(update_system_settings(
+            State(state.clone()),
+            session_headers(&admin_token),
+            Json(UpdateSystemSettingsRequest {
+                max_attachment_upload_bytes: 512 * 1024,
+                max_attachment_bytes_per_session: 1024 * 1024,
+            }),
+        )
+        .await
+        .is_err());
+        assert!(update_system_settings(
+            State(state.clone()),
+            session_headers(&admin_token),
+            Json(UpdateSystemSettingsRequest {
+                max_attachment_upload_bytes: 10 * 1024 * 1024,
+                max_attachment_bytes_per_session: 5 * 1024 * 1024,
+            }),
+        )
+        .await
+        .is_err());
+
+        let updated = update_system_settings(
+            State(state.clone()),
+            session_headers(&admin_token),
+            Json(UpdateSystemSettingsRequest {
+                max_attachment_upload_bytes: 200 * 1024 * 1024,
+                max_attachment_bytes_per_session: 1024 * 1024 * 1024,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(updated.max_attachment_upload_bytes, 200 * 1024 * 1024);
+        assert_eq!(
+            load_system_settings(&state.pool)
+                .await
+                .unwrap()
+                .max_attachment_upload_bytes,
+            200 * 1024 * 1024
+        );
     }
 }

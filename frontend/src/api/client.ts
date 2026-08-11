@@ -441,6 +441,11 @@ export type AuthPolicy = {
   password_placeholder: string;
 };
 
+export type SystemSettings = {
+  max_attachment_upload_bytes: number;
+  max_attachment_bytes_per_session: number;
+};
+
 export type AuthProviders = AuthPolicy;
 
 export type LdapSecurityMode = 'ldaps' | 'starttls' | 'plain';
@@ -1024,6 +1029,14 @@ export const api = {
     request<AuthPolicy>('/api/admin/auth-policy', {
       method: 'PATCH',
       body: JSON.stringify(policy),
+      signal
+    }),
+  systemSettings: (signal?: AbortSignal) =>
+    request<SystemSettings>('/api/admin/system-settings', { signal }),
+  updateSystemSettings: (settings: SystemSettings, signal?: AbortSignal) =>
+    request<SystemSettings>('/api/admin/system-settings', {
+      method: 'PATCH',
+      body: JSON.stringify(settings),
       signal
     }),
   ldapConfiguration: (signal?: AbortSignal) =>

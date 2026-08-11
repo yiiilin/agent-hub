@@ -86,8 +86,7 @@ pub(crate) const MAX_CLIENT_TOOL_RESULT_BYTES: usize = 16_000;
 pub(crate) const EMBEDDED_ORIGIN_HEADER: &str = "x-agent-hub-embedded-origin";
 pub(crate) const MAX_ATTACHMENT_UPLOAD_BYTES: u64 = 104_857_600;
 pub(crate) const MAX_ATTACHMENT_BYTES_PER_SESSION: i64 = 524_288_000;
-pub(crate) const ATTACHMENT_UPLOAD_BODY_LIMIT: usize =
-    MAX_ATTACHMENT_UPLOAD_BYTES as usize + 1024 * 1024;
+pub(crate) const ATTACHMENT_UPLOAD_BODY_LIMIT: usize = 1024 * 1024 * 1024 + 1024 * 1024;
 pub(crate) const VISION_PROXY_HEADER: &str = "x-agent-hub-vision";
 pub(crate) const CLIENT_ACCESS_TTL_SECONDS: i64 = 15 * 60;
 pub(crate) const CLIENT_TOOL_DEADLINE_MINUTES: i64 = 5;
@@ -344,6 +343,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(get_ldap_configuration).put(update_ldap_configuration),
         )
         .route("/api/admin/ldap-config/test", post(test_ldap_configuration))
+        .route(
+            "/api/admin/system-settings",
+            get(get_system_settings).patch(update_system_settings),
+        )
         .route(
             "/api/admin/external-platforms",
             get(list_external_platforms).post(create_external_platform),
@@ -873,6 +876,10 @@ pub(crate) fn openapi_document() -> Value {
                 "get": { "summary": "Get authentication policy", "responses": { "200": response("AuthPolicy"), "403": { "$ref": "#/components/responses/Forbidden" } } },
                 "patch": { "summary": "Update authentication policy", "requestBody": body("AuthPolicy"), "responses": { "200": response("AuthPolicy"), "403": { "$ref": "#/components/responses/Forbidden" } } }
             },
+            "/api/admin/system-settings": {
+                "get": { "summary": "Get system-wide settings (attachment limits)", "responses": { "200": response("SystemSettings"), "403": { "$ref": "#/components/responses/Forbidden" } } },
+                "patch": { "summary": "Update system-wide settings", "requestBody": body("UpdateSystemSettingsRequest"), "responses": { "200": response("SystemSettings"), "400": { "$ref": "#/components/responses/BadRequest" }, "403": { "$ref": "#/components/responses/Forbidden" } } }
+            },
             "/api/admin/ldap-config": {
                 "get": { "summary": "Get the optional global LDAP configuration", "responses": { "200": response("NullableLdapConfiguration"), "403": { "$ref": "#/components/responses/Forbidden" } } },
                 "put": { "summary": "Save the global LDAP configuration", "requestBody": body("LdapConfiguration"), "responses": { "200": response("LdapConfiguration"), "400": { "$ref": "#/components/responses/BadRequest" }, "403": { "$ref": "#/components/responses/Forbidden" } } }
@@ -1204,6 +1211,8 @@ pub(crate) fn openapi_schemas() -> Value {
         "PasswordRegistrationResponse": { "type": "object", "required": ["user"], "properties": { "user": { "$ref": "#/components/schemas/User" } } },
         "AuthProvidersResponse": { "type": "object", "required": ["password_registration_enabled", "password_login_enabled", "ldap_login_enabled"], "properties": { "password_registration_enabled": { "type": "boolean" }, "password_login_enabled": { "type": "boolean" }, "ldap_login_enabled": { "type": "boolean" } } },
         "AuthPolicy": { "type": "object", "additionalProperties": false, "required": ["password_registration_enabled", "password_login_enabled", "ldap_login_enabled", "email_placeholder", "password_placeholder"], "properties": { "password_registration_enabled": { "type": "boolean" }, "password_login_enabled": { "type": "boolean" }, "ldap_login_enabled": { "type": "boolean" }, "email_placeholder": { "type": "string" }, "password_placeholder": { "type": "string" } } },
+        "SystemSettings": { "type": "object", "additionalProperties": false, "required": ["max_attachment_upload_bytes", "max_attachment_bytes_per_session"], "properties": { "max_attachment_upload_bytes": { "type": "integer", "minimum": 1048576, "maximum": 1073741824 }, "max_attachment_bytes_per_session": { "type": "integer", "minimum": 1048576, "maximum": 1.073741824e10 } } },
+        "UpdateSystemSettingsRequest": { "type": "object", "additionalProperties": false, "required": ["max_attachment_upload_bytes", "max_attachment_bytes_per_session"], "properties": { "max_attachment_upload_bytes": { "type": "integer", "minimum": 1048576, "maximum": 1073741824 }, "max_attachment_bytes_per_session": { "type": "integer", "minimum": 1048576, "maximum": 1.073741824e10 } } },
         "LdapConfiguration": { "type": "object", "additionalProperties": false, "required": ["url", "security", "base_dn", "bind_identity_template", "user_filter", "email_attribute", "display_name_attribute", "allow_insecure", "skip_tls_verify"], "properties": { "url": { "type": "string", "format": "uri" }, "security": { "type": "string", "enum": ["ldaps", "starttls", "plain"] }, "base_dn": { "type": "string" }, "bind_identity_template": { "type": "string", "default": "{email}", "description": "Bind identity template containing exactly one {email}; the substituted value is escaped as an LDAP DN attribute value." }, "user_filter": { "type": "string", "default": "(userPrincipalName={email})" }, "email_attribute": { "type": "string", "default": "mail" }, "display_name_attribute": { "type": "string", "default": "displayName" }, "allow_insecure": { "type": "boolean", "default": false }, "skip_tls_verify": { "type": "boolean", "default": false } } },
         "NullableLdapConfiguration": { "anyOf": [{ "$ref": "#/components/schemas/LdapConfiguration" }, { "type": "null" }] },
         "TestLdapConfigurationRequest": { "type": "object", "additionalProperties": false, "required": ["configuration", "email", "password"], "properties": { "configuration": { "$ref": "#/components/schemas/LdapConfiguration" }, "email": { "type": "string", "format": "email" }, "password": { "type": "string", "format": "password" } } },
