@@ -45,6 +45,20 @@ export function useChatAttachments(sessionId: string | null, upload: AttachmentU
   const uploadRef = useRef(upload);
   uploadRef.current = upload;
 
+  const markSendingForUpload = useCallback(() => {
+    // 发送消息时随 multipart 一起提交的 pending 附件：标记为上传中，
+    // 返回 multipart 上传进度回调（整体进度映射到各附件条目）。
+    setItems((current) => current.map((item) => item.status === 'pending'
+      ? { ...item, status: 'uploading' as const, progress: 0 }
+      : item));
+    return (loaded: number, total: number) => {
+      const percent = total > 0 ? Math.round((loaded / total) * 100) : 0;
+      setItems((current) => current.map((item) => item.status === 'uploading'
+        ? { ...item, progress: percent }
+        : item));
+    };
+  }, []);
+
   const clear = useCallback(() => {
     for (const controller of controllersRef.current.values()) controller.abort();
     controllersRef.current.clear();
@@ -143,6 +157,7 @@ export function useChatAttachments(sessionId: string | null, upload: AttachmentU
     addFiles,
     openPicker,
     handleInputChange,
+    markSendingForUpload,
     remove,
     clear,
     handleDragOver,
@@ -176,7 +191,7 @@ export function ComposerAttachmentPreview({ items, onRemove }: { items: PendingA
         {item.status === 'pending' && <span className="session-composer-attachment-status">{t('attachmentPending')}</span>}
         <span className="session-composer-attachment-name">{item.file.name}</span>
         <small>{formatAttachmentSize(item.file.size, locale)}</small>
-        {item.status === 'uploading' && <span className="session-composer-attachment-status">{t('attachmentUploading')}{item.progress > 0 ? ` ${item.progress}%` : ''}</span>}
+        {item.status === 'uploading' && <span className="session-composer-attachment-progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={item.progress}><span className="session-composer-attachment-progress-track"><span className="session-composer-attachment-progress-fill" style={{ width: `${item.progress}%` }} /></span><span className="session-composer-attachment-progress-text">{item.progress}%</span></span>}
         {item.status === 'error' && <span className="session-composer-attachment-status error">{t('attachmentUploadFailed')}</span>}
         <button type="button" className="icon-button session-composer-attachment-remove" aria-label={t('attachmentRemove')} title={t('attachmentRemove')} onClick={() => onRemove(item.id)}><X size={13} /></button>
       </div>

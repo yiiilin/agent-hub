@@ -1381,20 +1381,20 @@ export const api = {
     }),
   runs: (agentId: string, signal?: AbortSignal) => request<Run[]>(`/api/agents/${agentId}/runs`, { signal }),
  sessions: (signal?: AbortSignal) => request<HubSession[]>('/api/sessions', { signal }),
-  createSessionWithMessage: (agentId: string, content: string, files: File[], signal?: AbortSignal) => {
+  createSessionWithMessage: (agentId: string, content: string, files: File[], onProgress?: UploadProgressListener, signal?: AbortSignal) => {
     const form = new FormData();
     form.append('agent_id', agentId);
     form.append('content', content);
     for (const file of files) form.append('file', file);
-    return request<SessionMessageAcceptance>('/api/sessions', { method: 'POST', body: form, signal });
+    return uploadRequest<SessionMessageAcceptance>('/api/sessions', form, undefined, onProgress, signal);
   },
  session: (sessionId: string, signal?: AbortSignal) =>
    request<HubSession>(`/api/sessions/${sessionId}`, { signal }),
-  sendSessionMessageWithAttachments: (sessionId: string, content: string, files: File[], signal?: AbortSignal) => {
+  sendSessionMessageWithAttachments: (sessionId: string, content: string, files: File[], onProgress?: UploadProgressListener, signal?: AbortSignal) => {
     const form = new FormData();
     form.append('content', content);
     for (const file of files) form.append('file', file);
-    return request<SessionMessageAcceptance>(`/api/sessions/${sessionId}/messages/upload`, { method: 'POST', body: form, signal });
+    return uploadRequest<SessionMessageAcceptance>(`/api/sessions/${sessionId}/messages/upload`, form, undefined, onProgress, signal);
   },
   deleteSession: (sessionId: string, signal?: AbortSignal) =>
     request<void>(`/api/sessions/${sessionId}`, { method: 'DELETE', signal }),

@@ -816,7 +816,8 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
     handleDragOver: handleAttachmentDragOver,
     handleDragLeave: handleAttachmentDragLeave,
     handleDrop: handleAttachmentDrop,
-    addFiles: addAttachmentFiles
+    addFiles: addAttachmentFiles,
+    markSendingForUpload,
   } = useChatAttachments(selectedSession?.id ?? null, attachmentUploader);
   const sessionMessages = useMemo(
     () => messages.filter((message) => message.session_id === selectedId),
@@ -1239,7 +1240,8 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
         const draftFiles = pendingAttachmentFiles;
         let sessionId: string;
         if (draftFiles.length > 0) {
-          const accepted = await api.createSessionWithMessage(pendingConversationDraft.agentId, content, draftFiles);
+          const uploadProgress = markSendingForUpload();
+          const accepted = await api.createSessionWithMessage(pendingConversationDraft.agentId, content, draftFiles, uploadProgress);
           sessionId = accepted.message.session_id;
         } else {
           const run = await api.createRun(pendingConversationDraft.agentId, content);
@@ -1265,7 +1267,7 @@ export function SessionsPage({ currentUserId, initialSessionId }: { currentUserI
         return;
       }
       const accepted = pendingAttachmentFiles.length > 0
-        ? await api.sendSessionMessageWithAttachments(selectedSession!.id, content, pendingAttachmentFiles)
+        ? await api.sendSessionMessageWithAttachments(selectedSession!.id, content, pendingAttachmentFiles, markSendingForUpload())
         : await api.createSessionMessage(selectedSession!.id, { content, attachment_ids: readyAttachmentIds });
       if (!mountedRef.current) return;
       setMessages((current) => current.some((message) => message.id === accepted.message.id)

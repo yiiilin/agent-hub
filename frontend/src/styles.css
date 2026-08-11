@@ -1071,6 +1071,10 @@ textarea {
 .session-composer-attachment small { margin: 0; color: var(--text-tertiary); font-size: 11px; }
 .session-composer-attachment-status { color: var(--text-tertiary); font-size: 11px; }
 .session-composer-attachment-status.error { color: #9d332b; }
+.session-composer-attachment-progress { display: inline-flex; align-items: center; gap: 5px; min-width: 64px; }
+.session-composer-attachment-progress-track { width: 44px; height: 4px; border-radius: 2px; background: var(--border-subtle); overflow: hidden; }
+.session-composer-attachment-progress-fill { display: block; height: 100%; border-radius: 2px; background: var(--accent); transition: width 120ms linear; }
+.session-composer-attachment-progress-text { color: var(--text-tertiary); font-size: 11px; font-variant-numeric: tabular-nums; }
 .session-composer-attachment-remove { width: 22px; height: 22px; flex: 0 0 auto; border-radius: 50%; color: var(--text-tertiary); }
 .session-composer-attachment-remove:hover { color: #9d332b; background: #fff0ef; }
 .session-composer-attachment-spinner { color: var(--text-tertiary); animation: session-attachment-spin 1s linear infinite; }
