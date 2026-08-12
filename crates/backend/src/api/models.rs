@@ -3629,6 +3629,11 @@ mod tests {
                 instructions: "Use the selected model.".into(),
                 visibility: "private".into(),
                 public_to: Vec::new(),
+                endpoint_exposure: vec![
+                    "console".into(),
+                    "integration".into(),
+                    "automation".into(),
+                ],
                 model_selection: Some(selection_a),
                 model_settings: Some(AgentModelSettings::default()),
                 subagents: vec![SubagentDefinition {

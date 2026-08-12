@@ -706,6 +706,7 @@ pub(crate) async fn issue_authenticated_client_access(
          JOIN agents AS agent ON agent.id = delegated.agent_id
          WHERE delegated.app_id = $1 AND delegated.agent_id = $2
            AND agent.deleted_at IS NULL
+           AND 'integration' = ANY(agent.endpoint_exposure)
            AND ($3::boolean = false OR agent.tool_allowlist ? 'integration')
          FOR UPDATE OF agent, delegated",
     )
@@ -3551,6 +3552,7 @@ pub(crate) async fn validate_integration_app_agents_tx(
     let available = sqlx::query_scalar::<_, Uuid>(
         "SELECT id FROM agents
          WHERE id = ANY($1) AND deleted_at IS NULL
+           AND 'integration' = ANY(endpoint_exposure)
            AND (owner_id = $2 OR visibility = 'public'
                 OR (visibility = 'public_to' AND $2 = ANY(public_to)))
          ORDER BY id

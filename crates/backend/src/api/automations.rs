@@ -124,6 +124,7 @@ pub(crate) async fn create_automation(
     let agent = sqlx::query(
         "SELECT id, owner_id FROM agents
          WHERE id = $1 AND deleted_at IS NULL
+           AND 'automation' = ANY(endpoint_exposure)
            AND (owner_id = $2 OR visibility = 'public'
                 OR (visibility = 'public_to' AND $2 = ANY(public_to)))
          FOR UPDATE",

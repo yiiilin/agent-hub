@@ -98,7 +98,7 @@ pub(crate) async fn list_agents(
         "SELECT a.id, a.owner_id, owner.email AS owner_email, a.name, a.instructions, a.visibility, a.public_to,
                 a.runtime_id, a.model_connection_id, a.model_id, a.model_settings,
                 a.model_policy, a.sandbox_policy, a.mcp_allowlist, a.tool_allowlist,
-                a.created_at, a.updated_at
+                a.endpoint_exposure, a.created_at, a.updated_at
          FROM agents AS a
          JOIN users AS owner ON owner.id = a.owner_id
          WHERE a.deleted_at IS NULL
@@ -112,6 +112,8 @@ pub(crate) async fn list_agents(
            AND (a.owner_id = $1 OR a.visibility = 'public'
                 OR (a.visibility = 'public_to' AND $1 = ANY(a.public_to))
                 OR $2 IN ('admin', 'super_admin'))
+           AND (a.owner_id = $1 OR $2 IN ('admin', 'super_admin')
+                OR 'console' = ANY(a.endpoint_exposure))
          ORDER BY a.created_at DESC",
     )
     .bind(user.id)
@@ -141,8 +143,10 @@ pub(crate) async fn create_agent(
     let visibility = normalize_visibility(&req.visibility)?;
     validate_public_visibility_role(visibility, &user.role)?;
     validate_public_to(&state.pool, visibility, &req.public_to, user.id).await?;
+    let endpoint_exposure = normalize_endpoint_exposure(&req.endpoint_exposure)?;
     validate_subagent_definitions(&req.subagents)?;
     let tool_allowlist = normalize_agent_tool_allowlist(&req.tool_allowlist)?;
+    let endpoint_exposure = normalize_endpoint_exposure(&req.endpoint_exposure)?;
     let model_policy = json!({ "provider": "hub-proxy" });
     let id = Uuid::new_v4();
     let mut tx = state.pool.begin().await?;
@@ -190,8 +194,9 @@ pub(crate) async fn create_agent(
     sqlx::query(
         "INSERT INTO agents
              (id, owner_id, name, instructions, visibility, public_to, model_policy,
-              model_connection_id, model_id, model_settings, tool_allowlist)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+              model_connection_id, model_id, model_settings, tool_allowlist,
+              endpoint_exposure)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
     )
     .bind(id)
     .bind(user.id)
@@ -207,6 +212,7 @@ pub(crate) async fn create_agent(
         serde_json::to_value(tool_allowlist)
             .map_err(|_| ApiError::internal("Agent tool policy could not be encoded"))?,
     )
+    .bind(&endpoint_exposure)
     .execute(&mut *tx)
     .await?;
     replace_subagents_tx(&mut tx, id, &req.subagents).await?;
@@ -335,6 +341,7 @@ pub(crate) async fn update_agent(
         existing_agent.owner_id,
     )
     .await?;
+    let endpoint_exposure = normalize_endpoint_exposure(&req.endpoint_exposure)?;
     let mut tx = state.pool.begin().await?;
     req.model_settings = validate_agent_model_configuration_tx(
         &mut tx,
@@ -368,11 +375,11 @@ pub(crate) async fn update_agent(
          SET name = $1, instructions = $2, visibility = $3, public_to = $4, runtime_id = $5,
              model_connection_id = $6, model_id = $7, model_settings = $8,
              model_policy = $9, sandbox_policy = $10, mcp_allowlist = $11,
-             tool_allowlist = $12,
+             tool_allowlist = $12, endpoint_exposure = $13,
              execution_config_revision = execution_config_revision
-                 + CASE WHEN $13 THEN 1 ELSE 0 END,
+                 + CASE WHEN $14 THEN 1 ELSE 0 END,
              updated_at = now()
-         WHERE id = $14 AND deleted_at IS NULL
+         WHERE id = $15 AND deleted_at IS NULL
          ",
     )
     .bind(req.name.trim())
@@ -390,6 +397,7 @@ pub(crate) async fn update_agent(
         serde_json::to_value(&req.tool_allowlist)
             .map_err(|_| ApiError::internal("Agent tool policy could not be encoded"))?,
     )
+    .bind(&endpoint_exposure)
     .bind(execution_configuration_changed)
     .bind(agent_id)
     .execute(&mut *tx)
@@ -866,6 +874,50 @@ pub(crate) async fn create_run(
     Ok(Json(run))
 }
 
+/// 校验并规范化端点暴露列表：只允许已知端点、去重、保持稳定顺序。
+pub(crate) fn normalize_endpoint_exposure(
+    exposure: &[String],
+) -> Result<Vec<String>, ApiError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for endpoint in exposure {
+        if !matches!(endpoint.as_str(), "console" | "integration" | "automation") {
+            return Err(ApiError::bad_request(format!(
+                "unsupported agent endpoint: {endpoint}"
+            )));
+        }
+        seen.insert(endpoint.clone());
+    }
+    if seen.is_empty() {
+        return Err(ApiError::bad_request(
+            "agent must expose at least one endpoint",
+        ));
+    }
+    Ok(seen.into_iter().collect())
+}
+
+/// 校验 agent 是否暴露给指定端点（403 拒绝）。
+pub(crate) async fn ensure_agent_endpoint_allowed_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    agent_id: Uuid,
+    endpoint: &str,
+) -> Result<(), ApiError> {
+    let allowed: bool = sqlx::query_scalar(
+        "SELECT $2 = ANY(endpoint_exposure)
+         FROM agents WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(agent_id)
+    .bind(endpoint)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ApiError::not_found("agent not found"))?;
+    if !allowed {
+        return Err(ApiError::forbidden(format!(
+            "agent is not exposed to the {endpoint} endpoint"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn normalize_visibility(visibility: &str) -> Result<&'static str, ApiError> {
     match visibility.trim() {
         "private" => Ok("private"),
@@ -1030,7 +1082,7 @@ pub(crate) async fn load_agent_for_user(
         "SELECT a.id, a.owner_id, owner.email AS owner_email, a.name, a.instructions, a.visibility, a.public_to,
                 a.runtime_id, a.model_connection_id, a.model_id, a.model_settings,
                 a.model_policy, a.sandbox_policy, a.mcp_allowlist, a.tool_allowlist,
-                a.created_at, a.updated_at
+                a.endpoint_exposure, a.created_at, a.updated_at
          FROM agents AS a
          JOIN users AS owner ON owner.id = a.owner_id
          WHERE a.id = $1 AND a.deleted_at IS NULL
@@ -1066,7 +1118,8 @@ pub(crate) async fn load_agent_owned_by_user(
     let row = sqlx::query(
         "SELECT id, owner_id, name, instructions, visibility, public_to, runtime_id,
                 model_connection_id, model_id, model_settings,
-                model_policy, sandbox_policy, mcp_allowlist, tool_allowlist, created_at, updated_at
+                model_policy, sandbox_policy, mcp_allowlist, tool_allowlist,
+                endpoint_exposure, created_at, updated_at
          FROM agents
          WHERE id = $1 AND owner_id = $2 AND deleted_at IS NULL",
     )
@@ -1091,7 +1144,7 @@ pub(crate) async fn load_agent_manageable_by_user(
                 a.name, a.instructions, a.visibility, a.public_to,
                 a.runtime_id, a.model_connection_id, a.model_id, a.model_settings,
                 a.model_policy, a.sandbox_policy, a.mcp_allowlist, a.tool_allowlist,
-                a.created_at, a.updated_at
+                a.endpoint_exposure, a.created_at, a.updated_at
          FROM agents AS a
          WHERE a.id = $1 AND a.deleted_at IS NULL
            AND (a.owner_id = $2 OR $3 IN ('admin', 'super_admin'))",
@@ -2140,6 +2193,11 @@ mod tests {
                 instructions: "Initial instructions".into(),
                 visibility: "private".into(),
                 public_to: Vec::new(),
+                endpoint_exposure: vec![
+                    "console".into(),
+                    "integration".into(),
+                    "automation".into(),
+                ],
                 model_selection: None,
                 model_settings: Some(AgentModelSettings::default()),
                 subagents: Vec::new(),
@@ -2155,6 +2213,11 @@ mod tests {
             instructions: agent.instructions.clone(),
             visibility: agent.visibility.clone(),
             public_to: Vec::new(),
+            endpoint_exposure: vec![
+                "console".into(),
+                "integration".into(),
+                "automation".into(),
+            ],
             runtime_id: None,
             model_selection: agent.model_selection.clone(),
             model_settings: agent.model_settings.clone(),
@@ -2512,6 +2575,11 @@ mod tests {
                 instructions: "# Use the configured model".into(),
                 visibility: "private".into(),
                 public_to: Vec::new(),
+                endpoint_exposure: vec![
+                    "console".into(),
+                    "integration".into(),
+                    "automation".into(),
+                ],
                 model_selection: None,
                 model_settings: Some(AgentModelSettings {
                     reasoning_effort: ReasoningEffort::High,
@@ -2681,6 +2749,11 @@ mod tests {
                 instructions: "# Shared".into(),
                 visibility: "public_to".into(),
                 public_to: vec![caller.id],
+                endpoint_exposure: vec![
+                    "console".into(),
+                    "integration".into(),
+                    "automation".into(),
+                ],
                 model_selection: Some(test_model_selection(&default_connection)),
                 model_settings: Some(AgentModelSettings {
                     reasoning_effort: ReasoningEffort::Low,
@@ -2906,6 +2979,134 @@ mod tests {
             .await
             .unwrap(),
             0
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    async fn agent_endpoint_exposure_controls_console_listing_and_integration_automation_binding(
+        pool: PgPool,
+    ) {
+        let owner_token = create_user_session_with_role(&pool, "admin").await;
+        let other_token = create_user_session_with_role(&pool, "member").await;
+        let state = Arc::new(test_state_with_browser_session_auth(pool.clone()));
+
+        // 建一个只暴露 console 的私有 agent。
+        let agent = create_agent(
+            State(state.clone()),
+            session_headers(&owner_token),
+            Json(CreateAgentRequest {
+                name: "Console Only Agent".into(),
+                instructions: "run".into(),
+                visibility: "private".into(),
+                public_to: Vec::new(),
+                endpoint_exposure: vec!["console".into()],
+                model_selection: None,
+                model_settings: Some(AgentModelSettings::default()),
+                subagents: Vec::new(),
+                secret_declarations: Some(Vec::new()),
+                tool_allowlist: default_agent_tool_allowlist(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(agent.endpoint_exposure, vec!["console"]);
+
+        // console：owner 自己的列表仍可见。
+        let owner_list = list_agents(State(state.clone()), session_headers(&owner_token))
+            .await
+            .unwrap();
+        assert!(owner_list.iter().any(|item| item.id == agent.id));
+
+        // integration：owner 也不能把该 agent 绑给 Integration App（未暴露）。
+        let owner = require_user(&state, &session_headers(&owner_token)).await.unwrap();
+        let mut tx = state.pool.begin().await.unwrap();
+        let app_error = validate_integration_app_agents_tx(&mut tx, &owner, &[agent.id])
+            .await
+            .unwrap_err();
+        tx.rollback().await.unwrap();
+        assert_eq!(app_error.status, StatusCode::NOT_FOUND);
+
+        // automation：owner 也不能为该 agent 建自动化（未暴露）。
+        let automation_error = create_automation(
+            State(state.clone()),
+            session_headers(&owner_token),
+            Json(CreateAutomationRequest {
+                name: "Exposure Automation".into(),
+                agent_id: agent.id,
+                trigger_type: "manual".into(),
+                prompt: "run it".into(),
+                schedule: None,
+                enabled: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(automation_error.status, StatusCode::FORBIDDEN);
+
+        // 关闭 console 后：其他用户列表不再出现（visibility 也 private，双因）；
+        // owner 自己仍可见（管理）。
+        let updated = update_agent(
+            State(state.clone()),
+            session_headers(&owner_token),
+            Path(agent.id),
+            Json(UpdateAgentRequest {
+                name: agent.name.clone(),
+                instructions: agent.instructions.clone(),
+                visibility: "public".into(),
+                public_to: Vec::new(),
+                endpoint_exposure: Vec::new(),
+                runtime_id: None,
+                model_selection: agent.model_selection.clone(),
+                model_settings: agent.model_settings.clone(),
+                subagents: agent.subagents.clone(),
+                model_policy: agent.model_policy.clone(),
+                sandbox_policy: agent.sandbox_policy.clone(),
+                managed_skill_ids: agent.managed_skill_ids.clone(),
+                secret_declarations: Some(agent.secret_declarations.clone()),
+                mcp_allowlist: agent.mcp_allowlist.clone(),
+                tool_allowlist: agent.tool_allowlist.clone(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        // endpoint_exposure 不能为空（至少一个端点）。
+        assert_eq!(updated.status, StatusCode::BAD_REQUEST);
+
+        let updated = update_agent(
+            State(state.clone()),
+            session_headers(&owner_token),
+            Path(agent.id),
+            Json(UpdateAgentRequest {
+                name: agent.name.clone(),
+                instructions: agent.instructions.clone(),
+                visibility: "public".into(),
+                public_to: Vec::new(),
+                endpoint_exposure: vec!["integration".into()],
+                runtime_id: None,
+                model_selection: agent.model_selection.clone(),
+                model_settings: agent.model_settings.clone(),
+                subagents: agent.subagents.clone(),
+                model_policy: agent.model_policy.clone(),
+                sandbox_policy: agent.sandbox_policy.clone(),
+                managed_skill_ids: agent.managed_skill_ids.clone(),
+                secret_declarations: Some(agent.secret_declarations.clone()),
+                mcp_allowlist: agent.mcp_allowlist.clone(),
+                tool_allowlist: agent.tool_allowlist.clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(updated.endpoint_exposure, vec!["integration"]);
+
+        // console 关闭后：public 对其他用户隐藏（owner/admin 例外）。
+        let other_list = list_agents(State(state.clone()), session_headers(&other_token))
+            .await
+            .unwrap();
+        assert!(
+            !other_list.iter().any(|item| item.id == agent.id),
+            "agent without console exposure must not appear in another user's console list"
         );
     }
 }

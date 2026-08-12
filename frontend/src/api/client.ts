@@ -164,6 +164,7 @@ export type Agent = {
   instructions: string;
   visibility: string;
   public_to: string[];
+  endpoint_exposure: string[];
   runtime_id: string | null;
   model_selection: ModelSelection | null;
   model_settings: AgentModelSettings;
@@ -600,6 +601,7 @@ export type CreateConfiguredAgentRequest = {
   instructions: string;
   visibility: string;
   public_to: string[];
+  endpoint_exposure: string[];
   model_selection: ModelSelection | null;
   model_settings: AgentModelSettings;
   subagents: SubagentDefinition[];
@@ -1280,6 +1282,7 @@ export const api = {
         instructions: agent.instructions,
         visibility: agent.visibility,
         public_to: agent.public_to,
+        endpoint_exposure: agent.endpoint_exposure,
         runtime_id: agent.runtime_id,
         model_selection: agent.model_selection,
         model_settings: agent.model_settings,

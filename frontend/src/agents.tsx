@@ -637,6 +637,7 @@ function CreateAgentModal({ currentUser, navigate, onClose }: { currentUser: Use
   const [instructions, setInstructions] = useState(() => t('defaultAgentInstructions'));
   const [visibility, setVisibility] = useState('private');
   const [publicTo, setPublicTo] = useState<string[]>([]);
+  const [endpointExposure, setEndpointExposure] = useState<string[]>(['console', 'integration', 'automation']);
   const [users, setUsers] = useState<User[]>([]);
   const [usersLoading, setUsersLoading] = useState(true);
   const [usersError, setUsersError] = useState(false);
@@ -731,6 +732,7 @@ function CreateAgentModal({ currentUser, navigate, onClose }: { currentUser: Use
         instructions,
         visibility,
         public_to: visibility === 'public_to' ? publicTo : [],
+        endpoint_exposure: endpointExposure,
         model_selection: modelSelection,
         model_settings: modelSettings,
         subagents: subagents,
@@ -797,6 +799,11 @@ function CreateAgentModal({ currentUser, navigate, onClose }: { currentUser: Use
         </section>
         <ToolAllowlistPicker value={toolAllowlist} onChange={setToolAllowlist} disabled={pending} legend={t('toolAllowlist')} />
         <label>{t('visibility')}<select value={visibility} onChange={(event) => { setVisibility(event.target.value); if (event.target.value !== 'public_to') setPublicTo([]); }}><option value="private">{t('private')}</option><option value="public_to">{t('specificUsers')}</option>{canCreatePublic && <option value="public">{t('public')}</option>}</select></label>
+        <fieldset className="agent-endpoint-exposure" disabled={pending}><legend>{t('endpointExposure')}</legend>
+          <label className="check-row"><input type="checkbox" checked={endpointExposure.includes('console')} onChange={(event) => setEndpointExposure((current) => event.target.checked ? [...current, 'console'] : current.filter((value) => value !== 'console'))} /> {t('endpointConsole')}</label>
+          <label className="check-row"><input type="checkbox" checked={endpointExposure.includes('integration')} onChange={(event) => setEndpointExposure((current) => event.target.checked ? [...current, 'integration'] : current.filter((value) => value !== 'integration'))} /> {t('endpointIntegration')}</label>
+          <label className="check-row"><input type="checkbox" checked={endpointExposure.includes('automation')} onChange={(event) => setEndpointExposure((current) => event.target.checked ? [...current, 'automation'] : current.filter((value) => value !== 'automation'))} /> {t('endpointAutomation')}</label>
+        </fieldset>
         {visibility === 'public_to' && <fieldset className="agent-user-picker" disabled={pending || usersLoading}><legend>{t('agentPublicTo')}</legend>
           {usersLoading ? <span>{t('loadingUsers')}</span> : usersError ? <div role="alert"><span>{t('usersLoadFailed')}</span><button type="button" className="text-button" onClick={loadUsers}>{t('retry')}</button></div> : users.map((user) => <label className="check-row" key={user.id}><input type="checkbox" checked={publicTo.includes(user.id)} onChange={(event) => setPublicTo((current) => event.target.checked ? [...current, user.id] : current.filter((id) => id !== user.id))} /> {user.display_name} ({user.email})</label>)}</fieldset>}
         {error && <div className="error" role="alert">{t('agentCreateFailed')}</div>}
@@ -954,8 +961,8 @@ export function AgentPage({
   const [modelBase, setModelBase] = useState<AgentModelDraft>({ modelSelection: null, modelSettings: automaticAgentModelSettings, subagents: [] });
   const [secretDraft, setSecretDraft] = useState<AgentSecretDeclaration[]>([]);
   const [secretBase, setSecretBase] = useState<AgentSecretDeclaration[]>([]);
-  const [accessDraft, setAccessDraft] = useState({ visibility: 'private', publicTo: [] as string[], runtimeId: null as string | null, toolAllowlist: [...builtInTools] as string[] });
-  const [accessBase, setAccessBase] = useState({ visibility: 'private', publicTo: [] as string[], runtimeId: null as string | null, toolAllowlist: [...builtInTools] as string[] });
+  const [accessDraft, setAccessDraft] = useState({ visibility: 'private', publicTo: [] as string[], runtimeId: null as string | null, toolAllowlist: [...builtInTools] as string[], endpointExposure: ['console', 'integration', 'automation'] as string[] });
+  const [accessBase, setAccessBase] = useState({ visibility: 'private', publicTo: [] as string[], runtimeId: null as string | null, toolAllowlist: [...builtInTools] as string[], endpointExposure: ['console', 'integration', 'automation'] as string[] });
 
   const mounted = useRef(true);
   const loadGeneration = useRef(0);
@@ -980,7 +987,8 @@ export function AgentPage({
   const accessDirty = accessDraft.visibility !== accessBase.visibility
     || !sameIds(accessDraft.publicTo, accessBase.publicTo)
     || accessDraft.runtimeId !== accessBase.runtimeId
-    || !sameIds(accessDraft.toolAllowlist, accessBase.toolAllowlist);
+    || !sameIds(accessDraft.toolAllowlist, accessBase.toolAllowlist)
+    || !sameIds(accessDraft.endpointExposure, accessBase.endpointExposure);
   const dirty = instructionDirty || skillsDirty || mcpDirty || modelDirty || secretDirty || subagentDialogDirty || accessDirty;
 
   const applyLoadedAgent = useCallback((loaded: Agent) => {
@@ -999,7 +1007,8 @@ export function AgentPage({
       visibility: loaded.visibility,
       publicTo: loaded.public_to,
       runtimeId: loaded.runtime_id,
-      toolAllowlist: normalizeToolAllowlist(loaded.tool_allowlist)
+      toolAllowlist: normalizeToolAllowlist(loaded.tool_allowlist),
+      endpointExposure: loaded.endpoint_exposure
     };
     setAccessDraft(access);
     setAccessBase(access);
@@ -1150,6 +1159,7 @@ export function AgentPage({
         ...next,
         visibility: accessDraft.visibility,
         public_to: accessDraft.visibility === 'public_to' ? accessDraft.publicTo : [],
+        endpoint_exposure: accessDraft.endpointExposure,
         runtime_id: accessDraft.runtimeId,
         tool_allowlist: accessDraft.toolAllowlist
       };
@@ -1177,7 +1187,7 @@ export function AgentPage({
         setSecretBase(updated.secret_declarations);
       }
       if (tab === 'access') {
-        const saved = { visibility: updated.visibility, publicTo: updated.public_to, runtimeId: updated.runtime_id, toolAllowlist: normalizeToolAllowlist(updated.tool_allowlist) };
+        const saved = { visibility: updated.visibility, publicTo: updated.public_to, runtimeId: updated.runtime_id, toolAllowlist: normalizeToolAllowlist(updated.tool_allowlist), endpointExposure: updated.endpoint_exposure };
         setAccessDraft(saved);
         setAccessBase(saved);
       }
@@ -1401,7 +1411,12 @@ export function AgentPage({
               </table>
             </div>
           </section>
-          <section id="agent-panel-access" role="tabpanel" aria-labelledby="agent-tab-access" aria-label={t('tabAccess')} hidden={activeTab !== 'access'}>{agent.can_manage ? <form className="stack" onSubmit={(event) => saveAgentTab(event, 'access')}><label>{t('visibility')}<select disabled={configPending} value={accessDraft.visibility} onChange={(event) => setAccessDraft((current) => ({ ...current, visibility: event.target.value, publicTo: event.target.value === 'public_to' ? current.publicTo : [] }))}><option value="private">{t('private')}</option><option value="public_to">{t('specificUsers')}</option>{(canSetPublic || accessDraft.visibility === 'public') && <option value="public">{t('public')}</option>}</select></label>{accessDraft.visibility === 'public_to' && <fieldset className="agent-user-picker" disabled={configPending}><legend>{t('agentPublicTo')}</legend>{users.filter((user) => user.id !== agent.owner_id).map((user) => <label className="check-row" key={user.id}><input type="checkbox" checked={accessDraft.publicTo.includes(user.id)} onChange={(event) => setAccessDraft((current) => ({ ...current, publicTo: event.target.checked ? [...current.publicTo, user.id] : current.publicTo.filter((id) => id !== user.id) }))} /> {user.display_name} ({user.email})</label>)}</fieldset>}<label>{t('runtime')}<select disabled={configPending} value={accessDraft.runtimeId ?? ''} onChange={(event) => setAccessDraft((current) => ({ ...current, runtimeId: event.target.value || null }))}><option value="">{t('automatic')}</option>{runtimes.map((item) => <option key={item.id} value={item.id}>{item.hostname} · {runtimeStatusLabel(item.status, t)}</option>)}</select></label><ToolAllowlistPicker value={accessDraft.toolAllowlist} onChange={(toolAllowlist) => setAccessDraft((current) => ({ ...current, toolAllowlist }))} disabled={configPending} legend={t('toolAllowlist')} /><button className="primary" disabled={configPending || !accessDirty}><Save size={16} /> {configPending ? t('saving') : t('saveAgent')}</button></form> : <div className="agent-readonly">{visibilityLabel(agent.visibility, t)}</div>}</section>
+          <section id="agent-panel-access" role="tabpanel" aria-labelledby="agent-tab-access" aria-label={t('tabAccess')} hidden={activeTab !== 'access'}>{agent.can_manage ? <form className="stack" onSubmit={(event) => saveAgentTab(event, 'access')}><label>{t('visibility')}<select disabled={configPending} value={accessDraft.visibility} onChange={(event) => setAccessDraft((current) => ({ ...current, visibility: event.target.value, publicTo: event.target.value === 'public_to' ? current.publicTo : [] }))}><option value="private">{t('private')}</option><option value="public_to">{t('specificUsers')}</option>{(canSetPublic || accessDraft.visibility === 'public') && <option value="public">{t('public')}</option>}</select></label>
+<fieldset className="agent-endpoint-exposure" disabled={configPending}><legend>{t('endpointExposure')}</legend>
+  <label className="check-row"><input type="checkbox" checked={accessDraft.endpointExposure.includes('console')} onChange={(event) => setAccessDraft((current) => ({ ...current, endpointExposure: event.target.checked ? [...current.endpointExposure, 'console'] : current.endpointExposure.filter((value) => value !== 'console') }))} /> {t('endpointConsole')}</label>
+  <label className="check-row"><input type="checkbox" checked={accessDraft.endpointExposure.includes('integration')} onChange={(event) => setAccessDraft((current) => ({ ...current, endpointExposure: event.target.checked ? [...current.endpointExposure, 'integration'] : current.endpointExposure.filter((value) => value !== 'integration') }))} /> {t('endpointIntegration')}</label>
+  <label className="check-row"><input type="checkbox" checked={accessDraft.endpointExposure.includes('automation')} onChange={(event) => setAccessDraft((current) => ({ ...current, endpointExposure: event.target.checked ? [...current.endpointExposure, 'automation'] : current.endpointExposure.filter((value) => value !== 'automation') }))} /> {t('endpointAutomation')}</label>
+</fieldset>{accessDraft.visibility === 'public_to' && <fieldset className="agent-user-picker" disabled={configPending}><legend>{t('agentPublicTo')}</legend>{users.filter((user) => user.id !== agent.owner_id).map((user) => <label className="check-row" key={user.id}><input type="checkbox" checked={accessDraft.publicTo.includes(user.id)} onChange={(event) => setAccessDraft((current) => ({ ...current, publicTo: event.target.checked ? [...current.publicTo, user.id] : current.publicTo.filter((id) => id !== user.id) }))} /> {user.display_name} ({user.email})</label>)}</fieldset>}<label>{t('runtime')}<select disabled={configPending} value={accessDraft.runtimeId ?? ''} onChange={(event) => setAccessDraft((current) => ({ ...current, runtimeId: event.target.value || null }))}><option value="">{t('automatic')}</option>{runtimes.map((item) => <option key={item.id} value={item.id}>{item.hostname} · {runtimeStatusLabel(item.status, t)}</option>)}</select></label><ToolAllowlistPicker value={accessDraft.toolAllowlist} onChange={(toolAllowlist) => setAccessDraft((current) => ({ ...current, toolAllowlist }))} disabled={configPending} legend={t('toolAllowlist')} /><button className="primary" disabled={configPending || !accessDirty}><Save size={16} /> {configPending ? t('saving') : t('saveAgent')}</button></form> : <div className="agent-readonly">{visibilityLabel(agent.visibility, t)}</div>}</section>
         </div>
         {error && <div className="error agent-detail-error" role="alert">{error}</div>}
       </section>

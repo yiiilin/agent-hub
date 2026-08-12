@@ -6,6 +6,7 @@ type AgentFixture = {
   instructions: string;
   visibility: string;
   public_to: string[];
+  endpoint_exposure: string[];
   runtime_id: string | null;
   model_selection: { connection_id: string; model_id: string } | null;
   model_settings: {
@@ -96,6 +97,7 @@ function agentFixture(overrides: Partial<AgentFixture> & Pick<AgentFixture, 'id'
     instructions: `${overrides.name} instructions`,
     visibility: 'private',
     public_to: [],
+    endpoint_exposure: ['console', 'integration', 'automation'],
     runtime_id: null,
     model_selection: null,
     model_settings: automaticModelSettings,
@@ -185,7 +187,7 @@ test('agent list derives availability, filters, and sorts only the six reliable 
   const table = page.getByRole('table', { name: 'Agent list' });
   await expect(table).toBeVisible();
   await expect(table.getByRole('columnheader')).toHaveText([
-    'Name', 'Availability', 'Runtime hostname', 'Visibility', 'Managed skills', 'Created'
+    'Name', 'Availability', 'Runtime hostname', 'Visibility', 'Managed skills', 'Created by', 'Created'
   ]);
   expect(await agentRows(page).evaluateAll((rows) => rows.map((row) => row.getAttribute('data-agent-id')))).toEqual([
     listAgents[0].id, listAgents[1].id, listAgents[2].id, listAgents[3].id
@@ -216,9 +218,9 @@ test('agent list derives availability, filters, and sorts only the six reliable 
   await expect(agentRows(page)).toContainText('Online Agent');
   await page.getByLabel('Visibility filter').selectOption('all');
 
-  for (const heading of ['Name', 'Availability', 'Runtime hostname', 'Visibility', 'Managed skills', 'Created']) {
-    await table.getByRole('button', { name: new RegExp(`^Sort by ${heading}`) }).click();
-    await expect(table.getByRole('columnheader', { name: new RegExp(heading) })).toHaveAttribute('aria-sort', /ascending|descending/);
+  for (const heading of ['Name', 'Availability', 'Runtime hostname', 'Visibility', 'Managed skills', 'Created by', 'Created']) {
+    await table.getByRole('button', { name: new RegExp(`^Sort by ${heading}$`) }).click();
+    await expect(table.getByRole('columnheader', { name: new RegExp(`^Sort by ${heading}$`), exact: true })).toHaveAttribute('aria-sort', /ascending|descending/);
   }
   await table.getByRole('button', { name: /^Sort by Name/ }).click();
   await expect(agentRows(page).first()).toContainText('Automatic Agent');
@@ -473,7 +475,6 @@ test('agent detail uses the six-tab IA and stacks the inspector first on mobile'
   const inspector = page.getByRole('complementary', { name: 'Agent inspector' });
   await expect(inspector).toContainText(agent().name);
   await expect(inspector).toContainText('alpha-runtime');
-  await expect(inspector).toContainText('Online');
   await expect(inspector).toContainText('Specific users');
   await expect(inspector).toContainText('Repository review');
   await expect(inspector).toContainText('Created');

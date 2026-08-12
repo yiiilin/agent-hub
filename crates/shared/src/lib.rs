@@ -860,6 +860,9 @@ pub struct AgentDto {
     pub instructions: String,
     pub visibility: String,
     pub public_to: Vec<Uuid>,
+    /// 该智能体可被哪些接入端点使用（console / integration / automation）。
+    #[serde(default = "default_agent_endpoint_exposure")]
+    pub endpoint_exposure: Vec<String>,
     pub runtime_id: Option<Uuid>,
     #[serde(default)]
     pub model_selection: Option<ModelSelectionDto>,
@@ -1861,6 +1864,8 @@ pub struct CreateAgentRequest {
     pub visibility: String,
     #[serde(default)]
     pub public_to: Vec<Uuid>,
+    #[serde(default = "default_agent_endpoint_exposure")]
+    pub endpoint_exposure: Vec<String>,
     #[serde(default)]
     pub model_selection: Option<ModelSelectionDto>,
     #[serde(default)]
@@ -1871,6 +1876,14 @@ pub struct CreateAgentRequest {
     pub tool_allowlist: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_declarations: Option<Vec<AgentSecretDeclarationDto>>,
+}
+
+pub(crate) fn default_agent_endpoint_exposure() -> Vec<String> {
+    vec![
+        "console".into(),
+        "integration".into(),
+        "automation".into(),
+    ]
 }
 
 fn legacy_hub_proxy_model_policy() -> Value {
@@ -1885,6 +1898,8 @@ pub struct UpdateAgentRequest {
     pub visibility: String,
     #[serde(default)]
     pub public_to: Vec<Uuid>,
+    #[serde(default = "default_agent_endpoint_exposure")]
+    pub endpoint_exposure: Vec<String>,
     pub runtime_id: Option<Uuid>,
     #[serde(default)]
     pub model_selection: Option<ModelSelectionDto>,

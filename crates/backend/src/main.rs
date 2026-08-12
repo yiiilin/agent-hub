@@ -3119,6 +3119,11 @@ mod tests {
                 instructions: "Keep declarations".into(),
                 visibility: "private".into(),
                 public_to: Vec::new(),
+                endpoint_exposure: vec![
+                    "console".into(),
+                    "integration".into(),
+                    "automation".into(),
+                ],
                 model_selection: None,
                 model_settings: Some(AgentModelSettings::default()),
                 subagents: Vec::new(),

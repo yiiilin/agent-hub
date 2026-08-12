@@ -2964,6 +2964,11 @@ pub(crate) async fn runtime_claim_run(
         instructions: agent_row.get("instructions"),
         visibility: agent_row.get("visibility"),
         public_to: agent_row.get("public_to"),
+        endpoint_exposure: vec![
+            "console".into(),
+            "integration".into(),
+            "automation".into(),
+        ],
         runtime_id: agent_row.get("a_runtime_id"),
         model_selection: Some(ModelSelectionDto {
             connection_id: agent_row.get("a_model_connection_id"),

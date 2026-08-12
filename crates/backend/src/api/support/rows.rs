@@ -70,6 +70,9 @@ pub(crate) fn agent_from_row(row: sqlx::postgres::PgRow) -> AgentDto {
         instructions: row.get("instructions"),
         visibility: row.get("visibility"),
         public_to: row.get("public_to"),
+        endpoint_exposure: row
+            .try_get::<Vec<String>, _>("endpoint_exposure")
+            .unwrap_or_else(|_| vec!["console".into(), "integration".into(), "automation".into()]),
         runtime_id: row.get("runtime_id"),
         model_selection: connection_id
             .zip(model_id)
