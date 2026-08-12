@@ -593,6 +593,15 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/client/runs", post(create_widget_run))
         .route("/api/client/runs/{run_id}/stop", post(stop_widget_run))
         .route(
+            "/api/client/attachments",
+            post(upload_widget_attachment)
+                .layer(DefaultBodyLimit::max(ATTACHMENT_UPLOAD_BODY_LIMIT)),
+        )
+        .route(
+            "/api/client/attachments/{attachment_id}",
+            get(download_widget_attachment),
+        )
+        .route(
             "/api/client/tool-calls/{tool_call_id}/claim",
             post(claim_client_tool_call),
         )
@@ -4731,6 +4740,116 @@ mod tests {
         .await;
         assert_ne!(other_visitor.widget_session_id, first.widget_session_id);
         assert!(other_visitor.hub_session_id.is_none());
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn client_attachments_upload_download_and_auth_gate(pool: PgPool) {
+        let fixture = attachment_fixture(pool).await;
+        let (_, store, server) = attachment_object_store().await;
+        let mut state = (*fixture.state).clone();
+        state.session_bundle_store = Some(Arc::new(store));
+        let state = Arc::new(state);
+        let router = build_router((*state).clone());
+
+        let widget_token = format!("ahe_{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO embed_sessions
+                 (id, token_hash, agent_id, owner_id, expires_at, hub_session_id)
+             VALUES ($1, $2, $3, $4, now() + interval '1 hour', $5)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(sha256_hex(&widget_token))
+        .bind(fixture.agent_id)
+        .bind(fixture.owner_id)
+        .bind(fixture.session_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let multipart = ("--test-boundary\r\n\
+             Content-Disposition: form-data; name=\"session_id\"\r\n\r\n"
+            .to_owned()
+            + &fixture.session_id.to_string()
+            + "\r\n\
+             --test-boundary\r\n\
+             Content-Disposition: form-data; name=\"file\"; filename=\"hello.txt\"\r\n\
+             Content-Type: text/plain\r\n\r\n\
+             hello world\n\r\n\
+             --test-boundary--\r\n")
+        .into_bytes();
+
+        // 无凭据上传被拒绝。
+        let unauthorized = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/client/attachments")
+                    .header(header::CONTENT_TYPE, "multipart/form-data; boundary=test-boundary")
+                    .body(Body::from(multipart.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        // 带凭据上传成功，且走的是 /api/client/* 前缀（client 路由别名）。
+        let upload = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/client/attachments")
+                    .header("x-agent-hub-embed-token", &widget_token)
+                    .header(header::CONTENT_TYPE, "multipart/form-data; boundary=test-boundary")
+                    .body(Body::from(multipart))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(upload.status(), StatusCode::OK);
+        let attachment: HubSessionAttachmentDto = serde_json::from_slice(
+            &axum::body::to_bytes(upload.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(attachment.name, "hello.txt");
+        assert_eq!(attachment.content_type, "text/plain");
+        assert_eq!(attachment.size_bytes, 12);
+
+        // 附件归属到凭据作用域内的会话。
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<Uuid>>(
+                "SELECT session_id FROM hub_session_attachments WHERE id = $1",
+            )
+            .bind(attachment.id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap(),
+            Some(fixture.session_id)
+        );
+
+        // 凭据可下载原文件。
+        let download = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/client/attachments/{}", attachment.id))
+                    .header("x-agent-hub-embed-token", &widget_token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(download.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(download.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), b"hello world\n");
+        server.abort();
     }
 
     #[sqlx::test(migrations = "./migrations")]
