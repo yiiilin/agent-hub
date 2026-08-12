@@ -6,6 +6,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 本文件记录 Agent Hub 各正式版本面向使用者的变化。
 
+## [0.3.7] - 2026-08-12
+
+### Added
+
+- 第三方工具大结果归档：工具结果超过 32KB 不再本地截断或拒绝——32KB 到 `max_tool_result_bytes`（系统参数，默认 4MB）之间的结果全文归档到对象存储，DB 与模型上下文只保留 32KB 截断版 + 摘要（含原始大小与读取指引）；超过硬上限的结果仅截断并明确告知"未归档"。归档上传带指数退避重试，失败降级不阻断工具调用。
+- Pi 新增 `agent_hub_integration_tool_result_read` 工具：`size`（元数据）、`range`（有界文本切片 + 翻页）、`file`（全量写入工作区返回路径）三种模式读取归档结果。
+- 会话详情中截断的集成工具结果显示"查看完整结果"链接（新标签页打开全量）。
+- 会话删除时级联清理工具结果归档对象。
+- 智能体端点暴露：每个智能体可声明允许被哪些端点使用（console / integration / automation），默认全部打开；控制台列表、Integration App 绑定、自动化创建分别按声明校验。
+- Browser SDK 不再本地截断大工具结果（原样提交，由后端归档机制接管）；`/api/client/attachments` 上传与下载路由。
+
+### Fixed
+
+- run 正常 completed 时也发送终态 status 事件（此前只在非 completed 时发送），客户端可据此判定 run 真正结束。
+- tool result broker 收到停止信号后不再触发 unreachable panic（此前会导致 runtime 崩溃重启与 run 状态错乱）。
+- 会话活动合并时保留截断工具结果的"查看完整结果"链接（tool_request 先建活动、结果后合并的时序下不再丢失）。
+
 ## [0.3.6] - 2026-08-11
 
 ### Added
