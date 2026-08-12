@@ -2094,10 +2094,11 @@ struct ToolResultBrokerContext {
 fn run_tool_result_broker(
     listener: TcpListener,
     context: &ToolResultBrokerContext,
-) -> ! {
+) {
     loop {
         if context.stop.load(Ordering::Acquire) {
-            break;
+            // stop 标志是正常关闭路径（run 停止/引擎关闭时设置），不是 bug。
+            return;
         }
         match listener.accept() {
             Ok((stream, _)) => {
@@ -2112,10 +2113,9 @@ fn run_tool_result_broker(
             Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            Err(_) => break,
+            Err(_) => return,
         }
     }
-    unreachable!("tool result broker loop exits only on shutdown");
 }
 
 fn handle_tool_result_connection(
