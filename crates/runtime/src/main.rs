@@ -1119,10 +1119,11 @@ async fn drain_sessions_for_shutdown(
     client: &HubClient,
     config: &Config,
 ) {
-    // 1. 立即停止所有 supervisor（引擎进程终止，不等当前推理）。
-    manager.shutdown();
-    // 2. 收集所有托管会话（内存 records 在 shutdown 后仍保留）。
+    // 1. 先收集所有托管会话（shutdown 会清空 records，顺序不可反）。
     let sessions = manager.all_session_generations();
+    info!(count = sessions.len(), "shutdown drain collected managed sessions");
+    // 2. 立即停止所有 supervisor（引擎进程终止，不等当前推理）。
+    manager.shutdown();
     if sessions.is_empty() {
         return;
     }
@@ -1132,7 +1133,7 @@ async fn drain_sessions_for_shutdown(
         producing_engine_version: config.engine_version.clone(),
     };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(100);
-    for &(session_id, ownership_generation) in &sessions {
+    for &(session_id, ownership_generation, active_run_id) in &sessions {
         if tokio::time::Instant::now() >= deadline {
             warn!(
                 %session_id,
@@ -1140,6 +1141,23 @@ async fn drain_sessions_for_shutdown(
             );
             let _ = client.set_session_bundle_sync(session_id, "pending").await;
             break;
+        }
+        // 先结束活动 run（checkpoint 要求无进行中的执行；引擎已被杀，标记 failed）。
+        if let Some(run_id) = active_run_id {
+            if let Err(error) = client
+                .complete_run(
+                    run_id,
+                    ownership_generation,
+                    CompleteRunRequest {
+                        status: "failed".into(),
+                        native_session_id: None,
+                        work_dir_ref: None,
+                    },
+                )
+                .await
+            {
+                warn!(%run_id, error = %error, "mark run failed during shutdown drain");
+            }
         }
         if let Err(error) = client.set_session_bundle_sync(session_id, "uploading").await {
             warn!(%session_id, error = %error, "mark bundle sync uploading failed");
@@ -1163,11 +1181,15 @@ async fn drain_sessions_for_shutdown(
         if ok {
             info!(%session_id, "Session bundle synced during shutdown");
         } else {
-            warn!(%session_id, "Session bundle sync failed during shutdown");
+            let error = match &outcome.result {
+                RuntimeCheckpointEffectResult::Failed { error, .. } => error.clone(),
+                _ => "unknown checkpoint outcome".into(),
+            };
+            warn!(%session_id, error = %error, "Session bundle sync failed during shutdown");
         }
     }
     // 3. 兜底：未能释放的会话强制释放（新 runtime 可接管）。
-    for &(session_id, ownership_generation) in &sessions {
+    for &(session_id, ownership_generation, _) in &sessions {
         if let Err(error) = client
             .release_session(session_id, ownership_generation, true)
             .await
@@ -6195,12 +6217,19 @@ impl SessionSupervisorManager {
     }
 
     /// 收集全部托管会话（shutdown drain 用）：不区分状态，含所有 record。
-    fn all_session_generations(&self) -> Vec<(Uuid, i64)> {
+    /// 返回 (session_id, ownership_generation, active_run_id)。
+    fn all_session_generations(&self) -> Vec<(Uuid, i64, Option<Uuid>)> {
         self.records
             .lock()
             .unwrap()
             .values()
-            .map(|record| (record.snapshot.session_id, record.snapshot.ownership_generation))
+            .map(|record| {
+                (
+                    record.snapshot.session_id,
+                    record.snapshot.ownership_generation,
+                    record.snapshot.active_run_id,
+                )
+            })
             .collect()
     }
 
