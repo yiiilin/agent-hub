@@ -1403,7 +1403,40 @@ pub(crate) async fn release_session_ownership_tx(
 
     record_runtime_session_cleanup_tx(tx, runtime_id, session_id, ownership_generation, None)
         .await?;
-    sqlx::query(
+    let release_update = if force {
+        // force 释放：放弃 bundle 归档（清空全部归档字段含 checkpoint），恢复走消息表全量重放；
+        // checkpoint NULL 时 unreplayable 检查自动放行，避免后续 claim 被永久阻塞。
+        "UPDATE hub_sessions
+         SET runtime_owner_id = NULL,
+             lifecycle_status = CASE
+                 WHEN EXISTS (
+                     SELECT 1 FROM runs
+                     WHERE hub_session_id = $1 AND status = 'pending'
+                 ) OR EXISTS (
+                     SELECT 1 FROM hub_session_messages
+                     WHERE session_id = $1 AND delivery_state = 'queued'
+                 ) THEN 'waiting_for_runtime'
+                 ELSE 'offline'
+             END,
+             ownership_generation = ownership_generation + $4,
+             saving_history_checkpoint = NULL,
+             saving_ownership_generation = NULL,
+             saving_reason = NULL,
+             saving_checkpoint_attempt_id = NULL,
+             current_bundle_generation = NULL,
+             current_bundle_object_key = NULL,
+             current_bundle_checksum_sha256 = NULL,
+             current_bundle_size_bytes = NULL,
+             current_bundle_history_checkpoint = NULL,
+             current_bundle_ownership_generation = NULL,
+             current_bundle_producing_engine_version = NULL,
+             current_bundle_created_at = NULL,
+             current_bundle_runtime_id = NULL,
+             recovery_error = NULL
+         WHERE id = $1 AND runtime_owner_id = $2 AND ownership_generation = $3"
+    } else {
+        // 正常释放：非 force 前已校验 bundle 追平（无 unreplayable 历史），
+        // 保留 bundle 归档供下次恢复快速加载；仅清理进行中的保存状态。
         "UPDATE hub_sessions
          SET runtime_owner_id = NULL,
              lifecycle_status = CASE
@@ -1421,8 +1454,9 @@ pub(crate) async fn release_session_ownership_tx(
              saving_ownership_generation = NULL,
              saving_reason = NULL,
              saving_checkpoint_attempt_id = NULL
-         WHERE id = $1 AND runtime_owner_id = $2 AND ownership_generation = $3",
-    )
+         WHERE id = $1 AND runtime_owner_id = $2 AND ownership_generation = $3"
+    };
+    sqlx::query(release_update)
     .bind(session_id)
     .bind(runtime_id)
     .bind(ownership_generation)
@@ -5350,6 +5384,18 @@ pub(crate) async fn reap_stale_runtimes(pool: &PgPool) -> Result<(), ApiError> {
                  last_checkpoint_ownership_generation = NULL,
                  last_checkpoint_disposition = NULL,
                  last_checkpoint_has_queued_work = NULL,
+                 -- runtime 下线强制释放：bundle 归档不再有效，清空全部归档字段
+                 -- （含 checkpoint），恢复时从消息表全量重放；checkpoint NULL 时
+                 -- unreplayable 检查自动放行，避免后续 claim 被永久阻塞。
+                 current_bundle_generation = NULL,
+                 current_bundle_object_key = NULL,
+                 current_bundle_checksum_sha256 = NULL,
+                 current_bundle_size_bytes = NULL,
+                 current_bundle_history_checkpoint = NULL,
+                 current_bundle_ownership_generation = NULL,
+                 current_bundle_producing_engine_version = NULL,
+                 current_bundle_created_at = NULL,
+                 current_bundle_runtime_id = NULL,
                  recovery_error = CASE
                      WHEN EXISTS (
                          SELECT 1 FROM hub_session_messages
@@ -6497,6 +6543,126 @@ mod tests {
             released.lifecycle_status.as_str(),
             "offline" | "waiting_for_runtime"
         ));
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn force_released_session_clears_bundle_and_stays_claimable(pool: PgPool) {
+        // 回归：runtime 下线/强制释放后，bundle 归档字段必须清空（含 checkpoint），
+        // 否则 delivered 消息（sequence > checkpoint）会触发 unreplayable 检查，
+        // 导致后续 run 永久 pending（面板一直"正在启动"）。
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+
+        // 造一个"bundle 落后于 delivered 消息"的状态（释放前 runtime 未追平归档）；
+        // sequence 由触发器分配（必然 > checkpoint 1）。
+        sqlx::query(
+            "INSERT INTO hub_session_messages
+                 (id, session_id, run_id, role, message_kind, content,
+                  delivery_mode, delivery_state, accepted_at)
+             VALUES ($1, $2, $3, 'assistant', 'assistant_message', 'early',
+                     'next_turn', 'delivered', now()),
+                    ($4, $2, $3, 'assistant', 'assistant_message', 'late',
+                     'next_turn', 'delivered', now())",
+        )
+        .bind(Uuid::new_v4())
+        .bind(fixture.hub_session_id)
+        .bind(claim.run.id)
+        .bind(Uuid::new_v4())
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET lifecycle_status = 'online',
+                 current_bundle_generation = 1,
+                 current_bundle_object_key = 'sessions/bundle-1.tar.zst',
+                 current_bundle_checksum_sha256 = 'sha256:deadbeef',
+                 current_bundle_size_bytes = 128,
+                 current_bundle_history_checkpoint = 1,
+                 current_bundle_ownership_generation = 1,
+                 current_bundle_producing_engine_version = 'test',
+                 current_bundle_created_at = now(),
+                 current_bundle_runtime_id = $2
+             WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .bind(fixture.runtime_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        // 先结束 claim 的 run（release 要求无进行中的执行），再 force 释放。
+        let _ = runtime_complete_run(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(claim.run.id),
+            runtime_write_generation(
+                1,
+                CompleteRunRequest {
+                    status: "failed".into(),
+                    native_session_id: None,
+                    work_dir_ref: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let _ = runtime_release_session(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(fixture.hub_session_id),
+            Json(ReleaseRuntimeSessionRequest {
+                ownership_generation: 1,
+                force: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // force 释放后：bundle 归档字段全部清空（含 checkpoint）。
+        let bundle_state: (Option<i64>, Option<String>, Option<i64>) = sqlx::query_as(
+            "SELECT current_bundle_generation, current_bundle_object_key,
+                    current_bundle_history_checkpoint
+             FROM hub_sessions WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(bundle_state, (None, None, None), "force release must clear bundle state");
+
+        // 新 run 应能被正常 claim（unreplayable 检查不再阻塞）。
+        let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM runs WHERE id = $1")
+            .bind(claim.run.id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        let next_turn_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO hub_session_turns (id, session_id, status, ownership_generation)
+             VALUES ($1, $2, 'pending', 0)",
+        )
+        .bind(next_turn_id)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let next_run = sqlx::query_scalar::<_, Uuid>(
+            "INSERT INTO runs (id, agent_id, owner_id, hub_session_id, hub_turn_id,
+                               status, initial_message, source, session_ownership_generation)
+             VALUES ($1, $2, $3, $4, $5, 'pending', 'after force release', 'user', 0)
+             RETURNING id",
+        )
+        .bind(Uuid::new_v4())
+        .bind(fixture.agent_id)
+        .bind(owner_id)
+        .bind(fixture.hub_session_id)
+        .bind(next_turn_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        let reclaimed = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        assert_eq!(reclaimed.run.id, next_run, "session must be claimable after force release");
     }
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
