@@ -130,9 +130,17 @@ impl RuntimeRunFailure {
     }
 }
 
+/// 会话补丁消息（backend GET /api/runtime/sessions/{id}/patch-messages 的返回项）。
+#[derive(Debug, Clone, Deserialize)]
+struct PatchMessageDto {
+    seq: i64,
+    role: String,
+    content: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Clone)]
-struct HubClient {
-    http: reqwest::Client,
+struct HubClient {    http: reqwest::Client,
     hub_url: String,
     runtime_token: Arc<std::sync::RwLock<String>>,
     protocol_capabilities: HashSet<String>,
@@ -924,7 +932,39 @@ async fn runtime_health(State(health): State<Arc<RuntimeHealth>>) -> impl IntoRe
 async fn run_loop(config: Config, health: Arc<RuntimeHealth>) -> anyhow::Result<()> {
     let (mut client, mut stored) = initialize_runtime(&config).await?;
     let mut config = config;
-    run_registered_cycle(&mut config, &mut client, &mut stored, &health).await
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    spawn_shutdown_signal_listener(Arc::clone(&shutdown_requested));
+    run_registered_cycle(
+        &mut config,
+        &mut client,
+        &mut stored,
+        &health,
+        &shutdown_requested,
+    )
+    .await
+}
+
+/// 监听 SIGTERM/SIGINT：置 shutdown 标记，主循环检测后执行 drain 打包再退出。
+fn spawn_shutdown_signal_listener(shutdown_requested: Arc<AtomicBool>) {
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut terminate =
+                signal(SignalKind::terminate()).expect("install SIGTERM handler");
+            let mut interrupt = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+            tokio::select! {
+                _ = terminate.recv() => {}
+                _ = interrupt.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        shutdown_requested.store(true, Ordering::Release);
+        info!("shutdown signal received; requesting Session drain");
+    });
 }
 
 async fn run_registered_cycle(
@@ -932,6 +972,7 @@ async fn run_registered_cycle(
     client: &mut HubClient,
     stored: &mut StoredRuntimeCredential,
     health: &RuntimeHealth,
+    shutdown_requested: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let mut last_gc = Instant::now();
     let dispatcher = RuntimeRunDispatcher::default();
@@ -1054,7 +1095,89 @@ async fn run_registered_cycle(
             }
             last_gc = Instant::now();
         }
+        if shutdown_requested.load(Ordering::Acquire) {
+            info!("shutdown signal received; draining Sessions before exit");
+            break;
+        }
         tokio::time::sleep(config.poll_interval).await;
+    }
+
+    // 退出前：立即停止所有引擎（杀 pi），然后有界地逐会话打包上传
+    // （bundle_sync 状态可见），最后释放所有权。超时未打包的会话
+    // 由新 runtime 走"无 bundle → 只还原对话"路径（对话永不丢）。
+    if shutdown_requested.load(Ordering::Acquire) {
+        if let Some(manager) = &manager {
+            drain_sessions_for_shutdown(manager, client, &config).await;
+        }
+    }
+    Ok(())
+}
+
+/// 停止/drain 时：立即停引擎（杀 pi），随后有界逐会话打包上传 bundle。
+async fn drain_sessions_for_shutdown(
+    manager: &Arc<SessionSupervisorManager>,
+    client: &HubClient,
+    config: &Config,
+) {
+    // 1. 立即停止所有 supervisor（引擎进程终止，不等当前推理）。
+    manager.shutdown();
+    // 2. 收集所有托管会话（内存 records 在 shutdown 后仍保留）。
+    let sessions = manager.all_session_generations();
+    if sessions.is_empty() {
+        return;
+    }
+    let transport = HubRuntimeCheckpointTransport {
+        client: client.clone(),
+        work_root: config.work_root.clone(),
+        producing_engine_version: config.engine_version.clone(),
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(100);
+    for &(session_id, ownership_generation) in &sessions {
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                %session_id,
+                "shutdown bundle sync deadline exceeded; session will recover from messages"
+            );
+            let _ = client.set_session_bundle_sync(session_id, "pending").await;
+            break;
+        }
+        if let Err(error) = client.set_session_bundle_sync(session_id, "uploading").await {
+            warn!(%session_id, error = %error, "mark bundle sync uploading failed");
+        }
+        let request = RuntimeCheckpointRequest {
+            session_id,
+            ownership_generation,
+            reason: RuntimeCheckpointReason::Drain,
+        };
+        let outcome = transport.checkpoint(&request).await;
+        let ok = matches!(
+            outcome.result,
+            RuntimeCheckpointEffectResult::Saved { .. }
+        );
+        if let Err(error) = client
+            .set_session_bundle_sync(session_id, if ok { "done" } else { "failed" })
+            .await
+        {
+            warn!(%session_id, error = %error, "mark bundle sync done failed");
+        }
+        if ok {
+            info!(%session_id, "Session bundle synced during shutdown");
+        } else {
+            warn!(%session_id, "Session bundle sync failed during shutdown");
+        }
+    }
+    // 3. 兜底：未能释放的会话强制释放（新 runtime 可接管）。
+    for &(session_id, ownership_generation) in &sessions {
+        if let Err(error) = client
+            .release_session(session_id, ownership_generation, true)
+            .await
+        {
+            warn!(
+                %session_id,
+                error = %error,
+                "failed to release Session after shutdown"
+            );
+        }
     }
 }
 
@@ -2065,6 +2188,38 @@ impl HubClient {
         .await
     }
 
+    async fn get_session_patch_messages(&self, session_id: Uuid) -> anyhow::Result<Vec<PatchMessageDto>> {
+        self.http
+            .get(format!(
+                "{}/api/runtime/sessions/{session_id}/patch-messages",
+                self.hub_url
+            ))
+            .bearer_auth(self.runtime_credential())
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn set_session_bundle_sync(&self, session_id: Uuid, status: &str) -> anyhow::Result<()> {
+        retry_hub_upload(&self.upload_retry_delays_secs, || async move {
+            self.http
+                .put(format!(
+                    "{}/api/runtime/sessions/{session_id}/bundle-sync",
+                    self.hub_url
+                ))
+                .bearer_auth(self.runtime_credential())
+                .json(&serde_json::json!({ "status": status }))
+                .send()
+                .await?
+                .error_for_status()?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn release_session(
         &self,
         session_id: Uuid,
@@ -2555,11 +2710,94 @@ async fn download_attachments_to_workspace(
     notes
 }
 
+/// 本地是否存在该会话的 Pi 引擎会话文件（engine_state_root/sessions/*.jsonl）。
+/// 存在 = 引擎可本地恢复（无需补丁）；不存在 = 空启动，需历史补丁。
+fn has_local_pi_session(config: &Config, session_id: Uuid) -> bool {
+    let paths = SessionPaths::for_session(&config.work_root, session_id);
+    let session_dir = paths.engine_state.join("sessions");
+    let Ok(entries) = std::fs::read_dir(&session_dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .path()
+            .extension()
+            .and_then(|ext| ext.to_str())
+            == Some("jsonl")
+    })
+}
+
+/// 把补丁历史拼成"历史上下文提示"，作为首条消息前缀注入会话上下文。
+/// 语义：已闭环（user 后有 assistant 回复）为历史段（AI 知晓、不重复回复）；
+/// 未闭环（最后 user 无回复）为待办段（AI 必须回应——恢复后自动继续）。
+fn inject_history_patch(claim: &mut ClaimRunResponse, patch: &[PatchMessageDto]) {
+    let mut history_lines: Vec<String> = Vec::new();
+    let mut i = 0;
+    let mut pending: Option<&PatchMessageDto> = None;
+    while i < patch.len() {
+        let message = &patch[i];
+        let closed = message.role == "user"
+            && patch.get(i + 1).is_some_and(|next| next.role == "assistant");
+        if closed {
+            let reply = patch[i + 1].content.as_deref().unwrap_or("");
+            history_lines.push(format!(
+                "用户：{}\n助手：{}",
+                message.content.as_deref().unwrap_or(""),
+                reply
+            ));
+            i += 2;
+        } else {
+            if message.role == "user" {
+                pending = Some(message);
+            }
+            i += 1;
+        }
+    }
+    let mut prompt = String::new();
+    if !history_lines.is_empty() {
+        prompt.push_str(
+            "【以下为本会话已处理的历史对话，请知晓上下文，不要重复回复这些内容】\n",
+        );
+        prompt.push_str(&history_lines.join("\n"));
+        prompt.push('\n');
+    }
+    if let Some(pending_message) = pending {
+        prompt.push_str("【以下是恢复前未及回复的请求，请现在处理】\n");
+        prompt.push_str(pending_message.content.as_deref().unwrap_or(""));
+        prompt.push('\n');
+    }
+    if prompt.trim().is_empty() {
+        return;
+    }
+    let Some(context) = claim.session_context.as_mut() else {
+        return;
+    };
+    context.messages.insert(
+        0,
+        HubSessionMessageDto {
+            id: Uuid::new_v4(),
+            session_id: context.session.id,
+            sequence: 0,
+            role: "user".into(),
+            message_kind: "message".into(),
+            content: Some(prompt),
+            payload: Value::Null,
+            attachments: Vec::new(),
+            delivery_mode: "record_only".into(),
+            delivery_state: "delivered".into(),
+            client_message_key: None,
+            expected_native_turn_id: None,
+            turn_id: None,
+            run_id: None,
+            accepted_at: chrono::Utc::now(),
+        },
+    );
+}
+
 async fn inject_session_attachments(
     client: &HubClient,
     claim: &mut ClaimRunResponse,
-    work_root: &Path,
-) -> anyhow::Result<()> {
+    work_root: &Path,) -> anyhow::Result<()> {
     let Some(context) = claim.session_context.as_mut() else {
         return Ok(());
     };
@@ -2699,6 +2937,26 @@ async fn execute_managed_run_inner(
             "Hub returned a mismatched Turn begin response"
         );
         claim.session_context.as_mut().unwrap().messages = begin.messages;
+    }
+    // 恢复场景（runtime 升级/异常后引擎环境不可恢复：无 bundle、本地无引擎会话文件）：
+    // 从 run_events 拉全量历史消息，作为上下文前缀注入（对话永不丢；引擎空启动无重复）。
+    if claim.session_context.is_some() && !has_local_pi_session(&config, session_id) {
+        match client.get_session_patch_messages(session_id).await {
+            Ok(patch) if !patch.is_empty() => {
+                inject_history_patch(&mut claim, &patch);
+                info!(
+                    %session_id,
+                    patch_messages = patch.len(),
+                    "injected session history patch after recovery"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => warn!(
+                %session_id,
+                error = %error,
+                "failed to load session patch messages; continuing without history"
+            ),
+        }
     }
     inject_session_attachments(client, &mut claim, &config.work_root).await?;
     info!(
@@ -5933,6 +6191,16 @@ impl SessionSupervisorManager {
                         ownership_generation: record.snapshot.ownership_generation,
                     })
             })
+            .collect()
+    }
+
+    /// 收集全部托管会话（shutdown drain 用）：不区分状态，含所有 record。
+    fn all_session_generations(&self) -> Vec<(Uuid, i64)> {
+        self.records
+            .lock()
+            .unwrap()
+            .values()
+            .map(|record| (record.snapshot.session_id, record.snapshot.ownership_generation))
             .collect()
     }
 
@@ -16170,6 +16438,7 @@ done
                 model_settings,
                 subagents: Vec::new(),
                 model_policy: json!({ "provider": "hub-proxy" }),
+                endpoint_exposure: vec!["console".into()],
                 sandbox_policy: json!({ "mode": "workspace-write", "network_access": true }),
                 owner_email: None,
                 managed_skill_ids: Vec::new(),
@@ -16192,6 +16461,173 @@ done
             secret_files: Vec::new(),
             session_context: None,
         }
+    }
+
+    fn patch_message(seq: i64, role: &str, content: &str) -> PatchMessageDto {
+        PatchMessageDto {
+            seq,
+            role: role.into(),
+            content: Some(content.into()),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn history_patch_injects_closed_history_and_pending_request() {
+        let mut claim = test_claim();
+        let session_id = Uuid::new_v4();
+        claim.session_context = Some(ClaimSessionContextDto {
+            session: HubSessionDto {
+                id: session_id,
+                owner_id: Uuid::new_v4(),
+                agent_id: Uuid::new_v4(),
+                agent_name: "test".into(),
+                agent_deleted_at: None,
+                title: None,
+                origin_platform_name: None,
+                origin: HubSessionOriginDto::HubNative,
+                lifecycle_status: "online".into(),
+                native_session_id: None,
+                active_turn_id: None,
+                history_checkpoint: 0,
+                configuration_fingerprint: None,
+                runtime_owner_id: None,
+                ownership_generation: 1,
+                recovery_error: None,
+                current_bundle: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+            turn: HubSessionTurnDto {
+                id: Uuid::new_v4(),
+                session_id,
+                native_turn_id: None,
+                status: "pending".into(),
+                configuration_fingerprint: None,
+                ownership_generation: 1,
+                started_at: None,
+                ended_at: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+            messages: Vec::new(),
+        });
+        let patch = vec![
+            patch_message(1, "user", "first question"),
+            patch_message(2, "assistant", "first answer"),
+            patch_message(3, "user", "second question"),
+            patch_message(4, "tool", "tool noise"),
+            patch_message(5, "user", "pending request"),
+        ];
+        inject_history_patch(&mut claim, &patch);
+        let context = claim.session_context.as_ref().unwrap();
+        assert_eq!(context.messages.len(), 1, "history patch prepended as one context message");
+        let prompt = context.messages[0].content.as_deref().unwrap_or("");
+        assert!(prompt.contains("first question"), "closed history included");
+        assert!(prompt.contains("first answer"), "closed reply included");
+        assert!(prompt.contains("已处理的历史对话"), "history marker present");
+        assert!(prompt.contains("pending request"), "pending request included");
+        assert!(prompt.contains("请现在处理"), "pending marker present");
+        assert!(!prompt.contains("tool noise"), "tool messages excluded");
+    }
+
+    #[test]
+    fn history_patch_without_pending_is_knowledge_only() {
+        let mut claim = test_claim();
+        claim.session_context = Some(ClaimSessionContextDto {
+            session: HubSessionDto {
+                id: Uuid::new_v4(),
+                owner_id: Uuid::new_v4(),
+                agent_id: Uuid::new_v4(),
+                agent_name: "test".into(),
+                agent_deleted_at: None,
+                title: None,
+                origin_platform_name: None,
+                origin: HubSessionOriginDto::HubNative,
+                lifecycle_status: "online".into(),
+                native_session_id: None,
+                active_turn_id: None,
+                history_checkpoint: 0,
+                configuration_fingerprint: None,
+                runtime_owner_id: None,
+                ownership_generation: 1,
+                recovery_error: None,
+                current_bundle: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+            turn: HubSessionTurnDto {
+                id: Uuid::new_v4(),
+                session_id: Uuid::new_v4(),
+                native_turn_id: None,
+                status: "pending".into(),
+                configuration_fingerprint: None,
+                ownership_generation: 1,
+                started_at: None,
+                ended_at: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+            messages: Vec::new(),
+        });
+        let patch = vec![
+            patch_message(1, "user", "only question"),
+            patch_message(2, "assistant", "only answer"),
+        ];
+        inject_history_patch(&mut claim, &patch);
+        let prompt = claim
+            .session_context
+            .as_ref()
+            .unwrap()
+            .messages[0]
+            .content
+            .as_deref()
+            .unwrap_or("");
+        assert!(prompt.contains("不要重复回复"), "no pending: knowledge only");
+        assert!(!prompt.contains("请现在处理"), "no pending marker when closed");
+    }
+
+    #[test]
+    fn history_patch_empty_is_noop() {
+        let mut claim = test_claim();
+        claim.session_context = Some(ClaimSessionContextDto {
+            session: HubSessionDto {
+                id: Uuid::new_v4(),
+                owner_id: Uuid::new_v4(),
+                agent_id: Uuid::new_v4(),
+                agent_name: "test".into(),
+                agent_deleted_at: None,
+                title: None,
+                origin_platform_name: None,
+                origin: HubSessionOriginDto::HubNative,
+                lifecycle_status: "online".into(),
+                native_session_id: None,
+                active_turn_id: None,
+                history_checkpoint: 0,
+                configuration_fingerprint: None,
+                runtime_owner_id: None,
+                ownership_generation: 1,
+                recovery_error: None,
+                current_bundle: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+            turn: HubSessionTurnDto {
+                id: Uuid::new_v4(),
+                session_id: Uuid::new_v4(),
+                native_turn_id: None,
+                status: "pending".into(),
+                configuration_fingerprint: None,
+                ownership_generation: 1,
+                started_at: None,
+                ended_at: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            },
+            messages: Vec::new(),
+        });
+        inject_history_patch(&mut claim, &[]);
+        assert!(claim.session_context.as_ref().unwrap().messages.is_empty());
     }
 
     fn test_config() -> Config {
