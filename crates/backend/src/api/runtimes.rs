@@ -3453,6 +3453,103 @@ pub(crate) async fn skill_package_download_response(
     Ok(response)
 }
 
+/// bundle 打包同步状态（管理端）：按 runtime 聚合各状态的会话数量。
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct BundleSyncStatusResponse {
+    pub(crate) runtime_id: Uuid,
+    pub(crate) total: i64,
+    pub(crate) pending: i64,
+    pub(crate) uploading: i64,
+    pub(crate) done: i64,
+    pub(crate) failed: i64,
+}
+
+pub(crate) async fn get_bundle_sync_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<BundleSyncStatusResponse>>, ApiError> {
+    let administrator = require_administrator(&state, &headers).await?;
+    let _ = administrator;
+    let rows: Vec<(Uuid, i64, i64, i64, i64, i64)> = sqlx::query_as(
+        "SELECT runtime_owner_id,
+                count(*) AS total,
+                count(*) FILTER (WHERE bundle_sync_status = 'pending') AS pending,
+                count(*) FILTER (WHERE bundle_sync_status = 'uploading') AS uploading,
+                count(*) FILTER (WHERE bundle_sync_status = 'done') AS done,
+                count(*) FILTER (WHERE bundle_sync_status = 'failed') AS failed
+         FROM hub_sessions
+         WHERE runtime_owner_id IS NOT NULL
+         GROUP BY runtime_owner_id
+         ORDER BY runtime_owner_id",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::warn!(%error, "load bundle sync status failed");
+        ApiError::internal("load bundle sync status failed")
+    })?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|(runtime_id, total, pending, uploading, done, failed)| BundleSyncStatusResponse {
+                runtime_id,
+                total,
+                pending,
+                uploading,
+                done,
+                failed,
+            })
+            .collect(),
+    ))
+}
+
+/// 会话补丁消息（恢复用）：返回该会话全部 user/assistant 消息事件（按事件序号有序）。
+/// 用途：runtime 升级/异常后引擎环境不可恢复（无 bundle、无本地 jsonl）时，
+/// 以 run_events 为权威源全量重建对话上下文——对话永不丢。
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PatchMessageDto {
+    pub(crate) seq: i64,
+    pub(crate) role: String,
+    pub(crate) content: Option<String>,
+    pub(crate) created_at: DateTime<Utc>,
+}
+
+pub(crate) async fn get_session_patch_messages(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(session_id): Path<Uuid>,
+) -> Result<Json<Vec<PatchMessageDto>>, ApiError> {
+    let _runtime_id = require_runtime(&state, &headers).await?;
+    let rows: Vec<(i64, String, Option<String>, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT e.seq, e.role, e.content, e.created_at
+         FROM run_events e
+         JOIN runs r ON r.id = e.run_id
+         WHERE r.hub_session_id = $1
+           AND e.event_type = 'message'
+           AND e.role IN ('user', 'assistant')
+           AND e.content IS NOT NULL AND btrim(e.content) <> ''
+         ORDER BY e.seq",
+    )
+    .bind(session_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::warn!(%error, %session_id, "load session patch messages failed");
+        ApiError::internal("load session patch messages failed")
+    })?;
+    Ok(Json(
+        rows.into_iter()
+            .map(
+                |(seq, role, content, created_at)| PatchMessageDto {
+                    seq,
+                    role,
+                    content,
+                    created_at,
+                },
+            )
+            .collect(),
+    ))
+}
+
 pub(crate) async fn runtime_append_event(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -5320,7 +5417,7 @@ pub(crate) async fn reap_stale_runtimes(pool: &PgPool) -> Result<(), ApiError> {
     let stale_runtime_ids = sqlx::query_scalar::<_, Uuid>(
         "UPDATE runtimes
          SET status = 'offline'
-         WHERE status = 'online' AND last_heartbeat_at < now() - interval '30 seconds'
+         WHERE status = 'online' AND last_heartbeat_at < now() - interval '90 seconds'
          RETURNING id",
     )
     .fetch_all(&mut *tx)
@@ -6821,6 +6918,133 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(pending_count, 1);
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn runtime_reaper_skips_runtimes_within_the_grace_window(pool: PgPool) {
+        // reap 阈值 90s（> runtime HTTP 超时 60s）：60s 无心跳的正常 runtime
+        // （一次慢请求导致）不能被误杀；90s+ 无心跳（真下线）才回收。
+        let mut runtime_ids = Vec::new();
+        for (label, heartbeat_age, expect_reaped) in [
+            ("recent", "40 seconds", false),
+            ("grace", "80 seconds", false),
+            ("stale", "120 seconds", true),
+        ] {
+            let runtime_id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO runtimes
+                     (id, token_hash, hostname, labels, engine_version, capabilities,
+                      sandbox_mode, status, last_heartbeat_at)
+                 VALUES ($1, $2, $3, '{}', 'test', '{}'::jsonb,
+                         'workspace-write', 'online', now() - $4::interval)",
+            )
+            .bind(runtime_id)
+            .bind(sha256_hex(&format!("reaper-{label}-token")))
+            .bind(label)
+            .bind(heartbeat_age)
+            .execute(&pool)
+            .await
+            .unwrap();
+            runtime_ids.push((runtime_id, label, expect_reaped));
+        }
+
+        reap_stale_runtimes(&pool).await.unwrap();
+
+        for (runtime_id, label, expect_reaped) in runtime_ids {
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM runtimes WHERE id = $1")
+                    .bind(runtime_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                status,
+                if expect_reaped { "offline" } else { "online" },
+                "runtime {label} reap expectation"
+            );
+        }
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn bundle_sync_status_aggregates_by_runtime(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM hub_sessions WHERE id = $1")
+            .bind(fixture.hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        for status in ["pending", "uploading", "done"] {
+            let session_id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO hub_sessions
+                     (id, owner_id, agent_id, origin_kind, lifecycle_status,
+                      runtime_owner_id, ownership_generation, bundle_sync_status,
+                      bundle_sync_updated_at)
+                 VALUES ($1, $2, $3, 'hub_native', 'online', $4, 1, $5, now())",
+            )
+            .bind(session_id)
+            .bind(owner_id)
+            .bind(fixture.agent_id)
+            .bind(fixture.runtime_id)
+            .bind(status)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        }
+        let admin_token = create_super_admin_session(&fixture.state.pool).await;
+        let admin_state = Arc::new(test_state_with_browser_session_auth(fixture.state.pool.clone()));
+        let response = get_bundle_sync_status(State(admin_state), session_headers(&admin_token))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(response.len(), 1);
+        assert_eq!(response[0].runtime_id, fixture.runtime_id);
+        assert_eq!(response[0].total, 3);
+        assert_eq!(response[0].pending, 1);
+        assert_eq!(response[0].uploading, 1);
+        assert_eq!(response[0].done, 1);
+        assert_eq!(response[0].failed, 0);
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn session_patch_messages_returns_ordered_user_assistant_events(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        let mut tx = fixture.state.pool.begin().await.unwrap();
+        for (content, role) in [
+            ("first user message", "user"),
+            ("first assistant reply", "assistant"),
+            ("second user message", "user"),
+            ("tool noise", "tool"),
+        ] {
+            insert_run_event_tx(
+                &mut tx,
+                claim.run.id,
+                "message".into(),
+                Some(role.into()),
+                Some(content.into()),
+                json!({}),
+            )
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+        let patch = get_session_patch_messages(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(fixture.hub_session_id),
+        )
+        .await
+        .unwrap()
+        .0;
+        let roles: Vec<String> = patch.iter().map(|message| message.role.clone()).collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant", "user"],
+            "tool role excluded, user/assistant ordered"
+        );
+        assert_eq!(patch[0].content.as_deref(), Some("first user message"));
+        assert_eq!(patch[2].content.as_deref(), Some("second user message"));
     }
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
@@ -9267,7 +9491,7 @@ mod tests {
              (id, token_hash, hostname, labels, engine_version, capabilities, sandbox_mode,
               status, last_heartbeat_at)
              VALUES ($1, 'unused', 'stale-console-runtime', '{}', 'test', $2,
-                     'read-only', 'online', now() - interval '1 minute')",
+                     'read-only', 'online', now() - interval '2 minutes')",
         )
         .bind(runtime_id)
         .bind(json!({
@@ -9319,7 +9543,7 @@ mod tests {
         let fixture = integration_runtime_fixture(pool).await;
         sqlx::query(
             "UPDATE runtimes
-             SET last_heartbeat_at = now() - interval '1 minute'
+             SET last_heartbeat_at = now() - interval '2 minutes'
              WHERE id = $1",
         )
         .bind(fixture.runtime_id)

@@ -337,6 +337,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/admin/users/{user_id}/role", put(set_admin_user_role))
         .route("/api/admin/user-erasures", get(list_user_erasures))
         .route("/api/admin/users/{user_id}/erase", post(erase_user))
+        .route(
+            "/api/admin/bundle-sync-status",
+            get(get_bundle_sync_status),
+        )
         .route("/api/auth/providers", get(auth_providers))
         .route(
             "/api/admin/auth-policy",
@@ -730,6 +734,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/api/runtime/sessions/{session_id}/salvage-abandon",
             post(runtime_abandon_session_salvage),
+        )
+        .route(
+            "/api/runtime/sessions/{session_id}/patch-messages",
+            get(get_session_patch_messages),
         )
         .route(
             "/api/runtime/runs/{run_id}/events",
