@@ -3502,6 +3502,46 @@ pub(crate) async fn get_bundle_sync_status(
     ))
 }
 
+/// runtime 更新会话 bundle 打包同步状态（pending/uploading/done/failed）。
+#[derive(Debug, Deserialize)]
+pub(crate) struct SetBundleSyncStatusRequest {
+    pub(crate) status: String,
+}
+
+pub(crate) async fn set_session_bundle_sync_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(session_id): Path<Uuid>,
+    Json(req): Json<SetBundleSyncStatusRequest>,
+) -> Result<StatusCode, ApiError> {
+    let runtime_id = require_runtime(&state, &headers).await?;
+    if !matches!(req.status.as_str(), "pending" | "uploading" | "done" | "failed") {
+        return Err(ApiError::bad_request(
+            "bundle sync status must be pending/uploading/done/failed",
+        ));
+    }
+    let updated = sqlx::query(
+        "UPDATE hub_sessions
+         SET bundle_sync_status = $1, bundle_sync_updated_at = now()
+         WHERE id = $2 AND runtime_owner_id = $3",
+    )
+    .bind(&req.status)
+    .bind(session_id)
+    .bind(runtime_id)
+    .execute(&state.pool)
+    .await
+    .map_err(|error| {
+        tracing::warn!(%error, %session_id, "update bundle sync status failed");
+        ApiError::internal("update bundle sync status failed")
+    })?;
+    if updated.rows_affected() != 1 {
+        return Err(ApiError::not_found(
+            "session is not owned by this runtime",
+        ));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// 会话补丁消息（恢复用）：返回该会话全部 user/assistant 消息事件（按事件序号有序）。
 /// 用途：runtime 升级/异常后引擎环境不可恢复（无 bundle、无本地 jsonl）时，
 /// 以 run_events 为权威源全量重建对话上下文——对话永不丢。

@@ -736,6 +736,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
             post(runtime_abandon_session_salvage),
         )
         .route(
+            "/api/runtime/sessions/{session_id}/bundle-sync",
+            put(set_session_bundle_sync_status),
+        )
+        .route(
             "/api/runtime/sessions/{session_id}/patch-messages",
             get(get_session_patch_messages),
         )
