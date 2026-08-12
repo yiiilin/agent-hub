@@ -62,6 +62,8 @@ export type ActivityEntry = {
   summary: string | null;
   output: string | null;
   status: string | null;
+  /** 归档工具结果的查看入口（截断时提供，新标签页打开全量）。 */
+  artifactUrl: string | null;
 };
 
 export type RunFailureEntry = {
@@ -260,6 +262,7 @@ export function ActivityLiveStep({ activity }: { activity: ActivityEntry }) {
     <div className="session-live-activity-body">
       <span className="session-live-activity-heading"><strong>{label}</strong>{activity.summary && <code>{activity.summary}</code>}</span>
       {activity.output && <CollapsibleLive text={activity.output} />}
+      {activity.artifactUrl && <a className="session-activity-artifact" href={activity.artifactUrl} target="_blank" rel="noreferrer">{t('viewFullToolResult')}</a>}
     </div>
   </div>;
 }
@@ -347,6 +350,7 @@ function activityFromEvent(event: RunEvent): ActivityEntry | null {
     const output = result
       ? JSON.stringify(result, null, 2)
       : payloadString(event.payload, 'message') ?? event.content;
+    const truncated = result?.truncated === true && itemId;
     return {
       id: `activity-${event.run_id}-${itemId ?? event.seq}`,
       runId: event.run_id,
@@ -359,7 +363,10 @@ function activityFromEvent(event: RunEvent): ActivityEntry | null {
       endedAt,
       summary: payloadString(event.payload, 'tool_name'),
       output,
-      status
+      status,
+      artifactUrl: truncated
+        ? `/api/runs/${event.run_id}/tool-results/${itemId}?mode=full`
+        : null
     };
   }
   if (event.event_type !== 'item') return null;
@@ -412,7 +419,8 @@ function activityFromEvent(event: RunEvent): ActivityEntry | null {
     endedAt,
     summary,
     output: payloadString(event.payload, 'output'),
-    status: null
+    status: null,
+    artifactUrl: null
   };
 }
 
@@ -547,7 +555,7 @@ export function ChatActivityGroup({ activities, startedAt, endedAt, active = fal
     onToggle={(event) => setExpanded(event.currentTarget.open)}
   >
     <summary><span>{t('agentActivityDuration').replace('{duration}', formatActivityDuration(activities, locale, startedAt, durationEndedAt))}</span><ChevronRight className="session-activity-chevron" size={16} aria-hidden="true" /></summary>
-    {expanded && <div>{!showAll && collapsedRows > 0 && <button type="button" className="session-activity-show-more" onClick={() => setShowAll(true)}>{t('activityRowsCollapsed').replace('{count}', String(collapsedRows))}</button>}{visibleActivities.map((activity) => <div className="session-activity-row" key={activity.id}><span className="session-activity-icon" aria-hidden="true"><ActivityIcon kind={activity.kind} /></span><div className="session-activity-content"><span className="session-activity-heading"><strong>{t(activityKeys[activity.kind])}</strong>{activity.status && <small className={`session-activity-status status-${activity.status}`}>{t(activityStatusKeys[activity.status] ?? 'statusFailed')}</small>}{activity.kind === 'tool' && activity.status && activity.status !== 'pending' && <small className="session-activity-elapsed">{formatActivityDuration([activity], locale)}</small>}</span>{activity.summary && (activity.kind === 'command' ? <code>{activity.summary}</code> : activity.kind === 'reasoning' ? <CollapsibleBlock label={t('activityReasoning')} text={activity.summary} /> : <span className="session-activity-summary">{activity.summary}</span>)}{activity.output && <CollapsibleBlock label={t('activityOutput')} text={activity.output} />}</div></div>)}</div>}
+    {expanded && <div>{!showAll && collapsedRows > 0 && <button type="button" className="session-activity-show-more" onClick={() => setShowAll(true)}>{t('activityRowsCollapsed').replace('{count}', String(collapsedRows))}</button>}{visibleActivities.map((activity) => <div className="session-activity-row" key={activity.id}><span className="session-activity-icon" aria-hidden="true"><ActivityIcon kind={activity.kind} /></span><div className="session-activity-content"><span className="session-activity-heading"><strong>{t(activityKeys[activity.kind])}</strong>{activity.status && <small className={`session-activity-status status-${activity.status}`}>{t(activityStatusKeys[activity.status] ?? 'statusFailed')}</small>}{activity.kind === 'tool' && activity.status && activity.status !== 'pending' && <small className="session-activity-elapsed">{formatActivityDuration([activity], locale)}</small>}</span>{activity.summary && (activity.kind === 'command' ? <code>{activity.summary}</code> : activity.kind === 'reasoning' ? <CollapsibleBlock label={t('activityReasoning')} text={activity.summary} /> : <span className="session-activity-summary">{activity.summary}</span>)}{activity.output && <CollapsibleBlock label={t('activityOutput')} text={activity.output} />}{activity.artifactUrl && <a className="session-activity-artifact" href={activity.artifactUrl} target="_blank" rel="noreferrer">{t('viewFullToolResult')}</a>}</div></div>)}</div>}
   </details>;
 }
 

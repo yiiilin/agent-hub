@@ -17,7 +17,7 @@ use base64::{
     Engine,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt};
 use hmac::Mac;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -4269,8 +4269,8 @@ fn summarize_tool_result_payload(
         (Some(id), _) => (
             format!("[tool result truncated: {size} bytes total; archived as artifact://{id}]"),
             format!(
-                "Read the full result with agent_hub_integration_tool_result_read(tool_call_id=\"{}\", mode=\"size\") or (tool_call_id=\"{}\", mode=\"range\", offset, limit)",
-                tool_call_id, tool_call_id
+                "Read the full result with agent_hub_integration_tool_result_read(tool_call_id=\"{}\", mode=\"size\") or (tool_call_id=\"{}\", mode=\"range\", offset, limit) or (tool_call_id=\"{}\", mode=\"file\")",
+                tool_call_id, tool_call_id, tool_call_id
             ),
         ),
         (None, Some("over_hard_limit")) => (
@@ -4388,6 +4388,35 @@ async fn load_tool_result_artifact_response(
             "truncated": truncated,
         }))
         .into_response()),
+        "full" => {
+            // 全量流式返回（file 模式 / 下载用），不经内存整体加载。
+            let Some(artifact_id) = artifact_id else {
+                return Err(ApiError::not_found(
+                    "tool result was not archived; check artifact_reason via mode=size",
+                ));
+            };
+            let store = state
+                .session_bundle_store
+                .clone()
+                .ok_or_else(|| ApiError::internal("artifact store is unavailable"))?;
+            let object_key = format!("tool-results/{run_id}/{artifact_id}");
+            let response = store
+                .get(&object_key)
+                .await
+                .map_err(|_| ApiError::internal("artifact read failed"))?;
+            let stream = response.bytes_stream().map(|item| {
+                item.map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))
+            });
+            let body = axum::body::Body::from_stream(stream);
+            Ok(Response::builder()
+                .header(
+                    header::CONTENT_TYPE,
+                    "application/json; charset=utf-8".to_owned(),
+                )
+                .header(header::CONTENT_LENGTH, artifact_size_bytes.unwrap_or(0))
+                .body(body)
+                .map_err(|_| ApiError::internal("artifact response build failed"))?)
+        }
         "range" => {
             let Some(artifact_id) = artifact_id else {
                 return Err(ApiError::not_found(
@@ -8644,6 +8673,142 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(unauthorized.status, StatusCode::UNAUTHORIZED);
+
+        server.abort();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn archived_tool_result_full_mode_streams_the_whole_result(pool: PgPool) {
+        let fixture = integration_runtime_fixture(pool).await;
+        let (_, store, server) = attachment_object_store().await;
+        let mut state = (*fixture.state).clone();
+        state.session_bundle_store = Some(Arc::new(store));
+        let state = Arc::new(state);
+
+        let batch = tool_request_batch(&fixture, [fixture.tool_request_id]);
+        runtime_finalize_tool_requests(
+            State(state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(fixture.run_id),
+            runtime_write(batch),
+        )
+        .await
+        .unwrap();
+        let big_content = "w".repeat(TOOL_RESULT_TRUNCATE_BYTES + 8192);
+        let submitted = submit_integration_tool_result(
+            State(state.clone()),
+            bearer_headers(&fixture.integration_token),
+            Path(fixture.tool_request_id),
+            Json(SubmitToolResultRequest {
+                result: json!({ "content": big_content }),
+            }),
+        )
+        .await
+        .unwrap();
+        let tool_request_id = submitted.tool_request.id;
+
+        let full = get_tool_result_artifact_by_request_id(
+            State(state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(tool_request_id),
+            Query(ToolResultArtifactQuery {
+                mode: Some("full".into()),
+                offset: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let body = axum::body::to_bytes(full.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed["content"].as_str().unwrap().len(),
+            TOOL_RESULT_TRUNCATE_BYTES + 8192
+        );
+
+        server.abort();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn session_deletion_removes_tool_result_artifacts(pool: PgPool) {
+        let fixture = integration_runtime_fixture(pool.clone()).await;
+        let (objects, store, server) = attachment_object_store().await;
+        let mut state = (*fixture.state).clone();
+        state.session_bundle_store = Some(Arc::new(store));
+        let state = Arc::new(state);
+
+        let batch = tool_request_batch(&fixture, [fixture.tool_request_id]);
+        runtime_finalize_tool_requests(
+            State(state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(fixture.run_id),
+            runtime_write(batch),
+        )
+        .await
+        .unwrap();
+        let big_content = "v".repeat(TOOL_RESULT_TRUNCATE_BYTES + 1024);
+        let submitted = submit_integration_tool_result(
+            State(state.clone()),
+            bearer_headers(&fixture.integration_token),
+            Path(fixture.tool_request_id),
+            Json(SubmitToolResultRequest {
+                result: json!({ "content": big_content }),
+            }),
+        )
+        .await
+        .unwrap();
+        let artifact_id = submitted.tool_request.artifact_id.unwrap();
+        let object_key = format!("tool-results/{}/{}", fixture.run_id, artifact_id);
+        assert!(objects.lock().unwrap().contains_key(&object_key));
+
+        // 会话删除走 owner 路径：为 hub_session 的 owner 造一个会话 token。
+        // integration fixture 的 state 无 session provider，删除用独立 state。
+        let owner_id: Uuid = sqlx::query_scalar(
+            "SELECT owner_id FROM hub_sessions WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        let owner_token = format!("ahs_owner_{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO sessions (token_hash, user_id, expires_at)
+             VALUES ($1, $2, now() + interval '1 hour')",
+        )
+        .bind(sha256_hex(&owner_token))
+        .bind(owner_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        // 删除守卫要求会话处于非活动状态：置为 historical 并把 run 标终态。
+        sqlx::query("UPDATE hub_sessions SET lifecycle_status = 'historical' WHERE id = $1")
+            .bind(fixture.hub_session_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE runs SET status = 'completed' WHERE hub_session_id = $1")
+            .bind(fixture.hub_session_id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let mut session_state = test_state_with_browser_session_auth(pool.clone());
+        session_state.session_bundle_store = state.session_bundle_store.clone();
+        let session_state = Arc::new(session_state);
+        let deleted = delete_hub_session(
+            State(session_state.clone()),
+            session_headers(&owner_token),
+            Path(fixture.hub_session_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(deleted, StatusCode::NO_CONTENT);
+        assert!(
+            !objects.lock().unwrap().contains_key(&object_key),
+            "tool result artifact must be deleted with the session"
+        );
 
         server.abort();
     }

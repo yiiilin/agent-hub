@@ -191,7 +191,7 @@ export default function registerAgentHubToolResultRead(pi) {
       type: "object",
       properties: {
         tool_call_id: { type: "string", description: "Tool call id from the truncated result summary" },
-        mode: { type: "string", enum: ["size", "range"], description: "size: metadata only; range: text slice" },
+        mode: { type: "string", enum: ["size", "range", "file"], description: "size: metadata; range: text slice; file: write full result to workspace" },
         offset: { type: "integer", description: "Byte offset for range reads (default 0)" },
         limit: { type: "integer", description: "Max bytes for range reads (default 65536)" },
       },
@@ -1420,7 +1420,7 @@ impl PersistentPiRpcProcess {
         // 归档工具结果读取 broker：Hub 凭据已配置时启用（Pi 扩展经它调 Hub）。
         let tool_result_broker = (TOOL_RESULT_HUB_URL.get().is_some()
             && TOOL_RESULT_RUNTIME_TOKEN.get().is_some())
-        .then(ToolResultBroker::start)
+        .then(|| ToolResultBroker::start(&run_env.workdir))
         .transpose()
         .context("start tool result broker")?;
         materialize_tool_result_extension(run_env, tool_result_broker.is_some())?;
@@ -2019,6 +2019,9 @@ pub(super) struct VisionAnalyzeBroker {
 pub(super) static TOOL_RESULT_HUB_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 pub(super) static TOOL_RESULT_RUNTIME_TOKEN: std::sync::OnceLock<String> =
     std::sync::OnceLock::new();
+/// file 模式的落盘目录（Pi 工作区，随 run 清理）。
+static TOOL_RESULT_BROKER_WORKDIR: std::sync::OnceLock<std::path::PathBuf> =
+    std::sync::OnceLock::new();
 
 pub(super) struct ToolResultBroker {
     port: u16,
@@ -2039,7 +2042,7 @@ struct ToolResultBrokerRequest {
 }
 
 impl ToolResultBroker {
-    fn start() -> anyhow::Result<Self> {
+    fn start(workdir: &std::path::Path) -> anyhow::Result<Self> {
         let listener =
             TcpListener::bind("127.0.0.1:0").context("bind tool result loopback listener")?;
         let port = listener
@@ -2051,7 +2054,9 @@ impl ToolResultBroker {
             .context("configure tool result listener")?;
         let token = uuid::Uuid::new_v4().simple().to_string();
         let stop = Arc::new(AtomicBool::new(false));
+        let _ = TOOL_RESULT_BROKER_WORKDIR.set(workdir.to_path_buf());
         let context = ToolResultBrokerContext {
+            workdir: workdir.to_path_buf(),
             token: token.clone(),
             stop: Arc::clone(&stop),
         };
@@ -2087,6 +2092,7 @@ impl Drop for ToolResultBroker {
 }
 
 struct ToolResultBrokerContext {
+    workdir: std::path::PathBuf,
     token: String,
     stop: Arc<AtomicBool>,
 }
@@ -2103,6 +2109,7 @@ fn run_tool_result_broker(
         match listener.accept() {
             Ok((stream, _)) => {
                 let context = ToolResultBrokerContext {
+                    workdir: context.workdir.clone(),
                     token: context.token.clone(),
                     stop: Arc::clone(&context.stop),
                 };
@@ -2146,17 +2153,6 @@ fn fetch_tool_result(request: &ToolResultBrokerRequest) -> serde_json::Value {
     let Some(runtime_token) = TOOL_RESULT_RUNTIME_TOKEN.get() else {
         return serde_json::json!({ "error": "tool result broker is not configured" });
     };
-    let mut url = format!(
-        "{hub_url}/api/runtime/tool-results/{}?mode={}",
-        request.tool_call_id, request.mode
-    );
-    if request.mode == "range" {
-        url.push_str(&format!(
-            "&offset={}&limit={}",
-            request.offset.unwrap_or(0),
-            request.limit.unwrap_or(64 * 1024)
-        ));
-    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build();
@@ -2165,11 +2161,25 @@ fn fetch_tool_result(request: &ToolResultBrokerRequest) -> serde_json::Value {
     };
     runtime.block_on(async {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(std::time::Duration::from_secs(300))
             .build();
         let Ok(client) = client else {
             return serde_json::json!({ "error": "tool result broker HTTP client failed" });
         };
+        if request.mode == "file" {
+            return fetch_tool_result_file(&client, hub_url, runtime_token, request).await;
+        }
+        let mut url = format!(
+            "{hub_url}/api/runtime/tool-results/{}?mode={}",
+            request.tool_call_id, request.mode
+        );
+        if request.mode == "range" {
+            url.push_str(&format!(
+                "&offset={}&limit={}",
+                request.offset.unwrap_or(0),
+                request.limit.unwrap_or(64 * 1024)
+            ));
+        }
         let response = client.get(url).bearer_auth(runtime_token).send().await;
         match response {
             Ok(response) => match response.error_for_status() {
@@ -2187,6 +2197,67 @@ fn fetch_tool_result(request: &ToolResultBrokerRequest) -> serde_json::Value {
                 serde_json::json!({ "error": format!("tool result read failed: {error}") })
             }
         }
+    })
+}
+
+/// file 模式：全量下载并写入 Pi 工作区，返回文件路径（模型可用 read/grep 处理）。
+async fn fetch_tool_result_file(
+    client: &reqwest::Client,
+    hub_url: &str,
+    runtime_token: &str,
+    request: &ToolResultBrokerRequest,
+) -> serde_json::Value {
+    let url = format!(
+        "{hub_url}/api/runtime/tool-results/{}?mode=full",
+        request.tool_call_id
+    );
+    let response = match client.get(url).bearer_auth(runtime_token).send().await {
+        Ok(response) => match response.error_for_status() {
+            Ok(response) => response,
+            Err(error) => {
+                return serde_json::json!({ "error": format!("tool result read failed: {error}") })
+            }
+        },
+        Err(error) => {
+            return serde_json::json!({ "error": format!("tool result read failed: {error}") })
+        }
+    };
+    let workdir = TOOL_RESULT_BROKER_WORKDIR.get().cloned();
+    let Some(workdir) = workdir else {
+        return serde_json::json!({ "error": "tool result file mode is not configured" });
+    };
+    let tool_results_dir = workdir.join("tool-results");
+    if let Err(error) = std::fs::create_dir_all(&tool_results_dir) {
+        return serde_json::json!({ "error": format!("tool result directory failed: {error}") });
+    }
+    let target = tool_results_dir.join(format!("{}.json", request.tool_call_id));
+    if target.is_file() {
+        return match std::fs::metadata(&target) {
+            Ok(metadata) => serde_json::json!({
+                "path": target.display().to_string(),
+                "size_bytes": metadata.len(),
+            }),
+            Err(_) => serde_json::json!({ "error": "tool result file unavailable" }),
+        };
+    }
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return serde_json::json!({ "error": format!("tool result download failed: {error}") })
+        }
+    };
+    // 原子写：先写临时文件再改名，避免并发读半成品。
+    let temp = tool_results_dir.join(format!("{}.tmp", request.tool_call_id));
+    if let Err(error) = std::fs::write(&temp, &bytes) {
+        return serde_json::json!({ "error": format!("tool result write failed: {error}") });
+    }
+    if let Err(error) = std::fs::rename(&temp, &target) {
+        let _ = std::fs::remove_file(&temp);
+        return serde_json::json!({ "error": format!("tool result finalize failed: {error}") });
+    }
+    serde_json::json!({
+        "path": target.display().to_string(),
+        "size_bytes": bytes.len(),
     })
 }
 

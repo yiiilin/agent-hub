@@ -819,6 +819,7 @@ pub(crate) struct SessionDeletionGuard {
 
 pub(crate) struct SessionDeletionOutcome {
     pub(crate) attachment_object_keys: Vec<String>,
+    pub(crate) tool_result_object_keys: Vec<String>,
     pub(crate) bundle_object_key: Option<String>,
 }
 
@@ -927,6 +928,16 @@ pub(crate) async fn delete_session_rows_tx(
         .bind(session_id)
         .execute(&mut **tx)
         .await?;
+    let tool_result_object_keys = sqlx::query_scalar::<_, String>(
+        "SELECT 'tool-results/' || run_id::text || '/' || artifact_id::text
+         FROM integration_tool_requests
+         WHERE (hub_session_id = $1
+            OR run_id IN (SELECT id FROM runs WHERE hub_session_id = $1))
+           AND artifact_id IS NOT NULL",
+    )
+    .bind(session_id)
+    .fetch_all(&mut **tx)
+    .await?;
     sqlx::query(
         "DELETE FROM integration_tool_requests
          WHERE hub_session_id = $1
@@ -973,6 +984,7 @@ pub(crate) async fn delete_session_rows_tx(
         .await?;
     Ok(SessionDeletionOutcome {
         attachment_object_keys,
+        tool_result_object_keys,
         bundle_object_key: guard.current_bundle_object_key,
     })
 }
@@ -997,6 +1009,12 @@ pub(crate) async fn delete_session_object_store_entries(
             if let Err(error) = store.delete(object_key).await {
                 warn!(session_id = %session_id, object_key = %object_key, error = %error,
                     "failed to delete Attachment object after Session deletion");
+            }
+        }
+        for object_key in &outcome.tool_result_object_keys {
+            if let Err(error) = store.delete(object_key).await {
+                warn!(session_id = %session_id, object_key = %object_key, error = %error,
+                    "failed to delete Tool Result artifact after Session deletion");
             }
         }
     }

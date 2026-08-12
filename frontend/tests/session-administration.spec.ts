@@ -321,3 +321,58 @@ test('Administration remains operable in Chinese at 390px without browser or net
   expect(consoleErrors).toEqual([]);
   expect(requestFailures).toEqual([]);
 });
+
+test('Truncated integration tool results expose a view-full-result link', async ({ page }) => {
+  const active = session('tool-artifact', 'Integration agent', 'online', { active_turn_id: 'turn-tool' });
+  await routeMe(page);
+  await page.route('**/api/agents', (route) => route.fulfill({ json: [{
+    id: active.agent_id,
+    name: active.agent_name,
+    can_invoke: true
+  }] }));
+  await page.route('**/api/sessions', (route) => route.fulfill({ json: [active] }));
+  await page.route(/\/api\/sessions\/[^/]+\/messages(?:\?.*)?$/, (route) => route.fulfill({
+    json: [message('tool-artifact', 1, 'user', 'query the registry', {
+      run_id: 'run-tool',
+      turn_id: 'turn-tool'
+    })]
+  }));
+  await page.route('**/api/sessions/tool-artifact', (route) => route.fulfill({
+    json: { ...active, active_turn_id: 'turn-tool' }
+  }));
+  // 事件历史：一个截断的 client 工具结果（含 tool_call_id 与 truncated 标记）。
+  await page.route('**/api/runs/run-tool/events', (route) => route.fulfill({ json: [{
+    seq: 1,
+    run_id: 'run-tool',
+    event_type: 'client_tool_result',
+    role: 'tool',
+    content: null,
+    payload: {
+      tool_call_id: 'tool-call-1',
+      tool_name: 'lookup',
+      elapsed_ms: 12,
+      result: {
+        truncated: true,
+        content: '[tool result truncated: 40960 bytes total; archived as artifact://abc]\nRead the full result with agent_hub_integration_tool_result_read(...)'
+      }
+    },
+    created_at: '2026-07-15T08:00:00.000Z'
+  }] }));
+  await page.route('**/api/runs/run-tool/events/stream*', (route) => route.fulfill({
+    contentType: 'text/event-stream',
+    body: ''
+  }));
+
+  await page.goto('/sessions');
+  await page.getByRole('combobox', { name: 'Agent' }).selectOption(active.agent_id);
+  await page.getByRole('button', { name: /Integration agent/ }).click();
+  const detail = page.getByRole('region', { name: 'Session details' });
+  await expect(detail.getByText('query the registry')).toBeVisible();
+  await expect(detail.getByText('Used tool')).toBeVisible();
+  // 截断结果展示"查看完整结果"链接，指向归档读取接口。
+  const link = page.locator('a.session-activity-artifact');
+  await expect(link).toHaveAttribute(
+    'href',
+    '/api/runs/run-tool/tool-results/tool-call-1?mode=full'
+  );
+});
