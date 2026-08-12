@@ -80,6 +80,37 @@
   padding-top: 22px;
 }
 
+.administration-page .administration-bundle-sync {
+  max-width: 940px;
+  border-top: 1px solid #d5dee9;
+  padding-top: 22px;
+}
+
+.administration-bundle-sync-table {
+  min-width: 720px;
+}
+
+.administration-bundle-sync-table .status {
+  white-space: nowrap;
+}
+
+.administration-bundle-sync-table th:nth-child(1) {
+  width: 36%;
+}
+
+.administration-bundle-sync-remaining {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  border-radius: 999px;
+  padding: 3px 9px;
+  background: #fee2e2;
+  color: #b91c1c;
+  font-size: 12px;
+  font-weight: 750;
+}
+
 .administration-ldap-form,
 .administration-ldap-test-form {
   min-width: 0;

@@ -249,11 +249,51 @@ HUB_SKILL_PACKAGE_LOCAL_DIR=/var/lib/agent-hub/skill-packages
 Pi 版本随完整 Runtime 镜像发布。Hub 不分发 candidate、不切换 Runtime 二进制，
 也不安排 version checkpoint。
 
-升级前保存当前镜像的不可变 digest 作为上一已知良好版本。先 Drain 待升级 Runtime，
-等全部 Session 完成 Turn、提交 current Bundle 并释放 ownership，再用新 digest 重建
-Runtime。启动后必须验证 `/healthz`、`/opt/agent-hub/pi/pi --version`、一轮经 fake
-或受控 provider 的 Session 对话，以及同一 Session 的下一 Turn continuity。任一步失败
-即停止扩大部署，不 Force Delete 仍可能持有未 checkpoint 状态的旧节点。
+### 无感升级（默认路径）
+
+Runtime 收到 SIGTERM 时不再领取新 Session，并触发与 Drain 相同的保存流程：
+立即停止全部 Session 的 Pi RPC 进程，随后在 100 秒总时限内有界地逐个打包生成
+Session Bundle 并上传 Hub（每个 Session 的 bundle-sync 状态可经管理台观察），
+最后释放 ownership 并退出。Compose 随即启动新镜像，新 Runtime 从 current
+Bundle 恢复同一 Pi Session id，活动状态跨升级保留，不需要手工 Drain。超过
+100 秒仍未打包的 Session 由新 Runtime 走“无 bundle → 只还原对话”的路径，
+对话历史不丢。
+
+升级命令（生产，Runtime 位于 `runtime` profile；三张镜像统一版本后执行）：
+
+```bash
+docker compose --profile runtime pull
+docker compose --profile runtime up -d --force-recreate
+```
+
+开发环境（镜像本地构建，先重建再强制重建容器）：
+
+```bash
+docker compose -p agent-hub-dev -f compose.dev.yml up -d --build --force-recreate
+```
+
+`--force-recreate` 强制旧 Runtime 容器重建并收到 SIGTERM：即使 `AGENT_HUB_IMAGE_TAG`
+复用同一 tag 重新推送（本地镜像 ID 变化但 Compose 配置未变），也能确保切换生效；
+省略时若配置与镜像均未变化，Compose 可能保留旧容器继续运行。
+
+两个 Compose 文件均为 `runtime` 服务设置了 `stop_grace_period: 120s`：Compose
+发送 SIGTERM 后等待 120 秒才升级为 SIGKILL（未设置时默认只有 10 秒）。该宽限期
+必须大于 SIGTERM 触发的打包上传总时限 100 秒，否则时限未到的 Session 会被
+SIGKILL 强杀，最新 Workspace 状态无法进入 Bundle。不要在部署中把该值调低到
+100 秒以下；手工停止 Runtime 容器（`docker compose stop runtime`）同样受该
+宽限期保护，会先完成全部在途 Bundle 再退出。
+
+升级后必须验证 `/healthz`、`/opt/agent-hub/pi/pi --version`、一轮经 fake
+或受控 provider 的 Session 对话，以及同一 Session 的下一 Turn continuity。
+
+### 手动 Drain 升级
+
+需要精确控制切换时机（例如维护窗口内主动清空节点、或验证排空后状态）时，仍可
+先手工 Drain 再替换镜像。升级前保存当前镜像的不可变 digest 作为上一已知良好
+版本。先 Drain 待升级 Runtime，等全部 Session 完成 Turn、提交 current Bundle
+并释放 ownership，再用新 digest 重建 Runtime。
+
+任一步失败即停止扩大部署，不 Force Delete 仍可能持有未 checkpoint 状态的旧节点。
 
 回滚同样是整张 Runtime 镜像切换：Drain 新节点并等 Session 排出，固定 Compose 的
 Runtime image 为之前记录的 digest，再启动并重复 health、Pi version 和 Session recovery

@@ -183,6 +183,8 @@ services:
 
   runtime:
     labels: *development-labels
+    # 升级无感化：SIGTERM 后最多需 100s 逐会话打包上传 bundle，超时后再 SIGKILL
+    stop_grace_period: 120s
     build:
       context: .
       dockerfile: deploy/runtime.Dockerfile

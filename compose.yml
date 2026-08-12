@@ -138,6 +138,8 @@ services:
   runtime:
     profiles: ["runtime"]
     image: ${AGENT_HUB_IMAGE_REGISTRY:-ghcr.io/yiiilin}/agent-hub-runtime:${AGENT_HUB_IMAGE_TAG:-0.3.1}
+    # 升级无感化：SIGTERM 后最多需 100s 逐会话打包上传 bundle，超时后再 SIGKILL
+    stop_grace_period: 120s
     restart: unless-stopped
     environment:
       HUB_URL: http://backend:8080

@@ -5,6 +5,7 @@ import {
   Eye,
   FlaskConical,
   KeyRound,
+  Package,
   Pencil,
   Plus,
   Save,
@@ -23,6 +24,7 @@ import {
   type AdminUserDetail,
   type AuthenticationChannel,
   type AuthPolicy,
+  type BundleSyncStatus,
   type ExternalPlatform,
   type LdapConfiguration,
   type LdapTestResult,
@@ -134,8 +136,53 @@ function SystemSettingsTab() {
                 <button type="submit" className="primary admin-save" disabled={saving}><Save size={15} /> {saving ? t('saving') : t('saveSystemSettings')}</button>
               </form>}
       </section>
+      <BundleSyncStatusSection />
     </div>
   );
+}
+
+function BundleSyncStatusSection() {
+  const { t } = useI18n();
+  const [statuses, setStatuses] = useState<BundleSyncStatus[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
+  const [reload, setReload] = useState(0);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setLoading(true);
+    setLoadError(false);
+    api.bundleSyncStatus(controller.signal)
+      .then((response) => { setStatuses(response); })
+      .catch(() => { if (!controller.signal.aborted) setLoadError(true); })
+      .finally(() => { if (!controller.signal.aborted) setLoading(false); });
+    return () => controller.abort();
+  }, [reload]);
+
+  return <section className="admin-section administration-bundle-sync" aria-labelledby="bundle-sync-status-title">
+    <header><Package size={18} /><div><h2 id="bundle-sync-status-title">{t('bundleSyncStatus')}</h2><p>{t('bundleSyncStatusHelp')}</p></div></header>
+    {loading ? <div className="compact-empty">{t('loadingBundleSyncStatus')}</div>
+      : loadError ? <div className="error" role="alert"><span>{t('bundleSyncStatusLoadFailed')}</span><button type="button" className="text-button" onClick={() => setReload((value) => value + 1)}>{t('retry')}</button></div>
+        : <div className="administration-table-wrap">
+            <table className="administration-table administration-bundle-sync-table" aria-label={t('bundleSyncStatus')}>
+              <thead><tr><th>{t('runtime')}</th><th>{t('bundleTotal')}</th><th>{t('bundlePending')}</th><th>{t('bundleUploading')}</th><th>{t('bundleDone')}</th><th>{t('bundleFailed')}</th><th>{t('bundleRemaining')}</th></tr></thead>
+              <tbody>{statuses.length === 0 ? <tr><td colSpan={7}>{t('noBundleSyncStatus')}</td></tr> : statuses.map((status) => {
+                const remaining = status.pending + status.uploading;
+                return <tr key={status.runtime_id}>
+                  <td><code>{status.runtime_id}</code></td>
+                  <td>{status.total}</td>
+                  <td>{status.pending}</td>
+                  <td>{status.uploading}</td>
+                  <td>{status.done}</td>
+                  <td>{status.failed}</td>
+                  <td>{remaining > 0
+                    ? <span className="administration-bundle-sync-remaining" role="status">{remaining}</span>
+                    : <span className="status completed">{t('statusCompleted')}</span>}</td>
+                </tr>;
+              })}</tbody>
+            </table>
+          </div>}
+  </section>;
 }
 
 function AuthenticationTab() {

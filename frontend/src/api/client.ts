@@ -448,6 +448,16 @@ export type SystemSettings = {
   max_tool_result_bytes: number;
 };
 
+// 会话恢复 bundle 打包同步状态（按运行节点聚合，GET /api/admin/bundle-sync-status）。
+export type BundleSyncStatus = {
+  runtime_id: string;
+  total: number;
+  pending: number;
+  uploading: number;
+  done: number;
+  failed: number;
+};
+
 export type AuthProviders = AuthPolicy;
 
 export type LdapSecurityMode = 'ldaps' | 'starttls' | 'plain';
@@ -1489,6 +1499,8 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ hostname })
     }),
+  bundleSyncStatus: (signal?: AbortSignal) =>
+    request<BundleSyncStatus[]>('/api/admin/bundle-sync-status', { signal }),
   automations: () => request<Automation[]>('/api/automations'),
   automationRuns: (automationId: string, page = 1, pageSize = 20, signal?: AbortSignal) =>
     request<RunListResponse>(`/api/automations/${automationId}/runs?page=${page}&page_size=${pageSize}`, { signal }),
