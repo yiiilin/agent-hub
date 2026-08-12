@@ -341,8 +341,23 @@ test('Truncated integration tool results expose a view-full-result link', async 
     json: { ...active, active_turn_id: 'turn-tool' }
   }));
   // 事件历史：一个截断的 client 工具结果（含 tool_call_id 与 truncated 标记）。
-  await page.route('**/api/runs/run-tool/events', (route) => route.fulfill({ json: [{
+  await page.route('**/api/runs/run-tool/events', (route) => route.fulfill({ json: [
+  {
+    // tool_request 先建活动（无 artifactUrl），随后的 client_tool_result 合并后链接必须保留。
     seq: 1,
+    run_id: 'run-tool',
+    event_type: 'tool_request',
+    role: 'tool',
+    content: null,
+    payload: {
+      tool_request_id: 'tool-call-1',
+      tool_name: 'lookup',
+      arguments: { query: 'x' }
+    },
+    created_at: '2026-07-15T07:59:58.000Z'
+  },
+  {
+    seq: 2,
     run_id: 'run-tool',
     event_type: 'client_tool_result',
     role: 'tool',
@@ -357,7 +372,8 @@ test('Truncated integration tool results expose a view-full-result link', async 
       }
     },
     created_at: '2026-07-15T08:00:00.000Z'
-  }] }));
+  }
+  ] }));
   await page.route('**/api/runs/run-tool/events/stream*', (route) => route.fulfill({
     contentType: 'text/event-stream',
     body: ''

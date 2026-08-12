@@ -441,7 +441,8 @@ function mergeActivity(current: ActivityEntry, incoming: ActivityEntry): Activit
     sequence: Math.min(current.sequence, incoming.sequence),
     summary,
     output,
-    status: incoming.status ?? current.status
+    status: incoming.status ?? current.status,
+    artifactUrl: incoming.artifactUrl ?? current.artifactUrl
   };
 }
 
