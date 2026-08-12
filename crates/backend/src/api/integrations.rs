@@ -2048,8 +2048,16 @@ pub(crate) async fn submit_integration_tool_result(
 ) -> Result<Json<SubmitToolResultResponse>, ApiError> {
     let agent_id = integration_tool_request_agent_id(&state.pool, tool_request_id).await?;
     let principal = require_integration(&state, &headers, agent_id).await?;
-    validate_tool_result(&req.result)?;
-    let result = sanitize_run_event_payload(req.result);
+    let settings = load_system_settings(&state.pool).await?;
+    let validation = validate_tool_result(&req.result, settings.max_tool_result_bytes)?;
+    let run_id = sqlx::query_scalar::<_, Uuid>(
+        "SELECT run_id FROM integration_tool_requests WHERE id = $1",
+    )
+    .bind(tool_request_id)
+    .fetch_one(&state.pool)
+    .await?;
+    let archived = archive_tool_result(&state, run_id, tool_request_id, &validation).await;
+    let result = sanitize_run_event_payload(validation.payload);
     let mut tx = state.pool.begin().await?;
     // Integration 写事务统一先锁 Agent，避免与归档形成反向锁顺序。
     lock_active_integration_agent_tx(&mut tx, principal.agent_id, principal.agent_owner_id).await?;
@@ -2175,12 +2183,18 @@ pub(crate) async fn submit_integration_tool_result(
     .await?;
     sqlx::query(
         "UPDATE integration_tool_requests
-         SET status = 'completed', result_payload = $1, result_event_id = $2, follow_up_run_id = $3, responded_at = now()
-         WHERE id = $4 AND status = 'pending'",
+         SET status = 'completed', result_payload = $1, result_event_id = $2, follow_up_run_id = $3,
+             artifact_id = $4, artifact_size_bytes = $5, artifact_reason = $6,
+             result_truncated = $7, responded_at = now()
+         WHERE id = $8 AND status = 'pending'",
     )
     .bind(&result)
     .bind(result_event_id)
     .bind(run.id)
+    .bind(archived.as_ref().and_then(|archived| archived.0))
+    .bind(archived.as_ref().map(|archived| archived.1))
+    .bind(archived.as_ref().and_then(|archived| archived.2.as_ref()))
+    .bind(validation.truncated)
     .bind(tool_request.id)
     .execute(&mut *tx)
     .await?;
@@ -2294,11 +2308,25 @@ pub(crate) async fn submit_client_tool_result(
     Path(tool_call_id): Path<Uuid>,
     Json(req): Json<SubmitClientToolResultRequest>,
 ) -> Result<Json<SubmitClientToolResultResponse>, ApiError> {
-    let (result_payload, checksum) = validate_client_tool_result(&req.result)?;
+    let settings = load_system_settings(&state.pool).await?;
+    let (validation, checksum) =
+        validate_client_tool_result(&req.result, settings.max_tool_result_bytes)?;
     // NUL bytes are rejected by PostgreSQL jsonb; sanitize before persisting
     // while keeping the checksum over the client's original payload so an
     // idempotent resubmit still matches.
-    let result_payload = sanitize_run_event_payload(result_payload);
+    // 超阈值先归档全文（事务外、指数退避），超硬上限则仅截断不归档。
+    let archived = if validation.truncated {
+        let run_id = sqlx::query_scalar::<_, Uuid>(
+            "SELECT run_id FROM integration_tool_requests WHERE id = $1",
+        )
+        .bind(tool_call_id)
+        .fetch_one(&state.pool)
+        .await?;
+        archive_tool_result(&state, run_id, tool_call_id, &validation).await
+    } else {
+        None
+    };
+    let result_payload = sanitize_run_event_payload(validation.payload);
     let token = client_access_token_from_headers(&headers)
         .ok_or(ApiError::unauthorized("missing Client Access Credential"))?;
     let mut tx = state.pool.begin().await?;
@@ -2379,13 +2407,19 @@ pub(crate) async fn submit_client_tool_result(
         "UPDATE integration_tool_requests
          SET status = 'completed', result_payload = $1,
              result_checksum_sha256 = $2, result_event_id = $3,
+             artifact_id = $4, artifact_size_bytes = $5, artifact_reason = $6,
+             result_truncated = $7,
              responded_at = now()
-         WHERE id = $4 AND run_id = $5 AND status = 'claimed'
-           AND claimed_by_client_instance_id = $6",
+         WHERE id = $8 AND run_id = $9 AND status = 'claimed'
+           AND claimed_by_client_instance_id = $10",
     )
     .bind(&result_payload)
     .bind(&checksum)
     .bind(result_event.event_id)
+    .bind(archived.as_ref().and_then(|archived| archived.0))
+    .bind(archived.as_ref().map(|archived| archived.1))
+    .bind(archived.as_ref().and_then(|archived| archived.2.as_ref()))
+    .bind(validation.truncated)
     .bind(tool_call_id)
     .bind(scope.run_id)
     .bind(scope.client_instance_id)
@@ -2413,16 +2447,13 @@ pub(crate) async fn submit_client_tool_result(
 
 pub(crate) fn validate_client_tool_result(
     result: &ClientToolResultDto,
-) -> Result<(Value, String), ApiError> {
+    max_tool_result_bytes: i64,
+) -> Result<(ToolResultValidation, String), ApiError> {
     let value = serde_json::to_value(result)
         .map_err(|_| ApiError::bad_request("Client Tool result must be JSON"))?;
-    let encoded = serde_json::to_vec(&value)
-        .map_err(|_| ApiError::bad_request("Client Tool result must be JSON"))?;
-    if encoded.len() > MAX_CLIENT_TOOL_RESULT_BYTES {
-        return Err(ApiError::bad_request("Client Tool result is too large"));
-    }
     let checksum = sha256_hex(&canonical_json(&value));
-    Ok((value, checksum))
+    let validation = validate_tool_result_value(&value, max_tool_result_bytes)?;
+    Ok((validation, checksum))
 }
 
 pub(crate) async fn lock_client_tool_batch_tx(
@@ -2767,7 +2798,8 @@ pub(crate) async fn load_client_tool_request_tx(
     let row = sqlx::query(
         "SELECT id, session_id, hub_session_id, run_id, position, tool_name,
                 arguments, status, claimed_by_client_instance_id, claimed_at,
-                result_payload, follow_up_run_id, expires_at, responded_at, created_at
+                result_payload, follow_up_run_id, expires_at, responded_at, created_at,
+                artifact_id, artifact_size_bytes, artifact_reason, result_truncated
          FROM integration_tool_requests WHERE id = $1",
     )
     .bind(tool_call_id)
@@ -3770,16 +3802,126 @@ pub(crate) fn validate_integration_attachments(attachments: &Value) -> Result<()
     Ok(())
 }
 
-pub(crate) fn validate_tool_result(result: &Value) -> Result<(), ApiError> {
+/// 工具结果的三档校验结果。
+pub(crate) struct ToolResultValidation {
+    /// 存入 DB 的 payload：≤32KB 原样；更大为截断包装
+    /// `{"truncated": true, "content": "<前 32KB 文本>"}`。
+    pub payload: Value,
+    /// 原始结果（完整，用于归档 S3）。
+    pub original_value: Value,
+    /// 原始结果序列化后的字节数。
+    pub original_bytes: usize,
+    /// 是否超过 32KB 截断阈值。
+    pub truncated: bool,
+    /// 是否超过归档硬上限（不归档，仅截断）。
+    pub over_hard_limit: bool,
+}
+
+/// 三档校验：≤32KB 原样；32KB~硬上限 截断+归档；>硬上限 截断不归档。
+/// 任何一档都不再拒绝提交，保证会话不因大结果挂掉。
+pub(crate) fn validate_tool_result_value(
+    result: &Value,
+    max_tool_result_bytes: i64,
+) -> Result<ToolResultValidation, ApiError> {
     if result.is_null() {
         return Err(ApiError::bad_request("tool result is required"));
     }
     let serialized = serde_json::to_string(result)
         .map_err(|_| ApiError::bad_request("tool result must be JSON"))?;
-    if serialized.len() > 16_000 {
-        return Err(ApiError::bad_request("tool result is too large"));
+    let original_bytes = serialized.len();
+    if original_bytes <= TOOL_RESULT_TRUNCATE_BYTES {
+        return Ok(ToolResultValidation {
+            payload: result.clone(),
+            original_value: result.clone(),
+            original_bytes,
+            truncated: false,
+            over_hard_limit: false,
+        });
     }
-    Ok(())
+    let over_hard_limit = original_bytes as i64 > max_tool_result_bytes;
+    let mut truncated_text = serialized;
+    truncated_text.truncate(TOOL_RESULT_TRUNCATE_BYTES);
+    while !truncated_text.is_char_boundary(truncated_text.len()) {
+        truncated_text.pop();
+    }
+    Ok(ToolResultValidation {
+        payload: json!({ "truncated": true, "content": truncated_text }),
+        original_value: result.clone(),
+        original_bytes,
+        truncated: true,
+        over_hard_limit,
+    })
+}
+
+pub(crate) fn validate_tool_result(
+    result: &Value,
+    max_tool_result_bytes: i64,
+) -> Result<ToolResultValidation, ApiError> {
+    validate_tool_result_value(result, max_tool_result_bytes)
+}
+
+/// 将超限工具结果全文归档到 S3（指数退避重试 3 次），失败则降级为仅截断。
+/// 返回归档元数据；未归档（未超阈值 / 超硬上限 / S3 不可用）返回降级原因。
+pub(crate) async fn archive_tool_result(
+    state: &AppState,
+    run_id: Uuid,
+    tool_request_id: Uuid,
+    validation: &ToolResultValidation,
+) -> Option<(Option<Uuid>, i64, Option<String>)> {
+    if !validation.truncated {
+        return None;
+    }
+    let Some(store) = state.session_bundle_store.clone() else {
+        return Some((
+            None,
+            validation.original_bytes as i64,
+            Some("artifact_store_unavailable".into()),
+        ));
+    };
+    if validation.over_hard_limit {
+        return Some((
+            None,
+            validation.original_bytes as i64,
+            Some("over_hard_limit".into()),
+        ));
+    }
+    let artifact_id = Uuid::new_v4();
+    let object_key = format!("tool-results/{run_id}/{artifact_id}");
+    let Ok(serialized) = serde_json::to_string(&validation.original_value) else {
+        return Some((
+            Some(artifact_id),
+            validation.original_bytes as i64,
+            Some("artifact_serialize_failed".into()),
+        ));
+    };
+    let checksum = sha256_hex(&serialized);
+    let size_bytes = serialized.len() as u64;
+    let bytes = axum::body::Bytes::from(serialized);
+    let mut delay_secs = 1u64;
+    for attempt in 0..3 {
+        let chunk = bytes.clone();
+        let stream = futures_util::stream::once(async move { Ok::<_, std::io::Error>(chunk) });
+        match store
+            .put_stream(&object_key, size_bytes, &checksum, stream)
+            .await
+        {
+            Ok(()) => {
+                return Some((Some(artifact_id), size_bytes as i64, None));
+            }
+            Err(_) if attempt < 2 => {
+                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                delay_secs *= 2;
+            }
+            Err(_) => {
+                return Some((
+                    Some(artifact_id),
+                    size_bytes as i64,
+                    Some("artifact_upload_failed".into()),
+                ));
+            }
+        }
+    }
+    None
 }
 
 pub(crate) async fn insert_integration_attachments_tx(
@@ -4104,6 +4246,189 @@ pub(crate) async fn load_hub_session_tx(
     Ok(hub_session_from_row(row))
 }
 
+/// 把截断的工具结果 payload 展开为模型可读的摘要：告知原始大小、归档状态与
+/// 获取全量的工具指引；未归档（超硬上限/上传失败）明确告知不可获取，防止
+/// 模型反复尝试读取不存在的归档。
+fn summarize_tool_result_payload(
+    payload: Value,
+    tool_call_id: Uuid,
+    artifact_id: Option<Uuid>,
+    artifact_size_bytes: Option<i64>,
+    artifact_reason: Option<&str>,
+) -> Value {
+    if payload.get("truncated").and_then(Value::as_bool) != Some(true) {
+        return payload;
+    }
+    let content = payload
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let size = artifact_size_bytes.unwrap_or_else(|| content.len() as i64);
+    let (heading, hint) = match (artifact_id, artifact_reason) {
+        (Some(id), _) => (
+            format!("[tool result truncated: {size} bytes total; archived as artifact://{id}]"),
+            format!(
+                "Read the full result with agent_hub_integration_tool_result_read(tool_call_id=\"{}\", mode=\"size\") or (tool_call_id=\"{}\", mode=\"range\", offset, limit)",
+                tool_call_id, tool_call_id
+            ),
+        ),
+        (None, Some("over_hard_limit")) => (
+            format!(
+                "[tool result exceeded the hard limit and was NOT archived; total size: {size} bytes; only the first {} bytes are available]",
+                TOOL_RESULT_TRUNCATE_BYTES
+            ),
+            String::new(),
+        ),
+        (None, reason) => (
+            format!(
+                "[tool result truncated: {size} bytes total; full result unavailable ({})]",
+                reason.unwrap_or("not archived")
+            ),
+            String::new(),
+        ),
+    };
+    json!({
+        "truncated": true,
+        "content": format!("{heading}\n{hint}\n{}", content),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ToolResultArtifactQuery {
+    pub(crate) mode: Option<String>,
+    pub(crate) offset: Option<i64>,
+    pub(crate) limit: Option<i64>,
+}
+
+/// 读取已归档的工具结果：`mode=size` 返回元数据；`mode=range` 返回
+/// `{content, offset, limit, next_offset, size_bytes}` 文本片段。
+/// 鉴权双通道：runtime token（Pi 读取工具）或会话用户（run owner，前端查看）。
+pub(crate) async fn get_tool_result_artifact(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path((run_id, tool_request_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<ToolResultArtifactQuery>,
+) -> Result<Response, ApiError> {
+    if bearer_token(&headers).is_some() {
+        let runtime_id = require_runtime(&state, &headers).await?;
+        let owned: bool = sqlx::query_scalar(
+            "SELECT runtime_id = $1 FROM runs WHERE id = $2",
+        )
+        .bind(runtime_id)
+        .bind(run_id)
+        .fetch_optional(&state.pool)
+        .await?
+        .unwrap_or(false);
+        if !owned {
+            return Err(ApiError::forbidden(
+                "run is not owned by this runtime",
+            ));
+        }
+    } else {
+        let user = require_user(&state, &headers).await?;
+        let owned: bool = sqlx::query_scalar(
+            "SELECT owner_id = $1 FROM runs WHERE id = $2",
+        )
+        .bind(user.id)
+        .bind(run_id)
+        .fetch_optional(&state.pool)
+        .await?
+        .unwrap_or(false);
+        if !owned {
+            return Err(ApiError::forbidden("run is not owned by this user"));
+        }
+    }
+    load_tool_result_artifact_response(&state, run_id, tool_request_id, &query).await
+}
+
+/// runtime 专用读取接口：按 tool_request_id 解析 run_id（Pi 读取工具使用，
+/// 不要求调用方知道 run_id）。
+pub(crate) async fn get_tool_result_artifact_by_request_id(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(tool_request_id): Path<Uuid>,
+    Query(query): Query<ToolResultArtifactQuery>,
+) -> Result<Response, ApiError> {
+    require_runtime(&state, &headers).await?;
+    let run_id: Uuid = sqlx::query_scalar(
+        "SELECT run_id FROM integration_tool_requests WHERE id = $1",
+    )
+    .bind(tool_request_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(ApiError::not_found("tool request not found"))?;
+    load_tool_result_artifact_response(&state, run_id, tool_request_id, &query).await
+}
+
+async fn load_tool_result_artifact_response(
+    state: &AppState,
+    run_id: Uuid,
+    tool_request_id: Uuid,
+    query: &ToolResultArtifactQuery,
+) -> Result<Response, ApiError> {
+    let row = sqlx::query_as::<_, (Option<Uuid>, Option<i64>, Option<String>, bool)>(
+        "SELECT artifact_id, artifact_size_bytes, artifact_reason, result_truncated
+         FROM integration_tool_requests
+         WHERE id = $1 AND run_id = $2 AND status = 'completed'",
+    )
+    .bind(tool_request_id)
+    .bind(run_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    let Some((artifact_id, artifact_size_bytes, artifact_reason, truncated)) = row else {
+        return Err(ApiError::not_found("tool request result not found"));
+    };
+    match query.mode.as_deref().unwrap_or("size") {
+        "size" => Ok(Json(json!({
+            "tool_request_id": tool_request_id,
+            "size_bytes": artifact_size_bytes.unwrap_or(0),
+            "artifact_id": artifact_id,
+            "artifact_reason": artifact_reason,
+            "truncated": truncated,
+        }))
+        .into_response()),
+        "range" => {
+            let Some(artifact_id) = artifact_id else {
+                return Err(ApiError::not_found(
+                    "tool result was not archived; check artifact_reason via mode=size",
+                ));
+            };
+            let store = state
+                .session_bundle_store
+                .clone()
+                .ok_or_else(|| ApiError::internal("artifact store is unavailable"))?;
+            let offset = query.offset.unwrap_or(0).max(0);
+            let limit = query
+                .limit
+                .unwrap_or(TOOL_RESULT_READ_LIMIT_BYTES as i64)
+                .clamp(1, TOOL_RESULT_READ_LIMIT_BYTES as i64);
+            let object_key = format!("tool-results/{run_id}/{artifact_id}");
+            let range = format!("bytes={}-{}", offset, offset + limit - 1);
+            let response = store
+                .get_range(&object_key, &range)
+                .await
+                .map_err(|_| ApiError::internal("artifact read failed"))?;
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|_| ApiError::internal("artifact read failed"))?;
+            let content = String::from_utf8_lossy(&bytes).into_owned();
+            Ok(Json(json!({
+                "content": content,
+                "offset": offset,
+                "limit": limit,
+                "next_offset": offset + content.len() as i64,
+                "size_bytes": artifact_size_bytes.unwrap_or(0),
+            }))
+            .into_response())
+        }
+        _ => Err(ApiError::bad_request(
+            "unsupported tool result artifact mode",
+        )),
+    }
+}
+
 pub(crate) async fn load_integration_context_for_run(
     tx: &mut Transaction<'_, Postgres>,
     run: &RunDto,
@@ -4165,7 +4490,8 @@ pub(crate) async fn load_integration_context_for_run(
             .hub_session_id
             .ok_or(ApiError::internal("tool-result Run Session is missing"))?;
         let result_rows = sqlx::query(
-            "SELECT id, tool_name, result_payload
+            "SELECT id, tool_name, result_payload, artifact_id, artifact_size_bytes,
+                    artifact_reason
              FROM integration_tool_requests
              WHERE follow_up_run_id = $1 AND run_id = $2 AND hub_session_id = $3
                AND status = 'completed'
@@ -4176,17 +4502,40 @@ pub(crate) async fn load_integration_context_for_run(
         .bind(hub_session_id)
         .fetch_all(&mut **tx)
         .await?;
-        let tool_result = result_rows.last().and_then(|row| row.get("result_payload"));
+        let tool_result = result_rows.last().map(|row| {
+            let payload: Value = row.get("result_payload");
+            summarize_tool_result_payload(
+                payload,
+                row.get("id"),
+                row.get("artifact_id"),
+                row.get("artifact_size_bytes"),
+                row.get::<Option<String>, _>("artifact_reason").as_deref(),
+            )
+        });
         let tool_results = if client_instance_id.is_some() {
             result_rows
                 .into_iter()
                 .map(|row| {
+                    let result: ClientToolResultDto =
+                        serde_json::from_value(row.get("result_payload")).map_err(
+                            |_| ApiError::internal("stored Client Tool result is invalid"),
+                        )?;
+                    let result = match result {
+                        ClientToolResultDto::Success { output } => ClientToolResultDto::Success {
+                            output: summarize_tool_result_payload(
+                                output,
+                                row.get("id"),
+                                row.get("artifact_id"),
+                                row.get("artifact_size_bytes"),
+                                row.get::<Option<String>, _>("artifact_reason").as_deref(),
+                            ),
+                        },
+                        other => other,
+                    };
                     Ok(ClientToolContinuationResultDto {
                         tool_call_id: row.get("id"),
                         tool_name: row.get("tool_name"),
-                        result: serde_json::from_value(row.get("result_payload")).map_err(
-                            |_| ApiError::internal("stored Client Tool result is invalid"),
-                        )?,
+                        result,
                     })
                 })
                 .collect::<Result<Vec<_>, ApiError>>()?
@@ -4401,7 +4750,8 @@ pub(crate) async fn load_tool_request_for_update(
                 t.tool_name, t.arguments, t.status,
                 t.claimed_by_client_instance_id, t.claimed_at,
                 t.result_payload, t.follow_up_run_id, t.expires_at,
-                t.responded_at, t.created_at
+                t.responded_at, t.created_at,
+                t.artifact_id, t.artifact_size_bytes, t.artifact_reason, t.result_truncated
          FROM integration_tool_requests t
          JOIN integration_sessions s ON s.id = t.session_id
          JOIN oauth_apps app ON app.id = s.oauth_app_id
@@ -4487,7 +4837,8 @@ pub(crate) async fn load_tool_request(
                 t.tool_name, t.arguments, t.status,
                 t.claimed_by_client_instance_id, t.claimed_at,
                 t.result_payload, t.follow_up_run_id, t.expires_at,
-                t.responded_at, t.created_at
+                t.responded_at, t.created_at,
+                t.artifact_id, t.artifact_size_bytes, t.artifact_reason, t.result_truncated
          FROM integration_tool_requests t
          JOIN integration_sessions s ON s.id = t.session_id
          JOIN oauth_apps app ON app.id = s.oauth_app_id
@@ -5335,7 +5686,7 @@ mod tests {
     use crate::tests::{issue_widget_external_access_for, runtime_write, runtime_write_generation};
     use crate::{
         build_router, ACTIVE_RUNTIME_TOOL_REQUEST_AGENT_SQL, ACTIVE_RUNTIME_TOOL_REQUEST_RUN_SQL,
-        INTEGRATION_TOOL_REQUEST_INSERT_SQL, MAX_CLIENT_TOOL_RESULT_BYTES,
+        INTEGRATION_TOOL_REQUEST_INSERT_SQL, TOOL_RESULT_TRUNCATE_BYTES,
     };
     use axum::{
         body::Body,
@@ -6436,30 +6787,6 @@ mod tests {
             assert_eq!(claim.status, "claimed");
             assert!(!claim.terminal);
         }
-
-        let oversized = submit_client_tool_result(
-            State(fixture.app.state.clone()),
-            bearer_headers(&fixture.executor.access_token),
-            Path(first_call),
-            Json(SubmitClientToolResultRequest {
-                result: ClientToolResultDto::Success {
-                    output: json!({ "content": "x".repeat(MAX_CLIENT_TOOL_RESULT_BYTES) }),
-                },
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(oversized.status, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            sqlx::query_scalar::<_, String>(
-                "SELECT status FROM integration_tool_requests WHERE id = $1",
-            )
-            .bind(first_call)
-            .fetch_one(&fixture.app.state.pool)
-            .await
-            .unwrap(),
-            "claimed"
-        );
 
         let first_result = ClientToolResultDto::Success {
             output: json!({ "opened": true }),
@@ -8095,6 +8422,230 @@ mod tests {
         assert_ne!(tool_result_message.1, fixture.turn_id);
         assert_eq!(tool_result_message.2, Some(submitted.run.id));
         assert_eq!(tool_result_message.3, "tool_result");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn large_tool_result_is_archived_truncated_and_summarized(pool: PgPool) {
+        let fixture = integration_runtime_fixture(pool).await;
+        let (objects, store, server) = attachment_object_store().await;
+        let mut state = (*fixture.state).clone();
+        state.session_bundle_store = Some(Arc::new(store));
+        let state = Arc::new(state);
+
+        // runtime 先 finalize 创建 tool_request 行（fixture 不直接插入）。
+        let batch = tool_request_batch(&fixture, [fixture.tool_request_id]);
+        runtime_finalize_tool_requests(
+            State(state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(fixture.run_id),
+            runtime_write(batch),
+        )
+        .await
+        .unwrap();
+        let big_content = "x".repeat(TOOL_RESULT_TRUNCATE_BYTES + 1024);
+        let submitted = submit_integration_tool_result(
+            State(state.clone()),
+            bearer_headers(&fixture.integration_token),
+            Path(fixture.tool_request_id),
+            Json(SubmitToolResultRequest {
+                result: json!({ "content": big_content }),
+            }),
+        )
+        .await
+        .expect("large tool result must be accepted (not rejected)");
+        assert!(submitted.tool_request.result_truncated);
+        assert!(submitted.tool_request.artifact_id.is_some());
+        assert!(submitted.tool_request.artifact_reason.is_none());
+        assert!(submitted.tool_request.artifact_size_bytes.unwrap() as usize > TOOL_RESULT_TRUNCATE_BYTES);
+
+        let (payload, artifact_id): (serde_json::Value, Option<Uuid>) = sqlx::query_as(
+            "SELECT result_payload, artifact_id FROM integration_tool_requests WHERE id = $1",
+        )
+        .bind(fixture.tool_request_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(payload.get("truncated"), Some(&json!(true)));
+        let content = payload.get("content").and_then(Value::as_str).unwrap();
+        assert!(content.len() <= TOOL_RESULT_TRUNCATE_BYTES);
+
+        // S3 对象已落盘（键 tool-results/{run_id}/{artifact_id}）。
+        let object_key = format!("tool-results/{}/{}", fixture.run_id, artifact_id.unwrap());
+        let stored = objects.lock().unwrap().get(&object_key).cloned();
+        assert!(stored.is_some(), "archived result must exist in object storage");
+        assert!(stored.unwrap().len() > TOOL_RESULT_TRUNCATE_BYTES);
+
+        // context 摘要包含大小与读取指引。
+        let mut tx = state.pool.begin().await.unwrap();
+        let context = load_integration_context_for_run(&mut tx, &submitted.run)
+            .await
+            .unwrap()
+            .expect("tool-result run must expose integration context");
+        tx.commit().await.unwrap();
+        let tool_result = context.tool_result.expect("single tool result is emitted");
+        assert_eq!(tool_result.get("truncated"), Some(&json!(true)));
+        let summary = tool_result.get("content").and_then(Value::as_str).unwrap();
+        assert!(summary.contains("archived as artifact://"), "summary must point at the artifact");
+        assert!(
+            summary.contains("agent_hub_integration_tool_result_read"),
+            "summary must teach the model how to read the full result"
+        );
+        assert!(summary.contains("bytes total"), "summary must include the original size");
+        assert!(context.tool_results.is_empty());
+
+        server.abort();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn oversized_tool_result_over_hard_limit_is_truncated_without_archive(pool: PgPool) {
+        let fixture = integration_runtime_fixture(pool).await;
+        let (_, store, server) = attachment_object_store().await;
+        let mut state = (*fixture.state).clone();
+        state.session_bundle_store = Some(Arc::new(store));
+        let state = Arc::new(state);
+
+        let batch = tool_request_batch(&fixture, [fixture.tool_request_id]);
+        runtime_finalize_tool_requests(
+            State(state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(fixture.run_id),
+            runtime_write(batch),
+        )
+        .await
+        .unwrap();
+        let huge_content = "y".repeat((4 * 1024 * 1024) + 1);
+        let submitted = submit_integration_tool_result(
+            State(state.clone()),
+            bearer_headers(&fixture.integration_token),
+            Path(fixture.tool_request_id),
+            Json(SubmitToolResultRequest {
+                result: json!({ "content": huge_content }),
+            }),
+        )
+        .await
+        .expect("result over the hard limit must still be accepted");
+        assert!(submitted.tool_request.result_truncated);
+        assert_eq!(
+            submitted.tool_request.artifact_reason.as_deref(),
+            Some("over_hard_limit")
+        );
+        assert!(submitted.tool_request.artifact_id.is_none());
+        assert!(submitted.tool_request.artifact_size_bytes.unwrap() as usize > 4 * 1024 * 1024);
+
+        let mut tx = state.pool.begin().await.unwrap();
+        let context = load_integration_context_for_run(&mut tx, &submitted.run)
+            .await
+            .unwrap()
+            .unwrap();
+        tx.commit().await.unwrap();
+        let summary = context
+            .tool_result
+            .and_then(|value| value.get("content").cloned())
+            .and_then(|value| value.as_str().map(ToOwned::to_owned))
+            .unwrap();
+        assert!(
+            summary.contains("was NOT archived"),
+            "over-limit summary must tell the model the result is unavailable"
+        );
+        assert!(!summary.contains("agent_hub_integration_tool_result_read"));
+
+        server.abort();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn archived_tool_result_reads_metadata_and_ranges(pool: PgPool) {
+        let fixture = integration_runtime_fixture(pool).await;
+        let (_, store, server) = attachment_object_store().await;
+        let mut state = (*fixture.state).clone();
+        state.session_bundle_store = Some(Arc::new(store));
+        let state = Arc::new(state);
+
+        let batch = tool_request_batch(&fixture, [fixture.tool_request_id]);
+        runtime_finalize_tool_requests(
+            State(state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(fixture.run_id),
+            runtime_write(batch),
+        )
+        .await
+        .unwrap();
+        let big_content = "z".repeat(TOOL_RESULT_TRUNCATE_BYTES + 4096);
+        let submitted = submit_integration_tool_result(
+            State(state.clone()),
+            bearer_headers(&fixture.integration_token),
+            Path(fixture.tool_request_id),
+            Json(SubmitToolResultRequest {
+                result: json!({ "content": big_content }),
+            }),
+        )
+        .await
+        .unwrap();
+        let tool_request_id = submitted.tool_request.id;
+
+        // size 元数据（runtime 通道，按 tool_request_id 解析 run）。
+        let size = get_tool_result_artifact_by_request_id(
+            State(state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(tool_request_id),
+            Query(ToolResultArtifactQuery {
+                mode: Some("size".into()),
+                offset: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let size_body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(size.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            size_body["size_bytes"].as_i64().unwrap() as usize,
+            TOOL_RESULT_TRUNCATE_BYTES + 4096 + "{\"content\":\"".len() + "\"}".len()
+        );
+        assert!(size_body["artifact_id"].is_string());
+        assert_eq!(size_body["artifact_reason"], serde_json::Value::Null);
+
+        // range 读取（64KB 上限内）。
+        let range = get_tool_result_artifact_by_request_id(
+            State(state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(tool_request_id),
+            Query(ToolResultArtifactQuery {
+                mode: Some("range".into()),
+                offset: Some(0),
+                limit: Some(1024),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        let range_body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(range.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let content = range_body["content"].as_str().unwrap();
+        assert_eq!(content.len(), 1024);
+        assert_eq!(range_body["next_offset"].as_i64().unwrap(), 1024);
+
+        // 未授权（无凭据）拒绝。
+        let unauthorized = get_tool_result_artifact_by_request_id(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(tool_request_id),
+            Query(ToolResultArtifactQuery {
+                mode: Some("size".into()),
+                offset: None,
+                limit: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unauthorized.status, StatusCode::UNAUTHORIZED);
+
+        server.abort();
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -1090,10 +1090,12 @@ pub(crate) async fn user_erasure_loop(state: Arc<AppState>) {
 
 pub(crate) const DEFAULT_MAX_ATTACHMENT_UPLOAD_BYTES: i64 = 104_857_600;
 pub(crate) const DEFAULT_MAX_ATTACHMENT_BYTES_PER_SESSION: i64 = 524_288_000;
+pub(crate) const DEFAULT_MAX_TOOL_RESULT_BYTES: i64 = 4 * 1024 * 1024;
 
 pub(crate) async fn load_system_settings(pool: &PgPool) -> Result<SystemSettingsDto, ApiError> {
     let row = sqlx::query(
-        "SELECT max_attachment_upload_bytes, max_attachment_bytes_per_session
+        "SELECT max_attachment_upload_bytes, max_attachment_bytes_per_session,
+                max_tool_result_bytes
          FROM system_settings WHERE singleton = true",
     )
     .fetch_optional(pool)
@@ -1102,10 +1104,12 @@ pub(crate) async fn load_system_settings(pool: &PgPool) -> Result<SystemSettings
         Some(row) => SystemSettingsDto {
             max_attachment_upload_bytes: row.get("max_attachment_upload_bytes"),
             max_attachment_bytes_per_session: row.get("max_attachment_bytes_per_session"),
+            max_tool_result_bytes: row.get("max_tool_result_bytes"),
         },
         None => SystemSettingsDto {
             max_attachment_upload_bytes: DEFAULT_MAX_ATTACHMENT_UPLOAD_BYTES,
             max_attachment_bytes_per_session: DEFAULT_MAX_ATTACHMENT_BYTES_PER_SESSION,
+            max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
         },
     })
 }
@@ -1146,23 +1150,32 @@ pub(crate) async fn update_system_settings(
             "max attachment bytes per session must not exceed 10GB",
         ));
     }
+    if !(1024 * 1024..=1024 * 1024 * 1024).contains(&req.max_tool_result_bytes) {
+        return Err(ApiError::bad_request(
+            "max tool result bytes must be between 1MB and 1GB",
+        ));
+    }
     require_administrator_role_tx(&mut state.pool.begin().await?, user.id).await?;
     let row = sqlx::query(
         "UPDATE system_settings
          SET max_attachment_upload_bytes = $1,
              max_attachment_bytes_per_session = $2,
-             updated_by = $3, updated_at = now()
+             max_tool_result_bytes = $3,
+             updated_by = $4, updated_at = now()
          WHERE singleton = true
-         RETURNING max_attachment_upload_bytes, max_attachment_bytes_per_session",
+         RETURNING max_attachment_upload_bytes, max_attachment_bytes_per_session,
+                   max_tool_result_bytes",
     )
     .bind(req.max_attachment_upload_bytes)
     .bind(req.max_attachment_bytes_per_session)
+    .bind(req.max_tool_result_bytes)
     .bind(user.id)
     .fetch_one(&state.pool)
     .await?;
     Ok(Json(SystemSettingsDto {
         max_attachment_upload_bytes: row.get("max_attachment_upload_bytes"),
         max_attachment_bytes_per_session: row.get("max_attachment_bytes_per_session"),
+        max_tool_result_bytes: row.get("max_tool_result_bytes"),
     }))
 }
 
@@ -1546,6 +1559,7 @@ mod tests {
             Json(UpdateSystemSettingsRequest {
                 max_attachment_upload_bytes: 10 * 1024 * 1024,
                 max_attachment_bytes_per_session: 20 * 1024 * 1024,
+                max_tool_result_bytes: 4 * 1024 * 1024,
             }),
         )
         .await
@@ -1558,6 +1572,7 @@ mod tests {
             Json(UpdateSystemSettingsRequest {
                 max_attachment_upload_bytes: 512 * 1024,
                 max_attachment_bytes_per_session: 1024 * 1024,
+                max_tool_result_bytes: 4 * 1024 * 1024,
             }),
         )
         .await
@@ -1568,6 +1583,7 @@ mod tests {
             Json(UpdateSystemSettingsRequest {
                 max_attachment_upload_bytes: 10 * 1024 * 1024,
                 max_attachment_bytes_per_session: 5 * 1024 * 1024,
+                max_tool_result_bytes: 4 * 1024 * 1024,
             }),
         )
         .await
@@ -1579,6 +1595,7 @@ mod tests {
             Json(UpdateSystemSettingsRequest {
                 max_attachment_upload_bytes: 200 * 1024 * 1024,
                 max_attachment_bytes_per_session: 1024 * 1024 * 1024,
+                max_tool_result_bytes: 4 * 1024 * 1024,
             }),
         )
         .await

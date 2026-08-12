@@ -90,6 +90,8 @@ pub struct AuthPolicyDto {
 pub struct SystemSettingsDto {
     pub max_attachment_upload_bytes: i64,
     pub max_attachment_bytes_per_session: i64,
+    /// 第三方工具结果的归档硬上限（字节）：超过则仅保留截断版，不归档。
+    pub max_tool_result_bytes: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -97,6 +99,7 @@ pub struct SystemSettingsDto {
 pub struct UpdateSystemSettingsRequest {
     pub max_attachment_upload_bytes: i64,
     pub max_attachment_bytes_per_session: i64,
+    pub max_tool_result_bytes: i64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1685,6 +1688,18 @@ pub struct IntegrationToolRequestDto {
     pub expires_at: DateTime<Utc>,
     pub responded_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// 大结果归档元数据（>32KB 截断时）：S3 artifact id（未归档为 None）。
+    #[serde(default)]
+    pub artifact_id: Option<Uuid>,
+    /// 原始结果字节数（归档或截断时）。
+    #[serde(default)]
+    pub artifact_size_bytes: Option<i64>,
+    /// 未归档原因（over_hard_limit / artifact_store_unavailable / artifact_upload_failed）。
+    #[serde(default)]
+    pub artifact_reason: Option<String>,
+    /// 结果是否被截断（仅保留 32KB 截断版）。
+    #[serde(default)]
+    pub result_truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

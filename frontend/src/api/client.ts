@@ -444,6 +444,7 @@ export type AuthPolicy = {
 export type SystemSettings = {
   max_attachment_upload_bytes: number;
   max_attachment_bytes_per_session: number;
+  max_tool_result_bytes: number;
 };
 
 export type AuthProviders = AuthPolicy;

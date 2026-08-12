@@ -803,6 +803,9 @@ fn hub_client_from_stored(
     http: reqwest::Client,
     stored: &StoredRuntimeCredential,
 ) -> HubClient {
+    // 供 Pi 工具结果读取 broker 使用（loopback 服务代 Pi 访问 Hub）。
+    let _ = pi_driver::TOOL_RESULT_HUB_URL.set(config.hub_url.clone());
+    let _ = pi_driver::TOOL_RESULT_RUNTIME_TOKEN.set(stored.runtime_credential.clone());
     HubClient {
         http,
         hub_url: config.hub_url.clone(),
@@ -13103,16 +13106,6 @@ mod tests {
             claim.integration_context.as_ref().unwrap().attachments
         );
         assert_eq!(
-            envelope["tool_result"],
-            claim
-                .integration_context
-                .as_ref()
-                .unwrap()
-                .tool_result
-                .clone()
-                .unwrap()
-        );
-        assert_eq!(
             envelope["external_user"],
             serde_json::to_value(
                 claim
@@ -13125,11 +13118,34 @@ mod tests {
             )
             .unwrap()
         );
+        // Client 多结果场景：只发 tool_results 数组，不发冗余的单值 tool_result。
+        assert!(envelope.get("tool_result").is_none());
         assert_eq!(
             envelope["tool_results"],
             serde_json::to_value(&claim.integration_context.as_ref().unwrap().tool_results)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn pi_prompt_emits_single_tool_result_when_no_client_results_exist() {
+        let mut claim = test_claim();
+        claim.run.initial_message = "single tool result".into();
+        claim.integration_context = Some(IntegrationContextDto {
+            tools: json!([]),
+            attachments: json!([]),
+            tool_result: Some(json!({ "text": "server integration result" })),
+            tool_results: Vec::new(),
+            external_user: None,
+        });
+
+        let prompt = pi_driver::pi_prompt_text(&claim).unwrap();
+        let (_, encoded) = prompt
+            .split_once("Agent Hub Integration context (JSON):\n")
+            .unwrap();
+        let envelope: Value = serde_json::from_str(encoded).unwrap();
+        assert_eq!(envelope["tool_result"], json!({ "text": "server integration result" }));
+        assert!(envelope.get("tool_results").is_none());
     }
 
     #[tokio::test]
@@ -16155,6 +16171,7 @@ done
                 subagents: Vec::new(),
                 model_policy: json!({ "provider": "hub-proxy" }),
                 sandbox_policy: json!({ "mode": "workspace-write", "network_access": true }),
+                owner_email: None,
                 managed_skill_ids: Vec::new(),
                 secret_declarations: Vec::new(),
                 mcp_allowlist: json!([{ "name": "filesystem", "command": "fs" }]),

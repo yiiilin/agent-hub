@@ -150,6 +150,37 @@ impl S3BundleStore {
         Ok(response)
     }
 
+    /// Range 读取（`bytes=start-end`），用于大工具结果的分段读取。
+    pub(crate) async fn get_range(
+        &self,
+        object_key: &str,
+        range: &str,
+    ) -> Result<reqwest::Response> {
+        let url = self.object_url(object_key)?;
+        let payload_sha256 = format!("{:x}", Sha256::digest([]));
+        let headers = self.sign_headers(
+            Method::GET,
+            &url,
+            &payload_sha256,
+            Utc::now(),
+            BTreeMap::new(),
+        )?;
+        let response = self
+            .client
+            .get(url)
+            .headers(headers)
+            .header(reqwest::header::RANGE, range)
+            .send()
+            .await
+            .context("read Tool Result range from S3")?;
+        anyhow::ensure!(
+            response.status().is_success() || response.status() == reqwest::StatusCode::PARTIAL_CONTENT,
+            "Tool Result S3 GET failed with status {}",
+            response.status()
+        );
+        Ok(response)
+    }
+
     pub(crate) async fn delete(&self, object_key: &str) -> Result<()> {
         let url = self.object_url(object_key)?;
         let payload_sha256 = format!("{:x}", Sha256::digest([]));

@@ -2400,7 +2400,8 @@ pub(crate) async fn attachment_object_store() -> (
     let route_objects = Arc::clone(&objects);
     let app = Router::new().route(
         "/attachment-bucket/{*key}",
-        axum::routing::any(move |method: Method, Path(key): Path<String>, body: Body| {
+        axum::routing::any(
+            move |method: Method, headers: HeaderMap, Path(key): Path<String>, body: Body| {
             let route_objects = Arc::clone(&route_objects);
             async move {
                 match method {
@@ -2413,7 +2414,25 @@ pub(crate) async fn attachment_object_store() -> (
                         let objects = route_objects.lock().unwrap();
                         match objects.get(&key) {
                             Some(bytes) => {
-                                let mut response = Response::new(Body::from(bytes.clone()));
+                                let range = headers.get(header::RANGE).and_then(|value| value.to_str().ok());
+                                let slice: &[u8] = if let Some(range_text) = range {
+                                    let rest = range_text.strip_prefix("bytes=").unwrap_or("");
+                                    let mut parts = rest.split('-');
+                                    let start: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
+                                    let end: usize = parts
+                                        .next()
+                                        .and_then(|value| value.parse().ok())
+                                        .unwrap_or(bytes.len().saturating_sub(1));
+                                    let end = end.min(bytes.len().saturating_sub(1));
+                                    if start > end {
+                                        &[]
+                                    } else {
+                                        &bytes[start..=end]
+                                    }
+                                } else {
+                                    bytes.as_slice()
+                                };
+                                let mut response = Response::new(Body::from(slice.to_vec()));
                                 response.headers_mut().insert(
                                     header::CONTENT_TYPE,
                                     HeaderValue::from_static("application/octet-stream"),

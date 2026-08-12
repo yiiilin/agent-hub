@@ -126,6 +126,88 @@ export default function registerAgentHubIntegrationTools(pi) {
 }
 "#;
 
+const PI_TOOL_RESULT_EXTENSION_SOURCE: &str = r#"
+import { createConnection } from "node:net";
+
+const portValue = process.env.AGENT_HUB_TOOL_RESULT_PORT;
+const token = process.env.AGENT_HUB_TOOL_RESULT_TOKEN;
+if (!portValue || !token) {
+  throw new Error("Agent Hub tool result broker is not configured");
+}
+
+function callBroker(params, signal) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let buffer = "";
+    const socket = createConnection({ host: "127.0.0.1", port: Number(portValue) });
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", onAbort);
+      socket.destroy();
+      callback(value);
+    };
+    const onAbort = () => finish(reject, new Error("Tool result read aborted"));
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+    socket.setEncoding("utf8");
+    socket.on("connect", () => {
+      socket.write(`${JSON.stringify({ ...params, token })}\n`);
+    });
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      if (buffer.length > 2_200_000) {
+        finish(reject, new Error("Tool result read response exceeded its limit"));
+        return;
+      }
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) return;
+      try {
+        finish(resolve, JSON.parse(buffer.slice(0, newline)));
+      } catch (error) {
+        finish(reject, error);
+      }
+    });
+    socket.on("error", (error) => finish(reject, error));
+    socket.on("close", () => {
+      if (!settled) finish(reject, new Error("Tool result read connection closed"));
+    });
+  });
+}
+
+export default function registerAgentHubToolResultRead(pi) {
+  pi.registerTool({
+    name: "agent_hub_integration_tool_result_read",
+    label: "Read archived integration tool result",
+    description:
+      "Reads a large integration tool result that was truncated in context. " +
+      'mode="size" returns metadata (size_bytes, artifact_id, artifact_reason). ' +
+      'mode="range" returns a text slice with offset/limit/next_offset for paging. ' +
+      "Use the tool_call_id from the truncated result summary.",
+    parameters: {
+      type: "object",
+      properties: {
+        tool_call_id: { type: "string", description: "Tool call id from the truncated result summary" },
+        mode: { type: "string", enum: ["size", "range"], description: "size: metadata only; range: text slice" },
+        offset: { type: "integer", description: "Byte offset for range reads (default 0)" },
+        limit: { type: "integer", description: "Max bytes for range reads (default 65536)" },
+      },
+      required: ["tool_call_id", "mode"],
+    },
+    async execute(args, { signal }) {
+      const response = await callBroker(args, signal);
+      if (response.error) throw new Error(response.error);
+      return {
+        content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+      };
+    },
+  });
+}
+"#;
+
 const PI_VISION_EXTENSION_SOURCE: &str = r#"
 import { createConnection } from "node:net";
 
@@ -233,6 +315,20 @@ fn pi_skill_exec_extension_path(run_env: &RunEnv) -> PathBuf {
 
 fn pi_vision_extension_path(run_env: &RunEnv) -> PathBuf {
     pi_agent_directory(run_env).join(PI_VISION_EXTENSION_FILE)
+}
+
+fn pi_tool_result_extension_path(run_env: &RunEnv) -> PathBuf {
+    pi_agent_directory(run_env).join("agent-hub-tool-result.mjs")
+}
+
+fn materialize_tool_result_extension(run_env: &RunEnv, enabled: bool) -> anyhow::Result<()> {
+    let extension_path = pi_tool_result_extension_path(run_env);
+    if !enabled {
+        return remove_file_if_present(&extension_path);
+    }
+    prepare_control_directory(&pi_agent_directory(run_env), "Pi Agent directory")?;
+    replace_private_file(&extension_path, PI_TOOL_RESULT_EXTENSION_SOURCE.as_bytes())
+        .context("write tool result read Extension")
 }
 
 fn materialize_skill_exec_extension(run_env: &RunEnv, enabled: bool) -> anyhow::Result<()> {
@@ -1256,6 +1352,7 @@ pub(super) struct PersistentPiRpcProcess {
     stderr_reader: Option<std::thread::JoinHandle<Result<usize, std::io::Error>>>,
     skill_exec_broker: Option<SkillExecBroker>,
     vision_broker: Option<VisionAnalyzeBroker>,
+    tool_result_broker: Option<ToolResultBroker>,
     cancellation: Arc<EngineCancellation>,
     timeout: Duration,
 }
@@ -1320,6 +1417,13 @@ impl PersistentPiRpcProcess {
                 None
             }
         };
+        // 归档工具结果读取 broker：Hub 凭据已配置时启用（Pi 扩展经它调 Hub）。
+        let tool_result_broker = (TOOL_RESULT_HUB_URL.get().is_some()
+            && TOOL_RESULT_RUNTIME_TOKEN.get().is_some())
+        .then(ToolResultBroker::start)
+        .transpose()
+        .context("start tool result broker")?;
+        materialize_tool_result_extension(run_env, tool_result_broker.is_some())?;
         crate::protect_pi_agent_execution_sources(
             &agent_dir,
             &run_env.engine_state_root.join(crate::SKILL_EXEC_DIRECTORY),
@@ -1361,6 +1465,10 @@ impl PersistentPiRpcProcess {
         if vision_extension.is_file() {
             command.arg("--extension").arg(&vision_extension);
         }
+        let tool_result_extension = pi_tool_result_extension_path(run_env);
+        if tool_result_extension.is_file() {
+            command.arg("--extension").arg(&tool_result_extension);
+        }
         command
             .arg("--no-themes")
             .arg("--no-prompt-templates")
@@ -1388,6 +1496,11 @@ impl PersistentPiRpcProcess {
             command
                 .env("AGENT_HUB_VISION_PORT", broker.port().to_string())
                 .env("AGENT_HUB_VISION_TOKEN", broker.token());
+        }
+        if let Some(broker) = &tool_result_broker {
+            command
+                .env("AGENT_HUB_TOOL_RESULT_PORT", broker.port().to_string())
+                .env("AGENT_HUB_TOOL_RESULT_TOKEN", broker.token());
         }
         if let Some(saved_session) = &saved_session {
             command.arg("--session").arg(saved_session);
@@ -1453,6 +1566,7 @@ impl PersistentPiRpcProcess {
             stderr_reader: Some(stderr_reader),
             skill_exec_broker,
             vision_broker,
+            tool_result_broker,
             cancellation,
             timeout,
         };
@@ -1898,6 +2012,190 @@ pub(super) struct VisionAnalyzeBroker {
     stop: Arc<AtomicBool>,
     config: Arc<std::sync::Mutex<VisionAnalyzeConfig>>,
     actor: Option<thread::JoinHandle<()>>,
+}
+
+/// 读取归档工具结果的 loopback broker（Pi 扩展经它访问 Hub）。
+/// 凭据在 runtime 启动时初始化（见 main.rs），broker 无需再传参。
+pub(super) static TOOL_RESULT_HUB_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+pub(super) static TOOL_RESULT_RUNTIME_TOKEN: std::sync::OnceLock<String> =
+    std::sync::OnceLock::new();
+
+pub(super) struct ToolResultBroker {
+    port: u16,
+    token: String,
+    stop: Arc<AtomicBool>,
+    actor: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(serde::Deserialize)]
+struct ToolResultBrokerRequest {
+    token: String,
+    tool_call_id: String,
+    mode: String,
+    #[serde(default)]
+    offset: Option<i64>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+impl ToolResultBroker {
+    fn start() -> anyhow::Result<Self> {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").context("bind tool result loopback listener")?;
+        let port = listener
+            .local_addr()
+            .context("read tool result listener address")?
+            .port();
+        listener
+            .set_nonblocking(true)
+            .context("configure tool result listener")?;
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let stop = Arc::new(AtomicBool::new(false));
+        let context = ToolResultBrokerContext {
+            token: token.clone(),
+            stop: Arc::clone(&stop),
+        };
+        let actor = thread::spawn(move || run_tool_result_broker(listener, &context));
+        Ok(Self {
+            port,
+            token,
+            stop,
+            actor: Some(actor),
+        })
+    }
+
+    fn port(&self) -> u16 {
+        self.port
+    }
+
+    fn token(&self) -> &str {
+        &self.token
+    }
+
+    fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(actor) = self.actor.take() {
+            let _ = actor.join();
+        }
+    }
+}
+
+impl Drop for ToolResultBroker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+struct ToolResultBrokerContext {
+    token: String,
+    stop: Arc<AtomicBool>,
+}
+
+fn run_tool_result_broker(
+    listener: TcpListener,
+    context: &ToolResultBrokerContext,
+) -> ! {
+    loop {
+        if context.stop.load(Ordering::Acquire) {
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let context = ToolResultBrokerContext {
+                    token: context.token.clone(),
+                    stop: Arc::clone(&context.stop),
+                };
+                thread::spawn(move || {
+                    let _ = handle_tool_result_connection(stream, &context);
+                });
+            }
+            Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => break,
+        }
+    }
+    unreachable!("tool result broker loop exits only on shutdown");
+}
+
+fn handle_tool_result_connection(
+    mut stream: std::net::TcpStream,
+    context: &ToolResultBrokerContext,
+) -> anyhow::Result<()> {
+    use std::io::{BufRead, BufReader, Write};
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Ok(());
+    }
+    let request: ToolResultBrokerRequest = serde_json::from_str(&line)
+        .context("parse tool result broker request")?;
+    if request.token != context.token {
+        write_json_line(&mut stream, &serde_json::json!({ "error": "invalid broker token" }))?;
+        return Ok(());
+    }
+    let response = fetch_tool_result(&request);
+    write_json_line(&mut stream, &response)?;
+    Ok(())
+}
+
+fn fetch_tool_result(request: &ToolResultBrokerRequest) -> serde_json::Value {
+    let Some(hub_url) = TOOL_RESULT_HUB_URL.get() else {
+        return serde_json::json!({ "error": "tool result broker is not configured" });
+    };
+    let Some(runtime_token) = TOOL_RESULT_RUNTIME_TOKEN.get() else {
+        return serde_json::json!({ "error": "tool result broker is not configured" });
+    };
+    let mut url = format!(
+        "{hub_url}/api/runtime/tool-results/{}?mode={}",
+        request.tool_call_id, request.mode
+    );
+    if request.mode == "range" {
+        url.push_str(&format!(
+            "&offset={}&limit={}",
+            request.offset.unwrap_or(0),
+            request.limit.unwrap_or(64 * 1024)
+        ));
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build();
+    let Ok(runtime) = runtime else {
+        return serde_json::json!({ "error": "tool result broker runtime failed" });
+    };
+    runtime.block_on(async {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build();
+        let Ok(client) = client else {
+            return serde_json::json!({ "error": "tool result broker HTTP client failed" });
+        };
+        let response = client.get(url).bearer_auth(runtime_token).send().await;
+        match response {
+            Ok(response) => match response.error_for_status() {
+                Ok(response) => match response.json::<serde_json::Value>().await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        serde_json::json!({ "error": format!("tool result read failed: {error}") })
+                    }
+                },
+                Err(error) => {
+                    serde_json::json!({ "error": format!("tool result read failed: {error}") })
+                }
+            },
+            Err(error) => {
+                serde_json::json!({ "error": format!("tool result read failed: {error}") })
+            }
+        }
+    })
+}
+
+fn write_json_line(stream: &mut std::net::TcpStream, value: &serde_json::Value) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut encoded = serde_json::to_string(value)?;
+    encoded.push('\n');
+    stream.write_all(encoded.as_bytes())?;
+    Ok(())
 }
 
 impl VisionAnalyzeBroker {
@@ -2402,16 +2700,17 @@ impl PiRunState {
                     return Ok(());
                 }
                 self.done = true;
-                if self.final_status != "completed" {
-                    self.events.push(AppendRunEventRequest {
-                        event_id: uuid::Uuid::new_v4(),
-                        event_type: "status".into(),
-                        role: None,
-                        content: Some(self.final_status.clone()),
-                        payload: json!({ "kind": "pi_terminal" }),
-                        waiting_tool: None,
-                    });
-                }
+                // 总是发出 run 终态 status 事件（含正常 completed）：
+                // 客户端用 content=final_status + payload.kind=pi_terminal 判定 run 真正结束。
+                // 之前只在非 completed 时发，导致正常完成时客户端只能靠事件流静默猜终态。
+                self.events.push(AppendRunEventRequest {
+                    event_id: uuid::Uuid::new_v4(),
+                    event_type: "status".into(),
+                    role: None,
+                    content: Some(self.final_status.clone()),
+                    payload: json!({ "kind": "pi_terminal" }),
+                    waiting_tool: None,
+                });
             }
             "queue_update"
             | "entry_appended"
@@ -2959,13 +3258,21 @@ pub(super) fn pi_prompt_text(claim: &ClaimRunResponse) -> anyhow::Result<String>
     };
     anyhow::ensure!(!prompt.is_empty(), "Pi prompt must not be empty");
     if let Some(context) = &claim.integration_context {
-        let envelope = json!({
+        let mut envelope = json!({
             "message": prompt,
             "attachments": context.attachments,
-            "tool_result": context.tool_result,
-            "tool_results": context.tool_results,
             "external_user": context.external_user
         });
+        // 工具结果只发有效的那个：Client 多结果场景发 tool_results 数组；
+        // 单结果（服务器集成）发 tool_result。避免模型同时看到同一份结果的
+        // 单值与数组两种表示。
+        if context.tool_results.is_empty() {
+            if let Some(tool_result) = &context.tool_result {
+                envelope["tool_result"] = tool_result.clone();
+            }
+        } else {
+            envelope["tool_results"] = serde_json::to_value(&context.tool_results)?;
+        }
         prompt.push_str("\n\n");
         prompt.push_str(PI_INTEGRATION_CONTEXT_LABEL);
         prompt.push('\n');

@@ -73,6 +73,7 @@ function SystemSettingsTab() {
   const { t } = useI18n();
   const [uploadMb, setUploadMb] = useState('');
   const [sessionMb, setSessionMb] = useState('');
+  const [toolResultMb, setToolResultMb] = useState('');
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -86,6 +87,7 @@ function SystemSettingsTab() {
     api.systemSettings().then((response) => {
       setUploadMb(String(Math.round(response.max_attachment_upload_bytes / (1024 * 1024))));
       setSessionMb(String(Math.round(response.max_attachment_bytes_per_session / (1024 * 1024))));
+      setToolResultMb(String(Math.round(response.max_tool_result_bytes / (1024 * 1024))));
     }).catch(() => setLoadError(true))
       .finally(() => setLoading(false));
   }, [reload]);
@@ -94,7 +96,9 @@ function SystemSettingsTab() {
     if (saving) return;
     const upload = Number(uploadMb) * 1024 * 1024;
     const session = Number(sessionMb) * 1024 * 1024;
-    if (!Number.isFinite(upload) || !Number.isFinite(session) || upload < 1024 * 1024) {
+    const toolResult = Number(toolResultMb) * 1024 * 1024;
+    if (!Number.isFinite(upload) || !Number.isFinite(session) || !Number.isFinite(toolResult)
+      || upload < 1024 * 1024 || toolResult < 1024 * 1024) {
       setSaveError(true);
       return;
     }
@@ -104,7 +108,8 @@ function SystemSettingsTab() {
     try {
       await api.updateSystemSettings({
         max_attachment_upload_bytes: Math.round(upload),
-        max_attachment_bytes_per_session: Math.round(session)
+        max_attachment_bytes_per_session: Math.round(session),
+        max_tool_result_bytes: Math.round(toolResult)
       });
       setSaved(true);
     } catch {
@@ -123,6 +128,7 @@ function SystemSettingsTab() {
             : <form className="stack" onSubmit={(event) => { event.preventDefault(); void save(); }}>
                 <label>{t('maxAttachmentUploadMb')}<input type="number" min={1} max={1024} required value={uploadMb} onChange={(event) => { setUploadMb(event.target.value); setSaved(false); }} /><span className="administration-field-help">{t('maxAttachmentUploadMbHelp')}</span></label>
                 <label>{t('maxAttachmentSessionMb')}<input type="number" min={1} max={10240} required value={sessionMb} onChange={(event) => { setSessionMb(event.target.value); setSaved(false); }} /><span className="administration-field-help">{t('maxAttachmentSessionMbHelp')}</span></label>
+                <label>{t('maxToolResultMb')}<input type="number" min={1} max={1024} required value={toolResultMb} onChange={(event) => { setToolResultMb(event.target.value); setSaved(false); }} /><span className="administration-field-help">{t('maxToolResultMbHelp')}</span></label>
                 {saveError && <div className="error" role="alert">{t('systemSettingsSaveFailed')}</div>}
                 {saved && <div className="success" role="status">{t('changesSaved')}</div>}
                 <button type="submit" className="primary admin-save" disabled={saving}><Save size={15} /> {saving ? t('saving') : t('saveSystemSettings')}</button>

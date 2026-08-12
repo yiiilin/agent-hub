@@ -281,6 +281,10 @@ pub(crate) fn tool_request_from_row(row: sqlx::postgres::PgRow) -> IntegrationTo
         expires_at: row.get("expires_at"),
         responded_at: row.try_get("responded_at").unwrap_or_default(),
         created_at: row.get("created_at"),
+        artifact_id: row.try_get("artifact_id").unwrap_or_default(),
+        artifact_size_bytes: row.try_get("artifact_size_bytes").unwrap_or_default(),
+        artifact_reason: row.try_get("artifact_reason").unwrap_or_default(),
+        result_truncated: row.try_get("result_truncated").unwrap_or_default(),
     }
 }
 

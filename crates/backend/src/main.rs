@@ -82,7 +82,11 @@ pub(crate) const SKILL_PACKAGE_UPLOAD_BODY_LIMIT: usize =
     MAX_SKILL_PACKAGE_EXPANDED_BYTES as usize + 2 * 1024 * 1024;
 pub(crate) const MAX_CLIENT_TOOL_COUNT: usize = 128;
 pub(crate) const MAX_CLIENT_TOOL_DEFINITIONS_BYTES: usize = 256_000;
-pub(crate) const MAX_CLIENT_TOOL_RESULT_BYTES: usize = 16_000;
+/// 工具结果超过该字节数即归档 S3 并仅保留同大小的截断版（32KB）；
+/// 超过系统参数 max_tool_result_bytes（硬上限）则不归档，仅保留截断版。
+pub(crate) const TOOL_RESULT_TRUNCATE_BYTES: usize = 32 * 1024;
+/// 工具结果归档的单次范围读取上限（防止模型循环读爆上下文/内存）。
+pub(crate) const TOOL_RESULT_READ_LIMIT_BYTES: usize = 64 * 1024;
 pub(crate) const EMBEDDED_ORIGIN_HEADER: &str = "x-agent-hub-embedded-origin";
 pub(crate) const MAX_ATTACHMENT_UPLOAD_BYTES: u64 = 104_857_600;
 pub(crate) const MAX_ATTACHMENT_BYTES_PER_SESSION: i64 = 524_288_000;
@@ -498,6 +502,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/runs/{run_id}/stop", post(stop_hub_run))
         .route("/api/runs/{run_id}/events", get(list_run_events))
         .route("/api/runs/{run_id}/events/stream", get(stream_run_events))
+        .route(
+            "/api/runs/{run_id}/tool-results/{tool_request_id}",
+            get(get_tool_result_artifact),
+        )
+        .route(
+            "/api/runtime/tool-results/{tool_request_id}",
+            get(get_tool_result_artifact_by_request_id),
+        )
         .route("/api/runtimes", get(list_runtimes))
         .route(
             "/api/admin/runtime-enrollment-tokens",
@@ -1015,6 +1027,7 @@ pub(crate) fn openapi_document() -> Value {
             "/api/runs/{run_id}/stop": { "post": { "summary": "Stop an active Turn in an owned Session", "parameters": [id("run_id")], "responses": { "200": response("Run"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/runs/{run_id}/events": { "get": { "summary": "List run events", "parameters": [id("run_id")], "responses": { "200": list_response("RunEvent"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/runs/{run_id}/events/stream": { "get": { "summary": "Stream run events", "parameters": [id("run_id")], "responses": { "200": { "description": "Server-sent event stream", "content": { "text/event-stream": { "schema": { "type": "string" } } } }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
+            "/api/runs/{run_id}/tool-results/{tool_request_id}": { "get": { "summary": "Read an archived tool result (size metadata or byte range)", "parameters": [id("run_id"), id("tool_request_id"), { "name": "mode", "in": "query", "schema": { "type": "string", "enum": ["size", "range"] } }, { "name": "offset", "in": "query", "schema": { "type": "integer" } }, { "name": "limit", "in": "query", "schema": { "type": "integer" } }], "responses": { "200": { "description": "Tool result artifact metadata or range text", "content": { "application/json": { "schema": { "type": "object" } } } }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/skills": {
                 "get": { "summary": "List skills", "responses": { "200": list_response("Skill"), "401": { "$ref": "#/components/responses/Unauthorized" } } },
                 "post": { "summary": "Create skill", "requestBody": body("SkillWriteRequest"), "responses": { "200": response("Skill"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" } } },
