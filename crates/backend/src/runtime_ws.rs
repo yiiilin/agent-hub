@@ -22,6 +22,7 @@ use axum::response::IntoResponse;
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sqlx::Row;
 use tokio::sync::mpsc;
 use tokio::time::{sleep_until, Instant};
 use uuid::Uuid;
@@ -227,35 +228,111 @@ async fn handle_upstream(
                     *pending = None;
                 }
             }
-            // 快照丢失：operation→snapshot_lost、会话释放归属转 offline（无工作区，
-            // 对话仍在 DB，用户可继续发消息重建）。
-            if status == "snapshot_lost" {
-                let _ = sqlx::query(
-                    "UPDATE hub_sessions s
-                        SET runtime_owner_id = NULL, lifecycle_status = 'offline',
-                            updated_at = now()
-                      FROM force_stop_operation o
-                     WHERE o.operation_id = $1 AND o.session_id = s.id
-                       AND o.state = 'pending'
-                       AND s.lifecycle_status = 'force_stopping'",
-                )
-                .bind(operation_id)
-                .execute(&state.pool)
-                .await;
-                let _ = sqlx::query(
-                    "UPDATE force_stop_operation
-                        SET state = 'snapshot_lost', updated_at = now()
-                      WHERE operation_id = $1 AND state = 'pending'",
-                )
-                .bind(operation_id)
-                .execute(&state.pool)
-                .await;
-            }
             // status == "ok" 不在此处提交：快照上传成功以 HTTP 上传端点的原子事务为准。
+            // status == "snapshot_lost"：单事务原子终态（锁 operation + 校验
+            // pending、target runtime、会话对应与 force_stopping；不匹配忽略）。
+            if status == "snapshot_lost" {
+                apply_snapshot_lost(state, runtime_id, operation_id).await;
+            }
         }
         UpstreamMessage::OwnedSessions { sessions } => {
             reconcile_owned_sessions(state, runtime_id, sessions).await;
         }
+    }
+}
+
+/// 快照丢失终态：单事务锁 operation，校验该 operation 确实发给本 runtime
+/// 且会话仍处于 force_stopping（pending），然后原子更新
+/// operation→snapshot_lost + 会话→offline（释放归属）。任何不匹配 → 仅记录忽略。
+pub(crate) async fn apply_snapshot_lost(
+    state: &Arc<AppState>,
+    runtime_id: Uuid,
+    operation_id: Uuid,
+) {
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(error) => {
+            tracing::error!(%operation_id, error = %error, "begin snapshot_lost tx failed");
+            return;
+        }
+    };
+    let row = match sqlx::query(
+        "SELECT o.session_id, o.run_id, o.target_runtime_id, o.state,
+                s.lifecycle_status
+         FROM force_stop_operation o
+         JOIN hub_sessions s ON s.id = o.session_id
+         WHERE o.operation_id = $1
+         FOR UPDATE OF o, s",
+    )
+    .bind(operation_id)
+    .fetch_optional(&mut *tx)
+    .await
+    {
+        Ok(row) => row,
+        Err(error) => {
+            tracing::error!(%operation_id, error = %error, "lock snapshot_lost operation failed");
+            return;
+        }
+    };
+    let Some(row) = row else {
+        tracing::warn!(%operation_id, "snapshot_lost ack for unknown operation; ignored");
+        return;
+    };
+    let target: Option<Uuid> = row.get("target_runtime_id");
+    if target != Some(runtime_id) {
+        tracing::warn!(
+            %operation_id, %runtime_id,
+            "snapshot_lost ack from runtime that does not own the operation; ignored"
+        );
+        return;
+    }
+    if row.get::<String, _>("state") != "pending"
+        || row.get::<String, _>("lifecycle_status") != "force_stopping"
+    {
+        tracing::warn!(%operation_id, "snapshot_lost ack for non-pending operation; ignored");
+        return;
+    }
+    let session_id: Uuid = row.get("session_id");
+    let run_id: Uuid = row.get("run_id");
+    let result = async {
+        let updated = sqlx::query(
+            "UPDATE hub_sessions
+                SET runtime_owner_id = NULL, lifecycle_status = 'offline', updated_at = now()
+              WHERE id = $1 AND lifecycle_status = 'force_stopping'",
+        )
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            anyhow::bail!("session is no longer force stopping");
+        }
+        let updated = sqlx::query(
+            "UPDATE force_stop_operation
+                SET state = 'snapshot_lost', updated_at = now()
+              WHERE operation_id = $1 AND state = 'pending'",
+        )
+        .bind(operation_id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            anyhow::bail!("operation is no longer pending");
+        }
+        let updated =
+            sqlx::query("UPDATE runs SET status = 'interrupted', updated_at = now() WHERE id = $1")
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await?;
+        if updated.rows_affected() != 1 {
+            anyhow::bail!("run is missing");
+        }
+        tx.commit().await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(%operation_id, error = %error, "snapshot_lost atomic update failed");
+    } else {
+        tracing::info!(%operation_id, %session_id, "force stop snapshot lost; session released");
     }
 }
 

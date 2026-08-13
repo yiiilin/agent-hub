@@ -70,6 +70,7 @@ ALTER TABLE public.hub_sessions
         )
         OR (
             current_bundle_kind = 'force_stop'
+            AND current_bundle_checkpoint_attempt_id IS NULL
             AND current_bundle_generation IS NOT NULL
             AND current_bundle_object_key IS NOT NULL
             AND btrim(current_bundle_object_key) <> ''

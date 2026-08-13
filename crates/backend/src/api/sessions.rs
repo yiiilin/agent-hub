@@ -1813,10 +1813,8 @@ pub(crate) async fn force_stop_hub_run(
     }
     let user = require_user(&state, &headers).await?;
     let mut tx = state.pool.begin().await?;
-    let session = sqlx::query(
-        "SELECT runs.hub_session_id, sessions.origin_kind, sessions.lifecycle_status,
-                sessions.ownership_generation, sessions.runtime_owner_id,
-                sessions.active_turn_id, sessions.owner_id
+    let (hub_session_id, session_owner_id): (Uuid, Uuid) = sqlx::query_as(
+        "SELECT runs.hub_session_id, sessions.owner_id
          FROM runs
          JOIN hub_sessions AS sessions ON sessions.id = runs.hub_session_id
          WHERE runs.id = $1
@@ -1826,17 +1824,72 @@ pub(crate) async fn force_stop_hub_run(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(ApiError::not_found("run not found"))?;
-    let hub_session_id: Uuid = session.get("hub_session_id");
-    let session_owner_id: Uuid = session.get("owner_id");
-    let origin_kind: String = session.get("origin_kind");
-    if origin_kind != "hub_native" {
-        return Err(ApiError::conflict(
-            "External Sessions are read-only in the Hub console",
-        ));
-    }
     if session_owner_id != user.id && user.role != "super_admin" {
         return Err(ApiError::forbidden(
             "force stop requires the Session owner or an explicit administrator",
+        ));
+    }
+    let (dto, created) = force_stop_run_core_tx(
+        &mut tx,
+        run_id,
+        hub_session_id,
+        &request_id,
+        req.expected_generation,
+        false, // 控制台：仅 hub_native 会话。
+    )
+    .await?;
+    tx.commit().await?;
+    // 幂等语义：终态返回首次结果（200）；未完成返回 202（不重复创建）。
+    let status = if matches!(
+        dto.state.as_str(),
+        "succeeded" | "snapshot_lost" | "abandoned"
+    ) {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    // 仅本次新建且 target runtime 确定时推送停止命令（连接不在线由上报兜底重推）。
+    if created {
+        if let Some(target_runtime) = dto.target_runtime_id {
+            crate::runtime_ws::push_force_stop_command(
+                &state,
+                target_runtime,
+                dto.operation_id,
+                hub_session_id,
+                run_id,
+            )
+            .await;
+        }
+    }
+    Ok((status, Json(dto)))
+}
+
+/// force-stop 共享核心（事务内）：校验会话状态/归属代次、幂等、
+/// 终结活动 run、创建 operation、会话转 force_stopping。
+/// 调用方负责鉴权与事务提交；错误时事务由调用方回滚。
+pub(crate) async fn force_stop_run_core_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    run_id: Uuid,
+    hub_session_id: Uuid,
+    request_id: &str,
+    expected_generation: Option<i64>,
+    allow_external: bool,
+) -> Result<(ForceStopOperationDto, bool), ApiError> {
+    // Ok((dto, created))：created=false 表示幂等命中既有 operation（调用方不推送）。
+    let session = sqlx::query(
+        "SELECT origin_kind, lifecycle_status, ownership_generation, runtime_owner_id
+         FROM hub_sessions
+         WHERE id = $1
+         FOR UPDATE",
+    )
+    .bind(hub_session_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ApiError::not_found("session not found"))?;
+    let origin_kind: String = session.get("origin_kind");
+    if !allow_external && origin_kind != "hub_native" {
+        return Err(ApiError::conflict(
+            "External Sessions are read-only in the Hub console",
         ));
     }
     let lifecycle: String = session.get("lifecycle_status");
@@ -1844,7 +1897,7 @@ pub(crate) async fn force_stop_hub_run(
         return Err(ApiError::conflict("session is read-only"));
     }
     let current_generation: i64 = session.get("ownership_generation");
-    if let Some(expected) = req.expected_generation {
+    if let Some(expected) = expected_generation {
         if expected != current_generation {
             return Err(ApiError::conflict("expected generation does not match"));
         }
@@ -1855,18 +1908,12 @@ pub(crate) async fn force_stop_hub_run(
          WHERE session_id = $1 AND request_id = $2",
     )
     .bind(hub_session_id)
-    .bind(&request_id)
-    .fetch_optional(&mut *tx)
+    .bind(request_id)
+    .fetch_optional(&mut **tx)
     .await?
     {
-        let (operation_id, state) = existing;
-        let dto = load_force_stop_operation(&mut tx, operation_id).await?;
-        if matches!(state.as_str(), "succeeded" | "snapshot_lost" | "abandoned") {
-            // 终态：幂等返回首次结果（200）。
-            return Ok((StatusCode::OK, Json(dto)));
-        }
-        // 未完成：重复请求返回已存在的 operation（202，不重复创建）。
-        return Ok((StatusCode::ACCEPTED, Json(dto)));
+        let dto = load_force_stop_operation(tx, existing.0).await?;
+        return Ok((dto, false));
     }
     // 当前活动任务 A 必须存在且处于活动状态。
     let a = sqlx::query(
@@ -1876,10 +1923,9 @@ pub(crate) async fn force_stop_hub_run(
     )
     .bind(run_id)
     .bind(hub_session_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
     let Some(a) = a else {
-        tx.commit().await?;
         return Err(ApiError::conflict("run is not active (already terminal)"));
     };
     let a_turn_id: Uuid = a.get("hub_turn_id");
@@ -1893,10 +1939,9 @@ pub(crate) async fn force_stop_hub_run(
     )
     .bind(hub_session_id)
     .bind(run_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
     if other_active {
-        tx.commit().await?;
         return Err(ApiError::conflict(
             "session has other active runs; refusing force stop (invariant broken)",
         ));
@@ -1904,7 +1949,6 @@ pub(crate) async fn force_stop_hub_run(
     // 目标 runtime：无归属 → 409 不改库。
     let target_runtime: Option<Uuid> = session.get("runtime_owner_id");
     let Some(target_runtime) = target_runtime else {
-        tx.commit().await?;
         return Err(ApiError::conflict(
             "session is not owned by a runtime; cannot force stop",
         ));
@@ -1917,17 +1961,17 @@ pub(crate) async fn force_stop_hub_run(
     )
     .bind(hub_session_id)
     .bind(run_id)
-    .fetch_all(&mut *tx)
+    .fetch_all(&mut **tx)
     .await?;
     // 终结全部非 A pending run（其 queued 消息无需特殊处理——历史在 DB，
     // 恢复时重建包含；消息绑定已终态 run，恢复时按 sequence 重建）。
     for (pending_run, pending_turn) in pending_runs {
         sqlx::query("UPDATE runs SET status = 'failed', updated_at = now() WHERE id = $1")
             .bind(pending_run)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         insert_run_event_tx(
-            &mut tx,
+            tx,
             pending_run,
             "status".into(),
             None,
@@ -1942,16 +1986,16 @@ pub(crate) async fn force_stop_hub_run(
         )
         .bind(pending_turn)
         .bind(hub_session_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     }
     // A：interrupted + 事件 + 回合终态。
     sqlx::query("UPDATE runs SET status = 'interrupted', updated_at = now() WHERE id = $1")
         .bind(run_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     insert_run_event_tx(
-        &mut tx,
+        tx,
         run_id,
         "status".into(),
         None,
@@ -1966,7 +2010,7 @@ pub(crate) async fn force_stop_hub_run(
     )
     .bind(a_turn_id)
     .bind(hub_session_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     let operation_id = Uuid::new_v4();
     sqlx::query(
@@ -1979,7 +2023,7 @@ pub(crate) async fn force_stop_hub_run(
     .bind(run_id)
     .bind(&request_id)
     .bind(target_runtime)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     // 会话：标记"强制停止中"（保持 runtime 归属与 generation——hub 权威，
     // 由 10s 持有上报与非权威抛弃兜底），清 saving/checkpoint 状态。
@@ -1995,7 +2039,7 @@ pub(crate) async fn force_stop_hub_run(
          WHERE id = $1",
     )
     .bind(hub_session_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
     // 取消 pending/claimed tool 请求。
     sqlx::query(
@@ -2004,20 +2048,10 @@ pub(crate) async fn force_stop_hub_run(
     )
     .bind(hub_session_id)
     .bind(run_id)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await?;
-    let dto = load_force_stop_operation(&mut tx, operation_id).await?;
-    tx.commit().await?;
-    // 推送停止命令（WebSocket；连接不在线则由 10 秒上报兜底重推）。
-    crate::runtime_ws::push_force_stop_command(
-        &state,
-        target_runtime,
-        operation_id,
-        hub_session_id,
-        run_id,
-    )
-    .await;
-    Ok((StatusCode::ACCEPTED, Json(dto)))
+    let dto = load_force_stop_operation(tx, operation_id).await?;
+    Ok((dto, true))
 }
 
 pub(crate) async fn load_force_stop_operation(

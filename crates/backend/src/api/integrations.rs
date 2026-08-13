@@ -1567,24 +1567,7 @@ pub(crate) async fn stop_widget_run(
         .ok_or(ApiError::unauthorized("missing embed session"))?;
     let mut tx = state.pool.begin().await?;
     let credential = lock_widget_credential_tx(&mut tx, &token, &headers).await?;
-    let run = sqlx::query(
-        "SELECT id, agent_id, owner_id, integration_session_id, hub_session_id,
-                hub_turn_id, status, client_instance_id, client_tool_snapshot,
-                widget_session_id, external_user_context, model_subject_type,
-                model_subject_user_id, model_source_integration_app_id
-         FROM runs
-         WHERE id = $1 AND agent_id = $2 AND owner_id = $3
-           AND (($4::boolean = true AND source IN ('widget', 'integration:tool_result'))
-                OR ($4::boolean = false AND widget_session_id = $5))",
-    )
-    .bind(run_id)
-    .bind(credential.agent_id)
-    .bind(credential.owner_id)
-    .bind(credential.client_instance_id.is_some())
-    .bind(credential.id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or(ApiError::not_found("run not found"))?;
+    let run = locate_widget_run_tx(&mut tx, &credential, run_id).await?;
     let scoped = load_widget_scoped_session_tx(
         &mut tx,
         &credential,
@@ -1626,6 +1609,95 @@ pub(crate) async fn stop_widget_run(
     let run = request_run_interrupt_tx(&mut tx, run_id, scoped.hub_session_id).await?;
     tx.commit().await?;
     Ok(Json(run))
+}
+
+/// 在 client 凭证作用域内定位 run（与 stop 端点完全同构：client_instance_id
+/// 存在时只允许 widget/integration:tool_result 来源，否则必须属于该 widget 会话）。
+async fn locate_widget_run_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    credential: &WidgetCredential,
+    run_id: Uuid,
+) -> Result<sqlx::postgres::PgRow, ApiError> {
+    sqlx::query(
+        "SELECT id, agent_id, owner_id, integration_session_id, hub_session_id,
+                hub_turn_id, status, client_instance_id, client_tool_snapshot,
+                widget_session_id, external_user_context, model_subject_type,
+                model_subject_user_id, model_source_integration_app_id
+         FROM runs
+         WHERE id = $1 AND agent_id = $2 AND owner_id = $3
+           AND (($4::boolean = true
+                 AND widget_session_id = $5
+                 AND source IN ('widget', 'integration:tool_result'))
+                OR ($4::boolean = false AND widget_session_id = $5))",
+    )
+    .bind(run_id)
+    .bind(credential.agent_id)
+    .bind(credential.owner_id)
+    .bind(credential.client_instance_id.is_some())
+    .bind(credential.id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ApiError::not_found("run not found"))
+}
+
+/// Client 侧强制停止（第三方/external 会话也允许）：按 client 凭证作用域
+/// 定位 run 后执行与控制台一致的 force-stop 核心（杀 Pi + 快照上传）。
+pub(crate) async fn force_stop_widget_run(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(run_id): Path<Uuid>,
+    Json(req): Json<ForceStopRequest>,
+) -> Result<(StatusCode, Json<ForceStopOperationDto>), ApiError> {
+    let token = client_access_token_from_headers(&headers)
+        .ok_or(ApiError::unauthorized("missing embed session"))?;
+    let mut tx = state.pool.begin().await?;
+    let credential = lock_widget_credential_tx(&mut tx, &token, &headers).await?;
+    let run = locate_widget_run_tx(&mut tx, &credential, run_id).await?;
+    let scoped = load_widget_scoped_session_tx(
+        &mut tx,
+        &credential,
+        run.get("integration_session_id"),
+        Some(run.get("hub_session_id")),
+        true,
+    )
+    .await?;
+    let request_id = req.request_id.trim().to_owned();
+    if request_id.is_empty() || request_id.len() > 128 {
+        return Err(ApiError::bad_request(
+            "request_id is required (<=128 chars)",
+        ));
+    }
+    let (dto, created) = crate::api::sessions::force_stop_run_core_tx(
+        &mut tx,
+        run_id,
+        scoped.hub_session_id,
+        &request_id,
+        req.expected_generation,
+        true, // client 凭证作用域内的会话（含 external）允许强制停止。
+    )
+    .await?;
+    tx.commit().await?;
+    let status = if matches!(
+        dto.state.as_str(),
+        "succeeded" | "snapshot_lost" | "abandoned"
+    ) {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    if created {
+        if let Some(target_runtime) = dto.target_runtime_id {
+            crate::runtime_ws::push_force_stop_command(
+                &state,
+                target_runtime,
+                dto.operation_id,
+                scoped.hub_session_id,
+                run_id,
+            )
+            .await;
+        }
+    }
+    Ok((status, Json(dto)))
 }
 
 pub(crate) async fn create_integration_session(
@@ -8151,6 +8223,175 @@ mod tests {
         assert_eq!(accepted.run.status, "pending");
         assert_eq!(accepted.message.delivery_mode, "next_turn");
         assert_eq!(accepted.message.delivery_state, "queued");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn widget_force_stop_works_for_external_session_and_is_scoped(pool: PgPool) {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+        let fixture = widget_external_test_fixture(pool, true).await;
+        // 完整 external 身份：OAuth app + 平台/租户/外部用户 + client_instance。
+        let tenant_id = format!("tenant-{}", Uuid::new_v4().simple());
+        let external_user_id = format!("ext-{}", Uuid::new_v4().simple());
+        let instance_id = fixture.client_instance_id;
+        let access = issue_client_access_for_instance(
+            &fixture,
+            instance_id,
+            &tenant_id,
+            &external_user_id,
+            test_client_tool_definitions(&["open_panel"]),
+        )
+        .await;
+        let token = access.access_token;
+        let other_access = issue_client_access_for_instance(
+            &fixture,
+            Uuid::new_v4(),
+            &tenant_id,
+            &external_user_id,
+            test_client_tool_definitions(&["open_panel"]),
+        )
+        .await;
+        let other_token = other_access.access_token;
+
+        // 创建 external 会话 + run（/api/client/runs，canonical helper）。
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let run =
+            create_canonical_client_run(&fixture, &token, None, "external force stop test").await;
+        let hub_session_id =
+            sqlx::query_scalar::<_, Uuid>("SELECT hub_session_id FROM runs WHERE id = $1")
+                .bind(run.id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        // 确认是 external 会话（用户要求的第三方会话场景）。
+        let (origin_kind, platform_id, identity_id): (String, Option<Uuid>, Option<Uuid>) =
+            sqlx::query_as(
+                "SELECT origin_kind, origin_platform_id, origin_external_identity_id
+                 FROM hub_sessions WHERE id = $1",
+            )
+            .bind(hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        assert_eq!(origin_kind, "external");
+        assert_eq!(platform_id, Some(fixture.platform_id));
+        assert!(identity_id.is_some(), "external identity must be recorded");
+
+        // 置为运行中（模拟已被 runtime 领取执行）。
+        let runtime_id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO runtimes
+                 (id, token_hash, hostname, labels, engine_version, capabilities,
+                  sandbox_mode, status)
+             VALUES ($1, $2, 'force-stop-runtime', '{}', 'test',
+                     '{"model_proxy":true}'::jsonb, 'workspace-write', 'online')"#,
+        )
+        .bind(runtime_id)
+        .bind(sha256_hex(&format!("rt-{runtime_id}")))
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET runtime_owner_id = $1, ownership_generation = 1,
+                 lifecycle_status = 'online', active_turn_id = $2
+             WHERE id = $3",
+        )
+        .bind(runtime_id)
+        .bind(run.hub_turn_id)
+        .bind(hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE runs SET runtime_id = $1, status = 'running',
+                 session_ownership_generation = 1
+             WHERE id = $2",
+        )
+        .bind(runtime_id)
+        .bind(run.id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        // 用户强制停止（第三方会话也允许）。
+        let (status, dto) = force_stop_widget_run(
+            State(fixture.state.clone()),
+            headers.clone(),
+            Path(run.id),
+            Json(ForceStopRequest {
+                request_id: "external-force-stop-1".into(),
+                expected_generation: Some(1),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(dto.state, "pending");
+        assert_eq!(dto.session_id, hub_session_id);
+        assert_eq!(dto.target_runtime_id, Some(runtime_id));
+
+        let (lifecycle, gen, owner): (String, i64, Option<Uuid>) = sqlx::query_as(
+            "SELECT lifecycle_status, ownership_generation, runtime_owner_id
+             FROM hub_sessions WHERE id = $1",
+        )
+        .bind(hub_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(lifecycle, "force_stopping");
+        assert_eq!(gen, 1);
+        assert_eq!(owner, Some(runtime_id));
+        let (run_status,): (String,) = sqlx::query_as("SELECT status FROM runs WHERE id = $1")
+            .bind(run.id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        assert_eq!(run_status, "interrupted");
+
+        // 同一 app 但不同 client_instance 的凭证 → 404（作用域隔离）。
+        let mut other_headers = HeaderMap::new();
+        other_headers.insert(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {other_token}")).unwrap(),
+        );
+        let err = force_stop_widget_run(
+            State(fixture.state.clone()),
+            other_headers,
+            Path(run.id),
+            Json(ForceStopRequest {
+                request_id: "external-force-stop-other".into(),
+                expected_generation: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.status,
+            StatusCode::NOT_FOUND,
+            "foreign instance must not force stop: {:?}",
+            err.message
+        );
+
+        // 无凭证 → 401。
+        let err = force_stop_widget_run(
+            State(fixture.state.clone()),
+            HeaderMap::new(),
+            Path(run.id),
+            Json(ForceStopRequest {
+                request_id: "external-force-stop-anon".into(),
+                expected_generation: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -6048,6 +6048,14 @@ impl SessionSupervisorManager {
         if let Some(supervisor) = supervisor_to_stop {
             supervisor.shutdown();
         }
+        // 启动 fence：记录启动前 record 的归属代次与 run 标记，start 完成后
+        // 必须仍为同一 Starting record，防止 force-stop/重派后旧启动覆盖新 record。
+        let start_fence = {
+            let records = self.records.lock().unwrap();
+            records
+                .get(&metadata.session_id)
+                .map(|record| (record.snapshot.ownership_generation, record.reserved_run_id))
+        };
 
         if let Err(error) = persist_session_supervisor_metadata(&self.work_root, &metadata).await {
             self.mark_blocked(metadata.session_id, error.to_string());
@@ -6069,9 +6077,22 @@ impl SessionSupervisorManager {
             anyhow::bail!("Session manager stopped during startup");
         }
         let mut records = self.records.lock().unwrap();
-        let record = records
-            .get_mut(&metadata.session_id)
-            .context("Session capacity record disappeared during startup")?;
+        let Some(record) = records.get_mut(&metadata.session_id) else {
+            drop(records);
+            // 启动期间被 force-stop/抛弃移除：回收刚启动的 supervisor。
+            supervisor.shutdown();
+            anyhow::bail!("Session capacity record disappeared during startup");
+        };
+        let fence_ok = matches!(record.status, ManagedSessionStatus::Starting)
+            && start_fence.as_ref().is_some_and(|(gen, reserved)| {
+                *gen == record.snapshot.ownership_generation && *reserved == record.reserved_run_id
+            });
+        if !fence_ok {
+            drop(records);
+            // record 已被替换（新 claim 重建）或已非 Starting：不得覆盖。
+            supervisor.shutdown();
+            anyhow::bail!("Session capacity record was replaced during startup");
+        }
         record.status = ManagedSessionStatus::Ready {
             metadata,
             supervisor: Arc::clone(&supervisor),

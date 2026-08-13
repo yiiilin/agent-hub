@@ -826,6 +826,7 @@ pub(crate) async fn runtime_upload_force_stop_bundle(
                  current_bundle_created_at = now(),
                  current_bundle_runtime_id = $6,
                  current_bundle_kind = 'force_stop',
+                 current_bundle_checkpoint_attempt_id = NULL,
                  runtime_owner_id = NULL,
                  lifecycle_status = 'offline',
                  updated_at = now()
@@ -8245,6 +8246,113 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(op_count, 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn force_stop_snapshot_lost_ack_is_atomic_and_fenced(pool: PgPool) {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM hub_sessions WHERE id = $1")
+            .bind(fixture.hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        let session_token = format!("ahs_{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO sessions (token_hash, user_id, expires_at)
+             VALUES ($1, $2, now() + interval '1 hour')",
+        )
+        .bind(sha256_hex(&session_token))
+        .bind(owner_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let user_headers = HeaderMap::from_iter([(
+            header::COOKIE,
+            format!("agent_hub_session={session_token}")
+                .parse()
+                .unwrap(),
+        )]);
+        let (status, dto) = force_stop_hub_run(
+            State(fixture.state.clone()),
+            user_headers,
+            Path(fixture.run_id),
+            Json(ForceStopRequest {
+                request_id: "ack-fence-1".into(),
+                expected_generation: Some(1),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        // 另一个 runtime 的 snapshot_lost ack：不得改变任何状态。
+        let other_runtime_id = Uuid::new_v4();
+        crate::runtime_ws::apply_snapshot_lost(&fixture.state, other_runtime_id, dto.operation_id)
+            .await;
+        let (op_state,): (String,) =
+            sqlx::query_as("SELECT state FROM force_stop_operation WHERE operation_id = $1")
+                .bind(dto.operation_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(op_state, "pending", "foreign runtime ack must be ignored");
+        let (lifecycle,): (String,) =
+            sqlx::query_as("SELECT lifecycle_status FROM hub_sessions WHERE id = $1")
+                .bind(fixture.hub_session_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(lifecycle, "force_stopping");
+
+        // 正确 runtime 的 snapshot_lost ack：原子终态。
+        crate::runtime_ws::apply_snapshot_lost(
+            &fixture.state,
+            fixture.runtime_id,
+            dto.operation_id,
+        )
+        .await;
+        let (op_state,): (String,) =
+            sqlx::query_as("SELECT state FROM force_stop_operation WHERE operation_id = $1")
+                .bind(dto.operation_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(op_state, "snapshot_lost");
+        let (lifecycle, owner): (String, Option<Uuid>) = sqlx::query_as(
+            "SELECT lifecycle_status, runtime_owner_id FROM hub_sessions WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(lifecycle, "offline");
+        assert_eq!(owner, None);
+        let (run_status,): (String,) = sqlx::query_as("SELECT status FROM runs WHERE id = $1")
+            .bind(fixture.run_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        assert_eq!(run_status, "interrupted");
+
+        // 重复 ack（已终态）→ 忽略，状态不变。
+        crate::runtime_ws::apply_snapshot_lost(
+            &fixture.state,
+            fixture.runtime_id,
+            dto.operation_id,
+        )
+        .await;
+        let (op_state,): (String,) =
+            sqlx::query_as("SELECT state FROM force_stop_operation WHERE operation_id = $1")
+                .bind(dto.operation_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(op_state, "snapshot_lost", "terminal ack must be idempotent");
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -613,6 +613,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/client/runs", post(create_widget_run))
         .route("/api/client/runs/{run_id}/stop", post(stop_widget_run))
         .route(
+            "/api/client/runs/{run_id}/force-stop",
+            post(force_stop_widget_run),
+        )
+        .route(
             "/api/client/attachments",
             post(upload_widget_attachment)
                 .layer(DefaultBodyLimit::max(ATTACHMENT_UPLOAD_BODY_LIMIT)),
@@ -1177,6 +1181,7 @@ pub(crate) fn openapi_document() -> Value {
             "/api/client/sessions/{session_id}/events/stream": { "get": { "summary": "Resume the typed event stream for one exact Client Session", "security": [{ "clientAccessBearer": [] }], "parameters": [id("session_id"), { "name": "after", "in": "query", "required": false, "schema": { "type": "integer", "format": "int64", "minimum": 0 } }], "responses": { "200": { "description": "SSE frames whose data is a ClientSessionEvent JSON object", "content": { "text/event-stream": { "schema": { "type": "string" } } } }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/client/runs": { "post": { "summary": "Send a message, creating a Session only for the first accepted message", "security": [{ "clientAccessBearer": [] }], "requestBody": body("CreateClientRunRequest"), "responses": { "200": response("Run"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/client/runs/{run_id}/stop": { "post": { "summary": "Stop an active Run in this Client Access scope", "security": [{ "clientAccessBearer": [] }], "parameters": [id("run_id")], "responses": { "200": response("Run"), "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
+            "/api/client/runs/{run_id}/force-stop": { "post": { "summary": "Force stop an active Run in this Client Access scope (external Sessions included); kills the Pi and uploads a workspace snapshot, then the Session recovers on the next message", "security": [{ "clientAccessBearer": [] }], "parameters": [id("run_id")], "requestBody": body("ForceStopRequest"), "responses": { "202": response("ForceStopOperation"), "200": response("ForceStopOperation"), "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/client/tool-calls/{tool_call_id}/claim": { "post": { "summary": "Atomically claim one Run-bound Client Tool call", "security": [{ "clientAccessBearer": [] }], "parameters": [id("tool_call_id")], "responses": { "200": response("ClientToolClaimResponse"), "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" }, "410": { "$ref": "#/components/responses/Gone" } } } },
             "/api/client/tool-calls/{tool_call_id}/result": { "post": { "summary": "Submit one structured Client Tool result", "security": [{ "clientAccessBearer": [] }], "parameters": [id("tool_call_id")], "requestBody": body("SubmitClientToolResultRequest"), "responses": { "200": response("SubmitClientToolResultResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "description": "A different result was already accepted for this tool_call_id" }, "410": { "$ref": "#/components/responses/Gone" } } } },
             "/api/widget/access": { "post": { "summary": "Issue a short-lived Widget credential for one trusted external user", "deprecated": true, "security": [{ "integrationClientBasic": [] }], "requestBody": body("CreateWidgetAccessRequest"), "responses": { "200": response("WidgetAccessResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" } } } },
@@ -1977,6 +1982,7 @@ mod tests {
             "/api/client/sessions/{session_id}/events/stream",
             "/api/client/runs",
             "/api/client/runs/{run_id}/stop",
+            "/api/client/runs/{run_id}/force-stop",
             "/api/client/tool-calls/{tool_call_id}/claim",
             "/api/client/tool-calls/{tool_call_id}/result",
             "/api/widget/access",
