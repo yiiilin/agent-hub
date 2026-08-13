@@ -2051,12 +2051,11 @@ pub(crate) async fn submit_integration_tool_result(
     let principal = require_integration(&state, &headers, agent_id).await?;
     let settings = load_system_settings(&state.pool).await?;
     let validation = validate_tool_result(&req.result, settings.max_tool_result_bytes)?;
-    let run_id = sqlx::query_scalar::<_, Uuid>(
-        "SELECT run_id FROM integration_tool_requests WHERE id = $1",
-    )
-    .bind(tool_request_id)
-    .fetch_one(&state.pool)
-    .await?;
+    let run_id =
+        sqlx::query_scalar::<_, Uuid>("SELECT run_id FROM integration_tool_requests WHERE id = $1")
+            .bind(tool_request_id)
+            .fetch_one(&state.pool)
+            .await?;
     let archived = archive_tool_result(&state, run_id, tool_request_id, &validation).await;
     let result = sanitize_run_event_payload(validation.payload);
     let mut tx = state.pool.begin().await?;
@@ -4170,7 +4169,7 @@ pub(crate) async fn load_claim_session_context_tx(
                 current_bundle_size_bytes, current_bundle_history_checkpoint,
                 current_bundle_ownership_generation,
                 current_bundle_producing_engine_version,
-                current_bundle_created_at, created_at, updated_at
+                current_bundle_created_at, current_bundle_kind, created_at, updated_at
          FROM hub_sessions
          WHERE id = $1 AND agent_id = $2",
     )
@@ -4238,7 +4237,7 @@ pub(crate) async fn load_hub_session_tx(
                 current_bundle_size_bytes, current_bundle_history_checkpoint,
                 current_bundle_ownership_generation,
                 current_bundle_producing_engine_version,
-                current_bundle_created_at, created_at, updated_at
+                current_bundle_created_at, current_bundle_kind, created_at, updated_at
          FROM hub_sessions WHERE id = $1",
     )
     .bind(session_id)
@@ -4314,29 +4313,23 @@ pub(crate) async fn get_tool_result_artifact(
 ) -> Result<Response, ApiError> {
     if bearer_token(&headers).is_some() {
         let runtime_id = require_runtime(&state, &headers).await?;
-        let owned: bool = sqlx::query_scalar(
-            "SELECT runtime_id = $1 FROM runs WHERE id = $2",
-        )
-        .bind(runtime_id)
-        .bind(run_id)
-        .fetch_optional(&state.pool)
-        .await?
-        .unwrap_or(false);
+        let owned: bool = sqlx::query_scalar("SELECT runtime_id = $1 FROM runs WHERE id = $2")
+            .bind(runtime_id)
+            .bind(run_id)
+            .fetch_optional(&state.pool)
+            .await?
+            .unwrap_or(false);
         if !owned {
-            return Err(ApiError::forbidden(
-                "run is not owned by this runtime",
-            ));
+            return Err(ApiError::forbidden("run is not owned by this runtime"));
         }
     } else {
         let user = require_user(&state, &headers).await?;
-        let owned: bool = sqlx::query_scalar(
-            "SELECT owner_id = $1 FROM runs WHERE id = $2",
-        )
-        .bind(user.id)
-        .bind(run_id)
-        .fetch_optional(&state.pool)
-        .await?
-        .unwrap_or(false);
+        let owned: bool = sqlx::query_scalar("SELECT owner_id = $1 FROM runs WHERE id = $2")
+            .bind(user.id)
+            .bind(run_id)
+            .fetch_optional(&state.pool)
+            .await?
+            .unwrap_or(false);
         if !owned {
             return Err(ApiError::forbidden("run is not owned by this user"));
         }
@@ -4353,13 +4346,12 @@ pub(crate) async fn get_tool_result_artifact_by_request_id(
     Query(query): Query<ToolResultArtifactQuery>,
 ) -> Result<Response, ApiError> {
     require_runtime(&state, &headers).await?;
-    let run_id: Uuid = sqlx::query_scalar(
-        "SELECT run_id FROM integration_tool_requests WHERE id = $1",
-    )
-    .bind(tool_request_id)
-    .fetch_optional(&state.pool)
-    .await?
-    .ok_or(ApiError::not_found("tool request not found"))?;
+    let run_id: Uuid =
+        sqlx::query_scalar("SELECT run_id FROM integration_tool_requests WHERE id = $1")
+            .bind(tool_request_id)
+            .fetch_optional(&state.pool)
+            .await?
+            .ok_or(ApiError::not_found("tool request not found"))?;
     load_tool_result_artifact_response(&state, run_id, tool_request_id, &query).await
 }
 
@@ -4548,9 +4540,9 @@ pub(crate) async fn load_integration_context_for_run(
                 .into_iter()
                 .map(|row| {
                     let result: ClientToolResultDto =
-                        serde_json::from_value(row.get("result_payload")).map_err(
-                            |_| ApiError::internal("stored Client Tool result is invalid"),
-                        )?;
+                        serde_json::from_value(row.get("result_payload")).map_err(|_| {
+                            ApiError::internal("stored Client Tool result is invalid")
+                        })?;
                     let result = match result {
                         ClientToolResultDto::Success { output } => ClientToolResultDto::Success {
                             output: summarize_tool_result_payload(
@@ -8212,6 +8204,7 @@ mod tests {
             "UPDATE hub_sessions
              SET runtime_owner_id = $1, ownership_generation = 1,
                  lifecycle_status = 'online', active_turn_id = $2,
+                 recovery_source = NULL,
                  native_session_id = 'widget-stop-thread'
              WHERE id = $3",
         )
@@ -8488,7 +8481,10 @@ mod tests {
         assert!(submitted.tool_request.result_truncated);
         assert!(submitted.tool_request.artifact_id.is_some());
         assert!(submitted.tool_request.artifact_reason.is_none());
-        assert!(submitted.tool_request.artifact_size_bytes.unwrap() as usize > TOOL_RESULT_TRUNCATE_BYTES);
+        assert!(
+            submitted.tool_request.artifact_size_bytes.unwrap() as usize
+                > TOOL_RESULT_TRUNCATE_BYTES
+        );
 
         let (payload, artifact_id): (serde_json::Value, Option<Uuid>) = sqlx::query_as(
             "SELECT result_payload, artifact_id FROM integration_tool_requests WHERE id = $1",
@@ -8504,7 +8500,10 @@ mod tests {
         // S3 对象已落盘（键 tool-results/{run_id}/{artifact_id}）。
         let object_key = format!("tool-results/{}/{}", fixture.run_id, artifact_id.unwrap());
         let stored = objects.lock().unwrap().get(&object_key).cloned();
-        assert!(stored.is_some(), "archived result must exist in object storage");
+        assert!(
+            stored.is_some(),
+            "archived result must exist in object storage"
+        );
         assert!(stored.unwrap().len() > TOOL_RESULT_TRUNCATE_BYTES);
 
         // context 摘要包含大小与读取指引。
@@ -8517,12 +8516,18 @@ mod tests {
         let tool_result = context.tool_result.expect("single tool result is emitted");
         assert_eq!(tool_result.get("truncated"), Some(&json!(true)));
         let summary = tool_result.get("content").and_then(Value::as_str).unwrap();
-        assert!(summary.contains("archived as artifact://"), "summary must point at the artifact");
+        assert!(
+            summary.contains("archived as artifact://"),
+            "summary must point at the artifact"
+        );
         assert!(
             summary.contains("agent_hub_integration_tool_result_read"),
             "summary must teach the model how to read the full result"
         );
-        assert!(summary.contains("bytes total"), "summary must include the original size");
+        assert!(
+            summary.contains("bytes total"),
+            "summary must include the original size"
+        );
         assert!(context.tool_results.is_empty());
 
         server.abort();
@@ -8630,9 +8635,12 @@ mod tests {
         .await
         .unwrap()
         .into_response();
-        let size_body: serde_json::Value =
-            serde_json::from_slice(&axum::body::to_bytes(size.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
+        let size_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(size.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             size_body["size_bytes"].as_i64().unwrap() as usize,
             TOOL_RESULT_TRUNCATE_BYTES + 4096 + "{\"content\":\"".len() + "\"}".len()
@@ -8654,9 +8662,12 @@ mod tests {
         .await
         .unwrap()
         .into_response();
-        let range_body: serde_json::Value =
-            serde_json::from_slice(&axum::body::to_bytes(range.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
+        let range_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(range.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         let content = range_body["content"].as_str().unwrap();
         assert_eq!(content.len(), 1024);
         assert_eq!(range_body["next_offset"].as_i64().unwrap(), 1024);
@@ -8723,7 +8734,9 @@ mod tests {
         .await
         .unwrap()
         .into_response();
-        let body = axum::body::to_bytes(full.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(full.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(
             parsed["content"].as_str().unwrap().len(),
@@ -8768,13 +8781,11 @@ mod tests {
 
         // 会话删除走 owner 路径：为 hub_session 的 owner 造一个会话 token。
         // integration fixture 的 state 无 session provider，删除用独立 state。
-        let owner_id: Uuid = sqlx::query_scalar(
-            "SELECT owner_id FROM hub_sessions WHERE id = $1",
-        )
-        .bind(fixture.hub_session_id)
-        .fetch_one(&state.pool)
-        .await
-        .unwrap();
+        let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM hub_sessions WHERE id = $1")
+            .bind(fixture.hub_session_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
         let owner_token = format!("ahs_owner_{}", Uuid::new_v4().simple());
         sqlx::query(
             "INSERT INTO sessions (token_hash, user_id, expires_at)

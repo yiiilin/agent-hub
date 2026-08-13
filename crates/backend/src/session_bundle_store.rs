@@ -174,7 +174,8 @@ impl S3BundleStore {
             .await
             .context("read Tool Result range from S3")?;
         anyhow::ensure!(
-            response.status().is_success() || response.status() == reqwest::StatusCode::PARTIAL_CONTENT,
+            response.status().is_success()
+                || response.status() == reqwest::StatusCode::PARTIAL_CONTENT,
             "Tool Result S3 GET failed with status {}",
             response.status()
         );

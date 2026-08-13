@@ -6,26 +6,29 @@ use std::{
     collections::BTreeSet,
     fs::{self, File},
     io::{BufRead, BufReader, Read, Write},
+    os::unix::fs::symlink,
     path::{Component, Path, PathBuf},
 };
 use tar::{Archive, Builder, EntryType, Header};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
-const BUNDLE_FORMAT_VERSION: u32 = 1;
+const BUNDLE_FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub(crate) struct SessionBundleCreateSpec {
     pub session_id: Uuid,
-    pub native_session_id: String,
     pub history_checkpoint: i64,
     pub bundle_generation: i64,
     pub ownership_generation: i64,
     pub producing_engine_version: String,
     pub created_at: DateTime<Utc>,
     pub workspace: PathBuf,
-    pub engine_state_root: PathBuf,
     pub archive_path: PathBuf,
+    /// 强制停止快照：无 checkpoint 元数据，manifest 用占位值
+    /// （history_checkpoint=0、generation=0、ownership=0、engine="force-stop"），
+    /// 恢复时跳过这些字段的比对，只校验 session/checksum/workspace。
+    pub force_stop_snapshot: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,14 +44,12 @@ pub(crate) struct SessionBundleArtifact {
 pub(crate) struct SessionBundleManifest {
     pub format_version: u32,
     pub session_id: Uuid,
-    pub native_session_id: String,
     pub history_checkpoint: i64,
     pub bundle_generation: i64,
     pub ownership_generation: i64,
     pub producing_engine_version: String,
     pub created_at: DateTime<Utc>,
     pub workspace: BundleTreeDeclaration,
-    pub native_session: BundleTreeDeclaration,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -107,19 +108,31 @@ pub(crate) fn create_session_bundle(
 ) -> Result<SessionBundleArtifact> {
     validate_create_spec(spec)?;
     let workspace_entries = collect_tree_entries(&spec.workspace, |_, _| true)?;
-    let native_session_entries =
-        collect_pi_session_entries(&spec.engine_state_root, &spec.native_session_id)?;
     let manifest = SessionBundleManifest {
         format_version: BUNDLE_FORMAT_VERSION,
         session_id: spec.session_id,
-        native_session_id: spec.native_session_id.clone(),
-        history_checkpoint: spec.history_checkpoint,
-        bundle_generation: spec.bundle_generation,
-        ownership_generation: spec.ownership_generation,
-        producing_engine_version: spec.producing_engine_version.trim().to_owned(),
+        history_checkpoint: if spec.force_stop_snapshot {
+            0
+        } else {
+            spec.history_checkpoint
+        },
+        bundle_generation: if spec.force_stop_snapshot {
+            0
+        } else {
+            spec.bundle_generation
+        },
+        ownership_generation: if spec.force_stop_snapshot {
+            0
+        } else {
+            spec.ownership_generation
+        },
+        producing_engine_version: if spec.force_stop_snapshot {
+            "force-stop".to_owned()
+        } else {
+            spec.producing_engine_version.trim().to_owned()
+        },
         created_at: spec.created_at,
         workspace: declare_tree(&spec.workspace, &workspace_entries)?,
-        native_session: declare_tree(&spec.engine_state_root, &native_session_entries)?,
     };
 
     let parent = spec
@@ -151,12 +164,6 @@ pub(crate) fn create_session_bundle(
             .append_data(&mut header, "manifest.json", manifest_bytes.as_slice())
             .context("append Session Bundle manifest")?;
 
-        append_virtual_directory(&mut archive, "native-session", spec.created_at)?;
-        append_entries(
-            &mut archive,
-            &native_session_entries,
-            Path::new("native-session"),
-        )?;
         let encoder = archive.into_inner().context("finish tar archive")?;
         let writer = encoder.finish().context("finish zstd stream")?;
         let (file, checksum, size) = writer.finish();
@@ -187,99 +194,24 @@ pub(crate) fn create_session_bundle(
     })
 }
 
-pub(crate) fn restore_session_bundle(
-    archive_path: &Path,
-    expected_checksum_sha256: &str,
-    expected_size_bytes: u64,
-    expected_session_id: Uuid,
-    expected_history_checkpoint: i64,
-    destination_root: &Path,
-) -> Result<SessionBundleManifest> {
-    validate_sha256(expected_checksum_sha256)?;
-    let (actual_checksum, actual_size) = checksum_file(archive_path)?;
-    anyhow::ensure!(
-        actual_size == expected_size_bytes,
-        "Session Bundle size does not match Hub metadata"
-    );
-    anyhow::ensure!(
-        actual_checksum == expected_checksum_sha256,
-        "Session Bundle checksum does not match Hub metadata"
-    );
-    anyhow::ensure!(
-        !destination_root.exists(),
-        "Session Bundle restore destination already exists"
-    );
-    let parent = destination_root
-        .parent()
-        .context("Session Bundle restore destination has no parent")?;
-    fs::create_dir_all(parent).context("create Session Bundle restore parent")?;
-    let temporary = parent.join(format!(".restore-{}.tmp", Uuid::new_v4().simple()));
-    fs::create_dir(&temporary).context("create Session Bundle restore staging directory")?;
-    let restore_result = restore_archive_into(archive_path, &temporary).and_then(|manifest| {
-        anyhow::ensure!(
-            manifest.format_version == BUNDLE_FORMAT_VERSION,
-            "unsupported Session Bundle format version"
-        );
-        anyhow::ensure!(
-            manifest.session_id == expected_session_id,
-            "Session Bundle belongs to a different Session"
-        );
-        anyhow::ensure!(
-            manifest.history_checkpoint == expected_history_checkpoint,
-            "Session Bundle history checkpoint does not match Hub metadata"
-        );
-        let workspace_entries = collect_tree_entries(&temporary.join("workspace"), |_, _| true)?;
-        let native_session_entries =
-            collect_tree_entries(&temporary.join("engine-state"), |_, _| true)?;
-        anyhow::ensure!(
-            declare_tree(&temporary.join("workspace"), &workspace_entries)? == manifest.workspace,
-            "Session Bundle Workspace declaration does not match its contents"
-        );
-        anyhow::ensure!(
-            declare_tree(&temporary.join("engine-state"), &native_session_entries)?
-                == manifest.native_session,
-            "Session Bundle Native Session declaration does not match its contents"
-        );
-        Ok(manifest)
-    });
-    let manifest = match restore_result {
-        Ok(manifest) => manifest,
-        Err(error) => {
-            let _ = fs::remove_dir_all(&temporary);
-            return Err(error);
-        }
-    };
-    fs::rename(&temporary, destination_root).context("commit restored Session Bundle")?;
-    File::open(parent)
-        .context("open Session Bundle restore parent")?
-        .sync_all()
-        .context("sync Session Bundle restore parent")?;
-    Ok(manifest)
-}
-
 fn validate_create_spec(spec: &SessionBundleCreateSpec) -> Result<()> {
     anyhow::ensure!(!spec.session_id.is_nil(), "Session id must not be nil");
-    anyhow::ensure!(
-        !spec.native_session_id.trim().is_empty(),
-        "native Session id must not be empty"
-    );
-    anyhow::ensure!(spec.history_checkpoint >= 0, "invalid history checkpoint");
-    anyhow::ensure!(spec.bundle_generation > 0, "invalid Bundle generation");
-    anyhow::ensure!(
-        spec.ownership_generation > 0,
-        "invalid ownership generation"
-    );
-    anyhow::ensure!(
-        !spec.producing_engine_version.trim().is_empty(),
-        "producing Engine version must not be empty"
-    );
+
+    if !spec.force_stop_snapshot {
+        anyhow::ensure!(spec.history_checkpoint >= 0, "invalid history checkpoint");
+        anyhow::ensure!(spec.bundle_generation > 0, "invalid Bundle generation");
+        anyhow::ensure!(
+            spec.ownership_generation > 0,
+            "invalid ownership generation"
+        );
+        anyhow::ensure!(
+            !spec.producing_engine_version.trim().is_empty(),
+            "producing Engine version must not be empty"
+        );
+    }
     anyhow::ensure!(
         spec.workspace.is_dir(),
         "Workspace directory is unavailable"
-    );
-    anyhow::ensure!(
-        spec.engine_state_root.is_dir(),
-        "Engine state root directory is unavailable"
     );
     Ok(())
 }
@@ -321,78 +253,6 @@ where
         });
     }
     Ok(entries)
-}
-
-fn collect_pi_session_entries(
-    pi_home: &Path,
-    expected_native_session_id: &str,
-) -> Result<Vec<BundleSourceEntry>> {
-    let session_dir = pi_home.join("sessions");
-    anyhow::ensure!(
-        fs::symlink_metadata(&session_dir)
-            .context("inspect Pi Session directory")?
-            .file_type()
-            .is_dir(),
-        "Pi Session directory is unavailable"
-    );
-    let mut candidates = fs::read_dir(&session_dir)
-        .context("read Pi Session directory")?
-        .collect::<std::io::Result<Vec<_>>>()?;
-    candidates.sort_by_key(|entry| entry.file_name());
-
-    let mut matched = None;
-    for entry in candidates {
-        let file_type = entry.file_type().context("inspect Pi Session entry")?;
-        if !file_type.is_file()
-            || entry.path().extension().and_then(|value| value.to_str()) != Some("jsonl")
-        {
-            continue;
-        }
-        if read_pi_session_id(&entry.path())?.as_deref() != Some(expected_native_session_id) {
-            continue;
-        }
-        anyhow::ensure!(
-            matched.is_none(),
-            "multiple Pi Session files have the same id"
-        );
-        matched = Some(entry.path());
-    }
-
-    let matched = matched.context("Pi Session recovery file was not found")?;
-    let relative = matched
-        .strip_prefix(pi_home)
-        .context("Pi Session recovery file escaped its home")?
-        .to_path_buf();
-    validate_relative_path(&relative)?;
-    Ok(vec![
-        BundleSourceEntry {
-            source: session_dir,
-            relative: PathBuf::from("sessions"),
-        },
-        BundleSourceEntry {
-            source: matched,
-            relative,
-        },
-    ])
-}
-
-fn read_pi_session_id(path: &Path) -> Result<Option<String>> {
-    let file = File::open(path).context("open Pi Session candidate")?;
-    let first_line = BufReader::new(file)
-        .lines()
-        .next()
-        .transpose()
-        .context("read Pi Session header")?
-        .context("Pi Session candidate is empty")?;
-    let header: serde_json::Value =
-        serde_json::from_str(&first_line).context("parse Pi Session header")?;
-    if header.get("type").and_then(serde_json::Value::as_str) != Some("session") {
-        return Ok(None);
-    }
-    Ok(header
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned))
 }
 
 fn append_entries<W: Write>(
@@ -489,77 +349,98 @@ fn checksum_file(path: &Path) -> Result<(String, u64)> {
     Ok((format!("{:x}", hasher.finalize()), size))
 }
 
-fn restore_archive_into(archive_path: &Path, destination: &Path) -> Result<SessionBundleManifest> {
-    let file = File::open(archive_path).context("open Session Bundle for restore")?;
-    let decoder = zstd::Decoder::new(file).context("decode Session Bundle zstd stream")?;
-    let mut archive = Archive::new(decoder);
-    let mut seen = BTreeSet::new();
-    let mut symlinks = BTreeSet::new();
-    let mut manifest = None;
-    let mut saw_workspace_root = false;
-    let mut saw_native_session_root = false;
-    let mut saw_pi_sessions_root = false;
-    let mut pi_session_file = None;
-    for entry in archive
-        .entries()
-        .context("read Session Bundle tar stream")?
-    {
-        let mut entry = entry.context("read Session Bundle entry")?;
-        let archive_path = entry
-            .path()
-            .context("read Session Bundle entry path")?
-            .into_owned();
-        validate_relative_path(&archive_path)?;
-        anyhow::ensure!(
-            seen.insert(archive_path.clone()),
-            "Session Bundle contains a duplicate path"
-        );
-        anyhow::ensure!(
-            !archive_path
-                .ancestors()
-                .skip(1)
-                .any(|ancestor| symlinks.contains(ancestor)),
-            "Session Bundle entry traverses an archived symbolic link"
-        );
-        let mut components = archive_path.components();
-        let top = components
-            .next()
-            .context("Session Bundle contains an empty path")?
-            .as_os_str();
-        let entry_type = entry.header().entry_type();
-        anyhow::ensure!(
-            entry_type.is_dir() || entry_type.is_file() || entry_type.is_symlink(),
-            "Session Bundle contains a special or linked file type"
-        );
-        if entry_type.is_symlink() {
-            let target = entry
-                .link_name()
-                .context("read Session Bundle symbolic link")?
-                .context("Session Bundle symbolic link has no target")?;
-            validate_symlink_target(&archive_path, &target)?;
-            let resolved_top = resolve_symlink_path(&archive_path, &target)?
-                .components()
+pub(crate) fn restore_session_workspace_only(
+    archive_path: &Path,
+    expected_checksum_sha256: &str,
+    expected_size_bytes: u64,
+    expected_session_id: Uuid,
+    expected_history_checkpoint: i64,
+    destination_root: &Path,
+    force_stop_snapshot: bool,
+) -> Result<SessionBundleManifest> {
+    validate_sha256(expected_checksum_sha256)?;
+    let (actual_checksum, actual_size) = checksum_file(archive_path)?;
+    anyhow::ensure!(
+        actual_size == expected_size_bytes,
+        "Session Bundle size does not match Hub metadata"
+    );
+    anyhow::ensure!(
+        actual_checksum == expected_checksum_sha256,
+        "Session Bundle checksum does not match Hub metadata"
+    );
+    anyhow::ensure!(
+        !destination_root.exists(),
+        "Session Bundle restore destination already exists"
+    );
+    let parent = destination_root
+        .parent()
+        .context("Session Bundle restore destination has no parent")?;
+    fs::create_dir_all(parent).context("create Session Bundle restore parent")?;
+    let temporary = parent.join(format!(".restore-{}.tmp", Uuid::new_v4().simple()));
+    fs::create_dir(&temporary).context("create Session Bundle restore staging directory")?;
+
+    // 解包与全部校验放入闭包：任何一步失败都清理 staging 目录。
+    let restore_result = (|| -> Result<SessionBundleManifest> {
+        let file = File::open(archive_path).context("open Session Bundle for restore")?;
+        let decoder = zstd::Decoder::new(file).context("decode Session Bundle zstd stream")?;
+        let mut archive = Archive::new(decoder);
+        let mut seen = BTreeSet::new();
+        let mut symlinks = BTreeSet::new();
+        let mut manifest: Option<SessionBundleManifest> = None;
+        let mut saw_workspace_root = false;
+        for entry in archive
+            .entries()
+            .context("read Session Bundle tar stream")?
+        {
+            let mut entry = entry.context("read Session Bundle entry")?;
+            let archive_path = entry
+                .path()
+                .context("read Session Bundle entry path")?
+                .into_owned();
+            validate_relative_path(&archive_path)?;
+            anyhow::ensure!(
+                seen.insert(archive_path.clone()),
+                "Session Bundle contains a duplicate path"
+            );
+            anyhow::ensure!(
+                !archive_path
+                    .ancestors()
+                    .skip(1)
+                    .any(|ancestor| symlinks.contains(ancestor)),
+                "Session Bundle entry traverses an archived symbolic link"
+            );
+            let mut components = archive_path.components();
+            let top = components
                 .next()
-                .context("Session Bundle symbolic link has no resolved path")?
-                .as_os_str()
-                .to_owned();
+                .context("Session Bundle contains an empty path")?
+                .as_os_str();
+            let entry_type = entry.header().entry_type();
             anyhow::ensure!(
-                resolved_top == top,
-                "Session Bundle symbolic link crosses a top-level boundary"
+                matches!(
+                    entry_type,
+                    EntryType::Regular | EntryType::Directory | EntryType::Symlink
+                ),
+                "Session Bundle contains an unsupported entry type"
             );
-            symlinks.insert(archive_path.clone());
-        }
-        if top == "manifest.json" {
-            anyhow::ensure!(
-                archive_path == Path::new("manifest.json") && entry_type.is_file(),
-                "Session Bundle manifest must be one regular top-level file"
-            );
-            anyhow::ensure!(manifest.is_none(), "Session Bundle has multiple manifests");
-            manifest =
-                Some(serde_json::from_reader(&mut entry).context("parse Session Bundle manifest")?);
-            continue;
-        }
-        let destination_path = if top == "workspace" {
+            if top == "manifest.json" {
+                anyhow::ensure!(
+                    archive_path == Path::new("manifest.json") && entry_type.is_file(),
+                    "Session Bundle manifest must be one regular top-level file"
+                );
+                anyhow::ensure!(manifest.is_none(), "Session Bundle has multiple manifests");
+                manifest = Some(
+                    serde_json::from_reader(&mut entry).context("parse Session Bundle manifest")?,
+                );
+                continue;
+            }
+            if top != "workspace" {
+                // 只接受 manifest.json 与 workspace/；其余顶层（旧 native-session、
+                // engine-state、秘密目录等）一律拒绝，避免静默接受未知内容。
+                anyhow::bail!(
+                    "Session Bundle contains an unexpected top-level entry: {}",
+                    archive_path.display()
+                );
+            }
             if archive_path == Path::new("workspace") {
                 anyhow::ensure!(
                     entry_type.is_dir(),
@@ -567,66 +448,82 @@ fn restore_archive_into(archive_path: &Path, destination: &Path) -> Result<Sessi
                 );
                 saw_workspace_root = true;
             }
-            destination.join("workspace").join(components.as_path())
-        } else if top == "native-session" {
-            if archive_path == Path::new("native-session") {
-                anyhow::ensure!(
-                    entry_type.is_dir(),
-                    "Session Bundle native-session/ must be a directory"
-                );
-                saw_native_session_root = true;
-            } else if archive_path == Path::new("native-session/sessions") {
-                anyhow::ensure!(
-                    entry_type.is_dir(),
-                    "Session Bundle Pi sessions/ must be a directory"
-                );
-                saw_pi_sessions_root = true;
+            let destination_path = if archive_path == Path::new("workspace") {
+                temporary.join("workspace")
             } else {
-                let relative = archive_path
-                    .strip_prefix("native-session")
-                    .context("read Pi recovery path")?;
+                temporary.join("workspace").join(components.as_path())
+            };
+            if entry_type.is_symlink() {
+                let link = entry
+                    .link_name()
+                    .context("read Session Bundle symlink target")?
+                    .context("Session Bundle symlink has no target")?;
+                // 与完整恢复一致：目标必须是相对路径且解析结果不得逃逸顶层。
+                // workspace-only 恢复额外要求解析结果的首组件是 workspace，
+                // 拒绝指向 native-session/engine-state/manifest.json 的链接。
+                validate_symlink_target(&archive_path, &link)?;
+                let resolved = resolve_symlink_path(&archive_path, &link)?;
+                let first = resolved
+                    .components()
+                    .next()
+                    .context("Session Bundle symlink resolves to an empty path")?;
                 anyhow::ensure!(
-                    entry_type.is_file()
-                        && relative.parent() == Some(Path::new("sessions"))
-                        && relative.extension().and_then(|value| value.to_str()) == Some("jsonl"),
-                    "Session Bundle contains an unexpected Pi recovery path"
+                    matches!(first, Component::Normal(value) if value == "workspace"),
+                    "Session Bundle workspace symlink must resolve inside workspace/"
                 );
-                anyhow::ensure!(
-                    pi_session_file.is_none(),
-                    "Session Bundle contains multiple Pi recovery files"
-                );
-                pi_session_file = Some(destination.join("engine-state").join(relative));
+                symlinks.insert(archive_path.clone());
+                if let Some(parent) = destination_path.parent() {
+                    fs::create_dir_all(parent).context("create Session Bundle symlink parent")?;
+                }
+                symlink(link, &destination_path)
+                    .context("create Session Bundle workspace symlink")?;
+                continue;
             }
-            destination.join("engine-state").join(components.as_path())
-        } else {
-            anyhow::bail!("Session Bundle contains an unexpected top-level entry");
-        };
-        if let Some(parent) = destination_path.parent() {
-            fs::create_dir_all(parent).context("create Session Bundle restore directory")?;
+            if let Some(parent) = destination_path.parent() {
+                fs::create_dir_all(parent).context("create Session Bundle restore directory")?;
+            }
+            entry
+                .unpack(&destination_path)
+                .context("extract Session Bundle workspace entry")?;
         }
-        entry
-            .unpack(&destination_path)
-            .context("extract Session Bundle entry")?;
-    }
-    anyhow::ensure!(
-        saw_workspace_root,
-        "Session Bundle is missing workspace/ directory"
-    );
-    anyhow::ensure!(
-        saw_native_session_root,
-        "Session Bundle is missing native-session/ directory"
-    );
-    anyhow::ensure!(
-        saw_pi_sessions_root,
-        "Session Bundle is missing Pi sessions/ directory"
-    );
-    let pi_session_file = pi_session_file.context("Session Bundle is missing Pi recovery file")?;
-    let manifest: SessionBundleManifest =
-        manifest.context("Session Bundle is missing manifest.json")?;
-    anyhow::ensure!(
-        read_pi_session_id(&pi_session_file)?.as_deref() == Some(&manifest.native_session_id),
-        "Session Bundle Pi recovery file does not match its native Session id"
-    );
+        anyhow::ensure!(
+            saw_workspace_root,
+            "Session Bundle is missing workspace/ directory"
+        );
+        let manifest = manifest.context("Session Bundle is missing manifest.json")?;
+        anyhow::ensure!(
+            manifest.format_version == BUNDLE_FORMAT_VERSION,
+            "unsupported Session Bundle format version"
+        );
+        anyhow::ensure!(
+            manifest.session_id == expected_session_id,
+            "Session Bundle belongs to a different Session"
+        );
+        if !force_stop_snapshot {
+            anyhow::ensure!(
+                manifest.history_checkpoint == expected_history_checkpoint,
+                "Session Bundle history checkpoint does not match Hub metadata"
+            );
+        }
+        let workspace_entries = collect_tree_entries(&temporary.join("workspace"), |_, _| true)?;
+        anyhow::ensure!(
+            declare_tree(&temporary.join("workspace"), &workspace_entries)? == manifest.workspace,
+            "Session Bundle Workspace declaration does not match its contents"
+        );
+        Ok(manifest)
+    })();
+    let manifest = match restore_result {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&temporary);
+            return Err(error);
+        }
+    };
+    fs::rename(&temporary, destination_root).context("install restored Session workspace")?;
+    File::open(parent)
+        .context("open Session Bundle restore parent")?
+        .sync_all()
+        .context("sync Session Bundle restore parent")?;
     Ok(manifest)
 }
 
@@ -697,7 +594,7 @@ fn validate_sha256(value: &str) -> Result<()> {
 mod tests {
     use super::{
         append_entries, append_virtual_directory, checksum_file, collect_tree_entries,
-        create_session_bundle, declare_tree, restore_session_bundle, BundleTreeDeclaration,
+        create_session_bundle, declare_tree, restore_session_workspace_only, BundleTreeDeclaration,
         SessionBundleCreateSpec, SessionBundleManifest, BUNDLE_FORMAT_VERSION,
     };
     use chrono::{TimeZone, Utc};
@@ -732,29 +629,21 @@ mod tests {
         checksum_file(archive_path).unwrap()
     }
 
-    fn write_declared_bundle(
+    fn write_workspace_only_bundle(
         archive_path: &Path,
         workspace: &Path,
-        engine_state_root: &Path,
         manifest: &SessionBundleManifest,
     ) -> (String, u64) {
         let workspace_entries = collect_tree_entries(workspace, |_, _| true).unwrap();
-        let native_session_entries = collect_tree_entries(engine_state_root, |_, _| true).unwrap();
         assert_eq!(
             declare_tree(workspace, &workspace_entries).unwrap(),
             manifest.workspace
         );
-        assert_eq!(
-            declare_tree(engine_state_root, &native_session_entries).unwrap(),
-            manifest.native_session
-        );
-
         let file = fs::File::create(archive_path).unwrap();
         let encoder = zstd::Encoder::new(file, 1).unwrap();
         let mut archive = tar::Builder::new(encoder);
         archive.append_dir("workspace", workspace).unwrap();
         append_entries(&mut archive, &workspace_entries, Path::new("workspace")).unwrap();
-
         let manifest_bytes = serde_json::to_vec(manifest).unwrap();
         let mut manifest_header = tar::Header::new_gnu();
         manifest_header.set_entry_type(tar::EntryType::Regular);
@@ -768,431 +657,268 @@ mod tests {
                 manifest_bytes.as_slice(),
             )
             .unwrap();
-
-        append_virtual_directory(&mut archive, "native-session", manifest.created_at).unwrap();
-        append_entries(
-            &mut archive,
-            &native_session_entries,
-            Path::new("native-session"),
-        )
-        .unwrap();
         archive.into_inner().unwrap().finish().unwrap();
         checksum_file(archive_path).unwrap()
     }
 
     #[test]
-    fn session_bundle_round_trip_preserves_workspace_and_only_native_session_recovery_data() {
+    fn session_bundle_round_trip_preserves_only_the_workspace_snapshot() {
         let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("source");
-        let workspace = source.join("workspace");
-        let engine_state_root = source.join("engine-state");
-        fs::create_dir_all(workspace.join(".git")).unwrap();
-        fs::create_dir_all(engine_state_root.join("sessions")).unwrap();
-        fs::create_dir_all(engine_state_root.join(".pi/agent/skills/private-skill")).unwrap();
-        fs::create_dir_all(engine_state_root.join(".pi/agent/extensions")).unwrap();
-        fs::create_dir_all(engine_state_root.join(".pi/agent/cache")).unwrap();
-        fs::write(workspace.join("README.md"), "workspace\n").unwrap();
-        fs::write(workspace.join(".hidden"), "hidden\n").unwrap();
-        fs::write(workspace.join(".git/config"), "[core]\n").unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("README.md", workspace.join("readme-link")).unwrap();
-
-        let native_session_id = "019bf9b2-7a4d-7000-8000-000000000001";
-        fs::write(
-            engine_state_root.join("sessions/pi-session.jsonl"),
-            format!("{{\"type\":\"session\",\"id\":\"{native_session_id}\"}}\n"),
-        )
-        .unwrap();
-        fs::write(
-            engine_state_root.join(format!("sessions/decoy-{native_session_id}.jsonl")),
-            "{\"type\":\"session\",\"id\":\"another-session\"}\n",
-        )
-        .unwrap();
-        fs::write(
-            engine_state_root.join(".pi/agent/models.json"),
-            "model proxy token\n",
-        )
-        .unwrap();
-        fs::write(
-            engine_state_root.join(".pi/agent/auth.json"),
-            "provider secret\n",
-        )
-        .unwrap();
-        fs::write(
-            engine_state_root.join(".pi/agent/settings.json"),
-            "settings\n",
-        )
-        .unwrap();
-        fs::write(
-            engine_state_root.join(".pi/agent/skills/private-skill/SKILL.md"),
-            "regenerated skill\n",
-        )
-        .unwrap();
-        fs::write(
-            engine_state_root.join(".pi/agent/extensions/provider.ts"),
-            "generated extension\n",
-        )
-        .unwrap();
-        fs::write(engine_state_root.join(".pi/agent/cache/data"), "cache\n").unwrap();
-
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(workspace.join("nested")).unwrap();
+        fs::write(workspace.join("result.txt"), "saved\n").unwrap();
+        fs::write(workspace.join("nested/keep.txt"), "keep\n").unwrap();
         let session_id = Uuid::new_v4();
-        let archive = temp.path().join("staging/session.tar.zst");
+        let created_at = Utc.with_ymd_and_hms(2026, 7, 16, 1, 2, 3).unwrap();
+        let archive_path = temp.path().join("staging/session.tar.zst");
         let artifact = create_session_bundle(&SessionBundleCreateSpec {
             session_id,
-            native_session_id: native_session_id.to_owned(),
             history_checkpoint: 12,
             bundle_generation: 3,
             ownership_generation: 7,
             producing_engine_version: "0.81.1".into(),
-            created_at: Utc.with_ymd_and_hms(2026, 7, 16, 1, 2, 3).unwrap(),
+            created_at,
             workspace: workspace.clone(),
-            engine_state_root: engine_state_root.clone(),
-            archive_path: archive.clone(),
+            archive_path: archive_path.clone(),
+            force_stop_snapshot: false,
         })
         .unwrap();
 
-        assert_eq!(artifact.archive_path, archive);
-        assert_eq!(artifact.checksum_sha256.len(), 64);
-        assert_eq!(artifact.size_bytes, fs::metadata(&archive).unwrap().len());
-        let restored = temp.path().join("restored");
-        let manifest = restore_session_bundle(
-            &archive,
+        // 归档只含 workspace + manifest：无 native-session/engine-state 顶层。
+        let file = fs::File::open(&archive_path).unwrap();
+        let decoder = zstd::Decoder::new(file).unwrap();
+        let mut archive = tar::Archive::new(decoder);
+        let tops: std::collections::BTreeSet<String> = archive
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .path()
+                    .unwrap()
+                    .components()
+                    .next()
+                    .unwrap()
+                    .as_os_str()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            tops,
+            ["manifest.json".to_string(), "workspace".to_string()]
+                .into_iter()
+                .collect()
+        );
+
+        let destination = temp.path().join("restored");
+        let manifest = restore_session_workspace_only(
+            &archive_path,
             &artifact.checksum_sha256,
             artifact.size_bytes,
             session_id,
             12,
-            &restored,
+            &destination,
+            false,
         )
         .unwrap();
-
         assert_eq!(manifest.session_id, session_id);
-        assert_eq!(manifest.native_session_id, native_session_id);
         assert_eq!(
-            fs::read_to_string(restored.join("workspace/README.md")).unwrap(),
-            "workspace\n"
+            fs::read_to_string(destination.join("workspace/result.txt")).unwrap(),
+            "saved\n"
         );
         assert_eq!(
-            fs::read_to_string(restored.join("workspace/.hidden")).unwrap(),
-            "hidden\n"
+            fs::read_to_string(destination.join("workspace/nested/keep.txt")).unwrap(),
+            "keep\n"
         );
-        assert_eq!(
-            fs::read_to_string(restored.join("workspace/.git/config")).unwrap(),
-            "[core]\n"
-        );
-        #[cfg(unix)]
-        assert_eq!(
-            fs::read_link(restored.join("workspace/readme-link")).unwrap(),
-            std::path::PathBuf::from("README.md")
-        );
-        assert!(restored
-            .join("engine-state/sessions/pi-session.jsonl")
-            .is_file());
-        assert!(!restored
-            .join(format!(
-                "engine-state/sessions/decoy-{native_session_id}.jsonl"
-            ))
-            .exists());
-        assert!(!restored.join("engine-state/.pi").exists());
+        assert!(!destination.join("engine-state").exists());
     }
 
     #[test]
-    fn session_bundle_restore_rejects_regenerable_pi_state_even_when_declared() {
+    fn session_bundle_workspace_only_rejects_unexpected_top_level_entries() {
         let temp = tempfile::tempdir().unwrap();
-        let workspace = temp.path().join("source/workspace");
-        let engine_state_root = temp.path().join("source/engine-state");
-        fs::create_dir_all(&workspace).unwrap();
-        fs::create_dir_all(engine_state_root.join("sessions")).unwrap();
-        fs::create_dir_all(engine_state_root.join(".pi/agent")).unwrap();
-        fs::write(workspace.join("result.txt"), "workspace\n").unwrap();
-        let session_id = Uuid::new_v4();
-        let native_session_id = "pi-native-session";
-        fs::write(
-            engine_state_root.join("sessions/recovery.jsonl"),
-            format!("{{\"type\":\"session\",\"id\":\"{native_session_id}\"}}\n"),
-        )
-        .unwrap();
-        fs::write(
-            engine_state_root.join(".pi/agent/models.json"),
-            "must never restore\n",
-        )
-        .unwrap();
-
-        let workspace_entries = collect_tree_entries(&workspace, |_, _| true).unwrap();
-        let native_session_entries = collect_tree_entries(&engine_state_root, |_, _| true).unwrap();
-        let manifest = SessionBundleManifest {
-            format_version: BUNDLE_FORMAT_VERSION,
-            session_id,
-            native_session_id: native_session_id.into(),
-            history_checkpoint: 9,
-            bundle_generation: 2,
-            ownership_generation: 3,
-            producing_engine_version: "0.81.1".into(),
-            created_at: Utc.with_ymd_and_hms(2026, 7, 23, 1, 2, 3).unwrap(),
-            workspace: declare_tree(&workspace, &workspace_entries).unwrap(),
-            native_session: declare_tree(&engine_state_root, &native_session_entries).unwrap(),
-        };
-        let archive_path = temp.path().join("declared-secret.tar.zst");
-        let (checksum, size) =
-            write_declared_bundle(&archive_path, &workspace, &engine_state_root, &manifest);
-        let destination = temp.path().join("restored");
-
-        let error =
-            restore_session_bundle(&archive_path, &checksum, size, session_id, 9, &destination)
-                .expect_err("regenerable Pi state must be rejected during restore");
-
-        assert!(error.to_string().contains("Pi recovery path"));
-        assert!(!destination.exists());
-    }
-
-    #[test]
-    fn session_bundle_restore_rejects_a_workspace_file_disguised_as_the_top_level_directory() {
-        let temp = tempfile::tempdir().unwrap();
-        let archive_path = temp.path().join("malicious.tar.zst");
-        let session_id = Uuid::new_v4();
-        let empty_tree = BundleTreeDeclaration {
-            entry_count: 0,
-            size_bytes: 0,
-            checksum_sha256: format!("{:x}", sha2::Sha256::digest([])),
-        };
-        let manifest = SessionBundleManifest {
-            format_version: BUNDLE_FORMAT_VERSION,
-            session_id,
-            native_session_id: "thread-malicious".into(),
-            history_checkpoint: 1,
-            bundle_generation: 1,
-            ownership_generation: 1,
-            producing_engine_version: "0.104.0".into(),
-            created_at: Utc.with_ymd_and_hms(2026, 7, 16, 1, 2, 3).unwrap(),
-            workspace: empty_tree.clone(),
-            native_session: empty_tree,
-        };
-        let file = fs::File::create(&archive_path).unwrap();
-        let encoder = zstd::Encoder::new(file, 1).unwrap();
-        let mut archive = tar::Builder::new(encoder);
-        let mut workspace_header = tar::Header::new_gnu();
-        workspace_header.set_entry_type(tar::EntryType::Regular);
-        workspace_header.set_mode(0o600);
-        workspace_header.set_size(0);
-        workspace_header.set_cksum();
-        archive
-            .append_data(&mut workspace_header, "workspace", std::io::empty())
-            .unwrap();
-        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
-        let mut manifest_header = tar::Header::new_gnu();
-        manifest_header.set_entry_type(tar::EntryType::Regular);
-        manifest_header.set_mode(0o600);
-        manifest_header.set_size(manifest_bytes.len() as u64);
-        manifest_header.set_cksum();
-        archive
-            .append_data(
-                &mut manifest_header,
-                "manifest.json",
-                manifest_bytes.as_slice(),
-            )
-            .unwrap();
-        let mut native_session_header = tar::Header::new_gnu();
-        native_session_header.set_entry_type(tar::EntryType::Directory);
-        native_session_header.set_mode(0o700);
-        native_session_header.set_size(0);
-        native_session_header.set_cksum();
-        archive
-            .append_data(
-                &mut native_session_header,
-                "native-session",
-                std::io::empty(),
-            )
-            .unwrap();
-        archive.into_inner().unwrap().finish().unwrap();
-        let (checksum, size) = checksum_file(&archive_path).unwrap();
-
-        let error = restore_session_bundle(
+        let archive_path = temp.path().join("bad.tar.zst");
+        write_single_entry_bundle(
             &archive_path,
-            &checksum,
-            size,
-            session_id,
-            1,
-            &temp.path().join("restored"),
-        )
-        .expect_err("workspace must be a top-level directory");
-
-        assert!(error.to_string().contains("workspace/ must be a directory"));
-    }
-
-    #[test]
-    fn session_bundle_restore_rejects_path_traversal_without_writing_output() {
-        let temp = tempfile::tempdir().unwrap();
-        let archive_path = temp.path().join("traversal.tar.zst");
-        let (checksum, size) = write_single_entry_bundle(
-            &archive_path,
-            b"workspace/../../escaped.txt",
+            b"native-session/x.jsonl",
             tar::EntryType::Regular,
             None,
-            b"escaped",
+            b"old pi state",
         );
-        let destination = temp.path().join("restored");
-
-        restore_session_bundle(
+        let (checksum, size) = checksum_file(&archive_path).unwrap();
+        let error = restore_session_workspace_only(
             &archive_path,
             &checksum,
             size,
             Uuid::new_v4(),
-            1,
-            &destination,
+            0,
+            &temp.path().join("out"),
+            false,
         )
-        .expect_err("path traversal must be rejected");
-
-        assert!(!destination.exists());
-        assert!(!temp.path().join("escaped.txt").exists());
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("unexpected top-level entry"),
+            "unexpected top-level must be rejected: {error}"
+        );
+        assert!(!temp.path().join("out").exists());
+        // 解包后失败必须清理 staging 目录。
+        let leftovers: Vec<_> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".restore-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "failed restore must clean staging: {leftovers:?}"
+        );
     }
 
     #[test]
-    fn session_bundle_restore_rejects_escaping_symlink_without_writing_output() {
+    fn session_bundle_workspace_only_rejects_path_traversal() {
         let temp = tempfile::tempdir().unwrap();
-        let archive_path = temp.path().join("escaping-symlink.tar.zst");
-        let (checksum, size) = write_single_entry_bundle(
+        let archive_path = temp.path().join("traversal.tar.zst");
+        write_single_entry_bundle(
             &archive_path,
-            b"workspace/escape",
+            b"workspace/../escape.txt",
+            tar::EntryType::Regular,
+            None,
+            b"escape",
+        );
+        let (checksum, size) = checksum_file(&archive_path).unwrap();
+        let error = restore_session_workspace_only(
+            &archive_path,
+            &checksum,
+            size,
+            Uuid::new_v4(),
+            0,
+            &temp.path().join("out"),
+            false,
+        )
+        .unwrap_err();
+        assert!(!temp.path().join("out").exists());
+        assert!(!temp.path().join("escape.txt").exists());
+    }
+
+    #[test]
+    fn session_bundle_workspace_only_rejects_escaping_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive_path = temp.path().join("symlink.tar.zst");
+        write_single_entry_bundle(
+            &archive_path,
+            b"workspace/link",
             tar::EntryType::Symlink,
-            Some("../../outside"),
+            Some("../native-session"),
             b"",
         );
-        let destination = temp.path().join("restored");
-
-        restore_session_bundle(
+        let (checksum, size) = checksum_file(&archive_path).unwrap();
+        let error = restore_session_workspace_only(
             &archive_path,
             &checksum,
             size,
             Uuid::new_v4(),
-            1,
-            &destination,
+            0,
+            &temp.path().join("out"),
+            false,
         )
-        .expect_err("escaping symbolic link must be rejected");
-
-        assert!(!destination.exists());
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("resolve inside workspace"),
+            "escaping symlink must be rejected: {error}"
+        );
     }
 
     #[test]
-    fn session_bundle_restore_rejects_special_tar_entry_without_writing_output() {
+    fn session_bundle_workspace_only_rejects_special_tar_entries() {
         let temp = tempfile::tempdir().unwrap();
-        let archive_path = temp.path().join("special-entry.tar.zst");
-        let (checksum, size) = write_single_entry_bundle(
+        let archive_path = temp.path().join("special.tar.zst");
+        write_single_entry_bundle(
             &archive_path,
-            b"workspace/pipe",
+            b"workspace/fifo",
             tar::EntryType::Fifo,
             None,
             b"",
         );
-        let destination = temp.path().join("restored");
-
-        restore_session_bundle(
+        let (checksum, size) = checksum_file(&archive_path).unwrap();
+        let error = restore_session_workspace_only(
             &archive_path,
             &checksum,
             size,
             Uuid::new_v4(),
-            1,
-            &destination,
+            0,
+            &temp.path().join("out"),
+            false,
         )
-        .expect_err("special tar entry must be rejected");
-
-        assert!(!destination.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn session_bundle_creation_rejects_escaping_symlinks_and_special_files() {
-        use std::{ffi::CString, os::unix::ffi::OsStrExt};
-
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = temp.path().join("workspace");
-        let engine_state_root = temp.path().join("engine-state");
-        let native_session_id = "019bf9b2-7a4d-7000-8000-000000000002";
-        fs::create_dir_all(&workspace).unwrap();
-        fs::create_dir_all(engine_state_root.join("sessions")).unwrap();
-        fs::write(
-            engine_state_root.join("sessions/recovery.jsonl"),
-            format!("{{\"type\":\"session\",\"id\":\"{native_session_id}\"}}\n"),
-        )
-        .unwrap();
-        std::os::unix::fs::symlink("../../outside", workspace.join("escape")).unwrap();
-        let spec = SessionBundleCreateSpec {
-            session_id: Uuid::new_v4(),
-            native_session_id: native_session_id.into(),
-            history_checkpoint: 1,
-            bundle_generation: 1,
-            ownership_generation: 1,
-            producing_engine_version: "0.104.0".into(),
-            created_at: Utc::now(),
-            workspace: workspace.clone(),
-            engine_state_root: engine_state_root.clone(),
-            archive_path: temp.path().join("escape.tar.zst"),
-        };
-        let error = create_session_bundle(&spec).expect_err("escaping link must be rejected");
-        assert!(error.to_string().contains("escapes its root"));
-
-        fs::remove_file(workspace.join("escape")).unwrap();
-        let fifo = workspace.join("pipe");
-        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
-        let error = create_session_bundle(&SessionBundleCreateSpec {
-            archive_path: temp.path().join("fifo.tar.zst"),
-            ..spec
-        })
-        .expect_err("FIFO must be rejected");
-        assert!(error.to_string().contains("special file"));
+        .unwrap_err();
+        assert!(!temp.path().join("out").exists());
+        assert!(
+            error.to_string().contains("unsupported entry type"),
+            "special entry must be rejected: {error}"
+        );
     }
 
     #[test]
-    fn session_bundle_restore_rejects_compressed_size_and_checksum_mismatch_without_output() {
+    fn session_bundle_workspace_only_rejects_checksum_and_size_mismatch() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
-        let engine_state_root = temp.path().join("engine-state");
-        let native_session_id = "019bf9b2-7a4d-7000-8000-000000000003";
         fs::create_dir_all(&workspace).unwrap();
-        fs::create_dir_all(engine_state_root.join("sessions")).unwrap();
-        fs::write(workspace.join("file.txt"), "content").unwrap();
-        fs::write(
-            engine_state_root.join("sessions/recovery.jsonl"),
-            format!("{{\"type\":\"session\",\"id\":\"{native_session_id}\"}}\n"),
-        )
-        .unwrap();
+        fs::write(workspace.join("f.txt"), "x\n").unwrap();
         let session_id = Uuid::new_v4();
+        let created_at = Utc.with_ymd_and_hms(2026, 7, 16, 1, 2, 3).unwrap();
+        let archive_path = temp.path().join("bundle.tar.zst");
         let artifact = create_session_bundle(&SessionBundleCreateSpec {
             session_id,
-            native_session_id: native_session_id.into(),
-            history_checkpoint: 4,
+            history_checkpoint: 0,
             bundle_generation: 1,
-            ownership_generation: 2,
-            producing_engine_version: "0.104.0".into(),
-            created_at: Utc::now(),
-            workspace,
-            engine_state_root,
-            archive_path: temp.path().join("bundle.tar.zst"),
+            ownership_generation: 1,
+            producing_engine_version: "0.81.1".into(),
+            created_at,
+            workspace: workspace.clone(),
+            archive_path: archive_path.clone(),
+            force_stop_snapshot: false,
         })
         .unwrap();
-        let wrong_size_destination = temp.path().join("wrong-size");
-        let error = restore_session_bundle(
-            &artifact.archive_path,
+        // checksum 不匹配。
+        let wrong_checksum = "0".repeat(64);
+        let error = restore_session_workspace_only(
+            &archive_path,
+            &wrong_checksum,
+            artifact.size_bytes,
+            session_id,
+            0,
+            &temp.path().join("out"),
+            false,
+        )
+        .unwrap_err();
+        assert!(!temp.path().join("out").exists());
+        assert!(
+            error.to_string().contains("checksum"),
+            "checksum mismatch must be rejected: {error}"
+        );
+        // size 不匹配。
+        let error = restore_session_workspace_only(
+            &archive_path,
             &artifact.checksum_sha256,
             artifact.size_bytes + 1,
             session_id,
-            4,
-            &wrong_size_destination,
+            0,
+            &temp.path().join("out"),
+            false,
         )
-        .expect_err("wrong compressed size must be rejected");
-        assert!(error.to_string().contains("size does not match"));
-        assert!(!wrong_size_destination.exists());
-
-        let wrong_checksum_destination = temp.path().join("wrong-checksum");
-        let error = restore_session_bundle(
-            &artifact.archive_path,
-            &"0".repeat(64),
-            artifact.size_bytes,
-            session_id,
-            4,
-            &wrong_checksum_destination,
-        )
-        .expect_err("wrong checksum must be rejected");
-        assert!(error.to_string().contains("checksum does not match"));
-        assert!(!wrong_checksum_destination.exists());
+        .unwrap_err();
+        assert!(!temp.path().join("out").exists());
+        assert!(
+            error.to_string().contains("size"),
+            "size mismatch must be rejected: {error}"
+        );
+        // 失败路径不留 staging 目录。
+        let leftovers: Vec<_> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".restore-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "failed restore must clean staging: {leftovers:?}"
+        );
     }
 }

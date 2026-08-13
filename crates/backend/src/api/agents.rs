@@ -875,9 +875,7 @@ pub(crate) async fn create_run(
 }
 
 /// 校验并规范化端点暴露列表：只允许已知端点、去重、保持稳定顺序。
-pub(crate) fn normalize_endpoint_exposure(
-    exposure: &[String],
-) -> Result<Vec<String>, ApiError> {
+pub(crate) fn normalize_endpoint_exposure(exposure: &[String]) -> Result<Vec<String>, ApiError> {
     let mut seen = std::collections::BTreeSet::new();
     for endpoint in exposure {
         if !matches!(endpoint.as_str(), "console" | "integration" | "automation") {
@@ -2213,11 +2211,7 @@ mod tests {
             instructions: agent.instructions.clone(),
             visibility: agent.visibility.clone(),
             public_to: Vec::new(),
-            endpoint_exposure: vec![
-                "console".into(),
-                "integration".into(),
-                "automation".into(),
-            ],
+            endpoint_exposure: vec!["console".into(), "integration".into(), "automation".into()],
             runtime_id: None,
             model_selection: agent.model_selection.clone(),
             model_settings: agent.model_settings.clone(),
@@ -3019,7 +3013,9 @@ mod tests {
         assert!(owner_list.iter().any(|item| item.id == agent.id));
 
         // integration：owner 也不能把该 agent 绑给 Integration App（未暴露）。
-        let owner = require_user(&state, &session_headers(&owner_token)).await.unwrap();
+        let owner = require_user(&state, &session_headers(&owner_token))
+            .await
+            .unwrap();
         let mut tx = state.pool.begin().await.unwrap();
         let app_error = validate_integration_app_agents_tx(&mut tx, &owner, &[agent.id])
             .await

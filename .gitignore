@@ -19,3 +19,4 @@
 *.p12
 *.pfx
 runtime-credential.json
+test-results/

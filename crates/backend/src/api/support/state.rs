@@ -36,6 +36,7 @@ pub(crate) struct AppState {
     pub(crate) auth_providers: Vec<Arc<dyn AuthProvider>>,
     pub(crate) session_issuer: Arc<dyn SessionIssuer>,
     pub(crate) run_event_bus: Arc<dyn run_event_bus::RunEventBus + Send + Sync>,
+    pub(crate) runtime_ws: crate::runtime_ws::RuntimeWsRegistry,
 }
 
 pub(crate) struct MaybeConnectInfo(pub(crate) Option<SocketAddr>);

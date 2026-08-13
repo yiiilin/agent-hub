@@ -42,6 +42,7 @@ use uuid::Uuid;
 use walkdir::WalkDir;
 
 mod pi_driver;
+mod runtime_ws;
 mod session_bundle;
 
 const DEFAULT_ENGINE_TIMEOUT: Duration = Duration::from_secs(3600);
@@ -130,17 +131,22 @@ impl RuntimeRunFailure {
     }
 }
 
-/// 会话补丁消息（backend GET /api/runtime/sessions/{id}/patch-messages 的返回项）。
+/// 会话重建事件（backend GET /api/runtime/sessions/{id}/replay-events 的返回项）。
 #[derive(Debug, Clone, Deserialize)]
-struct PatchMessageDto {
+struct SessionReplayEventDto {
     seq: i64,
-    role: String,
+    run_id: Uuid,
+    hub_turn_id: Option<Uuid>,
+    event_type: String,
+    role: Option<String>,
     content: Option<String>,
+    payload: Value,
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Clone)]
-struct HubClient {    http: reqwest::Client,
+struct HubClient {
+    http: reqwest::Client,
     hub_url: String,
     runtime_token: Arc<std::sync::RwLock<String>>,
     protocol_capabilities: HashSet<String>,
@@ -206,7 +212,37 @@ impl RuntimeRunDispatcher {
         };
         let claim = client.claim_run(&request).await?;
         if let Some(claim) = &claim {
-            manager.reserve_claim(claim)?;
+            let run_id = claim.run.id;
+            let ownership_generation = claim.run.session_ownership_generation;
+            let incumbent = manager.incumbent_run_id_for(claim);
+            if let Err(error) = manager.reserve_claim(claim) {
+                // 活动冲突（异常派发）：用本地旧任务 id 作为 incumbent 拒绝该任务，
+                // 绝不动旧任务/不接管；拒绝失败只记日志（Hub 侧会以任务终态为准）。
+                if incumbent.is_some() {
+                    warn!(
+                        %run_id,
+                        error = %error,
+                        incumbent = ?incumbent,
+                        "claim conflicts with an active local run; rejecting the claimed run"
+                    );
+                    if let (Some(gen), Some(incumbent)) = (ownership_generation, incumbent) {
+                        if let Err(reject_error) = client
+                            .reject_claimed_run(run_id, gen, Some(incumbent))
+                            .await
+                        {
+                            warn!(
+                                %run_id,
+                                error = %reject_error,
+                                "failed to reject an anomalous claimed run"
+                            );
+                        }
+                    }
+                } else {
+                    // 无本地旧任务（非活动冲突的其他 reserve 错误）：原样传播。
+                    return Err(error);
+                }
+                return Ok(None);
+            }
         }
         Ok(claim)
     }
@@ -949,9 +985,8 @@ fn spawn_shutdown_signal_listener(shutdown_requested: Arc<AtomicBool>) {
     tokio::spawn(async move {
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut terminate =
-                signal(SignalKind::terminate()).expect("install SIGTERM handler");
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut terminate = signal(SignalKind::terminate()).expect("install SIGTERM handler");
             let mut interrupt = signal(SignalKind::interrupt()).expect("install SIGINT handler");
             tokio::select! {
                 _ = terminate.recv() => {}
@@ -967,6 +1002,34 @@ fn spawn_shutdown_signal_listener(shutdown_requested: Arc<AtomicBool>) {
     });
 }
 
+/// 函数退出（正常或错误）时自动停止保活心跳，避免主循环失效后
+/// 空心跳继续延长 Hub 侧在线时间、掩盖故障。
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
+/// 独立保活循环：与 Run 执行/恢复/checkpoint 解耦的固定频率轻量 keepalive。
+/// 周期 10s 显著小于模型代理授权的 30s 新鲜窗口；只延长 last_heartbeat_at，
+/// 不携带快照、不请求命令，因此不会释放空闲会话、不会覆盖 Hub 状态。
+/// 不检查 shutdown 标志：drain（最长 100s）期间也必须保持在线，
+/// 由调用方的 AbortOnDrop 守卫在函数整体返回后停止本循环。
+async fn heartbeat_keepalive_loop(client: HubClient, interval: Duration) {
+    let mut interval_timer =
+        tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    loop {
+        interval_timer.tick().await;
+        if let Err(error) = client.keepalive().await {
+            warn!(error = %error, "keepalive failed");
+        }
+    }
+}
+
 async fn run_registered_cycle(
     config: &mut Config,
     client: &mut HubClient,
@@ -979,6 +1042,11 @@ async fn run_registered_cycle(
     let command_dispatcher = Arc::new(RuntimeSessionCommandDispatcher::default());
     let mut manager: Option<Arc<SessionSupervisorManager>> = None;
     let mut workers = JoinSet::new();
+    let mut ws_started = false;
+    let _keepalive = AbortOnDrop(Some(tokio::spawn(heartbeat_keepalive_loop(
+        client.clone(),
+        Duration::from_secs(10),
+    ))));
     loop {
         while let Some(result) = workers.try_join_next() {
             if let Err(error) = result {
@@ -1023,6 +1091,15 @@ async fn run_registered_cycle(
                 )?;
                 let cleanups = recovered.take_pending_released_session_cleanups()?;
                 manager = Some(Arc::clone(&recovered));
+                if !ws_started {
+                    ws_started = true;
+                    let ws_config = config.clone();
+                    let ws_client = client.clone();
+                    let ws_manager = Arc::clone(&recovered);
+                    workers.spawn(async move {
+                        crate::runtime_ws::runtime_ws_loop(ws_config, ws_client, ws_manager).await;
+                    });
+                }
                 (recovered, cleanups)
             };
             let mut cleanups = cleanups;
@@ -1121,7 +1198,10 @@ async fn drain_sessions_for_shutdown(
 ) {
     // 1. 先收集所有托管会话（shutdown 会清空 records，顺序不可反）。
     let sessions = manager.all_session_generations();
-    info!(count = sessions.len(), "shutdown drain collected managed sessions");
+    info!(
+        count = sessions.len(),
+        "shutdown drain collected managed sessions"
+    );
     // 2. 立即停止所有 supervisor（引擎进程终止，不等当前推理）。
     manager.shutdown();
     if sessions.is_empty() {
@@ -1159,7 +1239,10 @@ async fn drain_sessions_for_shutdown(
                 warn!(%run_id, error = %error, "mark run failed during shutdown drain");
             }
         }
-        if let Err(error) = client.set_session_bundle_sync(session_id, "uploading").await {
+        if let Err(error) = client
+            .set_session_bundle_sync(session_id, "uploading")
+            .await
+        {
             warn!(%session_id, error = %error, "mark bundle sync uploading failed");
         }
         let request = RuntimeCheckpointRequest {
@@ -1168,10 +1251,7 @@ async fn drain_sessions_for_shutdown(
             reason: RuntimeCheckpointReason::Drain,
         };
         let outcome = transport.checkpoint(&request).await;
-        let ok = matches!(
-            outcome.result,
-            RuntimeCheckpointEffectResult::Saved { .. }
-        );
+        let ok = matches!(outcome.result, RuntimeCheckpointEffectResult::Saved { .. });
         if let Err(error) = client
             .set_session_bundle_sync(session_id, if ok { "done" } else { "failed" })
             .await
@@ -1232,9 +1312,6 @@ async fn drive_session_salvage(
         }
         return Ok(());
     };
-    let native_session_id = metadata
-        .native_session_id
-        .context("salvage Session has no Native Session id")?;
     let producing_engine_version = if metadata.engine_version.trim().is_empty() {
         config.engine_version.clone()
     } else {
@@ -1247,15 +1324,14 @@ async fn drive_session_salvage(
     ));
     let spec = session_bundle::SessionBundleCreateSpec {
         session_id: dto.session_id,
-        native_session_id,
         history_checkpoint: dto.history_checkpoint,
         bundle_generation: dto.bundle_generation,
         ownership_generation: dto.ownership_generation,
         producing_engine_version,
         created_at: chrono::Utc::now(),
         workspace: paths.workspace,
-        engine_state_root: paths.engine_state,
         archive_path,
+        force_stop_snapshot: false,
     };
     let artifact =
         tokio::task::spawn_blocking(move || session_bundle::create_session_bundle(&spec))
@@ -1451,24 +1527,29 @@ async fn run_claim_worker(
         let failure = RuntimeRunFailure::from_error(&error);
         warn!(run_id = %run_id, error = %error, "run execution failed");
         if let (Some(session_id), Some(ownership_generation)) = (session_id, ownership_generation) {
-            // The managed supervisor can no longer serve this Session. Drop it
-            // locally first so heartbeats stop reporting it, then tell the Hub
-            // to release ownership. If the release call itself fails, the Hub
-            // keeps the request in its release outbox (and heartbeats reconcile
-            // as a fallback), so the Session cannot stay stuck forever.
-            manager.forget_fenced_session(session_id);
-            let _ = client
-                .fail_run(run_id, ownership_generation, failure)
-                .await
-                .inspect_err(|mark_error| {
-                    warn!(run_id = %run_id, error = %mark_error, "failed to mark run failed");
-                });
-            if let Err(release_error) = client
-                .release_session(session_id, ownership_generation, true)
-                .await
-            {
-                warn!(session_id = %session_id, error = %release_error,
-                    "failed to release Session ownership after run failure");
+            // 仅当本地 record 仍属于本 Run 才清理与释放：若本 Run 已被 Hub 重派
+            // 接管（同 generation 的新 claim 已替换 record），旧 worker 不得
+            // fail/release/forget——那会拆掉新 Run 的 Hub ownership 与本地状态。
+            if manager.forget_fenced_run(session_id, run_id) {
+                let _ = client
+                    .fail_run(run_id, ownership_generation, failure)
+                    .await
+                    .inspect_err(|mark_error| {
+                        warn!(run_id = %run_id, error = %mark_error, "failed to mark run failed");
+                    });
+                if let Err(release_error) = client
+                    .release_session(session_id, ownership_generation, true)
+                    .await
+                {
+                    warn!(session_id = %session_id, error = %release_error,
+                        "failed to release Session ownership after run failure");
+                }
+            } else {
+                warn!(
+                    %session_id,
+                    %run_id,
+                    "run failed but its Session was already reassigned; skipping fail/release"
+                );
             }
         }
     }
@@ -1614,12 +1695,15 @@ impl HubClient {
         *self.runtime_token.write().unwrap() = credential;
     }
 
-    async fn heartbeat(&self) -> anyhow::Result<()> {
-        self.heartbeat_with_credential(
-            &self.runtime_credential(),
-            &RuntimeHeartbeatRequest::default(),
-        )
-        .await?;
+    /// 轻量保活：只延长 Hub 侧 Runtime 在线时间，不携带会话快照、不请求命令，
+    /// 因此不会触发"释放未上报会话"逻辑，也不会覆盖任何 Hub 会话状态。
+    async fn keepalive(&self) -> anyhow::Result<()> {
+        self.http
+            .post(format!("{}/api/runtime/keepalive", self.hub_url))
+            .bearer_auth(self.runtime_credential())
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 
@@ -1655,6 +1739,29 @@ impl HubClient {
             return Ok(None);
         }
         Ok(Some(response.error_for_status()?.json().await?))
+    }
+
+    /// 防御：异常派发任务的拒绝（活动冲突时调用；incumbent 为本地旧任务）。
+    async fn reject_claimed_run(
+        &self,
+        run_id: Uuid,
+        ownership_generation: i64,
+        incumbent_run_id: Option<Uuid>,
+    ) -> anyhow::Result<()> {
+        self.http
+            .post(format!(
+                "{}/api/runtime/runs/{run_id}/reject-claim",
+                self.hub_url
+            ))
+            .bearer_auth(self.runtime_credential())
+            .json(&RuntimeSessionWriteRequest {
+                ownership_generation,
+                payload: RejectClaimedRunRequest { incumbent_run_id },
+            })
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
     }
 
     async fn cache_skill_package(
@@ -1831,8 +1938,10 @@ impl HubClient {
         req.event_id = Uuid::new_v4();
         retry_hub_upload(&self.upload_retry_delays_secs, || {
             let req = req.clone();
+            let event_type = req.event_type.clone();
             async move {
-                self.http
+                let response = self
+                    .http
                     .post(format!("{}/api/runtime/runs/{run_id}/events", self.hub_url))
                     .bearer_auth(self.runtime_credential())
                     .json(&RuntimeSessionWriteRequest {
@@ -1840,8 +1949,19 @@ impl HubClient {
                         payload: req,
                     })
                     .send()
-                    .await?
-                    .error_for_status()?;
+                    .await?;
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    tracing::warn!(
+                        %run_id,
+                        %status,
+                        %event_type,
+                        body = %body,
+                        "append run event rejected by Hub"
+                    );
+                    anyhow::bail!("Hub rejected run event with {status}: {body}");
+                }
                 Ok(())
             }
         })
@@ -2061,6 +2181,31 @@ impl HubClient {
         Ok(())
     }
 
+    /// 上传强制停止快照（force-stop 专用端点，以 operation 鉴权）。
+    async fn upload_force_stop_bundle(
+        &self,
+        operation_id: Uuid,
+        artifact: &crate::session_bundle::SessionBundleArtifact,
+    ) -> anyhow::Result<()> {
+        let file = fs::File::open(&artifact.archive_path)
+            .await
+            .context("open force stop Session Bundle")?;
+        let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+        self.http
+            .put(format!(
+                "{}/api/runtime/force-stop/{operation_id}/bundle",
+                self.hub_url
+            ))
+            .bearer_auth(self.runtime_credential())
+            .header("x-agent-hub-bundle-sha256", &artifact.checksum_sha256)
+            .header("x-agent-hub-bundle-size", artifact.size_bytes)
+            .body(body)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
     async fn download_session_bundle(
         &self,
         session_id: Uuid,
@@ -2210,13 +2355,23 @@ impl HubClient {
         .await
     }
 
-    async fn get_session_patch_messages(&self, session_id: Uuid) -> anyhow::Result<Vec<PatchMessageDto>> {
+    /// 拉取会话重建事件（run_events 中对话/工具子集，按 seq 有序，
+    /// generation-fenced）。恢复会话时以 DB 为唯一事实源重建 Pi 会话 jsonl。
+    async fn get_session_replay_events(
+        &self,
+        session_id: Uuid,
+        ownership_generation: i64,
+    ) -> anyhow::Result<Vec<SessionReplayEventDto>> {
         self.http
             .get(format!(
-                "{}/api/runtime/sessions/{session_id}/patch-messages",
+                "{}/api/runtime/sessions/{session_id}/replay-events",
                 self.hub_url
             ))
             .bearer_auth(self.runtime_credential())
+            .header(
+                "x-agent-hub-ownership-generation",
+                ownership_generation.to_string(),
+            )
             .send()
             .await?
             .error_for_status()?
@@ -2356,7 +2511,7 @@ async fn finish_claimed_run(
             .append_event(claim.run.id, ownership_generation, event)
             .await?;
         if last_heartbeat.elapsed() >= Duration::from_secs(1) {
-            client.heartbeat().await?;
+            client.keepalive().await?;
             *last_heartbeat = Instant::now();
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -2384,7 +2539,7 @@ async fn finish_claimed_run(
             )
             .await?;
     } else {
-        client.heartbeat().await?;
+        client.keepalive().await?;
         client
             .complete_run(
                 claim.run.id,
@@ -2519,28 +2674,32 @@ async fn restore_claim_session_bundle_if_needed(
         let checksum = current.checksum_sha256.clone();
         let size = current.size_bytes as u64;
         let history_checkpoint = current.history_checkpoint;
+        let force_stop_snapshot = current.kind == "force_stop";
         let manifest = tokio::task::spawn_blocking(move || {
-            session_bundle::restore_session_bundle(
+            session_bundle::restore_session_workspace_only(
                 &archive_for_restore,
                 &checksum,
                 size,
                 session_id,
                 history_checkpoint,
                 &prepared_for_restore,
+                force_stop_snapshot,
             )
         })
         .await
         .context("Session Bundle restore task stopped")??;
-        anyhow::ensure!(
-            manifest.bundle_generation == current.generation
-                && manifest.ownership_generation == current.ownership_generation
-                && manifest.producing_engine_version == current.producing_engine_version,
-            "Session Bundle manifest does not match Hub Bundle metadata"
-        );
-        anyhow::ensure!(
-            context.session.native_session_id.as_deref() == Some(&manifest.native_session_id),
-            "Session Bundle Native Session does not match Hub Session"
-        );
+        // 强制停止快照无 checkpoint 元数据（代次/归属/引擎版本为占位值），跳过比对；
+        // 常规快照要求与 Hub 元数据完全一致。
+        if !force_stop_snapshot {
+            anyhow::ensure!(
+                manifest.bundle_generation == current.generation
+                    && manifest.ownership_generation == current.ownership_generation
+                    && manifest.producing_engine_version == current.producing_engine_version,
+                "Session Bundle manifest does not match Hub Bundle metadata"
+            );
+        }
+        // Bundle 只恢复工作区快照；native Session 绑定与 Pi 会话文件一律由
+        // DB 重建事件重现（reconstruct_pi_session_jsonl），不做 Bundle 校验。
         let metadata = session_supervisor_metadata_for_claim(
             configured_runtime_id(claim)?,
             claim,
@@ -2732,94 +2891,547 @@ async fn download_attachments_to_workspace(
     notes
 }
 
-/// 本地是否存在该会话的 Pi 引擎会话文件（engine_state_root/sessions/*.jsonl）。
-/// 存在 = 引擎可本地恢复（无需补丁）；不存在 = 空启动，需历史补丁。
-fn has_local_pi_session(config: &Config, session_id: Uuid) -> bool {
-    let paths = SessionPaths::for_session(&config.work_root, session_id);
-    let session_dir = paths.engine_state.join("sessions");
-    let Ok(entries) = std::fs::read_dir(&session_dir) else {
-        return false;
-    };
-    entries.flatten().any(|entry| {
-        entry
-            .path()
-            .extension()
-            .and_then(|ext| ext.to_str())
-            == Some("jsonl")
-    })
+/// 本地 Pi 会话文件的类型化检查：NotFound 才算缺失；权限/解析/歧义等
+/// 真实错误原样传播（不得折叠成"缺失"而盲目清目录重建）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalSessionFileStatus {
+    Found,
+    Missing,
 }
 
-/// 把补丁历史拼成"历史上下文提示"，作为首条消息前缀注入会话上下文。
-/// 语义：已闭环（user 后有 assistant 回复）为历史段（AI 知晓、不重复回复）；
-/// 未闭环（最后 user 无回复）为待办段（AI 必须回应——恢复后自动继续）。
-fn inject_history_patch(claim: &mut ClaimRunResponse, patch: &[PatchMessageDto]) {
-    let mut history_lines: Vec<String> = Vec::new();
-    let mut i = 0;
-    let mut pending: Option<&PatchMessageDto> = None;
-    while i < patch.len() {
-        let message = &patch[i];
-        let closed = message.role == "user"
-            && patch.get(i + 1).is_some_and(|next| next.role == "assistant");
-        if closed {
-            let reply = patch[i + 1].content.as_deref().unwrap_or("");
-            history_lines.push(format!(
-                "用户：{}\n助手：{}",
-                message.content.as_deref().unwrap_or(""),
-                reply
-            ));
-            i += 2;
-        } else {
-            if message.role == "user" {
-                pending = Some(message);
+fn local_session_file_status(
+    engine_state_root: &Path,
+    native_session_id: &str,
+) -> anyhow::Result<LocalSessionFileStatus> {
+    match pi_driver::discover_session_file(engine_state_root, native_session_id) {
+        Ok(_) => Ok(LocalSessionFileStatus::Found),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                || error
+                    .to_string()
+                    .contains("Pi Session recovery file was not found") =>
+        {
+            Ok(LocalSessionFileStatus::Missing)
+        }
+        Err(error) => Err(error.context("inspect local Pi session file before deciding recovery")),
+    }
+}
+
+/// 把会话重建事件生成为 Pi 会话 jsonl（header + parentId 事件链）。
+/// 会话历史以 DB 为唯一事实源（用户要求）：对话与工具调用一律从 run_events 重现。
+/// 两阶段处理：
+/// 1) 预收集工具结果（call_id → (tool_name, output, is_error, created_at)）：
+///    - item(dynamicToolCall, completed) 的 output（内置工具，id = Pi 原始 call|item）
+///    - client_tool_result（integration 工具，id = Hub UUID，权威优先）
+///    - tool_result（integration 批量）仅在尚不存在时补充（client 优先）
+/// 2) 顺序输出：message → 消息行；item/tool_request 仅在结果表有对应结果时
+///    输出 toolCall 行 + toolResult 行（dangling 调用不输出，避免 AI 误解历史）。
+fn build_pi_session_jsonl(
+    native_session_id: &str,
+    events: &[SessionReplayEventDto],
+) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        !events.is_empty(),
+        "cannot rebuild a Pi session jsonl without replay events"
+    );
+    use std::collections::HashMap;
+    type ToolResultInfo = (String, String, bool, chrono::DateTime<chrono::Utc>);
+    // 内置工具结果按 (run_id, item_id)（Pi 的 call|item id 跨 run 可能重号）；
+    // integration 工具结果按全局 tool_request_id（Hub UUID，跨父/子 Run 关联：
+    // tool_request 在父 Run，client_tool_result/tool_result 在 follow-up Run）。
+    let mut builtin_results: HashMap<(Uuid, String), ToolResultInfo> = HashMap::new();
+    let mut integration_results: HashMap<String, ToolResultInfo> = HashMap::new();
+    // 第一遍：权威结果（item completed / client_tool_result）。
+    for event in events {
+        match event.event_type.as_str() {
+            "item" => {
+                if event.payload.get("phase").and_then(Value::as_str) != Some("completed") {
+                    continue;
+                }
+                let (Some(item_id), Some(tool)) = (
+                    event.payload.get("item_id").and_then(Value::as_str),
+                    event.payload.get("tool").and_then(Value::as_str),
+                ) else {
+                    continue;
+                };
+                if tool.is_empty() || item_id.is_empty() {
+                    continue;
+                }
+                let output = event
+                    .payload
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let success = event
+                    .payload
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                builtin_results.insert(
+                    (event.run_id, item_id.to_string()),
+                    (tool.to_string(), output, !success, event.created_at),
+                );
             }
-            i += 1;
+            "client_tool_result" => {
+                let Some(call_id) = event
+                    .payload
+                    .get("tool_call_id")
+                    .or_else(|| event.payload.get("tool_request_id"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let Some(tool_name) = event
+                    .payload
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                else {
+                    continue;
+                };
+                let result = event.payload.get("result");
+                let output = result
+                    .and_then(|value| value.get("output"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let status = result
+                    .and_then(|value| value.get("status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                integration_results.insert(
+                    call_id.to_string(),
+                    (
+                        tool_name.to_string(),
+                        output,
+                        status != "success",
+                        event.created_at,
+                    ),
+                );
+            }
+            _ => {}
         }
     }
-    let mut prompt = String::new();
-    if !history_lines.is_empty() {
-        prompt.push_str(
-            "【以下为本会话已处理的历史对话，请知晓上下文，不要重复回复这些内容】\n",
-        );
-        prompt.push_str(&history_lines.join("\n"));
-        prompt.push('\n');
+    // 第二遍：tool_result 批量展开，仅补充尚未收集的结果（client 优先）。
+    for event in events {
+        if event.event_type != "tool_result" {
+            continue;
+        }
+        let Some(tool_results) = event
+            .payload
+            .get("message")
+            .and_then(|value| value.get("tool_results"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for item in tool_results {
+            let Some(call_id) = item
+                .get("tool_request_id")
+                .or_else(|| item.get("tool_call_id"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let Some(tool_name) = item
+                .get("tool_name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+            else {
+                continue;
+            };
+            let result = item.get("result");
+            let output = result
+                .and_then(|value| value.get("output"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let status = result
+                .and_then(|value| value.get("status"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            integration_results
+                .entry(call_id.to_string())
+                .or_insert_with(|| {
+                    (
+                        tool_name.to_string(),
+                        output,
+                        status != "success",
+                        event.created_at,
+                    )
+                });
+        }
     }
-    if let Some(pending_message) = pending {
-        prompt.push_str("【以下是恢复前未及回复的请求，请现在处理】\n");
-        prompt.push_str(pending_message.content.as_deref().unwrap_or(""));
-        prompt.push('\n');
+
+    let mut lines = vec![json!({
+        "type": "session",
+        "version": 3,
+        "id": native_session_id,
+        "timestamp": events
+            .first()
+            .expect("replay events are non-empty")
+            .created_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "cwd": "/workspace",
+    })];
+    // 当前模型调用（pending）的 assistant 输出：text + toolCalls（含结果）。
+    // 真实序列中每个 model_request 是一次模型调用；Pi 历史要求一次调用输出
+    // 合并为一条 assistant 消息（text + toolCall 块），随后紧跟对应 toolResult。
+    let mut parent_id: Option<String> = None;
+    let mut pending_text: Option<String> = None;
+    let mut pending_stop_reason: Option<String> = None;
+    let mut pending_usage: Option<Value> = None;
+    let mut pending_calls: Vec<(
+        String,
+        String,
+        Value,
+        String,
+        bool,
+        chrono::DateTime<chrono::Utc>,
+    )> = Vec::new();
+    let mut out_index: u64 = 0;
+    let mut pending_ts: Option<chrono::DateTime<chrono::Utc>> = None;
+    macro_rules! emit_entry {
+        ($timestamp:expr, $row:expr) => {{
+            let base = out_index
+                .checked_mul(2)
+                .and_then(|value| value.checked_add(1))
+                .context("replay event count is too large for deterministic Pi event ids")?;
+            let id = format!("{base:08x}");
+            lines.push(json!({
+                "type": "message",
+                "id": id,
+                "parentId": parent_id,
+                "timestamp": $timestamp,
+                "message": $row,
+            }));
+            parent_id = Some(id);
+            out_index += 1;
+        }};
     }
-    if prompt.trim().is_empty() {
-        return;
+    macro_rules! flush_pending {
+        () => {{
+            let has_output = pending_text.is_some() || !pending_calls.is_empty();
+            if has_output {
+                let mut content: Vec<Value> = Vec::new();
+                if let Some(text) = pending_text.take() {
+                    content.push(json!({ "type": "text", "text": text }));
+                }
+                let calls = std::mem::take(&mut pending_calls);
+                let mut result_rows: Vec<Value> = Vec::new();
+                for (call_id, tool_name, arguments, output, is_error, result_ts) in calls {
+                    content.push(json!({
+                        "type": "toolCall",
+                        "id": call_id,
+                        "name": tool_name,
+                        "arguments": arguments,
+                    }));
+                    result_rows.push(json!({
+                        "role": "toolResult",
+                        "toolCallId": call_id,
+                        "toolName": tool_name,
+                        "content": [{"type": "text", "text": output}],
+                        "details": {},
+                        "isError": is_error,
+                        "timestamp": result_ts.timestamp_millis(),
+                    }));
+                }
+                let mut row = json!({
+                    "role": "assistant",
+                    "content": content,
+                });
+                if let Some(usage) = pending_usage.take() {
+                    row["usage"] = usage;
+                }
+                if let Some(stop_reason) = pending_stop_reason.take() {
+                    row["stopReason"] = Value::String(stop_reason);
+                }
+                emit_entry!(
+                    pending_ts
+                        .expect("pending assistant output has an event timestamp")
+                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    row
+                );
+                for result_row in result_rows {
+                    emit_entry!(
+                        result_row["timestamp"]
+                            .as_i64()
+                            .map(|millis| {
+                                chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis)
+                                    .expect("tool result timestamp is valid")
+                                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                            })
+                            .unwrap_or_else(|| {
+                                pending_ts
+                                    .expect("pending assistant output has an event timestamp")
+                                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                            }),
+                        result_row
+                    );
+                }
+            }
+            pending_text = None;
+            pending_stop_reason = None;
+            pending_usage = None;
+            pending_calls.clear();
+        }};
     }
-    let Some(context) = claim.session_context.as_mut() else {
-        return;
-    };
-    context.messages.insert(
-        0,
-        HubSessionMessageDto {
-            id: Uuid::new_v4(),
-            session_id: context.session.id,
-            sequence: 0,
-            role: "user".into(),
-            message_kind: "message".into(),
-            content: Some(prompt),
-            payload: Value::Null,
-            attachments: Vec::new(),
-            delivery_mode: "record_only".into(),
-            delivery_state: "delivered".into(),
-            client_message_key: None,
-            expected_native_turn_id: None,
-            turn_id: None,
-            run_id: None,
-            accepted_at: chrono::Utc::now(),
-        },
-    );
+    let mut active_run_id: Option<Uuid> = None;
+    for event in events {
+        // Run 边界：事件属于不同 Run 时先结束上一个输出段，避免跨 Run 串话。
+        if active_run_id.is_some_and(|run_id| run_id != event.run_id) {
+            flush_pending!();
+            pending_ts = None;
+        }
+        active_run_id = Some(event.run_id);
+        match event.event_type.as_str() {
+            "model_request" => {
+                // 新的模型调用开始：结束上一个调用输出（Pi 历史边界）。
+                flush_pending!();
+                pending_ts = None;
+            }
+            "message" => match event.role.as_deref() {
+                Some("user") => {
+                    flush_pending!();
+                    let Some(text) = event
+                        .content
+                        .as_deref()
+                        .filter(|text| !text.trim().is_empty())
+                    else {
+                        continue;
+                    };
+                    emit_entry!(
+                        event
+                            .created_at
+                            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                        json!({
+                            "role": "user",
+                            "content": [{"type": "text", "text": text}],
+                            "timestamp": event.created_at.timestamp_millis(),
+                        })
+                    );
+                    pending_ts = None;
+                }
+                Some("assistant") => {
+                    let Some(text) = event
+                        .content
+                        .as_deref()
+                        .filter(|text| !text.trim().is_empty())
+                    else {
+                        continue;
+                    };
+                    pending_text = Some(text.to_string());
+                    pending_stop_reason = event
+                        .payload
+                        .get("stop_reason")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    if pending_ts.is_none() {
+                        pending_ts = Some(event.created_at);
+                    }
+                }
+                _ => {}
+            },
+            "item" => {
+                if event.payload.get("phase").and_then(Value::as_str) != Some("completed") {
+                    continue;
+                }
+                let (Some(item_id), Some(tool)) = (
+                    event.payload.get("item_id").and_then(Value::as_str),
+                    event.payload.get("tool").and_then(Value::as_str),
+                ) else {
+                    continue;
+                };
+                if tool.is_empty() || item_id.is_empty() {
+                    continue;
+                }
+                let arguments = event
+                    .payload
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                let Some((_name, output, is_error, result_ts)) =
+                    builtin_results.get(&(event.run_id, item_id.to_string()))
+                else {
+                    continue;
+                };
+                pending_calls.push((
+                    item_id.to_string(),
+                    tool.to_string(),
+                    arguments,
+                    output.clone(),
+                    *is_error,
+                    *result_ts,
+                ));
+                if pending_ts.is_none() {
+                    pending_ts = Some(event.created_at);
+                }
+            }
+            "tool_request" => {
+                let Some(call_id) = event
+                    .payload
+                    .get("tool_request_id")
+                    .or_else(|| event.payload.get("tool_call_id"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let Some(tool_name) = event
+                    .payload
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                else {
+                    continue;
+                };
+                let arguments = event
+                    .payload
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                let Some((_name, output, is_error, result_ts)) = integration_results.get(call_id)
+                else {
+                    continue;
+                };
+                pending_calls.push((
+                    call_id.to_string(),
+                    tool_name.to_string(),
+                    arguments,
+                    output.clone(),
+                    *is_error,
+                    *result_ts,
+                ));
+                if pending_ts.is_none() {
+                    pending_ts = Some(event.created_at);
+                }
+            }
+            "usage" => {
+                // usage 事件归属当前模型调用（pending），映射为 Pi usage 结构。
+                // 兼容两套键：pi driver 写 input/output/cacheRead/totalTokens，
+                // fake driver 测试写 input_tokens/output_tokens。
+                let usage = event.payload.clone();
+                let input = usage
+                    .get("input")
+                    .or_else(|| usage.get("input_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let output = usage
+                    .get("output")
+                    .or_else(|| usage.get("output_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let total = usage
+                    .get("totalTokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(input + output);
+                let mapped = json!({
+                    "input": input,
+                    "output": output,
+                    "cacheRead": usage.get("cacheRead").and_then(Value::as_u64).unwrap_or(0),
+                    "cacheWrite": usage.get("cacheWrite").and_then(Value::as_u64).unwrap_or(0),
+                    "totalTokens": total,
+                    "cost": usage.get("cost").cloned().unwrap_or_else(|| json!({})),
+                });
+                pending_usage = Some(mapped);
+            }
+            _ => {}
+        }
+    }
+    flush_pending!();
+    let mut out = String::new();
+    for line in lines {
+        out.push_str(&line.to_string());
+        out.push('\n');
+    }
+    Ok(out)
 }
 
+/// 恢复会话：从 Hub 拉取重建事件并生成 Pi 会话 jsonl（canonical native id）。
+/// 引擎加载后历史重现，turn_started 的 native_session_id 与 Hub 一致，
+/// 不会出现 native Session 绑定 409。只替换同 id 的旧会话文件（按 header
+/// 首行 id 判断），原子写入（临时文件 + rename），保留其他会话文件。
+async fn reconstruct_pi_session_jsonl(
+    client: &HubClient,
+    session_id: Uuid,
+    ownership_generation: i64,
+    native_session_id: &str,
+    engine_state_root: &Path,
+) -> anyhow::Result<()> {
+    let events = client
+        .get_session_replay_events(session_id, ownership_generation)
+        .await?;
+    if events.is_empty() {
+        // 用户硬要求：恢复会话必定用 DB 事件重现 Pi jsonl。
+        // 空事件直接失败（restoring 场景由 Hub 转 recovery_failed），
+        // 不得回退本地文件或空启动（那正是 409 的来源）。
+        anyhow::bail!("session {session_id} has no replay events to rebuild its Pi session jsonl");
+    }
+    let content = build_pi_session_jsonl(native_session_id, &events)?;
+    let session_dir = engine_state_root.join(pi_driver::PI_SESSION_DIRECTORY);
+    tokio::fs::create_dir_all(&session_dir).await?;
+    // 先原子写入新重建文件并确认可发现，再清理旧的同 id 会话文件；
+    // 写失败时旧文件仍在（避免唯一可恢复文件被删除）。
+    let tmp = session_dir.join(format!(".reconstruct-{}.tmp", Uuid::new_v4().simple()));
+    tokio::fs::write(&tmp, content).await?;
+    let filename = format!(
+        "{}_{}.jsonl",
+        chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S-%3fZ"),
+        Uuid::new_v4().simple()
+    );
+    let final_path = session_dir.join(filename);
+    tokio::fs::rename(&tmp, &final_path).await?;
+    // 新文件已原子就位：先清理旧的同 id 会话文件（避免 discover 因多文件
+    // 同 id 判为歧义），再验证重建文件可按 canonical id 发现。
+    let mut entries = tokio::fs::read_dir(&session_dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path == final_path || path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let same_session = tokio::fs::read_to_string(&path)
+            .await
+            .ok()
+            .and_then(|text| {
+                text.lines().next().and_then(|line| {
+                    serde_json::from_str::<Value>(line).ok().and_then(|header| {
+                        header
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(|id| id == native_session_id)
+                    })
+                })
+            })
+            .unwrap_or(false);
+        if same_session {
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+    }
+    anyhow::ensure!(
+        pi_driver::discover_session_file(engine_state_root, native_session_id)
+            .is_ok_and(|path| path == final_path),
+        "rebuilt Pi session file is not discoverable under the canonical native id"
+    );
+    info!(
+        %session_id,
+        %native_session_id,
+        event_count = events.len(),
+        "reconstructed Pi session jsonl from Hub events"
+    );
+    Ok(())
+}
+
+/// 恢复会话：从 Hub 拉取重建事件并生成 Pi 会话 jsonl（canonical native id）。
+/// 引擎加载后历史重现，turn_started 的 native_session_id 与 Hub 一致，
+/// 不会出现 native Session 绑定 409。只替换同 id 的旧会话文件（按 header
+/// 首行 id 判断），原子写入（临时文件 + rename），保留其他会话文件。
 async fn inject_session_attachments(
     client: &HubClient,
     claim: &mut ClaimRunResponse,
-    work_root: &Path,) -> anyhow::Result<()> {
+    work_root: &Path,
+) -> anyhow::Result<()> {
     let Some(context) = claim.session_context.as_mut() else {
         return Ok(());
     };
@@ -2872,9 +3484,10 @@ async fn execute_managed_run(
         .run
         .hub_session_id
         .context("claimed Run is missing its Hub Session id")?;
+    let run_id = claim.run.id;
     let result = execute_managed_run_inner(config, client, Arc::clone(&manager), claim).await;
     if let Err(error) = &result {
-        manager.cancel_session(session_id, error.to_string());
+        manager.cancel_session(session_id, run_id, error.to_string());
     }
     result
 }
@@ -2909,6 +3522,29 @@ async fn execute_managed_run_inner(
             .await?,
         ),
     };
+    // Hub 派发了本会话任务 = 权威决定（reserve_claim 已接管/复用本地记录）。
+    // 需要恢复（restoring 或 canonical 会话文件缺失）时，清空本地会话目录
+    //（engine-state/workspace 残留），随后按正常流程执行：Bundle 恢复
+    // workspace（如有）+ DB 事件重建 jsonl + 启动 pi。
+    let session_paths = SessionPaths::for_session(&config.work_root, session_id);
+    // 需要恢复 = restoring，或 canonical Pi 会话文件缺失（NotFound 才算缺失；
+    // 其他错误（权限/解析失败）直接传播，不得盲目清目录重建）。
+    let needs_recovery = match claim.session_context.as_ref() {
+        Some(context) if context.session.lifecycle_status == "restoring" => true,
+        Some(context) => match context.session.native_session_id.as_deref() {
+            Some(native) => match local_session_file_status(&session_paths.engine_state, native)? {
+                LocalSessionFileStatus::Found => false,
+                LocalSessionFileStatus::Missing => true,
+            },
+            None => false,
+        },
+        None => false,
+    };
+    if needs_recovery && fs::symlink_metadata(&session_paths.root).await.is_ok() {
+        fs::remove_dir_all(&session_paths.root)
+            .await
+            .context("clear stale local Session directory before recovery")?;
+    }
     restore_claim_session_bundle_if_needed(config, client, &claim).await?;
     let run_env = prepare_run_env_with_management(
         &config.work_root,
@@ -2920,6 +3556,50 @@ async fn execute_managed_run_inner(
         config.maintenance_token_file.as_deref(),
     )
     .await?;
+    // 恢复会话（仅跨 runtime 接管/异常恢复，lifecycle=restoring）：对话与工具
+    // 调用历史以 DB 为唯一事实源，重建 Pi 会话 jsonl（canonical native id）。
+    // 引擎加载后历史重现，turn_started 的 native_session_id 与 Hub 一致，
+    // 不会出现 native Session 绑定 409。online 正常续聊不重建（本地 jsonl 继续）。
+    if let Some(context) = claim.session_context.as_ref() {
+        // 恢复判定：跨 runtime 接管（restoring），或同 runtime 重启/GC 后
+        // canonical Pi 会话文件已缺失（online 但文件不在）。online 且文件
+        // 存在（正常续聊）不重建，本地 jsonl 继续使用。
+        let native_session_id = context.session.native_session_id.as_deref();
+        let canonical_missing = match native_session_id {
+            Some(native) => matches!(
+                local_session_file_status(&run_env.engine_state_root, native)?,
+                LocalSessionFileStatus::Missing
+            ),
+            None => false,
+        };
+        if context.session.lifecycle_status == "restoring" || canonical_missing {
+            if let Some(native_session_id) = native_session_id {
+                let ownership_generation = claim
+                    .run
+                    .session_ownership_generation
+                    .context("claimed Run is missing its Session ownership generation")?;
+                match reconstruct_pi_session_jsonl(
+                    client,
+                    session_id,
+                    ownership_generation,
+                    native_session_id,
+                    &run_env.engine_state_root,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(error) => {
+                        // 用户硬要求：恢复会话必定用 DB 事件重现 Pi jsonl。
+                        // 重建失败直接传播（restoring 场景由 Hub 转 recovery_failed），
+                        // 不得回退本地文件或空启动（那正是 409 的来源）。
+                        return Err(error.context(
+                            "failed to reconstruct Pi session jsonl from Hub replay events",
+                        ));
+                    }
+                }
+            }
+        }
+    }
     let metadata =
         session_supervisor_metadata_for_claim(manager.runtime_id, &claim, &config.engine_version)?;
     let vision_binding = model_binding(&claim.execution_configuration, "main")?;
@@ -2960,26 +3640,6 @@ async fn execute_managed_run_inner(
         );
         claim.session_context.as_mut().unwrap().messages = begin.messages;
     }
-    // 恢复场景（runtime 升级/异常后引擎环境不可恢复：无 bundle、本地无引擎会话文件）：
-    // 从 run_events 拉全量历史消息，作为上下文前缀注入（对话永不丢；引擎空启动无重复）。
-    if claim.session_context.is_some() && !has_local_pi_session(&config, session_id) {
-        match client.get_session_patch_messages(session_id).await {
-            Ok(patch) if !patch.is_empty() => {
-                inject_history_patch(&mut claim, &patch);
-                info!(
-                    %session_id,
-                    patch_messages = patch.len(),
-                    "injected session history patch after recovery"
-                );
-            }
-            Ok(_) => {}
-            Err(error) => warn!(
-                %session_id,
-                error = %error,
-                "failed to load session patch messages; continuing without history"
-            ),
-        }
-    }
     inject_session_attachments(client, &mut claim, &config.work_root).await?;
     info!(
         run_id = %claim.run.id,
@@ -2995,7 +3655,6 @@ async fn execute_managed_run_inner(
         Arc::clone(&manager),
         &claim,
         &mut last_heartbeat,
-        Duration::from_secs(10),
     )
     .await?;
     info!(
@@ -3005,6 +3664,16 @@ async fn execute_managed_run_inner(
         final_status = %result.final_status,
         "native Pi Turn finished"
     );
+    // 收尾 fence：被强制停止/抛弃的会话 record 已被移除，旧 worker 不再
+    // 向 Hub 写入（事件/终态/空闲定时器都跳过）。
+    if !manager.is_current_run(session_id, claim.run.id) {
+        tracing::info!(
+            %session_id,
+            run_id = %claim.run.id,
+            "run finished after force stop or reassignment; skipping hub finalization"
+        );
+        return Ok(());
+    }
     manager
         .update_native_session_id(
             session_id,
@@ -3024,7 +3693,17 @@ async fn execute_managed_run_inner(
         result.native_session_id,
         &mut last_heartbeat,
     )
-    .await
+    .await?;
+    // 任务成功收尾（Hub 终态确认后）：清 busy/标记并设置会话级空闲定时器。
+    manager.finalize_run(
+        session_id,
+        claim.run.id,
+        claim
+            .run
+            .session_ownership_generation
+            .context("claimed Run is missing its Session ownership generation")?,
+    )?;
+    Ok(())
 }
 
 async fn execute_managed_pi_with_streaming(
@@ -3032,7 +3711,6 @@ async fn execute_managed_pi_with_streaming(
     manager: Arc<SessionSupervisorManager>,
     claim: &ClaimRunResponse,
     last_heartbeat: &mut Instant,
-    heartbeat_interval: Duration,
 ) -> anyhow::Result<EngineRunResult> {
     let (event_tx, mut event_rx) = engine_event_channel();
     let mut deferred_tool_requests = Vec::new();
@@ -3051,10 +3729,6 @@ async fn execute_managed_pi_with_streaming(
         let claim = claim.clone();
         async move { manager.execute(claim, Some(event_tx)).await }
     });
-    let mut heartbeat = tokio::time::interval_at(
-        tokio::time::Instant::now() + heartbeat_interval,
-        heartbeat_interval,
-    );
 
     loop {
         tokio::select! {
@@ -3075,23 +3749,12 @@ async fn execute_managed_pi_with_streaming(
                         last_heartbeat,
                     ).await {
                         event_rx.close();
-                        manager.cancel_session(session_id, error.to_string());
+                        manager.cancel_session(session_id, run_id, error.to_string());
                         let _ = driver.await;
                         return Err(error);
                     }
                     if turn_started {
                         manager.acknowledge_model_proxy_turn(session_id, run_id)?;
-                    }
-                }
-            }
-            _ = heartbeat.tick() => {
-                match client.heartbeat().await {
-                    Ok(()) => *last_heartbeat = Instant::now(),
-                    Err(error) => {
-                        event_rx.close();
-                        manager.cancel_session(session_id, error.to_string());
-                        let _ = driver.await;
-                        return Err(error);
                     }
                 }
             }
@@ -3230,7 +3893,7 @@ async fn append_streamed_event(
         .append_event(run_id, ownership_generation, event)
         .await?;
     if last_heartbeat.elapsed() >= Duration::from_secs(1) {
-        client.heartbeat().await?;
+        client.keepalive().await?;
         *last_heartbeat = Instant::now();
     }
     Ok(())
@@ -4127,24 +4790,20 @@ impl RuntimeCheckpointTransport for HubRuntimeCheckpointTransport {
             } else {
                 metadata.engine_version.clone()
             };
-            let native_session_id = metadata
-                .native_session_id
-                .context("Session checkpoint has no Native Session id")?;
             let archive_path = paths.staging.join(format!(
                 "bundle-{}-{}.tar.zst",
                 bundle_generation, checkpoint_attempt_id
             ));
             session_bundle::create_session_bundle(&session_bundle::SessionBundleCreateSpec {
                 session_id,
-                native_session_id,
                 history_checkpoint,
                 bundle_generation,
                 ownership_generation,
                 producing_engine_version,
                 created_at: chrono::Utc::now(),
                 workspace: paths.workspace,
-                engine_state_root: paths.engine_state,
                 archive_path,
+                force_stop_snapshot: false,
             })
         })
         .await
@@ -5114,57 +5773,90 @@ impl SessionSupervisorManager {
             engine_version: String::new(),
             native_session_id: native_session_id.clone(),
         };
+
+        // 防御方案（v14）：Hub 已成功派发 = 权威。本地 record 分类处理——
+        // ① 真实活动冲突（有活动执行）→ 报错，调用方走 reject_claimed_run（不接管）；
+        // ② 空闲但版本不同（崩溃恢复/跨机接管）→ 替换 record（无进程可杀、无清理需要）；
+        // ③ 空闲且同版本 → 复用（正常续聊）。
         let mut records = self.records.lock().unwrap();
-        if let Some(record) = records.get_mut(&session_id) {
-            anyhow::ensure!(
-                record.snapshot.ownership_generation == ownership_generation,
-                "Session manager has a different ownership generation"
-            );
-            anyhow::ensure!(
-                record.reserved_run_id.is_none(),
-                "Session manager already reserved a Run"
-            );
-            let mut reserved_metadata = match &record.status {
-                ManagedSessionStatus::Ready { metadata, busy, .. } => {
-                    anyhow::ensure!(!*busy, "Session already has an active Run");
-                    anyhow::ensure!(
-                        metadata.lifecycle_status == "online",
-                        "Session is not online for a new Run"
-                    );
-                    metadata.clone()
-                }
-                ManagedSessionStatus::Cold { metadata } => {
-                    anyhow::ensure!(
-                        metadata.lifecycle_status == "online",
-                        "Session is not online for a new Run"
-                    );
-                    anyhow::ensure!(
-                        metadata.runtime_id == self.runtime_id
-                            && metadata.ownership_generation == ownership_generation,
-                        "cold Session metadata does not match claimed generation"
-                    );
-                    metadata.clone()
-                }
-                ManagedSessionStatus::Starting => {
-                    anyhow::bail!("Session supervisor is already starting")
-                }
-                ManagedSessionStatus::Blocked { reason, .. } => {
-                    anyhow::bail!("Session supervisor is blocked: {reason}")
-                }
+        if let Some(record) = records.get(&session_id) {
+            // 活动冲突只认真实活动执行（busy/Starting）；reserved 保留态由
+            // 复用分支的 already-reserved 检查处理（不是异常派发）。
+            let active_conflict = match &record.status {
+                ManagedSessionStatus::Ready { busy: true, .. } => true,
+                ManagedSessionStatus::Starting { .. } => true,
+                _ => false,
             };
-            reserved_metadata.idle_deadline_unix_ms = None;
-            reserved_metadata.checkpoint_reason = None;
-            reserved_metadata.checkpoint_retry_unix_ms = None;
-            reserved_metadata.hub_checkpoint_attempt_id = None;
-            persist_session_supervisor_metadata_sync(&self.work_root, &reserved_metadata)?;
-            match &mut record.status {
-                ManagedSessionStatus::Ready { metadata, .. }
-                | ManagedSessionStatus::Cold { metadata } => *metadata = reserved_metadata,
-                _ => unreachable!("validated Session state changed while locked"),
+            if active_conflict {
+                // 异常派发：本地有真实活动执行。绝不接管/清理——返回错误，
+                // 调用方（claim_next）用本地 record 的 reserved_run_id 作为
+                // incumbent 调用 reject_claimed_run。
+                return Err(anyhow::anyhow!(
+                    "session {} has an active local run; claim is an anomalous dispatch, rejecting via reject_claimed_run",
+                    session_id
+                ));
             }
-            record.reserved_run_id = Some(claim.run.id);
-            self.idle_deadlines.lock().unwrap().remove(&session_id);
-            return Ok(());
+            if record.snapshot.ownership_generation != ownership_generation {
+                // 空闲 + 版本不同：正常恢复（崩溃/接管），替换 record 走新建分支。
+                info!(
+                    %session_id,
+                    old_generation = record.snapshot.ownership_generation,
+                    new_generation = ownership_generation,
+                    "replacing idle local Session record for the claimed generation"
+                );
+                records.remove(&session_id);
+                self.idle_deadlines.lock().unwrap().remove(&session_id);
+                self.checkpoint_intents.lock().unwrap().remove(&session_id);
+                self.checkpoint_attempts.lock().unwrap().remove(&session_id);
+                self.checkpoint_retries.lock().unwrap().remove(&session_id);
+            } else {
+                let record = records.get_mut(&session_id).unwrap();
+                anyhow::ensure!(
+                    record.reserved_run_id.is_none(),
+                    "Session manager already reserved a Run"
+                );
+                let mut reserved_metadata = match &record.status {
+                    ManagedSessionStatus::Ready { metadata, busy, .. } => {
+                        anyhow::ensure!(!*busy, "Session already has an active Run");
+                        anyhow::ensure!(
+                            metadata.lifecycle_status == "online",
+                            "Session is not online for a new Run"
+                        );
+                        metadata.clone()
+                    }
+                    ManagedSessionStatus::Cold { metadata } => {
+                        anyhow::ensure!(
+                            metadata.lifecycle_status == "online",
+                            "Session is not online for a new Run"
+                        );
+                        anyhow::ensure!(
+                            metadata.runtime_id == self.runtime_id
+                                && metadata.ownership_generation == ownership_generation,
+                            "cold Session metadata does not match claimed generation"
+                        );
+                        metadata.clone()
+                    }
+                    ManagedSessionStatus::Starting => {
+                        anyhow::bail!("Session supervisor is already starting")
+                    }
+                    ManagedSessionStatus::Blocked { reason, .. } => {
+                        anyhow::bail!("Session supervisor is blocked: {reason}")
+                    }
+                };
+                reserved_metadata.idle_deadline_unix_ms = None;
+                reserved_metadata.checkpoint_reason = None;
+                reserved_metadata.checkpoint_retry_unix_ms = None;
+                reserved_metadata.hub_checkpoint_attempt_id = None;
+                persist_session_supervisor_metadata_sync(&self.work_root, &reserved_metadata)?;
+                match &mut record.status {
+                    ManagedSessionStatus::Ready { metadata, .. }
+                    | ManagedSessionStatus::Cold { metadata } => *metadata = reserved_metadata,
+                    _ => unreachable!("validated Session state changed while locked"),
+                }
+                record.reserved_run_id = Some(claim.run.id);
+                self.idle_deadlines.lock().unwrap().remove(&session_id);
+                return Ok(());
+            }
         }
         anyhow::ensure!(
             records.len() < self.max_online_sessions,
@@ -5219,9 +5911,10 @@ impl SessionSupervisorManager {
                                     .to_string()
                                     .contains("Pi Session recovery file was not found") =>
                         {
-                            // The local Pi session directory is gone (for
-                            // example after runtime GC); start fresh instead
-                            // of failing the whole Run.
+                            // 本地无该会话的 Pi 会话文件（恢复重建应已在
+                            // restore 阶段完成）；这里保持旧语义：空启动。
+                            // 若重建失败，Run 以普通错误失败，restoring 场景
+                            // 由 Hub 转入 recovery_failed。
                             Ok(None)
                         }
                         Err(error) => Err(error),
@@ -5544,6 +6237,7 @@ impl SessionSupervisorManager {
             .run
             .hub_session_id
             .context("claimed Run is missing its Hub Session id")?;
+        let run_id = claim.run.id;
         let ownership_generation = claim
             .run
             .session_ownership_generation
@@ -5558,7 +6252,9 @@ impl SessionSupervisorManager {
                     reserved_run_id == claim.run.id,
                     "Session is reserved for a different Run"
                 );
-                record.reserved_run_id = None;
+                // 保留 reserved_run_id 作为"当前执行 Run"标记：旧 worker 的收尾
+                // 与 Hub 重派后的接管都依赖它校验 record 归属，防止旧 worker
+                // 收尾误改/误杀新 record。run 正常结束或失败后由收尾清空。
             }
             match &mut record.status {
                 ManagedSessionStatus::Ready {
@@ -5593,12 +6289,20 @@ impl SessionSupervisorManager {
         let proxy_to_drop = {
             let mut records = self.records.lock().unwrap();
             let mut proxy_to_drop = None;
-            if let Some(record) = records.get_mut(&session_id) {
+            // 仅当 record 仍属于本 Run（reserved_run_id 标记）才回写状态/停机；
+            // Hub 重派接管后 record 已被替换，旧 worker 收尾不得触碰新 record。
+            let owns_record = records.get(&session_id).is_some_and(|record| {
+                record.reserved_run_id == Some(run_id)
+                    && record.snapshot.ownership_generation == ownership_generation
+            });
+            if owns_record {
                 if result.is_ok() {
-                    if let ManagedSessionStatus::Ready { busy, .. } = &mut record.status {
-                        *busy = false;
-                    }
+                    // 成功：保留 reserved_run_id 与 busy 直到 worker 外层 finalizer
+                    //（update_native_session_id / finish_claimed_run 之后）统一清理，
+                    // 保证这些收尾步骤仍能按 run 归属校验。
                 } else {
+                    let record = records.get_mut(&session_id).unwrap();
+                    record.reserved_run_id = None;
                     supervisor.shutdown();
                     proxy_to_drop = record.model_proxy.take();
                     record.status = ManagedSessionStatus::Blocked {
@@ -5614,10 +6318,34 @@ impl SessionSupervisorManager {
             proxy_to_drop
         };
         drop(proxy_to_drop);
-        if result.is_ok() {
-            self.arm_idle_deadline(session_id, ownership_generation);
-        }
         result
+    }
+
+    /// 任务成功收尾 finalizer（worker 外层在 Hub 终态确认后调用）：
+    /// 校验 record 仍属于本 run，然后清 busy/标记并设置会话级空闲定时器。
+    fn finalize_run(
+        &self,
+        session_id: Uuid,
+        run_id: Uuid,
+        ownership_generation: i64,
+    ) -> anyhow::Result<()> {
+        let mut records = self.records.lock().unwrap();
+        let Some(record) = records.get_mut(&session_id) else {
+            return Ok(());
+        };
+        if record.reserved_run_id != Some(run_id)
+            || record.snapshot.ownership_generation != ownership_generation
+        {
+            // record 已被替换（重派/接管）或不属于本 run：不动。
+            return Ok(());
+        }
+        record.reserved_run_id = None;
+        if let ManagedSessionStatus::Ready { busy, .. } = &mut record.status {
+            *busy = false;
+        }
+        drop(records);
+        self.arm_idle_deadline(session_id, ownership_generation);
+        Ok(())
     }
 
     fn mark_blocked(&self, session_id: Uuid, reason: String) {
@@ -5642,12 +6370,67 @@ impl SessionSupervisorManager {
         drop(proxy_to_drop);
     }
 
-    fn cancel_session(&self, session_id: Uuid, reason: String) {
+    /// 上报持有的会话与本地 run token（WebSocket 10 秒周期）。
+    /// run_id 为 None 表示无活动 run（空闲 record）；abandon 对账仍要清理这类残留。
+    fn owned_session_reports(&self) -> Vec<(Uuid, Option<Uuid>)> {
+        self.records
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(session_id, record)| (*session_id, record.reserved_run_id))
+            .collect()
+    }
+
+    /// 当前 record 是否仍属于给定 Run（worker 收尾 fence：被 force-stop 或
+    /// 重派移除后返回 false，旧 worker 不得再向 Hub 写入）。
+    fn is_current_run(&self, session_id: Uuid, run_id: Uuid) -> bool {
+        let records = self.records.lock().unwrap();
+        matches!(records.get(&session_id), Some(record) if record.reserved_run_id == Some(run_id))
+    }
+
+    /// 强制停止/抛弃接管：从 records 移除并 shutdown（杀 Pi），不删除本地
+    /// 工作区目录（由调用方上传快照成功后清理）。
+    /// run_id 为 None 时仅按会话存在性移除（abandon 无活动 run 的残留 record）；
+    /// 返回 record 是否被移除（fence 匹配）。移除后无论 supervisor 是否存在
+    /// （Starting/Cold/Blocked 无 supervisor）都算接管成功，调用方继续清理。
+    fn force_stop_session(&self, session_id: Uuid, run_id: Option<Uuid>) -> bool {
+        let (supervisor, proxy) = {
+            let mut records = self.records.lock().unwrap();
+            let Some(record) = records.get_mut(&session_id) else {
+                return false;
+            };
+            if let Some(expected) = run_id {
+                if record.reserved_run_id != Some(expected) {
+                    return false;
+                }
+            }
+            let supervisor = match &record.status {
+                ManagedSessionStatus::Ready { supervisor, .. } => Some(Arc::clone(supervisor)),
+                _ => None,
+            };
+            let proxy = record.model_proxy.take();
+            records.remove(&session_id);
+            (supervisor, proxy)
+        };
+        if let Some(ref supervisor) = supervisor {
+            supervisor.shutdown();
+        }
+        drop(proxy);
+        true
+    }
+
+    /// 取消会话：仅当 record 仍属于给定 Run（reserved_run_id 标记）时才生效。
+    /// 旧 worker 失败收尾调用它；若会话已被 Hub 重派接管（record 已替换），
+    /// 不得触碰新 record（不 shutdown 新 pi、不 Blocked 新状态）。
+    fn cancel_session(&self, session_id: Uuid, run_id: Uuid, reason: String) {
         let (supervisor, proxy) = {
             let mut records = self.records.lock().unwrap();
             let Some(record) = records.get_mut(&session_id) else {
                 return;
             };
+            if record.reserved_run_id != Some(run_id) {
+                return;
+            }
             let supervisor = match &record.status {
                 ManagedSessionStatus::Ready { supervisor, .. } => Some(Arc::clone(supervisor)),
                 _ => None,
@@ -5670,6 +6453,34 @@ impl SessionSupervisorManager {
             supervisor.shutdown();
         }
         drop(proxy);
+    }
+
+    /// 仅当本地 record 仍属于给定 Run（reserved_run_id 标记）时移除它并停掉
+    /// 旧 supervisor。返回是否真的移除：Hub 重派接管后 record 已被替换，
+    /// 返回 false（调用方不得再 fail/release 影响新 Run）。
+    fn forget_fenced_run(&self, session_id: Uuid, run_id: Uuid) -> bool {
+        let stale = {
+            let mut records = self.records.lock().unwrap();
+            let Some(record) = records.get(&session_id) else {
+                return false;
+            };
+            if record.reserved_run_id != Some(run_id) {
+                return false;
+            }
+            records.remove(&session_id)
+        };
+        if let Some(ManagedSessionRecord {
+            status: ManagedSessionStatus::Ready { supervisor, .. },
+            ..
+        }) = stale
+        {
+            supervisor.shutdown();
+        }
+        self.idle_deadlines.lock().unwrap().remove(&session_id);
+        self.checkpoint_intents.lock().unwrap().remove(&session_id);
+        self.checkpoint_attempts.lock().unwrap().remove(&session_id);
+        self.checkpoint_retries.lock().unwrap().remove(&session_id);
+        true
     }
 
     fn forget_fenced_session(&self, session_id: Uuid) {
@@ -6190,6 +7001,18 @@ impl SessionSupervisorManager {
         drop(records);
         self.arm_idle_deadline(session_id, claim.run.session_ownership_generation.unwrap());
         Ok(())
+    }
+
+    /// 活动冲突时取本地旧任务 id（作为 reject 的 incumbent）；无活动执行返回 None。
+    fn incumbent_run_id_for(&self, claim: &ClaimRunResponse) -> Option<Uuid> {
+        let session_id = claim.run.hub_session_id?;
+        let records = self.records.lock().unwrap();
+        let record = records.get(&session_id)?;
+        match &record.status {
+            ManagedSessionStatus::Ready { busy: true, .. }
+            | ManagedSessionStatus::Starting { .. } => record.reserved_run_id,
+            _ => None,
+        }
     }
 
     fn available_new_session_slots(&self) -> usize {
@@ -10792,33 +11615,22 @@ mod tests {
         let archive = temp.path().join("captured.tar.zst");
         std::fs::write(&archive, &bytes).unwrap();
         let restored = temp.path().join("captured-restore");
-        session_bundle::restore_session_bundle(
+        session_bundle::restore_session_workspace_only(
             &archive,
             &checksum,
             bytes.len() as u64,
             session_id,
             0,
             &restored,
+            false,
         )
         .unwrap();
         assert_eq!(
             std::fs::read_to_string(restored.join("workspace/result.txt")).unwrap(),
             "saved workspace\n"
         );
-        let recovered =
-            pi_driver::discover_session_file(&restored.join("engine-state"), native_session_id)
-                .unwrap();
-        assert_eq!(
-            recovered.file_name().unwrap().to_string_lossy(),
-            "pi-session.jsonl"
-        );
-        assert!(!restored.join("engine-state/.pi").exists());
-        assert!(!restored.join("engine-state/skill-exec").exists());
-        assert!(!restored
-            .join(format!(
-                "engine-state/sessions/decoy-{native_session_id}.jsonl"
-            ))
-            .exists());
+        // Bundle 只含工作区快照：不恢复 engine-state / Pi 会话树。
+        assert!(!restored.join("engine-state").exists());
         hub.abort();
     }
 
@@ -10879,31 +11691,59 @@ mod tests {
         let artifact =
             session_bundle::create_session_bundle(&session_bundle::SessionBundleCreateSpec {
                 session_id,
-                native_session_id: native_session_id.into(),
                 history_checkpoint: 8,
                 bundle_generation: 2,
                 ownership_generation: 3,
                 producing_engine_version: "0.103.0".into(),
                 created_at,
                 workspace: source_workspace,
-                engine_state_root: source_engine_state,
                 archive_path: temp.path().join("source/bundle.tar.zst"),
+                force_stop_snapshot: false,
             })
             .unwrap();
         let archive_bytes = Bytes::from(std::fs::read(&artifact.archive_path).unwrap());
         let archive_size = archive_bytes.len();
-        let app = Router::new().route(
-            "/api/runtime/sessions/{session_id}/bundle",
-            get(move || {
-                let archive_bytes = archive_bytes.clone();
-                async move {
-                    (
-                        [(header::CONTENT_LENGTH, archive_size.to_string())],
-                        archive_bytes,
-                    )
-                }
-            }),
-        );
+        let app = Router::new()
+            .route(
+                "/api/runtime/sessions/{session_id}/bundle",
+                get(move || {
+                    let archive_bytes = archive_bytes.clone();
+                    async move {
+                        (
+                            [(header::CONTENT_LENGTH, archive_size.to_string())],
+                            archive_bytes,
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/api/runtime/sessions/{session_id}/replay-events",
+                get(move || async move {
+                    let run_id = Uuid::new_v4();
+                    Json(vec![
+                        serde_json::json!({
+                            "seq": 1,
+                            "run_id": run_id,
+                            "hub_turn_id": null,
+                            "event_type": "message",
+                            "role": "user",
+                            "content": "恢复测试",
+                            "payload": {"source": "console"},
+                            "created_at": "2026-08-01T00:00:00.000Z",
+                        }),
+                        serde_json::json!({
+                            "seq": 2,
+                            "run_id": run_id,
+                            "hub_turn_id": null,
+                            "event_type": "message",
+                            "role": "assistant",
+                            "content": "历史回复",
+                            "payload": {"source": "pi", "stop_reason": "stop"},
+                            "created_at": "2026-08-01T00:00:01.000Z",
+                        }),
+                    ])
+                }),
+            );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let hub_addr = listener.local_addr().unwrap();
         let hub = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -10943,6 +11783,7 @@ mod tests {
                 ownership_generation: 4,
                 recovery_error: None,
                 current_bundle: Some(CurrentSessionBundleDto {
+                    kind: "checkpoint".into(),
                     generation: 2,
                     object_key: "hidden-from-runtime".into(),
                     checksum_sha256: artifact.checksum_sha256.clone(),
@@ -10986,11 +11827,10 @@ mod tests {
             "from bundle\n"
         );
         assert!(!paths.workspace.join("stale.txt").exists());
-        let restored_session =
-            pi_driver::discover_session_file(&paths.engine_state, native_session_id).unwrap();
-        assert_eq!(
-            restored_session.file_name().unwrap().to_string_lossy(),
-            "restored.jsonl"
+        // Bundle 只恢复工作区快照：engine-state（旧 Pi 会话树）不得恢复。
+        assert!(
+            !paths.engine_state.join("sessions/restored.jsonl").exists(),
+            "Bundle must not restore the old Pi session tree"
         );
         assert!(!paths.engine_state.join("sessions/other.jsonl").exists());
         assert!(!paths.engine_state.join(".pi").exists());
@@ -11008,28 +11848,7 @@ mod tests {
             Some(native_session_id)
         );
 
-        let run_env = prepare_run_env(&config.work_root, &claim, None)
-            .await
-            .unwrap();
-        let pid_file = temp.path().join("pi-restored.pid");
-        let pi_bin = write_fake_pi_wrapper(&temp, &pid_file, &["FAKE_PI_DISABLE_MODEL=1"]);
-        let mut process = pi_driver::PersistentPiRpcProcess::start(
-            pi_bin.to_str().unwrap(),
-            &run_env,
-            Some(&restored_session),
-            &pi_driver::pi_tool_allowlist(&claim.agent),
-            Duration::from_secs(2),
-            Arc::new(EngineCancellation::default()),
-            None,
-        )
-        .unwrap();
-        assert_eq!(process.native_session_id(), native_session_id);
-        assert_eq!(
-            process.execute(&claim, None).unwrap().final_status,
-            "completed"
-        );
-        drop(process);
-        assert_process_group_reaped_or_clean_up(&pid_file);
+        // workspace-only 恢复不启动旧 Bundle 的 Pi 会话（Pi jsonl 由 DB 重建）。
         hub.abort();
     }
 
@@ -11090,6 +11909,7 @@ mod tests {
                 ownership_generation: 2,
                 recovery_error: None,
                 current_bundle: Some(CurrentSessionBundleDto {
+                    kind: "checkpoint".into(),
                     generation: 1,
                     object_key: "hidden-from-runtime".into(),
                     checksum_sha256: format!(
@@ -13441,7 +14261,10 @@ mod tests {
             .split_once("Agent Hub Integration context (JSON):\n")
             .unwrap();
         let envelope: Value = serde_json::from_str(encoded).unwrap();
-        assert_eq!(envelope["tool_result"], json!({ "text": "server integration result" }));
+        assert_eq!(
+            envelope["tool_result"],
+            json!({ "text": "server integration result" })
+        );
         assert!(envelope.get("tool_results").is_none());
     }
 
@@ -15219,6 +16042,10 @@ Transfer-Encoding: chunked\r\n\
         let acknowledged_turns = Arc::new(AtomicUsize::new(0));
         let app = Router::new()
             .route(
+                "/api/runtime/keepalive",
+                post(|| async { AxumStatusCode::NO_CONTENT }),
+            )
+            .route(
                 "/api/runtime/model-proxy/v1/{*path}",
                 post({
                     let forwarded = Arc::clone(&forwarded);
@@ -15498,7 +16325,7 @@ Transfer-Encoding: chunked\r\n\
             .unwrap()
             .model_proxy = Some(proxy);
 
-        manager.cancel_session(session_id, "test cancellation".into());
+        manager.cancel_session(session_id, claim.run.id, "test cancellation".into());
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -15568,6 +16395,10 @@ done
         .unwrap();
         make_executable(&script);
         let app = Router::new()
+            .route(
+                "/api/runtime/keepalive",
+                post(|| async { AxumStatusCode::NO_CONTENT }),
+            )
             .route(
                 "/api/runtime/runs/{run_id}/events",
                 post(|| async { AxumStatusCode::OK }),
@@ -15750,6 +16581,10 @@ done
         .unwrap();
         make_executable(&script);
         let app = Router::new()
+            .route(
+                "/api/runtime/keepalive",
+                post(|| async { AxumStatusCode::NO_CONTENT }),
+            )
             .route(
                 "/api/runtime/runs/{run_id}/events",
                 post(|| async { AxumStatusCode::OK }),
@@ -16492,171 +17327,273 @@ done
         }
     }
 
-    fn patch_message(seq: i64, role: &str, content: &str) -> PatchMessageDto {
-        PatchMessageDto {
-            seq,
-            role: role.into(),
-            content: Some(content.into()),
-            created_at: chrono::Utc::now(),
-        }
-    }
-
     #[test]
-    fn history_patch_injects_closed_history_and_pending_request() {
-        let mut claim = test_claim();
-        let session_id = Uuid::new_v4();
-        claim.session_context = Some(ClaimSessionContextDto {
-            session: HubSessionDto {
-                id: session_id,
-                owner_id: Uuid::new_v4(),
-                agent_id: Uuid::new_v4(),
-                agent_name: "test".into(),
-                agent_deleted_at: None,
-                title: None,
-                origin_platform_name: None,
-                origin: HubSessionOriginDto::HubNative,
-                lifecycle_status: "online".into(),
-                native_session_id: None,
-                active_turn_id: None,
-                history_checkpoint: 0,
-                configuration_fingerprint: None,
-                runtime_owner_id: None,
-                ownership_generation: 1,
-                recovery_error: None,
-                current_bundle: None,
-                created_at: chrono::Utc::now(),
-                updated_at: chrono::Utc::now(),
+    fn build_pi_session_jsonl_replays_dialogue_and_tool_history_deterministically() {
+        let ts = |secs: i64| {
+            chrono::DateTime::<chrono::Utc>::from_timestamp(1_780_000_000 + secs, 0).unwrap()
+        };
+        let run_a = Uuid::from_u128(1);
+        let run_b = Uuid::from_u128(2);
+        let native = "019fdb13-3b0c-702c-9757-4b7b10ead09e";
+        // 两个 run 交错，且 run B 复用与 run A 相同的 tool_call_id（模拟引擎
+        // 重启后 call_00 重新编号），验证 run 边界与结果 key 的 run 作用域。
+        let events = vec![
+            SessionReplayEventDto {
+                seq: 1,
+                run_id: run_a,
+                hub_turn_id: Some(Uuid::from_u128(10)),
+                event_type: "message".into(),
+                role: Some("user".into()),
+                content: Some("问题A".into()),
+                payload: json!({"source": "console"}),
+                created_at: ts(0),
             },
-            turn: HubSessionTurnDto {
-                id: Uuid::new_v4(),
-                session_id,
-                native_turn_id: None,
-                status: "pending".into(),
-                configuration_fingerprint: None,
-                ownership_generation: 1,
-                started_at: None,
-                ended_at: None,
-                created_at: chrono::Utc::now(),
-                updated_at: chrono::Utc::now(),
+            SessionReplayEventDto {
+                seq: 2,
+                run_id: run_a,
+                hub_turn_id: Some(Uuid::from_u128(10)),
+                event_type: "model_request".into(),
+                role: None,
+                content: None,
+                payload: json!({"status": "started"}),
+                created_at: ts(1),
             },
-            messages: Vec::new(),
-        });
-        let patch = vec![
-            patch_message(1, "user", "first question"),
-            patch_message(2, "assistant", "first answer"),
-            patch_message(3, "user", "second question"),
-            patch_message(4, "tool", "tool noise"),
-            patch_message(5, "user", "pending request"),
+            SessionReplayEventDto {
+                seq: 3,
+                run_id: run_a,
+                hub_turn_id: Some(Uuid::from_u128(10)),
+                event_type: "item".into(),
+                role: Some("assistant".into()),
+                content: None,
+                payload: json!({
+                    "phase": "completed",
+                    "item_type": "dynamicToolCall",
+                    "item_id": "call_00_shared|item_1",
+                    "tool": "read",
+                    "arguments": {"path": "/a"},
+                    "output": "内容A",
+                    "success": true,
+                }),
+                created_at: ts(2),
+            },
+            // run B 开始：与 run A 相同的 call id（引擎重启后重新编号）。
+            SessionReplayEventDto {
+                seq: 4,
+                run_id: run_b,
+                hub_turn_id: Some(Uuid::from_u128(20)),
+                event_type: "message".into(),
+                role: Some("user".into()),
+                content: Some("问题B".into()),
+                payload: json!({"source": "console"}),
+                created_at: ts(3),
+            },
+            SessionReplayEventDto {
+                seq: 5,
+                run_id: run_b,
+                hub_turn_id: Some(Uuid::from_u128(20)),
+                event_type: "model_request".into(),
+                role: None,
+                content: None,
+                payload: json!({"status": "started"}),
+                created_at: ts(4),
+            },
+            SessionReplayEventDto {
+                seq: 6,
+                run_id: run_b,
+                hub_turn_id: Some(Uuid::from_u128(20)),
+                event_type: "message".into(),
+                role: Some("assistant".into()),
+                content: Some("说明B".into()),
+                payload: json!({"source": "pi", "stop_reason": "toolUse"}),
+                created_at: ts(5),
+            },
+            SessionReplayEventDto {
+                seq: 7,
+                run_id: run_b,
+                hub_turn_id: Some(Uuid::from_u128(20)),
+                event_type: "item".into(),
+                role: Some("assistant".into()),
+                content: None,
+                payload: json!({
+                    "phase": "completed",
+                    "item_type": "dynamicToolCall",
+                    "item_id": "call_00_shared|item_1",
+                    "tool": "read",
+                    "arguments": {"path": "/b"},
+                    "output": "内容B",
+                    "success": false,
+                }),
+                created_at: ts(6),
+            },
         ];
-        inject_history_patch(&mut claim, &patch);
-        let context = claim.session_context.as_ref().unwrap();
-        assert_eq!(context.messages.len(), 1, "history patch prepended as one context message");
-        let prompt = context.messages[0].content.as_deref().unwrap_or("");
-        assert!(prompt.contains("first question"), "closed history included");
-        assert!(prompt.contains("first answer"), "closed reply included");
-        assert!(prompt.contains("已处理的历史对话"), "history marker present");
-        assert!(prompt.contains("pending request"), "pending request included");
-        assert!(prompt.contains("请现在处理"), "pending marker present");
-        assert!(!prompt.contains("tool noise"), "tool messages excluded");
+        let out = build_pi_session_jsonl(native, &events).unwrap();
+        let entries: Vec<Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(entries[0]["type"], "session");
+        assert_eq!(entries[0]["id"], native);
+        let messages: Vec<&Value> = entries
+            .iter()
+            .filter(|entry| entry["type"] == "message")
+            .collect();
+        // 期望顺序：userA → assistantA(toolCall) → toolResultA → userB → assistantB(text+toolCall) → toolResultB
+        assert_eq!(messages.len(), 6);
+        assert_eq!(messages[0]["message"]["role"], "user");
+        assert_eq!(messages[0]["message"]["content"][0]["text"], "问题A");
+        assert_eq!(messages[1]["message"]["role"], "assistant");
+        assert_eq!(messages[1]["message"]["content"][0]["type"], "toolCall");
+        assert_eq!(
+            messages[1]["message"]["content"][0]["id"],
+            "call_00_shared|item_1"
+        );
+        assert_eq!(messages[2]["message"]["role"], "toolResult");
+        assert_eq!(
+            messages[2]["message"]["toolCallId"],
+            "call_00_shared|item_1"
+        );
+        assert_eq!(messages[2]["message"]["content"][0]["text"], "内容A");
+        assert_eq!(messages[3]["message"]["role"], "user");
+        assert_eq!(messages[3]["message"]["content"][0]["text"], "问题B");
+        assert_eq!(messages[4]["message"]["role"], "assistant");
+        // run B 的 assistant 合并了 text + toolCall（同一模型调用输出）。
+        assert_eq!(messages[4]["message"]["content"][0]["type"], "text");
+        assert_eq!(messages[4]["message"]["content"][1]["type"], "toolCall");
+        assert_eq!(messages[4]["message"]["stopReason"], "toolUse");
+        assert_eq!(messages[5]["message"]["role"], "toolResult");
+        assert_eq!(messages[5]["message"]["content"][0]["text"], "内容B");
+        assert_eq!(messages[5]["message"]["isError"], true);
+        // run A 的 toolResult 必须是 run A 的结果（内容A），run B 的同 id 不得串入。
+        assert_eq!(messages[2]["message"]["content"][0]["text"], "内容A");
+        // 确定性：两次构建输出完全一致（id 由 seq 派生）。
+        assert_eq!(out, build_pi_session_jsonl(native, &events).unwrap());
     }
 
-    #[test]
-    fn history_patch_without_pending_is_knowledge_only() {
-        let mut claim = test_claim();
-        claim.session_context = Some(ClaimSessionContextDto {
-            session: HubSessionDto {
-                id: Uuid::new_v4(),
-                owner_id: Uuid::new_v4(),
-                agent_id: Uuid::new_v4(),
-                agent_name: "test".into(),
-                agent_deleted_at: None,
-                title: None,
-                origin_platform_name: None,
-                origin: HubSessionOriginDto::HubNative,
-                lifecycle_status: "online".into(),
-                native_session_id: None,
-                active_turn_id: None,
-                history_checkpoint: 0,
-                configuration_fingerprint: None,
-                runtime_owner_id: None,
-                ownership_generation: 1,
-                recovery_error: None,
-                current_bundle: None,
-                created_at: chrono::Utc::now(),
-                updated_at: chrono::Utc::now(),
+    #[tokio::test]
+    async fn reserve_claim_takes_over_stale_generation_and_preserves_active_same_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Arc::new(SessionSupervisorManager::new(
+            temp.path().to_path_buf(),
+            Uuid::new_v4(),
+            4,
+        ));
+        let mut first = test_claim();
+        let session_id = first.run.hub_session_id.unwrap();
+        first.run.session_ownership_generation = Some(1);
+        manager.reserve_claim(&first).unwrap();
+        assert_eq!(
+            manager
+                .records
+                .lock()
+                .unwrap()
+                .get(&session_id)
+                .unwrap()
+                .snapshot
+                .ownership_generation,
+            1
+        );
+
+        // 同 generation 且已保留 run：活动冲突（异常派发语义）→ 报错（调用方 reject）。
+        let mut same_generation = test_claim();
+        same_generation.run.hub_session_id = Some(session_id);
+        same_generation.run.session_ownership_generation = Some(1);
+        let error = manager.reserve_claim(&same_generation).unwrap_err();
+        assert!(
+            error.to_string().contains("already reserved"),
+            "same-generation double reserve must be rejected: {error}"
+        );
+
+        // 版本不同且空闲（正常恢复）：替换 record（无进程可杀、无清理需要）。
+        let mut second = test_claim();
+        second.run.hub_session_id = Some(session_id);
+        second.run.session_ownership_generation = Some(2);
+        manager.reserve_claim(&second).unwrap();
+        let records = manager.records.lock().unwrap();
+        let record = records.get(&session_id).unwrap();
+        assert_eq!(record.snapshot.ownership_generation, 2);
+        assert_eq!(
+            record.reserved_run_id,
+            Some(second.run.id),
+            "takeover must reserve the new Run"
+        );
+        assert_eq!(
+            records.len(),
+            1,
+            "takeover must not leave the stale record behind"
+        );
+    }
+
+    fn build_pi_session_jsonl_skips_results_without_calls_and_dangling_calls() {
+        let ts = |secs: i64| {
+            chrono::DateTime::<chrono::Utc>::from_timestamp(1_780_000_000 + secs, 0).unwrap()
+        };
+        let run = Uuid::from_u128(7);
+        let native = "019fdb13-3b0c-702c-9757-4b7b10ead09e";
+        // tool_request 没有对应 client_tool_result（waiting_tool 未闭合）：
+        // 不得伪造可继续语义（跳过）；有结果才输出。
+        let events = vec![
+            SessionReplayEventDto {
+                seq: 1,
+                run_id: run,
+                hub_turn_id: Some(Uuid::from_u128(30)),
+                event_type: "message".into(),
+                role: Some("user".into()),
+                content: Some("查询".into()),
+                payload: json!({}),
+                created_at: ts(0),
             },
-            turn: HubSessionTurnDto {
-                id: Uuid::new_v4(),
-                session_id: Uuid::new_v4(),
-                native_turn_id: None,
-                status: "pending".into(),
-                configuration_fingerprint: None,
-                ownership_generation: 1,
-                started_at: None,
-                ended_at: None,
-                created_at: chrono::Utc::now(),
-                updated_at: chrono::Utc::now(),
+            SessionReplayEventDto {
+                seq: 2,
+                run_id: run,
+                hub_turn_id: Some(Uuid::from_u128(30)),
+                event_type: "model_request".into(),
+                role: None,
+                content: None,
+                payload: json!({"status": "started"}),
+                created_at: ts(1),
             },
-            messages: Vec::new(),
-        });
-        let patch = vec![
-            patch_message(1, "user", "only question"),
-            patch_message(2, "assistant", "only answer"),
+            SessionReplayEventDto {
+                seq: 3,
+                run_id: run,
+                hub_turn_id: Some(Uuid::from_u128(30)),
+                event_type: "tool_request".into(),
+                role: Some("assistant".into()),
+                content: Some("Pi requested run_shelves_operation".into()),
+                payload: json!({
+                    "tool_call_id": "hub-uuid-dangling",
+                    "tool_name": "run_shelves_operation",
+                    "arguments": {"name": "part-list"},
+                }),
+                created_at: ts(2),
+            },
+            // 悬空的结果（没有对应调用/结果未闭合）：不输出。
+            SessionReplayEventDto {
+                seq: 4,
+                run_id: run,
+                hub_turn_id: Some(Uuid::from_u128(30)),
+                event_type: "client_tool_result".into(),
+                role: Some("tool".into()),
+                content: None,
+                payload: json!({
+                    "tool_call_id": "hub-uuid-other",
+                    "tool_name": "run_shelves_operation",
+                    "result": {"output": "孤悬结果", "status": "success"},
+                }),
+                created_at: ts(3),
+            },
         ];
-        inject_history_patch(&mut claim, &patch);
-        let prompt = claim
-            .session_context
-            .as_ref()
-            .unwrap()
-            .messages[0]
-            .content
-            .as_deref()
-            .unwrap_or("");
-        assert!(prompt.contains("不要重复回复"), "no pending: knowledge only");
-        assert!(!prompt.contains("请现在处理"), "no pending marker when closed");
-    }
-
-    #[test]
-    fn history_patch_empty_is_noop() {
-        let mut claim = test_claim();
-        claim.session_context = Some(ClaimSessionContextDto {
-            session: HubSessionDto {
-                id: Uuid::new_v4(),
-                owner_id: Uuid::new_v4(),
-                agent_id: Uuid::new_v4(),
-                agent_name: "test".into(),
-                agent_deleted_at: None,
-                title: None,
-                origin_platform_name: None,
-                origin: HubSessionOriginDto::HubNative,
-                lifecycle_status: "online".into(),
-                native_session_id: None,
-                active_turn_id: None,
-                history_checkpoint: 0,
-                configuration_fingerprint: None,
-                runtime_owner_id: None,
-                ownership_generation: 1,
-                recovery_error: None,
-                current_bundle: None,
-                created_at: chrono::Utc::now(),
-                updated_at: chrono::Utc::now(),
-            },
-            turn: HubSessionTurnDto {
-                id: Uuid::new_v4(),
-                session_id: Uuid::new_v4(),
-                native_turn_id: None,
-                status: "pending".into(),
-                configuration_fingerprint: None,
-                ownership_generation: 1,
-                started_at: None,
-                ended_at: None,
-                created_at: chrono::Utc::now(),
-                updated_at: chrono::Utc::now(),
-            },
-            messages: Vec::new(),
-        });
-        inject_history_patch(&mut claim, &[]);
-        assert!(claim.session_context.as_ref().unwrap().messages.is_empty());
+        let out = build_pi_session_jsonl(native, &events).unwrap();
+        let entries: Vec<Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let messages: Vec<&Value> = entries
+            .iter()
+            .filter(|entry| entry["type"] == "message")
+            .collect();
+        // 只有 user 消息；dangling toolCall 与孤悬 toolResult 都不输出。
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["message"]["role"], "user");
     }
 
     fn test_config() -> Config {

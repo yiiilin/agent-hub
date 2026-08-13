@@ -8,7 +8,8 @@
 
 当前 Runtime 使用 Pi standalone RPC。Hub 的公开 DTO 和数据库使用
 `engine_version` 表示 Runtime Engine 版本，使用 `native_session_id` 表示 Pi
-Native Session ID；Bundle 的 `native-session/` 保存 Pi recovery JSONL。精确 Pi
+Native Session ID；Bundle 只保存 `workspace/` 工作区快照（对话与工具历史由
+Hub `run_events` 在恢复时重建 Pi session JSONL）。精确 Pi
 进程、RPC、模型代理、工具和 Bundle 约束见
 [`pi-driver-spec.md`](pi-driver-spec.md)。
 
@@ -122,15 +123,13 @@ Bundle 是 streaming `tar.zst`，顶层必须且只能包含：
 
 ```text
 workspace/       # 完整 Workspace，包含隐藏文件和 .git，不按 .gitignore 过滤
-manifest.json    # 格式/Hub Session/Pi Session/history checkpoint/generations/version/size/checksum
-native-session/  # 只含 sessions/<one Pi JSONL>
+manifest.json    # 格式/Hub Session/history checkpoint/generations/version/size/checksum
 ```
 
-- 打包前停止 Pi RPC 进程，确保 JSONL 已落盘。
-- 创建端解析每个直接位于 Pi `sessions/` 下的 `.jsonl` 首行，只选择 `type=session` 且 `id` 等于 manifest native Session id 的唯一文件；文件名不参与身份判断。
-- 恢复端只接受 `native-session/`、`native-session/sessions/` 和一个直接子级 `.jsonl`，并在提交目录前验证该 JSONL header 与 manifest 匹配。
-- 排除 `.pi/agent`、`skill-exec/`、Skill Package/Runtime 压缩缓存、Hub 认证、model proxy token、Runtime Credential、logs、caches、settings、extensions、Pi binary、其他 Session JSONL 和可由 Hub 重建的配置。
-- 普通文件、目录和不会逃逸归档根的安全 symlink 可进入 Bundle；拒绝 device、socket、FIFO、路径穿越和逃逸链接。
+- Bundle 只保存工作区快照；对话与工具调用历史以 Hub `run_events` 为唯一事实源，恢复时重建 Pi session JSONL（首行 id = canonical native Session id）。
+- 恢复端只接受 `workspace/` 与 `manifest.json` 顶层；其余顶层（旧 `native-session/`、`engine-state/` 等）一律拒绝。
+- 排除 `.pi/agent`、`skill-exec/`、Skill Package/Runtime 压缩缓存、Hub 认证、model proxy token、Runtime Credential、logs、caches、settings、extensions、Pi binary、engine-state 和可由 Hub 重建的配置。
+- 普通文件、目录和不会逃逸归档根的安全 symlink 可进入 Bundle（symlink 解析结果必须留在 `workspace/` 内）；拒绝 device、socket、FIFO、路径穿越和逃逸链接。
 - Runtime 流式计算压缩 Bundle checksum、压缩大小和内容声明；恢复 Runtime 在解包前验证。Hub 不 unpack、scan、hash 或完整缓冲 Bundle。
 - 每个 Session 只保留一个成功 generation。新对象完整写入后，Hub 在校验 current ownership generation 和小型 commit metadata 后原子切换 current pointer，再删除旧对象；失败上传永不成为 current。
 - 默认压缩大小上限 10 GiB，可由管理员配置。
@@ -150,7 +149,7 @@ native-session/  # 只含 sessions/<one Pi JSONL>
 - Pi 版本固定在 Runtime image 中，并以 `engine_version` 上报。不可变版本、源码 commit、build patch、Bun baseline 和 model-data snapshot 必须一起验证。
 - Hub 不提供 Runtime Engine rollout API，Runtime 不下载或切换执行二进制。
 - 升级或回滚以完整 Runtime image 为单位。先 Drain 并等 Session current Bundle 提交、ownership 释放，再替换镜像；active Turn 不被混用版本。
-- 新镜像恢复时重新物化当前配置并 resume Bundle 中同一 Pi Session id。无法 resume 时保留原 Bundle 和只读 Hub 历史，Session 进入 `recovery_failed`，不得创建替代 native Session。
+- 新镜像恢复时重新物化当前配置、从 Bundle 恢复 Workspace 快照，并以 Hub `run_events` 重建同一 canonical native Session id 的 Pi session JSONL（对话与工具历史以 DB 为唯一事实源）。重建失败时保留原 Bundle 和只读 Hub 历史，Session 进入 `recovery_failed`，不得创建替代 native Session。
 
 ## 验收测试边界
 

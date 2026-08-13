@@ -182,10 +182,9 @@ Session 空闲 15 分钟后，Runtime 默认停止其 Pi RPC 进程并生成一�
 | 路径 | 用途 |
 | --- | --- |
 | `workspace/` | Session 的完整工作区，包括隐藏文件和 `.git` |
-| `native-session/sessions/<file>.jsonl` | 恢复同一 Native Session 的唯一 Pi JSONL |
-| `manifest.json` | Hub/Pi Session 标识、Bundle generation、Hub history checkpoint、生成时 Pi 版本，以及内容大小和校验声明 |
+| `manifest.json` | Hub Session 标识、Bundle generation、Hub history checkpoint、生成时 Pi 版本，以及内容大小和校验声明 |
 
-Runtime 按 JSONL 第一行的 `type=session` 和 `id=<native_session_id>` 选择唯一恢复文件，不依赖文件名。恢复只接受 `native-session/`、`native-session/sessions/` 和一个直接子级 `.jsonl`，并在提交恢复目录前再次验证 header 与 manifest 匹配。Bundle 不包含 `.pi/agent`、`skill-exec/`、Skill Package 或 Runtime 压缩缓存、Runtime credential、模型密钥、OAuth secret、Agent/Skill/MCP 配置、settings、extensions、日志、Pi binary 或其他 Session。Agent/Skill/model binding 文件由 Hub 在下一 Turn 前按当前配置重新生成。
+Bundle 只保存工作区快照；对话与工具调用历史以 Hub `run_events` 为唯一事实源，恢复时重建 Pi session JSONL（首行 id = canonical native Session id）。恢复端只接受 `workspace/` 与 `manifest.json` 顶层。Bundle 不包含 `.pi/agent`、`skill-exec/`、engine-state、Skill Package 或 Runtime 压缩缓存、Runtime credential、模型密钥、OAuth secret、Agent/Skill/MCP 配置、settings、extensions、日志、Pi binary 或其他 Session。Agent/Skill/model binding 文件由 Hub 在下一 Turn 前按当前配置重新生成。
 
 物理删除 Hub Skill 会请求相关在线 Session 刷新派生配置。空闲 Session 立即处理，活动 Turn 结束或被停止后处理；这只修改 `engine-state/` 中 Hub-owned 文件，不修改 `workspace/`、Bundle 或 native transcript。
 
@@ -297,9 +296,9 @@ SIGKILL 强杀，最新 Workspace 状态无法进入 Bundle。不要在部署中
 
 回滚同样是整张 Runtime 镜像切换：Drain 新节点并等 Session 排出，固定 Compose 的
 Runtime image 为之前记录的 digest，再启动并重复 health、Pi version 和 Session recovery
-smoke。回滚镜像会重新物化当前 Agent/Skill/model 配置，但必须 resume Bundle 中同一 Pi
-Session id；无法恢复时保留原 Bundle，Session 进入 `recovery_failed`，不得静默创建新
-native Session。没有 current Bundle 或仍有未完成 Turn 时，不得把镜像回滚当作数据恢复。
+smoke。回滚镜像会重新物化当前 Agent/Skill/model 配置、从 Bundle 恢复 Workspace 快照，并以
+Hub `run_events` 重建同一 canonical native Session id 的 Pi session JSONL；重建失败时
+保留原 Bundle，Session 进入 `recovery_failed`，不得静默创建新 native Session。没有 current Bundle 或仍有未完成 Turn 时，不得把镜像回滚当作数据恢复。
 
 ## Runtime drain 和删除
 

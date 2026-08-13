@@ -42,3 +42,4 @@ zstd.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+tokio-tungstenite.workspace = true

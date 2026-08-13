@@ -39,7 +39,7 @@ mod skill_exec;
 
 use skill_exec::{SkillExecBroker, SKILL_EXEC_EXTENSION_SOURCE};
 
-const PI_SESSION_DIRECTORY: &str = "sessions";
+pub(super) const PI_SESSION_DIRECTORY: &str = "sessions";
 const PI_WORKSPACE_MOUNT: &str = "/workspace";
 const PI_AGENT_STATE_MOUNT: &str = "/agent-state";
 const PI_TMP_MOUNT: &str = "/tmp";
@@ -2097,10 +2097,7 @@ struct ToolResultBrokerContext {
     stop: Arc<AtomicBool>,
 }
 
-fn run_tool_result_broker(
-    listener: TcpListener,
-    context: &ToolResultBrokerContext,
-) {
+fn run_tool_result_broker(listener: TcpListener, context: &ToolResultBrokerContext) {
     loop {
         if context.stop.load(Ordering::Acquire) {
             // stop 标志是正常关闭路径（run 停止/引擎关闭时设置），不是 bug。
@@ -2135,10 +2132,13 @@ fn handle_tool_result_connection(
     if reader.read_line(&mut line)? == 0 {
         return Ok(());
     }
-    let request: ToolResultBrokerRequest = serde_json::from_str(&line)
-        .context("parse tool result broker request")?;
+    let request: ToolResultBrokerRequest =
+        serde_json::from_str(&line).context("parse tool result broker request")?;
     if request.token != context.token {
-        write_json_line(&mut stream, &serde_json::json!({ "error": "invalid broker token" }))?;
+        write_json_line(
+            &mut stream,
+            &serde_json::json!({ "error": "invalid broker token" }),
+        )?;
         return Ok(());
     }
     let response = fetch_tool_result(&request);
@@ -2261,7 +2261,10 @@ async fn fetch_tool_result_file(
     })
 }
 
-fn write_json_line(stream: &mut std::net::TcpStream, value: &serde_json::Value) -> anyhow::Result<()> {
+fn write_json_line(
+    stream: &mut std::net::TcpStream,
+    value: &serde_json::Value,
+) -> anyhow::Result<()> {
     use std::io::Write;
     let mut encoded = serde_json::to_string(value)?;
     encoded.push('\n');

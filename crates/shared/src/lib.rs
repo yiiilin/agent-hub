@@ -206,6 +206,8 @@ pub enum HubSessionOriginDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CurrentSessionBundleDto {
+    /// bundle 来源：checkpoint（常规快照）| force_stop（强制停止快照）。
+    pub kind: String,
     pub generation: i64,
     pub object_key: String,
     pub checksum_sha256: String,
@@ -1879,11 +1881,7 @@ pub struct CreateAgentRequest {
 }
 
 pub(crate) fn default_agent_endpoint_exposure() -> Vec<String> {
-    vec![
-        "console".into(),
-        "integration".into(),
-        "automation".into(),
-    ]
+    vec!["console".into(), "integration".into(), "automation".into()]
 }
 
 fn legacy_hub_proxy_model_policy() -> Value {
@@ -2472,6 +2470,78 @@ pub struct CompleteRunRequest {
     pub work_dir_ref: Option<String>,
 }
 
+/// 防御：异常派发任务的拒绝请求（runtime 领取时发现活动冲突后调用）。
+/// `incumbent_run_id` = 被替代的旧任务 A（可选；无法提供时走 3b 兜底）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RejectClaimedRunRequest {
+    pub incumbent_run_id: Option<Uuid>,
+}
+
+/// 强制停止（硬停止）请求：request_id 必填（同会话同 key 幂等，SDK/UI 每次
+/// 生成并原样重试）；expected_generation 可选 CAS（不匹配 → 409）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForceStopRequest {
+    pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_generation: Option<i64>,
+}
+
+/// 强制停止操作（202 + 可观察资源；同 request_id 查询同一 operation）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForceStopOperationDto {
+    pub operation_id: Uuid,
+    pub session_id: Uuid,
+    pub run_id: Uuid,
+    pub request_id: String,
+    pub target_runtime_id: Option<Uuid>,
+    pub state: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub snapshot_uploaded_at: Option<DateTime<Utc>>,
+}
+
+/// runtime 命令投递 payload（force_stop）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeForceStopPayload {
+    pub command_id: Uuid,
+    pub run_id: Uuid,
+    pub session_id: Uuid,
+    pub prior_generation: i64,
+    pub new_generation: i64,
+    pub stop_epoch: i64,
+    pub cleanup_mode: String,
+    pub payload_digest: String,
+}
+
+/// 命令流长轮询请求（query 参数，GET 无 body）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeCommandStreamRequest {
+    pub after_seq: i64,
+    pub limit: u32,
+    pub wait_ms: u32,
+}
+
+/// 命令流响应：seq>after_seq 的新命令（created）+ retry budget 内旧 created。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeCommandStreamResponse {
+    pub commands: Vec<RuntimeCommandDto>,
+    pub next_seq: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeCommandDto {
+    pub seq: i64,
+    pub command_id: Uuid,
+    pub r#type: String,
+    pub payload: Value,
+}
+
+/// 命令确认请求（幂等：created→acked；重复返回同结果）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeCommandAckRequest {
+    pub result: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2627,6 +2697,7 @@ mod tests {
             base_url: "https://models.example.test".into(),
             api_type: ModelUpstreamProtocol::OpenaiChatCompletions,
             allowed_model_ids: vec!["model-a".into(), "model-b".into()],
+            vision_model_id: None,
             status: ModelConnectionStatus::Enabled,
             has_api_key: true,
             created_at: now,
@@ -3178,6 +3249,7 @@ mod tests {
             agent_id: Uuid::from_u128(5),
             agent_name: "Test Agent".into(),
             agent_deleted_at: None,
+            title: None,
             origin_platform_name: Some("Trusted Platform".into()),
             origin: HubSessionOriginDto::External {
                 platform_id: Uuid::from_u128(6),
@@ -3260,6 +3332,7 @@ mod tests {
             message_kind: "message".into(),
             content: Some("Please adjust the current turn".into()),
             payload: json!({}),
+            attachments: Vec::new(),
             delivery_mode: "steer".into(),
             delivery_state: "delivered".into(),
             client_message_key: Some("request-1".into()),
@@ -3363,6 +3436,7 @@ mod tests {
                 fingerprint: None,
                 execution_configuration: None,
             }],
+            salvage_sessions: Vec::new(),
         };
         let value = serde_json::to_value(heartbeat).unwrap();
         assert_eq!(value["runtime_status"], "draining");

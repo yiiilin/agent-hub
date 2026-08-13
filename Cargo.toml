@@ -17,7 +17,8 @@ anyhow = "1"
 argon2 = "0.5"
 async-trait = "0.1"
 async-stream = "0.3"
-axum = { version = "0.8", features = ["macros", "multipart"] }
+axum = { version = "0.8", features = ["macros", "multipart", "ws"] }
+tokio-tungstenite = "0.24"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"

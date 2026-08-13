@@ -693,11 +693,7 @@ pub(crate) fn test_agent() -> AgentDto {
         instructions: "Test instructions".into(),
         visibility: "private".into(),
         public_to: Vec::new(),
-        endpoint_exposure: vec![
-            "console".into(),
-            "integration".into(),
-            "automation".into(),
-        ],
+        endpoint_exposure: vec!["console".into(), "integration".into(), "automation".into()],
         runtime_id: None,
         model_selection: None,
         model_settings: AgentModelSettings::default(),
@@ -732,11 +728,7 @@ pub(crate) fn test_update_agent_request() -> UpdateAgentRequest {
         instructions: "Test instructions".into(),
         visibility: "private".into(),
         public_to: Vec::new(),
-        endpoint_exposure: vec![
-            "console".into(),
-            "integration".into(),
-            "automation".into(),
-        ],
+        endpoint_exposure: vec!["console".into(), "integration".into(), "automation".into()],
         runtime_id: None,
         model_selection: None,
         model_settings: AgentModelSettings::default(),
@@ -1021,7 +1013,7 @@ pub(crate) async fn runtime_claim_fixture(
         .unwrap();
 
     RuntimeClaimFixture {
-        state: Arc::new(test_state_with_pool(pool)),
+        state: Arc::new(test_state_with_browser_session_auth(pool)),
         agent_id,
         model_connection_id,
         runtime_id,
@@ -1568,6 +1560,7 @@ pub(crate) fn test_state_with_pool(pool: PgPool) -> AppState {
         auth_providers: Vec::new(),
         session_issuer: Arc::new(BrowserSessionIssuer),
         run_event_bus: Arc::new(run_event_bus::InMemoryRunEventBus::default()),
+        runtime_ws: crate::runtime_ws::RuntimeWsRegistry::default(),
     }
 }
 
@@ -2266,6 +2259,7 @@ pub(crate) fn test_model_proxy_state_with_timeout(timeout: Duration) -> AppState
         auth_providers: Vec::new(),
         session_issuer: Arc::new(BrowserSessionIssuer),
         run_event_bus: Arc::new(run_event_bus::InMemoryRunEventBus::default()),
+        runtime_ws: crate::runtime_ws::RuntimeWsRegistry::default(),
     }
 }
 
@@ -2413,54 +2407,58 @@ pub(crate) async fn attachment_object_store() -> (
         "/attachment-bucket/{*key}",
         axum::routing::any(
             move |method: Method, headers: HeaderMap, Path(key): Path<String>, body: Body| {
-            let route_objects = Arc::clone(&route_objects);
-            async move {
-                match method {
-                    Method::PUT => {
-                        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
-                        route_objects.lock().unwrap().insert(key, bytes.to_vec());
-                        StatusCode::OK.into_response()
-                    }
-                    Method::GET => {
-                        let objects = route_objects.lock().unwrap();
-                        match objects.get(&key) {
-                            Some(bytes) => {
-                                let range = headers.get(header::RANGE).and_then(|value| value.to_str().ok());
-                                let slice: &[u8] = if let Some(range_text) = range {
-                                    let rest = range_text.strip_prefix("bytes=").unwrap_or("");
-                                    let mut parts = rest.split('-');
-                                    let start: usize = parts.next().unwrap_or("0").parse().unwrap_or(0);
-                                    let end: usize = parts
-                                        .next()
-                                        .and_then(|value| value.parse().ok())
-                                        .unwrap_or(bytes.len().saturating_sub(1));
-                                    let end = end.min(bytes.len().saturating_sub(1));
-                                    if start > end {
-                                        &[]
-                                    } else {
-                                        &bytes[start..=end]
-                                    }
-                                } else {
-                                    bytes.as_slice()
-                                };
-                                let mut response = Response::new(Body::from(slice.to_vec()));
-                                response.headers_mut().insert(
-                                    header::CONTENT_TYPE,
-                                    HeaderValue::from_static("application/octet-stream"),
-                                );
-                                response
-                            }
-                            None => StatusCode::NOT_FOUND.into_response(),
+                let route_objects = Arc::clone(&route_objects);
+                async move {
+                    match method {
+                        Method::PUT => {
+                            let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                            route_objects.lock().unwrap().insert(key, bytes.to_vec());
+                            StatusCode::OK.into_response()
                         }
+                        Method::GET => {
+                            let objects = route_objects.lock().unwrap();
+                            match objects.get(&key) {
+                                Some(bytes) => {
+                                    let range = headers
+                                        .get(header::RANGE)
+                                        .and_then(|value| value.to_str().ok());
+                                    let slice: &[u8] = if let Some(range_text) = range {
+                                        let rest = range_text.strip_prefix("bytes=").unwrap_or("");
+                                        let mut parts = rest.split('-');
+                                        let start: usize =
+                                            parts.next().unwrap_or("0").parse().unwrap_or(0);
+                                        let end: usize = parts
+                                            .next()
+                                            .and_then(|value| value.parse().ok())
+                                            .unwrap_or(bytes.len().saturating_sub(1));
+                                        let end = end.min(bytes.len().saturating_sub(1));
+                                        if start > end {
+                                            &[]
+                                        } else {
+                                            &bytes[start..=end]
+                                        }
+                                    } else {
+                                        bytes.as_slice()
+                                    };
+                                    let mut response = Response::new(Body::from(slice.to_vec()));
+                                    response.headers_mut().insert(
+                                        header::CONTENT_TYPE,
+                                        HeaderValue::from_static("application/octet-stream"),
+                                    );
+                                    response
+                                }
+                                None => StatusCode::NOT_FOUND.into_response(),
+                            }
+                        }
+                        Method::DELETE => {
+                            route_objects.lock().unwrap().remove(&key);
+                            StatusCode::NO_CONTENT.into_response()
+                        }
+                        _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
                     }
-                    Method::DELETE => {
-                        route_objects.lock().unwrap().remove(&key);
-                        StatusCode::NO_CONTENT.into_response()
-                    }
-                    _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
                 }
-            }
-        }),
+            },
+        ),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

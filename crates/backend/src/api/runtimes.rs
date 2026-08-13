@@ -669,6 +669,211 @@ pub(crate) async fn runtime_register(
     }))
 }
 
+pub(crate) async fn runtime_keepalive(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let token =
+        bearer_token(&headers).ok_or(ApiError::unauthorized("missing runtime credential"))?;
+    let credential_hash = sha256_hex(&token);
+    let updated = sqlx::query(
+        "UPDATE runtimes
+         SET status = CASE WHEN status = 'draining' THEN status ELSE 'online' END,
+             last_heartbeat_at = now()
+         WHERE credential_revoked_at IS NULL
+           AND (token_hash = $1 OR pending_token_hash = $1)",
+    )
+    .bind(&credential_hash)
+    .execute(&state.pool)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(ApiError::unauthorized("invalid runtime credential"));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 强制停止快照上传（force-stop 专用）：runtime 杀进程后打包上传工作区快照。
+/// 鉴权：operation 的 target_runtime 必须等于本 runtime 且 state='pending'。
+/// 上传成功提交：bundle 元数据 + operation→succeeded + 会话释放 owner 转 offline
+///（用户重发消息 → accept 创建新任务 → claim 走 bundle 恢复）。
+pub(crate) async fn runtime_upload_force_stop_bundle(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(operation_id): Path<Uuid>,
+    body: Body,
+) -> Result<StatusCode, ApiError> {
+    let runtime_id = require_runtime(&state, &headers).await?;
+    let checksum = required_header(&headers, "x-agent-hub-bundle-sha256")?;
+    validate_sha256_hex(&checksum).map_err(|_| ApiError::bad_request("invalid bundle checksum"))?;
+    let size_bytes: u64 = parse_required_header(&headers, "x-agent-hub-bundle-size")?;
+    if size_bytes == 0 || size_bytes > state.session_bundle_max_bytes {
+        return Err(ApiError::bad_request("invalid Session Bundle size"));
+    }
+    let store =
+        state
+            .session_bundle_store
+            .as_ref()
+            .cloned()
+            .ok_or(ApiError::service_unavailable(
+                "Session Bundle object storage is not configured",
+            ))?;
+    let mut tx = state.pool.begin().await?;
+    let op = sqlx::query(
+        "SELECT session_id, run_id, target_runtime_id, state
+         FROM force_stop_operation WHERE operation_id = $1 FOR UPDATE",
+    )
+    .bind(operation_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::not_found("force stop operation not found"))?;
+    let session_id: Uuid = op.get("session_id");
+    let run_id: Uuid = op.get("run_id");
+    let target: Option<Uuid> = op.get("target_runtime_id");
+    let op_state: String = op.get("state");
+    let session_ownership_generation: i64 =
+        sqlx::query_scalar("SELECT ownership_generation FROM hub_sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if target != Some(runtime_id) {
+        return Err(ApiError::forbidden(
+            "runtime does not own this force stop operation",
+        ));
+    }
+    if op_state != "pending" {
+        return Err(ApiError::conflict("force stop operation is not pending"));
+    }
+    let session_state: String =
+        sqlx::query_scalar("SELECT lifecycle_status FROM hub_sessions WHERE id = $1 FOR UPDATE")
+            .bind(session_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if session_state != "force_stopping" {
+        return Err(ApiError::conflict("session is not force stopping"));
+    }
+    let object_key = format!("sessions/{session_id}/force-stop-{operation_id}.tar.zst");
+    tx.commit().await?;
+
+    store
+        .put_stream(&object_key, size_bytes, &checksum, body.into_data_stream())
+        .await
+        .map_err(|error| {
+            tracing::warn!(%operation_id, error = %error, "force stop bundle upload failed");
+            ApiError::bad_gateway("Session Bundle upload failed")
+        })?;
+
+    // 二次事务：锁会话与 operation 重验证（pending + force_stopping + target owner），
+    // bundle generation = 当前 + 1（不覆盖既有），失败则删除已上传对象。
+    let commit_result = async {
+        let mut tx = state.pool.begin().await?;
+        let session_state: String = sqlx::query_scalar(
+            "SELECT lifecycle_status FROM hub_sessions WHERE id = $1 FOR UPDATE",
+        )
+        .bind(session_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if session_state != "force_stopping" {
+            return Err(ApiError::conflict("session is not force stopping"));
+        }
+        let op_state: String = sqlx::query_scalar(
+            "SELECT state FROM force_stop_operation WHERE operation_id = $1 FOR UPDATE",
+        )
+        .bind(operation_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if op_state != "pending" {
+            return Err(ApiError::conflict("force stop operation is not pending"));
+        }
+        // 会话行已在上面 FOR UPDATE 锁定；一并校验 target/owner/generation 未变。
+        let holder: (
+            Option<Uuid>,
+            Option<Uuid>,
+            i64,
+            Option<i64>,
+            Option<String>,
+            String,
+        ) = sqlx::query_as(
+            "SELECT runtime_owner_id, current_bundle_runtime_id,
+                        ownership_generation, current_bundle_generation,
+                        current_bundle_object_key,
+                        COALESCE(current_bundle_kind, 'checkpoint')
+                 FROM hub_sessions WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        // 旧 bundle 一律被新快照替换（用户定稿：新 bundle 上传成功即删旧 bundle）。
+        let old_object_key = holder.4.clone();
+        if holder.0 != Some(runtime_id) || holder.2 != session_ownership_generation {
+            return Err(ApiError::conflict(
+                "session ownership changed during upload",
+            ));
+        }
+        let current_generation = holder.3.unwrap_or(0);
+        let old_object_key = old_object_key.filter(|k| k != &object_key);
+        if current_generation == i64::MAX {
+            return Err(ApiError::internal("bundle generation overflow"));
+        }
+        let updated = sqlx::query(
+            "UPDATE hub_sessions
+             SET current_bundle_generation = $1,
+                 current_bundle_object_key = $2,
+                 current_bundle_checksum_sha256 = $3,
+                 current_bundle_size_bytes = $4,
+                 current_bundle_history_checkpoint = history_checkpoint,
+                 current_bundle_ownership_generation = ownership_generation,
+                 current_bundle_producing_engine_version = $5,
+                 current_bundle_created_at = now(),
+                 current_bundle_runtime_id = $6,
+                 current_bundle_kind = 'force_stop',
+                 runtime_owner_id = NULL,
+                 lifecycle_status = 'offline',
+                 updated_at = now()
+             WHERE id = $7",
+        )
+        .bind(current_generation + 1)
+        .bind(&object_key)
+        .bind(&checksum)
+        .bind(size_bytes as i64)
+        .bind(Option::<String>::None)
+        .bind(runtime_id)
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(ApiError::conflict("session state changed during upload"));
+        }
+        sqlx::query(
+            "UPDATE force_stop_operation
+             SET state = 'succeeded', snapshot_uploaded_at = now(), updated_at = now()
+             WHERE operation_id = $1",
+        )
+        .bind(operation_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE runs SET status = 'interrupted', updated_at = now() WHERE id = $1")
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok::<((), Option<String>), ApiError>(((), old_object_key))
+    }
+    .await;
+    let ((), old_object_key) = match commit_result {
+        Ok(ok) => ok,
+        Err(error) => {
+            let _ = store.delete(&object_key).await;
+            return Err(error);
+        }
+    };
+    // 新快照已生效：删除被替换的旧 force-stop 快照对象（锁内捕获的旧 key，
+    // 提交后按对象 key 前缀确认属 force-stop 再删；checkpoint 快照不动）。
+    if let Some(old_key) = old_object_key {
+        let _ = store.delete(&old_key).await;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub(crate) async fn runtime_heartbeat(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -834,6 +1039,8 @@ pub(crate) async fn runtime_heartbeat(
                           AND lifecycle_status = 'saving'
                           AND saving_reason = 'drain'
                      THEN lifecycle_status
+                     WHEN $1 = 'online' AND lifecycle_status = 'restoring'
+                     THEN lifecycle_status
                      ELSE $1
                  END,
                  saving_history_checkpoint = CASE
@@ -949,7 +1156,8 @@ pub(crate) async fn runtime_heartbeat(
             if !hub_fenced {
                 return Err(ApiError::conflict(
                     "Runtime-owned Session state has a stale owner or generation",
-                ));
+                )
+                .with_code("stale_session_generation"));
             }
         }
     }
@@ -959,6 +1167,7 @@ pub(crate) async fn runtime_heartbeat(
         "UPDATE hub_sessions
          SET runtime_owner_id = NULL,
              lifecycle_status = 'offline',
+             recovery_source = NULL,
              active_turn_id = NULL,
              ownership_generation = ownership_generation + 1
          WHERE runtime_owner_id = $1
@@ -1430,6 +1639,7 @@ pub(crate) async fn release_session_ownership_tx(
              current_bundle_history_checkpoint = NULL,
              current_bundle_ownership_generation = NULL,
              current_bundle_producing_engine_version = NULL,
+             current_bundle_kind = NULL,
              current_bundle_created_at = NULL,
              current_bundle_runtime_id = NULL,
              recovery_error = NULL
@@ -1457,12 +1667,12 @@ pub(crate) async fn release_session_ownership_tx(
          WHERE id = $1 AND runtime_owner_id = $2 AND ownership_generation = $3"
     };
     sqlx::query(release_update)
-    .bind(session_id)
-    .bind(runtime_id)
-    .bind(ownership_generation)
-    .bind(if force { 1 } else { 0 })
-    .execute(&mut **tx)
-    .await?;
+        .bind(session_id)
+        .bind(runtime_id)
+        .bind(ownership_generation)
+        .bind(if force { 1 } else { 0 })
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 
@@ -1512,9 +1722,10 @@ pub(crate) async fn runtime_begin_session_checkpoint(
     if session.get::<Option<Uuid>, _>("runtime_owner_id") != Some(runtime_id)
         || session.get::<i64, _>("ownership_generation") != req.ownership_generation
     {
-        return Err(ApiError::forbidden(
-            "runtime does not own this Session generation",
-        ));
+        return Err(
+            ApiError::forbidden("runtime does not own this Session generation")
+                .with_code("stale_session_generation"),
+        );
     }
     if session.get::<Option<Uuid>, _>("active_turn_id").is_some() {
         return Err(ApiError::conflict(
@@ -1647,9 +1858,10 @@ pub(crate) async fn runtime_fail_session_checkpoint(
     if session.get::<Option<Uuid>, _>("runtime_owner_id") != Some(runtime_id)
         || session.get::<i64, _>("ownership_generation") != req.ownership_generation
     {
-        return Err(ApiError::forbidden(
-            "runtime does not own this Session generation",
-        ));
+        return Err(
+            ApiError::forbidden("runtime does not own this Session generation")
+                .with_code("stale_session_generation"),
+        );
     }
     if session.get::<Option<Uuid>, _>("last_checkpoint_attempt_id")
         == Some(req.checkpoint_attempt_id)
@@ -1974,6 +2186,7 @@ pub(crate) async fn runtime_salvage_session_bundle(
              current_bundle_producing_engine_version = $7,
              current_bundle_created_at = $8,
              current_bundle_runtime_id = $9,
+             current_bundle_kind = 'checkpoint',
              history_checkpoint = GREATEST(history_checkpoint, $5),
              recovery_error = NULL
          WHERE id = $10",
@@ -2050,7 +2263,8 @@ pub(crate) async fn runtime_download_session_bundle(
                 current_bundle_generation, current_bundle_object_key,
                 current_bundle_checksum_sha256, current_bundle_size_bytes,
                 current_bundle_history_checkpoint,
-                current_bundle_producing_engine_version, current_bundle_created_at
+                current_bundle_producing_engine_version, current_bundle_created_at,
+                current_bundle_kind
          FROM hub_sessions WHERE id = $1",
     )
     .bind(session_id)
@@ -2097,6 +2311,14 @@ pub(crate) async fn runtime_download_session_bundle(
         header::CONTENT_LENGTH,
         row.get::<i64, _>("current_bundle_size_bytes"),
     )?;
+    let bundle_kind = row
+        .get::<Option<String>, _>("current_bundle_kind")
+        .unwrap_or_else(|| "checkpoint".to_owned());
+    insert_response_header(
+        response_headers,
+        HeaderName::from_static("x-agent-hub-bundle-kind"),
+        bundle_kind,
+    )?;
     for (name, value) in [
         (
             "x-agent-hub-bundle-generation",
@@ -2113,7 +2335,8 @@ pub(crate) async fn runtime_download_session_bundle(
         ),
         (
             "x-agent-hub-producing-engine-version",
-            row.get::<String, _>("current_bundle_producing_engine_version"),
+            row.get::<Option<String>, _>("current_bundle_producing_engine_version")
+                .unwrap_or_default(),
         ),
         (
             "x-agent-hub-bundle-created-at",
@@ -2654,7 +2877,8 @@ pub(crate) async fn commit_session_bundle_metadata_tx(
              current_bundle_producing_engine_version = $7,
              current_bundle_created_at = $8,
              current_bundle_runtime_id = $10,
-             current_bundle_checkpoint_attempt_id = $11
+             current_bundle_checkpoint_attempt_id = $11,
+             current_bundle_kind = 'checkpoint'
          WHERE id = $9
            AND runtime_owner_id = $10
            AND ownership_generation = $6
@@ -2923,6 +3147,69 @@ pub(crate) async fn runtime_claim_run(
     let run_id: Uuid = row.get("id");
     let hub_session_id: Uuid = row.get("hub_session_id");
     let hub_turn_id: Uuid = row.get("hub_turn_id");
+    let source: String = row.get("source");
+    // 1. 先锁会话行（claim 事务内），校验归属，避免终结/清理读到并发变化。
+    let locked: Option<(Option<Uuid>,)> =
+        sqlx::query_as("SELECT runtime_owner_id FROM hub_sessions WHERE id = $1 FOR UPDATE")
+            .bind(hub_session_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((current_owner,)) = locked else {
+        return Err(ApiError::conflict(
+            "session ownership changed while claiming",
+        ));
+    };
+    if current_owner.is_some() && current_owner != Some(runtime_id) {
+        return Err(ApiError::conflict(
+            "session ownership changed while claiming",
+        ));
+    }
+    // 1b. 活动 Turn 仍被 running/waiting_tool Run 引用时（例如同 Session 另一
+    //     run 正在执行），不得终结/接管：回滚并返回 NO_CONTENT（run 保持
+    //     pending，旧 Turn 保持 running），避免误杀活动执行。
+    let active_turn_claimed: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM runs AS active_runs
+             WHERE active_runs.hub_session_id = $1
+               AND active_runs.hub_turn_id = (
+                   SELECT active_turn_id FROM hub_sessions WHERE id = $1
+               )
+               AND active_runs.status IN ('running', 'waiting_tool')
+         )",
+    )
+    .bind(hub_session_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if active_turn_claimed && source != "integration:tool_result" {
+        // 事务内更早已执行 capability mismatch 标记等合法变更，不能回滚；
+        // 本分支未修改 candidate/session/run，提交后返回 NO_CONTENT。
+        tx.commit().await?;
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+    // 2. 终结旧的残留活动 turn（异常/崩溃路径，此时 active_turn_id 还是旧值），
+    //    避免旧 Run 晚到的 completion/heartbeat 造成状态冲突；绝不误标当前
+    //    待 claim 的 turn（id <> hub_turn_id），tool_result 续跑保留 active turn。
+    if source != "integration:tool_result" {
+        sqlx::query(
+            "UPDATE hub_session_turns AS old_turns
+             SET status = 'failed', ended_at = COALESCE(ended_at, now()), updated_at = now()
+             WHERE old_turns.session_id = $1
+               AND old_turns.id <> $2
+               AND old_turns.id = (SELECT active_turn_id FROM hub_sessions WHERE id = $1)
+               AND old_turns.status IN ('pending', 'starting', 'running')
+               AND NOT EXISTS (
+                   SELECT 1 FROM runs AS active_runs
+                   WHERE active_runs.hub_session_id = $1
+                     AND active_runs.hub_turn_id = old_turns.id
+                     AND active_runs.status IN ('running', 'waiting_tool')
+               )",
+        )
+        .bind(hub_session_id)
+        .bind(hub_turn_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    // 3. 会话接管（owner/gen/status），并清理 active_turn 指针（tool_result 除外）。
     let ownership_row = sqlx::query(
         "UPDATE hub_sessions
          SET runtime_owner_id = $1,
@@ -2933,6 +3220,20 @@ pub(crate) async fn runtime_claim_run(
              lifecycle_status = CASE
                  WHEN runtime_owner_id = $1 THEN lifecycle_status
                  ELSE 'restoring'
+             END,
+             recovery_source = CASE
+                 WHEN runtime_owner_id = $1 THEN recovery_source
+                 ELSE 'bundle'
+             END,
+             active_turn_id = CASE
+                 WHEN $3 = 'integration:tool_result' THEN active_turn_id
+                 WHEN EXISTS (
+                     SELECT 1 FROM runs AS active_runs
+                     WHERE active_runs.hub_session_id = $2
+                       AND active_runs.hub_turn_id = hub_sessions.active_turn_id
+                       AND active_runs.status IN ('running', 'waiting_tool')
+                 ) THEN active_turn_id
+                 ELSE NULL
              END
          WHERE id = $2
            AND (runtime_owner_id IS NULL OR runtime_owner_id = $1)
@@ -2940,6 +3241,7 @@ pub(crate) async fn runtime_claim_run(
     )
     .bind(runtime_id)
     .bind(hub_session_id)
+    .bind(&source)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(ApiError::conflict(
@@ -2998,11 +3300,7 @@ pub(crate) async fn runtime_claim_run(
         instructions: agent_row.get("instructions"),
         visibility: agent_row.get("visibility"),
         public_to: agent_row.get("public_to"),
-        endpoint_exposure: vec![
-            "console".into(),
-            "integration".into(),
-            "automation".into(),
-        ],
+        endpoint_exposure: vec!["console".into(), "integration".into(), "automation".into()],
         runtime_id: agent_row.get("a_runtime_id"),
         model_selection: Some(ModelSelectionDto {
             connection_id: agent_row.get("a_model_connection_id"),
@@ -3400,9 +3698,10 @@ pub(crate) async fn runtime_download_session_skill_package(
             "restoring" | "online"
         )
     {
-        return Err(ApiError::forbidden(
-            "runtime does not own this Session generation",
-        ));
+        return Err(
+            ApiError::forbidden("runtime does not own this Session generation")
+                .with_code("stale_session_generation"),
+        );
     }
     skill_package_download_response(
         &state,
@@ -3490,14 +3789,16 @@ pub(crate) async fn get_bundle_sync_status(
     })?;
     Ok(Json(
         rows.into_iter()
-            .map(|(runtime_id, total, pending, uploading, done, failed)| BundleSyncStatusResponse {
-                runtime_id,
-                total,
-                pending,
-                uploading,
-                done,
-                failed,
-            })
+            .map(
+                |(runtime_id, total, pending, uploading, done, failed)| BundleSyncStatusResponse {
+                    runtime_id,
+                    total,
+                    pending,
+                    uploading,
+                    done,
+                    failed,
+                },
+            )
             .collect(),
     ))
 }
@@ -3515,7 +3816,10 @@ pub(crate) async fn set_session_bundle_sync_status(
     Json(req): Json<SetBundleSyncStatusRequest>,
 ) -> Result<StatusCode, ApiError> {
     let runtime_id = require_runtime(&state, &headers).await?;
-    if !matches!(req.status.as_str(), "pending" | "uploading" | "done" | "failed") {
+    if !matches!(
+        req.status.as_str(),
+        "pending" | "uploading" | "done" | "failed"
+    ) {
         return Err(ApiError::bad_request(
             "bundle sync status must be pending/uploading/done/failed",
         ));
@@ -3535,55 +3839,106 @@ pub(crate) async fn set_session_bundle_sync_status(
         ApiError::internal("update bundle sync status failed")
     })?;
     if updated.rows_affected() != 1 {
-        return Err(ApiError::not_found(
-            "session is not owned by this runtime",
-        ));
+        return Err(ApiError::not_found("session is not owned by this runtime"));
     }
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// 会话补丁消息（恢复用）：返回该会话全部 user/assistant 消息事件（按事件序号有序）。
-/// 用途：runtime 升级/异常后引擎环境不可恢复（无 bundle、无本地 jsonl）时，
-/// 以 run_events 为权威源全量重建对话上下文——对话永不丢。
+/// 会话重建事件（恢复用）：返回该会话用于重建 Pi 会话 jsonl 的全部事件，
+/// 按事件序号有序。数据源 = run_events 的对话消息（message user/assistant）、
+/// 内置工具调用与结果（item dynamicToolCall completed，含 Pi 原始 call|item id
+/// 与完整 output）、integration 工具请求与结果（tool_request + client_tool_result，
+/// tool_call_id 为 Hub UUID）、模型元数据（model_request/usage，供 assistant
+/// 行还原 provider/model/usage）。会话历史以 DB 为唯一事实源。
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct PatchMessageDto {
+pub(crate) struct SessionReplayEventDto {
     pub(crate) seq: i64,
-    pub(crate) role: String,
+    pub(crate) run_id: Uuid,
+    pub(crate) hub_turn_id: Option<Uuid>,
+    pub(crate) event_type: String,
+    pub(crate) role: Option<String>,
     pub(crate) content: Option<String>,
+    pub(crate) payload: Value,
     pub(crate) created_at: DateTime<Utc>,
 }
 
-pub(crate) async fn get_session_patch_messages(
+pub(crate) async fn get_session_replay_events(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Path(session_id): Path<Uuid>,
-) -> Result<Json<Vec<PatchMessageDto>>, ApiError> {
-    let _runtime_id = require_runtime(&state, &headers).await?;
-    let rows: Vec<(i64, String, Option<String>, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT e.seq, e.role, e.content, e.created_at
+) -> Result<Json<Vec<SessionReplayEventDto>>, ApiError> {
+    let runtime_id = require_runtime(&state, &headers).await?;
+    let ownership_generation =
+        parse_required_header::<i64>(&headers, "x-agent-hub-ownership-generation")?;
+    validate_ownership_generation(ownership_generation)?;
+    let owned = sqlx::query(
+        "SELECT runtime_owner_id, ownership_generation FROM hub_sessions WHERE id = $1",
+    )
+    .bind(session_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    if owned.as_ref().and_then(|row| row.get("runtime_owner_id")) != Some(runtime_id)
+        || owned
+            .as_ref()
+            .and_then(|row| row.get("ownership_generation"))
+            != Some(ownership_generation)
+    {
+        return Err(
+            ApiError::forbidden("runtime does not own this Session generation")
+                .with_code("stale_session_generation"),
+        );
+    }
+    let rows: Vec<(
+        i64,
+        Uuid,
+        Option<Uuid>,
+        String,
+        Option<String>,
+        Option<String>,
+        Value,
+        DateTime<Utc>,
+    )> = sqlx::query_as(
+        "SELECT e.seq, e.run_id, r.hub_turn_id, e.event_type, e.role, e.content,
+                e.payload, e.created_at
          FROM run_events e
          JOIN runs r ON r.id = e.run_id
+         JOIN hub_sessions hs ON hs.id = r.hub_session_id
          WHERE r.hub_session_id = $1
-           AND e.event_type = 'message'
-           AND e.role IN ('user', 'assistant')
-           AND e.content IS NOT NULL AND btrim(e.content) <> ''
+           AND hs.runtime_owner_id = $2
+           AND hs.ownership_generation = $3
+           AND (
+               (e.event_type = 'message' AND e.role IN ('user', 'assistant'))
+               OR (e.event_type = 'item'
+                   AND e.payload->>'item_type' IN ('dynamicToolCall', 'commandExecution')
+                   AND e.payload->>'phase' = 'completed')
+               OR e.event_type IN ('tool_request', 'client_tool_result', 'tool_result',
+                                   'model_request', 'usage')
+           )
          ORDER BY e.seq",
     )
     .bind(session_id)
+    .bind(runtime_id)
+    .bind(ownership_generation)
     .fetch_all(&state.pool)
     .await
     .map_err(|error| {
-        tracing::warn!(%error, %session_id, "load session patch messages failed");
-        ApiError::internal("load session patch messages failed")
+        tracing::warn!(%error, %session_id, "load session replay events failed");
+        ApiError::internal("load session replay events failed")
     })?;
     Ok(Json(
         rows.into_iter()
             .map(
-                |(seq, role, content, created_at)| PatchMessageDto {
-                    seq,
-                    role,
-                    content,
-                    created_at,
+                |(seq, run_id, hub_turn_id, event_type, role, content, payload, created_at)| {
+                    SessionReplayEventDto {
+                        seq,
+                        run_id,
+                        hub_turn_id,
+                        event_type,
+                        role,
+                        content,
+                        payload,
+                        created_at,
+                    }
                 },
             )
             .collect(),
@@ -3639,6 +3994,33 @@ pub(crate) async fn runtime_append_event(
         .fetch_optional(&mut *tx)
         .await?;
         if active.is_none() {
+            let actual_run: Option<(String, i64, Option<Uuid>)> = sqlx::query_as(
+                "SELECT status, session_ownership_generation, runtime_id FROM runs WHERE id = $1",
+            )
+            .bind(run_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .ok()
+            .flatten();
+            let actual_session: Option<(Option<Uuid>, i64, String)> = sqlx::query_as(
+                "SELECT runtime_owner_id, ownership_generation, lifecycle_status
+                 FROM hub_sessions WHERE id = $1",
+            )
+            .bind(session_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .ok()
+            .flatten();
+            tracing::warn!(
+                %run_id,
+                %session_id,
+                %runtime_id,
+                expected_generation = req.ownership_generation,
+                run = ?actual_run,
+                session = ?actual_session,
+                event_type = %event_type,
+                "Run is not active for streaming event append"
+            );
             return Err(ApiError::conflict("Run is not active for event append"));
         }
         tx.commit().await?;
@@ -4243,6 +4625,223 @@ pub(crate) async fn runtime_finalize_tool_requests(
     Ok(Json(run))
 }
 
+/// 防御（报错防御方案）：runtime 领取任务时发现该会话有活动冲突（异常派发），
+/// 调用本端点把冲突任务拒绝掉——只动 B，绝不动被替代任务 A / 回合 / 会话状态。
+/// 3a 主路径（A 可验证）：A≠B 且 A 仍是当前版本号活动任务 →
+///   不同回合：B failed + 事件 + B 回合终态 + B 的 queued 消息迁移（下一 run 领取，仅一次）；
+///   同回合（异常复用）：B failed + 事件，B 的 steer 插话保持归 A，next_turn queued 迁移。
+/// 3b 兜底（A 无法验证）：只 B failed + 幂等事件，不动共享回合/session/message，
+///   B 的 queued 消息迁移（不滞留，事件即对账记录）。
+/// 幂等：B 已终态 → 返回现有状态（不 409）。
+pub(crate) async fn runtime_reject_claimed_run(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(run_id): Path<Uuid>,
+    Json(req): Json<RuntimeSessionWriteRequest<RejectClaimedRunRequest>>,
+) -> Result<Json<RunDto>, ApiError> {
+    validate_ownership_generation(req.ownership_generation)?;
+    reap_stale_runtimes(&state.pool).await?;
+    let runtime_id = require_runtime(&state, &headers).await?;
+    let mut tx = state.pool.begin().await?;
+    let owned_session_id =
+        lock_owned_session_for_run_tx(&mut tx, run_id, runtime_id, req.ownership_generation)
+            .await?;
+    let current = sqlx::query(
+        "SELECT runs.status, runs.hub_session_id, runs.hub_turn_id
+         FROM runs
+         WHERE runs.id = $1 AND runs.runtime_id = $2
+           AND runs.session_ownership_generation = $3
+           AND runs.hub_session_id = $4
+         FOR UPDATE OF runs",
+    )
+    .bind(run_id)
+    .bind(runtime_id)
+    .bind(req.ownership_generation)
+    .bind(owned_session_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(
+        ApiError::forbidden("runtime does not own an active run")
+            .with_code("stale_session_generation"),
+    )?;
+    let current_status: String = current.get("status");
+    let hub_session_id: Uuid = current.get("hub_session_id");
+    let hub_turn_id: Uuid = current.get("hub_turn_id");
+    if current_status != "running" {
+        // 幂等：B 已终态（异常派发早已被处理）→ 返回现有状态。
+        let run = load_run_public_tx(&mut tx, run_id).await?;
+        tx.commit().await?;
+        return Ok(Json(run));
+    }
+
+    // A 可验证性（3a 主路径 vs 3b 兜底）。
+    let incumbent: Option<(Uuid, Uuid, String)> = match req.payload.incumbent_run_id {
+        Some(incumbent_run_id) if incumbent_run_id != run_id => {
+            sqlx::query_as(
+                "SELECT id, hub_turn_id, status FROM runs
+             WHERE id = $1 AND hub_session_id = $2
+             FOR UPDATE",
+            )
+            .bind(incumbent_run_id)
+            .bind(hub_session_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        }
+        _ => None,
+    };
+    let same_turn = incumbent
+        .as_ref()
+        .is_some_and(|(_, incumbent_turn, _)| *incumbent_turn == hub_turn_id);
+
+    // B 失败 + 幂等事件（3a 与 3b 共用）。
+    sqlx::query("UPDATE runs SET status = 'failed', updated_at = now() WHERE id = $1")
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+    insert_run_event_tx(
+        &mut tx,
+        run_id,
+        "status".into(),
+        None,
+        Some("failed".into()),
+        json!({
+            "status": "failed",
+            "reason": if same_turn {
+                "run was rejected: it illegally reused the active Turn of its incumbent"
+            } else {
+                "run was rejected: session already had an active run (anomalous dispatch)"
+            }
+        }),
+    )
+    .await?;
+
+    if let Some((incumbent_run_id, incumbent_turn_id, incumbent_status)) = incumbent {
+        // 3a 主路径：A 仍是活动任务（running/waiting_tool）。
+        if matches!(incumbent_status.as_str(), "running" | "waiting_tool") {
+            if same_turn {
+                // 同回合（异常复用 A 的回合）：B 的回合共享 A——不终态回合；
+                // B 的 steer 插话归 A（run_id 更新到 A，回合不变，A 继续处理）；
+                // B 的 next_turn queued 迁移到 A。
+                sqlx::query(
+                    "UPDATE hub_session_messages
+                     SET run_id = $2
+                     WHERE session_id = $1 AND run_id = $3
+                       AND delivery_mode = 'steer' AND delivery_state = 'queued'",
+                )
+                .bind(hub_session_id)
+                .bind(incumbent_run_id)
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "UPDATE hub_session_messages
+                     SET delivery_state = 'queued', turn_id = $2, run_id = $3
+                     WHERE session_id = $1 AND run_id = $4
+                       AND delivery_mode = 'next_turn' AND delivery_state = 'queued'",
+                )
+                .bind(hub_session_id)
+                .bind(incumbent_turn_id)
+                .bind(incumbent_run_id)
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await?;
+            } else {
+                // 不同回合：终态 B 的回合，B 的 queued 消息迁移到下一 run（仅一次）。
+                sqlx::query(
+                    "UPDATE hub_session_turns
+                     SET status = 'failed', ended_at = COALESCE(ended_at, now()), updated_at = now()
+                     WHERE id = $1 AND session_id = $2",
+                )
+                .bind(hub_turn_id)
+                .bind(hub_session_id)
+                .execute(&mut *tx)
+                .await?;
+                // next_turn 模式先转为 steer，统一走迁移路径（迁移后转回 next_turn）。
+                sqlx::query(
+                    "UPDATE hub_session_messages
+                     SET delivery_mode = 'steer', expected_native_turn_id = 'reject-migration'
+                     WHERE session_id = $1 AND run_id = $2
+                       AND delivery_mode = 'next_turn' AND delivery_state = 'queued'",
+                )
+                .bind(hub_session_id)
+                .bind(run_id)
+                .execute(&mut *tx)
+                .await?;
+                move_queued_steers_to_next_turn_tx(
+                    &mut tx,
+                    hub_session_id,
+                    run_id,
+                    hub_turn_id,
+                    req.ownership_generation,
+                )
+                .await?;
+            }
+            let _ = incumbent_run_id;
+        } else {
+            // A 已终态：B 的回合终态 + 消息迁移（B 不再滞留）。
+            sqlx::query(
+                "UPDATE hub_session_turns
+                 SET status = 'failed', ended_at = COALESCE(ended_at, now()), updated_at = now()
+                 WHERE id = $1 AND session_id = $2",
+            )
+            .bind(hub_turn_id)
+            .bind(hub_session_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE hub_session_messages
+                 SET delivery_mode = 'steer', expected_native_turn_id = 'reject-migration'
+                 WHERE session_id = $1 AND run_id = $2
+                   AND delivery_mode = 'next_turn' AND delivery_state = 'queued'",
+            )
+            .bind(hub_session_id)
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
+            move_queued_steers_to_next_turn_tx(
+                &mut tx,
+                hub_session_id,
+                run_id,
+                hub_turn_id,
+                req.ownership_generation,
+            )
+            .await?;
+        }
+    } else {
+        // 3b 兜底（A 无法验证）：只失败 B + 消息迁移（事件即对账记录）。
+        sqlx::query(
+            "UPDATE hub_session_turns
+             SET status = 'failed', ended_at = COALESCE(ended_at, now()), updated_at = now()
+             WHERE id = $1 AND session_id = $2",
+        )
+        .bind(hub_turn_id)
+        .bind(hub_session_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE hub_session_messages
+             SET delivery_mode = 'steer', expected_native_turn_id = 'reject-migration'
+             WHERE session_id = $1 AND run_id = $2
+               AND delivery_mode = 'next_turn' AND delivery_state = 'queued'",
+        )
+        .bind(hub_session_id)
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+        move_queued_steers_to_next_turn_tx(
+            &mut tx,
+            hub_session_id,
+            run_id,
+            hub_turn_id,
+            req.ownership_generation,
+        )
+        .await?;
+    }
+    let run = load_run_public_tx(&mut tx, run_id).await?;
+    tx.commit().await?;
+    Ok(Json(run))
+}
+
 pub(crate) async fn runtime_complete_run(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -4279,7 +4878,10 @@ pub(crate) async fn runtime_complete_run(
     .bind(owned_session_id)
     .fetch_optional(&mut *tx)
     .await?
-    .ok_or(ApiError::forbidden("runtime does not own an active run"))?;
+    .ok_or(
+        ApiError::forbidden("runtime does not own an active run")
+            .with_code("stale_session_generation"),
+    )?;
     let current_status: String = current.get("status");
     let current_native_session_id: Option<String> = current.get("native_session_id");
     let current_work_dir_ref: Option<String> = current.get("work_dir_ref");
@@ -4397,6 +4999,10 @@ pub(crate) async fn runtime_complete_run(
                  WHEN $5 = 'failed' AND sessions.lifecycle_status = 'restoring'
                  THEN 'Session Bundle restore failed on its assigned Runtime'
                  ELSE sessions.recovery_error
+             END,
+             recovery_source = CASE
+                 WHEN sessions.lifecycle_status = 'restoring' THEN NULL
+                 ELSE sessions.recovery_source
              END,
              saving_history_checkpoint = CASE
                  WHEN $5 = 'failed' AND sessions.lifecycle_status = 'restoring' THEN NULL
@@ -5529,6 +6135,7 @@ pub(crate) async fn reap_stale_runtimes(pool: &PgPool) -> Result<(), ApiError> {
                  current_bundle_checksum_sha256 = NULL,
                  current_bundle_size_bytes = NULL,
                  current_bundle_history_checkpoint = NULL,
+                 current_bundle_kind = NULL,
                  current_bundle_ownership_generation = NULL,
                  current_bundle_producing_engine_version = NULL,
                  current_bundle_created_at = NULL,
@@ -6712,6 +7319,7 @@ mod tests {
             "UPDATE hub_sessions
              SET lifecycle_status = 'online',
                  current_bundle_generation = 1,
+                 current_bundle_kind = 'checkpoint',
                  current_bundle_object_key = 'sessions/bundle-1.tar.zst',
                  current_bundle_checksum_sha256 = 'sha256:deadbeef',
                  current_bundle_size_bytes = 128,
@@ -6766,7 +7374,11 @@ mod tests {
         .fetch_one(&fixture.state.pool)
         .await
         .unwrap();
-        assert_eq!(bundle_state, (None, None, None), "force release must clear bundle state");
+        assert_eq!(
+            bundle_state,
+            (None, None, None),
+            "force release must clear bundle state"
+        );
 
         // 新 run 应能被正常 claim（unreplayable 检查不再阻塞）。
         let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM runs WHERE id = $1")
@@ -6799,7 +7411,10 @@ mod tests {
         .await
         .unwrap();
         let reclaimed = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-        assert_eq!(reclaimed.run.id, next_run, "session must be claimable after force release");
+        assert_eq!(
+            reclaimed.run.id, next_run,
+            "session must be claimable after force release"
+        );
     }
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
@@ -6991,12 +7606,11 @@ mod tests {
         reap_stale_runtimes(&pool).await.unwrap();
 
         for (runtime_id, label, expect_reaped) in runtime_ids {
-            let status: String =
-                sqlx::query_scalar("SELECT status FROM runtimes WHERE id = $1")
-                    .bind(runtime_id)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
+            let status: String = sqlx::query_scalar("SELECT status FROM runtimes WHERE id = $1")
+                .bind(runtime_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
             assert_eq!(
                 status,
                 if expect_reaped { "offline" } else { "online" },
@@ -7032,7 +7646,9 @@ mod tests {
             .unwrap();
         }
         let admin_token = create_super_admin_session(&fixture.state.pool).await;
-        let admin_state = Arc::new(test_state_with_browser_session_auth(fixture.state.pool.clone()));
+        let admin_state = Arc::new(test_state_with_browser_session_auth(
+            fixture.state.pool.clone(),
+        ));
         let response = get_bundle_sync_status(State(admin_state), session_headers(&admin_token))
             .await
             .unwrap()
@@ -7044,47 +7660,6 @@ mod tests {
         assert_eq!(response[0].uploading, 1);
         assert_eq!(response[0].done, 1);
         assert_eq!(response[0].failed, 0);
-    }
-    #[sqlx::test(migrations = "./migrations")]
-    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
-    async fn session_patch_messages_returns_ordered_user_assistant_events(pool: PgPool) {
-        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-        let mut tx = fixture.state.pool.begin().await.unwrap();
-        for (content, role) in [
-            ("first user message", "user"),
-            ("first assistant reply", "assistant"),
-            ("second user message", "user"),
-            ("tool noise", "tool"),
-        ] {
-            insert_run_event_tx(
-                &mut tx,
-                claim.run.id,
-                "message".into(),
-                Some(role.into()),
-                Some(content.into()),
-                json!({}),
-            )
-            .await
-            .unwrap();
-        }
-        tx.commit().await.unwrap();
-        let patch = get_session_patch_messages(
-            State(fixture.state.clone()),
-            bearer_headers(&fixture.runtime_token),
-            Path(fixture.hub_session_id),
-        )
-        .await
-        .unwrap()
-        .0;
-        let roles: Vec<String> = patch.iter().map(|message| message.role.clone()).collect();
-        assert_eq!(
-            roles,
-            vec!["user", "assistant", "user"],
-            "tool role excluded, user/assistant ordered"
-        );
-        assert_eq!(patch[0].content.as_deref(), Some("first user message"));
-        assert_eq!(patch[2].content.as_deref(), Some("second user message"));
     }
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
@@ -7245,6 +7820,1609 @@ mod tests {
         assert_eq!(*stored.lock().unwrap(), bytes);
         object_server.abort();
     }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn reject_claimed_run_terminates_conflict_and_preserves_incumbent(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let _claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        // 构造第二个回合与任务 B（异常派发），并置 running。
+        let conflict_turn = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO hub_session_turns (id, session_id, status, ownership_generation)
+             VALUES ($1, $2, 'running', 1)",
+        )
+        .bind(conflict_turn)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let conflict_run = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO runs
+                 (id, agent_id, owner_id, runtime_id, hub_session_id, hub_turn_id, status,
+                  initial_message, source, session_ownership_generation)
+             SELECT $1, agent_id, owner_id, $3, id, $2, 'running', '异常任务', 'user',
+                    ownership_generation
+             FROM hub_sessions WHERE id = $4",
+        )
+        .bind(conflict_run)
+        .bind(conflict_turn)
+        .bind(fixture.runtime_id)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO run_events (event_id, run_id, event_type, role, content, payload)
+             VALUES ($1, $2, 'message', 'user', '异常任务', '{}'::jsonb)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(conflict_run)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        // B 的 queued 消息。
+        sqlx::query(
+            "INSERT INTO hub_session_messages
+                 (id, session_id, turn_id, run_id, role, message_kind,
+                  content, payload, delivery_mode, delivery_state)
+             VALUES ($1, $2, $3, $4, 'user', 'message', 'B 的消息', '{}'::jsonb,
+                     'next_turn', 'queued')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(fixture.hub_session_id)
+        .bind(conflict_turn)
+        .bind(conflict_run)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        // reject（incumbent = fixture.run，不同回合）。
+        let rejected = runtime_reject_claimed_run(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(conflict_run),
+            runtime_write_generation(
+                1,
+                RejectClaimedRunRequest {
+                    incumbent_run_id: Some(fixture.run_id),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(rejected.status, "failed");
+
+        // B 终态、B 回合终态。
+        let (status,): (String,) = sqlx::query_as("SELECT status FROM runs WHERE id = $1")
+            .bind(conflict_run)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "failed");
+        let (turn_status,): (String,) =
+            sqlx::query_as("SELECT status FROM hub_session_turns WHERE id = $1")
+                .bind(conflict_turn)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(turn_status, "failed");
+        // A（incumbent）完全不变：仍 running（已 claim）且未被触碰。
+        let (a_status,): (String,) = sqlx::query_as("SELECT status FROM runs WHERE id = $1")
+            .bind(fixture.run_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        assert_eq!(a_status, "running");
+        // B 的 queued 消息迁移到下一 pending run（不滞留、不丢）。
+        let (msg_run,): (Option<Uuid>,) = sqlx::query_as(
+            "SELECT run_id FROM hub_session_messages
+             WHERE session_id = $1 AND content = 'B 的消息'",
+        )
+        .bind(fixture.hub_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert!(
+            msg_run.is_some_and(|run| run != conflict_run),
+            "queued message must move off the rejected run"
+        );
+
+        // 幂等：再次 reject 返回现有状态（failed），不 409。
+        let again = runtime_reject_claimed_run(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(conflict_run),
+            runtime_write_generation(
+                1,
+                RejectClaimedRunRequest {
+                    incumbent_run_id: Some(fixture.run_id),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(again.status, "failed");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn reject_claimed_run_same_turn_preserves_incumbent_turn_and_steer(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let _claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        // B 异常复用 A 的回合（同 turn）。
+        let conflict_run = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO runs
+                 (id, agent_id, owner_id, runtime_id, hub_session_id, hub_turn_id, status,
+                  initial_message, source, session_ownership_generation)
+             SELECT $1, agent_id, owner_id, $3, id, $2, 'running', '异常复用回合', 'user',
+                    ownership_generation
+             FROM hub_sessions WHERE id = $4",
+        )
+        .bind(conflict_run)
+        .bind(fixture.turn_id)
+        .bind(fixture.runtime_id)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO run_events (event_id, run_id, event_type, role, content, payload)
+             VALUES ($1, $2, 'message', 'user', '异常复用回合', '{}'::jsonb)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(conflict_run)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        // B 的 next_turn queued 消息 + B 的 steer queued 消息。
+        sqlx::query(
+            "INSERT INTO hub_session_messages
+                 (id, session_id, turn_id, run_id, role, message_kind,
+                  content, payload, delivery_mode, delivery_state, expected_native_turn_id)
+             VALUES ($1, $2, $3, $4, 'user', 'message', 'B 的 next_turn', '{}'::jsonb,
+                     'next_turn', 'queued', NULL),
+                    ($5, $2, $3, $4, 'user', 'message', 'B 的 steer', '{}'::jsonb,
+                     'steer', 'queued', 'native-turn-x')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(fixture.hub_session_id)
+        .bind(fixture.turn_id)
+        .bind(conflict_run)
+        .bind(Uuid::new_v4())
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        let rejected = runtime_reject_claimed_run(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(conflict_run),
+            runtime_write_generation(
+                1,
+                RejectClaimedRunRequest {
+                    incumbent_run_id: Some(fixture.run_id),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(rejected.status, "failed");
+        // A 的回合保持（未终态）。
+        let (turn_status,): (String,) =
+            sqlx::query_as("SELECT status FROM hub_session_turns WHERE id = $1")
+                .bind(fixture.turn_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(turn_status, "pending");
+        // B 的 next_turn 消息迁移到 A；steer 插话保持归 A（回合不变）。
+        let (nt_run, nt_turn): (Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+            "SELECT run_id, turn_id FROM hub_session_messages
+             WHERE session_id = $1 AND content = 'B 的 next_turn'",
+        )
+        .bind(fixture.hub_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            nt_run,
+            Some(fixture.run_id),
+            "next_turn message moves to incumbent run"
+        );
+        assert_eq!(nt_turn, Some(fixture.turn_id));
+        let (steer_run,): (Option<Uuid>,) = sqlx::query_as(
+            "SELECT run_id FROM hub_session_messages
+             WHERE session_id = $1 AND content = 'B 的 steer'",
+        )
+        .bind(fixture.hub_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            steer_run,
+            Some(fixture.run_id),
+            "steer interjection stays with the incumbent Turn"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn reject_claimed_run_fallback_without_incumbent_moves_messages(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let _claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        // B running，无 incumbent（3b 兜底）。
+        let conflict_run = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO runs
+                 (id, agent_id, owner_id, runtime_id, hub_session_id, hub_turn_id, status,
+                  initial_message, source, session_ownership_generation)
+             SELECT $1, agent_id, owner_id, $3, id, $2, 'running', '兜底任务', 'user',
+                    ownership_generation
+             FROM hub_sessions WHERE id = $4",
+        )
+        .bind(conflict_run)
+        .bind(fixture.turn_id)
+        .bind(fixture.runtime_id)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO hub_session_messages
+                 (id, session_id, turn_id, run_id, role, message_kind,
+                  content, payload, delivery_mode, delivery_state)
+             VALUES ($1, $2, $3, $4, 'user', 'message', '兜底消息', '{}'::jsonb,
+                     'next_turn', 'queued')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(fixture.hub_session_id)
+        .bind(fixture.turn_id)
+        .bind(conflict_run)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        let rejected = runtime_reject_claimed_run(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(conflict_run),
+            runtime_write_generation(
+                1,
+                RejectClaimedRunRequest {
+                    incumbent_run_id: None,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(rejected.status, "failed");
+        let (msg_run,): (Option<Uuid>,) = sqlx::query_as(
+            "SELECT run_id FROM hub_session_messages
+             WHERE session_id = $1 AND content = '兜底消息'",
+        )
+        .bind(fixture.hub_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert!(
+            msg_run.is_some_and(|run| run != conflict_run),
+            "fallback must not strand messages"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn force_stop_terminates_run_and_creates_operation_with_held_messages(pool: PgPool) {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        // 用户消息（queued steer）挂在 A 上。
+        sqlx::query(
+            "INSERT INTO hub_session_messages
+                 (id, session_id, turn_id, run_id, role, message_kind,
+                  content, payload, delivery_mode, delivery_state, expected_native_turn_id)
+             VALUES ($1, $2, $3, $4, 'user', 'message', '停止前的消息', '{}'::jsonb,
+                     'steer', 'queued', 'native-turn-x')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(fixture.hub_session_id)
+        .bind(fixture.turn_id)
+        .bind(fixture.run_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        // 用户认证（session cookie）。
+        let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM hub_sessions WHERE id = $1")
+            .bind(fixture.hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        let session_token = format!("ahs_{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO sessions (token_hash, user_id, expires_at)
+             VALUES ($1, $2, now() + interval '1 hour')",
+        )
+        .bind(sha256_hex(&session_token))
+        .bind(owner_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let user_headers = HeaderMap::from_iter([(
+            header::COOKIE,
+            format!("agent_hub_session={session_token}")
+                .parse()
+                .unwrap(),
+        )]);
+
+        let (status, dto) = force_stop_hub_run(
+            State(fixture.state.clone()),
+            user_headers.clone(),
+            Path(fixture.run_id),
+            Json(ForceStopRequest {
+                request_id: "force-stop-test-1".into(),
+                expected_generation: Some(1),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(dto.run_id, fixture.run_id);
+        assert_eq!(dto.state, "pending");
+        assert_eq!(dto.target_runtime_id, Some(fixture.runtime_id));
+
+        // A 终态 interrupted、回合终态。
+        let (run_status,): (String,) = sqlx::query_as("SELECT status FROM runs WHERE id = $1")
+            .bind(fixture.run_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        assert_eq!(run_status, "interrupted");
+        let (turn_status,): (String,) =
+            sqlx::query_as("SELECT status FROM hub_session_turns WHERE id = $1")
+                .bind(fixture.turn_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(turn_status, "interrupted");
+        // 会话：强制停止中（保持归属与 generation——hub 权威 + 上报兜底）、active_turn 清。
+        let (gen, lifecycle, active_turn): (i64, String, Option<Uuid>) = sqlx::query_as(
+            "SELECT ownership_generation, lifecycle_status, active_turn_id
+             FROM hub_sessions WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(gen, 1, "force stop does not bump generation");
+        assert_eq!(lifecycle, "force_stopping");
+        assert_eq!(active_turn, None);
+        // operation：pending（命令经 WebSocket 推送；连接不在线由 10 秒上报兜底重推）。
+        let (op_state,): (String,) =
+            sqlx::query_as("SELECT state FROM force_stop_operation WHERE operation_id = $1")
+                .bind(dto.operation_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(op_state, "pending");
+        // 消息无需特殊处理：仍保持原状态（DB 全量历史，恢复时重建包含）。
+        let (msg_state,): (String,) = sqlx::query_as(
+            "SELECT delivery_state FROM hub_session_messages
+             WHERE session_id = $1 AND content = '停止前的消息'",
+        )
+        .bind(fixture.hub_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(msg_state, "queued", "messages stay untouched in DB");
+
+        // 幂等：同 request_id 重复 → 返回同一 operation（不重复创建）。
+        let (status2, dto2) = force_stop_hub_run(
+            State(fixture.state.clone()),
+            user_headers.clone(),
+            Path(fixture.run_id),
+            Json(ForceStopRequest {
+                request_id: "force-stop-test-1".into(),
+                expected_generation: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status2, StatusCode::ACCEPTED);
+        assert_eq!(dto2.operation_id, dto.operation_id);
+        let op_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM force_stop_operation WHERE request_id = 'force-stop-test-1'",
+        )
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(op_count, 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn force_stop_ws_delivers_command_and_commits_snapshot(pool: PgPool) {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+
+        // 用户认证 + 发起强制停止 → operation pending。
+        let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM hub_sessions WHERE id = $1")
+            .bind(fixture.hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        let session_token = format!("ahs_{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO sessions (token_hash, user_id, expires_at)
+             VALUES ($1, $2, now() + interval '1 hour')",
+        )
+        .bind(sha256_hex(&session_token))
+        .bind(owner_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let user_headers = HeaderMap::from_iter([(
+            header::COOKIE,
+            format!("agent_hub_session={session_token}")
+                .parse()
+                .unwrap(),
+        )]);
+        // 真实服务器 + WS 客户端连接（先连再停：命令推送只在连接在线时生效）。
+        let app = build_router((*fixture.state).clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        let url = format!("ws://{address}/api/runtime/ws");
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().insert(
+            "Authorization",
+            HeaderValue::from_str(&format!("Bearer {}", fixture.runtime_token)).unwrap(),
+        );
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+
+        // 连接建立后发起强制停止 → operation pending + 命令推送。
+        let (status, dto) = force_stop_hub_run(
+            State(fixture.state.clone()),
+            user_headers,
+            Path(fixture.run_id),
+            Json(ForceStopRequest {
+                request_id: "ws-test-1".into(),
+                expected_generation: Some(1),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(dto.state, "pending");
+
+        // 应收到 force_stop 命令（真实 operation_id）。
+        let message = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("command timeout")
+            .expect("stream closed")
+            .unwrap();
+        let tokio_tungstenite::tungstenite::Message::Text(text) = message else {
+            panic!("expected text command");
+        };
+        let command: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(command["type"], "command");
+        assert_eq!(command["kind"], "force_stop");
+        assert_eq!(command["operation_id"], dto.operation_id.to_string());
+        assert_eq!(command["session_id"], fixture.hub_session_id.to_string());
+        assert_eq!(command["require_snapshot"], true);
+
+        // runtime ack ok（接管）。
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({ "type": "ack", "operation_id": dto.operation_id, "status": "ok" })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+        // 上传快照 → 原子提交：operation→succeeded、会话→offline、kind=force_stop。
+        let objects = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let object_app = Router::new().route(
+            "/bundle-bucket/{*key}",
+            axum::routing::put({
+                let objects = Arc::clone(&objects);
+                move |Path(key): Path<String>, body: Body| {
+                    let objects = Arc::clone(&objects);
+                    async move {
+                        let bytes = axum::body::to_bytes(body, 1024).await.unwrap().to_vec();
+                        objects.lock().unwrap().insert(key, bytes);
+                        StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let object_server =
+            tokio::spawn(async move { axum::serve(listener, object_app).await.unwrap() });
+        let store = crate::session_bundle_store::S3BundleStore::new(
+            crate::session_bundle_store::S3BundleStoreConfig {
+                endpoint: format!("http://{address}").parse().unwrap(),
+                bucket: "bundle-bucket".into(),
+                region: "us-test-1".into(),
+                access_key_id: "test-access".into(),
+                secret_access_key: "test-secret".into(),
+                session_token: None,
+                server_side_encryption: None,
+                kms_key_id: None,
+                allow_http: true,
+            },
+        )
+        .unwrap();
+        let mut state = (*fixture.state).clone();
+        state.session_bundle_store = Some(Arc::new(store));
+        state.session_bundle_max_bytes = 1024;
+        let state = Arc::new(state);
+
+        let bytes = Bytes::from_static(b"ws snapshot body");
+        let checksum = format!("{:x}", Sha256::digest(&bytes));
+        let mut headers = bearer_headers(&fixture.runtime_token);
+        for (name, value) in [
+            ("content-length", bytes.len().to_string()),
+            ("x-agent-hub-bundle-sha256", checksum),
+            ("x-agent-hub-bundle-size", bytes.len().to_string()),
+        ] {
+            headers.insert(
+                name.parse::<HeaderName>().unwrap(),
+                value.parse::<HeaderValue>().unwrap(),
+            );
+        }
+        let upload_status = runtime_upload_force_stop_bundle(
+            State(state.clone()),
+            headers,
+            Path(dto.operation_id),
+            Body::from(bytes),
+        )
+        .await
+        .unwrap();
+        assert_eq!(upload_status, StatusCode::NO_CONTENT);
+
+        let (op_state,): (String,) =
+            sqlx::query_as("SELECT state FROM force_stop_operation WHERE operation_id = $1")
+                .bind(dto.operation_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(op_state, "succeeded");
+        let (lifecycle, owner, kind, gen): (String, Option<Uuid>, Option<String>, i64) =
+            sqlx::query_as(
+                "SELECT lifecycle_status, runtime_owner_id, current_bundle_kind,
+                        current_bundle_generation
+                 FROM hub_sessions WHERE id = $1",
+            )
+            .bind(fixture.hub_session_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(lifecycle, "offline");
+        assert_eq!(owner, None);
+        assert_eq!(kind.as_deref(), Some("force_stop"));
+        assert_eq!(gen, 1);
+
+        // 上报持有列表：hub 对账（会话已 offline，非权威 → abandon 命令）。
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({
+                    "type": "owned_sessions",
+                    "sessions": [{
+                        "session_id": fixture.hub_session_id,
+                        "run_id": fixture.run_id,
+                    }],
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let message = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("abandon timeout")
+            .expect("stream closed")
+            .unwrap();
+        let tokio_tungstenite::tungstenite::Message::Text(text) = message else {
+            panic!("expected text");
+        };
+        let command: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(command["type"], "command");
+        assert_eq!(command["kind"], "abandon");
+        assert_eq!(command["require_snapshot"], false);
+
+        socket.close(None).await.unwrap();
+        server.abort();
+        object_server.abort();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn force_stop_snapshot_lost_ack_and_5min_expiry(pool: PgPool) {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM hub_sessions WHERE id = $1")
+            .bind(fixture.hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        let session_token = format!("ahs_{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO sessions (token_hash, user_id, expires_at)
+             VALUES ($1, $2, now() + interval '1 hour')",
+        )
+        .bind(sha256_hex(&session_token))
+        .bind(owner_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let user_headers = HeaderMap::from_iter([(
+            header::COOKIE,
+            format!("agent_hub_session={session_token}")
+                .parse()
+                .unwrap(),
+        )]);
+        let (status, dto) = force_stop_hub_run(
+            State(fixture.state.clone()),
+            user_headers,
+            Path(fixture.run_id),
+            Json(ForceStopRequest {
+                request_id: "ws-test-lost-1".into(),
+                expected_generation: Some(1),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        // 直接把 created_at 改老，触发 5 分钟兜底。
+        sqlx::query(
+            "UPDATE force_stop_operation SET created_at = now() - interval '6 minutes'
+             WHERE operation_id = $1",
+        )
+        .bind(dto.operation_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        crate::runtime_ws::expire_stuck_force_stops(&fixture.state).await;
+
+        let (op_state,): (String,) =
+            sqlx::query_as("SELECT state FROM force_stop_operation WHERE operation_id = $1")
+                .bind(dto.operation_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(op_state, "snapshot_lost");
+        let (lifecycle, owner): (String, Option<Uuid>) = sqlx::query_as(
+            "SELECT lifecycle_status, runtime_owner_id FROM hub_sessions WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(lifecycle, "offline");
+        assert_eq!(owner, None);
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn force_stop_bundle_upload_commits_operation_and_offlines_session(pool: PgPool) {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        // 1. 发起强制停止 → operation pending。
+        let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM hub_sessions WHERE id = $1")
+            .bind(fixture.hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        let session_token = format!("ahs_{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO sessions (token_hash, user_id, expires_at)
+             VALUES ($1, $2, now() + interval '1 hour')",
+        )
+        .bind(sha256_hex(&session_token))
+        .bind(owner_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let user_headers = HeaderMap::from_iter([(
+            header::COOKIE,
+            format!("agent_hub_session={session_token}")
+                .parse()
+                .unwrap(),
+        )]);
+        let (status, dto) = force_stop_hub_run(
+            State(fixture.state.clone()),
+            user_headers.clone(),
+            Path(fixture.run_id),
+            Json(ForceStopRequest {
+                request_id: "force-stop-upload-1".into(),
+                expected_generation: Some(1),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(dto.state, "pending");
+
+        // 2. mock S3：PUT 记录对象，DELETE 记录被删 key。
+        let objects = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let object_app = Router::new()
+            .route(
+                "/bundle-bucket/{*key}",
+                axum::routing::put({
+                    let objects = Arc::clone(&objects);
+                    move |Path(key): Path<String>, body: Body| {
+                        let objects = Arc::clone(&objects);
+                        async move {
+                            let bytes = axum::body::to_bytes(body, 1024).await.unwrap().to_vec();
+                            objects.lock().unwrap().insert(key, bytes);
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/bundle-bucket/{*key}",
+                axum::routing::delete({
+                    let deleted = Arc::clone(&deleted);
+                    move |Path(key): Path<String>| {
+                        let deleted = Arc::clone(&deleted);
+                        async move {
+                            deleted.lock().unwrap().push(key);
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let object_server =
+            tokio::spawn(async move { axum::serve(listener, object_app).await.unwrap() });
+        let store = crate::session_bundle_store::S3BundleStore::new(
+            crate::session_bundle_store::S3BundleStoreConfig {
+                endpoint: format!("http://{address}").parse().unwrap(),
+                bucket: "bundle-bucket".into(),
+                region: "us-test-1".into(),
+                access_key_id: "test-access".into(),
+                secret_access_key: "test-secret".into(),
+                session_token: None,
+                server_side_encryption: None,
+                kms_key_id: None,
+                allow_http: true,
+            },
+        )
+        .unwrap();
+        let mut state = (*fixture.state).clone();
+        state.session_bundle_store = Some(Arc::new(store));
+        state.session_bundle_max_bytes = 1024;
+        let state = Arc::new(state);
+
+        // 3. 预置旧 bundle：DB 指针指向旧对象（kind=checkpoint，验证任意旧 bundle
+        // 都会被新快照替换删除）。
+        let old_key = format!("sessions/{}/bundle-old.tar.zst", fixture.hub_session_id);
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET current_bundle_generation = 1,
+                 current_bundle_object_key = $1,
+                 current_bundle_checksum_sha256 = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                 current_bundle_size_bytes = 3,
+                 current_bundle_history_checkpoint = 0,
+                 current_bundle_ownership_generation = 1,
+                 current_bundle_producing_engine_version = '0.104.0',
+                 current_bundle_created_at = now(),
+                 current_bundle_runtime_id = $2,
+                 current_bundle_kind = 'checkpoint'
+             WHERE id = $3",
+        )
+        .bind(&old_key)
+        .bind(fixture.runtime_id)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        objects
+            .lock()
+            .unwrap()
+            .insert(old_key.clone(), b"old".to_vec());
+
+        // 4. 上传停止快照。
+        let bytes = Bytes::from_static(b"force stop snapshot body");
+        let checksum = format!("{:x}", Sha256::digest(&bytes));
+        let mut headers = bearer_headers(&fixture.runtime_token);
+        for (name, value) in [
+            ("content-length", bytes.len().to_string()),
+            ("x-agent-hub-bundle-sha256", checksum.clone()),
+            ("x-agent-hub-bundle-size", bytes.len().to_string()),
+        ] {
+            headers.insert(
+                name.parse::<HeaderName>().unwrap(),
+                value.parse::<HeaderValue>().unwrap(),
+            );
+        }
+        let status = runtime_upload_force_stop_bundle(
+            State(state.clone()),
+            headers,
+            Path(dto.operation_id),
+            Body::from(bytes.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // 5. operation → succeeded；会话 offline、归属释放、kind=force_stop、generation=1。
+        let (op_state, uploaded_at): (String, Option<chrono::DateTime<chrono::Utc>>) =
+            sqlx::query_as(
+                "SELECT state, snapshot_uploaded_at FROM force_stop_operation
+                 WHERE operation_id = $1",
+            )
+            .bind(dto.operation_id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(op_state, "succeeded");
+        assert!(uploaded_at.is_some());
+        let (lifecycle, owner, kind, generation, stored_key): (
+            String,
+            Option<Uuid>,
+            Option<String>,
+            i64,
+            String,
+        ) = sqlx::query_as(
+            "SELECT lifecycle_status, runtime_owner_id, current_bundle_kind,
+                    current_bundle_generation, current_bundle_object_key
+             FROM hub_sessions WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(lifecycle, "offline");
+        assert_eq!(owner, None);
+        assert_eq!(kind.as_deref(), Some("force_stop"));
+        assert_eq!(
+            generation, 2,
+            "force stop snapshot advances the bundle generation"
+        );
+        assert_eq!(
+            stored_key,
+            format!(
+                "sessions/{}/force-stop-{}.tar.zst",
+                fixture.hub_session_id, dto.operation_id
+            )
+        );
+        // 对象确实上传成功。
+        let stored = objects.lock().unwrap();
+        assert_eq!(
+            stored.get(&stored_key),
+            Some(&bytes.to_vec()),
+            "force stop snapshot object must be stored"
+        );
+        drop(stored);
+
+        // 6. 旧 force-stop 对象已删除（旧 key 与新 key 不同）。
+        assert!(
+            deleted.lock().unwrap().contains(&old_key),
+            "replaced bundle object must be deleted"
+        );
+
+        // 7. 重复上传同一 operation（已完成）→ 409，不重复提交。
+        let mut headers2 = bearer_headers(&fixture.runtime_token);
+        for (name, value) in [
+            ("content-length", bytes.len().to_string()),
+            ("x-agent-hub-bundle-sha256", checksum.clone()),
+            ("x-agent-hub-bundle-size", bytes.len().to_string()),
+        ] {
+            headers2.insert(
+                name.parse::<HeaderName>().unwrap(),
+                value.parse::<HeaderValue>().unwrap(),
+            );
+        }
+        let err = runtime_upload_force_stop_bundle(
+            State(state.clone()),
+            headers2,
+            Path(dto.operation_id),
+            Body::from(bytes),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        object_server.abort();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn run_completion_is_idempotent_and_rejects_conflicting_payload(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        // 第一次完成（commit 后响应可能丢失）。
+        let first = runtime_complete_run(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(claim.run.id),
+            runtime_write_generation(
+                1,
+                CompleteRunRequest {
+                    status: "completed".into(),
+                    native_session_id: Some("native-1".into()),
+                    work_dir_ref: Some("workdir-1".into()),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(first.status, "completed");
+        // 重试（同 payload）：返回同一结果，不 409、不重复迁移。
+        let retry = runtime_complete_run(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(claim.run.id),
+            runtime_write_generation(
+                1,
+                CompleteRunRequest {
+                    status: "completed".into(),
+                    native_session_id: Some("native-1".into()),
+                    work_dir_ref: Some("workdir-1".into()),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(retry.status, "completed");
+        assert_eq!(retry.native_session_id.as_deref(), Some("native-1"));
+        // 冲突 payload（同 status 不同内容）：409。
+        let error = runtime_complete_run(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(claim.run.id),
+            runtime_write_generation(
+                1,
+                CompleteRunRequest {
+                    status: "completed".into(),
+                    native_session_id: Some("native-2".into()),
+                    work_dir_ref: Some("workdir-2".into()),
+                },
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        // status(completed) 事件只写入一次（幂等重试不追加；claim 的 running 事件不计）。
+        let (event_count,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM run_events
+             WHERE run_id = $1 AND event_type = 'status' AND content = 'completed'",
+        )
+        .bind(claim.run.id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(event_count, 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn runtime_keepalive_does_not_release_idle_sessions(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET runtime_owner_id = $1, ownership_generation = 1, lifecycle_status = 'online'
+             WHERE id = $2",
+        )
+        .bind(fixture.runtime_id)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            runtime_keepalive(
+                State(fixture.state.clone()),
+                bearer_headers(&fixture.runtime_token),
+            )
+            .await
+            .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+
+        let (owner, generation, status): (Option<Uuid>, i64, String) = sqlx::query_as(
+            "SELECT runtime_owner_id, ownership_generation, lifecycle_status
+             FROM hub_sessions WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            owner,
+            Some(fixture.runtime_id),
+            "keepalive must not release owned Sessions"
+        );
+        assert_eq!(
+            generation, 1,
+            "keepalive must not bump ownership generation"
+        );
+        assert_eq!(
+            status, "online",
+            "keepalive must not change Session lifecycle"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn runtime_keepalive_rejects_revoked_credentials(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        sqlx::query("UPDATE runtimes SET credential_revoked_at = now() WHERE id = $1")
+            .bind(fixture.runtime_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        let error = runtime_keepalive(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn runtime_keepalive_preserves_draining_and_pending_credentials(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        sqlx::query("UPDATE runtimes SET status = 'draining' WHERE id = $1")
+            .bind(fixture.runtime_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime_keepalive(
+                State(fixture.state.clone()),
+                bearer_headers(&fixture.runtime_token),
+            )
+            .await
+            .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        let (status,): (String,) = sqlx::query_as("SELECT status FROM runtimes WHERE id = $1")
+            .bind(fixture.runtime_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "draining", "keepalive must preserve draining");
+
+        // pending token 可认证但不激活（token_hash 不变，pending 保留）。
+        let pending = format!("ahrt_pending_{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "UPDATE runtimes
+             SET pending_token_hash = $1, pending_token_created_at = now()
+             WHERE id = $2",
+        )
+        .bind(sha256_hex(&pending))
+        .bind(fixture.runtime_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            runtime_keepalive(State(fixture.state.clone()), bearer_headers(&pending))
+                .await
+                .unwrap(),
+            StatusCode::NO_CONTENT
+        );
+        let (token_hash, pending_hash): (String, Option<String>) =
+            sqlx::query_as("SELECT token_hash, pending_token_hash FROM runtimes WHERE id = $1")
+                .bind(fixture.runtime_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        let pending_hash_expected = sha256_hex(&pending);
+        assert_eq!(
+            token_hash,
+            sha256_hex(&fixture.runtime_token),
+            "pending token must not be activated by keepalive"
+        );
+        assert_eq!(
+            pending_hash.as_deref(),
+            Some(pending_hash_expected.as_str()),
+            "pending token must remain pending"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn claim_terminates_stale_active_turn_and_clears_pointer(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        // 造一个残留的旧活动 turn（异常/崩溃路径）并挂到会话 active_turn_id。
+        let stale_turn_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO hub_session_turns
+                 (id, session_id, status, ownership_generation)
+             VALUES ($1, $2, 'running', 1)",
+        )
+        .bind(stale_turn_id)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET runtime_owner_id = $1, ownership_generation = 1,
+                 lifecycle_status = 'online', active_turn_id = $2
+             WHERE id = $3",
+        )
+        .bind(fixture.runtime_id)
+        .bind(stale_turn_id)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        // claim 当前 run（source = user，非 tool_result 续跑）。
+        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        // 旧残留 turn 被终结为 failed 且结束时间已记录。
+        let (status, ended_at): (String, Option<chrono::DateTime<Utc>>) =
+            sqlx::query_as("SELECT status, ended_at FROM hub_session_turns WHERE id = $1")
+                .bind(stale_turn_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status, "failed",
+            "stale active turn must be terminated on claim"
+        );
+        assert!(
+            ended_at.is_some(),
+            "stale active turn must record an end time"
+        );
+        // 会话 active_turn_id 已清（当前 claim 的 turn 尚未 begin）。
+        let (active_turn_id, lifecycle): (Option<Uuid>, String) = sqlx::query_as(
+            "SELECT active_turn_id, lifecycle_status FROM hub_sessions WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            active_turn_id, None,
+            "claim must clear stale active turn pointer"
+        );
+        // 同一 runtime 重 claim：lifecycle 保持原状态（online），gen 不 bump。
+        assert_eq!(lifecycle, "online");
+        assert_eq!(claim.run.id, fixture.run_id);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn claim_does_not_terminate_an_active_turn_still_referenced_by_a_running_run(
+        pool: PgPool,
+    ) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        // 同 Session 已有 running run（活动执行），其 turn 是会话 active_turn。
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET runtime_owner_id = $1, ownership_generation = 1, lifecycle_status = 'online',
+                 active_turn_id = $2
+             WHERE id = $3",
+        )
+        .bind(fixture.runtime_id)
+        .bind(fixture.turn_id)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE runs SET status = 'running', runtime_id = $1,
+                    session_ownership_generation = 1
+             WHERE id = $2",
+        )
+        .bind(fixture.runtime_id)
+        .bind(fixture.run_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE hub_session_turns SET status = 'running' WHERE id = $1")
+            .bind(fixture.turn_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+        // 新普通 pending run（source=user）。
+        let pending_run_id =
+            insert_pending_session_run(&fixture.state.pool, fixture.hub_session_id).await;
+
+        // 活动 turn 被 running run 引用：claim 被拒（NO_CONTENT），run 保持 pending，
+        // 旧 Turn 保持 running、active_turn 指针保留。
+        let ready_owned = vec![RuntimeOwnedSessionGenerationDto {
+            session_id: fixture.hub_session_id,
+            ownership_generation: 1,
+        }];
+        let response = runtime_claim_run(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            runtime_claim_request(1, ready_owned),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let (run_status,): (String,) = sqlx::query_as("SELECT status FROM runs WHERE id = $1")
+            .bind(pending_run_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        assert_eq!(run_status, "pending", "unclaimed Run must stay pending");
+        let (turn_status,): (String,) =
+            sqlx::query_as("SELECT status FROM hub_session_turns WHERE id = $1")
+                .bind(fixture.turn_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(turn_status, "running", "active Turn must not be terminated");
+        let (active_turn,): (Option<Uuid>,) =
+            sqlx::query_as("SELECT active_turn_id FROM hub_sessions WHERE id = $1")
+                .bind(fixture.hub_session_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(active_turn, Some(fixture.turn_id));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn tool_result_continuation_may_claim_waiting_parent(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        // 父 run 处于 waiting_tool（等待审批）；tool_result 续跑 run 允许 claim。
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET runtime_owner_id = $1, ownership_generation = 1, lifecycle_status = 'online',
+                 active_turn_id = $2
+             WHERE id = $3",
+        )
+        .bind(fixture.runtime_id)
+        .bind(fixture.turn_id)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE runs SET status = 'waiting_tool', runtime_id = $1,
+                    session_ownership_generation = 1
+             WHERE id = $2",
+        )
+        .bind(fixture.runtime_id)
+        .bind(fixture.run_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        // 父 waiting_tool 的 turn 成为活动 turn。
+        sqlx::query("UPDATE hub_session_turns SET status = 'running' WHERE id = $1")
+            .bind(fixture.turn_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+
+        let continuation_id = Uuid::new_v4();
+        let continuation_turn = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO hub_session_turns (id, session_id, status, ownership_generation)
+             VALUES ($1, $2, 'pending', 1)",
+        )
+        .bind(continuation_turn)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs
+                 (id, agent_id, owner_id, hub_session_id, hub_turn_id, parent_run_id, status,
+                  initial_message, source, session_ownership_generation)
+             VALUES ($1, $2, $3, $4, $5, $6, 'pending', '工具结果续跑', 'integration:tool_result', 1)",
+        )
+        .bind(continuation_id)
+        .bind(fixture.agent_id)
+        .bind(
+            sqlx::query_scalar::<_, Uuid>("SELECT owner_id FROM hub_sessions WHERE id = $1")
+                .bind(fixture.hub_session_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap(),
+        )
+        .bind(fixture.hub_session_id)
+        .bind(continuation_turn)
+        .bind(fixture.run_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        assert_eq!(
+            claim.run.id, continuation_id,
+            "integration:tool_result continuation must be claimable while its parent waits"
+        );
+        // 续跑不清 active turn（父 waiting_tool 仍持有）。
+        let (active_turn,): (Option<Uuid>,) =
+            sqlx::query_as("SELECT active_turn_id FROM hub_sessions WHERE id = $1")
+                .bind(fixture.hub_session_id)
+                .fetch_one(&fixture.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(active_turn, Some(fixture.turn_id));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn tool_result_continuation_with_unrelated_parent_is_rejected(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        // 父 run 处于 waiting_tool（本会话的活动 run）。
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET runtime_owner_id = $1, ownership_generation = 1, lifecycle_status = 'online',
+                 active_turn_id = $2
+             WHERE id = $3",
+        )
+        .bind(fixture.runtime_id)
+        .bind(fixture.turn_id)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE runs SET status = 'waiting_tool', runtime_id = $1,
+                    session_ownership_generation = 1
+             WHERE id = $2",
+        )
+        .bind(fixture.runtime_id)
+        .bind(fixture.run_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE hub_session_turns SET status = 'running' WHERE id = $1")
+            .bind(fixture.turn_id)
+            .execute(&fixture.state.pool)
+            .await
+            .unwrap();
+
+        // 已完成的历史父 run（非活动）：continuation 的 parent 指向它时例外不匹配，
+        // 因为活动 run 是 fixture.run（waiting_tool），claim 必须被拒。
+        let historical_parent = Uuid::new_v4();
+        let historical_parent_turn = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO hub_session_turns (id, session_id, status, ownership_generation)
+             VALUES ($1, $2, 'completed', 1)",
+        )
+        .bind(historical_parent_turn)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs
+                 (id, agent_id, owner_id, hub_session_id, hub_turn_id, status,
+                  initial_message, source, session_ownership_generation)
+             SELECT $1, agent_id, owner_id, id, $2, 'completed', '历史父任务', 'user',
+                    ownership_generation
+             FROM hub_sessions WHERE id = $3",
+        )
+        .bind(historical_parent)
+        .bind(historical_parent_turn)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        let continuation_turn = Uuid::new_v4();
+        // 父 run 处于 waiting_tool 且带 pending integration tool request（阻断条件）。
+        sqlx::query(
+            "INSERT INTO integration_tool_requests
+                 (id, hub_session_id, run_id, position, tool_name, arguments, status, expires_at)
+             VALUES ($1, $2, $3, 0, 'run_shelves_operation', '{}'::jsonb, 'pending', now() + interval '5 minutes')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(fixture.hub_session_id)
+        .bind(fixture.run_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO hub_session_turns (id, session_id, status, ownership_generation)
+             VALUES ($1, $2, 'pending', 1)",
+        )
+        .bind(continuation_turn)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO runs
+                 (id, agent_id, owner_id, hub_session_id, hub_turn_id, parent_run_id, status,
+                  initial_message, source, session_ownership_generation)
+             SELECT $1, agent_id, owner_id, $4, $2, $3, 'pending', '错误父续跑',
+                    'integration:tool_result', ownership_generation
+             FROM hub_sessions WHERE id = $4",
+        )
+        .bind(Uuid::new_v4())
+        .bind(continuation_turn)
+        .bind(historical_parent)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        let ready_owned = vec![RuntimeOwnedSessionGenerationDto {
+            session_id: fixture.hub_session_id,
+            ownership_generation: 1,
+        }];
+        let response = runtime_claim_run(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            runtime_claim_request(1, ready_owned),
+        )
+        .await
+        .unwrap()
+        .into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::NO_CONTENT,
+            "tool_result continuation with an unrelated parent must be rejected"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn heartbeat_preserves_restoring_lifecycle_and_saving_fields(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET runtime_owner_id = $1, ownership_generation = 1, lifecycle_status = 'restoring',
+                 recovery_source = 'local_workspace'
+             WHERE id = $2",
+        )
+        .bind(fixture.runtime_id)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        // runtime 上报 online（本地 metadata 滞后）：Hub 必须保持 restoring。
+        let _ = runtime_heartbeat(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Json(RuntimeHeartbeatRequest {
+                pending_credential_hash: None,
+                accepts_session_commands: false,
+                owned_sessions: vec![RuntimeOwnedSessionStateRequest {
+                    session_id: fixture.hub_session_id,
+                    ownership_generation: 1,
+                    lifecycle_status: "online".into(),
+                    checkpoint_reason: None,
+                }],
+                cleaned_sessions: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        let (lifecycle, saving_checkpoint, saving_reason, last_checkpoint): (
+            String,
+            Option<i64>,
+            Option<String>,
+            Option<i64>,
+        ) = sqlx::query_as(
+            "SELECT lifecycle_status, saving_history_checkpoint, saving_reason,
+                    last_checkpoint_ownership_generation
+             FROM hub_sessions WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            lifecycle, "restoring",
+            "online heartbeat must not override restoring"
+        );
+        // 约束保证非 saving 状态下 saving_* 全 NULL；heartbeat 不得破坏该不变式。
+        assert_eq!(saving_checkpoint, None);
+        assert_eq!(saving_reason, None);
+        // last_checkpoint_* 在非 saving 心跳下原样保留（fixture 初始为 NULL）。
+        assert_eq!(last_checkpoint, None);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn replay_events_are_generation_fenced_and_ordered(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        // 写入两条重建事件（message user + item dynamicToolCall completed）。
+        let ts = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO run_events
+                 (event_id, run_id, event_type, role, content, payload, created_at)
+             VALUES ($1, $2, 'message', 'user', '重建测试', '{}'::jsonb, $3)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(fixture.run_id)
+        .bind(ts)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO run_events
+                 (event_id, run_id, event_type, role, payload, created_at)
+             VALUES ($1, $2, 'item', 'assistant',
+                     '{\"phase\":\"completed\",\"item_type\":\"dynamicToolCall\",
+                       \"item_id\":\"call_00_x|item_y\",\"tool\":\"read\",
+                       \"arguments\":{},\"output\":\"结果\",\"success\":true}'::jsonb, $3)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(fixture.run_id)
+        .bind(ts)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET runtime_owner_id = $1, ownership_generation = 1, lifecycle_status = 'restoring',
+                 recovery_source = 'local_workspace'
+             WHERE id = $2",
+        )
+        .bind(fixture.runtime_id)
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        // 正确代际可读。
+        let mut headers = bearer_headers(&fixture.runtime_token);
+        headers.insert("x-agent-hub-ownership-generation", "1".parse().unwrap());
+        let events = get_session_replay_events(
+            State(fixture.state.clone()),
+            headers.clone(),
+            Path(fixture.hub_session_id),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "message");
+        assert_eq!(events[0].run_id, fixture.run_id);
+        assert_eq!(events[1].event_type, "item");
+        assert_eq!(events[1].payload["item_id"], "call_00_x|item_y");
+
+        // 错误代际被拒（403）。
+        let mut headers = bearer_headers(&fixture.runtime_token);
+        headers.insert("x-agent-hub-ownership-generation", "99".parse().unwrap());
+        let error = get_session_replay_events(
+            State(fixture.state.clone()),
+            headers,
+            Path(fixture.hub_session_id),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn runtime_heartbeat_tolerates_stale_owned_sessions_instead_of_conflicting(pool: PgPool) {
@@ -8481,6 +10659,7 @@ mod tests {
         sqlx::query(
             "UPDATE hub_sessions
              SET lifecycle_status = 'restoring', current_bundle_generation = 1,
+                 current_bundle_kind = 'checkpoint',
                  current_bundle_object_key = $2, current_bundle_checksum_sha256 = $3,
                  current_bundle_size_bytes = $4, current_bundle_history_checkpoint = 3,
                  current_bundle_ownership_generation = 1,
@@ -9137,7 +11316,9 @@ mod tests {
         .fetch_one(&fixture.state.pool)
         .await
         .unwrap();
-        assert_eq!(session, ("online".into(), None, None, None, None));
+        // 会话仍处于 restoring（online 心跳不得覆盖恢复中状态；恢复完成后
+        // 由 turn_started 置 online）。
+        assert_eq!(session, ("restoring".into(), None, None, None, None));
     }
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]

@@ -347,13 +347,18 @@ pub(crate) fn hub_session_from_row(row: sqlx::postgres::PgRow) -> HubSessionDto 
     let current_bundle = row
         .get::<Option<i64>, _>("current_bundle_generation")
         .map(|generation| CurrentSessionBundleDto {
+            kind: row
+                .get::<Option<String>, _>("current_bundle_kind")
+                .unwrap_or_else(|| "checkpoint".to_owned()),
             generation,
             object_key: row.get("current_bundle_object_key"),
             checksum_sha256: row.get("current_bundle_checksum_sha256"),
             size_bytes: row.get("current_bundle_size_bytes"),
             history_checkpoint: row.get("current_bundle_history_checkpoint"),
             ownership_generation: row.get("current_bundle_ownership_generation"),
-            producing_engine_version: row.get("current_bundle_producing_engine_version"),
+            producing_engine_version: row
+                .get::<Option<String>, _>("current_bundle_producing_engine_version")
+                .unwrap_or_default(),
             created_at: row.get("current_bundle_created_at"),
         });
     HubSessionDto {

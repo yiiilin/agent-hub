@@ -12,6 +12,9 @@ pub(crate) struct ApiError {
     pub(crate) message: String,
     pub(crate) retry_after_seconds: Option<u64>,
     pub(crate) details: Option<Value>,
+    /// 结构化错误码（credential_revoked / stale_session_generation），
+    /// 供执行程序按码分类处理（区别于裸 401/403 判断）。
+    pub(crate) code: Option<&'static str>,
 }
 
 impl ApiError {
@@ -21,6 +24,7 @@ impl ApiError {
             message: message.into(),
             retry_after_seconds: None,
             details: None,
+            code: None,
         }
     }
 
@@ -30,6 +34,7 @@ impl ApiError {
             message: message.into(),
             retry_after_seconds: None,
             details: None,
+            code: None,
         }
     }
 
@@ -39,6 +44,7 @@ impl ApiError {
             message: message.into(),
             retry_after_seconds: None,
             details: None,
+            code: None,
         }
     }
 
@@ -48,6 +54,7 @@ impl ApiError {
             message: message.into(),
             retry_after_seconds: None,
             details: None,
+            code: None,
         }
     }
 
@@ -57,6 +64,7 @@ impl ApiError {
             message: message.into(),
             retry_after_seconds: None,
             details: None,
+            code: None,
         }
     }
 
@@ -66,6 +74,7 @@ impl ApiError {
             message: message.into(),
             retry_after_seconds: None,
             details: None,
+            code: None,
         }
     }
 
@@ -75,6 +84,7 @@ impl ApiError {
             message: message.into(),
             retry_after_seconds: None,
             details: None,
+            code: None,
         }
     }
 
@@ -84,6 +94,7 @@ impl ApiError {
             message: message.into(),
             retry_after_seconds: None,
             details: None,
+            code: None,
         }
     }
 
@@ -93,6 +104,7 @@ impl ApiError {
             message: message.into(),
             retry_after_seconds: None,
             details: None,
+            code: None,
         }
     }
 
@@ -102,6 +114,7 @@ impl ApiError {
             message: message.into(),
             retry_after_seconds: None,
             details: None,
+            code: None,
         }
     }
 
@@ -111,6 +124,7 @@ impl ApiError {
             message: message.into(),
             retry_after_seconds: Some(retry_after_seconds),
             details: None,
+            code: None,
         }
     }
 
@@ -120,6 +134,7 @@ impl ApiError {
             message: message.into(),
             retry_after_seconds: None,
             details: None,
+            code: None,
         }
     }
 
@@ -129,13 +144,22 @@ impl ApiError {
             message: "the Agent requires additional Secret Grants".into(),
             retry_after_seconds: None,
             details: Some(json!({ "secret_grants_required": requirements })),
+            code: None,
         }
+    }
+
+    pub(crate) fn with_code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
+        self
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let mut body = json!({ "error": self.message });
+        if let Some(code) = self.code {
+            body["code"] = Value::String(code.to_string());
+        }
         if let Some(details) = self.details {
             body["details"] = details;
         }

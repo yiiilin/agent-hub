@@ -2103,7 +2103,8 @@ mod tests {
         let main_binding_id = model_binding_id(&claim, "main");
         sqlx::query(
             "UPDATE hub_sessions
-             SET lifecycle_status = 'online', active_turn_id = $1
+             SET lifecycle_status = 'online', active_turn_id = $1,
+                 recovery_source = NULL
              WHERE id = $2",
         )
         .bind(fixture.turn_id)
@@ -2362,7 +2363,8 @@ mod tests {
         let main_binding_id = model_binding_id(&claim, "main");
         sqlx::query(
             "UPDATE hub_sessions
-             SET lifecycle_status = 'online', active_turn_id = $1
+             SET lifecycle_status = 'online', active_turn_id = $1,
+                 recovery_source = NULL
              WHERE id = $2",
         )
         .bind(fixture.turn_id)
@@ -2487,7 +2489,8 @@ mod tests {
         let main_binding_id = model_binding_id(&claim, "main");
         sqlx::query(
             "UPDATE hub_sessions
-             SET lifecycle_status = 'online', active_turn_id = $1
+             SET lifecycle_status = 'online', active_turn_id = $1,
+                 recovery_source = NULL
              WHERE id = $2",
         )
         .bind(fixture.turn_id)
@@ -2707,7 +2710,8 @@ mod tests {
         let main_binding_id = model_binding_id(&claim, "main");
         sqlx::query(
             "UPDATE hub_sessions
-             SET lifecycle_status = 'online', active_turn_id = $1
+             SET lifecycle_status = 'online', active_turn_id = $1,
+                 recovery_source = NULL
              WHERE id = $2",
         )
         .bind(fixture.turn_id)
@@ -2844,7 +2848,8 @@ mod tests {
         let reviewer_binding_id = model_binding_id(&claim, "reviewer");
         sqlx::query(
             "UPDATE hub_sessions
-             SET lifecycle_status = 'online', active_turn_id = $1
+             SET lifecycle_status = 'online', active_turn_id = $1,
+                 recovery_source = NULL
              WHERE id = $2",
         )
         .bind(fixture.turn_id)
@@ -2941,7 +2946,8 @@ mod tests {
         let header_binding_id = model_binding_id(&header_claim, "main");
         sqlx::query(
             "UPDATE hub_sessions
-             SET lifecycle_status = 'online', active_turn_id = $1
+             SET lifecycle_status = 'online', active_turn_id = $1,
+                 recovery_source = NULL
              WHERE id = $2",
         )
         .bind(header_fixture.turn_id)
@@ -2994,7 +3000,8 @@ mod tests {
         let body_binding_id = model_binding_id(&body_claim, "main");
         sqlx::query(
             "UPDATE hub_sessions
-             SET lifecycle_status = 'online', active_turn_id = $1
+             SET lifecycle_status = 'online', active_turn_id = $1,
+                 recovery_source = NULL
              WHERE id = $2",
         )
         .bind(body_fixture.turn_id)
@@ -4522,7 +4529,8 @@ mod tests {
         let binding_id = model_binding_id(&claim, "main");
         sqlx::query(
             "UPDATE hub_sessions
-             SET lifecycle_status = 'online', active_turn_id = $1
+             SET lifecycle_status = 'online', active_turn_id = $1,
+                 recovery_source = NULL
              WHERE id = $2",
         )
         .bind(fixture.turn_id)

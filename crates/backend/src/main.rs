@@ -68,6 +68,7 @@ use std::io::Read;
 use url::Url;
 
 pub(crate) mod run_event_bus;
+mod runtime_ws;
 mod session_bundle_store;
 mod skill_package_store;
 
@@ -246,6 +247,7 @@ pub(crate) async fn main() -> anyhow::Result<()> {
         ],
         session_issuer: Arc::new(BrowserSessionIssuer),
         run_event_bus: Arc::new(run_event_bus::InMemoryRunEventBus::default()),
+        runtime_ws: crate::runtime_ws::RuntimeWsRegistry::default(),
     };
 
     let scheduler_pool = state.pool.clone();
@@ -271,6 +273,10 @@ pub(crate) async fn main() -> anyhow::Result<()> {
     let attachment_orphan_state = Arc::new(state.clone());
     tokio::spawn(async move {
         runtime_attachment_orphan_loop(attachment_orphan_state).await;
+    });
+    let force_stop_state = Arc::new(state.clone());
+    tokio::spawn(async move {
+        force_stop_expiry_loop(force_stop_state).await;
     });
     let app = build_router(state);
     info!("backend listening on {bind_addr}");
@@ -337,10 +343,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/admin/users/{user_id}/role", put(set_admin_user_role))
         .route("/api/admin/user-erasures", get(list_user_erasures))
         .route("/api/admin/users/{user_id}/erase", post(erase_user))
-        .route(
-            "/api/admin/bundle-sync-status",
-            get(get_bundle_sync_status),
-        )
+        .route("/api/admin/bundle-sync-status", get(get_bundle_sync_status))
         .route("/api/auth/providers", get(auth_providers))
         .route(
             "/api/admin/auth-policy",
@@ -504,6 +507,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/attachments/{attachment_id}", get(download_attachment))
         .route("/api/runs/{run_id}", get(get_run))
         .route("/api/runs/{run_id}/stop", post(stop_hub_run))
+        .route("/api/runs/{run_id}/force-stop", post(force_stop_hub_run))
         .route("/api/runs/{run_id}/events", get(list_run_events))
         .route("/api/runs/{run_id}/events/stream", get(stream_run_events))
         .route(
@@ -686,6 +690,12 @@ pub(crate) fn build_router(state: AppState) -> Router {
         )
         .route("/api/runtime/register", post(runtime_register))
         .route("/api/runtime/heartbeat", post(runtime_heartbeat))
+        .route("/api/runtime/keepalive", post(runtime_keepalive))
+        .route(
+            "/api/runtime/force-stop/{operation_id}/bundle",
+            put(runtime_upload_force_stop_bundle),
+        )
+        .route("/api/runtime/ws", get(runtime_ws::runtime_ws_upgrade))
         .route("/api/runtime/runs/claim", post(runtime_claim_run))
         .route(
             "/api/runtime/runs/{run_id}/secrets/{secret_name}",
@@ -740,8 +750,8 @@ pub(crate) fn build_router(state: AppState) -> Router {
             put(set_session_bundle_sync_status),
         )
         .route(
-            "/api/runtime/sessions/{session_id}/patch-messages",
-            get(get_session_patch_messages),
+            "/api/runtime/sessions/{session_id}/replay-events",
+            get(get_session_replay_events),
         )
         .route(
             "/api/runtime/runs/{run_id}/events",
@@ -754,6 +764,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/api/runtime/runs/{run_id}/complete",
             post(runtime_complete_run),
+        )
+        .route(
+            "/api/runtime/runs/{run_id}/reject-claim",
+            post(runtime_reject_claimed_run),
         )
         .route(
             "/api/runtime/model-proxy/v1/{*path}",
@@ -841,6 +855,15 @@ pub(crate) async fn api_not_found() -> StatusCode {
 
 pub(crate) async fn healthz() -> Json<Value> {
     Json(json!({ "ok": true }))
+}
+
+/// 每 30 秒检查一次超时未完成的强制停止（>5 分钟 → 标记快照丢失并释放会话）。
+async fn force_stop_expiry_loop(state: Arc<AppState>) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+    loop {
+        ticker.tick().await;
+        crate::runtime_ws::expire_stuck_force_stops(&state).await;
+    }
 }
 
 pub(crate) async fn openapi() -> Json<Value> {
@@ -1037,6 +1060,7 @@ pub(crate) fn openapi_document() -> Value {
             "/api/attachments/{attachment_id}": { "get": { "summary": "Download an owned attachment", "parameters": [id("attachment_id")], "responses": { "200": { "description": "Attachment bytes", "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } } }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/runs/{run_id}": { "get": { "summary": "Get run", "parameters": [id("run_id")], "responses": { "200": response("Run"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/runs/{run_id}/stop": { "post": { "summary": "Stop an active Turn in an owned Session", "parameters": [id("run_id")], "responses": { "200": response("Run"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
+            "/api/runs/{run_id}/force-stop": { "post": { "summary": "Force stop a Run: mark the Session force_stopping, kill the Pi and upload a workspace snapshot; the Session then becomes offline and recovers on the next user message", "parameters": [id("run_id")], "requestBody": body("ForceStopRequest"), "responses": { "202": response("ForceStopOperation"), "200": response("ForceStopOperation"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/runs/{run_id}/events": { "get": { "summary": "List run events", "parameters": [id("run_id")], "responses": { "200": list_response("RunEvent"), "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/runs/{run_id}/events/stream": { "get": { "summary": "Stream run events", "parameters": [id("run_id")], "responses": { "200": { "description": "Server-sent event stream", "content": { "text/event-stream": { "schema": { "type": "string" } } } }, "401": { "$ref": "#/components/responses/Unauthorized" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
             "/api/runs/{run_id}/tool-results/{tool_request_id}": { "get": { "summary": "Read an archived tool result (size metadata or byte range)", "parameters": [id("run_id"), id("tool_request_id"), { "name": "mode", "in": "query", "schema": { "type": "string", "enum": ["size", "range"] } }, { "name": "offset", "in": "query", "schema": { "type": "integer" } }, { "name": "limit", "in": "query", "schema": { "type": "integer" } }], "responses": { "200": { "description": "Tool result artifact metadata or range text", "content": { "application/json": { "schema": { "type": "object" } } } }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" } } } },
@@ -1081,6 +1105,9 @@ pub(crate) fn openapi_document() -> Value {
             "/api/admin/runtimes/{runtime_id}/force-delete": { "post": { "summary": "Force delete a Runtime and invalidate owned Session generations", "parameters": [id("runtime_id")], "requestBody": body("ConfirmRuntimeHostnameRequest"), "responses": { "200": response("ForceDeleteRuntimeResponse"), "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
             "/api/runtime/register": { "post": { "summary": "Consume a one-time enrollment token and create an immutable Runtime identity", "security": [{ "runtimeEnrollmentBearer": [] }], "requestBody": body("RuntimeRegisterRequest"), "responses": { "200": response("RuntimeRegisterResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" } } } },
             "/api/runtime/heartbeat": { "post": { "summary": "Heartbeat and complete staged Runtime credential rotation", "security": [{ "runtimeBearer": [] }], "requestBody": body("RuntimeHeartbeatRequest"), "responses": { "200": response("RuntimeHeartbeatResponse"), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
+            "/api/runtime/keepalive": { "post": { "summary": "Lightweight keepalive: refresh runtime online status without session state or commands", "security": [{ "runtimeBearer": [] }], "responses": { "204": { "description": "No content" }, "401": { "$ref": "#/components/responses/Unauthorized" } } } },
+            "/api/runtime/force-stop/{operation_id}/bundle": { "put": { "summary": "Upload a force-stop workspace snapshot; commits bundle metadata, operation->succeeded and Session->offline atomically", "security": [{ "runtimeBearer": [] }], "parameters": [id("operation_id")], "responses": { "204": { "description": "Committed" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "$ref": "#/components/responses/Conflict" } } } },
+            "/api/runtime/ws": { "get": { "summary": "Runtime WebSocket channel: command delivery (force_stop/abandon), 10s owned-session reports and ACKs", "security": [{ "runtimeBearer": [] }], "responses": { "101": { "description": "WebSocket upgrade" }, "401": { "$ref": "#/components/responses/Unauthorized" } } } },
             "/api/runtime/runs/claim": { "post": { "summary": "Claim one capacity-fenced Run and its exclusive Session ownership generation", "security": [{ "runtimeBearer": [] }], "requestBody": body("RuntimeClaimRunRequest"), "responses": { "200": response("ClaimRunResponse"), "204": no_content(), "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" } } } },
             "/api/runtime/runs/{run_id}/skills/{skill_id}/package": { "get": { "summary": "Stream an active Run's snapshotted Skill package to its owning Runtime", "security": [{ "runtimeBearer": [] }], "parameters": [id("run_id"), id("skill_id"), required_header("x-agent-hub-ownership-generation", json!({ "type": "integer", "minimum": 1 }))], "responses": { "200": { "description": "Skill package tar.zst stream", "content": { "application/zstd": { "schema": { "type": "string", "format": "binary" } } } }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "502": { "description": "Skill package object download failed" }, "503": { "description": "Skill package object storage is not configured" } } } },
             "/api/runtime/sessions/{session_id}/skills/{skill_id}/packages/{package_id}": { "get": { "summary": "Stream a current Skill package while refreshing an owned Session", "security": [{ "runtimeBearer": [] }], "parameters": [id("session_id"), id("skill_id"), id("package_id"), required_header("x-agent-hub-ownership-generation", json!({ "type": "integer", "minimum": 1 }))], "responses": { "200": { "description": "Skill package tar.zst stream", "content": { "application/zstd": { "schema": { "type": "string", "format": "binary" } } } }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "502": { "description": "Skill package object download failed" }, "503": { "description": "Skill package object storage is not configured" } } } },
@@ -1373,6 +1400,8 @@ pub(crate) fn openapi_schemas() -> Value {
         "RuntimeSessionCommand": { "type": "object", "additionalProperties": false, "required": ["command_id", "session_id", "ownership_generation", "command", "run_id", "turn_id", "native_session_id", "native_turn_id", "message", "configuration_revision", "fingerprint", "execution_configuration"], "properties": { "command_id": uuid(), "session_id": uuid(), "ownership_generation": { "type": "integer", "minimum": 1 }, "command": { "type": "string", "enum": ["checkpoint", "steer", "interrupt", "refresh_configuration"] }, "run_id": { "anyOf": [uuid(), { "type": "null" }] }, "turn_id": { "anyOf": [uuid(), { "type": "null" }] }, "native_session_id": { "type": ["string", "null"] }, "native_turn_id": { "type": ["string", "null"] }, "message": { "anyOf": [{ "$ref": "#/components/schemas/RuntimeSteeringMessage" }, { "type": "null" }] }, "configuration_revision": { "type": ["integer", "null"], "minimum": 1 }, "fingerprint": { "type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$" }, "execution_configuration": { "anyOf": [{ "$ref": "#/components/schemas/AgentExecutionConfiguration" }, { "type": "null" }] } } },
         "RuntimeHeartbeatRequest": { "type": "object", "additionalProperties": false, "properties": { "pending_credential_hash": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" }, "accepts_session_commands": { "type": "boolean", "default": false }, "owned_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeOwnedSessionStateRequest" } }, "cleaned_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeOwnedSessionGeneration" } } } },
         "RuntimeHeartbeatResponse": { "type": "object", "additionalProperties": false, "required": ["rotation_requested", "pending_credential_accepted", "credential_activated", "runtime_status", "owned_sessions", "session_commands"], "properties": { "rotation_requested": { "type": "boolean" }, "pending_credential_accepted": { "type": "boolean" }, "credential_activated": { "type": "boolean" }, "runtime_status": { "type": "string" }, "owned_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeOwnedSessionSnapshot" } }, "cleanup_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeOwnedSessionGeneration" } }, "salvage_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeSalvageSession" } }, "session_commands": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeSessionCommand" } } } },
+        "ForceStopRequest": { "type": "object", "additionalProperties": false, "required": ["request_id"], "properties": { "request_id": { "type": "string" }, "expected_generation": { "type": "integer", "minimum": 1 } } },
+        "ForceStopOperation": { "type": "object", "additionalProperties": false, "required": ["operation_id", "session_id", "run_id", "request_id", "state"], "properties": { "operation_id": uuid(), "session_id": uuid(), "run_id": uuid(), "request_id": { "type": "string" }, "target_runtime_id": { "type": ["string", "null"], "format": "uuid" }, "state": { "type": "string", "enum": ["pending", "succeeded", "snapshot_lost", "abandoned"] }, "created_at": date(), "updated_at": date(), "snapshot_uploaded_at": { "type": ["string", "null"], "format": "date-time" } } },
         "RuntimeSalvageSession": { "type": "object", "additionalProperties": false, "required": ["session_id", "ownership_generation", "history_checkpoint", "bundle_generation"], "properties": { "session_id": uuid(), "ownership_generation": { "type": "integer", "minimum": 1 }, "history_checkpoint": { "type": "integer", "minimum": 0 }, "bundle_generation": { "type": "integer", "minimum": 1 } } },
         "RuntimeOwnedSessionGeneration": { "type": "object", "additionalProperties": false, "required": ["session_id", "ownership_generation"], "properties": { "session_id": uuid(), "ownership_generation": { "type": "integer", "minimum": 1 } } },
         "RuntimeClaimRunRequest": { "type": "object", "additionalProperties": false, "required": ["available_new_session_slots", "ready_owned_sessions"], "properties": { "available_new_session_slots": { "type": "integer", "minimum": 0 }, "ready_owned_sessions": { "type": "array", "items": { "$ref": "#/components/schemas/RuntimeOwnedSessionGeneration" } } } },
@@ -1975,6 +2004,7 @@ mod tests {
             "/api/admin/runtimes/{runtime_id}/force-delete",
             "/api/runtime/register",
             "/api/runtime/heartbeat",
+            "/api/runtime/keepalive",
             "/api/runtime/model-proxy/v1/responses",
             "/api/runtime/runs/claim",
             "/api/runtime/runs/{run_id}/turn/begin",
@@ -4807,7 +4837,7 @@ mod tests {
              Content-Type: text/plain\r\n\r\n\
              hello world\n\r\n\
              --test-boundary--\r\n")
-        .into_bytes();
+            .into_bytes();
 
         // 无凭据上传被拒绝。
         let unauthorized = router
@@ -4816,7 +4846,10 @@ mod tests {
                 axum::http::Request::builder()
                     .method(Method::POST)
                     .uri("/api/client/attachments")
-                    .header(header::CONTENT_TYPE, "multipart/form-data; boundary=test-boundary")
+                    .header(
+                        header::CONTENT_TYPE,
+                        "multipart/form-data; boundary=test-boundary",
+                    )
                     .body(Body::from(multipart.clone()))
                     .unwrap(),
             )
@@ -4832,7 +4865,10 @@ mod tests {
                     .method(Method::POST)
                     .uri("/api/client/attachments")
                     .header("x-agent-hub-embed-token", &widget_token)
-                    .header(header::CONTENT_TYPE, "multipart/form-data; boundary=test-boundary")
+                    .header(
+                        header::CONTENT_TYPE,
+                        "multipart/form-data; boundary=test-boundary",
+                    )
                     .body(Body::from(multipart))
                     .unwrap(),
             )

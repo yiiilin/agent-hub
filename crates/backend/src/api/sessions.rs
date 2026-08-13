@@ -399,7 +399,7 @@ pub(crate) async fn list_hub_sessions(
                 current_bundle_size_bytes, current_bundle_history_checkpoint,
                 current_bundle_ownership_generation,
                 current_bundle_producing_engine_version,
-                current_bundle_created_at, created_at, updated_at
+                current_bundle_created_at, current_bundle_kind, created_at, updated_at
          FROM hub_sessions
          WHERE owner_id = $1
          ORDER BY created_at DESC, id DESC",
@@ -783,7 +783,7 @@ pub(crate) async fn get_hub_session(
                 current_bundle_size_bytes, current_bundle_history_checkpoint,
                 current_bundle_ownership_generation,
                 current_bundle_producing_engine_version,
-                current_bundle_created_at, created_at, updated_at
+                current_bundle_created_at, current_bundle_kind, created_at, updated_at
          FROM hub_sessions
          WHERE id = $1 AND owner_id = $2",
     )
@@ -1794,6 +1794,256 @@ pub(crate) async fn stop_hub_run(
     let run = request_run_interrupt_tx(&mut tx, run_id, hub_session_id).await?;
     tx.commit().await?;
     Ok(Json(run))
+}
+
+/// 强制停止（硬停止）：作废当前活动任务 A（interrupted）+ 会话版本号 +1 +
+/// 消息 held/ambiguity 义务 + 创建 operation 与 force_stop 命令（NOTIFY 唤醒）。
+/// 权限：会话属主或显式授权管理员（super_admin）。request_id 必填且幂等。
+pub(crate) async fn force_stop_hub_run(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(run_id): Path<Uuid>,
+    Json(req): Json<ForceStopRequest>,
+) -> Result<(StatusCode, Json<ForceStopOperationDto>), ApiError> {
+    let request_id = req.request_id.trim().to_owned();
+    if request_id.is_empty() || request_id.len() > 128 {
+        return Err(ApiError::bad_request(
+            "request_id is required (<=128 chars)",
+        ));
+    }
+    let user = require_user(&state, &headers).await?;
+    let mut tx = state.pool.begin().await?;
+    let session = sqlx::query(
+        "SELECT runs.hub_session_id, sessions.origin_kind, sessions.lifecycle_status,
+                sessions.ownership_generation, sessions.runtime_owner_id,
+                sessions.active_turn_id, sessions.owner_id
+         FROM runs
+         JOIN hub_sessions AS sessions ON sessions.id = runs.hub_session_id
+         WHERE runs.id = $1
+         FOR UPDATE OF runs, sessions",
+    )
+    .bind(run_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::not_found("run not found"))?;
+    let hub_session_id: Uuid = session.get("hub_session_id");
+    let session_owner_id: Uuid = session.get("owner_id");
+    let origin_kind: String = session.get("origin_kind");
+    if origin_kind != "hub_native" {
+        return Err(ApiError::conflict(
+            "External Sessions are read-only in the Hub console",
+        ));
+    }
+    if session_owner_id != user.id && user.role != "super_admin" {
+        return Err(ApiError::forbidden(
+            "force stop requires the Session owner or an explicit administrator",
+        ));
+    }
+    let lifecycle: String = session.get("lifecycle_status");
+    if matches!(lifecycle.as_str(), "historical" | "recovery_failed") {
+        return Err(ApiError::conflict("session is read-only"));
+    }
+    let current_generation: i64 = session.get("ownership_generation");
+    if let Some(expected) = req.expected_generation {
+        if expected != current_generation {
+            return Err(ApiError::conflict("expected generation does not match"));
+        }
+    }
+    // 幂等：同 (session, request_id) 已有 operation → 返回首次结果。
+    if let Some(existing) = sqlx::query_as::<_, (Uuid, String)>(
+        "SELECT operation_id, state FROM force_stop_operation
+         WHERE session_id = $1 AND request_id = $2",
+    )
+    .bind(hub_session_id)
+    .bind(&request_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    {
+        let (operation_id, state) = existing;
+        let dto = load_force_stop_operation(&mut tx, operation_id).await?;
+        if matches!(state.as_str(), "succeeded" | "snapshot_lost" | "abandoned") {
+            // 终态：幂等返回首次结果（200）。
+            return Ok((StatusCode::OK, Json(dto)));
+        }
+        // 未完成：重复请求返回已存在的 operation（202，不重复创建）。
+        return Ok((StatusCode::ACCEPTED, Json(dto)));
+    }
+    // 当前活动任务 A 必须存在且处于活动状态。
+    let a = sqlx::query(
+        "SELECT id, status, hub_turn_id FROM runs
+         WHERE id = $1 AND hub_session_id = $2 AND status IN ('running', 'waiting_tool')
+         FOR UPDATE",
+    )
+    .bind(run_id)
+    .bind(hub_session_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(a) = a else {
+        tx.commit().await?;
+        return Err(ApiError::conflict("run is not active (already terminal)"));
+    };
+    let a_turn_id: Uuid = a.get("hub_turn_id");
+    // nonterminal 不变量：同会话其他 running/waiting_tool run → fail closed 409。
+    let other_active: bool = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM runs
+             WHERE hub_session_id = $1 AND id <> $2
+               AND status IN ('running', 'waiting_tool')
+         )",
+    )
+    .bind(hub_session_id)
+    .bind(run_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if other_active {
+        tx.commit().await?;
+        return Err(ApiError::conflict(
+            "session has other active runs; refusing force stop (invariant broken)",
+        ));
+    }
+    // 目标 runtime：无归属 → 409 不改库。
+    let target_runtime: Option<Uuid> = session.get("runtime_owner_id");
+    let Some(target_runtime) = target_runtime else {
+        tx.commit().await?;
+        return Err(ApiError::conflict(
+            "session is not owned by a runtime; cannot force stop",
+        ));
+    };
+    // 终结全部非 A pending run（held 其 queued 输入）。
+    let pending_runs: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT id, hub_turn_id FROM runs
+         WHERE hub_session_id = $1 AND status = 'pending' AND id <> $2
+         FOR UPDATE",
+    )
+    .bind(hub_session_id)
+    .bind(run_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    // 终结全部非 A pending run（其 queued 消息无需特殊处理——历史在 DB，
+    // 恢复时重建包含；消息绑定已终态 run，恢复时按 sequence 重建）。
+    for (pending_run, pending_turn) in pending_runs {
+        sqlx::query("UPDATE runs SET status = 'failed', updated_at = now() WHERE id = $1")
+            .bind(pending_run)
+            .execute(&mut *tx)
+            .await?;
+        insert_run_event_tx(
+            &mut tx,
+            pending_run,
+            "status".into(),
+            None,
+            Some("failed".into()),
+            json!({ "status": "failed", "reason": "superseded by force stop" }),
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE hub_session_turns
+             SET status = 'failed', ended_at = COALESCE(ended_at, now()), updated_at = now()
+             WHERE id = $1 AND session_id = $2",
+        )
+        .bind(pending_turn)
+        .bind(hub_session_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    // A：interrupted + 事件 + 回合终态。
+    sqlx::query("UPDATE runs SET status = 'interrupted', updated_at = now() WHERE id = $1")
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await?;
+    insert_run_event_tx(
+        &mut tx,
+        run_id,
+        "status".into(),
+        None,
+        Some("interrupted".into()),
+        json!({ "status": "interrupted", "reason": "force stopped by user" }),
+    )
+    .await?;
+    sqlx::query(
+        "UPDATE hub_session_turns
+         SET status = 'interrupted', ended_at = COALESCE(ended_at, now()), updated_at = now()
+         WHERE id = $1 AND session_id = $2",
+    )
+    .bind(a_turn_id)
+    .bind(hub_session_id)
+    .execute(&mut *tx)
+    .await?;
+    let operation_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO force_stop_operation
+             (operation_id, session_id, run_id, request_id, target_runtime_id, state)
+         VALUES ($1, $2, $3, $4, $5, 'pending')",
+    )
+    .bind(operation_id)
+    .bind(hub_session_id)
+    .bind(run_id)
+    .bind(&request_id)
+    .bind(target_runtime)
+    .execute(&mut *tx)
+    .await?;
+    // 会话：标记"强制停止中"（保持 runtime 归属与 generation——hub 权威，
+    // 由 10s 持有上报与非权威抛弃兜底），清 saving/checkpoint 状态。
+    sqlx::query(
+        "UPDATE hub_sessions
+         SET active_turn_id = NULL,
+             lifecycle_status = 'force_stopping', recovery_source = NULL,
+             saving_history_checkpoint = NULL, saving_ownership_generation = NULL,
+             saving_reason = NULL, saving_checkpoint_attempt_id = NULL,
+             last_checkpoint_attempt_id = NULL, last_checkpoint_ownership_generation = NULL,
+             last_checkpoint_disposition = NULL, last_checkpoint_has_queued_work = NULL,
+             updated_at = now()
+         WHERE id = $1",
+    )
+    .bind(hub_session_id)
+    .execute(&mut *tx)
+    .await?;
+    // 取消 pending/claimed tool 请求。
+    sqlx::query(
+        "UPDATE integration_tool_requests SET status = 'cancelled'
+         WHERE hub_session_id = $1 AND run_id = $2 AND status IN ('pending', 'claimed')",
+    )
+    .bind(hub_session_id)
+    .bind(run_id)
+    .execute(&mut *tx)
+    .await?;
+    let dto = load_force_stop_operation(&mut tx, operation_id).await?;
+    tx.commit().await?;
+    // 推送停止命令（WebSocket；连接不在线则由 10 秒上报兜底重推）。
+    crate::runtime_ws::push_force_stop_command(
+        &state,
+        target_runtime,
+        operation_id,
+        hub_session_id,
+        run_id,
+    )
+    .await;
+    Ok((StatusCode::ACCEPTED, Json(dto)))
+}
+
+pub(crate) async fn load_force_stop_operation(
+    tx: &mut Transaction<'_, Postgres>,
+    operation_id: Uuid,
+) -> Result<ForceStopOperationDto, ApiError> {
+    let row = sqlx::query(
+        "SELECT operation_id, session_id, run_id, request_id, target_runtime_id,
+                state, created_at, updated_at, snapshot_uploaded_at
+         FROM force_stop_operation WHERE operation_id = $1",
+    )
+    .bind(operation_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(ApiError::not_found("force stop operation not found"))?;
+    Ok(ForceStopOperationDto {
+        operation_id: row.get("operation_id"),
+        session_id: row.get("session_id"),
+        run_id: row.get("run_id"),
+        request_id: row.get("request_id"),
+        target_runtime_id: row.get("target_runtime_id"),
+        state: row.get("state"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+        snapshot_uploaded_at: row.get("snapshot_uploaded_at"),
+    })
 }
 
 pub(crate) async fn list_run_events(
@@ -3220,6 +3470,7 @@ mod tests {
         sqlx::query(
             "UPDATE hub_sessions
              SET current_bundle_generation = 1,
+                 current_bundle_kind = 'checkpoint',
                  current_bundle_object_key = 'sessions/native/bundle-1.tar.zst',
                  current_bundle_checksum_sha256 = 'abc123',
                  current_bundle_size_bytes = 4096,
@@ -6101,7 +6352,8 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn stop_on_terminal_run_is_idempotent_and_returns_the_run(pool: PgPool) {
-        let fixture = runtime_claim_fixture(pool.clone(), "workspace-write", "workspace-write").await;
+        let fixture =
+            runtime_claim_fixture(pool.clone(), "workspace-write", "workspace-write").await;
         sqlx::query("UPDATE runs SET status = 'completed' WHERE id = $1")
             .bind(fixture.run_id)
             .execute(&pool)
