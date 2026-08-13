@@ -210,10 +210,12 @@ async fn execute_force_stop(
     }
 
     // 打包工作区快照（force-stop 快照：manifest 仅 session + workspace + 格式版本）。
+    // 工作区不存在 = 无快照可传 → 快照丢失（不得 ok，否则 hub 清 pending 后
+    // 只剩 5 分钟兜底）。失败路径保留工作区（环境尽量保留），只删 staging 归档。
     let workspace = SessionPaths::for_session(&config.work_root, session_id).workspace;
     if !workspace.is_dir() {
-        cleanup().await;
-        return "ok";
+        tracing::warn!(%session_id, "force stop: workspace missing, snapshot lost");
+        return "snapshot_lost";
     }
     let archive_path = config
         .work_root
@@ -239,7 +241,6 @@ async fn execute_force_stop(
         Ok(Err(error)) | Err(error) => {
             tracing::error!(%session_id, error = %error, "force stop bundle creation failed");
             let _ = tokio::fs::remove_file(&archive_path).await;
-            cleanup().await;
             return "snapshot_lost";
         }
     };
@@ -260,7 +261,6 @@ async fn execute_force_stop(
                         "force stop bundle upload failed after {attempts} attempts; snapshot lost"
                     );
                     let _ = tokio::fs::remove_file(&artifact.archive_path).await;
-                    cleanup().await;
                     return "snapshot_lost";
                 }
                 tracing::warn!(%session_id, %operation_id, error = %error,
@@ -274,4 +274,119 @@ async fn execute_force_stop(
     cleanup().await;
     tracing::info!(%session_id, %operation_id, "force stop snapshot uploaded");
     "ok"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn test_config(work_root: &std::path::Path) -> crate::Config {
+        crate::Config {
+            hub_url: "http://127.0.0.1:1.invalid".into(),
+            enrollment_token: None,
+            credential_file: work_root.join("credential.json"),
+            work_root: work_root.to_path_buf(),
+            hostname: "ws-test-runtime".into(),
+            poll_interval: std::time::Duration::from_millis(10),
+            engine_driver: "pi".into(),
+            engine_bin: "pi".into(),
+            engine_version: "test-engine".into(),
+            engine_timeout: std::time::Duration::from_secs(1),
+            model_proxy_idle_timeout: std::time::Duration::from_secs(1),
+            session_idle_timeout: crate::DEFAULT_SESSION_IDLE_TIMEOUT,
+            max_online_sessions: crate::DEFAULT_MAX_ONLINE_SESSIONS,
+            workdir_ttl: std::time::Duration::from_secs(3600),
+            hub_upload_retry_delays_secs: vec![0, 0, 0],
+            local_skills_dir: None,
+            maintenance_token_file: None,
+            sandbox_mode: "workspace-write".into(),
+            sandbox_downgrade_reason: None,
+            health_bind_addr: "127.0.0.1:0".parse().unwrap(),
+        }
+    }
+
+    fn test_manager(work_root: &std::path::Path) -> Arc<SessionSupervisorManager> {
+        SessionSupervisorManager::recover_cold(
+            work_root.to_path_buf(),
+            Uuid::new_v4(),
+            crate::SessionRecoveryPlan {
+                records: std::collections::BTreeMap::new(),
+                max_online_sessions: crate::DEFAULT_MAX_ONLINE_SESSIONS,
+            },
+        )
+    }
+
+    /// 无法连通的 hub：打包成功但上传必然失败（3 次后 snapshot_lost）。
+    fn unreachable_client() -> HubClient {
+        HubClient {
+            http: reqwest::Client::new(),
+            hub_url: "http://127.0.0.1:1.invalid".into(),
+            runtime_token: Arc::new(std::sync::RwLock::new("ws-test-token".into())),
+            protocol_capabilities: Default::default(),
+            upload_retry_delays_secs: vec![0, 0, 0],
+        }
+    }
+
+    #[tokio::test]
+    async fn force_stop_with_missing_workspace_reports_snapshot_lost() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = test_config(temp.path());
+        let manager = test_manager(temp.path());
+        let client = unreachable_client();
+        let session_id = Uuid::new_v4();
+        let status =
+            execute_force_stop(&config, &client, &manager, Uuid::new_v4(), session_id, true).await;
+        assert_eq!(status, "snapshot_lost");
+    }
+
+    #[tokio::test]
+    async fn force_stop_abandon_without_snapshot_returns_ok() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = test_config(temp.path());
+        let manager = test_manager(temp.path());
+        let client = unreachable_client();
+        let session_id = Uuid::new_v4();
+        let status = execute_force_stop(
+            &config,
+            &client,
+            &manager,
+            Uuid::new_v4(),
+            session_id,
+            false,
+        )
+        .await;
+        assert_eq!(status, "ok");
+    }
+
+    #[tokio::test]
+    async fn force_stop_upload_failure_keeps_workspace_and_removes_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = test_config(temp.path());
+        let manager = test_manager(temp.path());
+        let client = unreachable_client();
+        let session_id = Uuid::new_v4();
+        // 工作区存在且含文件（模拟真实会话环境）。
+        let workspace = SessionPaths::for_session(&config.work_root, session_id).workspace;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::write(workspace.join("keep.txt"), "keep")
+            .await
+            .unwrap();
+
+        let operation_id = Uuid::new_v4();
+        let status =
+            execute_force_stop(&config, &client, &manager, operation_id, session_id, true).await;
+        assert_eq!(status, "snapshot_lost");
+        // 环境尽量保留：工作区未被删除。
+        assert!(
+            workspace.join("keep.txt").exists(),
+            "workspace must be preserved on failure"
+        );
+        // staging 归档已清理。
+        let staging = config
+            .work_root
+            .join("bundle-staging")
+            .join(format!("force-stop-{operation_id}.tar.zst"));
+        assert!(!staging.exists(), "staging archive must be removed");
+    }
 }

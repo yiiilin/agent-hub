@@ -770,12 +770,6 @@ pub(crate) async fn runtime_upload_force_stop_bundle(
             "Session Bundle body does not match its declared checksum/size",
         ));
     }
-    if actual_sha256 != checksum || actual_size != size_bytes {
-        let _ = store.delete(&object_key).await;
-        return Err(ApiError::bad_request(
-            "Session Bundle body does not match its declared checksum/size",
-        ));
-    }
 
     // 二次事务：锁会话与 operation 重验证（pending + force_stopping + target owner），
     // bundle generation = 当前 + 1（不覆盖既有），失败则删除已上传对象。
@@ -8318,6 +8312,127 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(op_count, 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn force_stop_unknown_ack_status_keeps_pending_and_retries(pool: PgPool) {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM hub_sessions WHERE id = $1")
+            .bind(fixture.hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        let session_token = format!("ahs_{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO sessions (token_hash, user_id, expires_at)
+             VALUES ($1, $2, now() + interval '1 hour')",
+        )
+        .bind(sha256_hex(&session_token))
+        .bind(owner_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let user_headers = HeaderMap::from_iter([(
+            header::COOKIE,
+            format!("agent_hub_session={session_token}")
+                .parse()
+                .unwrap(),
+        )]);
+
+        let app = build_router((*fixture.state).clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .await
+                .unwrap();
+        });
+        let url = format!("ws://{address}/api/runtime/ws");
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().insert(
+            "Authorization",
+            HeaderValue::from_str(&format!("Bearer {}", fixture.runtime_token)).unwrap(),
+        );
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+
+        let (status, dto) = force_stop_hub_run(
+            State(fixture.state.clone()),
+            user_headers,
+            Path(fixture.run_id),
+            Json(ForceStopRequest {
+                request_id: "unknown-ack-1".into(),
+                expected_generation: Some(1),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        // 收到命令。
+        let message = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("command timeout")
+            .expect("closed")
+            .unwrap();
+        let tokio_tungstenite::tungstenite::Message::Text(text) = message else {
+            panic!("expected text");
+        };
+        let command: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(command["type"], "command");
+        assert_eq!(command["operation_id"], dto.operation_id.to_string());
+
+        // 未知 status 的 ack：不得确认 pending。
+        use futures_util::SinkExt;
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({
+                    "type": "ack",
+                    "operation_id": dto.operation_id,
+                    "status": "bogus",
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+        // 10 秒 ACK 超时后应收到同命令重发（pending 未被清）。
+        let message = tokio::time::timeout(std::time::Duration::from_secs(14), socket.next())
+            .await
+            .expect("retry timeout")
+            .expect("closed")
+            .unwrap();
+        let tokio_tungstenite::tungstenite::Message::Text(text) = message else {
+            panic!("expected text");
+        };
+        let retry: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(retry["type"], "command");
+        assert_eq!(retry["operation_id"], dto.operation_id.to_string());
+        assert_eq!(retry["kind"], "force_stop");
+
+        // 合法 ok ack 后不再重发：等待一个超时窗口，确认无新消息。
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({
+                    "type": "ack",
+                    "operation_id": dto.operation_id,
+                    "status": "ok",
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let idle = tokio::time::timeout(std::time::Duration::from_secs(12), socket.next());
+        assert!(idle.await.is_err(), "acked command must not be retried");
+        socket.close(None).await.unwrap();
+        server.abort();
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -92,11 +92,23 @@ impl RuntimeWsRegistry {
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ACK_SENDS: u32 = 4; // 首次 + 最多 3 次重发
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AckStatus {
+    Ok,
+    SnapshotLost,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum UpstreamMessage {
-    Ack { operation_id: Uuid, status: String },
-    OwnedSessions { sessions: Vec<OwnedSessionReport> },
+    Ack {
+        operation_id: Uuid,
+        status: AckStatus,
+    },
+    OwnedSessions {
+        sessions: Vec<OwnedSessionReport>,
+    },
 }
 
 /// 上报的持有会话（run_id 为本地 record 的 reserved_run_id，无活动 run 时为 null）。
@@ -222,16 +234,17 @@ async fn handle_upstream(
             operation_id,
             status,
         } => {
-            // 匹配 in-flight 命令 → 确认完成。
+            // 匹配 in-flight 命令 → 确认完成（未知 status 会被 serde 拒绝，
+            // 整个消息忽略，pending 保留并继续按超时重发）。
             if let Some(p) = pending.as_ref() {
                 if p.operation_id == operation_id {
                     *pending = None;
                 }
             }
-            // status == "ok" 不在此处提交：快照上传成功以 HTTP 上传端点的原子事务为准。
-            // status == "snapshot_lost"：单事务原子终态（锁 operation + 校验
+            // status == ok 不在此处提交：快照上传成功以 HTTP 上传端点的原子事务为准。
+            // status == snapshot_lost：单事务原子终态（锁 operation + 校验
             // pending、target runtime、会话对应与 force_stopping；不匹配忽略）。
-            if status == "snapshot_lost" {
+            if status == AckStatus::SnapshotLost {
                 apply_snapshot_lost(state, runtime_id, operation_id).await;
             }
         }
