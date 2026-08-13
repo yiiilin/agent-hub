@@ -414,23 +414,80 @@ pub(crate) async fn expire_stuck_force_stops(state: &Arc<AppState>) {
     .await
     .unwrap_or_default();
     for (operation_id, session_id) in rows {
-        let _ = sqlx::query(
+        expire_snapshot_lost(state, operation_id).await;
+        tracing::warn!(%operation_id, %session_id, "force stop timed out, marked snapshot lost");
+    }
+}
+
+/// 超时兜底没有发起 runtime：走一个不可能匹配的 runtime id，
+/// 由 apply_snapshot_lost 的 target 校验分支？——不行，这会误伤。
+/// 超时兜底直接使用原子锁核心的独立入口（无 target 校验）。
+async fn expire_snapshot_lost(state: &Arc<AppState>, operation_id: Uuid) {
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(error) => {
+            tracing::error!(%operation_id, error = %error, "begin expire snapshot_lost tx failed");
+            return;
+        }
+    };
+    let row = match sqlx::query(
+        "SELECT o.session_id, o.run_id, o.state, s.lifecycle_status
+         FROM force_stop_operation o
+         JOIN hub_sessions s ON s.id = o.session_id
+         WHERE o.operation_id = $1
+         FOR UPDATE OF o, s",
+    )
+    .bind(operation_id)
+    .fetch_optional(&mut *tx)
+    .await
+    {
+        Ok(row) => row,
+        Err(error) => {
+            tracing::error!(%operation_id, error = %error, "lock expire snapshot_lost failed");
+            return;
+        }
+    };
+    let Some(row) = row else { return };
+    if row.get::<String, _>("state") != "pending"
+        || row.get::<String, _>("lifecycle_status") != "force_stopping"
+    {
+        return;
+    }
+    let session_id: Uuid = row.get("session_id");
+    let run_id: Uuid = row.get("run_id");
+    let result = async {
+        let updated = sqlx::query(
             "UPDATE hub_sessions
                 SET runtime_owner_id = NULL, lifecycle_status = 'offline', updated_at = now()
               WHERE id = $1 AND lifecycle_status = 'force_stopping'",
         )
         .bind(session_id)
-        .execute(&state.pool)
-        .await;
-        let _ = sqlx::query(
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            anyhow::bail!("session is no longer force stopping");
+        }
+        let updated = sqlx::query(
             "UPDATE force_stop_operation
                 SET state = 'snapshot_lost', updated_at = now()
               WHERE operation_id = $1 AND state = 'pending'",
         )
         .bind(operation_id)
-        .execute(&state.pool)
-        .await;
-        tracing::warn!(%operation_id, %session_id, "force stop timed out, marked snapshot lost");
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            anyhow::bail!("operation is no longer pending");
+        }
+        sqlx::query("UPDATE runs SET status = 'interrupted', updated_at = now() WHERE id = $1")
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(%operation_id, error = %error, "expire snapshot_lost atomic update failed");
     }
 }
 

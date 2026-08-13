@@ -754,13 +754,28 @@ pub(crate) async fn runtime_upload_force_stop_bundle(
     let object_key = format!("sessions/{session_id}/force-stop-{operation_id}.tar.zst");
     tx.commit().await?;
 
+    // 边传边算实际字节数/SHA-256：SigV4 不会校验流式 body，声明必须与实物一致。
+    let (hashing, accumulator) = HashingStream::new(body.into_data_stream());
     store
-        .put_stream(&object_key, size_bytes, &checksum, body.into_data_stream())
+        .put_stream(&object_key, size_bytes, &checksum, hashing)
         .await
         .map_err(|error| {
             tracing::warn!(%operation_id, error = %error, "force stop bundle upload failed");
             ApiError::bad_gateway("Session Bundle upload failed")
         })?;
+    let (actual_sha256, actual_size) = accumulator.lock().unwrap().digest();
+    if actual_sha256 != checksum || actual_size != size_bytes {
+        let _ = store.delete(&object_key).await;
+        return Err(ApiError::bad_request(
+            "Session Bundle body does not match its declared checksum/size",
+        ));
+    }
+    if actual_sha256 != checksum || actual_size != size_bytes {
+        let _ = store.delete(&object_key).await;
+        return Err(ApiError::bad_request(
+            "Session Bundle body does not match its declared checksum/size",
+        ));
+    }
 
     // 二次事务：锁会话与 operation 重验证（pending + force_stopping + target owner），
     // bundle generation = 当前 + 1（不覆盖既有），失败则删除已上传对象。
@@ -2902,6 +2917,63 @@ pub(crate) async fn commit_session_bundle_metadata_tx(
     .execute(&mut **tx)
     .await?;
     load_hub_session_tx(tx, session_id).await
+}
+
+/// 流式包装：边转发边计算实际字节数与 SHA-256（防声明与实际不符）。
+/// put_stream 消费后不返回流本体，因此用共享累加器取出实测值。
+struct HashAccumulator {
+    hasher: Sha256,
+    count: u64,
+}
+
+impl HashAccumulator {
+    fn digest(&self) -> (String, u64) {
+        (format!("{:x}", self.hasher.clone().finalize()), self.count)
+    }
+}
+
+struct HashingStream<S> {
+    inner: S,
+    shared: Arc<std::sync::Mutex<HashAccumulator>>,
+}
+
+impl<S> HashingStream<S> {
+    fn new(inner: S) -> (Self, Arc<std::sync::Mutex<HashAccumulator>>) {
+        let shared = Arc::new(std::sync::Mutex::new(HashAccumulator {
+            hasher: Sha256::new(),
+            count: 0,
+        }));
+        (
+            Self {
+                inner,
+                shared: Arc::clone(&shared),
+            },
+            shared,
+        )
+    }
+}
+
+impl<S> futures_util::Stream for HashingStream<S>
+where
+    S: futures_util::Stream<Item = Result<Bytes, axum::Error>> + Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match futures_util::Stream::poll_next(std::pin::Pin::new(&mut self.inner), cx) {
+            std::task::Poll::Ready(Some(Ok(chunk))) => {
+                let mut acc = self.shared.lock().unwrap();
+                acc.hasher.update(&chunk);
+                acc.count += chunk.len() as u64;
+                drop(acc);
+                std::task::Poll::Ready(Some(Ok(chunk)))
+            }
+            other => other,
+        }
+    }
 }
 
 pub(crate) fn validate_sha256_hex(value: &str) -> Result<(), ApiError> {
@@ -8246,6 +8318,149 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(op_count, 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn force_stop_bundle_upload_rejects_mismatched_checksum(pool: PgPool) {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM hub_sessions WHERE id = $1")
+            .bind(fixture.hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        let session_token = format!("ahs_{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO sessions (token_hash, user_id, expires_at)
+             VALUES ($1, $2, now() + interval '1 hour')",
+        )
+        .bind(sha256_hex(&session_token))
+        .bind(owner_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let user_headers = HeaderMap::from_iter([(
+            header::COOKIE,
+            format!("agent_hub_session={session_token}")
+                .parse()
+                .unwrap(),
+        )]);
+        let (status, dto) = force_stop_hub_run(
+            State(fixture.state.clone()),
+            user_headers,
+            Path(fixture.run_id),
+            Json(ForceStopRequest {
+                request_id: "checksum-mismatch-1".into(),
+                expected_generation: Some(1),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED);
+
+        // mock S3：记录 PUT 对象与 DELETE。
+        let objects = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let deleted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let object_app = Router::new()
+            .route(
+                "/bundle-bucket/{*key}",
+                axum::routing::put({
+                    let objects = Arc::clone(&objects);
+                    move |Path(key): Path<String>, body: Body| {
+                        let objects = Arc::clone(&objects);
+                        async move {
+                            let bytes = axum::body::to_bytes(body, 1024).await.unwrap().to_vec();
+                            objects.lock().unwrap().insert(key, bytes);
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/bundle-bucket/{*key}",
+                axum::routing::delete({
+                    let deleted = Arc::clone(&deleted);
+                    move |Path(key): Path<String>| {
+                        let deleted = Arc::clone(&deleted);
+                        async move {
+                            deleted.lock().unwrap().push(key);
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let object_server =
+            tokio::spawn(async move { axum::serve(listener, object_app).await.unwrap() });
+        let store = crate::session_bundle_store::S3BundleStore::new(
+            crate::session_bundle_store::S3BundleStoreConfig {
+                endpoint: format!("http://{address}").parse().unwrap(),
+                bucket: "bundle-bucket".into(),
+                region: "us-test-1".into(),
+                access_key_id: "test-access".into(),
+                secret_access_key: "test-secret".into(),
+                session_token: None,
+                server_side_encryption: None,
+                kms_key_id: None,
+                allow_http: true,
+            },
+        )
+        .unwrap();
+        let mut state = (*fixture.state).clone();
+        state.session_bundle_store = Some(Arc::new(store));
+        state.session_bundle_max_bytes = 1024;
+        let state = Arc::new(state);
+
+        // 声明 checksum 与实际 body 不符 → 409，对象被删除，状态不变。
+        let bytes = Bytes::from_static(b"actual body bytes");
+        let mut headers = bearer_headers(&fixture.runtime_token);
+        for (name, value) in [
+            ("content-length", bytes.len().to_string()),
+            (
+                "x-agent-hub-bundle-sha256",
+                "0".repeat(64), // 错误 checksum
+            ),
+            ("x-agent-hub-bundle-size", bytes.len().to_string()),
+        ] {
+            headers.insert(
+                name.parse::<HeaderName>().unwrap(),
+                value.parse::<HeaderValue>().unwrap(),
+            );
+        }
+        let err = runtime_upload_force_stop_bundle(
+            State(state.clone()),
+            headers,
+            Path(dto.operation_id),
+            Body::from(bytes),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            deleted.lock().unwrap().len(),
+            1,
+            "mismatched object must be deleted"
+        );
+        let (op_state,): (String,) =
+            sqlx::query_as("SELECT state FROM force_stop_operation WHERE operation_id = $1")
+                .bind(dto.operation_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(op_state, "pending", "mismatched upload must not commit");
+        let (lifecycle,): (String,) =
+            sqlx::query_as("SELECT lifecycle_status FROM hub_sessions WHERE id = $1")
+                .bind(fixture.hub_session_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(lifecycle, "force_stopping");
+        object_server.abort();
     }
 
     #[sqlx::test(migrations = "./migrations")]

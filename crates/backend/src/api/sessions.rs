@@ -1838,6 +1838,13 @@ pub(crate) async fn force_stop_hub_run(
         false, // 控制台：仅 hub_native 会话。
     )
     .await?;
+    // 新建的 operation 必须绑定确定的目标 runtime（核心已校验归属），
+    // 否则回滚（不静默吞掉推送）。
+    if created && dto.target_runtime_id.is_none() {
+        return Err(ApiError::internal(
+            "force stop operation was created without a target runtime",
+        ));
+    }
     tx.commit().await?;
     // 幂等语义：终态返回首次结果（200）；未完成返回 202（不重复创建）。
     let status = if matches!(

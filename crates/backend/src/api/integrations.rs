@@ -1676,6 +1676,12 @@ pub(crate) async fn force_stop_widget_run(
         true, // client 凭证作用域内的会话（含 external）允许强制停止。
     )
     .await?;
+    // 新建的 operation 必须绑定确定的目标 runtime，否则回滚。
+    if created && dto.target_runtime_id.is_none() {
+        return Err(ApiError::internal(
+            "force stop operation was created without a target runtime",
+        ));
+    }
     tx.commit().await?;
     let status = if matches!(
         dto.state.as_str(),

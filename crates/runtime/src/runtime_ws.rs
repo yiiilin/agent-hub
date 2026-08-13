@@ -144,16 +144,8 @@ async fn run_ws_connection(
                             }
                             continue;
                         };
-                        // 接管成功：立即 ack ok（清 hub 侧 pending）。
-                        let ack = json!({
-                            "type": "ack",
-                            "operation_id": operation_id,
-                            "status": "ok",
-                        });
-                        if socket.send(Message::Text(ack.to_string().into())).await.is_err() {
-                            break;
-                        }
-                        // 后台执行打包/上传/清理；失败回传 snapshot_lost。
+                        // 接管成功：先 spawn 快照任务（杀 Pi 后打包/上传可能耗时，
+                        // 且 ack 发送失败不得丢弃快照），再发 ack ok（清 hub 侧 pending）。
                         let config = config.clone();
                         let client = client.clone();
                         let manager = Arc::clone(manager);
@@ -170,6 +162,14 @@ async fn run_ws_connection(
                                     .await;
                             }
                         });
+                        let ack = json!({
+                            "type": "ack",
+                            "operation_id": operation_id,
+                            "status": "ok",
+                        });
+                        if socket.send(Message::Text(ack.to_string().into())).await.is_err() {
+                            break;
+                        }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(_)) => {}
