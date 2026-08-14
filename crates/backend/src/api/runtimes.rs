@@ -3465,6 +3465,24 @@ pub(crate) async fn runtime_claim_run(
     let mut execution_configuration =
         build_agent_execution_configuration(&agent, execution_config_revision, skill_rows)?;
     execution_configuration.model_bindings = model_bindings;
+    // 第三方应用预指令（会话创建时一次性写入）：合并到基础指令之后，
+    // 随现有 instructions → Pi AGENTS.md 注入链生效（新建与恢复共用）。
+    let prepend_instructions: Option<String> = sqlx::query_scalar(
+        "SELECT session.prepend_instructions
+         FROM runs
+         JOIN integration_sessions AS session ON session.id = runs.integration_session_id
+         WHERE runs.id = $1",
+    )
+    .bind(run_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .flatten();
+    if let Some(prepend) = prepend_instructions {
+        if !execution_configuration.instructions.trim().is_empty() {
+            execution_configuration.instructions.push_str("\n\n");
+        }
+        execution_configuration.instructions.push_str(&prepend);
+    }
     let expected_configuration_fingerprint =
         execution_configuration_fingerprint(&execution_configuration)
             .map_err(|error| ApiError::internal(error.to_string()))?;

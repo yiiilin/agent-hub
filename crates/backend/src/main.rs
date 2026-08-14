@@ -11197,6 +11197,7 @@ mod tests {
                 hub_session_id: None,
                 parent_run_id: None,
                 client_message_key: None,
+                prepend_instructions: None,
             }),
         )
         .await

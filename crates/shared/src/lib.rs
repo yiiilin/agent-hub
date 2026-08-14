@@ -2046,6 +2046,11 @@ pub struct CreateWidgetRunRequest {
     pub parent_run_id: Option<Uuid>,
     #[serde(default)]
     pub client_message_key: Option<String>,
+    /// 第三方应用预指令：仅会话创建时（首个 run 且新建 integration session）
+    /// 一次性写入，之后不可变；限 65536 字节。与智能体基础指令合并后注入
+    /// Pi 的 AGENTS.md（新建与恢复共用同一注入链）。
+    #[serde(default)]
+    pub prepend_instructions: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3265,6 +3270,7 @@ mod tests {
             ownership_generation: 3,
             recovery_error: None,
             current_bundle: Some(CurrentSessionBundleDto {
+                kind: "checkpoint".into(),
                 generation: 2,
                 object_key: "sessions/1/bundle-2.tar.zst".into(),
                 checksum_sha256: "abc123".into(),

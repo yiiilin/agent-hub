@@ -1292,6 +1292,22 @@ pub(crate) async fn create_widget_run(
             return Err(ApiError::requires_secret_grants(missing_grants));
         }
     }
+    let prepend_instructions = match req.prepend_instructions.as_deref() {
+        Some(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                if trimmed.len() > 65536 {
+                    return Err(ApiError::bad_request(
+                        "prepend_instructions must not exceed 65536 bytes",
+                    ));
+                }
+                Some(trimmed)
+            }
+        }
+        None => None,
+    };
     let client_message_key = normalize_client_message_key(req.client_message_key.as_deref())?;
     let (requested_integration_session_id, requested_hub_session_id) =
         widget_run_session_locator(&credential, &req)?;
@@ -1380,6 +1396,13 @@ pub(crate) async fn create_widget_run(
             serde_json::from_value::<ExternalUserContextDto>(credential.profile_snapshot.clone())
                 .map_err(|_| ApiError::internal("external Widget profile is invalid"))?;
 
+        if prepend_instructions.is_some()
+            && (requested_integration_session_id.is_some() || requested_hub_session_id.is_some())
+        {
+            return Err(ApiError::bad_request(
+                "prepend_instructions is immutable after session creation",
+            ));
+        }
         let (selected_hub_session_id, selected_integration_session_id) =
             if requested_integration_session_id.is_some() || requested_hub_session_id.is_some() {
                 let selected = load_widget_scoped_session_tx(
@@ -1421,6 +1444,11 @@ pub(crate) async fn create_widget_run(
                     } else {
                         None
                     };
+                if prepend_instructions.is_some() && retried_session.is_some() {
+                    return Err(ApiError::bad_request(
+                        "prepend_instructions is immutable after session creation",
+                    ));
+                }
                 if let Some((integration_session_id, hub_session_id)) = retried_session {
                     let selected = load_widget_scoped_session_tx(
                         &mut tx,
@@ -1457,8 +1485,8 @@ pub(crate) async fn create_widget_run(
                     sqlx::query(
                         "INSERT INTO integration_sessions
                              (id, oauth_app_id, agent_id, owner_id, external_user_id,
-                              tool_definitions, metadata, hub_session_id)
-                         VALUES ($1, $2, $3, $4, $5, '[]'::jsonb, '{}'::jsonb, $6)",
+                              tool_definitions, metadata, hub_session_id, prepend_instructions)
+                         VALUES ($1, $2, $3, $4, $5, '[]'::jsonb, '{}'::jsonb, $6, $7)",
                     )
                     .bind(integration_session_id)
                     .bind(oauth_app_id)
@@ -1466,6 +1494,7 @@ pub(crate) async fn create_widget_run(
                     .bind(credential.owner_id)
                     .bind(external_user_id)
                     .bind(hub_session_id)
+                    .bind(prepend_instructions)
                     .execute(&mut *tx)
                     .await?;
                     (hub_session_id, integration_session_id)
@@ -8233,6 +8262,108 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn client_run_prepend_instructions_written_once_and_immutable(pool: PgPool) {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+        let fixture = widget_external_test_fixture(pool, true).await;
+        let tenant_id = format!("tenant-{}", Uuid::new_v4().simple());
+        let external_user_id = format!("ext-{}", Uuid::new_v4().simple());
+        let access = issue_client_access_for_instance(
+            &fixture,
+            fixture.client_instance_id,
+            &tenant_id,
+            &external_user_id,
+            test_client_tool_definitions(&["open_panel"]),
+        )
+        .await;
+        let token = access.access_token;
+
+        // 1. 创建会话并带预指令 → 写入 integration_sessions。
+        let mut create_headers = HeaderMap::new();
+        create_headers.insert(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let run = create_widget_run(
+            State(fixture.state.clone()),
+            create_headers,
+            Json(CreateWidgetRunRequest {
+                message: "create with prepend".into(),
+                session_id: None,
+                integration_session_id: None,
+                hub_session_id: None,
+                parent_run_id: None,
+                client_message_key: Some("create-with-prepend-1".into()),
+                prepend_instructions: Some("业务术语：工程解决方案=应用系统。".into()),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let integration_session_id = run.integration_session_id.expect("external session id");
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT prepend_instructions FROM integration_sessions WHERE id = $1",
+        )
+        .bind(integration_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stored.as_deref(),
+            Some("业务术语：工程解决方案=应用系统。"),
+            "prepend must be written at session creation"
+        );
+
+        // 2. 既有会话再带预指令 → 400（不可变）。
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let err = create_widget_run(
+            State(fixture.state.clone()),
+            headers,
+            Json(CreateWidgetRunRequest {
+                message: "second message".into(),
+                session_id: Some(integration_session_id),
+                integration_session_id: None,
+                hub_session_id: None,
+                parent_run_id: None,
+                client_message_key: Some("immutable-check-1".into()),
+                prepend_instructions: Some("改变预指令".into()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+
+        // 3. 超长 → 400。
+        let mut headers2 = HeaderMap::new();
+        headers2.insert(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let err = create_widget_run(
+            State(fixture.state.clone()),
+            headers2,
+            Json(CreateWidgetRunRequest {
+                message: "third message".into(),
+                session_id: None,
+                integration_session_id: None,
+                hub_session_id: None,
+                parent_run_id: None,
+                client_message_key: Some("too-long-1".into()),
+                prepend_instructions: Some("x".repeat(65537)),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn widget_force_stop_works_for_external_session_and_is_scoped(pool: PgPool) {
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::DEBUG)
@@ -8497,6 +8628,7 @@ mod tests {
                 hub_session_id: Some(fixture.hub_session_id),
                 parent_run_id: None,
                 client_message_key: Some("widget-active-turn".into()),
+                prepend_instructions: None,
             }),
         )
         .await
