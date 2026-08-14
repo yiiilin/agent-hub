@@ -6934,6 +6934,68 @@ mod tests {
     }
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn runtime_turn_started_clears_recovery_source_when_resuming(pool: PgPool) {
+        let fixture = integration_runtime_fixture(pool).await;
+        // 模拟恢复中的会话：restoring + recovery_source='bundle'。
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET lifecycle_status = 'restoring', recovery_source = 'bundle',
+                 native_session_id = NULL, active_turn_id = NULL
+             WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE hub_session_turns
+             SET native_turn_id = NULL, status = 'starting', started_at = NULL
+             WHERE id = $1",
+        )
+        .bind(fixture.turn_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        let _ = runtime_append_event(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(fixture.run_id),
+            runtime_write_generation(
+                1,
+                AppendRunEventRequest {
+                    event_id: Uuid::new_v4(),
+                    event_type: "turn_started".into(),
+                    role: None,
+                    content: None,
+                    payload: json!({
+                        "native_session_id": "native-resumed",
+                        "native_turn_id": "native-turn-resumed"
+                    }),
+                    waiting_tool: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        // 恢复完成：online 且 recovery_source 必须为 NULL（约束要求）。
+        let (lifecycle, recovery_source): (String, Option<String>) = sqlx::query_as(
+            "SELECT lifecycle_status, recovery_source FROM hub_sessions WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(lifecycle, "online");
+        assert_eq!(
+            recovery_source, None,
+            "resumed session must clear recovery_source"
+        );
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn runtime_turn_started_event_binds_native_turn_before_completion(pool: PgPool) {
         let fixture = integration_runtime_fixture(pool).await;
         sqlx::query(

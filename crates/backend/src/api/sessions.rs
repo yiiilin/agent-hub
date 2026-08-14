@@ -3062,7 +3062,8 @@ pub(crate) async fn insert_run_event_for_active_runtime(
         let session = sqlx::query(
             "UPDATE hub_sessions
              SET native_session_id = $1, active_turn_id = $2,
-                 lifecycle_status = 'online'
+                 lifecycle_status = 'online',
+                 recovery_source = NULL
              WHERE id = $3 AND runtime_owner_id = $4 AND ownership_generation = $5
                AND (native_session_id IS NULL OR native_session_id = $1)
                AND (active_turn_id IS NULL OR active_turn_id = $2)",
