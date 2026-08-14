@@ -10093,7 +10093,7 @@ mod tests {
             .with_max_level(tracing::Level::DEBUG)
             .try_init();
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        let _claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
         // 保持 claim 后的 restoring + recovery_source='bundle'（恢复中 runtime 崩溃场景），
         // 心跳过期后 reaper 必须能释放会话且不违反 recovery_source_shape 约束。
         sqlx::query(
