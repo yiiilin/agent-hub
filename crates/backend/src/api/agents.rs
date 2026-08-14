@@ -2602,13 +2602,29 @@ mod tests {
             .iter()
             .any(|item| item.connection_id == admin_personal.id));
 
+        // Admin may not point the Agent at a different Personal connection:
+        // the owner's Personal connections stay owner/super-only.
+        let mut admin_repoint = update_request_from_agent(&created);
+        admin_repoint.model_selection = Some(test_model_selection(&owner_personal));
+        admin_repoint.subagents[0].model_selection = Some(test_model_selection(&owner_personal));
+        let error = update_agent(
+            State(state.clone()),
+            session_headers(&admin_token),
+            Path(created.id),
+            Json(admin_repoint),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+
+        // The Agent owner may use their own Personal connection.
         let mut owner_scoped = update_request_from_agent(&created);
         owner_scoped.model_selection = Some(test_model_selection(&owner_personal));
         owner_scoped.model_settings.reasoning_effort = ReasoningEffort::Ultra;
         owner_scoped.subagents[0].model_selection = Some(test_model_selection(&owner_personal));
         let updated = update_agent(
             State(state.clone()),
-            session_headers(&admin_token),
+            session_headers(&member_token),
             Path(created.id),
             Json(owner_scoped),
         )
@@ -2628,7 +2644,29 @@ mod tests {
             Some(test_model_selection(&owner_personal))
         );
 
-        let mut wrong_owner = update_request_from_agent(&updated);
+        // Admin may retain the owner's existing Personal selection while
+        // adjusting unrelated fields.
+        let mut admin_retain = update_request_from_agent(&updated);
+        admin_retain.model_settings.reasoning_effort = ReasoningEffort::Medium;
+        let retained = update_agent(
+            State(state.clone()),
+            session_headers(&admin_token),
+            Path(created.id),
+            Json(admin_retain),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            retained.model_selection,
+            Some(test_model_selection(&owner_personal))
+        );
+        assert_eq!(
+            retained.model_settings.reasoning_effort,
+            ReasoningEffort::Medium
+        );
+
+        let mut wrong_owner = update_request_from_agent(&retained);
         wrong_owner.model_selection = Some(test_model_selection(&admin_personal));
         let error = update_agent(
             State(state),
