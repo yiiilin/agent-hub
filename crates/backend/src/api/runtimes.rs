@@ -6228,6 +6228,7 @@ pub(crate) async fn reap_stale_runtimes(pool: &PgPool) -> Result<(), ApiError> {
                  current_bundle_producing_engine_version = NULL,
                  current_bundle_created_at = NULL,
                  current_bundle_runtime_id = NULL,
+                 recovery_source = NULL,
                  recovery_error = CASE
                      WHEN EXISTS (
                          SELECT 1 FROM hub_session_messages
@@ -10085,6 +10086,48 @@ mod tests {
                 .unwrap();
         assert_eq!(runtime_status, "offline");
     }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn runtime_reaper_releases_restoring_session_without_constraint_violation(pool: PgPool) {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        // 保持 claim 后的 restoring + recovery_source='bundle'（恢复中 runtime 崩溃场景），
+        // 心跳过期后 reaper 必须能释放会话且不违反 recovery_source_shape 约束。
+        sqlx::query(
+            "UPDATE runtimes SET last_heartbeat_at = now() - interval '2 minutes'
+             WHERE id = $1",
+        )
+        .bind(fixture.runtime_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        reap_stale_runtimes(&fixture.state.pool).await.unwrap();
+
+        // 会话被释放：非 restoring、恢复源清空、不再归属 runtime。
+        let (lifecycle, recovery_source, owner): (String, Option<String>, Option<Uuid>) =
+            sqlx::query_as(
+                "SELECT lifecycle_status, recovery_source, runtime_owner_id
+                 FROM hub_sessions WHERE id = $1",
+            )
+            .bind(fixture.hub_session_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        assert_ne!(lifecycle, "restoring");
+        assert_eq!(recovery_source, None, "reaper must clear recovery_source");
+        assert_eq!(owner, None);
+        // run 被终结（reaper 对活动的 run 置 failed/interrupted）。
+        let (run_status,): (String,) = sqlx::query_as("SELECT status FROM runs WHERE id = $1")
+            .bind(fixture.run_id)
+            .fetch_one(&fixture.state.pool)
+            .await
+            .unwrap();
+        assert!(matches!(run_status.as_str(), "failed" | "interrupted"));
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn runtime_reaper_fails_running_runs_and_allows_reclaiming_pending_work(pool: PgPool) {
