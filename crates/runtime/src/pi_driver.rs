@@ -1352,7 +1352,6 @@ pub(super) struct PersistentPiRpcProcess {
     stderr_reader: Option<std::thread::JoinHandle<Result<usize, std::io::Error>>>,
     skill_exec_broker: Option<SkillExecBroker>,
     vision_broker: Option<VisionAnalyzeBroker>,
-    tool_result_broker: Option<ToolResultBroker>,
     cancellation: Arc<EngineCancellation>,
     timeout: Duration,
 }
@@ -1566,7 +1565,6 @@ impl PersistentPiRpcProcess {
             stderr_reader: Some(stderr_reader),
             skill_exec_broker,
             vision_broker,
-            tool_result_broker,
             cancellation,
             timeout,
         };
@@ -2126,7 +2124,7 @@ fn handle_tool_result_connection(
     mut stream: std::net::TcpStream,
     context: &ToolResultBrokerContext,
 ) -> anyhow::Result<()> {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader};
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     if reader.read_line(&mut line)? == 0 {

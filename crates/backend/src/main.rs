@@ -16,13 +16,9 @@ use std::{
 };
 
 #[cfg(test)]
-use axum::extract::{Form, Multipart};
+use axum::extract::Form;
 #[cfg(test)]
 use chrono::Duration as ChronoDuration;
-#[cfg(test)]
-use ldap3::result::LdapError;
-#[cfg(test)]
-use std::net::IpAddr;
 
 use agent_hub_backend::ModelSecretCipher;
 use agent_hub_shared::*;
@@ -62,10 +58,6 @@ use crate::skill_package_store::SkillPackageStore;
 use base64::engine::general_purpose::STANDARD;
 #[cfg(test)]
 use ipnet::IpNet;
-#[cfg(test)]
-use std::io::Read;
-#[cfg(test)]
-use url::Url;
 
 pub(crate) mod run_event_bus;
 mod runtime_ws;
@@ -89,6 +81,7 @@ pub(crate) const TOOL_RESULT_TRUNCATE_BYTES: usize = 32 * 1024;
 /// 工具结果归档的单次范围读取上限（防止模型循环读爆上下文/内存）。
 pub(crate) const TOOL_RESULT_READ_LIMIT_BYTES: usize = 64 * 1024;
 pub(crate) const EMBEDDED_ORIGIN_HEADER: &str = "x-agent-hub-embedded-origin";
+#[cfg(test)]
 pub(crate) const MAX_ATTACHMENT_UPLOAD_BYTES: u64 = 104_857_600;
 pub(crate) const MAX_ATTACHMENT_BYTES_PER_SESSION: i64 = 524_288_000;
 pub(crate) const ATTACHMENT_UPLOAD_BODY_LIMIT: usize = 1024 * 1024 * 1024 + 1024 * 1024;
@@ -1512,8 +1505,6 @@ pub(crate) async fn readiness_response(pool: &PgPool, timeout: Duration) -> Resp
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
-
 struct ModelGatewayForwardRequest<'a> {
     request_id: Uuid,
     upstream_protocol: ModelUpstreamProtocol,
@@ -1523,49 +1514,6 @@ struct ModelGatewayForwardRequest<'a> {
     headers: &'a HeaderMap,
     body: &'a [u8],
     api_key: &'a str,
-}
-
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)] // Keep every optional run association explicit at call sites.
-#[allow(clippy::too_many_arguments)] // Keep every optional run association explicit at call sites.
-#[derive(Debug)]
-struct OAuthAppRecord {
-    id: Uuid,
-    owner_id: Uuid,
-    client_secret_hash: String,
-    redirect_uris: Value,
-    external_platform_id: Uuid,
-    authentication_channel_id: Uuid,
-    widget_history_enabled: bool,
-    login_required: bool,
-    allowed_origins: Vec<String>,
-    tool_allowlist: Option<Vec<String>>,
-    client_tool_definitions: Vec<ClientToolDefinitionDto>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SecretGrantListQuery {
-    agent_id: Option<Uuid>,
-}
-
-#[cfg(test)]
-
-pub(crate) fn existing_mcp_secret<'a>(
-    existing: &'a Value,
-    server_name: Option<&str>,
-    key: &str,
-) -> Option<&'a str> {
-    let server_name = server_name?;
-    existing.as_array()?.iter().find_map(|server| {
-        if server.get("name").and_then(Value::as_str) != Some(server_name) {
-            return None;
-        }
-        server
-            .get("secrets")
-            .and_then(Value::as_object)?
-            .get(key)?
-            .as_str()
-    })
 }
 
 pub(crate) async fn load_run_for_user(

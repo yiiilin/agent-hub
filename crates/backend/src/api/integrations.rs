@@ -1396,7 +1396,7 @@ pub(crate) async fn create_widget_run(
             serde_json::from_value::<ExternalUserContextDto>(credential.profile_snapshot.clone())
                 .map_err(|_| ApiError::internal("external Widget profile is invalid"))?;
 
-        if let Some(prepend) = prepend_instructions.as_deref() {
+        if let Some(prepend) = prepend_instructions {
             if let Some(existing_session_id) = requested_integration_session_id {
                 // 不可变：与已存值一致（幂等重放）→ 忽略；不一致 → 400。
                 let stored: Option<String> = sqlx::query_scalar(
@@ -1457,7 +1457,7 @@ pub(crate) async fn create_widget_run(
                     } else {
                         None
                     };
-                if let Some(prepend) = prepend_instructions.as_deref() {
+                if let Some(prepend) = prepend_instructions {
                     if let Some((retried_integration_id, _)) = retried_session {
                         let stored: Option<String> = sqlx::query_scalar(
                             "SELECT prepend_instructions FROM integration_sessions WHERE id = $1",
@@ -4016,7 +4016,7 @@ pub(crate) fn validate_tool_result(
 pub(crate) async fn archive_tool_result(
     state: &AppState,
     run_id: Uuid,
-    tool_request_id: Uuid,
+    _tool_request_id: Uuid,
     validation: &ToolResultValidation,
 ) -> Option<(Option<Uuid>, i64, Option<String>)> {
     if !validation.truncated {
@@ -4415,7 +4415,7 @@ fn summarize_tool_result_payload(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    let size = artifact_size_bytes.unwrap_or_else(|| content.len() as i64);
+    let size = artifact_size_bytes.unwrap_or(content.len() as i64);
     let (heading, hint) = match (artifact_id, artifact_reason) {
         (Some(id), _) => (
             format!("[tool result truncated: {size} bytes total; archived as artifact://{id}]"),
@@ -4548,9 +4548,9 @@ async fn load_tool_result_artifact_response(
                 .get(&object_key)
                 .await
                 .map_err(|_| ApiError::internal("artifact read failed"))?;
-            let stream = response.bytes_stream().map(|item| {
-                item.map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))
-            });
+            let stream = response
+                .bytes_stream()
+                .map(|item| item.map_err(std::io::Error::other));
             let body = axum::body::Body::from_stream(stream);
             Ok(Response::builder()
                 .header(
@@ -5644,7 +5644,7 @@ pub(crate) async fn load_widget_session_events_after_tx(
             // 取最近 n 条（倒序截取后恢复正序），用于历史恢复场景。
             query = format!(
                 "SELECT * FROM ({query} ORDER BY event.seq DESC LIMIT {}) AS recent ORDER BY seq ASC",
-                limit.max(1).min(2000)
+                limit.clamp(1, 2000)
             );
         } else {
             query.push_str(" ORDER BY event.seq ASC");
@@ -5668,7 +5668,7 @@ pub(crate) async fn load_widget_session_events_after_tx(
             // 取最近 n 条（倒序截取后恢复正序），用于历史恢复场景。
             query = format!(
                 "SELECT * FROM ({query} ORDER BY event.seq DESC LIMIT {}) AS recent ORDER BY seq ASC",
-                limit.max(1).min(2000)
+                limit.clamp(1, 2000)
             );
         } else {
             query.push_str(" ORDER BY event.seq ASC");
@@ -6628,7 +6628,7 @@ mod tests {
     async fn client_tool_continuation_run_supports_claim_stream_and_stop(pool: PgPool) {
         let fixture = prepare_client_tool_run(pool, &["first_action", "second_action"]).await;
         // 第一批工具请求（原 widget run）。
-        runtime_finalize_tool_requests(
+        let _ = runtime_finalize_tool_requests(
             State(fixture.app.state.clone()),
             bearer_headers(&fixture.runtime_token),
             Path(fixture.run.id),
@@ -6737,7 +6737,7 @@ mod tests {
         .unwrap()
         .0;
         let second_call_id = Uuid::new_v4();
-        runtime_finalize_tool_requests(
+        let _ = runtime_finalize_tool_requests(
             State(fixture.app.state.clone()),
             bearer_headers(&fixture.runtime_token),
             Path(continuation.id),
@@ -8914,7 +8914,7 @@ mod tests {
 
         // runtime 先 finalize 创建 tool_request 行（fixture 不直接插入）。
         let batch = tool_request_batch(&fixture, [fixture.tool_request_id]);
-        runtime_finalize_tool_requests(
+        let _ = runtime_finalize_tool_requests(
             State(state.clone()),
             bearer_headers(&fixture.runtime_token),
             Path(fixture.run_id),
@@ -8998,7 +8998,7 @@ mod tests {
         let state = Arc::new(state);
 
         let batch = tool_request_batch(&fixture, [fixture.tool_request_id]);
-        runtime_finalize_tool_requests(
+        let _ = runtime_finalize_tool_requests(
             State(state.clone()),
             bearer_headers(&fixture.runtime_token),
             Path(fixture.run_id),
@@ -9055,7 +9055,7 @@ mod tests {
         let state = Arc::new(state);
 
         let batch = tool_request_batch(&fixture, [fixture.tool_request_id]);
-        runtime_finalize_tool_requests(
+        let _ = runtime_finalize_tool_requests(
             State(state.clone()),
             bearer_headers(&fixture.runtime_token),
             Path(fixture.run_id),
@@ -9155,7 +9155,7 @@ mod tests {
         let state = Arc::new(state);
 
         let batch = tool_request_batch(&fixture, [fixture.tool_request_id]);
-        runtime_finalize_tool_requests(
+        let _ = runtime_finalize_tool_requests(
             State(state.clone()),
             bearer_headers(&fixture.runtime_token),
             Path(fixture.run_id),
@@ -9211,7 +9211,7 @@ mod tests {
         let state = Arc::new(state);
 
         let batch = tool_request_batch(&fixture, [fixture.tool_request_id]);
-        runtime_finalize_tool_requests(
+        let _ = runtime_finalize_tool_requests(
             State(state.clone()),
             bearer_headers(&fixture.runtime_token),
             Path(fixture.run_id),

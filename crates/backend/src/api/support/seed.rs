@@ -115,7 +115,7 @@ pub(crate) async fn seed_dev_model_connection(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BuiltinSkillSeedStatus {
+pub(crate) enum BuiltinSkillSeedStatus {
     Seeded,
     Deferred,
     Unavailable,

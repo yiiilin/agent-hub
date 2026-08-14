@@ -266,7 +266,7 @@ pub(crate) async fn delete_drained_runtime(
     Ok(StatusCode::NO_CONTENT)
 }
 
-struct RuntimeDeletionImpactSessionState {
+pub(crate) struct RuntimeDeletionImpactSessionState {
     impact: RuntimeDeletionImpactSessionDto,
     ownership_generation: i64,
     active_turn_id: Option<Uuid>,
@@ -1959,7 +1959,7 @@ pub(crate) async fn runtime_fail_session_checkpoint(
 }
 
 #[derive(Debug, Clone)]
-struct SessionBundleUploadHeaders {
+pub(crate) struct SessionBundleUploadHeaders {
     ownership_generation: i64,
     checkpoint_attempt_id: Uuid,
     bundle_generation: i64,
@@ -3947,6 +3947,17 @@ pub(crate) struct SessionReplayEventDto {
     pub(crate) created_at: DateTime<Utc>,
 }
 
+type ReplayEventRow = (
+    i64,
+    Uuid,
+    Option<Uuid>,
+    String,
+    Option<String>,
+    Option<String>,
+    Value,
+    DateTime<Utc>,
+);
+
 pub(crate) async fn get_session_replay_events(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -3973,16 +3984,7 @@ pub(crate) async fn get_session_replay_events(
                 .with_code("stale_session_generation"),
         );
     }
-    let rows: Vec<(
-        i64,
-        Uuid,
-        Option<Uuid>,
-        String,
-        Option<String>,
-        Option<String>,
-        Value,
-        DateTime<Utc>,
-    )> = sqlx::query_as(
+    let rows: Vec<ReplayEventRow> = sqlx::query_as(
         "SELECT e.seq, e.run_id, r.hub_turn_id, e.event_type, e.role, e.content,
                 e.payload, e.created_at
          FROM run_events e
@@ -5218,7 +5220,7 @@ pub(crate) async fn runtime_model_proxy(
     .await
 }
 
-struct ResolvedModelProxyRequest {
+pub(crate) struct ResolvedModelProxyRequest {
     upstream_url: String,
     model_id: String,
     vision_model_id: Option<String>,
@@ -5227,7 +5229,7 @@ struct ResolvedModelProxyRequest {
 }
 
 #[derive(Clone)]
-struct ModelProxyAccountingContext {
+pub(crate) struct ModelProxyAccountingContext {
     request_id: Uuid,
     model_connection_id: Uuid,
     model_connection_scope: String,
@@ -5353,7 +5355,7 @@ pub(crate) fn model_proxy_path_supported(path: &str) -> bool {
     path == "responses"
 }
 
-struct ModelProxyForwardRequest {
+pub(crate) struct ModelProxyForwardRequest {
     upstream_url: String,
     upstream_protocol: ModelUpstreamProtocol,
     request_settings: ModelRequestSettings,
@@ -5685,14 +5687,14 @@ struct ModelResponseObserver {
     terminal: Option<ModelProxyTerminal>,
 }
 
-struct ModelProxyTerminal {
+pub(crate) struct ModelProxyTerminal {
     response_status: String,
     usage: Option<ObservedModelUsage>,
     error_code: Option<String>,
     error_message: Option<String>,
 }
 
-struct ModelProxyObservation {
+pub(crate) struct ModelProxyObservation {
     usage: Option<(String, ObservedModelUsage)>,
     error: Option<ModelProxyErrorObservation>,
 }
@@ -8270,7 +8272,7 @@ mod tests {
             .with_max_level(tracing::Level::DEBUG)
             .try_init();
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        let _claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
         // 用户消息（queued steer）挂在 A 上。
         sqlx::query(
             "INSERT INTO hub_session_messages
@@ -8401,7 +8403,7 @@ mod tests {
             .with_max_level(tracing::Level::DEBUG)
             .try_init();
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        let _claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
         let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM hub_sessions WHERE id = $1")
             .bind(fixture.hub_session_id)
             .fetch_one(&fixture.state.pool)
@@ -8476,8 +8478,7 @@ mod tests {
                     "operation_id": dto.operation_id,
                     "status": "bogus",
                 })
-                .to_string()
-                .into(),
+                .to_string(),
             ))
             .await
             .unwrap();
@@ -8504,8 +8505,7 @@ mod tests {
                     "operation_id": dto.operation_id,
                     "status": "ok",
                 })
-                .to_string()
-                .into(),
+                .to_string(),
             ))
             .await
             .unwrap();
@@ -8522,7 +8522,7 @@ mod tests {
             .with_max_level(tracing::Level::DEBUG)
             .try_init();
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        let _claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
         let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM hub_sessions WHERE id = $1")
             .bind(fixture.hub_session_id)
             .fetch_one(&fixture.state.pool)
@@ -8665,7 +8665,7 @@ mod tests {
             .with_max_level(tracing::Level::DEBUG)
             .try_init();
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        let _claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
         let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM hub_sessions WHERE id = $1")
             .bind(fixture.hub_session_id)
             .fetch_one(&fixture.state.pool)
@@ -8772,7 +8772,7 @@ mod tests {
             .with_max_level(tracing::Level::DEBUG)
             .try_init();
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        let _claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
 
         // 用户认证 + 发起强制停止 → operation pending。
         let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM hub_sessions WHERE id = $1")
@@ -8850,8 +8850,7 @@ mod tests {
         socket
             .send(tokio_tungstenite::tungstenite::Message::Text(
                 json!({ "type": "ack", "operation_id": dto.operation_id, "status": "ok" })
-                    .to_string()
-                    .into(),
+                    .to_string(),
             ))
             .await
             .unwrap();
@@ -8950,8 +8949,7 @@ mod tests {
                         "run_id": fixture.run_id,
                     }],
                 })
-                .to_string()
-                .into(),
+                .to_string(),
             ))
             .await
             .unwrap();
@@ -8980,7 +8978,7 @@ mod tests {
             .with_max_level(tracing::Level::DEBUG)
             .try_init();
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        let _claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
         let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM hub_sessions WHERE id = $1")
             .bind(fixture.hub_session_id)
             .fetch_one(&fixture.state.pool)
@@ -9050,7 +9048,7 @@ mod tests {
             .with_max_level(tracing::Level::DEBUG)
             .try_init();
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
-        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        let _claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
         // 1. 发起强制停止 → operation pending。
         let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM hub_sessions WHERE id = $1")
             .bind(fixture.hub_session_id)
@@ -9235,13 +9233,14 @@ mod tests {
             )
         );
         // 对象确实上传成功。
-        let stored = objects.lock().unwrap();
-        assert_eq!(
-            stored.get(&stored_key),
-            Some(&bytes.to_vec()),
-            "force stop snapshot object must be stored"
-        );
-        drop(stored);
+        {
+            let stored = objects.lock().unwrap();
+            assert_eq!(
+                stored.get(&stored_key),
+                Some(&bytes.to_vec()),
+                "force stop snapshot object must be stored"
+            );
+        }
 
         // 6. 旧 force-stop 对象已删除（旧 key 与新 key 不同）。
         assert!(

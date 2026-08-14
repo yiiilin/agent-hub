@@ -31,6 +31,7 @@ enum DownstreamMessage {
         operation_id: Uuid,
         session_id: Uuid,
         run_id: Option<Uuid>,
+        #[allow(dead_code)] // 协议保留字段：当前按 run_id 是否为 nil 区分 force_stop/abandon
         kind: String,
         require_snapshot: bool,
     },
@@ -97,7 +98,7 @@ async fn run_ws_connection(
                     .collect();
                 let message = json!({ "type": "owned_sessions", "sessions": sessions });
                 if socket
-                    .send(Message::Text(message.to_string().into()))
+                    .send(Message::Text(message.to_string()))
                     .await
                     .is_err()
                 {
@@ -112,7 +113,7 @@ async fn run_ws_connection(
                     "operation_id": late.operation_id,
                     "status": late.status,
                 });
-                if socket.send(Message::Text(ack.to_string().into())).await.is_err() {
+                if socket.send(Message::Text(ack.to_string())).await.is_err() {
                     break;
                 }
             }
@@ -126,7 +127,7 @@ async fn run_ws_connection(
                             operation_id,
                             session_id,
                             run_id,
-                            kind,
+                            kind: _,
                             require_snapshot,
                         } = message;
                         // 接管（同步、短）：record 移除 + 杀 Pi。fence 不匹配/已不存在
@@ -139,7 +140,7 @@ async fn run_ws_connection(
                                 "operation_id": operation_id,
                                 "status": "ok",
                             });
-                            if socket.send(Message::Text(ack.to_string().into())).await.is_err() {
+                            if socket.send(Message::Text(ack.to_string())).await.is_err() {
                                 break;
                             }
                             continue;
@@ -167,7 +168,7 @@ async fn run_ws_connection(
                             "operation_id": operation_id,
                             "status": "ok",
                         });
-                        if socket.send(Message::Text(ack.to_string().into())).await.is_err() {
+                        if socket.send(Message::Text(ack.to_string())).await.is_err() {
                             break;
                         }
                     }

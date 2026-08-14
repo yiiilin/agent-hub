@@ -134,8 +134,10 @@ impl RuntimeRunFailure {
 /// 会话重建事件（backend GET /api/runtime/sessions/{id}/replay-events 的返回项）。
 #[derive(Debug, Clone, Deserialize)]
 struct SessionReplayEventDto {
+    #[allow(dead_code)] // 由后端 ORDER BY seq 保证顺序，runtime 无需读取
     seq: i64,
     run_id: Uuid,
+    #[allow(dead_code)] // hub 侧 turn 绑定仅对后端有约束意义
     hub_turn_id: Option<Uuid>,
     event_type: String,
     role: Option<String>,
@@ -1184,7 +1186,7 @@ async fn run_registered_cycle(
     // 由新 runtime 走"无 bundle → 只还原对话"路径（对话永不丢）。
     if shutdown_requested.load(Ordering::Acquire) {
         if let Some(manager) = &manager {
-            drain_sessions_for_shutdown(manager, client, &config).await;
+            drain_sessions_for_shutdown(manager, client, config).await;
         }
     }
     Ok(())
@@ -3173,9 +3175,6 @@ fn build_pi_session_jsonl(
                     );
                 }
             }
-            pending_text = None;
-            pending_stop_reason = None;
-            pending_usage = None;
             pending_calls.clear();
         }};
     }
@@ -5821,11 +5820,10 @@ impl SessionSupervisorManager {
         if let Some(record) = records.get(&session_id) {
             // 活动冲突只认真实活动执行（busy/Starting）；reserved 保留态由
             // 复用分支的 already-reserved 检查处理（不是异常派发）。
-            let active_conflict = match &record.status {
-                ManagedSessionStatus::Ready { busy: true, .. } => true,
-                ManagedSessionStatus::Starting { .. } => true,
-                _ => false,
-            };
+            let active_conflict = matches!(
+                &record.status,
+                ManagedSessionStatus::Ready { busy: true, .. } | ManagedSessionStatus::Starting
+            );
             if active_conflict {
                 // 异常派发：本地有真实活动执行。绝不接管/清理——返回错误，
                 // 调用方（claim_next）用本地 record 的 reserved_run_id 作为
@@ -7069,8 +7067,9 @@ impl SessionSupervisorManager {
         let records = self.records.lock().unwrap();
         let record = records.get(&session_id)?;
         match &record.status {
-            ManagedSessionStatus::Ready { busy: true, .. }
-            | ManagedSessionStatus::Starting { .. } => record.reserved_run_id,
+            ManagedSessionStatus::Ready { busy: true, .. } | ManagedSessionStatus::Starting => {
+                record.reserved_run_id
+            }
             _ => None,
         }
     }
@@ -17656,6 +17655,7 @@ done
         );
     }
 
+    #[test]
     fn build_pi_session_jsonl_skips_results_without_calls_and_dangling_calls() {
         let ts = |secs: i64| {
             chrono::DateTime::<chrono::Utc>::from_timestamp(1_780_000_000 + secs, 0).unwrap()

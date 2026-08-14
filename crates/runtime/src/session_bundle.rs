@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs::{self, File},
-    io::{BufRead, BufReader, Read, Write},
+    io::{Read, Write},
     os::unix::fs::symlink,
     path::{Component, Path, PathBuf},
 };
@@ -265,23 +265,6 @@ fn append_entries<W: Write>(
             .append_path_with_name(&entry.source, prefix.join(&entry.relative))
             .with_context(|| format!("append Session Bundle path {}", entry.source.display()))?;
     }
-    Ok(())
-}
-
-fn append_virtual_directory<W: Write>(
-    archive: &mut Builder<W>,
-    path: &str,
-    created_at: DateTime<Utc>,
-) -> Result<()> {
-    let mut header = Header::new_gnu();
-    header.set_entry_type(EntryType::Directory);
-    header.set_mode(0o700);
-    header.set_mtime(created_at.timestamp().max(0) as u64);
-    header.set_size(0);
-    header.set_cksum();
-    archive
-        .append_data(&mut header, path, std::io::empty())
-        .context("append Session Bundle directory")?;
     Ok(())
 }
 
@@ -593,12 +576,10 @@ fn validate_sha256(value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_entries, append_virtual_directory, checksum_file, collect_tree_entries,
-        create_session_bundle, declare_tree, restore_session_workspace_only, BundleTreeDeclaration,
-        SessionBundleCreateSpec, SessionBundleManifest, BUNDLE_FORMAT_VERSION,
+        checksum_file, create_session_bundle, restore_session_workspace_only,
+        SessionBundleCreateSpec,
     };
     use chrono::{TimeZone, Utc};
-    use sha2::Digest;
     use std::{fs, path::Path};
     use uuid::Uuid;
 
@@ -625,38 +606,6 @@ mod tests {
         name[..entry_path.len()].copy_from_slice(entry_path);
         header.set_cksum();
         archive.append(&header, contents).unwrap();
-        archive.into_inner().unwrap().finish().unwrap();
-        checksum_file(archive_path).unwrap()
-    }
-
-    fn write_workspace_only_bundle(
-        archive_path: &Path,
-        workspace: &Path,
-        manifest: &SessionBundleManifest,
-    ) -> (String, u64) {
-        let workspace_entries = collect_tree_entries(workspace, |_, _| true).unwrap();
-        assert_eq!(
-            declare_tree(workspace, &workspace_entries).unwrap(),
-            manifest.workspace
-        );
-        let file = fs::File::create(archive_path).unwrap();
-        let encoder = zstd::Encoder::new(file, 1).unwrap();
-        let mut archive = tar::Builder::new(encoder);
-        archive.append_dir("workspace", workspace).unwrap();
-        append_entries(&mut archive, &workspace_entries, Path::new("workspace")).unwrap();
-        let manifest_bytes = serde_json::to_vec(manifest).unwrap();
-        let mut manifest_header = tar::Header::new_gnu();
-        manifest_header.set_entry_type(tar::EntryType::Regular);
-        manifest_header.set_mode(0o600);
-        manifest_header.set_size(manifest_bytes.len() as u64);
-        manifest_header.set_cksum();
-        archive
-            .append_data(
-                &mut manifest_header,
-                "manifest.json",
-                manifest_bytes.as_slice(),
-            )
-            .unwrap();
         archive.into_inner().unwrap().finish().unwrap();
         checksum_file(archive_path).unwrap()
     }
@@ -785,7 +734,7 @@ mod tests {
             b"escape",
         );
         let (checksum, size) = checksum_file(&archive_path).unwrap();
-        let error = restore_session_workspace_only(
+        restore_session_workspace_only(
             &archive_path,
             &checksum,
             size,

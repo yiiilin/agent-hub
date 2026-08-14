@@ -52,6 +52,7 @@ use crate::widget_session_locator;
 use crate::ModelGatewayForwardRequest;
 use crate::ObservedModelUsage;
 use crate::MAX_ATTACHMENT_BYTES_PER_SESSION;
+#[cfg(test)]
 use crate::MAX_ATTACHMENT_UPLOAD_BYTES;
 use crate::SESSION_MESSAGE_PAGE_SQL;
 
@@ -2028,7 +2029,7 @@ pub(crate) async fn force_stop_run_core_tx(
     .bind(operation_id)
     .bind(hub_session_id)
     .bind(run_id)
-    .bind(&request_id)
+    .bind(request_id)
     .bind(target_runtime)
     .execute(&mut **tx)
     .await?;
@@ -2527,7 +2528,7 @@ pub(crate) async fn request_run_interrupt_tx(
             run_status.as_str(),
             "completed" | "failed" | "interrupted" | "cancelled"
         ) {
-            return Ok(load_run_public_tx(tx, run_id).await?);
+            return load_run_public_tx(tx, run_id).await;
         }
         return Err(ApiError::conflict("run has no active Turn to stop"));
     }

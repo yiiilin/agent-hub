@@ -146,7 +146,6 @@ pub(crate) async fn create_agent(
     let endpoint_exposure = normalize_endpoint_exposure(&req.endpoint_exposure)?;
     validate_subagent_definitions(&req.subagents)?;
     let tool_allowlist = normalize_agent_tool_allowlist(&req.tool_allowlist)?;
-    let endpoint_exposure = normalize_endpoint_exposure(&req.endpoint_exposure)?;
     let model_policy = json!({ "provider": "hub-proxy" });
     let id = Uuid::new_v4();
     let mut tx = state.pool.begin().await?;
@@ -891,29 +890,6 @@ pub(crate) fn normalize_endpoint_exposure(exposure: &[String]) -> Result<Vec<Str
         ));
     }
     Ok(seen.into_iter().collect())
-}
-
-/// 校验 agent 是否暴露给指定端点（403 拒绝）。
-pub(crate) async fn ensure_agent_endpoint_allowed_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    agent_id: Uuid,
-    endpoint: &str,
-) -> Result<(), ApiError> {
-    let allowed: bool = sqlx::query_scalar(
-        "SELECT $2 = ANY(endpoint_exposure)
-         FROM agents WHERE id = $1 AND deleted_at IS NULL",
-    )
-    .bind(agent_id)
-    .bind(endpoint)
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or(ApiError::not_found("agent not found"))?;
-    if !allowed {
-        return Err(ApiError::forbidden(format!(
-            "agent is not exposed to the {endpoint} endpoint"
-        )));
-    }
-    Ok(())
 }
 
 pub(crate) fn normalize_visibility(visibility: &str) -> Result<&'static str, ApiError> {
