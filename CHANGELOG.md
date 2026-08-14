@@ -6,6 +6,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 本文件记录 Agent Hub 各正式版本面向使用者的变化。
 
+## [0.3.8] - 2026-08-14
+
+### Added
+
+- 硬停止（force-stop）：运行中会话可强制停止（控制台与第三方 external 会话均支持）——命令经 WebSocket 投递并带 ACK/重试与 5 分钟超时兜底；停止时打包工作区快照上传，会话下次消息自动基于快照无损恢复。
+- 升级无感化：Runtime 收到 SIGTERM 后先停引擎、再逐会话打包上传（管理端可见 bundle 同步进度），Compose 增加 `stop_grace_period`；配合会话恢复体系（reap 阈值放宽、bundle 同步状态、补丁消息端点），恢复中的会话可基于本地工作区或 bundle 恢复。
+- 第三方应用会话预指令（prepend_instructions）：创建会话时一次性写入、不可变；同值重放忽略、异值返回 400。
+- 管理端展示 bundle 打包进度（打包状态与剩余数量）。
+- INFO 日志：Session Bundle checkpoint 提交成功（含生成号/大小/排队与归属释放）、client tool claim/result（tool_call_id/会话/状态/耗时）。
+- OpenAPI 文档补齐三条缺失路由（会话消息上传、消息附件绑定、runtime 附件下载）。
+
+### Fixed
+
+- 停止链路四项硬伤修复与安全加固（排队 run 劫持、按钮依赖过期状态、stop 与 run 完成竞态、external 会话只读校验等）。
+- 快照失败语义与 ACK 枚举加固：失败/丢失/未知状态按协议处理，不再确认 pending 操作。
+- 恢复会话 turn_started 置 online 时未清 `recovery_source` 导致约束冲突。
+- 恢复重建的 Pi 会话 jsonl 属主/权限错误导致 Pi 启动即退出。
+- force release/reap 释放会话时清空 bundle 归档，消除 claim 永久阻塞。
+- runtime drain 顺序修复：先收集会话再停引擎；drain 前先 fail 活动 run。
+- reaper 释放 restoring 会话时清 `recovery_source`（防约束 23514）。
+- `--ignored` 测试全量修复：fixture 适配恢复体系约束、生产 UPDATE 补齐约束列。
+
+### Internal
+
+- clippy `-D warnings` 清零（死代码删除与 lint 修复）；admin 模型选择测试与规则语义对齐。
+
 ## [0.3.7] - 2026-08-12
 
 ### Added
@@ -201,7 +227,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Release 工作流在 GHCR 鉴权和发布前完成全历史与镜像凭证扫描，且不上传原始扫描报告。
 - LDAP QA 私钥改为测试环境启动时临时生成，不再保存在 Git 中。
 
-[Unreleased]: https://github.com/yiiilin/agent-hub/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/yiiilin/agent-hub/compare/v0.3.8...HEAD
+[0.3.8]: https://github.com/yiiilin/agent-hub/compare/v0.3.7...v0.3.8
 [0.3.1]: https://github.com/yiiilin/agent-hub/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/yiiilin/agent-hub/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/yiiilin/agent-hub/compare/v0.1.0...v0.2.0
