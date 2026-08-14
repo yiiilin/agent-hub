@@ -4852,6 +4852,16 @@ impl RuntimeCheckpointTransport for HubRuntimeCheckpointTransport {
                     if committed.checkpoint_attempt_id == attempt.checkpoint_attempt_id
                         && committed.bundle_generation == attempt.bundle_generation =>
                 {
+                    info!(
+                        session_id = %request.session_id,
+                        checkpoint_attempt_id = %attempt.checkpoint_attempt_id,
+                        reason = %request.reason.as_str(),
+                        bundle_generation = attempt.bundle_generation,
+                        size_bytes = artifact.size_bytes,
+                        has_queued_work = committed.has_queued_work,
+                        ownership_released = committed.ownership_released,
+                        "Session Bundle checkpoint committed"
+                    );
                     if let Err(error) = fs::remove_file(&artifact.archive_path).await {
                         if error.kind() != std::io::ErrorKind::NotFound {
                             warn!(
