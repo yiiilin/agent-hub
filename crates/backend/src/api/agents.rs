@@ -610,6 +610,8 @@ pub(crate) async fn delete_agent(
                  current_bundle_producing_engine_version = NULL,
                  current_bundle_created_at = NULL, current_bundle_runtime_id = NULL,
                  current_bundle_checkpoint_attempt_id = NULL,
+                 current_bundle_kind = NULL,
+                 recovery_source = NULL,
                  saving_history_checkpoint = NULL, saving_ownership_generation = NULL,
                  saving_reason = NULL, saving_checkpoint_attempt_id = NULL,
                  last_checkpoint_attempt_id = NULL,
@@ -1090,7 +1092,9 @@ pub(crate) async fn load_agent_owned_by_user(
     user_id: Uuid,
 ) -> Result<AgentDto, ApiError> {
     let row = sqlx::query(
-        "SELECT id, owner_id, name, instructions, visibility, public_to, runtime_id,
+        "SELECT id, owner_id,
+                (SELECT email FROM users WHERE id = agents.owner_id) AS owner_email,
+                name, instructions, visibility, public_to, runtime_id,
                 model_connection_id, model_id, model_settings,
                 model_policy, sandbox_policy, mcp_allowlist, tool_allowlist,
                 endpoint_exposure, created_at, updated_at
@@ -2385,6 +2389,7 @@ mod tests {
             "INSERT INTO hub_sessions
                  (id, owner_id, agent_id, origin_kind, lifecycle_status,
                   current_bundle_generation, current_bundle_object_key,
+                  current_bundle_kind,
                   current_bundle_checksum_sha256, current_bundle_size_bytes,
                   current_bundle_history_checkpoint,
                   current_bundle_ownership_generation,
@@ -2392,6 +2397,7 @@ mod tests {
                   current_bundle_created_at,
                   current_bundle_checkpoint_attempt_id)
              VALUES ($1, $2, $3, 'hub_native', 'offline', 1, $4,
+                     'checkpoint',
                      $5, 12, 0, 0, '0.104.0', now(), $6)",
         )
         .bind(session_id)

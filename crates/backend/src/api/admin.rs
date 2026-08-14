@@ -694,6 +694,8 @@ pub(crate) async fn begin_user_erasure(
              current_bundle_producing_engine_version = NULL,
              current_bundle_created_at = NULL, current_bundle_runtime_id = NULL,
              current_bundle_checkpoint_attempt_id = NULL,
+             current_bundle_kind = NULL,
+             recovery_source = NULL,
              saving_history_checkpoint = NULL, saving_ownership_generation = NULL,
              saving_reason = NULL, saving_checkpoint_attempt_id = NULL,
              last_checkpoint_attempt_id = NULL,

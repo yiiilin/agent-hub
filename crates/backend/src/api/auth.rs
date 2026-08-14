@@ -2103,6 +2103,7 @@ mod tests {
         sqlx::query(
             "UPDATE hub_sessions
              SET current_bundle_generation = 1, current_bundle_object_key = $2,
+                 current_bundle_kind = 'checkpoint',
                  current_bundle_checksum_sha256 = $3, current_bundle_size_bytes = 12,
                  current_bundle_history_checkpoint = history_checkpoint,
                  current_bundle_ownership_generation = ownership_generation,

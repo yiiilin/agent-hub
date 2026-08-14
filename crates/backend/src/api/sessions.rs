@@ -3897,11 +3897,15 @@ mod tests {
         assert_eq!(duplicate.message.id, first.message.id);
         assert_eq!(duplicate.run.as_ref().unwrap().id, first_run.id);
 
-        sqlx::query("UPDATE hub_sessions SET lifecycle_status = 'restoring' WHERE id = $1")
-            .bind(session_id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET lifecycle_status = 'restoring', recovery_source = 'bundle'
+             WHERE id = $1",
+        )
+        .bind(session_id)
+        .execute(&pool)
+        .await
+        .unwrap();
         let (second, third) = tokio::join!(
             accept_test_session_message(
                 &pool,
@@ -3975,7 +3979,8 @@ mod tests {
             .unwrap();
         sqlx::query(
             "UPDATE hub_sessions
-             SET lifecycle_status = 'online', active_turn_id = $1
+             SET lifecycle_status = 'online', active_turn_id = $1,
+                 recovery_source = NULL
              WHERE id = $2",
         )
         .bind(turn_id)
@@ -5105,7 +5110,8 @@ mod tests {
             .unwrap();
         sqlx::query(
             "UPDATE hub_sessions
-             SET runtime_owner_id = NULL, lifecycle_status = 'offline'
+             SET runtime_owner_id = NULL, lifecycle_status = 'offline',
+                 recovery_source = NULL
              WHERE id = $1",
         )
         .bind(fixture.hub_session_id)

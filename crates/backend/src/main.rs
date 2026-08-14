@@ -4332,7 +4332,7 @@ mod tests {
                     .uri(format!("/api/client/runs/{}/stop", first_run.id))
                     .header(
                         header::AUTHORIZATION,
-                        format!("Bearer {}", second.access_token),
+                        format!("Bearer {}", first.access_token),
                     )
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from("{}"))
@@ -7215,7 +7215,8 @@ mod tests {
         let old_object_key = session_bundle_object_key(fixture.hub_session_id, 1, old_attempt_id);
         sqlx::query(
             "UPDATE hub_sessions
-             SET current_bundle_generation = 1, current_bundle_object_key = $2,
+             SET current_bundle_generation = 1, current_bundle_kind = 'checkpoint',
+                 current_bundle_object_key = $2,
                  current_bundle_checksum_sha256 = $3, current_bundle_size_bytes = 10,
                  current_bundle_history_checkpoint = history_checkpoint,
                  current_bundle_ownership_generation = 1,
@@ -8197,6 +8198,7 @@ mod tests {
              SET runtime_owner_id = $1, ownership_generation = 1,
                  lifecycle_status = 'online', active_turn_id = NULL,
                  current_bundle_generation = 1,
+                 current_bundle_kind = 'checkpoint',
                  current_bundle_object_key = 'hub/bundles/release-force-delete.tar.zst',
                  current_bundle_checksum_sha256 = $2, current_bundle_size_bytes = 1,
                  current_bundle_history_checkpoint = history_checkpoint,
@@ -11161,6 +11163,18 @@ mod tests {
     async fn deleted_agent_fences_runtime_ownership_without_trapping_stale_heartbeat(pool: PgPool) {
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
         let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        // claim 接管时会话进入 restoring（recovery_source='bundle'）；先推进到
+        // online 并清恢复源（与其余 reaper fixture 一致），避免删除代理时
+        // recovery_source_shape 约束冲突。
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET lifecycle_status = 'online', recovery_source = NULL
+             WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
         let owner_id: Uuid = sqlx::query_scalar("SELECT owner_id FROM agents WHERE id = $1")
             .bind(fixture.agent_id)
             .fetch_one(&fixture.state.pool)

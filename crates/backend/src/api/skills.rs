@@ -1967,6 +1967,18 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn skill_bulk_delete_is_owner_scoped_and_all_or_nothing(pool: PgPool) {
+        // create_hub_user 会把库内首个用户提升为 super_admin，会绕过
+        // delete_skills_for_user 的 owner 作用域检查；先播种一个普通用户，
+        // 保证 owner/other 均为 member，测试的"foreign 不可删"前提成立。
+        let _seed = create_hub_user(
+            &pool,
+            Some("skills-seed@example.com"),
+            None,
+            Some("x"),
+            true,
+        )
+        .await
+        .unwrap();
         let owner = create_hub_user(
             &pool,
             Some("skills-owner@example.com"),

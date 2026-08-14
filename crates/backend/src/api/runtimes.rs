@@ -511,6 +511,7 @@ pub(crate) async fn force_delete_runtime(
              SET runtime_owner_id = NULL,
                  ownership_generation = ownership_generation + 1,
                  active_turn_id = NULL,
+                 recovery_source = NULL,
                  lifecycle_status = CASE
                      WHEN $2 = false THEN 'recovery_failed'
                      WHEN EXISTS (
@@ -7386,11 +7387,15 @@ mod tests {
     ) {
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
         let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-        sqlx::query("UPDATE hub_sessions SET lifecycle_status = 'online' WHERE id = $1")
-            .bind(fixture.hub_session_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET lifecycle_status = 'online', recovery_source = NULL
+             WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
         let _ = runtime_complete_run(
             State(fixture.state.clone()),
             bearer_headers(&fixture.runtime_token),
@@ -7467,6 +7472,7 @@ mod tests {
         sqlx::query(
             "UPDATE hub_sessions
              SET lifecycle_status = 'online',
+                 recovery_source = NULL,
                  current_bundle_generation = 1,
                  current_bundle_kind = 'checkpoint',
                  current_bundle_object_key = 'sessions/bundle-1.tar.zst',
@@ -7815,11 +7821,15 @@ mod tests {
     async fn runtime_salvage_obligation_recovers_crashed_workspace_bundle(pool: PgPool) {
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
         let _ = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-        sqlx::query("UPDATE hub_sessions SET lifecycle_status = 'online' WHERE id = $1")
-            .bind(fixture.hub_session_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET lifecycle_status = 'online', recovery_source = NULL
+             WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
         sqlx::query(
             "UPDATE runtimes
              SET last_heartbeat_at = now() - interval '2 minutes'
@@ -9945,11 +9955,15 @@ mod tests {
     async fn runtime_heartbeat_tolerates_stale_owned_sessions_instead_of_conflicting(pool: PgPool) {
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
         let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
-        sqlx::query("UPDATE hub_sessions SET lifecycle_status = 'online' WHERE id = $1")
-            .bind(fixture.hub_session_id)
-            .execute(&fixture.state.pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET lifecycle_status = 'online', recovery_source = NULL
+             WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
         let _ = runtime_complete_run(
             State(fixture.state.clone()),
             bearer_headers(&fixture.runtime_token),
@@ -10025,6 +10039,7 @@ mod tests {
         sqlx::query(
             "UPDATE hub_sessions
              SET lifecycle_status = 'saving',
+                 recovery_source = NULL,
                  saving_history_checkpoint = 1,
                  saving_ownership_generation = 1,
                  saving_reason = 'idle',
@@ -10075,6 +10090,17 @@ mod tests {
     async fn runtime_reaper_fails_running_runs_and_allows_reclaiming_pending_work(pool: PgPool) {
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
         let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        // claim 接管时会话进入 restoring（recovery_source='bundle'）；reaper 只应
+        // 处理已接管完成的会话，先推进到 online 并清恢复源（与其余 reaper fixture 一致）。
+        sqlx::query(
+            "UPDATE hub_sessions
+             SET lifecycle_status = 'online', recovery_source = NULL
+             WHERE id = $1",
+        )
+        .bind(fixture.hub_session_id)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
         assert_eq!(
             sqlx::query_scalar::<_, String>("SELECT status FROM runs WHERE id = $1")
                 .bind(claim.run.id)
@@ -12135,6 +12161,7 @@ mod tests {
         sqlx::query(
             "UPDATE hub_sessions
              SET lifecycle_status = 'saving',
+                 recovery_source = NULL,
                  saving_history_checkpoint = history_checkpoint,
                  saving_ownership_generation = ownership_generation,
                  saving_reason = 'drain', saving_checkpoint_attempt_id = $1
