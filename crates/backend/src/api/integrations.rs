@@ -2334,6 +2334,7 @@ pub(crate) async fn claim_client_tool_call(
     headers: HeaderMap,
     Path(tool_call_id): Path<Uuid>,
 ) -> Result<Json<ClientToolClaimResponse>, ApiError> {
+    let started_at = std::time::Instant::now();
     let token = client_access_token_from_headers(&headers)
         .ok_or(ApiError::unauthorized("missing Client Access Credential"))?;
     let mut tx = state.pool.begin().await?;
@@ -2405,7 +2406,15 @@ pub(crate) async fn claim_client_tool_call(
         },
         _ => return Err(ApiError::internal("stored Client Tool status is invalid")),
     };
+    let session_id: Option<Uuid> = batch.first().and_then(|row| row.get("hub_session_id"));
     tx.commit().await?;
+    tracing::info!(
+        %tool_call_id,
+        ?session_id,
+        status = %response.status,
+        elapsed_ms = started_at.elapsed().as_millis() as u64,
+        "client tool call claimed"
+    );
     Ok(Json(response))
 }
 
@@ -2415,6 +2424,7 @@ pub(crate) async fn submit_client_tool_result(
     Path(tool_call_id): Path<Uuid>,
     Json(req): Json<SubmitClientToolResultRequest>,
 ) -> Result<Json<SubmitClientToolResultResponse>, ApiError> {
+    let started_at = std::time::Instant::now();
     let settings = load_system_settings(&state.pool).await?;
     let (validation, checksum) =
         validate_client_tool_result(&req.result, settings.max_tool_result_bytes)?;
@@ -2461,6 +2471,11 @@ pub(crate) async fn submit_client_tool_result(
         };
         let tool_request = load_client_tool_request_tx(&mut tx, tool_call_id).await?;
         tx.commit().await?;
+        tracing::info!(
+            %tool_call_id,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "client tool result resubmitted (idempotent)"
+        );
         return Ok(Json(SubmitClientToolResultResponse { run, tool_request }));
     }
     if matches!(status.as_str(), "timed_out" | "unknown" | "cancelled") {
@@ -2549,6 +2564,11 @@ pub(crate) async fn submit_client_tool_result(
     };
     let tool_request = load_client_tool_request_tx(&mut tx, tool_call_id).await?;
     tx.commit().await?;
+    tracing::info!(
+        %tool_call_id,
+        elapsed_ms = started_at.elapsed().as_millis() as u64,
+        "client tool result submitted"
+    );
     Ok(Json(SubmitClientToolResultResponse { run, tool_request }))
 }
 
