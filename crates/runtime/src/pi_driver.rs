@@ -44,9 +44,9 @@ const PI_WORKSPACE_MOUNT: &str = "/workspace";
 const PI_AGENT_STATE_MOUNT: &str = "/agent-state";
 const PI_TMP_MOUNT: &str = "/tmp";
 #[cfg_attr(test, allow(dead_code))]
-const PI_SANDBOX_UID: u32 = 10001;
+pub(super) const PI_SANDBOX_UID: u32 = 10001;
 #[cfg_attr(test, allow(dead_code))]
-const PI_SANDBOX_GID: u32 = 10001;
+pub(super) const PI_SANDBOX_GID: u32 = 10001;
 const PI_AGENT_DIRECTORY: &str = ".pi/agent";
 const PI_HOME_DIRECTORY: &str = ".pi/home";
 const PI_TEMP_DIRECTORY: &str = ".pi/tmp";

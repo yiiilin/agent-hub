@@ -3383,6 +3383,35 @@ async fn reconstruct_pi_session_jsonl(
     );
     let final_path = session_dir.join(filename);
     tokio::fs::rename(&tmp, &final_path).await?;
+    // Pi 以降权用户（PI_SANDBOX_UID/GID=10001）运行且会持续写该会话文件：
+    // 重建文件必须归属该用户且仅其可读写，否则 Pi 加载后写失败直接退出
+    // （现场：root:root 0644 → Pi exit 1）。
+    {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = tokio::fs::metadata(&final_path).await?.permissions();
+        permissions.set_mode(0o600);
+        tokio::fs::set_permissions(&final_path, permissions).await?;
+        let path_c = std::ffi::CString::new(final_path.as_os_str().as_bytes())
+            .context("rebuilt Pi session path contains NUL")?;
+        // 仅 root 需要（也才能）chown 到沙箱用户；非 root 测试环境跳过
+        //（生产 runtime 以 root 运行，Pi 降权 10001）。
+        if unsafe { libc::geteuid() } == 0 {
+            let chown_result = unsafe {
+                libc::chown(
+                    path_c.as_ptr(),
+                    pi_driver::PI_SANDBOX_UID,
+                    pi_driver::PI_SANDBOX_GID,
+                )
+            };
+            if chown_result != 0 {
+                anyhow::bail!(
+                    "chown rebuilt Pi session file failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+    }
     // 新文件已原子就位：先清理旧的同 id 会话文件（避免 discover 因多文件
     // 同 id 判为歧义），再验证重建文件可按 canonical id 发现。
     let mut entries = tokio::fs::read_dir(&session_dir).await?;
@@ -17346,6 +17375,79 @@ done
             secret_files: Vec::new(),
             session_context: None,
         }
+    }
+
+    #[tokio::test]
+    async fn reconstruct_pi_session_jsonl_creates_pi_owned_private_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let native_session_id = "019ffdc6-reconstruct-test";
+        let run_id = Uuid::new_v4();
+        let app = Router::new().route(
+            "/api/runtime/sessions/{session_id}/replay-events",
+            get(move || {
+                let run_id = run_id;
+                async move {
+                    Json(vec![
+                        serde_json::json!({
+                            "seq": 1,
+                            "run_id": run_id,
+                            "hub_turn_id": null,
+                            "event_type": "message",
+                            "role": "user",
+                            "content": "重建测试",
+                            "payload": {"source": "console"},
+                            "created_at": "2026-08-01T00:00:00.000Z",
+                        }),
+                        serde_json::json!({
+                            "seq": 2,
+                            "run_id": run_id,
+                            "hub_turn_id": null,
+                            "event_type": "message",
+                            "role": "assistant",
+                            "content": "历史回复",
+                            "payload": {"source": "pi", "stop_reason": "stop"},
+                            "created_at": "2026-08-01T00:00:01.000Z",
+                        }),
+                    ])
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hub_addr = listener.local_addr().unwrap();
+        let hub = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = HubClient {
+            http: reqwest::Client::new(),
+            hub_url: format!("http://{hub_addr}"),
+            runtime_token: Arc::new(std::sync::RwLock::new("runtime-token".into())),
+            protocol_capabilities: HashSet::new(),
+            upload_retry_delays_secs: vec![0, 0, 0, 0, 0],
+        };
+        let engine_state_root = temp.path().join("engine-state");
+        reconstruct_pi_session_jsonl(
+            &client,
+            session_id,
+            1,
+            native_session_id,
+            &engine_state_root,
+        )
+        .await
+        .unwrap();
+
+        // 重建文件可发现，且属主/权限必须允许降权 Pi（10001）继续写。
+        let file = pi_driver::discover_session_file(&engine_state_root, native_session_id).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(&file).unwrap();
+        assert_eq!(
+            metadata.mode() & 0o777,
+            0o600,
+            "rebuilt session file must be private"
+        );
+        if unsafe { libc::geteuid() } == 0 {
+            assert_eq!(metadata.uid(), pi_driver::PI_SANDBOX_UID);
+            assert_eq!(metadata.gid(), pi_driver::PI_SANDBOX_GID);
+        }
+        hub.abort();
     }
 
     #[test]
