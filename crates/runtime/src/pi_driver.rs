@@ -3267,6 +3267,14 @@ pub(super) fn pi_tool_allowlist_for_claim(claim: &ClaimRunResponse) -> anyhow::R
             }
         }
     }
+    // 归档工具结果读取工具：broker 启用（Hub 凭据就绪）时必须暴露给模型，
+    // 否则大结果截断后模型无工具可读全文（只能用 read artifact:// 失败）。
+    if TOOL_RESULT_HUB_URL.get().is_some() && TOOL_RESULT_RUNTIME_TOKEN.get().is_some() {
+        const TOOL_RESULT_READ_TOOL: &str = "agent_hub_integration_tool_result_read";
+        if !tools.iter().any(|tool| tool == TOOL_RESULT_READ_TOOL) {
+            tools.push(TOOL_RESULT_READ_TOOL.into());
+        }
+    }
     Ok(tools)
 }
 

@@ -9870,10 +9870,11 @@ mod tests {
         claim.agent.tool_allowlist = vec!["grep".into()];
         claim.execution_configuration.tool_allowlist = vec!["grep".into()];
 
-        assert_eq!(
-            pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap(),
-            ["grep", "vision_analyze"]
-        );
+        let tools = pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap();
+        assert!(tools.contains(&"grep".to_string()));
+        assert!(!tools.contains(&"read".to_string()));
+        assert!(!tools.contains(&"skill_exec".to_string()));
+        assert!(tools.contains(&"vision_analyze".to_string()));
     }
 
     #[test]
@@ -10043,16 +10044,16 @@ mod tests {
             }],
         });
 
-        assert_eq!(
-            pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap(),
-            ["read", "skill_exec", "vision_analyze"]
-        );
+        let with_skill_exec = pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap();
+        assert!(with_skill_exec.contains(&"read".to_string()));
+        assert!(with_skill_exec.contains(&"skill_exec".to_string()));
+        assert!(with_skill_exec.contains(&"vision_analyze".to_string()));
 
         claim.execution_configuration.tool_allowlist = vec!["read".into()];
-        assert_eq!(
-            pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap(),
-            ["read", "vision_analyze"]
-        );
+        let read_only = pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap();
+        assert!(read_only.contains(&"read".to_string()));
+        assert!(!read_only.contains(&"skill_exec".to_string()));
+        assert!(read_only.contains(&"vision_analyze".to_string()));
 
         claim.execution_configuration.tool_allowlist = vec!["read".into(), "skill_exec".into()];
         claim.execution_configuration.skills[0]
@@ -10061,9 +10062,26 @@ mod tests {
             .unwrap()
             .files[0]
             .executable = false;
-        assert_eq!(
-            pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap(),
-            ["read", "vision_analyze"]
+        let no_exec_skill = pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap();
+        assert!(no_exec_skill.contains(&"read".to_string()));
+        assert!(!no_exec_skill.contains(&"skill_exec".to_string()));
+    }
+
+    #[test]
+    fn tool_result_read_tool_is_exposed_when_broker_credentials_are_ready() {
+        // 并行安全：OnceLock 只能 set 一次；其他 allowlist 测试用包含断言，
+        // 不受本测试设置全局凭据的影响。
+        let _ = pi_driver::TOOL_RESULT_HUB_URL.set("http://hub.test".into());
+        let _ = pi_driver::TOOL_RESULT_RUNTIME_TOKEN.set("rt-token".into());
+
+        let mut claim = test_claim();
+        claim.agent.tool_allowlist = vec!["read".into()];
+        claim.execution_configuration.tool_allowlist = vec!["read".into()];
+
+        let tools = pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap();
+        assert!(
+            tools.contains(&"agent_hub_integration_tool_result_read".to_string()),
+            "archived tool result read tool must be exposed to the model"
         );
     }
 
@@ -14129,20 +14147,23 @@ mod tests {
                 & 0o777,
             0o440
         );
-        assert_eq!(
-            pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap(),
-            [
-                "read",
-                "grep",
-                "find",
-                "ls",
-                "edit",
-                "write",
-                "bash",
-                "vision_analyze",
-                "echo"
-            ]
-        );
+        let tools = pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap();
+        for expected in [
+            "read",
+            "grep",
+            "find",
+            "ls",
+            "edit",
+            "write",
+            "bash",
+            "vision_analyze",
+            "echo",
+        ] {
+            assert!(
+                tools.contains(&expected.to_string()),
+                "allowlist must contain {expected}"
+            );
+        }
 
         let catalog_sentinel = temp.path().join("catalog-sentinel");
         let extension_sentinel = temp.path().join("extension-sentinel");
