@@ -4704,11 +4704,15 @@ async fn load_tool_result_artifact_response(
                 .limit
                 .unwrap_or(TOOL_RESULT_READ_LIMIT_BYTES as i64)
                 .clamp(1, TOOL_RESULT_READ_LIMIT_BYTES as i64);
-            // 未归档但完整在 DB：直接切片（预算占位场景）。
-            let bytes = if let Some(bytes) = db_result {
-                let start = (offset as usize).min(bytes.len());
-                let end = (offset as usize + limit as usize).min(bytes.len());
-                bytes[start..end].to_vec()
+            // UTF-8 continuation byte（10xxxxxx）。
+            fn is_cont(byte: u8) -> bool {
+                byte & 0xC0 == 0x80
+            }
+            // 两分支返回 (raw, absolute_base)：DB 全文 base=0；S3 是区间相对
+            // 字节，前后各多取最多 3 字节（base=实际 fetch_start）以便对齐
+            // UTF-8 边界。绝对偏移 = base + 本地偏移。
+            let (mut raw, mut base, raw_size) = if let Some(bytes) = db_result {
+                (bytes, 0i64, db_result_len.unwrap_or(0))
             } else {
                 let Some(artifact_id) = artifact_id else {
                     return Err(ApiError::not_found(
@@ -4719,25 +4723,84 @@ async fn load_tool_result_artifact_response(
                     .session_bundle_store
                     .clone()
                     .ok_or_else(|| ApiError::internal("artifact store is unavailable"))?;
+                let total = artifact_size_bytes.unwrap_or(0);
+                // offset 超出对象：返回空页（不构造越界 Range）。
+                if offset >= total {
+                    return Ok(Json(json!({
+                        "content": "",
+                        "offset": offset,
+                        "limit": limit,
+                        "next_offset": total,
+                        "size_bytes": total,
+                    }))
+                    .into_response());
+                }
+                let fetch_start = offset.saturating_sub(3).max(0);
+                // 尾部多取最多 3 字节：chunk 恰在字符中间结束时，end==raw.len()
+                // 会被误当边界，多取的字节让回退循环有完整字符可对齐。
+                let fetch_end = offset
+                    .saturating_add(limit)
+                    .saturating_add(3)
+                    .min(total.saturating_sub(1))
+                    .max(fetch_start);
                 let object_key = format!("tool-results/{run_id}/{artifact_id}");
-                let range = format!("bytes={}-{}", offset, offset + limit - 1);
+                let range = format!("bytes={fetch_start}-{fetch_end}");
                 let response = store
                     .get_range(&object_key, &range)
                     .await
                     .map_err(|_| ApiError::internal("artifact read failed"))?;
-                response
+                let bytes = response
                     .bytes()
                     .await
                     .map_err(|_| ApiError::internal("artifact read failed"))?
-                    .to_vec()
+                    .to_vec();
+                (bytes, fetch_start, total)
             };
-            let content = String::from_utf8_lossy(&bytes).into_owned();
+            // fetch_start 可能切进前一个字符中间：丢弃开头的 continuation
+            // bytes（半个字符前缀），使 raw[0] 是 lead byte，后续对齐结果
+            // 可直接换算绝对偏移。
+            while !raw.is_empty() && is_cont(raw[0]) {
+                raw.remove(0);
+                base += 1;
+            }
+            let mut local_start = ((offset - base) as usize).min(raw.len());
+            let mut local_end = ((offset - base) as usize + limit as usize).min(raw.len());
+            // 回退到 lead byte：避免返回半个字符（from_utf8 替换 U+FFFD），
+            // next_offset 按实际原始字节推进。local_x 可能等于 raw.len()
+            //（offset 超出 / 尾部多取不足），统一看末字节（安全下标）。
+            let last = raw.len().saturating_sub(1);
+            while local_start > 0 && is_cont(raw[local_start.min(last)]) {
+                local_start -= 1;
+            }
+            while local_end > local_start && is_cont(raw[local_end.min(last)]) {
+                local_end -= 1;
+            }
+            if local_start >= raw.len() {
+                // EOF / offset 超出：空页，next_offset 停在末尾不再前进。
+                return Ok(Json(json!({
+                    "content": "",
+                    "offset": offset,
+                    "limit": limit,
+                    "next_offset": raw_size,
+                    "size_bytes": raw_size,
+                }))
+                .into_response());
+            }
+            let content =
+                String::from_utf8(raw[local_start..local_end].to_vec()).map_err(|err| {
+                    tracing::error!(
+                        %err,
+                        %tool_request_id,
+                        "tool result range slice is not valid UTF-8"
+                    );
+                    ApiError::internal("tool result range read failed")
+                })?;
             Ok(Json(json!({
                 "content": content,
-                "offset": offset,
+                "offset": base + local_start as i64,
                 "limit": limit,
-                "next_offset": offset + content.len() as i64,
-                "size_bytes": artifact_size_bytes.or(db_result_len).unwrap_or(0),
+                "next_offset": base + local_end as i64,
+                "size_bytes": raw_size,
             }))
             .into_response())
         }
@@ -9198,6 +9261,261 @@ mod tests {
         let full_text = String::from_utf8_lossy(&full_bytes);
         assert!(full_text.contains("first_action:"));
         assert!(full_text.contains("\"status\":\"success\""));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn tool_result_range_read_aligns_utf8_db_path(pool: PgPool) {
+        let fixture = prepare_client_tool_run(pool, &["first_action"]).await;
+        finalize_test_client_tool_batch(&fixture, &["first_action"])
+            .await
+            .unwrap();
+        let claim = claim_client_tool_call(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(fixture.tool_call_ids[0]),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(claim.status, "claimed");
+        // 中文结果（15KB < 32KB 不截断不归档）：序列化形如
+        // {"output":"中中...","status":"success"}，`{"output":"` 是 11 字节
+        // ASCII 前缀，offset 12 切进第一个"中"（3 字节）中间。
+        let chinese = "中".repeat(5_000);
+        let _ = submit_client_tool_result(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(fixture.tool_call_ids[0]),
+            Json(SubmitClientToolResultRequest {
+                result: ClientToolResultDto::Success {
+                    output: json!(chinese),
+                    truncated: None,
+                },
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let state = fixture.app.state.clone();
+        let size_resp = load_tool_result_artifact_response(
+            &state,
+            fixture.run.id,
+            fixture.tool_call_ids[0],
+            &ToolResultArtifactQuery {
+                mode: Some("size".into()),
+                offset: None,
+                limit: None,
+            },
+        )
+        .await
+        .unwrap();
+        let size_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(size_resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let total = size_body["size_bytes"].as_i64().unwrap();
+
+        // offset 落在多字节字符中间：回退到完整字符，绝对偏移正确。
+        let range_resp = load_tool_result_artifact_response(
+            &state,
+            fixture.run.id,
+            fixture.tool_call_ids[0],
+            &ToolResultArtifactQuery {
+                mode: Some("range".into()),
+                offset: Some(12),
+                limit: Some(5),
+            },
+        )
+        .await
+        .unwrap();
+        let range_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(range_resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(range_body["content"], json!("中中"));
+        assert_eq!(range_body["offset"], 11);
+        assert_eq!(range_body["next_offset"], 17);
+
+        // EOF：offset == size → 空页，next_offset 停在末尾。
+        let eof_resp = load_tool_result_artifact_response(
+            &state,
+            fixture.run.id,
+            fixture.tool_call_ids[0],
+            &ToolResultArtifactQuery {
+                mode: Some("range".into()),
+                offset: Some(total),
+                limit: Some(5),
+            },
+        )
+        .await
+        .unwrap();
+        let eof_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(eof_resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(eof_body["content"], "");
+        assert_eq!(eof_body["next_offset"], total);
+
+        // offset > size：空页。
+        let beyond_resp = load_tool_result_artifact_response(
+            &state,
+            fixture.run.id,
+            fixture.tool_call_ids[0],
+            &ToolResultArtifactQuery {
+                mode: Some("range".into()),
+                offset: Some(total + 10),
+                limit: Some(5),
+            },
+        )
+        .await
+        .unwrap();
+        let beyond_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(beyond_resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(beyond_body["content"], "");
+        assert_eq!(beyond_body["next_offset"], total);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn tool_result_range_read_aligns_utf8_s3_path(pool: PgPool) {
+        let fixture = prepare_client_tool_run(pool, &["first_action"]).await;
+        let (_, store, server) = attachment_object_store().await;
+        let mut app_state = (*fixture.app.state).clone();
+        app_state.session_bundle_store = Some(Arc::new(store));
+        let state = Arc::new(app_state);
+        finalize_test_client_tool_batch(&fixture, &["first_action"])
+            .await
+            .unwrap();
+        let claim = claim_client_tool_call(
+            State(state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(fixture.tool_call_ids[0]),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(claim.status, "claimed");
+        // 中文大结果（36KB > 32KB）：截断并全文归档到 S3，read 走 S3 range。
+        let chinese = "中".repeat(12_000);
+        let submitted = submit_client_tool_result(
+            State(state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(fixture.tool_call_ids[0]),
+            Json(SubmitClientToolResultRequest {
+                result: ClientToolResultDto::Success {
+                    output: json!(chinese),
+                    truncated: None,
+                },
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(submitted.run.is_some());
+
+        let size_resp = load_tool_result_artifact_response(
+            &state,
+            fixture.run.id,
+            fixture.tool_call_ids[0],
+            &ToolResultArtifactQuery {
+                mode: Some("size".into()),
+                offset: None,
+                limit: None,
+            },
+        )
+        .await
+        .unwrap();
+        let size_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(size_resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(size_body["artifact_id"].is_string(), "must be archived");
+        let total = size_body["size_bytes"].as_i64().unwrap();
+
+        // offset 切进"中"中间：对齐到完整字符，绝对偏移 = 11/14。
+        let range_resp = load_tool_result_artifact_response(
+            &state,
+            fixture.run.id,
+            fixture.tool_call_ids[0],
+            &ToolResultArtifactQuery {
+                mode: Some("range".into()),
+                offset: Some(12),
+                limit: Some(5),
+            },
+        )
+        .await
+        .unwrap();
+        let range_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(range_resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(range_body["content"], json!("中中"));
+        assert_eq!(range_body["offset"], 11);
+        assert_eq!(range_body["next_offset"], 17);
+
+        // 末尾附近 range：不产生 U+FFFD（对象尾部是 ASCII `"}`，安全）。
+        let tail_resp = load_tool_result_artifact_response(
+            &state,
+            fixture.run.id,
+            fixture.tool_call_ids[0],
+            &ToolResultArtifactQuery {
+                mode: Some("range".into()),
+                offset: Some(total - 40),
+                limit: Some(64),
+            },
+        )
+        .await
+        .unwrap();
+        let tail_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(tail_resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let tail_content = tail_body["content"].as_str().unwrap();
+        assert!(
+            !tail_content.contains('\u{fffd}'),
+            "range must not produce replacement characters"
+        );
+
+        // EOF 空页。
+        let eof_resp = load_tool_result_artifact_response(
+            &state,
+            fixture.run.id,
+            fixture.tool_call_ids[0],
+            &ToolResultArtifactQuery {
+                mode: Some("range".into()),
+                offset: Some(total),
+                limit: Some(5),
+            },
+        )
+        .await
+        .unwrap();
+        let eof_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(eof_resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(eof_body["content"], "");
+        assert_eq!(eof_body["next_offset"], total);
+
+        server.abort();
     }
 
     #[sqlx::test(migrations = "./migrations")]
