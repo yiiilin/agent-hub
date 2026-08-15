@@ -3,11 +3,13 @@
 -- 0.3.9 起 submit_client_tool_result 写入
 --   {"tool_call_id", "tool_name", "result": <ClientToolResultDto>}
 -- 与 ClientToolContinuationResultDto 同构；续接解析/context 读取不再
--- 兼容旧纯 DTO 形状。本迁移把存量 client 路径已完成的旧形状行包一层：
+-- 兼容旧纯 DTO 形状。本迁移把存量 client 路径（run.client_instance_id
+-- 非空）已完成的旧形状行包一层：
 --   {"status": "success", ...} -> {"tool_call_id": id, "tool_name": tool_name,
 --                                    "result": {原值}}
--- 幂等：只匹配顶层有 status 且无 result 键的行（runtime 集成路径的
--- {truncated, content} 形状没有 status，不受影响）。
+-- 路径判定以 run.client_instance_id 为准（runtime 集成路径的
+-- result_payload 是任意 JSON，可能带 status 键，不能用 JSON 形状判断）；
+-- 同时排除已包装（有 result 键）与纯旧形状之外的行。
 
 UPDATE integration_tool_requests
 SET result_payload = jsonb_build_object(
@@ -18,4 +20,8 @@ SET result_payload = jsonb_build_object(
 WHERE status = 'completed'
   AND result_payload IS NOT NULL
   AND NOT (result_payload ? 'result')
-  AND result_payload ? 'status';
+  AND EXISTS (
+      SELECT 1 FROM runs AS run
+      WHERE run.id = integration_tool_requests.run_id
+        AND run.client_instance_id IS NOT NULL
+  );

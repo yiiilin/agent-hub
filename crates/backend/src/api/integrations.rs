@@ -8926,6 +8926,93 @@ mod tests {
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn migration_0015_wraps_only_client_tool_rows(pool: PgPool) {
+        // client 行：finalize 后手工置为旧形状 completed（纯 DTO）。
+        let fixture = prepare_client_tool_run(pool, &["first_action"]).await;
+        finalize_test_client_tool_batch(&fixture, &["first_action"])
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE integration_tool_requests
+             SET status = 'completed', result_payload = $2
+             WHERE id = $1",
+        )
+        .bind(fixture.tool_call_ids[0])
+        .bind(json!({ "status": "success", "output": "old shape" }))
+        .execute(&fixture.app.state.pool)
+        .await
+        .unwrap();
+
+        // runtime 行：finalize 后置为 completed，result_payload 是任意 JSON
+        // 且带 status 键——不能靠 JSON 形状判定路径，必须按 run 排除。
+        let rfixture = integration_runtime_fixture(fixture.app.state.pool.clone()).await;
+        let batch = tool_request_batch(&rfixture, [rfixture.tool_request_id]);
+        let _ = runtime_finalize_tool_requests(
+            State(rfixture.state.clone()),
+            bearer_headers(&rfixture.runtime_token),
+            Path(rfixture.run_id),
+            runtime_write(batch),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE integration_tool_requests
+             SET status = 'completed', result_payload = $2
+             WHERE id = $1",
+        )
+        .bind(rfixture.tool_request_id)
+        .bind(json!({ "status": "ok", "data": 1 }))
+        .execute(&fixture.app.state.pool)
+        .await
+        .unwrap();
+
+        // 执行 0015 迁移 SQL（单条 UPDATE）。
+        let sql = include_str!("../../migrations/0015_client_tool_result_wrap_payload.sql");
+        sqlx::raw_sql(sql)
+            .execute(&fixture.app.state.pool)
+            .await
+            .unwrap();
+
+        // client 行被包一层，内层原值保留。
+        let (client_payload,): (serde_json::Value,) =
+            sqlx::query_as("SELECT result_payload FROM integration_tool_requests WHERE id = $1")
+                .bind(fixture.tool_call_ids[0])
+                .fetch_one(&fixture.app.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            client_payload.get("tool_call_id").and_then(Value::as_str),
+            Some(fixture.tool_call_ids[0].to_string().as_str())
+        );
+        assert_eq!(
+            client_payload.get("tool_name").and_then(Value::as_str),
+            Some("first_action")
+        );
+        assert_eq!(
+            client_payload
+                .pointer("/result/status")
+                .and_then(Value::as_str),
+            Some("success")
+        );
+        assert_eq!(
+            client_payload
+                .pointer("/result/output")
+                .and_then(Value::as_str),
+            Some("old shape")
+        );
+
+        // runtime 行原样保留（任意 JSON，即使带 status 键）。
+        let (runtime_payload,): (serde_json::Value,) =
+            sqlx::query_as("SELECT result_payload FROM integration_tool_requests WHERE id = $1")
+                .bind(rfixture.tool_request_id)
+                .fetch_one(&fixture.app.state.pool)
+                .await
+                .unwrap();
+        assert_eq!(runtime_payload, json!({ "status": "ok", "data": 1 }));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn truncated_client_tool_result_utf8_boundary_does_not_panic(pool: PgPool) {
         let fixture = prepare_client_tool_run(pool, &["first_action"]).await;
         finalize_test_client_tool_batch(&fixture, &["first_action"])
