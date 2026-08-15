@@ -4614,8 +4614,18 @@ async fn load_tool_result_artifact_response(
     tool_request_id: Uuid,
     query: &ToolResultArtifactQuery,
 ) -> Result<Response, ApiError> {
-    let row = sqlx::query_as::<_, (Option<Uuid>, Option<i64>, Option<String>, bool)>(
-        "SELECT artifact_id, artifact_size_bytes, artifact_reason, result_truncated
+    let row = sqlx::query_as::<
+        _,
+        (
+            Option<Uuid>,
+            Option<i64>,
+            Option<String>,
+            bool,
+            Option<Value>,
+        ),
+    >(
+        "SELECT artifact_id, artifact_size_bytes, artifact_reason, result_truncated,
+                result_payload
          FROM integration_tool_requests
          WHERE id = $1 AND run_id = $2 AND status = 'completed'",
     )
@@ -4623,79 +4633,111 @@ async fn load_tool_result_artifact_response(
     .bind(run_id)
     .fetch_optional(&state.pool)
     .await?;
-    let Some((artifact_id, artifact_size_bytes, artifact_reason, truncated)) = row else {
+    let Some((artifact_id, artifact_size_bytes, artifact_reason, truncated, result_payload)) = row
+    else {
         return Err(ApiError::not_found("tool request result not found"));
     };
+    // 未归档且未截断时，完整结果就在 result_payload（client 包装层取内层
+    // result；runtime 路径原样），read 接口直接从 DB 提供 size/range/full，
+    // 保证 plural 预算裁剪的占位结果仍可取全文（不丢数据）。
+    let db_result: Option<Vec<u8>> = if artifact_id.is_none() && !truncated {
+        result_payload.map(|payload| {
+            let inner = payload.get("result").cloned().unwrap_or(payload);
+            serde_json::to_vec(&inner).unwrap_or_default()
+        })
+    } else {
+        None
+    };
+    let db_result_len = db_result.as_ref().map(|bytes| bytes.len() as i64);
     match query.mode.as_deref().unwrap_or("size") {
         "size" => Ok(Json(json!({
             "tool_request_id": tool_request_id,
-            "size_bytes": artifact_size_bytes.unwrap_or(0),
+            "size_bytes": artifact_size_bytes.or(db_result_len).unwrap_or(0),
             "artifact_id": artifact_id,
             "artifact_reason": artifact_reason,
             "truncated": truncated,
         }))
         .into_response()),
         "full" => {
-            // 全量流式返回（file 模式 / 下载用），不经内存整体加载。
-            let Some(artifact_id) = artifact_id else {
-                return Err(ApiError::not_found(
-                    "tool result was not archived; check artifact_reason via mode=size",
-                ));
+            // 全量流式返回（file 模式 / 下载用），不经内存整体加载；
+            // 未归档但完整在 DB 的结果直接返回（预算占位场景）。
+            let Some(bytes) = db_result else {
+                let Some(artifact_id) = artifact_id else {
+                    return Err(ApiError::not_found(
+                        "tool result was not archived; check artifact_reason via mode=size",
+                    ));
+                };
+                let store = state
+                    .session_bundle_store
+                    .clone()
+                    .ok_or_else(|| ApiError::internal("artifact store is unavailable"))?;
+                let object_key = format!("tool-results/{run_id}/{artifact_id}");
+                let response = store
+                    .get(&object_key)
+                    .await
+                    .map_err(|_| ApiError::internal("artifact read failed"))?;
+                let stream = response
+                    .bytes_stream()
+                    .map(|item| item.map_err(std::io::Error::other));
+                let body = axum::body::Body::from_stream(stream);
+                return Response::builder()
+                    .header(
+                        header::CONTENT_TYPE,
+                        "application/json; charset=utf-8".to_owned(),
+                    )
+                    .header(header::CONTENT_LENGTH, artifact_size_bytes.unwrap_or(0))
+                    .body(body)
+                    .map_err(|_| ApiError::internal("artifact response build failed"));
             };
-            let store = state
-                .session_bundle_store
-                .clone()
-                .ok_or_else(|| ApiError::internal("artifact store is unavailable"))?;
-            let object_key = format!("tool-results/{run_id}/{artifact_id}");
-            let response = store
-                .get(&object_key)
-                .await
-                .map_err(|_| ApiError::internal("artifact read failed"))?;
-            let stream = response
-                .bytes_stream()
-                .map(|item| item.map_err(std::io::Error::other));
-            let body = axum::body::Body::from_stream(stream);
             Ok(Response::builder()
                 .header(
                     header::CONTENT_TYPE,
                     "application/json; charset=utf-8".to_owned(),
                 )
-                .header(header::CONTENT_LENGTH, artifact_size_bytes.unwrap_or(0))
-                .body(body)
+                .header(header::CONTENT_LENGTH, bytes.len())
+                .body(Body::from(bytes))
                 .map_err(|_| ApiError::internal("artifact response build failed"))?)
         }
         "range" => {
-            let Some(artifact_id) = artifact_id else {
-                return Err(ApiError::not_found(
-                    "tool result was not archived; check artifact_reason via mode=size",
-                ));
-            };
-            let store = state
-                .session_bundle_store
-                .clone()
-                .ok_or_else(|| ApiError::internal("artifact store is unavailable"))?;
             let offset = query.offset.unwrap_or(0).max(0);
             let limit = query
                 .limit
                 .unwrap_or(TOOL_RESULT_READ_LIMIT_BYTES as i64)
                 .clamp(1, TOOL_RESULT_READ_LIMIT_BYTES as i64);
-            let object_key = format!("tool-results/{run_id}/{artifact_id}");
-            let range = format!("bytes={}-{}", offset, offset + limit - 1);
-            let response = store
-                .get_range(&object_key, &range)
-                .await
-                .map_err(|_| ApiError::internal("artifact read failed"))?;
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|_| ApiError::internal("artifact read failed"))?;
+            // 未归档但完整在 DB：直接切片（预算占位场景）。
+            let bytes = if let Some(bytes) = db_result {
+                let start = (offset as usize).min(bytes.len());
+                let end = (offset as usize + limit as usize).min(bytes.len());
+                bytes[start..end].to_vec()
+            } else {
+                let Some(artifact_id) = artifact_id else {
+                    return Err(ApiError::not_found(
+                        "tool result was not archived; check artifact_reason via mode=size",
+                    ));
+                };
+                let store = state
+                    .session_bundle_store
+                    .clone()
+                    .ok_or_else(|| ApiError::internal("artifact store is unavailable"))?;
+                let object_key = format!("tool-results/{run_id}/{artifact_id}");
+                let range = format!("bytes={}-{}", offset, offset + limit - 1);
+                let response = store
+                    .get_range(&object_key, &range)
+                    .await
+                    .map_err(|_| ApiError::internal("artifact read failed"))?;
+                response
+                    .bytes()
+                    .await
+                    .map_err(|_| ApiError::internal("artifact read failed"))?
+                    .to_vec()
+            };
             let content = String::from_utf8_lossy(&bytes).into_owned();
             Ok(Json(json!({
                 "content": content,
                 "offset": offset,
                 "limit": limit,
                 "next_offset": offset + content.len() as i64,
-                "size_bytes": artifact_size_bytes.unwrap_or(0),
+                "size_bytes": artifact_size_bytes.or(db_result_len).unwrap_or(0),
             }))
             .into_response())
         }
@@ -9009,6 +9051,153 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(runtime_payload, json!({ "status": "ok", "data": 1 }));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn plural_budget_placeholder_result_still_readable_from_db(pool: PgPool) {
+        let fixture =
+            prepare_client_tool_run(pool, &["first_action", "second_action", "third_action"]).await;
+        finalize_test_client_tool_batch(
+            &fixture,
+            &["first_action", "second_action", "third_action"],
+        )
+        .await
+        .unwrap();
+        // 三个亚阈值结果（各 ~22KB，不截断不归档），展开后合计超 64KB
+        // 预算——最旧（first_action）被占位，但其完整结果仍在 DB。
+        let mut continuation_run = None;
+        for (idx, name) in ["first_action", "second_action", "third_action"]
+            .iter()
+            .enumerate()
+        {
+            let claim = claim_client_tool_call(
+                State(fixture.app.state.clone()),
+                bearer_headers(&fixture.executor.access_token),
+                Path(fixture.tool_call_ids[idx]),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(claim.status, "claimed");
+            let mid = "y".repeat(22_000);
+            let submitted = submit_client_tool_result(
+                State(fixture.app.state.clone()),
+                bearer_headers(&fixture.executor.access_token),
+                Path(fixture.tool_call_ids[idx]),
+                Json(SubmitClientToolResultRequest {
+                    result: ClientToolResultDto::Success {
+                        output: json!(format!("{name}:{mid}")),
+                        truncated: None,
+                    },
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+            if idx == 2 {
+                assert!(
+                    submitted.run.is_some(),
+                    "continuation run must be created after last tool result"
+                );
+                continuation_run = submitted.run;
+            }
+        }
+        let continuation_run = continuation_run.expect("continuation run must exist");
+
+        // 占位确认：first_action 被预算裁剪为占位 DTO。
+        let mut tx = fixture.app.state.pool.begin().await.unwrap();
+        let context = load_integration_context_for_run(&mut tx, &continuation_run)
+            .await
+            .unwrap()
+            .expect("tool-result run must expose integration context");
+        tx.commit().await.unwrap();
+        assert_eq!(context.tool_results.len(), 3);
+        let first = serde_json::to_value(&context.tool_results[0]).unwrap();
+        assert!(
+            first
+                .pointer("/result/output")
+                .and_then(Value::as_str)
+                .unwrap()
+                .contains("工具结果未展开"),
+            "first_action must be a placeholder"
+        );
+
+        // read 三种模式：first_action 未归档且未截断，完整结果从 DB 提供。
+        let state = fixture.app.state.clone();
+        let size_resp = load_tool_result_artifact_response(
+            &state,
+            fixture.run.id,
+            fixture.tool_call_ids[0],
+            &ToolResultArtifactQuery {
+                mode: Some("size".into()),
+                offset: None,
+                limit: None,
+            },
+        )
+        .await
+        .unwrap();
+        let size_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(size_resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(size_body["truncated"], json!(false));
+        assert!(size_body["artifact_id"].is_null());
+        let size_bytes = size_body["size_bytes"].as_i64().unwrap();
+        assert!(
+            size_bytes > 22_000,
+            "size must reflect the full in-DB result"
+        );
+
+        let range_resp = load_tool_result_artifact_response(
+            &state,
+            fixture.run.id,
+            fixture.tool_call_ids[0],
+            &ToolResultArtifactQuery {
+                mode: Some("range".into()),
+                offset: Some(0),
+                limit: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+        let range_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(range_resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let content = range_body["content"].as_str().unwrap();
+        assert!(
+            content.contains("first_action:"),
+            "range must return the full-result JSON prefix"
+        );
+        assert_eq!(range_body["next_offset"].as_i64().unwrap(), 100);
+
+        let full_resp = load_tool_result_artifact_response(
+            &state,
+            fixture.run.id,
+            fixture.tool_call_ids[0],
+            &ToolResultArtifactQuery {
+                mode: Some("full".into()),
+                offset: None,
+                limit: None,
+            },
+        )
+        .await
+        .unwrap();
+        let full_bytes = axum::body::to_bytes(full_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            full_bytes.len() > 22_000,
+            "full read must return the complete in-DB result"
+        );
+        let full_text = String::from_utf8_lossy(&full_bytes);
+        assert!(full_text.contains("first_action:"));
+        assert!(full_text.contains("\"status\":\"success\""));
     }
 
     #[sqlx::test(migrations = "./migrations")]
