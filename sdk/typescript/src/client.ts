@@ -39,6 +39,28 @@ const JOURNAL_RETENTION_MS = 24 * 60 * 60 * 1_000;
 const DEFAULT_RENEWAL_WINDOW_MS = 60_000;
 const DEFAULT_REQUEST_RETRY_DELAY_MS = 100;
 const DEFAULT_RECONNECT_DELAY_MS = 500;
+/** 工具绝对期限前保留的提交余量：deadline 提前触发，确保结果/错误能提交。 */
+const SUBMIT_GRACE_MS = 5_000;
+/** 执行状态未知时的收尾结果：不重跑 handler（副作用窗口未知），提交错误告知模型。 */
+const UNKNOWN_RESULT: ToolResult = {
+  status: "error",
+  error: {
+    code: "tool_result_unknown",
+    message:
+      "Previous Client Tool execution did not record a result; rerun the operation to confirm its outcome",
+    retryable: false,
+  },
+};
+
+/**
+ * 恢复扫描的统一筛选：recorded（从未执行，可安全重跑）、executing/unknown
+ * （副作用窗口未知，无 result 时以 tool_result_unknown 收尾）、completed
+ * （handler 已完成、提交未确认，cached result 直接重提）。acknowledged
+ * 已被 Hub 确认，跳过。
+ */
+function isRecoverableJournalState(state: string): boolean {
+  return ["recorded", "executing", "unknown", "completed"].includes(state);
+}
 
 const PATHS = {
   anonymousAccess: "/api/client/anonymous/access",
@@ -717,7 +739,7 @@ export class ClientSession {
     }
     for (const entry of entries) {
       if (entry.sessionId !== sessionId) continue;
-      if (!["recorded", "executing", "unknown"].includes(entry.state)) continue;
+      if (!isRecoverableJournalState(entry.state)) continue;
       seen.add(entry.toolCallId);
       await this.#operations.recoverToolInvocation(entry, signal);
     }
@@ -747,6 +769,7 @@ export class ClientSession {
           ...(event.runId ? { runId: event.runId } : {}),
           toolName: event.toolName,
           input: event.input,
+          ...(event.expiresAt ? { expiresAt: event.expiresAt } : {}),
           state: "recorded",
           createdAt: Date.now(),
           updatedAt: Date.now(),
@@ -1120,15 +1143,14 @@ export class AgentHubClient {
       entries = await this.#journal.list(this.clientInstanceId);
     } catch {
       return;
-    }    const pending = entries.filter((entry) =>
-      ["recorded", "executing", "unknown"].includes(entry.state)
-    );
+    }
+    const pending = entries.filter((entry) => isRecoverableJournalState(entry.state));
     for (const entry of pending) {
       await this.#recoverToolInvocation(entry);
     }
   }
 
-  /** 认领并执行一个遗留的工具调用（幂等；Hub 侧已结束或属于其他实例则跳过）。 */
+  /** 认领并收尾一个遗留的工具调用（幂等；Hub 侧已结束或属于其他实例则跳过）。 */
   async #recoverToolInvocation(entry: ToolJournalEntry, signal?: AbortSignal): Promise<void> {
     try {
       const claim = await this.#requestJson<ClaimResponse>(
@@ -1141,7 +1163,32 @@ export class AgentHubClient {
         await this.#journal.delete(this.clientInstanceId, entry.toolCallId);
         return;
       }
-      if (["completed", "acknowledged"].includes(entry.state)) {
+      if (entry.state === "acknowledged") {
+        return;
+      }
+
+      // cached result（completed/unknown/executing 遗留）：直接重提，绝不重跑
+      // handler——副作用可能已经发生，重跑会重复写。
+      if (entry.result) {
+        await this.#submitToolResult(entry.toolCallId, entry.result);
+        const completed: ToolJournalEntry = { ...entry, state: "completed", updatedAt: Date.now() };
+        await this.#journal.put(completed);
+        await this.#acknowledgeEntry(completed);
+        return;
+      }
+
+      // 仅 recorded 可执行（从未开始，副作用安全）；executing/unknown 无
+      // result 一律以 tool_result_unknown 收尾，不重跑。
+      if (entry.state !== "recorded") {
+        await this.#submitToolResult(entry.toolCallId, UNKNOWN_RESULT);
+        const completed: ToolJournalEntry = {
+          ...entry,
+          result: UNKNOWN_RESULT,
+          state: "completed",
+          updatedAt: Date.now(),
+        };
+        await this.#journal.put(completed);
+        await this.#acknowledgeEntry(completed);
         return;
       }
 
@@ -1157,51 +1204,110 @@ export class AgentHubClient {
           },
         };
       } else {
-        const controller = new AbortController();
-        let deadlineTimer: number | undefined;
-        const deadline = new Promise<never>((_resolve, reject) => {
-          deadlineTimer = globalThis.setTimeout(() => {
-            controller.abort(new DOMException("Client Tool deadline reached", "TimeoutError"));
-            reject(new DOMException("Client Tool deadline reached", "TimeoutError"));
-          }, 5 * 60_000);
-        });
-        try {
-          const output = await Promise.race([
-            handler(entry.input, {
-              toolCallId: entry.toolCallId,
-              sessionId: entry.sessionId,
-              ...(entry.runId ? { runId: entry.runId } : {}),
-              signal: combinedSignal(controller.signal, this.#lifetime.signal, signal),
-              recovering: true,
-            }),
-            deadline,
-          ]);
-          controller.abort();
-          result = checkedToolResult(output);
-        } catch (error) {
-          controller.abort();
-          result = {
-            status: "error",
-            error: {
-              code: "tool_handler_failed",
-              message: error instanceof Error ? error.message : "Client Tool handler failed",
-              retryable: false,
-            },
-          };
-        } finally {
-          if (deadlineTimer !== undefined) globalThis.clearTimeout(deadlineTimer);
-        }
+        result = await this.#executeToolHandler(
+          entry,
+          handler,
+          combinedSignal(this.#lifetime.signal, signal),
+          true,
+        );
       }
-      await this.#submitToolResult(entry.toolCallId, result);
+      // 先落 journal（completed+result）再提交：提交失败时恢复重提 cached
+      // result，不会重跑 handler。
       const completed: ToolJournalEntry = { ...entry, result, state: "completed", updatedAt: Date.now() };
       await this.#journal.put(completed);
-      await this.#acknowledgeEntry(completed);
+      try {
+        await this.#submitToolResult(entry.toolCallId, result);
+        await this.#acknowledgeEntry(completed);
+      } catch (error) {
+        if (error instanceof AgentHubError && [404, 409, 410].includes(error.status)) {
+          // Hub 已结束/结果不匹配：清理，下次不再恢复。
+          await this.#journal.delete(this.clientInstanceId, entry.toolCallId).catch(() => undefined);
+        }
+        // transient：completed+result 已落盘，下次恢复重提。
+      }
     } catch (error) {
       if (error instanceof AgentHubError && (error.status === 404 || error.status === 403)) {
         await this.#journal.delete(this.clientInstanceId, entry.toolCallId).catch(() => undefined);
         return;
       }
-      await this.#journal.put({ ...entry, state: "unknown", updatedAt: Date.now() }).catch(() => undefined);
+      // claim 网络失败：保留原状态，下次恢复重试。
+      await this.#journal.put(entry).catch(() => undefined);
+    }
+  }
+
+  /**
+   * 统一执行 handler：按 entry 绝对期限（expiresAt）减提交余量设置 deadline，
+   * 超时/中断生成错误结果（不静默）。期限缺失或不足时**不调用** handler
+   * （Promise.race 会先求值 handler，不能靠 deadline reject 阻止副作用）。
+   */
+  async #executeToolHandler(
+    entry: ToolJournalEntry,
+    handler: ToolHandler,
+    signal: AbortSignal,
+    recovering: boolean,
+  ): Promise<ToolResult> {
+    const expiresAt = entry.expiresAt ? Date.parse(entry.expiresAt) : NaN;
+    const remaining = Number.isFinite(expiresAt)
+      ? expiresAt - Date.now() - SUBMIT_GRACE_MS
+      : NaN;
+    if (!Number.isFinite(remaining) || remaining <= 0) {
+      return {
+        status: "error",
+        error: {
+          code: Number.isFinite(expiresAt) ? "tool_timeout" : "tool_result_unknown",
+          message: Number.isFinite(expiresAt)
+            ? "Client Tool invocation reached its deadline"
+            : "Tool deadline is unknown; execution was not attempted",
+          retryable: false,
+        },
+      };
+    }
+    const controller = new AbortController();
+    let deadlineTimer: number | undefined;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      deadlineTimer = globalThis.setTimeout(() => {
+        controller.abort(new DOMException("Client Tool deadline reached", "TimeoutError"));
+        reject(new DOMException("Client Tool deadline reached", "TimeoutError"));
+      }, Math.min(remaining, 5 * 60_000));
+    });
+    try {
+      const output = await Promise.race([
+        handler(entry.input, {
+          toolCallId: entry.toolCallId,
+          sessionId: entry.sessionId,
+          ...(entry.runId ? { runId: entry.runId } : {}),
+          signal: combinedSignal(controller.signal, signal),
+          recovering,
+        }),
+        deadline,
+      ]);
+      controller.abort();
+      return checkedToolResult(output);
+    } catch (error) {
+      controller.abort();
+      if (error instanceof DOMException && error.name === "TimeoutError") {
+        return {
+          status: "error",
+          error: {
+            code: "tool_timeout",
+            message: "Client Tool invocation reached its deadline",
+            retryable: false,
+          },
+        };
+      }
+      if (isAbort(error)) {
+        return {
+          status: "error",
+          error: {
+            code: "tool_execution_interrupted",
+            message: "Client Tool execution was interrupted",
+            retryable: false,
+          },
+        };
+      }
+      return checkedToolResult(handlerError(error));
+    } finally {
+      if (deadlineTimer !== undefined) globalThis.clearTimeout(deadlineTimer);
     }
   }
 
@@ -1455,12 +1561,47 @@ export class AgentHubClient {
     signal: AbortSignal,
   ): Promise<ToolDispatchOutcome> {
     const existing = await this.#journal.get(this.clientInstanceId, event.toolCallId);
-    if (existing?.result && (existing.state === "completed" || existing.state === "acknowledged")) {
-      await this.#submitToolResult(event.toolCallId, existing.result);
-      await this.#acknowledgeEntry(existing);
+    // cached result（completed/unknown/executing 遗留，含已 acknowledged 后
+    // Hub 重发 SSE 的重复帧）：幂等重提缓存结果，绝不重跑 handler（副作用
+    // 可能已发生）。Hub 明确结束（terminal）则清理并放行批次。
+    if (existing?.result) {
+      try {
+        await this.#submitToolResult(event.toolCallId, existing.result);
+        if (existing.state !== "acknowledged") {
+          await this.#acknowledgeEntry(existing);
+        }
+      } catch (error) {
+        if (error instanceof AgentHubError && [404, 409, 410].includes(error.status)) {
+          await this.#journal.delete(this.clientInstanceId, event.toolCallId).catch(() => undefined);
+          return { blocked: false };
+        }
+        return {
+          blocked: true,
+          event: {
+            type: "error",
+            sequence: event.sequence,
+            code: error instanceof AgentHubError ? error.code : "tool_result_submission_failed",
+            message: error instanceof Error ? error.message : "Client Tool result submission failed",
+            retryable: true,
+            raw: error,
+            toolCallId: event.toolCallId,
+          } as ErrorSessionEvent,
+        };
+      }
       return { blocked: false };
     }
     if (existing?.state === "acknowledged") return { blocked: false };
+    // 无 result 的 executing/unknown（副作用窗口未知）：不重跑，提交
+    // tool_result_unknown 收尾，模型明确收到失败而非静默。
+    if (existing && !existing.result && ["executing", "unknown"].includes(existing.state)) {
+      try {
+        await this.#submitToolResult(event.toolCallId, UNKNOWN_RESULT);
+        await this.#acknowledgeEntry({ ...existing, result: UNKNOWN_RESULT });
+      } catch {
+        // transient：保留 journal，恢复路径会重试收尾。
+      }
+      return { blocked: false };
+    }
 
     const now = Date.now();
     const entry: ToolJournalEntry = existing ?? {
@@ -1470,6 +1611,7 @@ export class AgentHubClient {
       ...(event.runId ? { runId: event.runId } : {}),
       toolName: event.toolName,
       input: event.input,
+      ...(event.expiresAt ? { expiresAt: event.expiresAt } : {}),
       state: "recorded",
       createdAt: now,
       updatedAt: now,
@@ -1524,80 +1666,23 @@ export class AgentHubClient {
         status: "error",
         error: {
           code: "tool_handler_not_registered",
-          message: `No handler is registered for Client Tool \"${event.toolName}\"`,
+          message: `No handler is registered for Client Tool "${event.toolName}"`,
           retryable: false,
         },
       };
     } else {
-      const controller = new AbortController();
-      const expiresAt = event.expiresAt ? Date.parse(event.expiresAt) : Date.now() + 5 * 60_000;
-      const remaining = Math.max(0, expiresAt - Date.now());
-      let deadlineTimer: number | undefined;
-      const deadline = new Promise<never>((_resolve, reject) => {
-        deadlineTimer = globalThis.setTimeout(() => {
-          controller.abort(new DOMException("Client Tool deadline reached", "TimeoutError"));
-          reject(new DOMException("Client Tool deadline reached", "TimeoutError"));
-        }, remaining);
-      });
-      const interrupted = new Promise<never>((_resolve, reject) => {
-        const interrupt = () => reject(new DOMException("Client Tool execution interrupted", "AbortError"));
-        if (signal.aborted || this.#lifetime.signal.aborted) interrupt();
-        else {
-          signal.addEventListener("abort", interrupt, { once: true });
-          this.#lifetime.signal.addEventListener("abort", interrupt, { once: true });
-        }
-      });
-      try {
-        const output = await Promise.race([
-          handler(event.input, {
-            toolCallId: event.toolCallId,
-            sessionId,
-            ...(event.runId ? { runId: event.runId } : {}),
-            signal: combinedSignal(controller.signal, signal, this.#lifetime.signal),
-          }),
-          deadline,
-          interrupted,
-        ]);
-        controller.abort();
-        result = checkedToolResult(output);
-      } catch (error) {
-        controller.abort();
-        if (error instanceof DOMException && error.name === "TimeoutError") {
-          await this.#journal.put({ ...executing, state: "unknown", updatedAt: Date.now() });
-          return {
-            blocked: true,
-            event: {
-              type: "timeout",
-              sequence: event.sequence,
-              toolCallId: event.toolCallId,
-              toolName: event.toolName,
-              message: "Client Tool invocation reached its deadline",
-              raw: event.raw,
-              ...(event.runId ? { runId: event.runId } : {}),
-            },
-          };
-        }
-        if (isAbort(error)) {
-          await this.#journal.put({ ...executing, state: "unknown", updatedAt: Date.now() });
-          return {
-            blocked: true,
-            event: {
-              type: "error",
-              sequence: event.sequence,
-              code: "tool_execution_interrupted",
-              message: "Client Tool execution was interrupted and will not be replayed automatically",
-              retryable: false,
-              raw: event.raw,
-              ...(event.runId ? { runId: event.runId } : {}),
-            },
-          };
-        }
-        result = checkedToolResult(handlerError(error));
-      } finally {
-        if (deadlineTimer !== undefined) globalThis.clearTimeout(deadlineTimer);
-      }
+      // 统一执行：按 entry 绝对期限减提交余量；超时/中断生成错误结果提交
+      // （不静默 blocked），期限缺失/不足时不调用 handler。
+      result = await this.#executeToolHandler(
+        entry,
+        handler,
+        combinedSignal(signal, this.#lifetime.signal),
+        false,
+      );
     }
 
+    // 先落 journal（completed+result）再提交：transient 失败保留 completed，
+    // 恢复路径重提 cached result（不重跑 handler）。
     const completed: ToolJournalEntry = {
       ...executing,
       state: "completed",
@@ -1610,7 +1695,13 @@ export class AgentHubClient {
       await this.#acknowledgeEntry(completed);
       return { blocked: false };
     } catch (error) {
-      await this.#journal.put({ ...completed, state: "unknown", updatedAt: Date.now() });
+      if (error instanceof AgentHubError && [404, 409, 410].includes(error.status)) {
+        // Hub 已结束/结果不匹配：清理，批次放行。
+        await this.#journal.delete(this.clientInstanceId, event.toolCallId).catch(() => undefined);
+        return { blocked: false };
+      }
+      // transient：completed+result 保留，恢复路径重提；阻塞同批后续工具，
+      // 避免前一个结果未达 Hub 时继续产生副作用。
       return {
         blocked: true,
         event: {
@@ -1620,7 +1711,8 @@ export class AgentHubClient {
           message: error instanceof Error ? error.message : "Client Tool result submission failed",
           retryable: true,
           raw: error,
-        },
+          toolCallId: event.toolCallId,
+        } as ErrorSessionEvent,
       };
     }
   }

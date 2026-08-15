@@ -242,6 +242,8 @@ export interface ToolJournalEntry {
   runId?: string;
   toolName: string;
   input: JsonValue;
+  /** Hub 侧工具的绝对过期时间（ISO），恢复执行按它减去提交余量计算 deadline。 */
+  expiresAt?: string;
   state: ToolJournalState;
   result?: ToolResult;
   createdAt: number;

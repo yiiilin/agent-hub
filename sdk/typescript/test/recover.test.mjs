@@ -98,7 +98,7 @@ async function makeTestHarness({ journalEntries = [], eventPayload = [] } = {}) 
   };
 }
 
-test("recoverPendingTools resumes a journal entry left executing across a refresh", async () => {
+test("recoverPendingTools settles an executing entry without rerunning the handler", async () => {
   const h = await makeTestHarness({
     journalEntries: [
       {
@@ -119,12 +119,14 @@ test("recoverPendingTools resumes a journal entry left executing across a refres
   const session = client.sessions.existing(SESSION_ID);
   await session.recoverPendingTools();
 
+  // 副作用窗口未知：不重跑 handler，提交 tool_result_unknown 收尾。
   assert.equal(h.calls.claim, 1, "claim must be replayed");
   assert.equal(h.calls.result, 1, "result must be submitted");
-  assert.deepEqual(h.executed, [{ index: 3 }], "handler must run with stored input");
+  assert.deepEqual(h.executed, [], "handler must NOT rerun for an executing entry");
 
   const entry = await h.journal.get("client-1", TOOL_CALL_ID);
   assert.equal(entry.state, "acknowledged");
+  assert.equal(entry.result?.error?.code, "tool_result_unknown");
   client.dispose();
 });
 
@@ -143,6 +145,7 @@ test("recoverPendingTools discovers tool requests missing results in the event s
           tool_name: "click_element_by_index",
           arguments: { index: 7 },
           batch_id: "batch-1",
+          expires_at: new Date(Date.now() + 60_000).toISOString(),
         },
         created_at: new Date().toISOString(),
       },
@@ -201,5 +204,128 @@ test("recoverPendingTools skips tool requests that already have results", async 
   assert.equal(h.calls.claim, 0, "completed calls must not be replayed");
   assert.equal(h.calls.result, 0);
   assert.equal(h.executed.length, 0);
+  client.dispose();
+});
+
+
+test("recoverPendingTools re-submits a completed cached result without rerunning the handler", async () => {
+  const h = await makeTestHarness({
+    journalEntries: [
+      {
+        clientInstanceId: "client-1",
+        toolCallId: TOOL_CALL_ID,
+        sessionId: SESSION_ID,
+        runId: "run-1",
+        toolName: "click_element_by_index",
+        input: { index: 5 },
+        state: "completed",
+        result: { status: "success", output: { cached: true } },
+        createdAt: Date.now() - 2000,
+        updatedAt: Date.now() - 1000,
+      },
+    ],
+  });
+
+  const client = await h.makeClient();
+  const session = client.sessions.existing(SESSION_ID);
+  await session.recoverPendingTools();
+
+  // completed（提交未确认）：重提 cached result，绝不重跑 handler。
+  assert.equal(h.calls.result, 1, "cached result must be re-submitted");
+  assert.deepEqual(h.executed, [], "handler must NOT rerun for a completed entry");
+  const entry = await h.journal.get("client-1", TOOL_CALL_ID);
+  assert.equal(entry.state, "acknowledged");
+  assert.deepEqual(entry.result, { status: "success", output: { cached: true } });
+  client.dispose();
+});
+
+test("a recorded entry inside the submit grace window is not executed and submits a timeout error", async () => {
+  const h = await makeTestHarness({
+    journalEntries: [
+      {
+        clientInstanceId: "client-1",
+        toolCallId: TOOL_CALL_ID,
+        sessionId: SESSION_ID,
+        runId: "run-1",
+        toolName: "click_element_by_index",
+        input: { index: 9 },
+        state: "recorded",
+        // 距过期不足提交余量（5s）：恢复时不执行 handler。
+        expiresAt: new Date(Date.now() + 2_000).toISOString(),
+        createdAt: Date.now() - 2000,
+        updatedAt: Date.now() - 1000,
+      },
+    ],
+  });
+
+  const client = await h.makeClient();
+  const session = client.sessions.existing(SESSION_ID);
+  await session.recoverPendingTools();
+
+  assert.equal(h.calls.result, 1, "timeout error must be submitted");
+  assert.deepEqual(h.executed, [], "handler must NOT run when the deadline is inside the grace window");
+  const entry = await h.journal.get("client-1", TOOL_CALL_ID);
+  assert.equal(entry.state, "acknowledged");
+  assert.equal(entry.result?.error?.code, "tool_timeout");
+  client.dispose();
+});
+
+test("a recorded entry without an expiry is settled as unknown without execution", async () => {
+  const h = await makeTestHarness({
+    journalEntries: [
+      {
+        clientInstanceId: "client-1",
+        toolCallId: TOOL_CALL_ID,
+        sessionId: SESSION_ID,
+        runId: "run-1",
+        toolName: "click_element_by_index",
+        input: { index: 11 },
+        state: "recorded",
+        createdAt: Date.now() - 2000,
+        updatedAt: Date.now() - 1000,
+      },
+    ],
+  });
+
+  const client = await h.makeClient();
+  const session = client.sessions.existing(SESSION_ID);
+  await session.recoverPendingTools();
+
+  // 无绝对期限：不执行（无法保证提交窗口），以 tool_result_unknown 收尾。
+  assert.equal(h.calls.result, 1, "unknown result must be submitted");
+  assert.deepEqual(h.executed, [], "handler must NOT run without an expiry");
+  const entry = await h.journal.get("client-1", TOOL_CALL_ID);
+  assert.equal(entry.state, "acknowledged");
+  assert.equal(entry.result?.error?.code, "tool_result_unknown");
+  client.dispose();
+});
+
+test("an expired recorded entry is settled with a timeout error without execution", async () => {
+  const h = await makeTestHarness({
+    journalEntries: [
+      {
+        clientInstanceId: "client-1",
+        toolCallId: TOOL_CALL_ID,
+        sessionId: SESSION_ID,
+        runId: "run-1",
+        toolName: "click_element_by_index",
+        input: { index: 13 },
+        state: "recorded",
+        expiresAt: new Date(Date.now() - 1_000).toISOString(),
+        createdAt: Date.now() - 2000,
+        updatedAt: Date.now() - 1000,
+      },
+    ],
+  });
+
+  const client = await h.makeClient();
+  const session = client.sessions.existing(SESSION_ID);
+  await session.recoverPendingTools();
+
+  assert.equal(h.calls.result, 1, "timeout error must be submitted");
+  assert.deepEqual(h.executed, [], "handler must NOT run for an expired entry");
+  const entry = await h.journal.get("client-1", TOOL_CALL_ID);
+  assert.equal(entry.state, "acknowledged");
+  assert.equal(entry.result?.error?.code, "tool_timeout");
   client.dispose();
 });

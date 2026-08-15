@@ -163,7 +163,9 @@ function toolFrame(sequence, toolCallId, toolName, batchId = "batch-1", expiresA
       tool_name: toolName,
       batch_id: batchId,
       arguments: { sequence },
-      ...(expiresAt ? { expires_at: expiresAt } : {}),
+      ...(expiresAt !== undefined
+        ? { expires_at: expiresAt }
+        : { expires_at: new Date(Date.now() + 60_000).toISOString() }),
     })}\n\n`,
   ].join("");
 }
@@ -641,7 +643,7 @@ test("Client Tool failures are structured and oversized or non-JSON outputs are 
   client.dispose();
 });
 
-test("an interrupted Client Tool remains unknown and stops the rest of its batch", async () => {
+test("an expired Client Tool is settled with a timeout error without invoking its handler", async () => {
   const journal = new MemoryToolJournalStorage();
   const claims = [];
   const results = [];
@@ -683,18 +685,26 @@ test("an interrupted Client Tool remains unknown and stops the rest of its batch
   const events = [];
   subscription = client.existing("session-timeout").subscribe((event) => {
     events.push(event);
-    if (event.type === "timeout") subscription.dispose();
   });
-  await subscription.closed;
-  await new Promise((resolve) => setTimeout(resolve, 10));
+  try {
+    // 等两个工具都提交后显式关闭订阅（SSE EOF 后会重连，不能只等 closed）。
+    await waitFor(() => results.length === 2);
+    await new Promise((resolve) => setTimeout(resolve, 10));
 
-  assert.equal(handlerCalls, 1);
-  assert.equal(claims.length, 1);
-  assert.equal(results.length, 0);
-  assert.equal(events.some((event) => event.type === "timeout"), true);
-  const entry = await journal.get(client.clientInstanceId, "timeout-1");
-  assert.equal(entry.state, "unknown");
-  client.dispose();
+    // 过期工具：不调用 handler，提交 tool_timeout 错误（模型收到失败而非
+    // 静默）；批次继续（错误已反馈），第二个工具正常执行并提交。
+    assert.equal(handlerCalls, 0);
+    assert.equal(claims.length, 2);
+    assert.equal(results.length, 2);
+    // 仅原始 tool_request 事件；无本地 timeout/error 事件（错误已作为结果提交）。
+    assert.deepEqual(events.map((event) => event.type), ["tool_request", "tool_request"]);
+    const entry = await journal.get(client.clientInstanceId, "timeout-1");
+    assert.equal(entry.state, "acknowledged");
+    assert.equal(entry.result?.error?.code, "tool_timeout");
+  } finally {
+    subscription.dispose();
+    client.dispose();
+  }
 });
 
 test("an uncertain Client Tool result submission remains unknown and stops the rest of its batch", async () => {
@@ -753,7 +763,9 @@ test("an uncertain Client Tool result submission remains unknown and stops the r
   assert.equal(events.some((event) => event.type === "error"), true);
   const entry = await journal.get(client.clientInstanceId, "uncertain-1");
   client.dispose();
-  assert.equal(entry.state, "unknown");
+  // 提交失败：completed + cached result 保留，恢复路径重提（不重跑 handler）。
+  assert.equal(entry.state, "completed");
+  assert.equal(entry.result?.status, "success");
 });
 
 test("anonymous clients persist only visitor/current Session identity and share the Session API", async () => {
