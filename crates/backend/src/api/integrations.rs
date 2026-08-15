@@ -2455,18 +2455,71 @@ pub(crate) async fn submit_client_tool_result(
     // while keeping the checksum over the client's original payload so an
     // idempotent resubmit still matches.
     // 超阈值先归档全文（事务外、指数退避），超硬上限则仅截断不归档。
-    let archived = if validation.truncated {
-        let run_id = sqlx::query_scalar::<_, Uuid>(
-            "SELECT run_id FROM integration_tool_requests WHERE id = $1",
+    let run_id = if validation.truncated {
+        Some(
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT run_id FROM integration_tool_requests WHERE id = $1",
+            )
+            .bind(tool_call_id)
+            .fetch_one(&state.pool)
+            .await?,
         )
-        .bind(tool_call_id)
-        .fetch_one(&state.pool)
-        .await?;
-        archive_tool_result(&state, run_id, tool_call_id, &validation).await
     } else {
         None
     };
-    let result_payload = sanitize_run_event_payload(validation.payload);
+    let archived = match run_id {
+        Some(run_id) => archive_tool_result(&state, run_id, tool_call_id, &validation).await,
+        None => None,
+    };
+    // 截断时保留合法 ClientToolResultDto 外壳：续接 run 会按 serde tag="status"
+    // 解析 result_payload，纯 {truncated, content} 会反序列化失败导致 submit
+    // 500（无日志 internal）。只替换 output/error.message 为截断文本，并加
+    // 同级 result_truncated 与 artifact_ref（S3 归档位置）供消费方取完整内容；
+    // 未知字段被 serde 忽略，SDK 旧结构提交依旧兼容。
+    let result_payload = if validation.truncated {
+        let content = validation
+            .payload
+            .get("content")
+            .cloned()
+            .unwrap_or_else(|| Value::String(String::new()));
+        let mut payload = serde_json::to_value(&req.result)
+            .map_err(|_| ApiError::bad_request("Client Tool result must be JSON"))?;
+        match payload.get("status").and_then(Value::as_str) {
+            Some("success") => {
+                payload["output"] = json!({ "truncated": true, "content": content });
+            }
+            Some("error") => {
+                let code = payload
+                    .pointer("/error/code")
+                    .cloned()
+                    .unwrap_or_else(|| json!("tool_result_truncated"));
+                let retryable = payload
+                    .pointer("/error/retryable")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                payload["error"] = json!({
+                    "code": code,
+                    "message": content.clone(),
+                    "retryable": retryable,
+                });
+            }
+            _ => {
+                // serde tag 反序列化已保证 status ∈ {success, error}，此分支不可达；
+                // 用 400 而非 internal，避免无日志 500。
+                return Err(ApiError::bad_request(
+                    "Client Tool result has an unknown status variant",
+                ));
+            }
+        }
+        payload["result_truncated"] = json!(true);
+        if let (Some(run_id), Some((Some(artifact_id), _, _))) = (run_id, &archived) {
+            payload["artifact_ref"] = json!(format!("tool-results/{run_id}/{artifact_id}"));
+        }
+        payload
+    } else {
+        validation.payload
+    };
+    let result_payload = sanitize_run_event_payload(result_payload);
     let token = client_access_token_from_headers(&headers)
         .ok_or(ApiError::unauthorized("missing Client Access Credential"))?;
     let mut tx = state.pool.begin().await?;
@@ -3990,11 +4043,13 @@ pub(crate) fn validate_tool_result_value(
         });
     }
     let over_hard_limit = original_bytes as i64 > max_tool_result_bytes;
-    let mut truncated_text = serialized;
-    truncated_text.truncate(TOOL_RESULT_TRUNCATE_BYTES);
-    while !truncated_text.is_char_boundary(truncated_text.len()) {
-        truncated_text.pop();
+    // 先回退到字符边界再切片：String::truncate 在边界内会直接 panic，
+    // 多字节 UTF-8（中文等）结果在阈值处恰好切进字符中间时线上表现为 500。
+    let mut end = TOOL_RESULT_TRUNCATE_BYTES.min(serialized.len());
+    while !serialized.is_char_boundary(end) {
+        end -= 1;
     }
+    let truncated_text = serialized[..end].to_owned();
     Ok(ToolResultValidation {
         payload: json!({ "truncated": true, "content": truncated_text }),
         original_value: result.clone(),
@@ -4400,6 +4455,11 @@ pub(crate) async fn load_hub_session_tx(
 /// 把截断的工具结果 payload 展开为模型可读的摘要：告知原始大小、归档状态与
 /// 获取全量的工具指引；未归档（超硬上限/上传失败）明确告知不可获取，防止
 /// 模型反复尝试读取不存在的归档。
+/// 兼容三种形状：
+/// - runtime 侧旧形状 `{truncated, content}`（整行 payload 或 output 直传）；
+/// - client 侧 DTO 外壳 `{status, output:{truncated,content}, ...}`（singular
+///   路径传入整行 payload）；
+/// - plural 路径把 output 对象直传 summarize（顶层 truncated）。
 fn summarize_tool_result_payload(
     payload: Value,
     tool_call_id: Uuid,
@@ -4407,12 +4467,18 @@ fn summarize_tool_result_payload(
     artifact_size_bytes: Option<i64>,
     artifact_reason: Option<&str>,
 ) -> Value {
-    if payload.get("truncated").and_then(Value::as_bool) != Some(true) {
+    let truncated = payload.get("truncated").and_then(Value::as_bool) == Some(true)
+        || payload
+            .pointer("/output/truncated")
+            .and_then(Value::as_bool)
+            == Some(true);
+    if !truncated {
         return payload;
     }
     let content = payload
         .get("content")
         .and_then(Value::as_str)
+        .or_else(|| payload.pointer("/output/content").and_then(Value::as_str))
         .unwrap_or_default()
         .to_owned();
     let size = artifact_size_bytes.unwrap_or(content.len() as i64);
@@ -8436,6 +8502,203 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn submit_string_output_client_tool_result_like_run_shelves_operation(pool: PgPool) {
+        let fixture = prepare_client_tool_run(pool, &["first_action"]).await;
+        finalize_test_client_tool_batch(&fixture, &["first_action"])
+            .await
+            .unwrap();
+        let claim = claim_client_tool_call(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(fixture.tool_call_ids[0]),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(claim.status, "claimed");
+        // run_shelves_operation 前端返回 toToolResult(JSON.stringify(result))：
+        // output 是 JSON 字符串（可能较大）。
+        let output = json!({
+            "ok": true,
+            "message": "",
+            "data": { "code": 200, "msg": "", "total": 5, "data": [ { "id": "abc", "cluster_name": "工程1" } ] }
+        });
+        let submitted = submit_client_tool_result(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(fixture.tool_call_ids[0]),
+            Json(SubmitClientToolResultRequest {
+                result: ClientToolResultDto::Success {
+                    output: json!(output.to_string()),
+                },
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(submitted.run.is_some(), "continuation run must be created");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn truncated_client_tool_result_keeps_dto_shell_for_continuation(pool: PgPool) {
+        let fixture = prepare_client_tool_run(pool, &["first_action"]).await;
+        // 带 S3 store：截断全文归档，模型输入应带 artifact 读取指引。
+        let (objects, store, server) = attachment_object_store().await;
+        let mut app_state = (*fixture.app.state).clone();
+        app_state.session_bundle_store = Some(Arc::new(store));
+        let state = Arc::new(app_state);
+        finalize_test_client_tool_batch(&fixture, &["first_action"])
+            .await
+            .unwrap();
+        let claim = claim_client_tool_call(
+            State(state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(fixture.tool_call_ids[0]),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(claim.status, "claimed");
+        // 大结果（超过截断阈值）触发 truncated 路径：续接 run 必须仍能按
+        // ClientToolResultDto 解析 result_payload，否则 submit 返回 500。
+        let big_content = "x".repeat(TOOL_RESULT_TRUNCATE_BYTES + 1024);
+        let submitted = submit_client_tool_result(
+            State(state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(fixture.tool_call_ids[0]),
+            Json(SubmitClientToolResultRequest {
+                result: ClientToolResultDto::Success {
+                    output: json!(big_content),
+                },
+            }),
+        )
+        .await
+        .expect("truncated Client Tool result must be accepted")
+        .0;
+        assert!(submitted.run.is_some(), "continuation run must be created");
+
+        // DB 形状：合法 DTO 外壳 + output 带 truncated/content + 同级标记与归档引用。
+        let (status, output, result_truncated, artifact_ref): (
+            String,
+            serde_json::Value,
+            Option<bool>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT result_payload->>'status', result_payload->'output',
+                    (result_payload->>'result_truncated')::bool,
+                    result_payload->>'artifact_ref'
+             FROM integration_tool_requests WHERE id = $1",
+        )
+        .bind(fixture.tool_call_ids[0])
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "success");
+        assert_eq!(output.get("truncated"), Some(&json!(true)));
+        let content = output.get("content").and_then(Value::as_str).unwrap();
+        assert!(content.len() <= TOOL_RESULT_TRUNCATE_BYTES);
+        assert_eq!(result_truncated, Some(true));
+        let artifact_ref = artifact_ref.expect("archived result must carry artifact_ref");
+        assert!(artifact_ref.starts_with("tool-results/"));
+
+        // 模型输入（singular）：context.tool_result 感知截断并给出读取指引。
+        let mut tx = state.pool.begin().await.unwrap();
+        let context = load_integration_context_for_run(&mut tx, submitted.run.as_ref().unwrap())
+            .await
+            .unwrap()
+            .expect("tool-result run must expose integration context");
+        tx.commit().await.unwrap();
+        let tool_result = context.tool_result.expect("single tool result is emitted");
+        assert_eq!(tool_result.get("truncated"), Some(&json!(true)));
+        let summarized = tool_result.get("content").and_then(Value::as_str).unwrap();
+        assert!(
+            summarized.contains("agent_hub_integration_tool_result_read(tool_call_id="),
+            "model input must carry full-result read instructions"
+        );
+        assert!(summarized.contains("artifact://"));
+
+        // 模型输入（plural）：tool_results 的 result 同样保留截断标记与指引。
+        assert_eq!(context.tool_results.len(), 1);
+        let plural_result = serde_json::to_value(&context.tool_results[0].result).unwrap();
+        assert_eq!(
+            plural_result.get("status").and_then(Value::as_str),
+            Some("success")
+        );
+        let plural_output = plural_result.get("output").unwrap();
+        assert_eq!(plural_output.get("truncated"), Some(&json!(true)));
+        let plural_summary = plural_output
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(
+            plural_summary.contains("agent_hub_integration_tool_result_read(tool_call_id="),
+            "plural path must carry full-result read instructions"
+        );
+
+        // 完整内容已归档到 S3。
+        let stored_key = artifact_ref;
+        let stored = objects.lock().unwrap().get(&stored_key).cloned();
+        assert!(
+            stored.is_some(),
+            "archived result must exist in object storage"
+        );
+        assert!(stored.unwrap().len() > TOOL_RESULT_TRUNCATE_BYTES);
+
+        // 释放测试 S3 server。
+        server.abort();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn truncated_client_tool_result_utf8_boundary_does_not_panic(pool: PgPool) {
+        let fixture = prepare_client_tool_run(pool, &["first_action"]).await;
+        finalize_test_client_tool_batch(&fixture, &["first_action"])
+            .await
+            .unwrap();
+        let claim = claim_client_tool_call(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(fixture.tool_call_ids[0]),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(claim.status, "claimed");
+        // "中é" 是 5 字节周期（3+2）：32768 与 5 互质，32768-2 不整除 5，
+        // 截断阈值必然落在多字节字符中间；旧的 String::truncate 直接
+        // panic（线上表现为无日志 500）。
+        let chinese = "中\u{e9}".repeat(16_385); // 2 + 81_925 = 81_927 字节
+        let submitted = submit_client_tool_result(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(fixture.tool_call_ids[0]),
+            Json(SubmitClientToolResultRequest {
+                result: ClientToolResultDto::Success {
+                    output: json!(chinese),
+                },
+            }),
+        )
+        .await
+        .expect("UTF-8 boundary truncation must not panic")
+        .0;
+        assert!(submitted.run.is_some(), "continuation run must be created");
+        let (status, content): (String, Option<String>) = sqlx::query_as(
+            "SELECT result_payload->>'status', result_payload#>>'{output,content}'
+             FROM integration_tool_requests WHERE id = $1",
+        )
+        .bind(fixture.tool_call_ids[0])
+        .fetch_one(&fixture.app.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "success");
+        let content = content.unwrap();
+        assert!(content.len() <= TOOL_RESULT_TRUNCATE_BYTES);
+        assert!(content.is_char_boundary(content.len()));
     }
 
     #[sqlx::test(migrations = "./migrations")]

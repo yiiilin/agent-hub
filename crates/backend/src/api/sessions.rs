@@ -2161,7 +2161,7 @@ pub(crate) async fn stream_run_events(
                      }
                      // 心跳：约每 3.5 秒发一个 SSE 注释行，保持连接活跃。
                      keepalive_ticks = keepalive_ticks.wrapping_add(1);
-                     if keepalive_ticks % 5 == 0 {
+                     if keepalive_ticks.is_multiple_of(5) {
                          yield Ok(Event::default().comment("keepalive"));
                      }
                      match load_events_after(&pool, run_id, last_seq).await {
