@@ -768,6 +768,89 @@ test("an uncertain Client Tool result submission remains unknown and stops the r
   assert.equal(entry.result?.status, "success");
 });
 
+test("an unknown-state tool whose unknown-result submission fails blocks the batch", async () => {
+  const journal = new MemoryToolJournalStorage();
+  const storage = new MemoryStorage();
+  // 固定 Client Instance，使预置 journal entry 与连接后的实例一致。
+  storage.setItem("agent-hub:client-instance-id", "client-1");
+  const now = Date.now();
+  await journal.put({
+    clientInstanceId: "client-1",
+    toolCallId: "unknown-1",
+    sessionId: "session-unknown-submit",
+    runId: "run-unknown-submit",
+    toolName: "first",
+    input: { x: 1 },
+    state: "executing",
+    createdAt: now - 1000,
+    updatedAt: now - 500,
+  });
+  const handlerCalls = [];
+  const claims = [];
+  let resultAttempts = 0;
+  const client = await connect({
+    baseUrl: "https://hub.example",
+    sessionStorage: storage,
+    storage: journal,
+    requestRetryDelayMs: 0,
+    authorize: async () => credential("unknown-submit-token", ["first", "later"]),
+    handlers: {
+      first: async () => {
+        handlerCalls.push("first");
+        return { value: "first" };
+      },
+      later: async () => {
+        handlerCalls.push("later");
+        return { value: "later" };
+      },
+    },
+    fetch: async (input, init = {}) => {
+      const path = pathOf(input);
+      if (path.endsWith("/events/stream")) {
+        return sseResponse([
+          toolFrame(1, "unknown-1", "first", "unknown-submit-batch"),
+          toolFrame(2, "unknown-2", "later", "unknown-submit-batch"),
+        ], init.signal, true);
+      }
+      if (path.endsWith("/claim")) {
+        claims.push(path);
+        return json({ status: "claimed" });
+      }
+      if (path.endsWith("/result")) {
+        resultAttempts += 1;
+        return json({ code: "temporary", message: "response was lost" }, 503);
+      }
+      throw new Error(`unexpected path ${path}`);
+    },
+  });
+
+  let subscription;
+  const events = [];
+  subscription = client.existing("session-unknown-submit").subscribe((event) => {
+    events.push(event);
+    if (event.type === "error") subscription.dispose();
+  }, { reconnectDelayMs: 0 });
+  try {
+    await subscription.closed;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    // unknown 收尾提交失败：阻塞同批（later 不执行），error 事件上报。
+    const dbgEntry = await journal.get(client.clientInstanceId, "unknown-1");
+    console.error("DBG dispatch entry:", JSON.stringify(dbgEntry));
+    assert.deepEqual(handlerCalls, [], "batch must be blocked before later handlers run");
+    // connect 恢复 + dispatch 各提交一次 UNKNOWN_RESULT（503 重试 2 次 = 3 次/处）。
+    assert.equal(resultAttempts, 6);
+    assert.equal(events.some((event) => event.type === "error"), true);
+    const entry = await journal.get(client.clientInstanceId, "unknown-1");
+    assert.equal(entry.state, "completed", "completed + UNKNOWN_RESULT must be persisted");
+    assert.equal(entry.result?.error?.code, "tool_result_unknown");
+  } finally {
+    subscription.dispose();
+    client.dispose();
+  }
+});
+
+
 test("anonymous clients persist only visitor/current Session identity and share the Session API", async () => {
   const localStorage = new MemoryStorage();
   const accessBodies = [];

@@ -1621,13 +1621,37 @@ export class AgentHubClient {
     }
     if (existing?.state === "acknowledged") return { blocked: false };
     // 无 result 的 executing/unknown（副作用窗口未知）：不重跑，提交
-    // tool_result_unknown 收尾，模型明确收到失败而非静默。
+    // tool_result_unknown 收尾，模型明确收到失败而非静默。先落 journal
+    // （completed+UNKNOWN_RESULT）；transient 提交失败阻塞同批（前一个结果
+    // 未达 Hub 不继续产生副作用），仅 Hub 明确结束才清理放行。
     if (existing && !existing.result && ["executing", "unknown"].includes(existing.state)) {
+      const unknownCompleted: ToolJournalEntry = {
+        ...existing,
+        result: UNKNOWN_RESULT,
+        state: "completed",
+        updatedAt: Date.now(),
+      };
+      await this.#journal.put(unknownCompleted);
       try {
         await this.#submitToolResult(event.toolCallId, UNKNOWN_RESULT);
-        await this.#acknowledgeEntry({ ...existing, result: UNKNOWN_RESULT });
-      } catch {
-        // transient：保留 journal，恢复路径会重试收尾。
+        await this.#acknowledgeEntry(unknownCompleted);
+      } catch (error) {
+        if (error instanceof AgentHubError && [404, 409, 410].includes(error.status)) {
+          await this.#journal.delete(this.clientInstanceId, event.toolCallId).catch(() => undefined);
+          return { blocked: false };
+        }
+        return {
+          blocked: true,
+          event: {
+            type: "error",
+            sequence: event.sequence,
+            code: error instanceof AgentHubError ? error.code : "tool_result_submission_failed",
+            message: error instanceof Error ? error.message : "Client Tool result submission failed",
+            retryable: true,
+            raw: error,
+            toolCallId: event.toolCallId,
+          } as ErrorSessionEvent,
+        };
       }
       return { blocked: false };
     }
