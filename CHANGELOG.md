@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 本文件记录 Agent Hub 各正式版本面向使用者的变化。
 
+## [0.3.12] - 2026-08-15
+
+### Internal
+
+- 全仓门禁修复：clippy `--all-targets` 下测试代码显式丢弃 finalize 返回值。
+
 ## [0.3.11] - 2026-08-15
 
 ### Fixed
