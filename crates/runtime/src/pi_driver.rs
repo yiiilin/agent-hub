@@ -1349,6 +1349,7 @@ pub(super) struct PersistentPiRpcProcess {
     stderr_reader: Option<std::thread::JoinHandle<Result<usize, std::io::Error>>>,
     skill_exec_broker: Option<SkillExecBroker>,
     vision_broker: Option<VisionAnalyzeBroker>,
+    tool_result_broker: Option<ToolResultBroker>,
     cancellation: Arc<EngineCancellation>,
     timeout: Duration,
 }
@@ -1413,12 +1414,21 @@ impl PersistentPiRpcProcess {
                 None
             }
         };
-        // 归档工具结果读取 broker：Hub 凭据已配置时启用（Pi 扩展经它调 Hub）。
-        let tool_result_broker = (TOOL_RESULT_HUB_URL.get().is_some()
-            && TOOL_RESULT_RUNTIME_TOKEN.get().is_some())
-        .then(|| ToolResultBroker::start(&run_env.workdir))
-        .transpose()
-        .context("start tool result broker")?;
+        // 归档工具结果读取 broker：启用标志由 runtime 启动时设置（Pi 扩展经
+        // 它调 Hub；凭证/会话边界随 run_env 逐实例传递）。
+        let tool_result_broker = TOOL_RESULT_BROKER_ENABLED
+            .load(Ordering::Acquire)
+            .then(|| {
+                ToolResultBroker::start(
+                    &run_env.workdir,
+                    &run_env.hub_url,
+                    run_env.runtime_token.clone(),
+                    run_env.hub_session_id,
+                    run_env.ownership_generation,
+                )
+            })
+            .transpose()
+            .context("start tool result broker")?;
         materialize_tool_result_extension(run_env, tool_result_broker.is_some())?;
         crate::protect_pi_agent_execution_sources(
             &agent_dir,
@@ -1562,6 +1572,7 @@ impl PersistentPiRpcProcess {
             stderr_reader: Some(stderr_reader),
             skill_exec_broker,
             vision_broker,
+            tool_result_broker,
             cancellation,
             timeout,
         };
@@ -1960,6 +1971,7 @@ impl PersistentPiRpcProcess {
             let _ = reader.join();
         }
         self.skill_exec_broker.take();
+        self.tool_result_broker.take();
         self.vision_broker.take();
     }
 }
@@ -2009,14 +2021,9 @@ pub(super) struct VisionAnalyzeBroker {
     actor: Option<thread::JoinHandle<()>>,
 }
 
-/// 读取归档工具结果的 loopback broker（Pi 扩展经它访问 Hub）。
-/// 凭据在 runtime 启动时初始化（见 main.rs），broker 无需再传参。
-pub(super) static TOOL_RESULT_HUB_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-pub(super) static TOOL_RESULT_RUNTIME_TOKEN: std::sync::OnceLock<String> =
-    std::sync::OnceLock::new();
-/// file 模式的落盘目录（Pi 工作区，随 run 清理）。
-static TOOL_RESULT_BROKER_WORKDIR: std::sync::OnceLock<std::path::PathBuf> =
-    std::sync::OnceLock::new();
+/// 归档工具结果读取 broker 的启用标志（runtime 启动时设置，见 main.rs）。
+pub(super) static TOOL_RESULT_BROKER_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub(super) struct ToolResultBroker {
     port: u16,
@@ -2037,7 +2044,13 @@ struct ToolResultBrokerRequest {
 }
 
 impl ToolResultBroker {
-    fn start(workdir: &std::path::Path) -> anyhow::Result<Self> {
+    fn start(
+        workdir: &std::path::Path,
+        hub_url: &str,
+        runtime_token: Arc<std::sync::RwLock<String>>,
+        hub_session_id: uuid::Uuid,
+        ownership_generation: i64,
+    ) -> anyhow::Result<Self> {
         let listener =
             TcpListener::bind("127.0.0.1:0").context("bind tool result loopback listener")?;
         let port = listener
@@ -2049,9 +2062,12 @@ impl ToolResultBroker {
             .context("configure tool result listener")?;
         let token = uuid::Uuid::new_v4().simple().to_string();
         let stop = Arc::new(AtomicBool::new(false));
-        let _ = TOOL_RESULT_BROKER_WORKDIR.set(workdir.to_path_buf());
         let context = ToolResultBrokerContext {
             workdir: workdir.to_path_buf(),
+            hub_url: hub_url.to_owned(),
+            runtime_token,
+            hub_session_id,
+            ownership_generation,
             token: token.clone(),
             stop: Arc::clone(&stop),
         };
@@ -2086,8 +2102,15 @@ impl Drop for ToolResultBroker {
     }
 }
 
+#[derive(Clone)]
 struct ToolResultBrokerContext {
     workdir: std::path::PathBuf,
+    hub_url: String,
+    /// 共享当前 runtime 凭证（轮换自动生效），loopback broker 代 Pi 调 Hub。
+    runtime_token: Arc<std::sync::RwLock<String>>,
+    /// 当前 Session 边界：读取只允许本会话归属的归档结果（防跨会话越权）。
+    hub_session_id: uuid::Uuid,
+    ownership_generation: i64,
     token: String,
     stop: Arc<AtomicBool>,
 }
@@ -2100,11 +2123,7 @@ fn run_tool_result_broker(listener: TcpListener, context: &ToolResultBrokerConte
         }
         match listener.accept() {
             Ok((stream, _)) => {
-                let context = ToolResultBrokerContext {
-                    workdir: context.workdir.clone(),
-                    token: context.token.clone(),
-                    stop: Arc::clone(&context.stop),
-                };
+                let context = context.clone();
                 thread::spawn(move || {
                     let _ = handle_tool_result_connection(stream, &context);
                 });
@@ -2136,18 +2155,17 @@ fn handle_tool_result_connection(
         )?;
         return Ok(());
     }
-    let response = fetch_tool_result(&request);
+    let response = fetch_tool_result(context, &request);
     write_json_line(&mut stream, &response)?;
     Ok(())
 }
 
-fn fetch_tool_result(request: &ToolResultBrokerRequest) -> serde_json::Value {
-    let Some(hub_url) = TOOL_RESULT_HUB_URL.get() else {
-        return serde_json::json!({ "error": "tool result broker is not configured" });
-    };
-    let Some(runtime_token) = TOOL_RESULT_RUNTIME_TOKEN.get() else {
-        return serde_json::json!({ "error": "tool result broker is not configured" });
-    };
+fn fetch_tool_result(
+    context: &ToolResultBrokerContext,
+    request: &ToolResultBrokerRequest,
+) -> serde_json::Value {
+    let hub_url = &context.hub_url;
+    let runtime_token = context.runtime_token.read().unwrap().clone();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build();
@@ -2162,11 +2180,15 @@ fn fetch_tool_result(request: &ToolResultBrokerRequest) -> serde_json::Value {
             return serde_json::json!({ "error": "tool result broker HTTP client failed" });
         };
         if request.mode == "file" {
-            return fetch_tool_result_file(&client, hub_url, runtime_token, request).await;
+            return fetch_tool_result_file(&client, hub_url, &runtime_token, context, request)
+                .await;
         }
         let mut url = format!(
-            "{hub_url}/api/runtime/tool-results/{}?mode={}",
-            request.tool_call_id, request.mode
+            "{hub_url}/api/runtime/tool-results/{}?mode={}&session_id={}&generation={}",
+            request.tool_call_id,
+            request.mode,
+            context.hub_session_id,
+            context.ownership_generation
         );
         if request.mode == "range" {
             url.push_str(&format!(
@@ -2200,11 +2222,12 @@ async fn fetch_tool_result_file(
     client: &reqwest::Client,
     hub_url: &str,
     runtime_token: &str,
+    context: &ToolResultBrokerContext,
     request: &ToolResultBrokerRequest,
 ) -> serde_json::Value {
     let url = format!(
-        "{hub_url}/api/runtime/tool-results/{}?mode=full",
-        request.tool_call_id
+        "{hub_url}/api/runtime/tool-results/{}?mode=full&session_id={}&generation={}",
+        request.tool_call_id, context.hub_session_id, context.ownership_generation
     );
     let response = match client.get(url).bearer_auth(runtime_token).send().await {
         Ok(response) => match response.error_for_status() {
@@ -2217,11 +2240,7 @@ async fn fetch_tool_result_file(
             return serde_json::json!({ "error": format!("tool result read failed: {error}") })
         }
     };
-    let workdir = TOOL_RESULT_BROKER_WORKDIR.get().cloned();
-    let Some(workdir) = workdir else {
-        return serde_json::json!({ "error": "tool result file mode is not configured" });
-    };
-    let tool_results_dir = workdir.join("tool-results");
+    let tool_results_dir = context.workdir.join("tool-results");
     if let Err(error) = std::fs::create_dir_all(&tool_results_dir) {
         return serde_json::json!({ "error": format!("tool result directory failed: {error}") });
     }
@@ -3266,7 +3285,7 @@ pub(super) fn pi_tool_allowlist_for_claim(claim: &ClaimRunResponse) -> anyhow::R
     }
     // 归档工具结果读取工具：broker 启用（Hub 凭据就绪）时必须暴露给模型，
     // 否则大结果截断后模型无工具可读全文（只能用 read artifact:// 失败）。
-    if TOOL_RESULT_HUB_URL.get().is_some() && TOOL_RESULT_RUNTIME_TOKEN.get().is_some() {
+    if TOOL_RESULT_BROKER_ENABLED.load(Ordering::Acquire) {
         const TOOL_RESULT_READ_TOOL: &str = "tool_result_read";
         if !tools.iter().any(|tool| tool == TOOL_RESULT_READ_TOOL) {
             tools.push(TOOL_RESULT_READ_TOOL.into());
@@ -3633,6 +3652,44 @@ mod tests {
     use crate::RunEnv;
     use agent_hub_shared::{RunSecretFileDto, RunSecretValueDto};
 
+    #[test]
+    fn tool_result_broker_survives_after_start_returns() {
+        // 回归：broker 曾是 start 的局部变量，返回即 Drop 关闭 listener；
+        // 必须 move 进 PersistentPiRpcProcess 保持存活。
+        let temp = tempfile::tempdir().unwrap();
+        let session_id = uuid::Uuid::new_v4();
+        let broker = ToolResultBroker::start(
+            temp.path(),
+            "http://hub.invalid",
+            Arc::new(std::sync::RwLock::new("rt-token".into())),
+            session_id,
+            3,
+        )
+        .unwrap();
+        // start 返回后 broker 必须仍可连接并处理请求（hub.invalid 不可达，
+        // 响应为读取错误——证明 broker 存活而非 connection refused）。
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", broker.port)).unwrap();
+        write_json_line(
+            &mut stream,
+            &serde_json::json!({
+                "token": broker.token,
+                "tool_call_id": uuid::Uuid::new_v4(),
+                "mode": "size",
+            }),
+        )
+        .unwrap();
+        use std::io::BufRead;
+        let mut line = String::new();
+        std::io::BufReader::new(&mut stream)
+            .read_line(&mut line)
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert!(
+            value.get("error").is_some() || value.get("size_bytes").is_some(),
+            "broker must respond after start returns: {line}"
+        );
+    }
+
     struct IsolatedRunEnv {
         run_env: RunEnv,
         agent_dir: PathBuf,
@@ -3647,6 +3704,9 @@ mod tests {
             workdir: session_root.join("workspace"),
             engine_state_root: session_root.join("engine-state"),
             hub_url: "http://127.0.0.1:8080".into(),
+            runtime_token: Arc::new(std::sync::RwLock::new("rt-token".into())),
+            hub_session_id: uuid::Uuid::new_v4(),
+            ownership_generation: 0,
             maintenance_token_file: None,
             secret_values: Vec::new(),
             secret_files: Vec::new(),
@@ -3846,6 +3906,9 @@ if [ "$$" -ne 1 ] && IFS= read -r _ < /proc/1/maps; then exit 31; fi
             workdir: temp.path().join("sessions/first/workspace"),
             engine_state_root: engine_state_root.clone(),
             hub_url: "http://127.0.0.1:8080".into(),
+            runtime_token: Arc::new(std::sync::RwLock::new("rt-token".into())),
+            hub_session_id: uuid::Uuid::new_v4(),
+            ownership_generation: 0,
             maintenance_token_file: None,
             secret_values: vec![
                 RunSecretValueDto {

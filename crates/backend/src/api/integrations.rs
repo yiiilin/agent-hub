@@ -4553,6 +4553,10 @@ pub(crate) struct ToolResultArtifactQuery {
     pub(crate) mode: Option<String>,
     pub(crate) offset: Option<i64>,
     pub(crate) limit: Option<i64>,
+    /// 会话边界（broker 代 Pi 调用时必带）：结果只允许本会话读取。
+    pub(crate) session_id: Option<Uuid>,
+    /// 会话归属代次，与 session_id 一起校验 runtime 所有权。
+    pub(crate) generation: Option<i64>,
 }
 
 /// 读取已归档的工具结果：`mode=size` 返回元数据；`mode=range` 返回
@@ -4598,7 +4602,33 @@ pub(crate) async fn get_tool_result_artifact_by_request_id(
     Path(tool_request_id): Path<Uuid>,
     Query(query): Query<ToolResultArtifactQuery>,
 ) -> Result<Response, ApiError> {
-    require_runtime(&state, &headers).await?;
+    let runtime_id = require_runtime(&state, &headers).await?;
+    // 会话边界：一个 runtime 托管多个 Session，必须校验请求归属的会话与
+    // 代次，否则任一 Session 的模型拿到别的请求 UUID 即可跨会话读取。
+    let session_id = query
+        .session_id
+        .ok_or_else(|| ApiError::bad_request("session_id is required"))?;
+    let generation = query.generation.unwrap_or(0);
+    let owned: Option<bool> = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM integration_tool_requests AS request
+             JOIN runs AS run ON run.id = request.run_id
+             JOIN hub_sessions AS session ON session.id = run.hub_session_id
+             WHERE request.id = $1
+               AND run.hub_session_id = $2
+               AND session.runtime_owner_id = $3
+               AND session.ownership_generation = $4
+         )",
+    )
+    .bind(tool_request_id)
+    .bind(session_id)
+    .bind(runtime_id)
+    .bind(generation)
+    .fetch_one(&state.pool)
+    .await?;
+    if owned != Some(true) {
+        return Err(ApiError::not_found("tool request result not found"));
+    }
     let run_id: Uuid =
         sqlx::query_scalar("SELECT run_id FROM integration_tool_requests WHERE id = $1")
             .bind(tool_request_id)
@@ -9269,6 +9299,8 @@ mod tests {
                 mode: Some("size".into()),
                 offset: None,
                 limit: None,
+                session_id: None,
+                generation: None,
             },
         )
         .await
@@ -9295,6 +9327,8 @@ mod tests {
                 mode: Some("range".into()),
                 offset: Some(0),
                 limit: Some(100),
+                session_id: None,
+                generation: None,
             },
         )
         .await
@@ -9320,6 +9354,8 @@ mod tests {
                 mode: Some("full".into()),
                 offset: None,
                 limit: None,
+                session_id: None,
+                generation: None,
             },
         )
         .await
@@ -9479,6 +9515,8 @@ mod tests {
                 mode: Some("size".into()),
                 offset: None,
                 limit: None,
+                session_id: None,
+                generation: None,
             },
         )
         .await
@@ -9500,6 +9538,8 @@ mod tests {
                 mode: Some("range".into()),
                 offset: Some(12),
                 limit: Some(5),
+                session_id: None,
+                generation: None,
             },
         )
         .await
@@ -9524,6 +9564,8 @@ mod tests {
                 mode: Some("range".into()),
                 offset: Some(11),
                 limit: Some(1),
+                session_id: None,
+                generation: None,
             },
         )
         .await
@@ -9547,6 +9589,8 @@ mod tests {
                 mode: Some("range".into()),
                 offset: Some(total),
                 limit: Some(5),
+                session_id: None,
+                generation: None,
             },
         )
         .await
@@ -9569,6 +9613,8 @@ mod tests {
                 mode: Some("range".into()),
                 offset: Some(total + 10),
                 limit: Some(5),
+                session_id: None,
+                generation: None,
             },
         )
         .await
@@ -9629,6 +9675,8 @@ mod tests {
                 mode: Some("size".into()),
                 offset: None,
                 limit: None,
+                session_id: None,
+                generation: None,
             },
         )
         .await
@@ -9651,6 +9699,8 @@ mod tests {
                 mode: Some("range".into()),
                 offset: Some(12),
                 limit: Some(5),
+                session_id: None,
+                generation: None,
             },
         )
         .await
@@ -9674,6 +9724,8 @@ mod tests {
                 mode: Some("range".into()),
                 offset: Some(11),
                 limit: Some(1),
+                session_id: None,
+                generation: None,
             },
         )
         .await
@@ -9697,6 +9749,8 @@ mod tests {
                 mode: Some("range".into()),
                 offset: Some(total - 40),
                 limit: Some(64),
+                session_id: None,
+                generation: None,
             },
         )
         .await
@@ -9722,6 +9776,8 @@ mod tests {
                 mode: Some("range".into()),
                 offset: Some(total),
                 limit: Some(5),
+                session_id: None,
+                generation: None,
             },
         )
         .await
@@ -10336,6 +10392,114 @@ mod tests {
 
         server.abort();
     }
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn tool_result_read_is_scoped_to_the_claiming_session(pool: PgPool) {
+        let fixture = integration_runtime_fixture(pool).await;
+        let (objects, store, server) = attachment_object_store().await;
+        let mut state = (*fixture.state).clone();
+        state.session_bundle_store = Some(Arc::new(store));
+        let state = Arc::new(state);
+
+        let batch = tool_request_batch(&fixture, [fixture.tool_request_id]);
+        let _ = runtime_finalize_tool_requests(
+            State(state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(fixture.run_id),
+            runtime_write(batch),
+        )
+        .await
+        .unwrap();
+        let big_content = "x".repeat(TOOL_RESULT_TRUNCATE_BYTES + 1024);
+        let submitted = submit_integration_tool_result(
+            State(state.clone()),
+            bearer_headers(&fixture.integration_token),
+            Path(fixture.tool_request_id),
+            Json(SubmitToolResultRequest {
+                result: json!({ "content": big_content }),
+            }),
+        )
+        .await
+        .unwrap();
+        let tool_request_id = submitted.tool_request.id;
+
+        // 正确会话可读。
+        let ok = get_tool_result_artifact_by_request_id(
+            State(state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(tool_request_id),
+            Query(ToolResultArtifactQuery {
+                mode: Some("size".into()),
+                offset: None,
+                limit: None,
+                session_id: Some(fixture.hub_session_id),
+                generation: Some(1),
+            }),
+        )
+        .await
+        .unwrap();
+        let ok_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(ok.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(ok_body["artifact_id"].is_string());
+
+        // 同 runtime 的另一个 Session（随机 UUID）被拒绝——不能跨会话读取。
+        let cross_session = get_tool_result_artifact_by_request_id(
+            State(state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(tool_request_id),
+            Query(ToolResultArtifactQuery {
+                mode: Some("size".into()),
+                offset: None,
+                limit: None,
+                session_id: Some(Uuid::new_v4()),
+                generation: Some(0),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(cross_session.status, StatusCode::NOT_FOUND);
+
+        // 代次不匹配同样拒绝。
+        let stale_generation = get_tool_result_artifact_by_request_id(
+            State(state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(tool_request_id),
+            Query(ToolResultArtifactQuery {
+                mode: Some("size".into()),
+                offset: None,
+                limit: None,
+                session_id: Some(fixture.hub_session_id),
+                generation: Some(0),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale_generation.status, StatusCode::NOT_FOUND);
+
+        // 缺 session_id 直接 400。
+        let missing_session = get_tool_result_artifact_by_request_id(
+            State(state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(tool_request_id),
+            Query(ToolResultArtifactQuery {
+                mode: Some("size".into()),
+                offset: None,
+                limit: None,
+                session_id: None,
+                generation: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing_session.status, StatusCode::BAD_REQUEST);
+
+        let _ = objects;
+        server.abort();
+    }
 
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
@@ -10434,6 +10598,8 @@ mod tests {
                 mode: Some("size".into()),
                 offset: None,
                 limit: None,
+                session_id: Some(fixture.hub_session_id),
+                generation: Some(1),
             }),
         )
         .await
@@ -10461,6 +10627,8 @@ mod tests {
                 mode: Some("range".into()),
                 offset: Some(0),
                 limit: Some(1024),
+                session_id: Some(fixture.hub_session_id),
+                generation: Some(1),
             }),
         )
         .await
@@ -10485,6 +10653,8 @@ mod tests {
                 mode: Some("size".into()),
                 offset: None,
                 limit: None,
+                session_id: None,
+                generation: None,
             }),
         )
         .await
@@ -10533,6 +10703,8 @@ mod tests {
                 mode: Some("full".into()),
                 offset: None,
                 limit: None,
+                session_id: Some(fixture.hub_session_id),
+                generation: Some(1),
             }),
         )
         .await

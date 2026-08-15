@@ -849,9 +849,9 @@ fn hub_client_from_stored(
     http: reqwest::Client,
     stored: &StoredRuntimeCredential,
 ) -> HubClient {
-    // 供 Pi 工具结果读取 broker 使用（loopback 服务代 Pi 访问 Hub）。
-    let _ = pi_driver::TOOL_RESULT_HUB_URL.set(config.hub_url.clone());
-    let _ = pi_driver::TOOL_RESULT_RUNTIME_TOKEN.set(stored.runtime_credential.clone());
+    // 归档工具结果读取 broker 启用：runtime 始终连 Hub（凭证经 Arc<RwLock>
+    // 共享，轮换自动生效）。
+    pi_driver::TOOL_RESULT_BROKER_ENABLED.store(true, Ordering::Release);
     HubClient {
         http,
         hub_url: config.hub_url.clone(),
@@ -7388,6 +7388,11 @@ struct RunEnv {
     workdir: PathBuf,
     engine_state_root: PathBuf,
     hub_url: String,
+    /// 共享 runtime 凭证（工具结果 broker 代 Pi 调 Hub，轮换自动生效）。
+    runtime_token: Arc<std::sync::RwLock<String>>,
+    /// 当前 Session 边界（工具结果读取只允许本会话）。
+    hub_session_id: Uuid,
+    ownership_generation: i64,
     maintenance_token_file: Option<PathBuf>,
     secret_values: Vec<RunSecretValueDto>,
     secret_files: Vec<RunSecretFileDto>,
@@ -7926,10 +7931,21 @@ async fn prepare_run_env_with_local_skills_and_management(
             output.sync_all().await?;
         }
     }
+    let runtime_token = client
+        .map(|client| client.runtime_token.clone())
+        .unwrap_or_else(|| Arc::new(std::sync::RwLock::new(String::new())));
+    let hub_session_id = claim
+        .run
+        .hub_session_id
+        .context("claimed Run is missing its Hub Session id")?;
+    let ownership_generation = claim.run.session_ownership_generation.unwrap_or(0);
     let run_env = RunEnv {
         workdir: paths.workspace.clone(),
         engine_state_root: paths.engine_state.clone(),
         hub_url: hub_url.to_owned(),
+        runtime_token,
+        hub_session_id,
+        ownership_generation,
         maintenance_token_file: maintenance_token_file.map(Path::to_path_buf),
         secret_values: claim.secret_values.clone(),
         secret_files: claim.secret_files.clone(),
@@ -10071,8 +10087,7 @@ mod tests {
     fn tool_result_read_tool_is_exposed_when_broker_credentials_are_ready() {
         // 并行安全：OnceLock 只能 set 一次；其他 allowlist 测试用包含断言，
         // 不受本测试设置全局凭据的影响。
-        let _ = pi_driver::TOOL_RESULT_HUB_URL.set("http://hub.test".into());
-        let _ = pi_driver::TOOL_RESULT_RUNTIME_TOKEN.set("rt-token".into());
+        pi_driver::TOOL_RESULT_BROKER_ENABLED.store(true, Ordering::Release);
 
         let mut claim = test_claim();
         claim.agent.tool_allowlist = vec!["read".into()];
