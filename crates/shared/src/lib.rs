@@ -950,6 +950,9 @@ pub enum ClientToolResultDto {
     },
     Error {
         error: ClientToolErrorDto,
+        /// 结果被截断时置 true（截断的 error.message 附带读取指引）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        truncated: Option<bool>,
     },
 }
 

@@ -14259,6 +14259,7 @@ mod tests {
                             message: "The user rejected the action".into(),
                             retryable: false,
                         },
+                        truncated: None,
                     },
                 },
             ],

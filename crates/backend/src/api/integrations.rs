@@ -4951,18 +4951,64 @@ pub(crate) async fn load_integration_context_for_run(
                 let result: ClientToolResultDto = serde_json::from_value(inner.clone())
                     .map_err(|_| ApiError::internal("stored Client Tool result is invalid"))?;
                 let result = match result {
-                    ClientToolResultDto::Success { output, .. } => ClientToolResultDto::Success {
-                        output: summarize_tool_result_payload(
-                            output,
-                            row.get("id"),
-                            row.get("artifact_id"),
-                            row.get("artifact_size_bytes"),
-                            row.get::<Option<String>, _>("artifact_reason").as_deref(),
-                            truncated,
-                        ),
-                        truncated: None,
-                    },
-                    other => other,
+                    // Success 与 Error 一致：截断时 output 直接放摘要文本
+                    // （heading + 读取指引 + 前 32KB），顶层 truncated 标记；
+                    // 不产生 {truncated, content} 嵌套形状。
+                    ClientToolResultDto::Success { output, .. } => {
+                        if truncated {
+                            let summary = summarize_tool_result_payload(
+                                output,
+                                row.get("id"),
+                                row.get("artifact_id"),
+                                row.get("artifact_size_bytes"),
+                                row.get::<Option<String>, _>("artifact_reason").as_deref(),
+                                true,
+                            );
+                            ClientToolResultDto::Success {
+                                output: summary.get("content").cloned().unwrap_or(summary),
+                                truncated: Some(true),
+                            }
+                        } else {
+                            ClientToolResultDto::Success {
+                                output,
+                                truncated: None,
+                            }
+                        }
+                    }
+                    // 截断的 Error 同样注入完整结果读取提示（message 替换为
+                    // 摘要），否则 truncated 标记被 DTO 丢弃、模型只看到截短
+                    // 的 error.message。
+                    ClientToolResultDto::Error {
+                        error,
+                        truncated: err_truncated,
+                    } => {
+                        if truncated {
+                            let summary = summarize_tool_result_payload(
+                                Value::String(error.message.clone()),
+                                row.get("id"),
+                                row.get("artifact_id"),
+                                row.get("artifact_size_bytes"),
+                                row.get::<Option<String>, _>("artifact_reason").as_deref(),
+                                true,
+                            );
+                            ClientToolResultDto::Error {
+                                error: ClientToolErrorDto {
+                                    message: summary
+                                        .get("content")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or(&error.message)
+                                        .to_owned(),
+                                    ..error
+                                },
+                                truncated: Some(true),
+                            }
+                        } else {
+                            ClientToolResultDto::Error {
+                                error,
+                                truncated: err_truncated,
+                            }
+                        }
+                    }
                 };
                 let dto = ClientToolContinuationResultDto {
                     tool_call_id: row.get("id"),
@@ -7302,6 +7348,7 @@ mod tests {
                 message: "The user rejected this action".into(),
                 retryable: false,
             },
+            truncated: None,
         };
         let completed = submit_client_tool_result(
             State(fixture.app.state.clone()),
@@ -8848,13 +8895,18 @@ mod tests {
             second.get("tool_name").and_then(Value::as_str),
             Some("second_action")
         );
-        let second_output = second.pointer("/result/output").unwrap();
-        assert_eq!(second_output.get("truncated"), Some(&json!(true)));
-        assert!(second_output
-            .get("content")
+        assert_eq!(
+            second.pointer("/result/truncated").and_then(Value::as_bool),
+            Some(true)
+        );
+        let second_output = second
+            .pointer("/result/output")
             .and_then(Value::as_str)
-            .unwrap()
-            .contains("agent_hub_integration_tool_result_read"));
+            .unwrap();
+        assert!(
+            second_output.contains("agent_hub_integration_tool_result_read"),
+            "expanded result must carry read instructions in its output text"
+        );
 
         server.abort();
     }
@@ -9027,11 +9079,11 @@ mod tests {
             Some("success")
         );
         let plural_output = plural_result.get("output").unwrap();
-        assert_eq!(plural_output.get("truncated"), Some(&json!(true)));
-        let plural_summary = plural_output
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap();
+        assert_eq!(
+            plural_result.get("truncated").and_then(Value::as_bool),
+            Some(true)
+        );
+        let plural_summary = plural_output.as_str().unwrap();
         assert!(
             plural_summary.contains("agent_hub_integration_tool_result_read(tool_call_id="),
             "plural path must carry full-result read instructions"
@@ -9282,6 +9334,106 @@ mod tests {
         let full_text = String::from_utf8_lossy(&full_bytes);
         assert!(full_text.contains("first_action:"));
         assert!(full_text.contains("\"status\":\"success\""));
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn truncated_error_client_tool_result_keeps_reading_hint_in_plural(pool: PgPool) {
+        let fixture = prepare_client_tool_run(pool, &["first_action", "second_action"]).await;
+        let (_, store, server) = attachment_object_store().await;
+        let mut app_state = (*fixture.app.state).clone();
+        app_state.session_bundle_store = Some(Arc::new(store));
+        let state = Arc::new(app_state);
+        let _ = finalize_test_client_tool_batch(&fixture, &["first_action", "second_action"])
+            .await
+            .unwrap();
+        // 第一个工具提交超大 Error 结果（message >32KB，截断归档）。
+        let claim = claim_client_tool_call(
+            State(state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(fixture.tool_call_ids[0]),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(claim.status, "claimed");
+        let big_message = "e".repeat(TOOL_RESULT_TRUNCATE_BYTES + 1024);
+        let _ = submit_client_tool_result(
+            State(state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(fixture.tool_call_ids[0]),
+            Json(SubmitClientToolResultRequest {
+                result: ClientToolResultDto::Error {
+                    error: ClientToolErrorDto {
+                        code: "operation_failed".into(),
+                        message: big_message,
+                        retryable: false,
+                    },
+                    truncated: None,
+                },
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        // 第二个工具正常提交，触发续接 run。
+        let claim2 = claim_client_tool_call(
+            State(state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(fixture.tool_call_ids[1]),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(claim2.status, "claimed");
+        let submitted = submit_client_tool_result(
+            State(state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(fixture.tool_call_ids[1]),
+            Json(SubmitClientToolResultRequest {
+                result: ClientToolResultDto::Success {
+                    output: json!("ok"),
+                    truncated: None,
+                },
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        let continuation_run = submitted.run.expect("continuation run must exist");
+
+        let mut tx = state.pool.begin().await.unwrap();
+        let context = load_integration_context_for_run(&mut tx, &continuation_run)
+            .await
+            .unwrap()
+            .expect("tool-result run must expose integration context");
+        tx.commit().await.unwrap();
+        assert_eq!(context.tool_results.len(), 2);
+        // 截断的 Error：message 携带完整结果读取提示，truncated 标记保留。
+        let first = serde_json::to_value(&context.tool_results[0]).unwrap();
+        assert_eq!(
+            first.get("tool_name").and_then(Value::as_str),
+            Some("first_action")
+        );
+        assert_eq!(
+            first.pointer("/result/truncated").and_then(Value::as_bool),
+            Some(true)
+        );
+        let message = first
+            .pointer("/result/error/message")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(
+            message.contains("agent_hub_integration_tool_result_read(tool_call_id="),
+            "truncated Error message must carry full-result read instructions"
+        );
+        assert!(message.contains("artifact://"));
+        assert_eq!(
+            first.pointer("/result/error/code").and_then(Value::as_str),
+            Some("operation_failed")
+        );
+
+        server.abort();
     }
 
     #[sqlx::test(migrations = "./migrations")]
