@@ -329,3 +329,73 @@ test("an expired recorded entry is settled with a timeout error without executio
   assert.equal(entry.result?.error?.code, "tool_timeout");
   client.dispose();
 });
+
+test("an interrupted handler is settled immediately without waiting for its deadline", async () => {
+  // 空 journal 连接（避免 connect 的初始化恢复抢先执行），再手动放入 entry。
+  const h = await makeTestHarness();
+  // handler 永不 resolve（忽略 abort 信号）：abort race 必须立即收尾。
+  h.handlers.click_element_by_index = async () => {
+    h.executed.push({ index: 15 });
+    return new Promise(() => {});
+  };
+  const client = await h.makeClient();
+  const session = client.sessions.existing(SESSION_ID);
+  const entry = {
+    clientInstanceId: "client-1",
+    toolCallId: TOOL_CALL_ID,
+    sessionId: SESSION_ID,
+    runId: "run-1",
+    toolName: "click_element_by_index",
+    input: { index: 15 },
+    state: "recorded",
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    createdAt: Date.now() - 2000,
+    updatedAt: Date.now() - 1000,
+  };
+  await h.journal.put(entry);
+
+  const controller = new AbortController();
+  const recovery = session.recoverPendingTools({ signal: controller.signal });
+  setTimeout(() => controller.abort(), 20);
+  await recovery;
+
+  try {
+    assert.equal(h.calls.result, 1, "interruption error must be submitted");
+    assert.equal(h.executed.length, 1, "handler was invoked before the abort");
+    const done = await h.journal.get("client-1", TOOL_CALL_ID);
+    assert.equal(done.state, "acknowledged");
+    assert.equal(done.result?.error?.code, "tool_execution_interrupted");
+  } finally {
+    client.dispose();
+  }
+});
+
+test("an already-aborted recovery never invokes the handler", async () => {
+  const h = await makeTestHarness();
+  const client = await h.makeClient();
+  const session = client.sessions.existing(SESSION_ID);
+  const entry = {
+    clientInstanceId: "client-1",
+    toolCallId: TOOL_CALL_ID,
+    sessionId: SESSION_ID,
+    runId: "run-1",
+    toolName: "click_element_by_index",
+    input: { index: 17 },
+    state: "recorded",
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    createdAt: Date.now() - 2000,
+    updatedAt: Date.now() - 1000,
+  };
+  await h.journal.put(entry);
+
+  const controller = new AbortController();
+  controller.abort();
+  await session.recoverPendingTools({ signal: controller.signal });
+
+  assert.equal(h.calls.result, 1, "interruption error must be submitted");
+  assert.deepEqual(h.executed, [], "handler must NOT run when already aborted");
+  const done = await h.journal.get("client-1", TOOL_CALL_ID);
+  assert.equal(done.state, "acknowledged");
+  assert.equal(done.result?.error?.code, "tool_execution_interrupted");
+  client.dispose();
+});

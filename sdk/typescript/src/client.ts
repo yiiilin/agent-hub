@@ -1262,6 +1262,17 @@ export class AgentHubClient {
         },
       };
     }
+    // 调用前 aborted 预检：信号已中断时直接生成中断结果，不调用 handler。
+    if (signal.aborted) {
+      return {
+        status: "error",
+        error: {
+          code: "tool_execution_interrupted",
+          message: "Client Tool execution was interrupted",
+          retryable: false,
+        },
+      };
+    }
     const controller = new AbortController();
     let deadlineTimer: number | undefined;
     const deadline = new Promise<never>((_resolve, reject) => {
@@ -1269,6 +1280,19 @@ export class AgentHubClient {
         controller.abort(new DOMException("Client Tool deadline reached", "TimeoutError"));
         reject(new DOMException("Client Tool deadline reached", "TimeoutError"));
       }, Math.min(remaining, 5 * 60_000));
+    });
+    // 独立 abort race：signal 中断立即拒绝，不依赖 handler 是否响应 abort
+    // （忽略 signal 的 handler 不应悬到 deadline）。
+    let interruptListener: (() => void) | undefined;
+    const interrupted = new Promise<never>((_resolve, reject) => {
+      const interrupt = () =>
+        reject(new DOMException("Client Tool execution interrupted", "AbortError"));
+      interruptListener = interrupt;
+      if (signal.aborted) {
+        interrupt();
+        return;
+      }
+      signal.addEventListener("abort", interrupt, { once: true });
     });
     try {
       const output = await Promise.race([
@@ -1280,6 +1304,7 @@ export class AgentHubClient {
           recovering,
         }),
         deadline,
+        interrupted,
       ]);
       controller.abort();
       return checkedToolResult(output);
@@ -1308,6 +1333,10 @@ export class AgentHubClient {
       return checkedToolResult(handlerError(error));
     } finally {
       if (deadlineTimer !== undefined) globalThis.clearTimeout(deadlineTimer);
+      // listener 清理：race 已结束但信号可能稍后才 abort，移除未触发的监听。
+      if (interruptListener !== undefined && !signal.aborted) {
+        signal.removeEventListener("abort", interruptListener);
+      }
     }
   }
 
