@@ -8728,7 +8728,7 @@ mod tests {
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn submit_string_output_client_tool_result_like_run_shelves_operation(pool: PgPool) {
         let fixture = prepare_client_tool_run(pool, &["first_action"]).await;
-        finalize_test_client_tool_batch(&fixture, &["first_action"])
+        let _ = finalize_test_client_tool_batch(&fixture, &["first_action"])
             .await
             .unwrap();
         let claim = claim_client_tool_call(
@@ -8774,7 +8774,7 @@ mod tests {
         app_state.session_bundle_store = Some(Arc::new(store));
         let state = Arc::new(app_state);
         let fixture_state = state.clone();
-        finalize_test_client_tool_batch(&fixture, &["first_action", "second_action"])
+        let _ = finalize_test_client_tool_batch(&fixture, &["first_action", "second_action"])
             .await
             .unwrap();
         // 两个工具都提交超过截断阈值的大结果：summarize 后各约 32KB+，
@@ -8863,7 +8863,7 @@ mod tests {
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn re_claim_after_submit_returns_terminal_result(pool: PgPool) {
         let fixture = prepare_client_tool_run(pool, &["first_action"]).await;
-        finalize_test_client_tool_batch(&fixture, &["first_action"])
+        let _ = finalize_test_client_tool_batch(&fixture, &["first_action"])
             .await
             .unwrap();
         let claim = claim_client_tool_call(
@@ -8924,7 +8924,7 @@ mod tests {
         let mut app_state = (*fixture.app.state).clone();
         app_state.session_bundle_store = Some(Arc::new(store));
         let state = Arc::new(app_state);
-        finalize_test_client_tool_batch(&fixture, &["first_action"])
+        let _ = finalize_test_client_tool_batch(&fixture, &["first_action"])
             .await
             .unwrap();
         let claim = claim_client_tool_call(
@@ -9055,7 +9055,7 @@ mod tests {
     async fn migration_0015_wraps_only_client_tool_rows(pool: PgPool) {
         // client 行：finalize 后手工置为旧形状 completed（纯 DTO）。
         let fixture = prepare_client_tool_run(pool, &["first_action"]).await;
-        finalize_test_client_tool_batch(&fixture, &["first_action"])
+        let _ = finalize_test_client_tool_batch(&fixture, &["first_action"])
             .await
             .unwrap();
         sqlx::query(
@@ -9142,7 +9142,7 @@ mod tests {
     async fn plural_budget_placeholder_result_still_readable_from_db(pool: PgPool) {
         let fixture =
             prepare_client_tool_run(pool, &["first_action", "second_action", "third_action"]).await;
-        finalize_test_client_tool_batch(
+        let _ = finalize_test_client_tool_batch(
             &fixture,
             &["first_action", "second_action", "third_action"],
         )
@@ -9288,7 +9288,7 @@ mod tests {
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn tool_result_range_read_aligns_utf8_db_path(pool: PgPool) {
         let fixture = prepare_client_tool_run(pool, &["first_action"]).await;
-        finalize_test_client_tool_batch(&fixture, &["first_action"])
+        let _ = finalize_test_client_tool_batch(&fixture, &["first_action"])
             .await
             .unwrap();
         let claim = claim_client_tool_call(
@@ -9439,7 +9439,7 @@ mod tests {
         let mut app_state = (*fixture.app.state).clone();
         app_state.session_bundle_store = Some(Arc::new(store));
         let state = Arc::new(app_state);
-        finalize_test_client_tool_batch(&fixture, &["first_action"])
+        let _ = finalize_test_client_tool_batch(&fixture, &["first_action"])
             .await
             .unwrap();
         let claim = claim_client_tool_call(
@@ -9590,7 +9590,7 @@ mod tests {
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn truncated_client_tool_result_utf8_boundary_does_not_panic(pool: PgPool) {
         let fixture = prepare_client_tool_run(pool, &["first_action"]).await;
-        finalize_test_client_tool_batch(&fixture, &["first_action"])
+        let _ = finalize_test_client_tool_batch(&fixture, &["first_action"])
             .await
             .unwrap();
         let claim = claim_client_tool_call(

@@ -948,7 +948,9 @@ pub enum ClientToolResultDto {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         truncated: Option<bool>,
     },
-    Error { error: ClientToolErrorDto },
+    Error {
+        error: ClientToolErrorDto,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
