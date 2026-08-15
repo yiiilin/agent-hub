@@ -40,7 +40,7 @@ dependencies = [
 
 [[package]]
 name = "agent-hub-backend"
-version = "0.3.10"
+version = "0.3.11"
 dependencies = [
  "aes-gcm",
  "agent-hub-shared",
@@ -79,7 +79,7 @@ dependencies = [
 
 [[package]]
 name = "agent-hub-cli"
-version = "0.3.10"
+version = "0.3.11"
 dependencies = [
  "anyhow",
  "clap",
@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "agent-hub-runtime"
-version = "0.3.10"
+version = "0.3.11"
 dependencies = [
  "agent-hub-shared",
  "anyhow",
@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "agent-hub-shared"
-version = "0.3.10"
+version = "0.3.11"
 dependencies = [
  "chrono",
  "serde",

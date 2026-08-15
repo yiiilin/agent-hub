@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 本文件记录 Agent Hub 各正式版本面向使用者的变化。
 
+## [0.3.11] - 2026-08-15
+
+### Fixed
+
+- 工具结果 `read` 接口 range 模式按 UTF-8 字节边界对齐：分页不再产生替换字符（U+FFFD）、偏移不再漂移；`limit` 小于多字节字符时返回至少一个完整字符，`next_offset` 始终前进（分页不死循环）。
+
+## [0.3.10] - 2026-08-15
+
+### Fixed
+
+- 工具结果 range 读取 UTF-8 边界对齐（DB/S3 两路径统一，S3 前后各多取最多 3 字节），EOF 返回空页。
+
 ## [0.3.9] - 2026-08-15
 
 ### Fixed
