@@ -14247,6 +14247,7 @@ mod tests {
                     tool_name: "show_notice".into(),
                     result: ClientToolResultDto::Success {
                         output: json!({ "visible": true }),
+                        truncated: None,
                     },
                 },
                 ClientToolContinuationResultDto {

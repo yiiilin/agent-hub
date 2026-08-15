@@ -80,6 +80,9 @@ pub(crate) const MAX_CLIENT_TOOL_DEFINITIONS_BYTES: usize = 256_000;
 pub(crate) const TOOL_RESULT_TRUNCATE_BYTES: usize = 32 * 1024;
 /// 工具结果归档的单次范围读取上限（防止模型循环读爆上下文/内存）。
 pub(crate) const TOOL_RESULT_READ_LIMIT_BYTES: usize = 64 * 1024;
+/// 续接 run 模型输入中 plural 工具结果的总量预算（展开后序列化字节数）；
+/// 超预算的旧结果替换为占位 DTO，模型仍可用 read 工具取全文。
+pub(crate) const CLIENT_TOOL_RESULTS_BUDGET_BYTES: usize = 64 * 1024;
 pub(crate) const EMBEDDED_ORIGIN_HEADER: &str = "x-agent-hub-embedded-origin";
 #[cfg(test)]
 pub(crate) const MAX_ATTACHMENT_UPLOAD_BYTES: u64 = 104_857_600;
@@ -3708,6 +3711,7 @@ mod tests {
             Json(SubmitClientToolResultRequest {
                 result: ClientToolResultDto::Success {
                     output: json!({ "visible": true }),
+                    truncated: None,
                 },
             }),
         )
@@ -3754,7 +3758,8 @@ mod tests {
         assert_eq!(
             context.tool_results[0].result,
             ClientToolResultDto::Success {
-                output: json!({ "visible": true })
+                output: json!({ "visible": true }),
+                truncated: None
             }
         );
         assert!(context.external_user.is_none());

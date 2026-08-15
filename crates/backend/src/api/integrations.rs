@@ -2423,7 +2423,11 @@ pub(crate) async fn claim_client_tool_call(
             terminal: true,
             result: request
                 .get::<Option<Value>, _>("result_payload")
-                .map(serde_json::from_value)
+                .map(|payload| {
+                    // result_payload 是自包含包装层，取内层 result 反序列化。
+                    let inner = payload.get("result").cloned().unwrap_or(payload);
+                    serde_json::from_value(inner)
+                })
                 .transpose()
                 .map_err(|_| ApiError::internal("stored Client Tool result is invalid"))?,
         },
@@ -2455,28 +2459,27 @@ pub(crate) async fn submit_client_tool_result(
     // while keeping the checksum over the client's original payload so an
     // idempotent resubmit still matches.
     // 超阈值先归档全文（事务外、指数退避），超硬上限则仅截断不归档。
-    let run_id = if validation.truncated {
-        Some(
-            sqlx::query_scalar::<_, Uuid>(
-                "SELECT run_id FROM integration_tool_requests WHERE id = $1",
-            )
+    let request_row =
+        sqlx::query("SELECT run_id, tool_name FROM integration_tool_requests WHERE id = $1")
             .bind(tool_call_id)
-            .fetch_one(&state.pool)
-            .await?,
-        )
+            .fetch_optional(&state.pool)
+            .await?
+            .ok_or(ApiError::not_found("Client Tool call not found"))?;
+    let run_id: Uuid = request_row.get("run_id");
+    let tool_name: String = request_row.get("tool_name");
+    let archived = if validation.truncated {
+        archive_tool_result(&state, run_id, tool_call_id, &validation).await
     } else {
         None
     };
-    let archived = match run_id {
-        Some(run_id) => archive_tool_result(&state, run_id, tool_call_id, &validation).await,
-        None => None,
-    };
     // 截断时保留合法 ClientToolResultDto 外壳：续接 run 会按 serde tag="status"
-    // 解析 result_payload，纯 {truncated, content} 会反序列化失败导致 submit
-    // 500（无日志 internal）。只替换 output/error.message 为截断文本，并加
-    // 同级 result_truncated 与 artifact_ref（S3 归档位置）供消费方取完整内容；
-    // 未知字段被 serde 忽略，SDK 旧结构提交依旧兼容。
-    let result_payload = if validation.truncated {
+    // 解析 result，纯 {truncated, content} 会反序列化失败导致 submit 500
+    // （无日志 internal）。output 直接放前 32KB 截断文本，result 内 truncated
+    // 与 artifact_ref（S3 归档位置）标识截断与完整内容。
+    // result_payload 存自包含包装层 {tool_call_id, tool_name, result}（与
+    // ClientToolContinuationResultDto 同构）；事件写入只用内层 result，
+    // 保持 event.result.status 协议不变。身份以行列（id/tool_name）权威。
+    let inner_result = if validation.truncated {
         let content = validation
             .payload
             .get("content")
@@ -2486,7 +2489,7 @@ pub(crate) async fn submit_client_tool_result(
             .map_err(|_| ApiError::bad_request("Client Tool result must be JSON"))?;
         match payload.get("status").and_then(Value::as_str) {
             Some("success") => {
-                payload["output"] = json!({ "truncated": true, "content": content });
+                payload["output"] = content;
             }
             Some("error") => {
                 let code = payload
@@ -2511,15 +2514,20 @@ pub(crate) async fn submit_client_tool_result(
                 ));
             }
         }
-        payload["result_truncated"] = json!(true);
-        if let (Some(run_id), Some((Some(artifact_id), _, _))) = (run_id, &archived) {
+        payload["truncated"] = json!(true);
+        if let Some((Some(artifact_id), _, _)) = &archived {
             payload["artifact_ref"] = json!(format!("tool-results/{run_id}/{artifact_id}"));
         }
         payload
     } else {
         validation.payload
     };
-    let result_payload = sanitize_run_event_payload(result_payload);
+    let inner_result = sanitize_run_event_payload(inner_result);
+    let result_payload = json!({
+        "tool_call_id": tool_call_id,
+        "tool_name": tool_name,
+        "result": inner_result.clone(),
+    });
     let token = client_access_token_from_headers(&headers)
         .ok_or(ApiError::unauthorized("missing Client Access Credential"))?;
     let mut tx = state.pool.begin().await?;
@@ -2529,6 +2537,12 @@ pub(crate) async fn submit_client_tool_result(
         .iter()
         .find(|row| row.get::<Uuid, _>("id") == tool_call_id)
         .ok_or(ApiError::not_found("Client Tool call not found"))?;
+    if request.get::<String, _>("tool_name") != tool_name {
+        // 理论不可达（工具名不可变）；用 409 而非 internal，避免无日志 500。
+        return Err(ApiError::conflict(
+            "Client Tool name changed while submitting",
+        ));
+    }
     let status: String = request.get("status");
     if status == "completed" {
         if request
@@ -2596,7 +2610,7 @@ pub(crate) async fn submit_client_tool_result(
         json!({
             "tool_call_id": tool_call_id,
             "tool_name": request.get::<String, _>("tool_name"),
-            "result": result_payload.clone(),
+            "result": inner_result.clone(),
             "elapsed_ms": elapsed_ms,
         }),
     )
@@ -2781,11 +2795,20 @@ pub(crate) async fn create_client_tool_continuation_tx(
     let results = rows
         .into_iter()
         .map(|row| {
+            let payload: Value = row.get("result_payload");
+            // 自包含包装层 {tool_call_id, tool_name, result}，身份以行列
+            // （id/tool_name）权威；部署前数据迁移已保证无旧纯 DTO 行。
+            let result = serde_json::from_value(
+                payload
+                    .get("result")
+                    .ok_or_else(|| ApiError::internal("stored Client Tool result is missing"))?
+                    .clone(),
+            )
+            .map_err(|_| ApiError::internal("stored Client Tool result is invalid"))?;
             Ok(ClientToolContinuationResultDto {
                 tool_call_id: row.get("id"),
                 tool_name: row.get("tool_name"),
-                result: serde_json::from_value(row.get("result_payload"))
-                    .map_err(|_| ApiError::internal("stored Client Tool result is invalid"))?,
+                result,
             })
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
@@ -4466,21 +4489,35 @@ fn summarize_tool_result_payload(
     artifact_id: Option<Uuid>,
     artifact_size_bytes: Option<i64>,
     artifact_reason: Option<&str>,
+    truncated: bool,
 ) -> Value {
-    let truncated = payload.get("truncated").and_then(Value::as_bool) == Some(true)
-        || payload
-            .pointer("/output/truncated")
-            .and_then(Value::as_bool)
-            == Some(true);
     if !truncated {
         return payload;
     }
+    // content 提取兼容三种形状：plural 直传 output（字符串）、runtime 旧形状
+    // {truncated, content}、singular 整行 DTO 外壳（output / error.message）。
     let content = payload
-        .get("content")
-        .and_then(Value::as_str)
-        .or_else(|| payload.pointer("/output/content").and_then(Value::as_str))
-        .unwrap_or_default()
-        .to_owned();
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| {
+            payload
+                .get("content")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            payload
+                .get("output")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            payload
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
     let size = artifact_size_bytes.unwrap_or(content.len() as i64);
     let (heading, hint) = match (artifact_id, artifact_reason) {
         (Some(id), _) => (
@@ -4741,43 +4778,95 @@ pub(crate) async fn load_integration_context_for_run(
         .bind(hub_session_id)
         .fetch_all(&mut **tx)
         .await?;
-        let tool_result = result_rows.last().map(|row| {
-            let payload: Value = row.get("result_payload");
-            summarize_tool_result_payload(
-                payload,
-                row.get("id"),
-                row.get("artifact_id"),
-                row.get("artifact_size_bytes"),
-                row.get::<Option<String>, _>("artifact_reason").as_deref(),
-            )
-        });
+        let tool_result = result_rows
+            .last()
+            .map(|row| -> Result<Value, ApiError> {
+                let payload: Value = row.get("result_payload");
+                // 按来源分流：client 路径取包装层内层 result；runtime 路径的
+                // payload 本身就是 {truncated, content} 形状，原样使用。
+                let result_value = if client_instance_id.is_some() {
+                    payload
+                        .get("result")
+                        .ok_or_else(|| ApiError::internal("stored Client Tool result is missing"))?
+                        .clone()
+                } else {
+                    payload
+                };
+                let truncated =
+                    result_value.get("truncated").and_then(Value::as_bool) == Some(true);
+                Ok(summarize_tool_result_payload(
+                    result_value,
+                    row.get("id"),
+                    row.get("artifact_id"),
+                    row.get("artifact_size_bytes"),
+                    row.get::<Option<String>, _>("artifact_reason").as_deref(),
+                    truncated,
+                ))
+            })
+            .transpose()?;
         let tool_results = if client_instance_id.is_some() {
-            result_rows
-                .into_iter()
-                .map(|row| {
-                    let result: ClientToolResultDto =
-                        serde_json::from_value(row.get("result_payload")).map_err(|_| {
-                            ApiError::internal("stored Client Tool result is invalid")
-                        })?;
-                    let result = match result {
-                        ClientToolResultDto::Success { output } => ClientToolResultDto::Success {
-                            output: summarize_tool_result_payload(
-                                output,
-                                row.get("id"),
-                                row.get("artifact_id"),
-                                row.get("artifact_size_bytes"),
-                                row.get::<Option<String>, _>("artifact_reason").as_deref(),
-                            ),
-                        },
-                        other => other,
-                    };
-                    Ok(ClientToolContinuationResultDto {
+            let total = result_rows.len();
+            // 总量预算：最新优先展开（position 升序，倒序迭代即最新在前，
+            // 且 singular 与最后一个同源，保证最新结果永远完整展开）；累计
+            // 序列化大小超 64KB 预算后，更旧的结果替换为占位 DTO（保留
+            // tool_call_id/tool_name 身份与读取指引，模型仍可取全文）。
+            let mut budget = CLIENT_TOOL_RESULTS_BUDGET_BYTES;
+            let mut expanded = 0usize;
+            let mut results = Vec::with_capacity(total);
+            for row in result_rows.into_iter().rev() {
+                let payload: Value = row.get("result_payload");
+                // 包装层内层 result + 内层 truncated；DTO 反序列化会丢弃
+                // truncated 字段，先读取标记再解析；身份以行列
+                // （id/tool_name）权威。
+                let inner = payload
+                    .get("result")
+                    .ok_or_else(|| ApiError::internal("stored Client Tool result is missing"))?;
+                let truncated = inner.get("truncated").and_then(Value::as_bool) == Some(true);
+                let result: ClientToolResultDto = serde_json::from_value(inner.clone())
+                    .map_err(|_| ApiError::internal("stored Client Tool result is invalid"))?;
+                let result = match result {
+                    ClientToolResultDto::Success { output, .. } => ClientToolResultDto::Success {
+                        output: summarize_tool_result_payload(
+                            output,
+                            row.get("id"),
+                            row.get("artifact_id"),
+                            row.get("artifact_size_bytes"),
+                            row.get::<Option<String>, _>("artifact_reason").as_deref(),
+                            truncated,
+                        ),
+                        truncated: None,
+                    },
+                    other => other,
+                };
+                let dto = ClientToolContinuationResultDto {
+                    tool_call_id: row.get("id"),
+                    tool_name: row.get("tool_name"),
+                    result,
+                };
+                let size = serde_json::to_string(&dto).map(|s| s.len()).unwrap_or(0);
+                if budget >= size {
+                    budget -= size;
+                    expanded += 1;
+                    results.push(dto);
+                } else {
+                    // 占位：超预算后更旧的结果不再展开（预算置 0 恒占位）。
+                    results.push(ClientToolContinuationResultDto {
                         tool_call_id: row.get("id"),
                         tool_name: row.get("tool_name"),
-                        result,
-                    })
-                })
-                .collect::<Result<Vec<_>, ApiError>>()?
+                        result: ClientToolResultDto::Success {
+                            output: json!(format!(
+                                "[工具结果未展开：本批共 {total} 个结果超总量上限(64KB)，仅展开最近 {expanded} 个；用 agent_hub_integration_tool_result_read(tool_call_id=\"{}\", mode=\"size\") 读取完整内容]",
+                                row.get::<Uuid, _>("id")
+                            )),
+                            truncated: Some(true),
+                        },
+                    });
+                    budget = 0;
+                }
+            }
+            // 恢复 position 升序，模型按时间顺序读取。
+            results.reverse();
+            results
         } else {
             Vec::new()
         };
@@ -6732,6 +6821,7 @@ mod tests {
             Json(SubmitClientToolResultRequest {
                 result: ClientToolResultDto::Success {
                     output: json!({ "opened": true }),
+                    truncated: None,
                 },
             }),
         )
@@ -6939,6 +7029,7 @@ mod tests {
             Json(SubmitClientToolResultRequest {
                 result: ClientToolResultDto::Success {
                     output: json!({ "ignored": true }),
+                    truncated: None,
                 },
             }),
         )
@@ -7029,6 +7120,7 @@ mod tests {
 
         let first_result = ClientToolResultDto::Success {
             output: json!({ "opened": true }),
+            truncated: None,
         };
         let first_response = submit_client_tool_result(
             State(fixture.app.state.clone()),
@@ -7061,6 +7153,7 @@ mod tests {
             Json(SubmitClientToolResultRequest {
                 result: ClientToolResultDto::Success {
                     output: json!({ "opened": false }),
+                    truncated: None,
                 },
             }),
         )
@@ -7274,6 +7367,7 @@ mod tests {
             Json(SubmitClientToolResultRequest {
                 result: ClientToolResultDto::Success {
                     output: json!({ "too_late": true }),
+                    truncated: None,
                 },
             }),
         )
@@ -8534,6 +8628,7 @@ mod tests {
             Json(SubmitClientToolResultRequest {
                 result: ClientToolResultDto::Success {
                     output: json!(output.to_string()),
+                    truncated: None,
                 },
             }),
         )
@@ -8541,6 +8636,157 @@ mod tests {
         .unwrap()
         .0;
         assert!(submitted.run.is_some(), "continuation run must be created");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn plural_tool_results_respect_total_budget(pool: PgPool) {
+        let fixture = prepare_client_tool_run(pool, &["first_action", "second_action"]).await;
+        // 带 S3 store：截断结果归档，summarize 给出 read 指引。
+        let (_, store, server) = attachment_object_store().await;
+        let mut app_state = (*fixture.app.state).clone();
+        app_state.session_bundle_store = Some(Arc::new(store));
+        let state = Arc::new(app_state);
+        let fixture_state = state.clone();
+        finalize_test_client_tool_batch(&fixture, &["first_action", "second_action"])
+            .await
+            .unwrap();
+        // 两个工具都提交超过截断阈值的大结果：summarize 后各约 32KB+，
+        // 合计超 64KB 总量预算——最新（second_action）展开、旧（first_action）
+        // 占位（保留身份与读取指引）。
+        let mut continuation_run = None;
+        for (idx, tool_name) in ["first_action", "second_action"].iter().enumerate() {
+            let claim = claim_client_tool_call(
+                State(fixture_state.clone()),
+                bearer_headers(&fixture.executor.access_token),
+                Path(fixture.tool_call_ids[idx]),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(claim.status, "claimed");
+            let big = "x".repeat(TOOL_RESULT_TRUNCATE_BYTES + 1024);
+            let submitted = submit_client_tool_result(
+                State(fixture_state.clone()),
+                bearer_headers(&fixture.executor.access_token),
+                Path(fixture.tool_call_ids[idx]),
+                Json(SubmitClientToolResultRequest {
+                    result: ClientToolResultDto::Success {
+                        output: json!(format!("{tool_name}:{big}")),
+                        truncated: None,
+                    },
+                }),
+            )
+            .await
+            .unwrap()
+            .0;
+            if idx == 1 {
+                assert!(
+                    submitted.run.is_some(),
+                    "continuation run must be created after last tool result"
+                );
+                continuation_run = submitted.run;
+            }
+        }
+        let continuation_run = continuation_run.expect("continuation run must exist");
+        let mut tx = fixture_state.pool.begin().await.unwrap();
+        let context = load_integration_context_for_run(&mut tx, &continuation_run)
+            .await
+            .unwrap()
+            .expect("tool-result run must expose integration context");
+        tx.commit().await.unwrap();
+
+        assert_eq!(context.tool_results.len(), 2);
+        // 旧结果（first_action，position 0）占位：保留身份与 truncated 标记。
+        let first = serde_json::to_value(&context.tool_results[0]).unwrap();
+        assert_eq!(
+            first.get("tool_name").and_then(Value::as_str),
+            Some("first_action")
+        );
+        let first_output = first
+            .pointer("/result/output")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(
+            first_output.contains("工具结果未展开"),
+            "older result beyond budget must be a readable placeholder"
+        );
+        assert!(first_output.contains("agent_hub_integration_tool_result_read(tool_call_id="));
+        assert_eq!(
+            first.pointer("/result/truncated").and_then(Value::as_bool),
+            Some(true)
+        );
+        // 最新结果（second_action，position 1）完整展开。
+        let second = serde_json::to_value(&context.tool_results[1]).unwrap();
+        assert_eq!(
+            second.get("tool_name").and_then(Value::as_str),
+            Some("second_action")
+        );
+        let second_output = second.pointer("/result/output").unwrap();
+        assert_eq!(second_output.get("truncated"), Some(&json!(true)));
+        assert!(second_output
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap()
+            .contains("agent_hub_integration_tool_result_read"));
+
+        server.abort();
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn re_claim_after_submit_returns_terminal_result(pool: PgPool) {
+        let fixture = prepare_client_tool_run(pool, &["first_action"]).await;
+        finalize_test_client_tool_batch(&fixture, &["first_action"])
+            .await
+            .unwrap();
+        let claim = claim_client_tool_call(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(fixture.tool_call_ids[0]),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(claim.status, "claimed");
+        let output = json!({ "ok": true, "total": 5 });
+        let submitted = submit_client_tool_result(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(fixture.tool_call_ids[0]),
+            Json(SubmitClientToolResultRequest {
+                result: ClientToolResultDto::Success {
+                    output: json!(output.to_string()),
+                    truncated: None,
+                },
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(submitted.run.is_some());
+        // 已完成工具再次 claim：terminal=true 且 result 从包装层内层正确解析。
+        let re_claim = claim_client_tool_call(
+            State(fixture.app.state.clone()),
+            bearer_headers(&fixture.executor.access_token),
+            Path(fixture.tool_call_ids[0]),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(re_claim.terminal);
+        assert_eq!(re_claim.status, "completed");
+        let result =
+            serde_json::to_value(re_claim.result.expect("terminal claim must return result"))
+                .unwrap();
+        assert_eq!(
+            result.get("status").and_then(Value::as_str),
+            Some("success")
+        );
+        assert_eq!(
+            result.get("output").and_then(Value::as_str),
+            Some(output.to_string().as_str())
+        );
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -8574,6 +8820,7 @@ mod tests {
             Json(SubmitClientToolResultRequest {
                 result: ClientToolResultDto::Success {
                     output: json!(big_content),
+                    truncated: None,
                 },
             }),
         )
@@ -8582,29 +8829,53 @@ mod tests {
         .0;
         assert!(submitted.run.is_some(), "continuation run must be created");
 
-        // DB 形状：合法 DTO 外壳 + output 带 truncated/content + 同级标记与归档引用。
-        let (status, output, result_truncated, artifact_ref): (
+        // DB 形状：自包含包装层 {tool_call_id, tool_name, result}；result 是
+        // 合法 DTO，output 直接是前 32KB 截断文本，result 内 truncated 与
+        // artifact_ref 标识截断与归档位置。
+        let (tool_call_id, tool_name, status, output, truncated_flag, artifact_ref): (
             String,
-            serde_json::Value,
+            String,
+            String,
+            Option<String>,
             Option<bool>,
             Option<String>,
         ) = sqlx::query_as(
-            "SELECT result_payload->>'status', result_payload->'output',
-                    (result_payload->>'result_truncated')::bool,
-                    result_payload->>'artifact_ref'
+            "SELECT result_payload->>'tool_call_id', result_payload->>'tool_name',
+                    result_payload->'result'->>'status', result_payload->'result'->>'output',
+                    (result_payload->'result'->>'truncated')::bool,
+                    result_payload->'result'->>'artifact_ref'
              FROM integration_tool_requests WHERE id = $1",
         )
         .bind(fixture.tool_call_ids[0])
         .fetch_one(&state.pool)
         .await
         .unwrap();
+        assert_eq!(tool_call_id, fixture.tool_call_ids[0].to_string());
+        assert_eq!(tool_name, "first_action");
         assert_eq!(status, "success");
-        assert_eq!(output.get("truncated"), Some(&json!(true)));
-        let content = output.get("content").and_then(Value::as_str).unwrap();
+        let content = output.expect("output must be the truncated text");
         assert!(content.len() <= TOOL_RESULT_TRUNCATE_BYTES);
-        assert_eq!(result_truncated, Some(true));
+        assert_eq!(truncated_flag, Some(true));
         let artifact_ref = artifact_ref.expect("archived result must carry artifact_ref");
         assert!(artifact_ref.starts_with("tool-results/"));
+
+        // 事件协议不变：client_tool_result 事件的 result 是内层 DTO
+        // （event.result.status 直接可读），不是包装层。
+        let (event_result, event_tool_name): (serde_json::Value, String) = sqlx::query_as(
+            "SELECT payload->'result', payload->>'tool_name'
+             FROM run_events
+             WHERE run_id = $1 AND event_type = 'client_tool_result'
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(fixture.run.id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            event_result.get("status").and_then(Value::as_str),
+            Some("success")
+        );
+        assert_eq!(event_tool_name, "first_action");
 
         // 模型输入（singular）：context.tool_result 感知截断并给出读取指引。
         let mut tx = state.pool.begin().await.unwrap();
@@ -8680,6 +8951,7 @@ mod tests {
             Json(SubmitClientToolResultRequest {
                 result: ClientToolResultDto::Success {
                     output: json!(chinese),
+                    truncated: None,
                 },
             }),
         )
@@ -8688,7 +8960,7 @@ mod tests {
         .0;
         assert!(submitted.run.is_some(), "continuation run must be created");
         let (status, content): (String, Option<String>) = sqlx::query_as(
-            "SELECT result_payload->>'status', result_payload#>>'{output,content}'
+            "SELECT result_payload->'result'->>'status', result_payload->'result'->>'output'
              FROM integration_tool_requests WHERE id = $1",
         )
         .bind(fixture.tool_call_ids[0])

@@ -941,7 +941,13 @@ pub struct ClientToolErrorDto {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ClientToolResultDto {
-    Success { output: Value },
+    Success {
+        output: Value,
+        /// 结果被截断或未展开（plural 预算裁剪占位）时置 true；
+        /// 旧 SDK 提交无此字段（default None），序列化时省略。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        truncated: Option<bool>,
+    },
     Error { error: ClientToolErrorDto },
 }
 
