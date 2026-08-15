@@ -3653,9 +3653,11 @@ mod tests {
     use agent_hub_shared::{RunSecretFileDto, RunSecretValueDto};
 
     #[test]
-    fn tool_result_broker_survives_after_start_returns() {
+    fn tool_result_broker_keeps_listening_while_held_by_process() {
         // 回归：broker 曾是 start 的局部变量，返回即 Drop 关闭 listener；
-        // 必须 move 进 PersistentPiRpcProcess 保持存活。
+        // 必须 move 进 PersistentPiRpcProcess 保持存活。本测试通过构造
+        // process 持有 broker 验证：若 process 的 tool_result_broker 字段
+        // 被删除，构造字面量编译失败（覆盖回归）。
         let temp = tempfile::tempdir().unwrap();
         let session_id = uuid::Uuid::new_v4();
         let broker = ToolResultBroker::start(
@@ -3666,13 +3668,33 @@ mod tests {
             3,
         )
         .unwrap();
-        // start 返回后 broker 必须仍可连接并处理请求（hub.invalid 不可达，
-        // 响应为读取错误——证明 broker 存活而非 connection refused）。
-        let mut stream = std::net::TcpStream::connect(("127.0.0.1", broker.port)).unwrap();
+        let port = broker.port;
+        let token = broker.token.clone();
+        // 局部 broker move 进持有者（模拟 PersistentPiRpcProcess 字段）。
+        let _process = PersistentPiRpcProcess {
+            session_dir: temp.path().to_path_buf(),
+            session_file: temp.path().join("session.jsonl"),
+            native_session_id: "native-session".into(),
+            next_request_id: 0,
+            timeout: std::time::Duration::from_secs(300),
+            child: None,
+            stdin: None,
+            line_rx: None,
+            stdout_reader: None,
+            stderr_reader: None,
+            skill_exec_broker: None,
+            vision_broker: None,
+            tool_result_broker: Some(broker),
+            cancellation: Arc::new(EngineCancellation::default()),
+        };
+        // 局部 broker 已 move；持有者存活时 broker 必须仍可连接并处理请求
+        // （hub.invalid 不可达，响应为读取错误——证明 broker 存活而非
+        // connection refused）。
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
         write_json_line(
             &mut stream,
             &serde_json::json!({
-                "token": broker.token,
+                "token": token,
                 "tool_call_id": uuid::Uuid::new_v4(),
                 "mode": "size",
             }),
@@ -3686,7 +3708,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert!(
             value.get("error").is_some() || value.get("size_bytes").is_some(),
-            "broker must respond after start returns: {line}"
+            "broker must respond while held by the process: {line}"
         );
     }
 
