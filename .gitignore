@@ -20,3 +20,4 @@
 *.pfx
 runtime-credential.json
 test-results/
+dist/
