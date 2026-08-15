@@ -2128,7 +2128,10 @@ pub(crate) async fn stream_run_events(
              }
          }
          let mut rx = bus.subscribe(run_id);
-         let mut ticker = tokio::time::interval(Duration::from_millis(700));
+        let mut ticker = tokio::time::interval(Duration::from_millis(700));
+        // 心跳计数：空闲连接必须持续有数据，否则中间代理（vite/go 反代等）
+        // 空闲超时会断开 → 前端收到 502 "Session event stream failed"。
+        let mut keepalive_ticks: u32 = 0;
          loop {
              tokio::select! {
                  item = rx.recv() => {
@@ -2155,6 +2158,11 @@ pub(crate) async fn stream_run_events(
                      if let Err(err) = authorize_run_stream(&authorization_state, &authorization_headers, run_id).await {
                          yield Ok(Event::default().event("error").data(err.message));
                          break;
+                     }
+                     // 心跳：约每 3.5 秒发一个 SSE 注释行，保持连接活跃。
+                     keepalive_ticks = keepalive_ticks.wrapping_add(1);
+                     if keepalive_ticks % 5 == 0 {
+                         yield Ok(Event::default().comment("keepalive"));
                      }
                      match load_events_after(&pool, run_id, last_seq).await {
                          Ok(events) => {
