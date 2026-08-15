@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 本文件记录 Agent Hub 各正式版本面向使用者的变化。
 
+## [0.3.9] - 2026-08-15
+
+### Fixed
+
+- 大结果客户端工具提交 500 根因修复：截断后的结果不再破坏续接解析——`result_payload` 改为自包含包装层 `{tool_call_id, tool_name, result}`（与模型输入同构），截断时 `output` 直接保留前 32KB 文本、`truncated` 与 `artifact_ref` 标识截断与完整内容；多字节 UTF-8（中文等）结果在截断阈值处不再触发 `String::truncate` panic。
+- 续接 run 模型输入的 plural 工具结果增加 64KB 总量预算：最新结果优先完整展开，超预算的旧结果以可读占位展示（保留工具身份与 `agent_hub_integration_tool_result_read` 读取指引）。
+- 未归档工具结果 `read` 接口（size/range/full）改为直接从 DB 提供完整内容——亚阈值结果被预算占位后仍可取全文，不丢数据。
+
+### Internal
+
+- 迁移 0015：存量 client 工具结果 `result_payload` 包一层（以 `run.client_instance_id` 判定 client 路径，runtime 任意 JSON 结果不受影响）。
+- 回归测试新增：截断 DTO 外壳端到端（DB 形状/事件协议/singular+plural 模型输入/S3 归档）、UTF-8 边界 panic、re-claim terminal、plural 预算裁剪、迁移 0015、预算占位可读。
+
 ## [0.3.8] - 2026-08-14
 
 ### Added
