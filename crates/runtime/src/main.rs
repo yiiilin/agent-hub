@@ -10080,7 +10080,7 @@ mod tests {
 
         let tools = pi_driver::pi_tool_allowlist_for_claim(&claim).unwrap();
         assert!(
-            tools.contains(&"agent_hub_integration_tool_result_read".to_string()),
+            tools.contains(&"tool_result_read".to_string()),
             "archived tool result read tool must be exposed to the model"
         );
     }

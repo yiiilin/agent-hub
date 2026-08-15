@@ -180,10 +180,10 @@ function callBroker(params, signal) {
 
 export default function registerAgentHubToolResultRead(pi) {
   pi.registerTool({
-    name: "agent_hub_integration_tool_result_read",
+    name: "tool_result_read",
     label: "Read archived integration tool result",
     description:
-      "Reads a large integration tool result that was truncated in context. " +
+      "Reads a large integration tool result (managed operation / page capability) that was truncated in context. " +
       'mode="size" returns metadata (size_bytes, artifact_id, artifact_reason). ' +
       'mode="range" returns a text slice with offset/limit/next_offset for paging. ' +
       "Use the tool_call_id from the truncated result summary.",
@@ -406,22 +406,19 @@ fn normalized_integration_tools(
         ));
     }
     let mut allocated_names = names;
-    let mut next_client_name = 1_u32;
     let mut normalized = Vec::with_capacity(parsed.len());
     for (external_name, description, parameters, client_managed) in parsed {
+        // client 工具内部名 = 前缀 + 实际工具名（可读且防与 Pi 内置冲突；
+        // external_name 已保证非空、无逗号、唯一）。
         let internal_name = if client_managed {
-            loop {
-                let candidate = format!("{PI_CLIENT_TOOL_PREFIX}{next_client_name}");
-                next_client_name = next_client_name
-                    .checked_add(1)
-                    .context("Client Tool internal name counter overflowed")?;
-                if !allocated_names.contains(&candidate)
-                    && !PI_BUILTIN_TOOL_NAMES.contains(&candidate.as_str())
-                {
-                    allocated_names.insert(candidate.clone());
-                    break candidate;
-                }
-            }
+            let candidate = format!("{PI_CLIENT_TOOL_PREFIX}{external_name}");
+            anyhow::ensure!(
+                !allocated_names.contains(&candidate)
+                    && !PI_BUILTIN_TOOL_NAMES.contains(&candidate.as_str()),
+                "Client Tool internal name conflicts: {candidate}"
+            );
+            allocated_names.insert(candidate.clone());
+            candidate
         } else {
             external_name.clone()
         };
@@ -3270,7 +3267,7 @@ pub(super) fn pi_tool_allowlist_for_claim(claim: &ClaimRunResponse) -> anyhow::R
     // 归档工具结果读取工具：broker 启用（Hub 凭据就绪）时必须暴露给模型，
     // 否则大结果截断后模型无工具可读全文（只能用 read artifact:// 失败）。
     if TOOL_RESULT_HUB_URL.get().is_some() && TOOL_RESULT_RUNTIME_TOKEN.get().is_some() {
-        const TOOL_RESULT_READ_TOOL: &str = "agent_hub_integration_tool_result_read";
+        const TOOL_RESULT_READ_TOOL: &str = "tool_result_read";
         if !tools.iter().any(|tool| tool == TOOL_RESULT_READ_TOOL) {
             tools.push(TOOL_RESULT_READ_TOOL.into());
         }

@@ -4523,7 +4523,7 @@ fn summarize_tool_result_payload(
         (Some(id), _) => (
             format!("[tool result truncated: {size} bytes total; archived as artifact://{id}]"),
             format!(
-                "Read the full result with agent_hub_integration_tool_result_read(tool_call_id=\"{}\", mode=\"size\") or (tool_call_id=\"{}\", mode=\"range\", offset, limit) or (tool_call_id=\"{}\", mode=\"file\")",
+                "Read the full result with tool_result_read(tool_call_id=\"{}\", mode=\"size\") or (tool_call_id=\"{}\", mode=\"range\", offset, limit) or (tool_call_id=\"{}\", mode=\"file\")",
                 tool_call_id, tool_call_id, tool_call_id
             ),
         ),
@@ -5027,7 +5027,7 @@ pub(crate) async fn load_integration_context_for_run(
                         tool_name: row.get("tool_name"),
                         result: ClientToolResultDto::Success {
                             output: json!(format!(
-                                "[工具结果未展开：本批共 {total} 个结果超总量上限(64KB)，仅展开最近 {expanded} 个；用 agent_hub_integration_tool_result_read(tool_call_id=\"{}\", mode=\"size\") 读取完整内容]",
+                                "[工具结果未展开：本批共 {total} 个结果超总量上限(64KB)，仅展开最近 {expanded} 个；用 tool_result_read(tool_call_id=\"{}\", mode=\"size\") 读取完整内容]",
                                 row.get::<Uuid, _>("id")
                             )),
                             truncated: Some(true),
@@ -8884,7 +8884,7 @@ mod tests {
             first_output.contains("工具结果未展开"),
             "older result beyond budget must be a readable placeholder"
         );
-        assert!(first_output.contains("agent_hub_integration_tool_result_read(tool_call_id="));
+        assert!(first_output.contains("tool_result_read(tool_call_id="));
         assert_eq!(
             first.pointer("/result/truncated").and_then(Value::as_bool),
             Some(true)
@@ -8904,7 +8904,7 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap();
         assert!(
-            second_output.contains("agent_hub_integration_tool_result_read"),
+            second_output.contains("tool_result_read"),
             "expanded result must carry read instructions in its output text"
         );
 
@@ -9066,7 +9066,7 @@ mod tests {
         assert_eq!(tool_result.get("truncated"), Some(&json!(true)));
         let summarized = tool_result.get("content").and_then(Value::as_str).unwrap();
         assert!(
-            summarized.contains("agent_hub_integration_tool_result_read(tool_call_id="),
+            summarized.contains("tool_result_read(tool_call_id="),
             "model input must carry full-result read instructions"
         );
         assert!(summarized.contains("artifact://"));
@@ -9085,7 +9085,7 @@ mod tests {
         );
         let plural_summary = plural_output.as_str().unwrap();
         assert!(
-            plural_summary.contains("agent_hub_integration_tool_result_read(tool_call_id="),
+            plural_summary.contains("tool_result_read(tool_call_id="),
             "plural path must carry full-result read instructions"
         );
 
@@ -9424,7 +9424,7 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap();
         assert!(
-            message.contains("agent_hub_integration_tool_result_read(tool_call_id="),
+            message.contains("tool_result_read(tool_call_id="),
             "truncated Error message must carry full-result read instructions"
         );
         assert!(message.contains("artifact://"));
@@ -10325,7 +10325,7 @@ mod tests {
             "summary must point at the artifact"
         );
         assert!(
-            summary.contains("agent_hub_integration_tool_result_read"),
+            summary.contains("tool_result_read"),
             "summary must teach the model how to read the full result"
         );
         assert!(
@@ -10389,7 +10389,7 @@ mod tests {
             summary.contains("was NOT archived"),
             "over-limit summary must tell the model the result is unavailable"
         );
-        assert!(!summary.contains("agent_hub_integration_tool_result_read"));
+        assert!(!summary.contains("tool_result_read"));
 
         server.abort();
     }
