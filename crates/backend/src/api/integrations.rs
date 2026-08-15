@@ -4786,20 +4786,41 @@ async fn load_tool_result_artifact_response(
                 }))
                 .into_response());
             }
-            let content =
-                String::from_utf8(raw[local_start..local_end].to_vec()).map_err(|err| {
-                    tracing::error!(
-                        %err,
-                        %tool_request_id,
-                        "tool result range slice is not valid UTF-8"
-                    );
-                    ApiError::internal("tool result range read failed")
-                })?;
+            // limit 小于一个多字节字符时，end 回退后可能等于 start：必须向后
+            // 扩到至少一个完整 code point（最多超 limit 3 字节，S3 已多取
+            // 尾部），否则空内容且 next_offset 不前进会死循环。
+            if local_end == local_start && local_start < raw.len() {
+                local_end = (local_start + 1).min(raw.len());
+                while local_end < raw.len() && is_cont(raw[local_end]) {
+                    local_end += 1;
+                }
+            }
+            // 切片必须是合法 UTF-8；若尾部仍是半个字符（S3 fetch_end 切进
+            // 字符），逐字节缩回直到合法（最多数字节），绝不让调用方读到
+            // 替换字符或错位偏移。
+            let content;
+            let mut slice_end = local_end;
+            loop {
+                match String::from_utf8(raw[local_start..slice_end].to_vec()) {
+                    Ok(text) => {
+                        content = text;
+                        break;
+                    }
+                    Err(_) if slice_end > local_start => slice_end -= 1,
+                    Err(_) => {
+                        tracing::error!(
+                            %tool_request_id,
+                            "tool result range slice is not valid UTF-8"
+                        );
+                        return Err(ApiError::internal("tool result range read failed"));
+                    }
+                }
+            }
             Ok(Json(json!({
                 "content": content,
                 "offset": base + local_start as i64,
                 "limit": limit,
-                "next_offset": base + local_end as i64,
+                "next_offset": base + slice_end as i64,
                 "size_bytes": raw_size,
             }))
             .into_response())
@@ -9341,6 +9362,30 @@ mod tests {
         assert_eq!(range_body["offset"], 11);
         assert_eq!(range_body["next_offset"], 17);
 
+        // limit=1 从字符边界开始：必须返回一个完整字符且 next_offset 前进
+        // （否则分页死循环）。
+        let tiny_resp = load_tool_result_artifact_response(
+            &state,
+            fixture.run.id,
+            fixture.tool_call_ids[0],
+            &ToolResultArtifactQuery {
+                mode: Some("range".into()),
+                offset: Some(11),
+                limit: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        let tiny_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(tiny_resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tiny_body["content"], json!("中"));
+        assert_eq!(tiny_body["offset"], 11);
+        assert_eq!(tiny_body["next_offset"], 14);
+
         // EOF：offset == size → 空页，next_offset 停在末尾。
         let eof_resp = load_tool_result_artifact_response(
             &state,
@@ -9467,6 +9512,29 @@ mod tests {
         assert_eq!(range_body["content"], json!("中中"));
         assert_eq!(range_body["offset"], 11);
         assert_eq!(range_body["next_offset"], 17);
+
+        // limit=1 从字符边界开始：完整字符 + next_offset 前进（防死循环）。
+        let tiny_resp = load_tool_result_artifact_response(
+            &state,
+            fixture.run.id,
+            fixture.tool_call_ids[0],
+            &ToolResultArtifactQuery {
+                mode: Some("range".into()),
+                offset: Some(11),
+                limit: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        let tiny_body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(tiny_resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tiny_body["content"], json!("中"));
+        assert_eq!(tiny_body["offset"], 11);
+        assert_eq!(tiny_body["next_offset"], 14);
 
         // 末尾附近 range：不产生 U+FFFD（对象尾部是 ASCII `"}`，安全）。
         let tail_resp = load_tool_result_artifact_response(
