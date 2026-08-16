@@ -83,7 +83,16 @@ jobs:
         run: 'timeout 300 cargo test -p agent-hub-runtime runtime_ws:: -- --test-threads=1'
 
       - name: Run runtime main tests
-        run: 'timeout 600 cargo test -p agent-hub-runtime tests:: -- --test-threads=1'
+        run: |
+          set +e
+          timeout 300 cargo test -p agent-hub-runtime tests:: -- --test-threads=1 --format json --report-time > /tmp/runtime-main.log 2>&1
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            tail -n 180 /tmp/runtime-main.log | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+          fi
+          exit "$status"
 
       - name: Run CLI tests
         run: timeout 300 cargo test -p agent-hub-cli -- --test-threads=1
