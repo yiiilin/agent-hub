@@ -494,12 +494,14 @@ fn replace_private_file(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
             {
                 use std::os::unix::ffi::OsStrExt;
                 use std::os::unix::fs::PermissionsExt;
-                let cpath =
-                    CString::new(path.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
-                // SAFETY: pointer is NUL-terminated and the path is valid.
-                if unsafe { libc::chown(cpath.as_ptr(), 0, PI_SANDBOX_GID) } != 0 {
-                    return Err(std::io::Error::last_os_error())
-                        .context("chown private file to root:agenthub");
+                if unsafe { libc::geteuid() } == 0 {
+                    let cpath =
+                        CString::new(path.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
+                    // SAFETY: pointer is NUL-terminated and the path is valid.
+                    if unsafe { libc::chown(cpath.as_ptr(), 0, PI_SANDBOX_GID) } != 0 {
+                        return Err(std::io::Error::last_os_error())
+                            .context("chown private file to root:agenthub");
+                    }
                 }
                 fs::set_permissions(path, fs::Permissions::from_mode(0o440))
                     .context("protect private file as read-only")?;
@@ -562,10 +564,15 @@ pub(super) fn prepare_control_directory(path: &Path, purpose: &str) -> anyhow::R
     {
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::PermissionsExt;
-        let cpath = CString::new(path.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
-        // SAFETY: pointer is NUL-terminated and the path is valid.
-        if unsafe { libc::chown(cpath.as_ptr(), 0, PI_SANDBOX_GID) } != 0 {
-            return Err(std::io::Error::last_os_error()).context("chown control directory");
+        // Hosted runners and unprivileged local builds cannot transfer ownership
+        // to the sandbox UID/GID. Production Runtime runs as root and still
+        // applies the stronger ownership boundary below.
+        if unsafe { libc::geteuid() } == 0 {
+            let cpath = CString::new(path.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
+            // SAFETY: pointer is NUL-terminated and the path is valid.
+            if unsafe { libc::chown(cpath.as_ptr(), 0, PI_SANDBOX_GID) } != 0 {
+                return Err(std::io::Error::last_os_error()).context("chown control directory");
+            }
         }
         fs::set_permissions(path, fs::Permissions::from_mode(0o550))
             .with_context(|| format!("protect {purpose}"))?;
