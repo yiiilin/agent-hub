@@ -23,6 +23,9 @@ jobs:
     name: Rust
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    container:
+      image: rust:1.91-bookworm
+      options: --user root
     services:
       postgres:
         image: postgres:16
@@ -38,7 +41,7 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     env:
-      DATABASE_URL: postgres://agent_hub:agent_hub@localhost:5432/agent_hub
+      DATABASE_URL: postgres://agent_hub:agent_hub@postgres:5432/agent_hub
       RUST_BACKTRACE: 1
     steps:
       - name: Check out source
@@ -46,11 +49,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: 1.91.0
-          components: rustfmt, clippy
+      - name: Install Runtime test dependencies
+        run: apt-get update && apt-get install -y --no-install-recommends curl jq
+
+      - name: Ensure Rust components
+        run: rustup component add rustfmt clippy
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -58,58 +61,8 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - name: Run shared tests
-        run: timeout 900 cargo test -p agent-hub-shared -- --test-threads=1
-
-      - name: Run backend tests
-        run: timeout 900 cargo test -p agent-hub-backend -- --test-threads=1
-
-      - name: Run runtime pi_driver tests
-        run: |
-          set +e
-          timeout 600 cargo test -p agent-hub-runtime pi_driver:: -- --test-threads=1 --skip reaps_background_processes_after_the_catalog_program_exits > /tmp/pi-driver.log 2>&1
-          status=$?
-          if [ "$status" -ne 0 ]; then
-            tail -n 180 /tmp/pi-driver.log | while IFS= read -r line; do
-              echo "::error::$line"
-            done
-          fi
-          exit "$status"
-
-      - name: Run runtime session_bundle tests
-        run: 'timeout 300 cargo test -p agent-hub-runtime session_bundle:: -- --test-threads=1'
-
-      - name: Run runtime websocket tests
-        run: 'timeout 300 cargo test -p agent-hub-runtime runtime_ws:: -- --test-threads=1'
-
-      - name: Run runtime main tests
-        run: |
-          set -e
-          mapfile -t runtime_tests < <(cargo test -p agent-hub-runtime tests:: -- --list 2>/dev/null | sed -n 's/: test$//p')
-          if [ "${#runtime_tests[@]}" -eq 0 ]; then
-            echo "::error::No runtime main tests were discovered"
-            exit 1
-          fi
-          failed_tests=()
-          for test_name in "${runtime_tests[@]}"; do
-            if [ "$test_name" = "tests::complete_failure_after_finalize_does_not_fall_back_to_partial_publication" ] || [ "$test_name" = "tests::configuration_refresh_upgrades_a_legacy_package_free_marker" ] || [ "$test_name" = "tests::hub_fenced_cleanup_removes_read_only_skill_execution_packages" ] || [ "$test_name" = "tests::hub_skill_overrides_runtime_local_skill_with_same_name" ]; then
-              continue
-            fi
-            timeout 30 cargo test -p agent-hub-runtime "$test_name" -- --exact --test-threads=1 > /tmp/runtime-main-one.log 2>&1 || {
-              failed_tests+=("$test_name")
-              echo "::error::runtime main test failed: $test_name"
-              tail -n 30 /tmp/runtime-main-one.log | while IFS= read -r line; do
-                echo "::error::$line"
-              done
-            }
-          done
-          if [ "${#failed_tests[@]}" -ne 0 ]; then
-            echo "::error::failed runtime main tests: ${failed_tests[*]}"
-            exit 1
-          fi
-
-      - name: Run CLI tests
-        run: timeout 300 cargo test -p agent-hub-cli -- --test-threads=1
+      - name: Run workspace tests
+        run: timeout 1200 cargo test --workspace -- --test-threads=1
 
       - name: Run database-backed tests
         run: cargo test -p agent-hub-backend -- --ignored --skip local_s3_compatible_round_trip_streams_put_get_and_delete
