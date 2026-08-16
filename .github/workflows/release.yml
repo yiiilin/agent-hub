@@ -82,9 +82,15 @@ jobs:
             --no-banner \
             --verbose
 
+  quality:
+    name: Quality gates
+    permissions:
+      contents: read
+    uses: ./.github/workflows/quality.yml
+
   images:
     name: Build ${{ matrix.name }} image
-    needs: validate
+    needs: [validate, quality]
     runs-on: ubuntu-latest
     permissions:
       contents: read

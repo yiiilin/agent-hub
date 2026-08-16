@@ -1,0 +1,133 @@
+name: Quality gates
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  versions:
+    name: Version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Verify release metadata
+        run: bash scripts/verify-release-version.sh
+
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: agent_hub
+          POSTGRES_PASSWORD: agent_hub
+          POSTGRES_DB: agent_hub
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agent_hub -d agent_hub"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      minio:
+        image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+        env:
+          MINIO_ROOT_USER: agent_hub
+          MINIO_ROOT_PASSWORD: agent_hub_test_secret
+        ports:
+          - 9000:9000
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/minio/health/live"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgres://agent_hub:agent_hub@localhost:5432/agent_hub
+      BUNDLE_S3_INTEGRATION_ENDPOINT: http://localhost:9000
+      BUNDLE_S3_INTEGRATION_ACCESS_KEY_ID: agent_hub
+      BUNDLE_S3_INTEGRATION_SECRET_ACCESS_KEY: agent_hub_test_secret
+      BUNDLE_S3_INTEGRATION_REGION: us-east-1
+      RUST_BACKTRACE: 1
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.91.0
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+      - name: Run database and S3-backed tests
+        run: cargo test -p agent-hub-backend -- --ignored
+
+  frontend:
+    name: Frontend and SDK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install SDK dependencies
+        run: npm ci --prefix sdk/typescript
+
+      - name: Test SDK
+        run: npm test --prefix sdk/typescript
+
+      - name: Verify SDK package
+        run: |
+          cd sdk/typescript
+          npm pack --dry-run
+
+      - name: Install frontend dependencies
+        run: npm ci --prefix frontend
+
+      - name: Build frontend
+        run: npm run build --prefix frontend
+
+  gateway:
+    name: Model Gateway
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: gateway/go.mod
+
+      - name: Vet Gateway
+        run: go vet ./...
+        working-directory: gateway
+
+      - name: Test Gateway
+        run: go test ./...
+        working-directory: gateway

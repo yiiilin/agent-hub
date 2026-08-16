@@ -49,11 +49,11 @@ workflow 会拒绝不属于 `origin/main` 历史的标签：
 
 | 服务 | 默认镜像 |
 | --- | --- |
-| Hub 与管理台 | `ghcr.io/yiiilin/agent-hub:0.1.0` |
-| Runtime 与 Pi standalone | `ghcr.io/yiiilin/agent-hub-runtime:0.1.0` |
-| Model Gateway | `ghcr.io/yiiilin/agent-hub-gateway:0.1.0` |
+| Hub 与管理台 | `ghcr.io/yiiilin/agent-hub:0.3.13` |
+| Runtime 与 Pi standalone | `ghcr.io/yiiilin/agent-hub-runtime:0.3.13` |
+| Model Gateway | `ghcr.io/yiiilin/agent-hub-gateway:0.3.13` |
 
-Release workflow 先对完整 Git 历史执行凭据扫描，再在 GitHub runner 本地构建候选镜像。
+Release workflow 先执行版本一致性与全语言质量门禁，并对完整 Git 历史执行凭据扫描，再在 GitHub runner 本地构建候选镜像。
 候选镜像的 config、每个最终 image layer 和二进制文件的可打印字符串均通过 Gitleaks
 脱敏扫描后，workflow 才登录 GHCR 并推送同一个本地镜像。扫描报告、Buildx cache 和
 build record 均不上传；任何扫描发现都会在登录 registry 前终止该镜像任务。创建 release
@@ -64,7 +64,7 @@ tag 前仍需在本地对待推送历史执行同一份 `.gitleaks.toml`，因�
 已有版本标签：
 
 ```bash
-gh workflow run Release --ref main -f release_tag=v0.1.0
+gh workflow run Release --ref main -f release_tag=v0.3.13
 ```
 
 固定 Pi `0.81.1` 的 compiled binary 会被 Gitleaks `8.28.0` 的通用规则命中 6 个源码

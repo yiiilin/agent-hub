@@ -101,21 +101,26 @@ from the Hub over the network.
 ## Architecture
 
 ```
-┌────────────────────────────┐
-│        Hub (Rust)          │  HTTP API · auth · sessions · scheduling
-│   React management console │  models · usage · automations · integrations
-└──────────┬─────────────────┘
-           │ POST / heartbeat / claim / events (runtime is always the caller)
-┌──────────▼─────────────────┐      ┌───────────────────────┐
-│       Runtime (Rust)       │ ───► │ Model Gateway / models │
-│  Pi standalone per session │      └───────────────────────┘
+┌────────────────────────────┐      ┌───────────────────────┐
+│        Hub (Rust)          │ ───► │ Model Gateway / models │
+│  HTTP API · auth · sessions│      │ protocol translation  │
+│  React console · Responses │      └───────────┬───────────┘
+│  proxy · usage accounting  │                  │ provider API
+└──────────┬─────────────────┘          ┌───────▼───────────┐
+           │ POST / heartbeat /         │ Model providers    │
+           │ claim / events             └───────────────────┘
+┌──────────▼─────────────────┐
+│       Runtime (Rust)       │
+│  Pi standalone per session │
 │  sandboxed workspace       │
 └────────────────────────────┘
 ```
 
 The Hub never calls runtimes directly: runtimes poll for work, stream events, upload session
 bundles, and acknowledge state changes. The Hub is the single source of truth for sessions;
-runtimes are disposable executors.
+runtimes are disposable executors. Runtime model requests go through the Hub Responses proxy;
+the Hub authorizes the Run, decrypts the provider credential, and forwards the request to the
+internal Model Gateway.
 
 ## Building & testing
 

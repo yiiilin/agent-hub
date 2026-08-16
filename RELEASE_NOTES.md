@@ -1,20 +1,19 @@
-# 🚀 Agent Hub v0.3.7
+# 🚀 Agent Hub v0.3.13
 
-📅 发布日期：2026-08-12
-
-## ✨ Features
-
-- **第三方工具大结果归档**：结果超过 32KB 不再本地截断或整体拒绝——32KB ~ `max_tool_result_bytes`（系统参数，默认 4MB）之间全文归档到对象存储，模型上下文只保留 32KB 截断版 + 摘要（原始大小 + 读取指引）；超过硬上限仅截断并明确告知"未归档"。上传带指数退避重试，失败降级不阻断工具调用。
-- **Pi 读取工具 `agent_hub_integration_tool_result_read`**：`size`（元数据）/ `range`（有界切片 + 翻页）/ `file`（全量写入工作区）三种模式读取归档结果。
-- **智能体端点暴露**：每个智能体可声明允许被哪些端点使用（Console / Integration / Automation），默认全部打开——控制台列表、Integration App 绑定、自动化创建分别校验。
-- 会话详情截断结果提供"查看完整结果"链接；会话删除级联清理归档。
-- Browser SDK 大工具结果原样提交（后端归档接管）；`/api/client/attachments` 上传下载。
+📅 发布日期：2026-08-16
 
 ## 🐛 Bug Fixes
 
-- run 正常 completed 也发送终态 status 事件，客户端可判定 run 真正结束。
-- tool result broker 停止后不再 panic（此前导致 runtime 崩溃重启）。
-- 会话活动合并时序下不再丢失"查看完整结果"链接。
+- 大结果读取链路完整修复：Pi 工具白名单暴露 `tool_result_read`，模型可读取截断结果的全文归档。
+- 工具结果读取 broker 生命周期改为由会话进程持有；凭证共享轮换自动生效，`file` 模式写入当前会话工作区。
+- 读取接口联表校验 `hub_session_id`、Runtime 归属与 ownership generation，拒绝同 Runtime 跨会话读取。
+- `tool_call_id` 改为严格 UUID，URL 查询参数结构化构造，避免 `?#` 注入篡改会话参数。
+- Client 受管工具内部名统一为 `agent_hub_client_tool_{实际名}`，与 `tool_result_read` 使用一致命名。
+
+## ✨ Changes
+
+- Browser SDK 统一错误提交协议：工具超时或中断生成错误结果，提交失败缓存结果可安全重放。
+- 绝对执行期限预留提交余量；`executing/unknown` 无结果时以 `tool_result_unknown` 收尾。
 
 ## 👥 Contributors
 

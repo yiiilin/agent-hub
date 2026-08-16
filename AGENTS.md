@@ -38,6 +38,54 @@ E2E_COMPOSE_PROJECT=agent-hub-dev npm run test:e2e
 
 需要真实 PostgreSQL 的 ignored `#[sqlx::test]` 使用具有 `CREATE DATABASE` 权限的 `DATABASE_URL`，并通过 `cargo test -p agent-hub-backend -- --ignored` 运行。执行前应先确认 URL 指向测试数据库，不得指向生产库。
 
+## 发布与 CI 准则
+
+每次发布新版本时，必须在一个版本变更中完成以下内容：
+
+1. `VERSION` 改为新的 `MAJOR.MINOR.PATCH`。
+2. Rust 版本：
+   - `crates/backend/Cargo.toml`
+   - `crates/runtime/Cargo.toml`
+   - `crates/shared/Cargo.toml`
+   - `crates/agent-hub-cli/Cargo.toml`
+   - `Cargo.lock`
+
+   修改 manifest 后运行 `cargo generate-lockfile`，不得用 `cargo update` 顺便升级无关依赖。
+3. 前端版本：
+   - `frontend/package.json`
+   - `frontend/package-lock.json`
+
+   运行 `npm install --package-lock-only --ignore-scripts --prefix frontend` 更新 lockfile；不要提交 `frontend/dist`。
+4. TypeScript SDK 版本：
+   - `sdk/typescript/package.json`
+   - `sdk/typescript/package-lock.json`
+
+   运行 `npm install --package-lock-only --ignore-scripts --prefix sdk/typescript`，随后运行 SDK build。若受版本发布的构建影响，提交重新生成的 `sdk/typescript/dist/`。
+5. 生产镜像默认版本：
+   - `compose.yml` 中 gateway、backend、runtime-init、runtime 四处的 `${AGENT_HUB_IMAGE_TAG:-X.Y.Z}`。
+   - `.env.example` 的 `AGENT_HUB_IMAGE_TAG=X.Y.Z`。
+
+   生产默认值必须固定语义化版本，不得默认 `latest`。
+6. 运维文档：
+   - `docs/operations.md` 中三张默认镜像的版本表格。
+   - `docs/operations.md` 中 `gh workflow run Release ... -f release_tag=vX.Y.Z` 示例。
+7. 用户可见发布记录：
+   - `CHANGELOG.md` 增加新版 `## [X.Y.Z]` 章节。
+   - `RELEASE_NOTES.md` 标题改为 `# 🚀 Agent Hub vX.Y.Z`，更新发布日期和本次发布内容。
+8. 默认启动和安装文档不得保留历史版本作为用户默认路径。
+
+版本文件全部更新后，至少运行：
+
+```bash
+bash scripts/verify-release-version.sh
+cargo fmt --all --check
+```
+
+CI 和 Release workflow 都必须复用 `.github/workflows/quality.yml`。版本变更必须先合入 `main` 并通过质量门禁，再创建 `vX.Y.Z` tag；发布后不得移动或覆盖已有 tag。所有 PR 和 `main` 分支必须经过 CI，不得跳过、删除或放宽 `fmt`、Clippy、workspace tests、PostgreSQL/MinIO ignored tests、SDK、frontend 和 Go gateway 检查。
+
+架构图、README 和 specs 必须与当前协议一致。模型请求的权威链路是 Runtime → Hub Responses proxy → Model Gateway → provider；不得再画出 Runtime 直接访问 Gateway/provider 的旧链路。CI 新增的数据库测试必须使用独立 Postgres/MinIO 服务，不得连接生产数据库或把生产凭据写入 workflow、环境变量或日志。
+
+
 ## 代码风格
 
 - Rust 使用 edition 2021，提交前运行 `cargo fmt` 和严格 Clippy；错误需保留必要上下文，公共 DTO 保持 serde 契约清晰。
