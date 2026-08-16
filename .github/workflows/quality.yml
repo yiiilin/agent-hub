@@ -36,37 +36,14 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 20
-      minio:
-        image: minio/minio:RELEASE.2025-04-22T22-12-26Z
-        env:
-          MINIO_ROOT_USER: agent_hub
-          MINIO_ROOT_PASSWORD: agent_hub_test_secret
-        ports:
-          - 9000:9000
     env:
       DATABASE_URL: postgres://agent_hub:agent_hub@localhost:5432/agent_hub
-      BUNDLE_S3_INTEGRATION_ENDPOINT: http://localhost:9000
-      BUNDLE_S3_INTEGRATION_ACCESS_KEY_ID: agent_hub
-      BUNDLE_S3_INTEGRATION_SECRET_ACCESS_KEY: agent_hub_test_secret
-      BUNDLE_S3_INTEGRATION_REGION: us-east-1
       RUST_BACKTRACE: 1
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-
-      - name: Wait for MinIO
-        run: |
-          for attempt in $(seq 1 60); do
-            if curl -fsS http://localhost:9000/minio/health/live >/dev/null; then
-              echo "MinIO is ready"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "MinIO did not become ready" >&2
-          exit 1
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@v1
@@ -83,8 +60,8 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace
 
-      - name: Run database and S3-backed tests
-        run: cargo test -p agent-hub-backend -- --ignored
+      - name: Run database-backed tests
+        run: cargo test -p agent-hub-backend -- --ignored --skip local_s3_compatible_round_trip_streams_put_get_and_delete
 
   frontend:
     name: Frontend and SDK

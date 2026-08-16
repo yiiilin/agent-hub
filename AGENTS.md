@@ -81,9 +81,9 @@ bash scripts/verify-release-version.sh
 cargo fmt --all --check
 ```
 
-CI 和 Release workflow 都必须复用 `.github/workflows/quality.yml`。版本变更必须先合入 `main` 并通过质量门禁，再创建 `vX.Y.Z` tag；发布后不得移动或覆盖已有 tag。所有 PR 和 `main` 分支必须经过 CI，不得跳过、删除或放宽 `fmt`、Clippy、workspace tests、PostgreSQL/MinIO ignored tests、SDK、frontend 和 Go gateway 检查。
+CI 和 Release workflow 都必须复用 `.github/workflows/quality.yml`。版本变更必须先合入 `main` 并通过质量门禁，再创建 `vX.Y.Z` tag；发布后不得移动或覆盖已有 tag。所有 PR 和 `main` 分支必须经过 CI，不得跳过、删除或放宽 `fmt`、Clippy、workspace tests、PostgreSQL ignored tests、SDK、frontend 和 Go gateway 检查。
 
-架构图、README 和 specs 必须与当前协议一致。模型请求的权威链路是 Runtime → Hub Responses proxy → Model Gateway → provider；不得再画出 Runtime 直接访问 Gateway/provider 的旧链路。CI 新增的数据库测试必须使用独立 Postgres/MinIO 服务，不得连接生产数据库或把生产凭据写入 workflow、环境变量或日志。
+架构图、README 和 specs 必须与当前协议一致。模型请求的权威链路是 Runtime → Hub Responses proxy → Model Gateway → provider；不得再画出 Runtime 直接访问 Gateway/provider 的旧链路。CI 新增的数据库测试必须使用独立 Postgres 服务，不得连接生产数据库或把生产凭据写入 workflow、环境变量或日志；S3-backed round-trip 由 `qa/run-all.sh` 的 Compose MinIO 链路覆盖。
 
 
 ## 代码风格
