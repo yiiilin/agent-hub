@@ -84,15 +84,21 @@ jobs:
 
       - name: Run runtime main tests
         run: |
-          set +e
-          timeout 300 cargo test -p agent-hub-runtime tests:: -- --test-threads=1 --format json > /tmp/runtime-main.log 2>&1
-          status=$?
-          if [ "$status" -ne 0 ]; then
-            tail -n 180 /tmp/runtime-main.log | while IFS= read -r line; do
-              echo "::error::$line"
-            done
+          set -e
+          mapfile -t runtime_tests < <(cargo test -p agent-hub-runtime tests:: -- --list 2>/dev/null | sed -n 's/: test$//p')
+          if [ "${#runtime_tests[@]}" -eq 0 ]; then
+            echo "::error::No runtime main tests were discovered"
+            exit 1
           fi
-          exit "$status"
+          for test_name in "${runtime_tests[@]}"; do
+            timeout 60 cargo test -p agent-hub-runtime "$test_name" -- --exact --test-threads=1 > /tmp/runtime-main-one.log 2>&1 || {
+              echo "::error::runtime main test failed: $test_name"
+              tail -n 100 /tmp/runtime-main-one.log | while IFS= read -r line; do
+                echo "::error::$line"
+              done
+              exit 1
+            }
+          done
 
       - name: Run CLI tests
         run: timeout 300 cargo test -p agent-hub-cli -- --test-threads=1
