@@ -90,18 +90,23 @@ jobs:
             echo "::error::No runtime main tests were discovered"
             exit 1
           fi
+          failed_tests=()
           for test_name in "${runtime_tests[@]}"; do
             if [ "$test_name" = "tests::complete_failure_after_finalize_does_not_fall_back_to_partial_publication" ]; then
               continue
             fi
-            timeout 60 cargo test -p agent-hub-runtime "$test_name" -- --exact --test-threads=1 > /tmp/runtime-main-one.log 2>&1 || {
+            timeout 30 cargo test -p agent-hub-runtime "$test_name" -- --exact --test-threads=1 > /tmp/runtime-main-one.log 2>&1 || {
+              failed_tests+=("$test_name")
               echo "::error::runtime main test failed: $test_name"
-              tail -n 100 /tmp/runtime-main-one.log | while IFS= read -r line; do
+              tail -n 30 /tmp/runtime-main-one.log | while IFS= read -r line; do
                 echo "::error::$line"
               done
-              exit 1
             }
           done
+          if [ "${#failed_tests[@]}" -ne 0 ]; then
+            echo "::error::failed runtime main tests: ${failed_tests[*]}"
+            exit 1
+          fi
 
       - name: Run CLI tests
         run: timeout 300 cargo test -p agent-hub-cli -- --test-threads=1
