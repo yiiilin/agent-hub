@@ -65,7 +65,16 @@ jobs:
         run: timeout 900 cargo test -p agent-hub-backend -- --test-threads=1
 
       - name: Run runtime pi_driver tests
-        run: 'timeout 600 cargo test -p agent-hub-runtime pi_driver:: -- --test-threads=1 --skip reaps_background_processes_after_the_catalog_program_exits'
+        run: |
+          set +e
+          timeout 600 cargo test -p agent-hub-runtime pi_driver:: -- --test-threads=1 --skip reaps_background_processes_after_the_catalog_program_exits > /tmp/pi-driver.log 2>&1
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            tail -n 180 /tmp/pi-driver.log | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+          fi
+          exit "$status"
 
       - name: Run runtime session_bundle tests
         run: 'timeout 300 cargo test -p agent-hub-runtime session_bundle:: -- --test-threads=1'
