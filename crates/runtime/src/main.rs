@@ -13898,6 +13898,7 @@ mod tests {
 
         assert!(!process.native_session_id().is_empty());
         assert!(process.session_file().is_file());
+
         let result = process.execute(&claim, None).unwrap();
         assert_eq!(result.final_status, "completed");
         assert_eq!(
@@ -13966,6 +13967,63 @@ mod tests {
         assert_process_group_reaped_or_clean_up(&pid_file);
     }
 
+    #[tokio::test]
+    async fn tool_result_broker_stays_listening_after_process_start() {
+        // 回归：broker 曾是 start 局部变量（返回即 Drop 关闭 listener）。
+        // 走真实 PersistentPiRpcProcess::start（fake Pi），start 返回后
+        // broker 字段必须为 Some 且端口可连——若 start 不再 move broker
+        // 进 process（字段为 None），expect 直接失败。
+        // 启用归档结果读取 broker（生产由 hub_client_from_stored 设置）。
+        pi_driver::TOOL_RESULT_BROKER_ENABLED.store(true, Ordering::Release);
+        let temp = tempfile::tempdir().unwrap();
+        let pid_file = temp.path().join("pi.pid");
+        let pi_bin = write_fake_pi_wrapper(&temp, &pid_file, &["FAKE_PI_DISABLE_MODEL=1"]);
+        let mut claim = test_claim();
+        claim.run.initial_message = "fixture:retry".into();
+        let run_env = prepare_run_env(temp.path(), &claim, Some("http://127.0.0.1:1/v1"))
+            .await
+            .unwrap();
+        let cancellation = Arc::new(EngineCancellation::default());
+        let process = pi_driver::PersistentPiRpcProcess::start(
+            pi_bin.to_str().unwrap(),
+            &run_env,
+            None,
+            &pi_driver::pi_tool_allowlist(&claim.agent),
+            Duration::from_secs(2),
+            cancellation,
+            None,
+        )
+        .unwrap();
+
+        let broker = process
+            .tool_result_broker
+            .as_ref()
+            .expect("broker must be held by the process after start");
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", broker.port)).unwrap();
+        {
+            use std::io::Write;
+            let request = serde_json::json!({
+                "token": broker.token,
+                "tool_call_id": uuid::Uuid::new_v4(),
+                "mode": "size",
+            });
+            stream.write_all(request.to_string().as_bytes()).unwrap();
+            stream.write_all(b"\n").unwrap();
+        }
+        {
+            use std::io::BufRead;
+            let mut line = String::new();
+            std::io::BufReader::new(&mut stream)
+                .read_line(&mut line)
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert!(
+                value.get("error").is_some() || value.get("size_bytes").is_some(),
+                "broker must respond after start returns: {line}"
+            );
+        }
+        drop(process);
+    }
     #[tokio::test]
     async fn persistent_pi_rpc_process_maps_client_tool_internal_name_to_external_request() {
         let temp = tempfile::tempdir().unwrap();
