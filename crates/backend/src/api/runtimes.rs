@@ -5163,6 +5163,7 @@ pub(crate) async fn runtime_model_proxy(
     if !model_proxy_path_supported(&path) {
         return Err(ApiError::not_found("unsupported model proxy path"));
     }
+    tracing::info!(bytes = body.len(), path = %path, "runtime model proxy request body size");
     let run_id = headers
         .get("x-agent-hub-run-id")
         .and_then(|value| value.to_str().ok())

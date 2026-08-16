@@ -68,6 +68,9 @@ type HmacSha256 = Hmac<Sha256>;
 pub(crate) const REDACTED_SECRET: &str = "********";
 pub(crate) const DEFAULT_MODEL_PROXY_TIMEOUT: Duration = Duration::from_secs(300);
 pub(crate) const MAX_MODEL_PROXY_TIMEOUT: Duration = Duration::from_secs(900);
+/// 模型代理请求体上限：Pi 全历史上下文可能远超 axum 默认 2MB，
+/// 提高到 64MB 以支撑 1M token 级上下文（sub2api 等上游支持）。
+pub(crate) const MODEL_PROXY_BODY_LIMIT: usize = 64 * 1024 * 1024;
 pub(crate) const DATABASE_READINESS_TIMEOUT: Duration = Duration::from_millis(500);
 pub(crate) const DEFAULT_SESSION_BUNDLE_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 pub(crate) const DEFAULT_FRONTEND_DIST_DIR: &str = "frontend/dist";
@@ -771,7 +774,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/runtime/model-proxy/v1/{*path}",
-            post(runtime_model_proxy),
+            post(runtime_model_proxy).layer(DefaultBodyLimit::max(MODEL_PROXY_BODY_LIMIT)),
         )
         .route("/widget", get(widget_page));
 

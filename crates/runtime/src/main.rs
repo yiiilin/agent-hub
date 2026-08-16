@@ -18,7 +18,7 @@ use agent_hub_shared::*;
 use anyhow::Context;
 use axum::{
     body::{Body, Bytes},
-    extract::{Path as AxumPath, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, State},
     http::{header, HeaderMap, HeaderName, StatusCode as AxumStatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -47,6 +47,8 @@ mod session_bundle;
 
 const DEFAULT_ENGINE_TIMEOUT: Duration = Duration::from_secs(3600);
 const DEFAULT_MODEL_PROXY_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// 模型代理请求体上限（与 backend 一致）：支撑 1M token 级上下文。
+const MODEL_PROXY_BODY_LIMIT: usize = 64 * 1024 * 1024;
 const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(900);
 const CHECKPOINT_RETRY_DELAY: Duration = Duration::from_secs(1);
 const DEFAULT_MAX_ONLINE_SESSIONS: usize = 4;
@@ -4027,7 +4029,12 @@ async fn start_model_proxy(
         turn_acknowledged: Notify::new(),
     });
     let app = Router::new()
-        .route("/v1/{*path}", post(local_model_proxy_request))
+        .route(
+            "/v1/{*path}",
+            post(local_model_proxy_request).layer(DefaultBodyLimit::max(
+                MODEL_PROXY_BODY_LIMIT,
+            )),
+        )
         .with_state(Arc::clone(&state));
     let handle = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, app).await {
@@ -4055,6 +4062,11 @@ async fn local_model_proxy_request(
         )
             .into_response();
     }
+    tracing::info!(
+        bytes = body.len(),
+        path = %path,
+        "local model proxy request body size"
+    );
     let binding_id = match headers
         .get("x-agent-hub-model-binding-id")
         .and_then(|value| value.to_str().ok())
