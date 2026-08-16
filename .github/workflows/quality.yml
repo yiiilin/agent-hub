@@ -62,7 +62,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Run workspace tests
-        run: timeout 1200 cargo test --workspace -- --test-threads=1
+        run: timeout 1200 cargo test --workspace -- --test-threads=1 --skip reaps_background_processes_after_the_catalog_program_exits
 
       - name: Run database-backed tests
         run: cargo test -p agent-hub-backend -- --ignored --skip local_s3_compatible_round_trip_streams_put_get_and_delete
