@@ -2035,7 +2035,9 @@ pub(super) struct ToolResultBroker {
 #[derive(serde::Deserialize)]
 struct ToolResultBrokerRequest {
     token: String,
-    tool_call_id: String,
+    /// 严格 UUID：模型可控字符串直接拼 URL 会注入查询参数/锚点，
+    /// serde 解析失败即整体拒绝（不发 Hub 请求）。
+    tool_call_id: uuid::Uuid,
     mode: String,
     #[serde(default)]
     offset: Option<i64>,
@@ -2044,7 +2046,7 @@ struct ToolResultBrokerRequest {
 }
 
 impl ToolResultBroker {
-    fn start(
+    pub(super) fn start(
         workdir: &std::path::Path,
         hub_url: &str,
         runtime_token: Arc<std::sync::RwLock<String>>,
@@ -2146,8 +2148,20 @@ fn handle_tool_result_connection(
     if reader.read_line(&mut line)? == 0 {
         return Ok(());
     }
-    let request: ToolResultBrokerRequest =
-        serde_json::from_str(&line).context("parse tool result broker request")?;
+    let request: ToolResultBrokerRequest = match serde_json::from_str(&line) {
+        Ok(request) => request,
+        Err(error) => {
+            // 解析失败（如非 UUID 的 tool_call_id 注入）必须结构化返回错误，
+            // 不能静默关闭连接——模型需要收到失败原因。
+            write_json_line(
+                &mut stream,
+                &serde_json::json!({
+                    "error": format!("invalid tool result broker request: {error}")
+                }),
+            )?;
+            return Ok(());
+        }
+    };
     if request.token != context.token {
         write_json_line(
             &mut stream,
@@ -2183,21 +2197,24 @@ fn fetch_tool_result(
             return fetch_tool_result_file(&client, hub_url, &runtime_token, context, request)
                 .await;
         }
-        let mut url = format!(
-            "{hub_url}/api/runtime/tool-results/{}?mode={}&session_id={}&generation={}",
-            request.tool_call_id,
-            request.mode,
-            context.hub_session_id,
-            context.ownership_generation
-        );
+        let mut request_builder = client
+            .get(format!(
+                "{hub_url}/api/runtime/tool-results/{}",
+                request.tool_call_id
+            ))
+            .query(&serde_json::json!({
+                "mode": request.mode.clone(),
+                "session_id": context.hub_session_id.to_string(),
+                "generation": context.ownership_generation.to_string(),
+            }))
+            .bearer_auth(runtime_token);
         if request.mode == "range" {
-            url.push_str(&format!(
-                "&offset={}&limit={}",
-                request.offset.unwrap_or(0),
-                request.limit.unwrap_or(64 * 1024)
-            ));
+            request_builder = request_builder.query(&serde_json::json!({
+                "offset": request.offset.unwrap_or(0),
+                "limit": request.limit.unwrap_or(64 * 1024),
+            }));
         }
-        let response = client.get(url).bearer_auth(runtime_token).send().await;
+        let response = request_builder.send().await;
         match response {
             Ok(response) => match response.error_for_status() {
                 Ok(response) => match response.json::<serde_json::Value>().await {
@@ -2225,11 +2242,20 @@ async fn fetch_tool_result_file(
     context: &ToolResultBrokerContext,
     request: &ToolResultBrokerRequest,
 ) -> serde_json::Value {
-    let url = format!(
-        "{hub_url}/api/runtime/tool-results/{}?mode=full&session_id={}&generation={}",
-        request.tool_call_id, context.hub_session_id, context.ownership_generation
-    );
-    let response = match client.get(url).bearer_auth(runtime_token).send().await {
+    let response = match client
+        .get(format!(
+            "{hub_url}/api/runtime/tool-results/{}",
+            request.tool_call_id
+        ))
+        .query(&serde_json::json!({
+            "mode": "full",
+            "session_id": context.hub_session_id.to_string(),
+            "generation": context.ownership_generation.to_string(),
+        }))
+        .bearer_auth(runtime_token)
+        .send()
+        .await
+    {
         Ok(response) => match response.error_for_status() {
             Ok(response) => response,
             Err(error) => {

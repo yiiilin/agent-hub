@@ -14024,6 +14024,50 @@ mod tests {
         }
         drop(process);
     }
+
+    #[tokio::test]
+    async fn tool_result_broker_rejects_injected_tool_call_ids() {
+        // 回归：tool_call_id 是模型可控字符串，曾直接拼进 URL——攻击者可
+        // 用 "<uuid>?mode=size&session_id=<另一会话>&generation=1#" 注入
+        // 查询参数/锚点（# 吞掉可信参数）跨会话读取。现在 serde 严格解析
+        // UUID，非 UUID 整体拒绝且不发 Hub 请求。
+        let temp = tempfile::tempdir().unwrap();
+        let broker = pi_driver::ToolResultBroker::start(
+            temp.path(),
+            "http://hub.invalid",
+            Arc::new(std::sync::RwLock::new("rt-token".into())),
+            uuid::Uuid::new_v4(),
+            1,
+        )
+        .unwrap();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", broker.port)).unwrap();
+        {
+            use std::io::Write;
+            let request = serde_json::json!({
+                "token": broker.token,
+                "tool_call_id":
+                    "11111111-1111-4111-8111-111111111111?mode=size&session_id=22222222-2222-4222-8222-222222222222&generation=1#",
+                "mode": "size",
+            });
+            stream.write_all(request.to_string().as_bytes()).unwrap();
+            stream.write_all(b"\n").unwrap();
+        }
+        use std::io::{BufRead, Read};
+        let mut line = String::new();
+        let read = std::io::BufReader::new(&mut stream)
+            .read_line(&mut line)
+            .unwrap();
+        assert!(read > 0, "broker must respond with a structured error");
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let error = value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(
+            error.contains("invalid tool result broker request"),
+            "injected tool_call_id must be rejected with a structured error (got: {error})"
+        );
+    }
     #[tokio::test]
     async fn persistent_pi_rpc_process_maps_client_tool_internal_name_to_external_request() {
         let temp = tempfile::tempdir().unwrap();
