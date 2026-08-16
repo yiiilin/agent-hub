@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 本文件记录 Agent Hub 各正式版本面向使用者的变化。
 
+## [0.3.13] - 2026-08-16
+
+### Fixed
+
+- 大结果读取链路完整修复（"AI 不会查工程"）：Pi 工具白名单暴露 `tool_result_read`（原归档读取工具改名），模型可读截断结果的全文归档。
+- 工具结果读取 broker 生命周期：broker 曾是进程启动局部变量（返回即关闭 listener），现由会话进程持有；凭证共享（轮换自动生效）、file 模式写入本会话工作区。
+- 会话边界：读取接口联表校验 `hub_session_id` + runtime 归属 + 代次——同 runtime 跨会话读取拒绝。
+- 注入防护：`tool_call_id` 严格 UUID（serde 拒绝非 UUID），URL 查询参数结构化构造——`?#` 注入无法篡改会话参数。
+- 工具命名统一：client 受管工具内部名 `agent_hub_client_tool_{实际名}`（替代编号）；`tool_result_read`。
+
+### Changed
+
+- SDK 0.3.13（`@agent-hub/client`）：统一错误提交协议——工具超时/中断生成错误结果提交（不再静默 blocked）、提交失败缓存结果可重放（恢复不重跑 handler）、绝对期限减提交余量、`executing/unknown` 无结果以 `tool_result_unknown` 收尾。
+
 ## [0.3.12] - 2026-08-15
 
 ### Internal

@@ -1092,6 +1092,17 @@ export class AgentHubClient {
                 },
             };
         }
+        // 调用前 aborted 预检：信号已中断时直接生成中断结果，不调用 handler。
+        if (signal.aborted) {
+            return {
+                status: "error",
+                error: {
+                    code: "tool_execution_interrupted",
+                    message: "Client Tool execution was interrupted",
+                    retryable: false,
+                },
+            };
+        }
         const controller = new AbortController();
         let deadlineTimer;
         const deadline = new Promise((_resolve, reject) => {
@@ -1099,6 +1110,18 @@ export class AgentHubClient {
                 controller.abort(new DOMException("Client Tool deadline reached", "TimeoutError"));
                 reject(new DOMException("Client Tool deadline reached", "TimeoutError"));
             }, Math.min(remaining, 5 * 60_000));
+        });
+        // 独立 abort race：signal 中断立即拒绝，不依赖 handler 是否响应 abort
+        // （忽略 signal 的 handler 不应悬到 deadline）。
+        let interruptListener;
+        const interrupted = new Promise((_resolve, reject) => {
+            const interrupt = () => reject(new DOMException("Client Tool execution interrupted", "AbortError"));
+            interruptListener = interrupt;
+            if (signal.aborted) {
+                interrupt();
+                return;
+            }
+            signal.addEventListener("abort", interrupt, { once: true });
         });
         try {
             const output = await Promise.race([
@@ -1110,6 +1133,7 @@ export class AgentHubClient {
                     recovering,
                 }),
                 deadline,
+                interrupted,
             ]);
             controller.abort();
             return checkedToolResult(output);
@@ -1141,6 +1165,10 @@ export class AgentHubClient {
         finally {
             if (deadlineTimer !== undefined)
                 globalThis.clearTimeout(deadlineTimer);
+            // listener 清理：race 已结束但信号可能稍后才 abort，移除未触发的监听。
+            if (interruptListener !== undefined && !signal.aborted) {
+                signal.removeEventListener("abort", interruptListener);
+            }
         }
     }
     async #authorizeFresh() {
@@ -1416,14 +1444,38 @@ export class AgentHubClient {
         if (existing?.state === "acknowledged")
             return { blocked: false };
         // 无 result 的 executing/unknown（副作用窗口未知）：不重跑，提交
-        // tool_result_unknown 收尾，模型明确收到失败而非静默。
+        // tool_result_unknown 收尾，模型明确收到失败而非静默。先落 journal
+        // （completed+UNKNOWN_RESULT）；transient 提交失败阻塞同批（前一个结果
+        // 未达 Hub 不继续产生副作用），仅 Hub 明确结束才清理放行。
         if (existing && !existing.result && ["executing", "unknown"].includes(existing.state)) {
+            const unknownCompleted = {
+                ...existing,
+                result: UNKNOWN_RESULT,
+                state: "completed",
+                updatedAt: Date.now(),
+            };
+            await this.#journal.put(unknownCompleted);
             try {
                 await this.#submitToolResult(event.toolCallId, UNKNOWN_RESULT);
-                await this.#acknowledgeEntry({ ...existing, result: UNKNOWN_RESULT });
+                await this.#acknowledgeEntry(unknownCompleted);
             }
-            catch {
-                // transient：保留 journal，恢复路径会重试收尾。
+            catch (error) {
+                if (error instanceof AgentHubError && [404, 409, 410].includes(error.status)) {
+                    await this.#journal.delete(this.clientInstanceId, event.toolCallId).catch(() => undefined);
+                    return { blocked: false };
+                }
+                return {
+                    blocked: true,
+                    event: {
+                        type: "error",
+                        sequence: event.sequence,
+                        code: error instanceof AgentHubError ? error.code : "tool_result_submission_failed",
+                        message: error instanceof Error ? error.message : "Client Tool result submission failed",
+                        retryable: true,
+                        raw: error,
+                        toolCallId: event.toolCallId,
+                    },
+                };
             }
             return { blocked: false };
         }
