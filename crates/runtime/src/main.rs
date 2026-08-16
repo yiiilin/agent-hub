@@ -14052,7 +14052,7 @@ mod tests {
             stream.write_all(request.to_string().as_bytes()).unwrap();
             stream.write_all(b"\n").unwrap();
         }
-        use std::io::{BufRead, Read};
+        use std::io::BufRead;
         let mut line = String::new();
         let read = std::io::BufReader::new(&mut stream)
             .read_line(&mut line)
