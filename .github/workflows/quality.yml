@@ -22,7 +22,7 @@ jobs:
   rust:
     name: Rust
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     services:
       postgres:
         image: postgres:16
@@ -64,10 +64,17 @@ jobs:
       - name: Run backend tests
         run: timeout 900 cargo test -p agent-hub-backend -- --test-threads=1
 
-      - name: Run runtime tests
-        # The background-child reaping assertion is timing-sensitive on hosted runners
-        # and can leave a child attached to the test pipe. Linux QA still exercises it.
-        run: timeout 900 cargo test -p agent-hub-runtime -- --test-threads=1 --skip reaps_background_processes_after_the_catalog_program_exits
+      - name: Run runtime pi_driver tests
+        run: 'timeout 600 cargo test -p agent-hub-runtime pi_driver:: -- --test-threads=1 --skip reaps_background_processes_after_the_catalog_program_exits'
+
+      - name: Run runtime session_bundle tests
+        run: 'timeout 300 cargo test -p agent-hub-runtime session_bundle:: -- --test-threads=1'
+
+      - name: Run runtime websocket tests
+        run: 'timeout 300 cargo test -p agent-hub-runtime runtime_ws:: -- --test-threads=1'
+
+      - name: Run runtime main tests
+        run: 'timeout 600 cargo test -p agent-hub-runtime tests:: -- --test-threads=1'
 
       - name: Run CLI tests
         run: timeout 300 cargo test -p agent-hub-cli -- --test-threads=1
