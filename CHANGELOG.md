@@ -6,7 +6,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 本文件记录 Agent Hub 各正式版本面向使用者的变化。
 
-## [0.4.0] - 2026-08-17
+## [0.4.1] - 2026-08-17
 
 ### Changed
 

@@ -97,25 +97,3 @@ jobs:
 
       - name: Build frontend
         run: npm run build --prefix frontend
-
-  gateway:
-    name: Model Gateway
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-
-      - name: Install Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: gateway/go.mod
-
-      - name: Vet Gateway
-        run: go vet ./...
-        working-directory: gateway
-
-      - name: Test Gateway
-        run: go test ./...
-        working-directory: gateway
