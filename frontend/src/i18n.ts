@@ -4,7 +4,7 @@ export type Language = 'en' | 'zh-CN';
 
 const en = {
   widgetHistoryEnabled: 'Enable Widget history', widgetHistory: 'History', widgetCloseHistory: 'Close history', widgetNoHistory: 'No conversations yet.', widgetHistoryLoadFailed: 'Unable to load Widget history. Retry.',
-  modelRequestParametersGroup: 'Model request parameters', modelRequestParametersResponses: 'Responses request parameters', modelRequestParameterSamplingExclusive: 'Anthropic accepts either temperature or top_p.',
+  modelRequestParametersGroup: 'Model request parameters', modelRequestParametersResponses: 'Responses request parameters', modelRequestParameterSamplingExclusive: 'Anthropic accepts either temperature or top_p.', modelRequestParameterSamplingRetired: 'Sampling overrides were retired with the model gateway; the provider default is used.',
   providerRequestTimeoutMs: 'Provider request timeout (ms)', turnTimeoutStopped: 'This turn exceeded {minutes} minutes and was stopped.',
   language: 'Language', english: 'English', chinese: '简体中文', loading: 'Loading...',
   agents: 'Agents', sessions: 'Sessions', models: 'Models', integrationApps: 'Integration Apps', skills: 'Skills', apiKeys: 'API Keys', usageGuide: 'Usage Guide', apiDocs: 'API Docs', automations: 'Automations', runtimes: 'Runtimes',
@@ -60,7 +60,7 @@ type Dictionary = Record<TranslationKey, string>;
 
 const zh: Dictionary = {
   widgetHistoryEnabled: '启用组件历史会话', widgetHistory: '历史会话', widgetCloseHistory: '关闭历史会话', widgetNoHistory: '暂无历史会话。', widgetHistoryLoadFailed: '无法加载组件历史会话，请重试。',
-  modelRequestParametersGroup: '模型请求参数', modelRequestParametersResponses: 'Responses 请求参数', modelRequestParameterSamplingExclusive: 'Anthropic 只能设置 temperature 或 top_p 其中一个。',
+  modelRequestParametersGroup: '模型请求参数', modelRequestParametersResponses: 'Responses 请求参数', modelRequestParameterSamplingExclusive: 'Anthropic 只能设置 temperature 或 top_p 其中一个。', modelRequestParameterSamplingRetired: '采样覆盖已随模型网关移除，使用上游模型默认值。',
   providerRequestTimeoutMs: '单次模型请求超时（毫秒）', turnTimeoutStopped: '本轮运行超过 {minutes} 分钟，已停止。',
   language: '语言', english: 'English', chinese: '简体中文', loading: '加载中...',
   agents: '智能体', sessions: '会话', models: '模型', integrationApps: '集成应用', skills: '技能', apiKeys: 'API 密钥', usageGuide: '使用文档', apiDocs: 'API 文档', automations: '自动化', runtimes: '运行节点',

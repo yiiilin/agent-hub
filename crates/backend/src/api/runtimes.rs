@@ -5163,6 +5163,9 @@ pub(crate) async fn runtime_model_proxy(
     if !model_proxy_path_supported(&path) {
         return Err(ApiError::not_found("unsupported model proxy path"));
     }
+    // 路径必须与 Run Binding 的协议一致：Hub 只做认证改写与透传，不做协议转换。
+    let path_protocol = model_proxy_protocol_from_path(&path)
+        .ok_or_else(|| ApiError::not_found("unsupported model proxy path"))?;
     tracing::info!(bytes = body.len(), path = %path, "runtime model proxy request body size");
     let run_id = headers
         .get("x-agent-hub-run-id")
@@ -5189,6 +5192,11 @@ pub(crate) async fn runtime_model_proxy(
             "request model does not match the selected Model Connection",
         ));
     }
+    if path_protocol != resolved.accounting.api_type {
+        return Err(ApiError::bad_request(
+            "model proxy path does not match the Run Binding protocol",
+        ));
+    }
     let vision_request = headers
         .get(VISION_PROXY_HEADER)
         .and_then(|value| value.to_str().ok())
@@ -5204,13 +5212,11 @@ pub(crate) async fn runtime_model_proxy(
             );
         }
     }
-    let request_settings = resolved.accounting.request_settings.clone();
     proxy_model_request_to_upstream_with_options(
         &state,
         ModelProxyForwardRequest {
             upstream_url: resolved.upstream_url,
             upstream_protocol: resolved.accounting.api_type,
-            request_settings,
             path,
             query: uri.query().map(str::to_owned),
             headers,
@@ -5354,13 +5360,21 @@ pub(crate) async fn resolve_model_proxy_request(
 }
 
 pub(crate) fn model_proxy_path_supported(path: &str) -> bool {
-    path == "responses"
+    matches!(path, "responses" | "chat/completions" | "messages")
+}
+
+pub(crate) fn model_proxy_protocol_from_path(path: &str) -> Option<ModelUpstreamProtocol> {
+    match path {
+        "responses" => Some(ModelUpstreamProtocol::OpenaiResponses),
+        "chat/completions" => Some(ModelUpstreamProtocol::OpenaiChatCompletions),
+        "messages" => Some(ModelUpstreamProtocol::AnthropicMessages),
+        _ => None,
+    }
 }
 
 pub(crate) struct ModelProxyForwardRequest {
     upstream_url: String,
     upstream_protocol: ModelUpstreamProtocol,
-    request_settings: ModelRequestSettings,
     path: String,
     query: Option<String>,
     headers: HeaderMap,
@@ -5369,60 +5383,94 @@ pub(crate) struct ModelProxyForwardRequest {
     accounting: Option<ModelProxyAccountingContext>,
 }
 
-#[derive(Serialize)]
-struct ModelGatewayRequestEnvelope<'a> {
-    request_id: String,
-    protocol: ModelUpstreamProtocol,
-    request_settings: &'a ModelRequestSettings,
-    endpoint: &'a str,
-    api_key: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    query: Option<&'a str>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    headers: BTreeMap<String, Vec<String>>,
-    body_base64: String,
+#[derive(Debug)]
+pub(crate) enum ModelUpstreamSendError {
+    /// 模型连接凭据无法表示为 HTTP 头（含控制字符等），拒绝发送而非降级为空值。
+    InvalidAuthHeader,
+    Request(reqwest::Error),
 }
 
-pub(crate) async fn send_model_gateway_request(
+impl std::fmt::Display for ModelUpstreamSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidAuthHeader => {
+                write!(f, "model connection credential cannot be represented as an HTTP header")
+            }
+            Self::Request(error) => write!(f, "model upstream request failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ModelUpstreamSendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidAuthHeader => None,
+            Self::Request(error) => Some(error),
+        }
+    }
+}
+
+impl From<reqwest::Error> for ModelUpstreamSendError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Request(error)
+    }
+}
+
+pub(crate) async fn send_model_upstream_request(
     state: &AppState,
-    request: ModelGatewayForwardRequest<'_>,
-) -> Result<reqwest::Response, reqwest::Error> {
-    let ModelGatewayForwardRequest {
-        request_id,
+    request: ModelUpstreamForwardRequest<'_>,
+) -> Result<reqwest::Response, ModelUpstreamSendError> {
+    let ModelUpstreamForwardRequest {
         upstream_protocol,
-        request_settings,
         upstream_url,
+        path,
         query,
         headers,
         body,
         api_key,
     } = request;
-    let mut serialized_headers = BTreeMap::<String, Vec<String>>::new();
-    for (name, value) in headers {
-        if let Ok(value) = value.to_str() {
-            serialized_headers
-                .entry(name.as_str().to_owned())
-                .or_default()
-                .push(value.to_owned());
-        }
+    // 只做认证改写与安全头过滤，body 原样透传，不做任何协议转换。
+    let mut upstream_headers = filtered_model_request_headers(headers);
+    if !upstream_headers.contains_key(header::CONTENT_TYPE) {
+        upstream_headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
     }
-    let envelope = ModelGatewayRequestEnvelope {
-        request_id: request_id.to_string(),
-        protocol: upstream_protocol,
-        request_settings,
-        endpoint: upstream_url,
-        api_key,
-        query: query.filter(|query| !query.is_empty()),
-        headers: serialized_headers,
-        body_base64: base64::engine::general_purpose::STANDARD.encode(body),
-    };
+    if upstream_protocol.is_anthropic() {
+        let mut value = HeaderValue::from_str(api_key)
+            .map_err(|_| ModelUpstreamSendError::InvalidAuthHeader)?;
+        value.set_sensitive(true);
+        upstream_headers.insert(header::HeaderName::from_static("x-api-key"), value);
+        if !upstream_headers.contains_key("anthropic-version") {
+            upstream_headers.insert(
+                header::HeaderName::from_static("anthropic-version"),
+                HeaderValue::from_static("2023-06-01"),
+            );
+        }
+    } else {
+        let mut value = HeaderValue::from_str(&format!("Bearer {api_key}"))
+            .map_err(|_| ModelUpstreamSendError::InvalidAuthHeader)?;
+        value.set_sensitive(true);
+        upstream_headers.insert(header::AUTHORIZATION, value);
+    }
+    let mut upstream_url = format!(
+        "{}/v1/{}",
+        upstream_url.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
+    if let Some(query) = query.filter(|query| !query.is_empty()) {
+        upstream_url.push('?');
+        upstream_url.push_str(query);
+    }
     state
         .model_proxy_http
-        .post(format!("{}/internal/v1/responses", state.model_gateway_url))
-        .bearer_auth(state.model_gateway_auth_token.as_str())
-        .json(&envelope)
+        .post(upstream_url)
+        .headers(upstream_headers)
+        .body(body.to_vec())
         .send()
         .await
+        .map_err(ModelUpstreamSendError::from)
 }
 
 #[cfg(test)]
@@ -5437,7 +5485,6 @@ pub(crate) async fn proxy_model_request_to_upstream(
         ModelProxyForwardRequest {
             upstream_url: upstream_url.to_owned(),
             upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
-            request_settings: ModelRequestSettings::default(),
             path: path.to_owned(),
             query: None,
             headers: HeaderMap::new(),
@@ -5456,7 +5503,6 @@ pub(crate) async fn proxy_model_request_to_upstream_with_options(
     let ModelProxyForwardRequest {
         upstream_url,
         upstream_protocol,
-        request_settings,
         path,
         query,
         headers,
@@ -5467,26 +5513,14 @@ pub(crate) async fn proxy_model_request_to_upstream_with_options(
     if !model_proxy_path_supported(&path) {
         return Err(ApiError::not_found("unsupported model proxy path"));
     }
-    let mut upstream_headers = filtered_model_request_headers(&headers);
-    if !upstream_headers.contains_key(header::CONTENT_TYPE) {
-        upstream_headers.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
-    }
-    let request_id = accounting
-        .as_ref()
-        .map(|accounting| accounting.request_id)
-        .unwrap_or_else(Uuid::new_v4);
-    let mut upstream = match send_model_gateway_request(
+    let mut upstream = match send_model_upstream_request(
         state,
-        ModelGatewayForwardRequest {
-            request_id,
+        ModelUpstreamForwardRequest {
             upstream_protocol,
-            request_settings: &request_settings,
             upstream_url: &upstream_url,
+            path: &path,
             query: query.as_deref(),
-            headers: &upstream_headers,
+            headers: &headers,
             body: &body,
             api_key: &api_key,
         },
@@ -5494,7 +5528,26 @@ pub(crate) async fn proxy_model_request_to_upstream_with_options(
     .await
     {
         Ok(upstream) => upstream,
-        Err(error) => {
+        Err(ModelUpstreamSendError::InvalidAuthHeader) => {
+            if let Some(accounting) = accounting.as_ref() {
+                let observation = ModelProxyObservation {
+                    usage: None,
+                    error: Some(ModelProxyErrorObservation {
+                        response_status: "transport_error".into(),
+                        upstream_http_status: None,
+                        error_kind: "transport".into(),
+                        error_code: None,
+                        message: "model connection credential cannot be represented as an HTTP header"
+                            .into(),
+                    }),
+                };
+                persist_model_proxy_observation(&state.pool, accounting, observation).await;
+            }
+            return Err(ApiError::internal(
+                "model connection credential cannot be represented as an HTTP header",
+            ));
+        }
+        Err(ModelUpstreamSendError::Request(error)) => {
             if let Some(accounting) = accounting.as_ref() {
                 let observation = ModelProxyObservation {
                     usage: None,
@@ -5531,7 +5584,10 @@ pub(crate) async fn proxy_model_request_to_upstream_with_options(
         .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/event-stream"));
     let pool = state.pool.clone();
     let body = Body::from_stream(stream! {
-        let mut observer = Some(ModelResponseObserver::new(is_sse));
+        let mut observer = Some(ModelResponseObserver::new(
+            ModelProxyObserverProtocol::from(upstream_protocol),
+            is_sse,
+        ));
         loop {
             match upstream.chunk().await {
                 Ok(Some(chunk)) => {
@@ -5678,7 +5734,25 @@ pub(crate) fn is_hop_by_hop_header(
     ) || connection_header_names.contains(name.as_str())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelProxyObserverProtocol {
+    Responses,
+    ChatCompletions,
+    AnthropicMessages,
+}
+
+impl From<ModelUpstreamProtocol> for ModelProxyObserverProtocol {
+    fn from(protocol: ModelUpstreamProtocol) -> Self {
+        match protocol {
+            ModelUpstreamProtocol::OpenaiResponses => Self::Responses,
+            ModelUpstreamProtocol::OpenaiChatCompletions => Self::ChatCompletions,
+            ModelUpstreamProtocol::AnthropicMessages => Self::AnthropicMessages,
+        }
+    }
+}
+
 struct ModelResponseObserver {
+    protocol: ModelProxyObserverProtocol,
     is_sse: bool,
     json_buffer: Vec<u8>,
     sse_line: Vec<u8>,
@@ -5687,6 +5761,19 @@ struct ModelResponseObserver {
     current_event_overflowed: bool,
     overflowed: bool,
     terminal: Option<ModelProxyTerminal>,
+    // Chat 流式：finish_reason 可能先于 usage-only chunk 到达，需累计到 [DONE] 再落账。
+    chat_finish_reason: Option<String>,
+    chat_usage: Option<ObservedModelUsage>,
+    // Anthropic 流式：input usage 在 message_start，output/cache/reasoning 在
+    // message_delta（API 报累计值，覆盖而非累加），message_stop 本身无 usage。
+    // 落账口径：总 input = input_tokens + cache_creation + cache_read；
+    // cached_tokens 只记 cache_read（命中），creation 计入 input 不计命中。
+    anthropic_input_tokens: i64,
+    anthropic_output_tokens: i64,
+    anthropic_cache_creation_tokens: i64,
+    anthropic_cache_read_tokens: i64,
+    anthropic_reasoning_tokens: i64,
+    anthropic_stop_reason: Option<String>,
 }
 
 pub(crate) struct ModelProxyTerminal {
@@ -5710,8 +5797,9 @@ struct ModelProxyErrorObservation {
 }
 
 impl ModelResponseObserver {
-    fn new(is_sse: bool) -> Self {
+    fn new(protocol: ModelProxyObserverProtocol, is_sse: bool) -> Self {
         Self {
+            protocol,
             is_sse,
             json_buffer: Vec::new(),
             sse_line: Vec::new(),
@@ -5720,6 +5808,14 @@ impl ModelResponseObserver {
             current_event_overflowed: false,
             overflowed: false,
             terminal: None,
+            chat_finish_reason: None,
+            chat_usage: None,
+            anthropic_input_tokens: 0,
+            anthropic_output_tokens: 0,
+            anthropic_cache_creation_tokens: 0,
+            anthropic_cache_read_tokens: 0,
+            anthropic_reasoning_tokens: 0,
+            anthropic_stop_reason: None,
         }
     }
 
@@ -5790,14 +5886,164 @@ impl ModelResponseObserver {
             && !self.sse_event_data.is_empty()
             && self.terminal.is_none()
         {
-            if let Ok(value) = serde_json::from_slice::<Value>(&self.sse_event_data) {
-                self.terminal =
-                    model_proxy_terminal_from_value(&value, self.sse_event_type.as_deref(), None);
+            match self.protocol {
+                ModelProxyObserverProtocol::Responses => {
+                    if let Ok(value) = serde_json::from_slice::<Value>(&self.sse_event_data) {
+                        self.terminal = model_proxy_terminal_from_value(
+                            &value,
+                            self.sse_event_type.as_deref(),
+                            None,
+                        );
+                    }
+                }
+                ModelProxyObserverProtocol::ChatCompletions => {
+                    if self.sse_event_data.as_slice() == b"[DONE]" {
+                        self.finish_chat_stream();
+                    } else if let Ok(value) = serde_json::from_slice::<Value>(&self.sse_event_data) {
+                        self.push_chat_sse_event(&value);
+                    }
+                }
+                ModelProxyObserverProtocol::AnthropicMessages => {
+                    if let Ok(value) = serde_json::from_slice::<Value>(&self.sse_event_data) {
+                        let event_type = self.sse_event_type.clone();
+                        self.push_anthropic_sse_event(event_type.as_deref(), &value);
+                    }
+                }
             }
         }
         self.sse_event_type = None;
         self.sse_event_data.clear();
         self.current_event_overflowed = false;
+    }
+
+    fn push_chat_sse_event(&mut self, value: &Value) {
+        if value.get("error").filter(|error| !error.is_null()).is_some() {
+            if let Some(terminal) = chat_terminal_from_value(value, None) {
+                self.terminal = Some(terminal);
+            }
+            return;
+        }
+        if value.get("usage").filter(|usage| !usage.is_null()).is_some() {
+            if let Some(usage) = extract_chat_usage(value) {
+                self.chat_usage = Some(usage);
+            }
+        }
+        if let Some(reason) = value
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+        {
+            self.chat_finish_reason = Some(reason.to_owned());
+        }
+    }
+
+    fn finish_chat_stream(&mut self) {
+        if self.terminal.is_some() {
+            return;
+        }
+        if let Some(reason) = self.chat_finish_reason.take() {
+            let status = chat_finish_reason_status(&reason);
+            self.terminal = Some(ModelProxyTerminal {
+                response_status: status.into(),
+                usage: self.chat_usage.take(),
+                error_code: None,
+                error_message: None,
+            });
+        }
+    }
+
+    fn push_anthropic_sse_event(&mut self, event_type: Option<&str>, value: &Value) {
+        match event_type {
+            Some("message_start") => {
+                if let Some(input) = value
+                    .pointer("/message/usage/input_tokens")
+                    .and_then(Value::as_i64)
+                {
+                    self.anthropic_input_tokens = input;
+                }
+                if let Some(creation) = value
+                    .pointer("/message/usage/cache_creation_input_tokens")
+                    .and_then(Value::as_i64)
+                {
+                    self.anthropic_cache_creation_tokens = creation;
+                }
+                if let Some(read) = value
+                    .pointer("/message/usage/cache_read_input_tokens")
+                    .and_then(Value::as_i64)
+                {
+                    self.anthropic_cache_read_tokens = read;
+                }
+            }
+            Some("message_delta") => {
+                if let Some(stop) = value
+                    .pointer("/delta/stop_reason")
+                    .and_then(Value::as_str)
+                {
+                    self.anthropic_stop_reason = Some(stop.to_owned());
+                }
+                if let Some(output) = value.pointer("/usage/output_tokens").and_then(Value::as_i64)
+                {
+                    self.anthropic_output_tokens = output;
+                }
+                if let Some(creation) = value
+                    .pointer("/usage/cache_creation_input_tokens")
+                    .and_then(Value::as_i64)
+                {
+                    self.anthropic_cache_creation_tokens = creation;
+                }
+                if let Some(read) = value
+                    .pointer("/usage/cache_read_input_tokens")
+                    .and_then(Value::as_i64)
+                {
+                    self.anthropic_cache_read_tokens = read;
+                }
+                if let Some(reasoning) = value
+                    .pointer("/usage/output_tokens_details/thinking_tokens")
+                    .and_then(Value::as_i64)
+                {
+                    self.anthropic_reasoning_tokens = reasoning;
+                }
+            }
+            Some("message_stop") => {
+                let status = self
+                    .anthropic_stop_reason
+                    .as_deref()
+                    .map(anthropic_stop_reason_status)
+                    .unwrap_or("completed");
+                let raw_input = self.anthropic_input_tokens;
+                let creation = self.anthropic_cache_creation_tokens;
+                let read = self.anthropic_cache_read_tokens;
+                let output_tokens = self.anthropic_output_tokens;
+                // 总 input = input_tokens + cache_creation + cache_read；cached 只记命中。
+                let input_tokens = raw_input + creation + read;
+                let usage = (input_tokens > 0 || output_tokens > 0).then(|| ObservedModelUsage {
+                    input_tokens,
+                    output_tokens,
+                    total_tokens: input_tokens + output_tokens,
+                    cached_tokens: read,
+                    reasoning_tokens: self.anthropic_reasoning_tokens,
+                });
+                self.terminal = Some(ModelProxyTerminal {
+                    response_status: status.into(),
+                    usage,
+                    error_code: None,
+                    error_message: None,
+                });
+            }
+            Some("error") => {
+                let error = value.get("error").filter(|error| !error.is_null()).unwrap_or(value);
+                self.terminal = Some(ModelProxyTerminal {
+                    response_status: "failed".into(),
+                    usage: None,
+                    error_code: error.get("type").and_then(Value::as_str).map(str::to_owned),
+                    error_message: error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .or_else(|| error.as_str().map(str::to_owned)),
+                });
+            }
+            _ => {}
+        }
     }
 
     fn finish(
@@ -5824,8 +6070,12 @@ impl ModelResponseObserver {
                 } else {
                     "completed"
                 };
-                self.terminal =
-                    model_proxy_terminal_from_value(&value, None, Some(fallback_status));
+                self.terminal = model_proxy_terminal_from_value_for(
+                    &value,
+                    None,
+                    Some(fallback_status),
+                    self.protocol,
+                );
             }
         }
 
@@ -5896,7 +6146,7 @@ impl ModelResponseObserver {
                 message: if self.overflowed {
                     "model response exceeded the accounting observer limit".into()
                 } else {
-                    "model response ended without a terminal Responses event".into()
+                    "model response ended without a terminal event".into()
                 },
             })
         } else {
@@ -5913,6 +6163,36 @@ impl ModelResponseObserver {
 }
 
 pub(crate) fn model_proxy_terminal_from_value(
+    value: &Value,
+    event_type: Option<&str>,
+    fallback_status: Option<&str>,
+) -> Option<ModelProxyTerminal> {
+    model_proxy_terminal_from_value_for(
+        value,
+        event_type,
+        fallback_status,
+        ModelProxyObserverProtocol::Responses,
+    )
+}
+
+fn model_proxy_terminal_from_value_for(
+    value: &Value,
+    event_type: Option<&str>,
+    fallback_status: Option<&str>,
+    protocol: ModelProxyObserverProtocol,
+) -> Option<ModelProxyTerminal> {
+    match protocol {
+        ModelProxyObserverProtocol::Responses => {
+            model_proxy_terminal_from_value_responses(value, event_type, fallback_status)
+        }
+        ModelProxyObserverProtocol::ChatCompletions => chat_terminal_from_value(value, fallback_status),
+        ModelProxyObserverProtocol::AnthropicMessages => {
+            anthropic_terminal_from_value(value, fallback_status)
+        }
+    }
+}
+
+fn model_proxy_terminal_from_value_responses(
     value: &Value,
     event_type: Option<&str>,
     fallback_status: Option<&str>,
@@ -5972,6 +6252,64 @@ pub(crate) fn model_proxy_terminal_from_value(
         usage: extract_model_usage(response).or_else(|| extract_model_usage(value)),
         error_code,
         error_message,
+    })
+}
+
+fn chat_terminal_from_value(
+    value: &Value,
+    fallback_status: Option<&str>,
+) -> Option<ModelProxyTerminal> {
+    if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
+        return Some(ModelProxyTerminal {
+            response_status: "failed".into(),
+            usage: None,
+            error_code: error.get("code").and_then(Value::as_str).map(str::to_owned),
+            error_message: error
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| error.as_str().map(str::to_owned)),
+        });
+    }
+    let status = value
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+        .map(chat_finish_reason_status)
+        .or_else(|| fallback_status.and_then(normalized_model_response_status))?;
+    Some(ModelProxyTerminal {
+        response_status: status.into(),
+        usage: extract_chat_usage(value),
+        error_code: None,
+        error_message: None,
+    })
+}
+
+fn anthropic_terminal_from_value(
+    value: &Value,
+    fallback_status: Option<&str>,
+) -> Option<ModelProxyTerminal> {
+    if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
+        return Some(ModelProxyTerminal {
+            response_status: "failed".into(),
+            usage: None,
+            error_code: error.get("type").and_then(Value::as_str).map(str::to_owned),
+            error_message: error
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| error.as_str().map(str::to_owned)),
+        });
+    }
+    let status = value
+        .get("stop_reason")
+        .and_then(Value::as_str)
+        .map(anthropic_stop_reason_status)
+        .or_else(|| fallback_status.and_then(normalized_model_response_status))?;
+    Some(ModelProxyTerminal {
+        response_status: status.into(),
+        usage: extract_anthropic_usage(value),
+        error_code: None,
+        error_message: None,
     })
 }
 
@@ -6448,6 +6786,333 @@ mod tests {
         assert!(!object.keys().any(|key| key.contains('\0')));
         assert_eq!(object["ok"], json!("value"));
     }
+
+    #[test]
+    fn chat_sse_observer_records_usage_after_finish_reason_until_done() {
+        let mut observer =
+            ModelResponseObserver::new(ModelProxyObserverProtocol::ChatCompletions, true);
+        observer.push(
+            br#"data: {"id":"c1","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}
+
+"#,
+        );
+        assert!(!observer.has_terminal());
+        // finish_reason chunk（此时不含 usage）
+        observer.push(
+            br#"data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+"#,
+        );
+        assert!(
+            !observer.has_terminal(),
+            "finish_reason 之后 usage-only chunk 可能未到，不能提前落账"
+        );
+        // usage-only chunk（choices 为空）
+        observer.push(
+            br#"data: {"id":"c1","choices":[],"usage":{"prompt_tokens":14,"completion_tokens":9,"total_tokens":23}}
+
+"#,
+        );
+        assert!(!observer.has_terminal());
+        // [DONE] 之后才落账
+        observer.push(b"data: [DONE]\n\n");
+        assert!(observer.has_terminal());
+        let observation = observer.finish(StatusCode::OK, None, None);
+        let (status, usage) = observation.usage.expect("usage recorded");
+        assert_eq!(status, "completed");
+        assert_eq!(usage.input_tokens, 14);
+        assert_eq!(usage.output_tokens, 9);
+        assert_eq!(usage.total_tokens, 23);
+        assert!(observation.error.is_none());
+    }
+
+    #[test]
+    fn chat_sse_observer_without_usage_reports_protocol_error() {
+        let mut observer =
+            ModelResponseObserver::new(ModelProxyObserverProtocol::ChatCompletions, true);
+        observer.push(
+            br#"data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+"#,
+        );
+        observer.push(b"data: [DONE]\n\n");
+        assert!(observer.has_terminal());
+        let observation = observer.finish(StatusCode::OK, None, None);
+        assert!(observation.usage.is_none());
+        let error = observation.error.expect("protocol error expected");
+        assert_eq!(error.response_status, "protocol_error");
+        assert_eq!(error.error_kind, "protocol");
+        assert_eq!(
+            error.message,
+            "completed model response did not include valid usage"
+        );
+    }
+
+    #[test]
+    fn anthropic_sse_observer_accumulates_message_events_and_records_usage() {
+        let mut observer =
+            ModelResponseObserver::new(ModelProxyObserverProtocol::AnthropicMessages, true);
+        observer.push(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":13,\"output_tokens\":0}}}\n\n",
+        );
+        observer.push(
+            b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        );
+        observer.push(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+        );
+        observer.push(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n");
+        assert!(!observer.has_terminal());
+        // message_delta 两次：output_tokens 为累计值，覆盖语义 → 最终 5。
+        observer.push(
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":null},\"usage\":{\"output_tokens\":3}}\n\n",
+        );
+        observer.push(
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+        );
+        assert!(!observer.has_terminal(), "message_stop 前不落账");
+        observer.push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        assert!(observer.has_terminal());
+        let observation = observer.finish(StatusCode::OK, None, None);
+        let (status, usage) = observation.usage.expect("usage recorded");
+        assert_eq!(status, "completed");
+        assert_eq!(usage.input_tokens, 13);
+        assert_eq!(usage.output_tokens, 5);
+        assert_eq!(usage.total_tokens, 18);
+        assert!(observation.error.is_none());
+    }
+
+    #[test]
+    fn chat_json_observer_parses_non_streaming_completion() {
+        let mut observer =
+            ModelResponseObserver::new(ModelProxyObserverProtocol::ChatCompletions, false);
+        observer.push(
+            br#"{"id":"c1","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":14,"completion_tokens":9,"total_tokens":23}}"#,
+        );
+        assert!(!observer.has_terminal());
+        let observation = observer.finish(StatusCode::OK, None, None);
+        let (status, usage) = observation.usage.expect("usage recorded");
+        assert_eq!(status, "completed");
+        assert_eq!(usage.input_tokens, 14);
+        assert_eq!(usage.output_tokens, 9);
+        assert_eq!(usage.total_tokens, 23);
+        assert!(observation.error.is_none());
+    }
+
+    #[test]
+    fn anthropic_json_observer_parses_non_streaming_message() {
+        let mut observer =
+            ModelResponseObserver::new(ModelProxyObserverProtocol::AnthropicMessages, false);
+        observer.push(
+            br#"{"id":"m1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":13,"output_tokens":8}}"#,
+        );
+        let observation = observer.finish(StatusCode::OK, None, None);
+        let (status, usage) = observation.usage.expect("usage recorded");
+        assert_eq!(status, "completed");
+        assert_eq!(usage.input_tokens, 13);
+        assert_eq!(usage.output_tokens, 8);
+        assert_eq!(usage.total_tokens, 21);
+        assert!(observation.error.is_none());
+    }
+
+    #[test]
+    fn chat_content_filter_finish_reason_is_failed_and_records_error() {
+        let mut observer =
+            ModelResponseObserver::new(ModelProxyObserverProtocol::ChatCompletions, false);
+        observer.push(
+            br#"{"id":"c1","choices":[{"message":{"role":"assistant","content":null},"finish_reason":"content_filter"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}"#,
+        );
+        let observation = observer.finish(StatusCode::OK, None, None);
+        let (status, usage) = observation.usage.expect("usage is still recorded for failed terminal");
+        assert_eq!(status, "failed");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 2);
+        let error = observation.error.expect("error recorded for content_filter");
+        assert_eq!(error.response_status, "failed");
+        assert_eq!(error.error_kind, "provider_failed");
+    }
+
+    #[test]
+    fn chat_unknown_finish_reason_is_failed_and_records_error() {
+        let mut observer =
+            ModelResponseObserver::new(ModelProxyObserverProtocol::ChatCompletions, false);
+        observer.push(
+            br#"{"id":"c1","choices":[{"message":{"role":"assistant","content":"partial"},"finish_reason":"future_reason"}],"usage":{"prompt_tokens":4,"completion_tokens":3,"total_tokens":7}}"#,
+        );
+        let observation = observer.finish(StatusCode::OK, None, None);
+        let (status, _) = observation.usage.expect("usage recorded");
+        assert_eq!(status, "failed");
+        let error = observation.error.expect("error recorded for unknown finish_reason");
+        assert_eq!(error.error_kind, "provider_failed");
+    }
+
+    #[test]
+    fn anthropic_refusal_stop_reason_is_failed_and_records_error() {
+        let mut observer =
+            ModelResponseObserver::new(ModelProxyObserverProtocol::AnthropicMessages, false);
+        observer.push(
+            br#"{"id":"m1","type":"message","role":"assistant","content":[],"stop_reason":"refusal","usage":{"input_tokens":10,"output_tokens":2}}"#,
+        );
+        let observation = observer.finish(StatusCode::OK, None, None);
+        let (status, usage) = observation.usage.expect("usage is still recorded for failed terminal");
+        assert_eq!(status, "failed");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 2);
+        let error = observation.error.expect("error recorded for refusal");
+        assert_eq!(error.response_status, "failed");
+        assert_eq!(error.error_kind, "provider_failed");
+    }
+    #[sqlx::test(migrations = "./migrations")]
+    async fn send_model_upstream_request_fails_closed_on_unrepresentable_credentials(
+        pool: PgPool,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hit_count = Arc::clone(&hits);
+        let server = tokio::spawn(async move {
+            let responses_hits = Arc::clone(&hit_count);
+            let messages_hits = Arc::clone(&hit_count);
+            let app = axum::Router::new()
+                .route(
+                    "/v1/responses",
+                    axum::routing::post(move || {
+                        let hit_count = Arc::clone(&responses_hits);
+                        async move {
+                            hit_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            axum::http::StatusCode::OK.into_response()
+                        }
+                    }),
+                )
+                .route(
+                    "/v1/messages",
+                    axum::routing::post(move || {
+                        let hit_count = Arc::clone(&messages_hits);
+                        async move {
+                            hit_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            axum::http::StatusCode::OK.into_response()
+                        }
+                    }),
+                );
+            axum::serve(listener, app).await.unwrap();
+        });
+        let state = test_state_with_pool(pool);
+        let base_url = format!("http://{address}");
+
+        // 非法 OpenAI key（含换行）→ 明确错误，不发出任何上游请求。
+        let bad_openai = ModelUpstreamForwardRequest {
+            upstream_protocol: ModelUpstreamProtocol::OpenaiResponses,
+            upstream_url: &base_url,
+            path: "responses",
+            query: None,
+            headers: &HeaderMap::new(),
+            body: b"{}",
+            api_key: "bad\nkey",
+        };
+        let error = send_model_upstream_request(&state, bad_openai).await.unwrap_err();
+        assert!(matches!(error, ModelUpstreamSendError::InvalidAuthHeader));
+
+        // 非法 Anthropic key（含回车）→ 同样明确拒绝。
+        let bad_anthropic = ModelUpstreamForwardRequest {
+            upstream_protocol: ModelUpstreamProtocol::AnthropicMessages,
+            upstream_url: &base_url,
+            path: "messages",
+            query: None,
+            headers: &HeaderMap::new(),
+            body: b"{}",
+            api_key: "bad\rkey",
+        };
+        let error = send_model_upstream_request(&state, bad_anthropic).await.unwrap_err();
+        assert!(matches!(error, ModelUpstreamSendError::InvalidAuthHeader));
+
+        // 合法 key 正常发出（含 Anthropic 认证头路径）。
+        let ok_anthropic = ModelUpstreamForwardRequest {
+            upstream_protocol: ModelUpstreamProtocol::AnthropicMessages,
+            upstream_url: &base_url,
+            path: "messages",
+            query: None,
+            headers: &HeaderMap::new(),
+            body: b"{}",
+            api_key: "good-key",
+        };
+        let response = send_model_upstream_request(&state, ok_anthropic)
+            .await
+            .expect("valid credential is sent");
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(response);
+
+        server.abort();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn model_response_status_for_maps_protocol_terminal_states() {
+        // Chat：stop → completed；length → incomplete；content_filter → failed。
+        assert_eq!(
+            model_response_status_for(
+                Some(&json!({"choices": [{"finish_reason": "stop"}]})),
+                true,
+                ModelUpstreamProtocol::OpenaiChatCompletions
+            ),
+            "completed"
+        );
+        assert_eq!(
+            model_response_status_for(
+                Some(&json!({"choices": [{"finish_reason": "length"}]})),
+                true,
+                ModelUpstreamProtocol::OpenaiChatCompletions
+            ),
+            "incomplete"
+        );
+        assert_eq!(
+            model_response_status_for(
+                Some(&json!({"choices": [{"finish_reason": "content_filter"}]})),
+                true,
+                ModelUpstreamProtocol::OpenaiChatCompletions
+            ),
+            "failed"
+        );
+        // Anthropic：end_turn → completed；max_tokens → incomplete；refusal → failed。
+        assert_eq!(
+            model_response_status_for(
+                Some(&json!({"stop_reason": "end_turn"})),
+                true,
+                ModelUpstreamProtocol::AnthropicMessages
+            ),
+            "completed"
+        );
+        assert_eq!(
+            model_response_status_for(
+                Some(&json!({"stop_reason": "max_tokens"})),
+                true,
+                ModelUpstreamProtocol::AnthropicMessages
+            ),
+            "incomplete"
+        );
+        assert_eq!(
+            model_response_status_for(
+                Some(&json!({"stop_reason": "refusal"})),
+                true,
+                ModelUpstreamProtocol::AnthropicMessages
+            ),
+            "failed"
+        );
+        // Responses：保持原 status 字段语义。
+        assert_eq!(
+            model_response_status_for(
+                Some(&json!({"status": "incomplete"})),
+                true,
+                ModelUpstreamProtocol::OpenaiResponses
+            ),
+            "incomplete"
+        );
+        // HTTP 非 2xx 且无终态字段 → failed。
+        assert_eq!(
+            model_response_status_for(None, false, ModelUpstreamProtocol::OpenaiChatCompletions),
+            "failed"
+        );
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn runtime_claim_contains_complete_effective_execution_configuration(pool: PgPool) {

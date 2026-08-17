@@ -1,19 +1,15 @@
-# 🚀 Agent Hub v0.3.13
+# 🚀 Agent Hub v0.4.0
 
-📅 发布日期：2026-08-16
-
-## 🐛 Bug Fixes
-
-- 大结果读取链路完整修复：Pi 工具白名单暴露 `tool_result_read`，模型可读取截断结果的全文归档。
-- 工具结果读取 broker 生命周期改为由会话进程持有；凭证共享轮换自动生效，`file` 模式写入当前会话工作区。
-- 读取接口联表校验 `hub_session_id`、Runtime 归属与 ownership generation，拒绝同 Runtime 跨会话读取。
-- `tool_call_id` 改为严格 UUID，URL 查询参数结构化构造，避免 `?#` 注入篡改会话参数。
-- Client 受管工具内部名统一为 `agent_hub_client_tool_{实际名}`，与 `tool_result_read` 使用一致命名。
+📅 发布日期：2026-08-17
 
 ## ✨ Changes
 
-- Browser SDK 统一错误提交协议：工具超时或中断生成错误结果，提交失败缓存结果可安全重放。
-- 绝对执行期限预留提交余量；`executing/unknown` 无结果时以 `tool_result_unknown` 收尾。
+- 移除内部 Model Gateway（Go/Bifrost 协议转换层），Hub 直连上游模型端点，只做认证改写与安全头过滤，请求体原样透传、不再做任何协议转换。
+- Pi 按 Run Binding 的 API 类型原生直连：`openai-responses` / `openai-completions` / `anthropic-messages`（含 Anthropic 根 URL 修正，避免 `/v1/v1/messages`）。
+- 用量与错误记账扩展至三协议：Chat Completions（`finish_reason` + `prompt_tokens`，流式在 `[DONE]` 后落账）与 Anthropic Messages（`message_start`/`message_delta`/`message_stop`，cache 口径计入 input）；终态映射与 Pi 一致（`content_filter`/`network_error`/`refusal`/`sensitive` 等记为失败）。
+- 会话标题生成与模型连接测试按协议构造请求并解析响应，不再仅支持 Responses。
+- 模型代理路径与 Run Binding 协议强制一致（不匹配 fail closed）；无法表示为 HTTP 头的凭据直接拒绝发送（fail closed），认证头标记敏感防日志泄露。
+- 采样覆盖（`temperature`/`top_p`）随模型网关移除而停用（前端输入框禁用并提示）；`max_completion_tokens`/`max_tokens` 仍作为 Pi 的 maxTokens 上限生效。
 
 ## 👥 Contributors
 

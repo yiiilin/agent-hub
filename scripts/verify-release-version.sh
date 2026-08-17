@@ -104,13 +104,11 @@ check_cargo_lock_version agent-hub-runtime
 check_cargo_lock_version agent-hub-shared
 check_cargo_lock_version agent-hub-cli
 
-check_file_occurrences compose.yml "agent-hub-gateway:\${AGENT_HUB_IMAGE_TAG:-$release_version}" 1
 check_file_occurrences compose.yml "agent-hub:\${AGENT_HUB_IMAGE_TAG:-$release_version}" 1
 check_file_occurrences compose.yml "agent-hub-runtime:\${AGENT_HUB_IMAGE_TAG:-$release_version}" 2
 check_file_contains .env.example "AGENT_HUB_IMAGE_TAG=$release_version"
 check_file_contains docs/operations.md "ghcr.io/yiiilin/agent-hub:$release_version"
 check_file_contains docs/operations.md "ghcr.io/yiiilin/agent-hub-runtime:$release_version"
-check_file_contains docs/operations.md "ghcr.io/yiiilin/agent-hub-gateway:$release_version"
 check_file_contains docs/operations.md "release_tag=v$release_version"
 
 release_notes_title=$(sed -n '1s/^[[:space:]]*//;1s/[[:space:]]*$//;1p' RELEASE_NOTES.md)

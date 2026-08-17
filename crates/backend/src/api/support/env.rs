@@ -9,8 +9,6 @@ use anyhow::Context;
 use ipnet::IpNet;
 use std::path::PathBuf;
 use std::{env, sync::Arc, time::Duration};
-use url::Url;
-use zeroize::Zeroizing;
 
 pub(crate) fn model_proxy_timeout_from_env() -> anyhow::Result<Duration> {
     parse_model_proxy_timeout(env::var("HUB_MODEL_PROXY_TIMEOUT_SECS").ok().as_deref())
@@ -35,52 +33,6 @@ pub(crate) fn parse_trusted_proxy_cidrs(value: Option<&str>) -> anyhow::Result<O
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Some(cidrs))
-}
-
-pub(crate) fn model_gateway_config_from_env() -> anyhow::Result<(String, Arc<Zeroizing<String>>)> {
-    let url = env::var("HUB_MODEL_GATEWAY_URL").context("HUB_MODEL_GATEWAY_URL is required")?;
-    let auth_token = env::var("HUB_MODEL_GATEWAY_AUTH_TOKEN")
-        .context("HUB_MODEL_GATEWAY_AUTH_TOKEN is required")?;
-    validate_model_gateway_config(&url, &auth_token)
-}
-
-pub(crate) fn validate_model_gateway_config(
-    url: &str,
-    auth_token: &str,
-) -> anyhow::Result<(String, Arc<Zeroizing<String>>)> {
-    let mut parsed = Url::parse(url).context("HUB_MODEL_GATEWAY_URL must be a valid URL")?;
-    anyhow::ensure!(
-        matches!(parsed.scheme(), "http" | "https"),
-        "HUB_MODEL_GATEWAY_URL must use http or https"
-    );
-    anyhow::ensure!(
-        parsed.host_str().is_some(),
-        "HUB_MODEL_GATEWAY_URL must include a host"
-    );
-    anyhow::ensure!(
-        parsed.username().is_empty()
-            && parsed.password().is_none()
-            && parsed.query().is_none()
-            && parsed.fragment().is_none(),
-        "HUB_MODEL_GATEWAY_URL must not include credentials, query, or fragment"
-    );
-    anyhow::ensure!(
-        parsed.path().is_empty() || parsed.path() == "/",
-        "HUB_MODEL_GATEWAY_URL must not include a path"
-    );
-    anyhow::ensure!(
-        !auth_token.is_empty()
-            && auth_token.len() <= 4096
-            && auth_token
-                .bytes()
-                .all(|byte| byte.is_ascii_graphic() && !byte.is_ascii_whitespace()),
-        "HUB_MODEL_GATEWAY_AUTH_TOKEN must be a non-empty visible ASCII token"
-    );
-    parsed.set_path("");
-    Ok((
-        parsed.as_str().trim_end_matches('/').to_owned(),
-        Arc::new(Zeroizing::new(auth_token.to_owned())),
-    ))
 }
 
 pub(crate) fn session_bundle_max_bytes_from_env() -> anyhow::Result<u64> {

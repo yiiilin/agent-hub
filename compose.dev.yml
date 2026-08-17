@@ -64,20 +64,6 @@ services:
     networks:
       - hub-network
 
-  model-gateway:
-    labels: *development-labels
-    build:
-      context: .
-      dockerfile: deploy/gateway.Dockerfile
-    environment:
-      GODEBUG: ${MODEL_GATEWAY_GODEBUG:-http2client=0}
-      MODEL_GATEWAY_AUTH_TOKEN: ${HUB_MODEL_GATEWAY_AUTH_TOKEN:-dev-model-gateway-auth-token}
-      MODEL_GATEWAY_LISTEN_ADDR: 0.0.0.0:8090
-      MODEL_GATEWAY_UPSTREAM_TIMEOUT: ${MODEL_GATEWAY_UPSTREAM_TIMEOUT:-60s}
-      MODEL_GATEWAY_STREAM_IDLE_TIMEOUT: ${MODEL_GATEWAY_STREAM_IDLE_TIMEOUT:-120s}
-    networks:
-      - model-network
-
   backend:
     labels: *development-labels
     build:
@@ -101,8 +87,6 @@ services:
       DEV_MODEL_PROVIDER_API_KEY: ${DEV_MODEL_PROVIDER_API_KEY:-dev-model-provider-api-key}
       DEV_RUNTIME_ENROLLMENT_TOKEN: ${DEV_RUNTIME_ENROLLMENT_TOKEN:-dev-runtime-enrollment-token}
       HUB_MODEL_PROXY_TIMEOUT_SECS: ${HUB_MODEL_PROXY_TIMEOUT_SECS:-300}
-      HUB_MODEL_GATEWAY_URL: ${HUB_MODEL_GATEWAY_URL:-http://model-gateway:8090}
-      HUB_MODEL_GATEWAY_AUTH_TOKEN: ${HUB_MODEL_GATEWAY_AUTH_TOKEN:-dev-model-gateway-auth-token}
       HUB_SESSION_BUNDLE_MAX_BYTES: ${HUB_SESSION_BUNDLE_MAX_BYTES:-10737418240}
       HUB_BUNDLE_S3_ENDPOINT: ${HUB_BUNDLE_S3_ENDPOINT:-http://bundle-store:9000}
       HUB_BUNDLE_S3_BUCKET: ${HUB_BUNDLE_S3_BUCKET:-agent-hub-sessions}
@@ -126,8 +110,6 @@ services:
         condition: service_healthy
       bundle-store-init:
         condition: service_completed_successfully
-      model-gateway:
-        condition: service_healthy
     volumes:
       - hub-data:/var/lib/agent-hub
     networks:

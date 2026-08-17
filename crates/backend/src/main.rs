@@ -3,7 +3,7 @@
 mod api;
 use api::*;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     convert::Infallible,
     env,
     net::SocketAddr,
@@ -212,7 +212,6 @@ pub(crate) async fn main() -> anyhow::Result<()> {
     }
 
     let model_proxy_timeout = model_proxy_timeout_from_env()?;
-    let (model_gateway_url, model_gateway_auth_token) = model_gateway_config_from_env()?;
     let model_proxy_http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10).min(model_proxy_timeout))
         .timeout(model_proxy_timeout)
@@ -233,8 +232,6 @@ pub(crate) async fn main() -> anyhow::Result<()> {
         trusted_proxy_cidrs: trusted_proxy_cidrs_from_env()?,
         model_secret_cipher,
         model_proxy_http,
-        model_gateway_url,
-        model_gateway_auth_token,
         session_bundle_store,
         skill_package_store: Some(skill_package_store),
         session_bundle_max_bytes,
@@ -1514,11 +1511,10 @@ pub(crate) async fn readiness_response(pool: &PgPool, timeout: Duration) -> Resp
 }
 
 #[allow(clippy::too_many_arguments)]
-struct ModelGatewayForwardRequest<'a> {
-    request_id: Uuid,
+struct ModelUpstreamForwardRequest<'a> {
     upstream_protocol: ModelUpstreamProtocol,
-    request_settings: &'a ModelRequestSettings,
     upstream_url: &'a str,
+    path: &'a str,
     query: Option<&'a str>,
     headers: &'a HeaderMap,
     body: &'a [u8],
@@ -1599,6 +1595,7 @@ pub(crate) async fn authorize_run_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use tower::ServiceExt;
 
     #[test]

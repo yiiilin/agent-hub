@@ -3,7 +3,7 @@
 
 use super::*;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     sync::Arc,
     time::Duration,
 };
@@ -20,39 +20,16 @@ use axum::{
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use tower::ServiceExt;
 use uuid::Uuid;
-use zeroize::Zeroizing;
 
 use crate::api::*;
 use crate::build_router;
 use crate::run_event_bus;
 use crate::tests::{issue_widget_external_access_for, runtime_write};
 use crate::DEFAULT_SESSION_BUNDLE_MAX_BYTES;
-
-#[derive(Clone, Debug, Deserialize)]
-pub(crate) struct TestModelGatewayEnvelope {
-    pub(crate) request_id: String,
-    pub(crate) protocol: ModelUpstreamProtocol,
-    pub(crate) request_settings: ModelRequestSettings,
-    pub(crate) endpoint: String,
-    pub(crate) api_key: String,
-    pub(crate) query: Option<String>,
-    #[serde(default)]
-    pub(crate) headers: BTreeMap<String, Vec<String>>,
-    pub(crate) body_base64: String,
-}
-
-pub(crate) fn decode_gateway_body(envelope: &TestModelGatewayEnvelope) -> Bytes {
-    Bytes::from(
-        base64::engine::general_purpose::STANDARD
-            .decode(&envelope.body_base64)
-            .unwrap(),
-    )
-}
 
 pub(crate) fn staged_skill_package_upload(
     name: &str,
@@ -762,9 +739,7 @@ pub(crate) fn test_automation(
     }
 }
 
-pub(crate) async fn slow_sse_model_upstream(
-    Json(_envelope): Json<TestModelGatewayEnvelope>,
-) -> axum::response::Response {
+pub(crate) async fn slow_sse_model_upstream() -> axum::response::Response {
     let stream = async_stream::stream! {
         yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: first\n\n"));
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -787,15 +762,11 @@ pub(crate) async fn slow_sse_model_upstream(
     response
 }
 
-pub(crate) async fn model_upstream_never_sends_headers(
-    Json(_envelope): Json<TestModelGatewayEnvelope>,
-) -> axum::response::Response {
+pub(crate) async fn model_upstream_never_sends_headers() -> axum::response::Response {
     std::future::pending().await
 }
 
-pub(crate) async fn model_upstream_stalls_after_first_chunk(
-    Json(_envelope): Json<TestModelGatewayEnvelope>,
-) -> axum::response::Response {
+pub(crate) async fn model_upstream_stalls_after_first_chunk() -> axum::response::Response {
     let stream = async_stream::stream! {
         yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: first\n\n"));
         std::future::pending::<()>().await;
@@ -808,9 +779,7 @@ pub(crate) async fn model_upstream_stalls_after_first_chunk(
     response
 }
 
-pub(crate) async fn model_upstream_rate_limited(
-    Json(_envelope): Json<TestModelGatewayEnvelope>,
-) -> axum::response::Response {
+pub(crate) async fn model_upstream_rate_limited() -> axum::response::Response {
     let mut response = axum::response::Response::new(axum::body::Body::from("provider rate limit"));
     *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
     response
@@ -1552,8 +1521,6 @@ pub(crate) fn test_state_with_pool(pool: PgPool) -> AppState {
         ))
         .unwrap(),
         model_proxy_http: reqwest::Client::new(),
-        model_gateway_url: "http://127.0.0.1:1".into(),
-        model_gateway_auth_token: Arc::new(Zeroizing::new("test-gateway-token".into())),
         session_bundle_store: None,
         skill_package_store: None,
         session_bundle_max_bytes: DEFAULT_SESSION_BUNDLE_MAX_BYTES,
@@ -2251,8 +2218,6 @@ pub(crate) fn test_model_proxy_state_with_timeout(timeout: Duration) -> AppState
             .read_timeout(timeout)
             .build()
             .unwrap(),
-        model_gateway_url: "http://127.0.0.1:1".into(),
-        model_gateway_auth_token: Arc::new(Zeroizing::new("test-gateway-token".into())),
         session_bundle_store: None,
         skill_package_store: None,
         session_bundle_max_bytes: DEFAULT_SESSION_BUNDLE_MAX_BYTES,

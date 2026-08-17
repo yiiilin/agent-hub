@@ -354,6 +354,50 @@ pub enum ModelUpstreamProtocol {
     AnthropicMessages,
 }
 
+impl ModelUpstreamProtocol {
+    /// Pi provider `api` 值（models.json 的 provider.api 字段）。
+    pub fn pi_api_name(self) -> &'static str {
+        match self {
+            Self::OpenaiResponses => "openai-responses",
+            Self::OpenaiChatCompletions => "openai-completions",
+            Self::AnthropicMessages => "anthropic-messages",
+        }
+    }
+
+    /// 上游协议路径（相对 provider base URL 的 `/v1` 前缀）。
+    pub fn upstream_path(self) -> &'static str {
+        match self {
+            Self::OpenaiResponses => "responses",
+            Self::OpenaiChatCompletions => "chat/completions",
+            Self::AnthropicMessages => "messages",
+        }
+    }
+
+    pub fn is_anthropic(self) -> bool {
+        matches!(self, Self::AnthropicMessages)
+    }
+}
+
+/// Chat Completions `finish_reason` → 归一化终态，与 Pi 的 mapStopReason 一致。
+pub fn chat_finish_reason_status(reason: &str) -> &'static str {
+    match reason {
+        "stop" | "end" | "function_call" | "tool_calls" => "completed",
+        "length" => "incomplete",
+        // content_filter / network_error / 未知值：视为失败。
+        _ => "failed",
+    }
+}
+
+/// Anthropic Messages `stop_reason` → 归一化终态，与 Pi 的 mapStopReason 一致。
+pub fn anthropic_stop_reason_status(reason: &str) -> &'static str {
+    match reason {
+        "end_turn" | "pause_turn" | "stop_sequence" | "tool_use" => "completed",
+        "max_tokens" => "incomplete",
+        // refusal / sensitive / 未知值：视为失败。
+        _ => "failed",
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelReasoningSummary {
@@ -495,6 +539,9 @@ pub struct ModelConnectionTestResultDto {
 #[serde(tag = "protocol", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ModelRequestSettings {
     OpenaiResponses {},
+    // 注意：temperature/top_p 为兼容存量数据保留，Hub 直连后不再注入上游请求
+    // （采样覆盖随 model gateway 移除，上游使用模型默认采样）；
+    // max_completion_tokens 仍生效，作为 Pi models.json 的 maxTokens 上限。
     OpenaiChatCompletions {
         #[serde(default)]
         temperature: Option<Number>,
@@ -503,6 +550,7 @@ pub enum ModelRequestSettings {
         #[serde(default)]
         max_completion_tokens: Option<u32>,
     },
+    // 同上：temperature/top_p 不再注入上游；max_tokens 仍作为 Pi 的 maxTokens 上限。
     AnthropicMessages {
         #[serde(default)]
         temperature: Option<Number>,
@@ -2562,6 +2610,30 @@ pub struct RuntimeCommandAckRequest {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn model_upstream_protocol_maps_pi_api_and_upstream_path() {
+        assert_eq!(ModelUpstreamProtocol::OpenaiResponses.pi_api_name(), "openai-responses");
+        assert_eq!(ModelUpstreamProtocol::OpenaiResponses.upstream_path(), "responses");
+        assert!(!ModelUpstreamProtocol::OpenaiResponses.is_anthropic());
+
+        assert_eq!(
+            ModelUpstreamProtocol::OpenaiChatCompletions.pi_api_name(),
+            "openai-completions"
+        );
+        assert_eq!(
+            ModelUpstreamProtocol::OpenaiChatCompletions.upstream_path(),
+            "chat/completions"
+        );
+        assert!(!ModelUpstreamProtocol::OpenaiChatCompletions.is_anthropic());
+
+        assert_eq!(
+            ModelUpstreamProtocol::AnthropicMessages.pi_api_name(),
+            "anthropic-messages"
+        );
+        assert_eq!(ModelUpstreamProtocol::AnthropicMessages.upstream_path(), "messages");
+        assert!(ModelUpstreamProtocol::AnthropicMessages.is_anthropic());
+    }
 
     #[test]
     fn runtime_contracts_do_not_expose_direct_model_capability() {

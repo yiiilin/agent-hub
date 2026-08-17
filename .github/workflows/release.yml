@@ -105,9 +105,6 @@ jobs:
           - name: runtime
             suffix: -runtime
             dockerfile: deploy/runtime.Dockerfile
-          - name: model-gateway
-            suffix: -gateway
-            dockerfile: deploy/gateway.Dockerfile
     steps:
       - name: Check out source and Pi
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

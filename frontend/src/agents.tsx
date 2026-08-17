@@ -254,14 +254,8 @@ function AgentModelSettingsFields({
     </div></fieldset>
     <fieldset><legend>{t('modelRequestParametersGroup')} · <code>{apiType}</code></legend>
       {apiType === 'openai_responses' ? <p className="agent-setting-note">{t('responsesRequestSettingsAutomatic')}</p> : <div className="agent-model-setting-grid">
-        <label><code>temperature</code><input aria-label="temperature" disabled={disabled} type="number" min={0} max={apiType === 'anthropic_messages' ? 1 : 2} step="any" value={'temperature' in requestSettings ? requestSettings.temperature ?? '' : ''} onChange={(event) => {
-          if (!('temperature' in requestSettings)) return;
-          updateRequest({ ...requestSettings, temperature: optionalNumber(event.target.value), ...(apiType === 'anthropic_messages' && event.target.value ? { top_p: null } : {}) });
-        }} />{source('temperature' in requestSettings ? requestSettings.temperature : null)}</label>
-        <label><code>top_p</code><input aria-label="top_p" disabled={disabled} type="number" min={0} max={1} step="any" value={'top_p' in requestSettings ? requestSettings.top_p ?? '' : ''} onChange={(event) => {
-          if (!('top_p' in requestSettings)) return;
-          updateRequest({ ...requestSettings, top_p: optionalNumber(event.target.value), ...(apiType === 'anthropic_messages' && event.target.value ? { temperature: null } : {}) });
-        }} />{source('top_p' in requestSettings ? requestSettings.top_p : null)}</label>
+        <label><code>temperature</code><input aria-label="temperature" disabled title={t('modelRequestParameterSamplingRetired')} type="number" min={0} max={apiType === 'anthropic_messages' ? 1 : 2} step="any" value={'temperature' in requestSettings ? requestSettings.temperature ?? '' : ''} /> <span className="agent-setting-note">{t('modelRequestParameterSamplingRetired')}</span></label>
+        <label><code>top_p</code><input aria-label="top_p" disabled title={t('modelRequestParameterSamplingRetired')} type="number" min={0} max={1} step="any" value={'top_p' in requestSettings ? requestSettings.top_p ?? '' : ''} /> <span className="agent-setting-note">{t('modelRequestParameterSamplingRetired')}</span></label>
         {apiType === 'openai_chat_completions' && requestSettings.protocol === apiType && <label><code>max_completion_tokens</code><input aria-label="max_completion_tokens" disabled={disabled} type="number" min={1} step={1} value={requestSettings.max_completion_tokens ?? ''} onChange={(event) => updateRequest({ ...requestSettings, max_completion_tokens: optionalNumber(event.target.value) })} />{source(requestSettings.max_completion_tokens)}</label>}
         {apiType === 'anthropic_messages' && requestSettings.protocol === apiType && <label><code>max_tokens</code><input aria-label="max_tokens" disabled={disabled} type="number" min={1} step={1} value={requestSettings.max_tokens ?? ''} onChange={(event) => updateRequest({ ...requestSettings, max_tokens: optionalNumber(event.target.value) })} />{source(requestSettings.max_tokens)}</label>}
       </div>}
@@ -351,14 +345,8 @@ function SubagentModelSettingsFields({
     <fieldset><legend>{t('modelRequestParametersGroup')} · <code>{apiType}</code></legend>
       <label>{t('overrideMode')}<select disabled={disabled} value={requestMode} onChange={(event) => onChange(changeOverrideMode(overrides, 'request_settings', event.target.value, requestSettingsFor(apiType)))}><option value="inherit">{t('inheritAgentSetting')}</option><option value="automatic">{t('modelParameterAutomatic')}</option><option value="override">{t('overrideValue')}</option></select><small className="agent-setting-effective">{t('effectiveValue')}: {settingValue(effectiveRequest, t)} · {requestSource}</small></label>
       {requestMode === 'override' && (apiType === 'openai_responses' ? <p className="agent-setting-note">{t('responsesRequestSettingsAutomatic')}</p> : <div className="agent-model-setting-grid">
-        <label><code>temperature</code><input aria-label="temperature" disabled={disabled} type="number" min={0} max={apiType === 'anthropic_messages' ? 1 : 2} step="any" value={'temperature' in effectiveRequest ? effectiveRequest.temperature ?? '' : ''} onChange={(event) => {
-          if (!('temperature' in effectiveRequest)) return;
-          onChange({ ...overrides, request_settings: { ...effectiveRequest, temperature: optionalNumber(event.target.value), ...(apiType === 'anthropic_messages' && event.target.value ? { top_p: null } : {}) } });
-        }} /></label>
-        <label><code>top_p</code><input aria-label="top_p" disabled={disabled} type="number" min={0} max={1} step="any" value={'top_p' in effectiveRequest ? effectiveRequest.top_p ?? '' : ''} onChange={(event) => {
-          if (!('top_p' in effectiveRequest)) return;
-          onChange({ ...overrides, request_settings: { ...effectiveRequest, top_p: optionalNumber(event.target.value), ...(apiType === 'anthropic_messages' && event.target.value ? { temperature: null } : {}) } });
-        }} /></label>
+        <label><code>temperature</code><input aria-label="temperature" disabled title={t('modelRequestParameterSamplingRetired')} type="number" min={0} max={apiType === 'anthropic_messages' ? 1 : 2} step="any" value={'temperature' in effectiveRequest ? effectiveRequest.temperature ?? '' : ''} /> <span className="agent-setting-note">{t('modelRequestParameterSamplingRetired')}</span></label>
+        <label><code>top_p</code><input aria-label="top_p" disabled title={t('modelRequestParameterSamplingRetired')} type="number" min={0} max={1} step="any" value={'top_p' in effectiveRequest ? effectiveRequest.top_p ?? '' : ''} /> <span className="agent-setting-note">{t('modelRequestParameterSamplingRetired')}</span></label>
         {apiType === 'openai_chat_completions' && effectiveRequest.protocol === apiType && <label><code>max_completion_tokens</code><input aria-label="max_completion_tokens" disabled={disabled} type="number" min={1} step={1} value={effectiveRequest.max_completion_tokens ?? ''} onChange={(event) => onChange({ ...overrides, request_settings: { ...effectiveRequest, max_completion_tokens: optionalNumber(event.target.value) } })} /></label>}
         {apiType === 'anthropic_messages' && effectiveRequest.protocol === apiType && <label><code>max_tokens</code><input aria-label="max_tokens" disabled={disabled} type="number" min={1} step={1} value={effectiveRequest.max_tokens ?? ''} onChange={(event) => onChange({ ...overrides, request_settings: { ...effectiveRequest, max_tokens: optionalNumber(event.target.value) } })} /></label>}
       </div>)}

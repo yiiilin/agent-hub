@@ -8820,6 +8820,17 @@ fn render_pi_models_json(
     let binding = model_binding(configuration, "main")?;
     let provider_name = pi_model_provider_name(binding.id);
     let base_url = model_base_url.unwrap_or("http://127.0.0.1:0/v1");
+    // Pi 原生支持 openai-responses / openai-completions / anthropic-messages，
+    // 按 Run Binding 的协议直接选择，Hub 直连透传不做协议转换。
+    let pi_api = binding.api_type.pi_api_name();
+    // OpenAI 系 SDK 的 baseUrl 已含 /v1（追加 /responses、/chat/completions）；
+    // Anthropic SDK 以 baseUrl 为根再追加 /v1/messages，必须去掉 /v1 后缀避免 /v1/v1。
+    let pi_base_url = if binding.api_type.is_anthropic() {
+        let trimmed = base_url.trim_end_matches('/');
+        trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_owned()
+    } else {
+        base_url.to_owned()
+    };
     let mut model = serde_json::Map::new();
     model.insert("id".into(), json!(binding.model_id));
     model.insert("name".into(), json!(binding.model_id));
@@ -8848,8 +8859,8 @@ fn render_pi_models_json(
     serde_json::to_string_pretty(&json!({
         "providers": {
             provider_name: {
-                "baseUrl": base_url,
-                "api": "openai-responses",
+                "baseUrl": pi_base_url,
+                "api": pi_api,
                 // Pi needs an auth presence to expose a custom model. This is a
                 // non-secret placeholder; the loopback proxy strips it.
                 "apiKey": "agent-hub-local-proxy",
@@ -13709,7 +13720,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_models_json_uses_the_local_gateway_and_preserves_ultra_intent() {
+    fn pi_models_json_uses_binding_protocol_api_and_preserves_ultra_intent() {
         let mut claim = test_claim();
         let binding = claim
             .execution_configuration
@@ -13743,7 +13754,7 @@ mod tests {
         let model = &provider["models"][0];
 
         assert_eq!(provider["baseUrl"], "http://127.0.0.1:4567/v1");
-        assert_eq!(provider["api"], "openai-responses");
+        assert_eq!(provider["api"], "openai-completions");
         assert_eq!(
             provider["headers"]["x-agent-hub-model-binding-id"],
             binding.id.to_string()
@@ -13774,6 +13785,41 @@ mod tests {
         assert!(automatic["retry"].get("maxRetries").is_none());
         assert!(automatic["retry"]["provider"].get("timeoutMs").is_none());
         assert!(automatic.get("httpIdleTimeoutMs").is_none());
+    }
+
+    #[test]
+    fn pi_models_json_uses_anthropic_root_base_url_for_anthropic_protocol() {
+        let mut claim = test_claim();
+        let binding = claim
+            .execution_configuration
+            .model_bindings
+            .first_mut()
+            .unwrap();
+        binding.api_type = ModelUpstreamProtocol::AnthropicMessages;
+        binding.model_settings = AgentModelSettings {
+            reasoning_effort: ReasoningEffort::Default,
+            request_settings: ModelRequestSettings::AnthropicMessages {
+                temperature: None,
+                top_p: None,
+                max_tokens: Some(8_192),
+            },
+            ..AgentModelSettings::default()
+        };
+
+        let rendered = render_pi_models_json(
+            &claim.execution_configuration,
+            Some("http://127.0.0.1:4567/v1"),
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&rendered).unwrap();
+        let binding = &claim.execution_configuration.model_bindings[0];
+        let provider = &parsed["providers"][&pi_model_provider_name(binding.id)];
+
+        // Anthropic SDK 以 baseUrl 为根追加 /v1/messages，models.json 必须给出根 URL。
+        assert_eq!(provider["baseUrl"], "http://127.0.0.1:4567");
+        assert_eq!(provider["api"], "anthropic-messages");
+        assert_eq!(provider["models"][0]["maxTokens"], 8_192);
+        assert_eq!(provider["models"][0]["reasoning"], false);
     }
 
     #[tokio::test]

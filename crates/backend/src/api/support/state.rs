@@ -16,7 +16,6 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use uuid::Uuid;
-use zeroize::Zeroizing;
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -28,8 +27,6 @@ pub(crate) struct AppState {
     pub(crate) trusted_proxy_cidrs: Option<Vec<IpNet>>,
     pub(crate) model_secret_cipher: ModelSecretCipher,
     pub(crate) model_proxy_http: reqwest::Client,
-    pub(crate) model_gateway_url: String,
-    pub(crate) model_gateway_auth_token: Arc<Zeroizing<String>>,
     pub(crate) session_bundle_store: Option<Arc<S3BundleStore>>,
     pub(crate) skill_package_store: Option<Arc<SkillPackageStore>>,
     pub(crate) session_bundle_max_bytes: u64,

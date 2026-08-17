@@ -1,7 +1,7 @@
 //! models 领域模块：Model API Connection / 模型用量台账 的 handler 与私有辅助函数。
 
 use super::*;
-use crate::{send_model_gateway_request, ModelGatewayForwardRequest, REDACTED_SECRET};
+use crate::{send_model_upstream_request, ModelUpstreamForwardRequest, REDACTED_SECRET};
 use std::{collections::BTreeSet, sync::Arc, time::Instant};
 
 use agent_hub_shared::*;
@@ -604,21 +604,22 @@ pub(crate) async fn test_model_connection(
         request_settings: &request_settings,
         user: &user,
     };
-    let request_body = serde_json::to_vec(&json!({
-        "model": model_id,
-        "input": message,
-        "max_output_tokens": 256
-    }))
+    let request_body = build_model_request_body(
+        model_id,
+        message,
+        256,
+        1.0,
+        connection.dto.api_type,
+    )
     .map_err(|_| ApiError::internal("failed to encode Model Connection test request"))?;
     let request_headers = HeaderMap::new();
     let started_at = Instant::now();
-    let response = send_model_gateway_request(
+    let response = send_model_upstream_request(
         &state,
-        ModelGatewayForwardRequest {
-            request_id,
+        ModelUpstreamForwardRequest {
             upstream_protocol: connection.dto.api_type,
-            request_settings: &request_settings,
             upstream_url: &connection.dto.base_url,
+            path: connection.dto.api_type.upstream_path(),
             query: None,
             headers: &request_headers,
             body: &request_body,
@@ -628,21 +629,30 @@ pub(crate) async fn test_model_connection(
     .await;
     let response = match response {
         Ok(response) => response,
-        Err(_) => {
+        Err(error) => {
+            let (message, error_code) = match error {
+                ModelUpstreamSendError::InvalidAuthHeader => (
+                    "connection credential cannot be represented as an HTTP header",
+                    "invalid_credential_header",
+                ),
+                ModelUpstreamSendError::Request(_) => {
+                    ("connection request failed", "transport_error")
+                }
+            };
             record_model_test_error(
                 &ledger_context,
                 "transport_error",
                 None,
                 "transport_error",
-                None,
-                "connection request failed",
+                Some(error_code),
+                message,
             )
             .await?;
             return Ok(Json(ModelConnectionTestResultDto {
                 success: false,
                 status_code: None,
-                error_code: Some("transport_error".into()),
-                message: Some("connection request failed".into()),
+                error_code: Some(error_code.into()),
+                message: Some(message.into()),
                 response_text: None,
                 response_time_ms: model_test_response_time_ms(started_at),
             }));
@@ -675,8 +685,11 @@ pub(crate) async fn test_model_connection(
     };
     let response_time_ms = model_test_response_time_ms(started_at);
     let value = serde_json::from_slice::<Value>(&body).ok();
-    let response_status = model_response_status(value.as_ref(), status.is_success());
-    let usage = value.as_ref().and_then(extract_model_usage);
+    let response_status =
+        model_response_status_for(value.as_ref(), status.is_success(), connection.dto.api_type);
+    let usage = value
+        .as_ref()
+        .and_then(|value| extract_model_usage_for(value, connection.dto.api_type));
     if let Some(usage) = usage.as_ref() {
         record_model_test_usage(&ledger_context, response_status, usage).await?;
     }
@@ -687,7 +700,9 @@ pub(crate) async fn test_model_connection(
             status_code: Some(status.as_u16()),
             error_code: None,
             message: None,
-            response_text: value.as_ref().and_then(model_test_response_text),
+            response_text: value
+                .as_ref()
+                .and_then(|value| model_test_response_text_for(value, connection.dto.api_type)),
             response_time_ms,
         }));
     }
@@ -774,6 +789,99 @@ pub(crate) fn model_test_response_text(value: &Value) -> Option<String> {
             if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
                 chunks.push(text);
             }
+        }
+    }
+    (!chunks.is_empty()).then(|| chunks.join("\n"))
+}
+
+/// 按协议构造 Hub 自发的模型请求体（会话标题、连接测试），匹配上游协议格式。
+pub(crate) fn build_model_request_body(
+    model_id: &str,
+    prompt: &str,
+    max_tokens: u32,
+    temperature: f64,
+    protocol: ModelUpstreamProtocol,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let body = match protocol {
+        ModelUpstreamProtocol::OpenaiResponses => json!({
+            "model": model_id,
+            "input": prompt,
+            "max_output_tokens": max_tokens,
+            "temperature": temperature,
+        }),
+        ModelUpstreamProtocol::OpenaiChatCompletions => json!({
+            "model": model_id,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_completion_tokens": max_tokens,
+            "temperature": temperature,
+        }),
+        ModelUpstreamProtocol::AnthropicMessages => json!({
+            "model": model_id,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }),
+    };
+    serde_json::to_vec(&body)
+}
+
+/// 按协议提取 usage（Responses: input_tokens；Chat: prompt_tokens；Anthropic: 含 cache 口径）。
+pub(crate) fn extract_model_usage_for(
+    value: &Value,
+    protocol: ModelUpstreamProtocol,
+) -> Option<ObservedModelUsage> {
+    match protocol {
+        ModelUpstreamProtocol::OpenaiResponses => extract_model_usage(value),
+        ModelUpstreamProtocol::OpenaiChatCompletions => extract_chat_usage(value),
+        ModelUpstreamProtocol::AnthropicMessages => extract_anthropic_usage(value),
+    }
+}
+
+pub(crate) fn model_test_response_text_for(
+    value: &Value,
+    protocol: ModelUpstreamProtocol,
+) -> Option<String> {
+    match protocol {
+        ModelUpstreamProtocol::OpenaiResponses => model_test_response_text(value),
+        ModelUpstreamProtocol::OpenaiChatCompletions => chat_response_text(value),
+        ModelUpstreamProtocol::AnthropicMessages => anthropic_response_text(value),
+    }
+}
+
+fn chat_response_text(value: &Value) -> Option<String> {
+    let message = value.pointer("/choices/0/message")?;
+    if let Some(text) = message
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+    {
+        return Some(text.to_owned());
+    }
+    let mut chunks = Vec::new();
+    for part in message.get("content").and_then(Value::as_array)? {
+        if let Some(text) = part
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+        {
+            chunks.push(text);
+        }
+    }
+    (!chunks.is_empty()).then(|| chunks.join("\n"))
+}
+
+fn anthropic_response_text(value: &Value) -> Option<String> {
+    let mut chunks = Vec::new();
+    for block in value.get("content").and_then(Value::as_array)? {
+        if block.get("type").and_then(Value::as_str) != Some("text") {
+            continue;
+        }
+        if let Some(text) = block
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+        {
+            chunks.push(text);
         }
     }
     (!chunks.is_empty()).then(|| chunks.join("\n"))
@@ -1088,7 +1196,70 @@ pub(crate) fn extract_model_usage(response: &Value) -> Option<ObservedModelUsage
         && observed.total_tokens == observed.input_tokens + observed.output_tokens
         && (0..=observed.input_tokens).contains(&observed.cached_tokens)
         && (0..=observed.output_tokens).contains(&observed.reasoning_tokens))
-    .then_some(observed)
+        .then_some(observed)
+}
+
+/// Chat Completions usage：`prompt_tokens` / `completion_tokens` / `total_tokens`。
+pub(crate) fn extract_chat_usage(response: &Value) -> Option<ObservedModelUsage> {
+    let usage = response.get("usage")?;
+    let input_tokens = usage.get("prompt_tokens")?.as_i64()?;
+    let output_tokens = usage.get("completion_tokens")?.as_i64()?;
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(input_tokens + output_tokens);
+    let cached_tokens = usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let reasoning_tokens = usage
+        .pointer("/completion_tokens_details/reasoning_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    (input_tokens >= 0
+        && output_tokens >= 0
+        && total_tokens == input_tokens + output_tokens
+        && (0..=input_tokens).contains(&cached_tokens)
+        && (0..=output_tokens).contains(&reasoning_tokens))
+        .then_some(ObservedModelUsage {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            cached_tokens,
+            reasoning_tokens,
+        })
+}
+
+/// Anthropic Messages usage：总 input = input_tokens + cache_creation + cache_read，
+/// cached_tokens 只记 cache_read（命中），creation 计入 input 不计命中。
+pub(crate) fn extract_anthropic_usage(response: &Value) -> Option<ObservedModelUsage> {
+    let usage = response.get("usage")?;
+    let raw_input = usage.get("input_tokens")?.as_i64()?;
+    let output_tokens = usage.get("output_tokens")?.as_i64()?;
+    let creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let read = usage
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let input_tokens = raw_input + creation + read;
+    let reasoning_tokens = usage
+        .pointer("/output_tokens_details/thinking_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    (input_tokens >= 0
+        && output_tokens >= 0
+        && (0..=input_tokens).contains(&read)
+        && (0..=output_tokens).contains(&reasoning_tokens))
+        .then_some(ObservedModelUsage {
+            input_tokens,
+            output_tokens,
+            total_tokens: input_tokens + output_tokens,
+            cached_tokens: read,
+            reasoning_tokens,
+        })
 }
 
 pub(crate) fn model_response_status(response: Option<&Value>, http_success: bool) -> &'static str {
@@ -1102,6 +1273,28 @@ pub(crate) fn model_response_status(response: Option<&Value>, http_success: bool
         Some("cancelled") => "cancelled",
         _ if http_success => "completed",
         _ => "failed",
+    }
+}
+
+/// 按上游协议归一化终态，与 Runtime 旁路记账的映射保持一致：
+/// Chat 看 `choices[0].finish_reason`，Anthropic 看 `stop_reason`。
+pub(crate) fn model_response_status_for(
+    response: Option<&Value>,
+    http_success: bool,
+    protocol: ModelUpstreamProtocol,
+) -> &'static str {
+    match protocol {
+        ModelUpstreamProtocol::OpenaiResponses => model_response_status(response, http_success),
+        ModelUpstreamProtocol::OpenaiChatCompletions => response
+            .and_then(|value| value.pointer("/choices/0/finish_reason"))
+            .and_then(Value::as_str)
+            .map(chat_finish_reason_status)
+            .unwrap_or(if http_success { "completed" } else { "failed" }),
+        ModelUpstreamProtocol::AnthropicMessages => response
+            .and_then(|value| value.get("stop_reason"))
+            .and_then(Value::as_str)
+            .map(anthropic_stop_reason_status)
+            .unwrap_or(if http_success { "completed" } else { "failed" }),
     }
 }
 
@@ -1892,9 +2085,25 @@ mod tests {
 
     #[test]
     fn model_proxy_only_supports_responses_path() {
-        assert!(model_proxy_path_supported("responses"));
-        assert!(!model_proxy_path_supported("chat/completions"));
-        assert!(!model_proxy_path_supported("models"));
+        for supported in ["responses", "chat/completions", "messages"] {
+            assert!(model_proxy_path_supported(supported));
+        }
+        for unsupported in ["models", "embeddings", "completions", ""] {
+            assert!(!model_proxy_path_supported(unsupported));
+        }
+        assert_eq!(
+            model_proxy_protocol_from_path("responses"),
+            Some(ModelUpstreamProtocol::OpenaiResponses)
+        );
+        assert_eq!(
+            model_proxy_protocol_from_path("chat/completions"),
+            Some(ModelUpstreamProtocol::OpenaiChatCompletions)
+        );
+        assert_eq!(
+            model_proxy_protocol_from_path("messages"),
+            Some(ModelUpstreamProtocol::AnthropicMessages)
+        );
+        assert_eq!(model_proxy_protocol_from_path("models"), None);
     }
 
     #[test]
@@ -1910,28 +2119,6 @@ mod tests {
         assert!(parse_model_proxy_timeout(Some("0")).is_err());
         assert!(parse_model_proxy_timeout(Some("901")).is_err());
         assert!(parse_model_proxy_timeout(Some("forever")).is_err());
-    }
-
-    #[test]
-    fn model_gateway_configuration_is_explicit_and_validated() {
-        let (url, token) =
-            validate_model_gateway_config("http://model-gateway:8090/", "gateway-token").unwrap();
-        assert_eq!(url, "http://model-gateway:8090");
-        assert_eq!(token.as_str(), "gateway-token");
-
-        for invalid_url in [
-            "ftp://model-gateway:8090",
-            "http://model-gateway:8090/internal",
-            "http://user@model-gateway:8090",
-            "http://model-gateway:8090?token=secret",
-        ] {
-            assert!(validate_model_gateway_config(invalid_url, "gateway-token").is_err());
-        }
-        for invalid_token in ["", "with space", "line\nbreak"] {
-            assert!(
-                validate_model_gateway_config("http://model-gateway:8090", invalid_token).is_err()
-            );
-        }
     }
 
     #[sqlx::test(migrations = "./migrations")]
@@ -2015,9 +2202,9 @@ mod tests {
     async fn model_proxy_routes_selected_connection_streams_and_records_usage(pool: PgPool) {
         #[derive(Clone)]
         struct CapturedRequest {
-            uri: String,
+            uri: axum::http::Uri,
             headers: HeaderMap,
-            envelope: TestModelGatewayEnvelope,
+            body: Bytes,
         }
 
         let captured = Arc::new(std::sync::Mutex::new(None::<CapturedRequest>));
@@ -2026,14 +2213,14 @@ mod tests {
         let captured_request = Arc::clone(&captured);
         let server = tokio::spawn(async move {
             let app = Router::new().route(
-                "/internal/v1/responses",
-                post(move |uri: axum::http::Uri, headers: HeaderMap, Json(envelope): Json<TestModelGatewayEnvelope>| {
+                "/provider/v1/responses",
+                post(move |uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
                     let captured_request = Arc::clone(&captured_request);
                     async move {
                         *captured_request.lock().unwrap() = Some(CapturedRequest {
-                            uri: uri.to_string(),
+                            uri,
                             headers,
-                            envelope,
+                            body,
                         });
                         let stream = async_stream::stream! {
                             yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
@@ -2115,8 +2302,7 @@ mod tests {
         let original = Bytes::from_static(
             br#" { "model": "runtime-claim-model", "input": [], "stream": true } "#,
         );
-        let mut state = (*fixture.state).clone();
-        state.model_gateway_url = format!("http://{address}");
+        let state = (*fixture.state).clone();
         let app = build_router(state);
         let response = app
             .oneshot(
@@ -2171,32 +2357,16 @@ mod tests {
         drop(body);
 
         let captured = captured.lock().unwrap().clone().unwrap();
-        assert_eq!(captured.uri, "/internal/v1/responses");
+        assert_eq!(captured.uri.path(), "/provider/v1/responses");
+        assert_eq!(captured.uri.query(), Some("include=usage&trace=1"));
         assert_eq!(
             captured.headers[header::AUTHORIZATION],
-            "Bearer test-gateway-token"
+            "Bearer runtime-claim-secret"
         );
+        assert_eq!(captured.body, original);
         assert_eq!(
-            captured.envelope.protocol,
-            ModelUpstreamProtocol::OpenaiResponses
-        );
-        assert_eq!(
-            captured.envelope.request_settings,
-            ModelRequestSettings::default()
-        );
-        assert_eq!(
-            captured.envelope.endpoint,
-            format!("http://{address}/provider")
-        );
-        assert_eq!(captured.envelope.api_key, "runtime-claim-secret");
-        assert_eq!(
-            captured.envelope.query.as_deref(),
-            Some("include=usage&trace=1")
-        );
-        assert_eq!(decode_gateway_body(&captured.envelope), original);
-        assert_eq!(
-            captured.envelope.headers.get("x-client-feature"),
-            Some(&vec!["preserve-me".into()])
+            captured.headers.get("x-client-feature").unwrap(),
+            "preserve-me"
         );
         for filtered in [
             "cookie",
@@ -2204,7 +2374,7 @@ mod tests {
             MODEL_PROXY_BINDING_ID_HEADER,
             "x-client-hop",
         ] {
-            assert!(!captured.envelope.headers.contains_key(filtered));
+            assert!(!captured.headers.contains_key(filtered));
         }
 
         let usage: (Uuid, String, i64, i64, i64, i64, i64, Uuid) = sqlx::query_as(
@@ -2216,10 +2386,10 @@ mod tests {
         .fetch_one(&fixture.state.pool)
         .await
         .unwrap();
+        assert_ne!(usage.0, Uuid::nil());
         assert_eq!(
-            usage,
+            (usage.1, usage.2, usage.3, usage.4, usage.5, usage.6, usage.7),
             (
-                Uuid::parse_str(&captured.envelope.request_id).unwrap(),
                 "completed".into(),
                 11,
                 7,
@@ -2263,14 +2433,10 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let app = Router::new().route(
-                "/internal/v1/responses",
-                post(|Json(envelope): Json<TestModelGatewayEnvelope>| async move {
-                    if envelope.protocol != ModelUpstreamProtocol::OpenaiResponses {
-                        return StatusCode::BAD_REQUEST.into_response();
-                    }
-                    let case = envelope
-                        .query
-                        .as_deref()
+                "/provider/v1/responses",
+                post(|uri: axum::http::Uri, _body: Bytes| async move {
+                    let case = uri
+                        .query()
                         .and_then(|query| query.strip_prefix("case="))
                         .unwrap_or("retry");
                     if case == "stream_error" {
@@ -2372,8 +2538,7 @@ mod tests {
         .execute(&fixture.state.pool)
         .await
         .unwrap();
-        let mut state = (*fixture.state).clone();
-        state.model_gateway_url = format!("http://{address}");
+        let state = (*fixture.state).clone();
         let app = build_router(state);
 
         for (case, expected_status) in [
@@ -2639,7 +2804,7 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .method(Method::POST)
-                    .uri("/api/runtime/model-proxy/v1/chat/completions")
+                    .uri("/api/runtime/model-proxy/v1/models")
                     .header(
                         header::AUTHORIZATION,
                         format!("Bearer {}", claim.model_proxy_token),
@@ -2679,7 +2844,7 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     async fn model_proxy_uses_turn_selection_snapshot_and_fresh_connection_secret(pool: PgPool) {
         let captured = Arc::new(std::sync::Mutex::new(
-            None::<(HeaderMap, TestModelGatewayEnvelope)>,
+            None::<(HeaderMap, axum::http::Uri, Bytes)>,
         ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -2687,11 +2852,11 @@ mod tests {
         let server =
             tokio::spawn(async move {
                 let app = Router::new().route(
-                "/internal/v1/responses",
-                post(move |headers: HeaderMap, Json(envelope): Json<TestModelGatewayEnvelope>| {
+                "/rotated/v1/responses",
+                post(move |uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
                     let captured_request = Arc::clone(&captured_request);
                     async move {
-                        *captured_request.lock().unwrap() = Some((headers, envelope));
+                        *captured_request.lock().unwrap() = Some((headers, uri, body));
                         Json(json!({
                             "status": "completed",
                             "usage": {
@@ -2746,8 +2911,7 @@ mod tests {
         .execute(&fixture.state.pool)
         .await
         .unwrap();
-        let mut state = (*fixture.state).clone();
-        state.model_gateway_url = format!("http://{address}");
+        let state = (*fixture.state).clone();
         let app = build_router(state);
 
         let current_turn = model_proxy_test_http_request(
@@ -2763,11 +2927,13 @@ mod tests {
         let _ = axum::body::to_bytes(current_turn.into_body(), usize::MAX)
             .await
             .unwrap();
-        let (headers, envelope) = captured.lock().unwrap().clone().unwrap();
-        assert_eq!(headers[header::AUTHORIZATION], "Bearer test-gateway-token");
-        assert_eq!(envelope.api_key, "rotated-provider-secret");
-        assert_eq!(envelope.endpoint, format!("http://{address}/rotated"));
-        let request_body: Value = serde_json::from_slice(&decode_gateway_body(&envelope)).unwrap();
+        let (headers, uri, body) = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            headers[header::AUTHORIZATION],
+            "Bearer rotated-provider-secret"
+        );
+        assert_eq!(uri.path(), "/rotated/v1/responses");
+        let request_body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(request_body["model"], "runtime-claim-model");
         assert_eq!(
             sqlx::query_scalar::<_, String>(
@@ -2800,8 +2966,8 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let app = Router::new().route(
-                "/internal/v1/responses",
-                post(|Json(_envelope): Json<TestModelGatewayEnvelope>| async {
+                "/subagent/v1/responses",
+                post(|_body: Bytes| async {
                     Json(json!({
                         "status": "completed",
                         "usage": {
@@ -2857,8 +3023,7 @@ mod tests {
         .execute(&fixture.state.pool)
         .await
         .unwrap();
-        let mut state = (*fixture.state).clone();
-        state.model_gateway_url = format!("http://{address}");
+        let state = (*fixture.state).clone();
         let app = build_router(state);
 
         let response = model_proxy_test_http_request(
@@ -2909,12 +3074,16 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let app = Router::new().route(
-                "/internal/v1/responses",
-                post(|Json(envelope): Json<TestModelGatewayEnvelope>| async move {
-                    if envelope.endpoint.ends_with("/header") {
+            let app = Router::new()
+                .route(
+                    "/header/v1/responses",
+                    post(|_uri: axum::http::Uri| async move {
                         std::future::pending::<Response>().await
-                    } else {
+                    }),
+                )
+                .route(
+                    "/body/v1/responses",
+                    post(|_uri: axum::http::Uri| async move {
                         let stream = async_stream::stream! {
                             yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
                                 b"event: response.created\ndata: {\"type\":\"response.created\"}\n\n",
@@ -2927,9 +3096,8 @@ mod tests {
                             HeaderValue::from_static("text/event-stream"),
                         );
                         response
-                    }
-                }),
-            );
+                    }),
+                );
             axum::serve(listener, app).await.unwrap();
         });
 
@@ -2962,7 +3130,6 @@ mod tests {
             .read_timeout(Duration::from_millis(100))
             .build()
             .unwrap();
-        header_state.model_gateway_url = format!("http://{address}");
         let header_app = build_router(header_state);
         let header_timeout = model_proxy_test_http_request(
             &header_app,
@@ -3016,7 +3183,6 @@ mod tests {
             .read_timeout(Duration::from_millis(100))
             .build()
             .unwrap();
-        body_state.model_gateway_url = format!("http://{address}");
         let body_app = build_router(body_state);
         let body_timeout = model_proxy_test_http_request(
             &body_app,
@@ -3071,13 +3237,12 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
-                Router::new().route("/internal/v1/responses", post(slow_sse_model_upstream)),
+                Router::new().route("/v1/responses", post(slow_sse_model_upstream)),
             )
             .await
             .unwrap();
         });
-        let mut state = test_model_proxy_state();
-        state.model_gateway_url = format!("http://{address}");
+        let state = test_model_proxy_state();
 
         let response = proxy_model_request_to_upstream(
             &state,
@@ -3128,13 +3293,12 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
-                Router::new().route("/internal/v1/responses", post(model_upstream_rate_limited)),
+                Router::new().route("/v1/responses", post(model_upstream_rate_limited)),
             )
             .await
             .unwrap();
         });
-        let mut state = test_model_proxy_state();
-        state.model_gateway_url = format!("http://{address}");
+        let state = test_model_proxy_state();
 
         let response = proxy_model_request_to_upstream(
             &state,
@@ -3167,15 +3331,14 @@ mod tests {
             axum::serve(
                 listener,
                 Router::new().route(
-                    "/internal/v1/responses",
+                    "/v1/responses",
                     post(model_upstream_never_sends_headers),
                 ),
             )
             .await
             .unwrap();
         });
-        let mut state = test_model_proxy_state_with_timeout(Duration::from_millis(100));
-        state.model_gateway_url = format!("http://{address}");
+        let state = test_model_proxy_state_with_timeout(Duration::from_millis(100));
 
         let error = proxy_model_request_to_upstream(
             &state,
@@ -3196,8 +3359,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
-        let mut state = test_model_proxy_state_with_timeout(Duration::from_millis(100));
-        state.model_gateway_url = format!("http://{address}");
+        let state = test_model_proxy_state_with_timeout(Duration::from_millis(100));
 
         let error = proxy_model_request_to_upstream(
             &state,
@@ -3222,15 +3384,14 @@ mod tests {
             axum::serve(
                 listener,
                 Router::new().route(
-                    "/internal/v1/responses",
+                    "/v1/responses",
                     post(model_upstream_stalls_after_first_chunk),
                 ),
             )
             .await
             .unwrap();
         });
-        let mut state = test_model_proxy_state_with_timeout(Duration::from_millis(150));
-        state.model_gateway_url = format!("http://{address}");
+        let state = test_model_proxy_state_with_timeout(Duration::from_millis(150));
         let response = proxy_model_request_to_upstream(
             &state,
             &format!("http://{address}"),
@@ -3264,34 +3425,31 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let captured_request = Arc::clone(&captured);
         let server = tokio::spawn(async move {
-            let handler =
-                move |headers: HeaderMap, Json(envelope): Json<TestModelGatewayEnvelope>| {
-                    let captured_request = Arc::clone(&captured_request);
-                    async move {
-                        let body = decode_gateway_body(&envelope);
-                        *captured_request.lock().unwrap() = Some((headers, envelope));
-                        let mut response = Response::new(Body::from(body));
-                        response.headers_mut().insert(
-                            header::CONTENT_TYPE,
-                            HeaderValue::from_static("application/json"),
-                        );
-                        response
-                    }
-                };
+            let handler = move |headers: HeaderMap, uri: axum::http::Uri, body: Bytes| {
+                let captured_request = Arc::clone(&captured_request);
+                async move {
+                    *captured_request.lock().unwrap() = Some((headers, uri, body.clone()));
+                    let mut response = Response::new(Body::from(body));
+                    response.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    response
+                }
+            };
             axum::serve(
                 listener,
-                Router::new().route("/internal/v1/responses", post(handler)),
+                Router::new().route("/custom/v1/responses", post(handler)),
             )
             .await
             .unwrap();
         });
-        let mut state = test_model_proxy_state();
-        state.model_gateway_url = format!("http://{address}");
+        let state = test_model_proxy_state();
         let original = Bytes::from_static(br#" { "model": "test-model", "input": [] } "#);
 
         let response = proxy_model_request_to_upstream(
             &state,
-            "https://provider.example/custom",
+            &format!("http://{address}/custom"),
             "responses",
             original.clone(),
         )
@@ -3303,17 +3461,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(body, original);
-        let (headers, envelope) = captured.lock().unwrap().clone().unwrap();
-        assert_eq!(headers[header::AUTHORIZATION], "Bearer test-gateway-token");
-        assert!(Uuid::parse_str(&envelope.request_id).is_ok());
-        assert_eq!(envelope.protocol, ModelUpstreamProtocol::OpenaiResponses);
-        assert_eq!(envelope.request_settings, ModelRequestSettings::default());
-        assert_eq!(envelope.endpoint, "https://provider.example/custom");
-        assert_eq!(envelope.api_key, "test-provider-secret");
-        assert_eq!(envelope.query, None);
+        let (headers, uri, body) = captured.lock().unwrap().clone().unwrap();
         assert_eq!(
-            envelope.headers.get("content-type"),
-            Some(&vec!["application/json".into()])
+            headers[header::AUTHORIZATION],
+            "Bearer test-provider-secret"
+        );
+        assert_eq!(uri.path(), "/custom/v1/responses");
+        assert_eq!(uri.query(), None);
+        assert_eq!(body, original);
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
         );
         server.abort();
     }
@@ -3901,22 +4059,18 @@ mod tests {
     async fn model_connection_test_calls_responses_and_attributes_usage_and_errors(pool: PgPool) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let upstream = Router::new().route(
-            "/internal/v1/responses",
-            post(
-                |headers: HeaderMap, Json(envelope): Json<TestModelGatewayEnvelope>| async move {
+        let upstream = Router::new().fallback(
+            |headers: HeaderMap, uri: axum::http::Uri, body: Bytes| async move {
                     if headers
                         .get(header::AUTHORIZATION)
                         .and_then(|value| value.to_str().ok())
-                        != Some("Bearer test-gateway-token")
+                        != Some("Bearer provider-secret")
                     {
                         return StatusCode::UNAUTHORIZED.into_response();
                     }
-                    if envelope.endpoint.ends_with("/ok") {
-                        let body: Value =
-                            serde_json::from_slice(&decode_gateway_body(&envelope)).unwrap();
-                        if envelope.api_key != "provider-secret"
-                            || body.get("model").and_then(Value::as_str) != Some("test-model")
+                    if uri.path().starts_with("/ok") {
+                        let body: Value = serde_json::from_slice(&body).unwrap();
+                        if body.get("model").and_then(Value::as_str) != Some("test-model")
                             || body.get("input").and_then(Value::as_str) != Some("hi")
                             || body.get("max_output_tokens").and_then(Value::as_u64) != Some(256)
                         {
@@ -3951,7 +4105,7 @@ mod tests {
                         )
                             .into_response();
                     }
-                    if envelope.endpoint.ends_with("/fail") {
+                    if uri.path().starts_with("/fail") {
                         return (
                             StatusCode::TOO_MANY_REQUESTS,
                             Json(json!({
@@ -3977,14 +4131,12 @@ mod tests {
                     );
                     response
                 },
-            ),
         );
         let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
 
         let member_token = create_user_session_with_role(&pool, "member").await;
         let member_headers = session_headers(&member_token);
-        let mut test_state = test_state_with_browser_session_auth(pool.clone());
-        test_state.model_gateway_url = format!("http://{address}");
+        let test_state = test_state_with_browser_session_auth(pool.clone());
         let state = Arc::new(test_state);
         let member = require_user(&state, &member_headers).await.unwrap();
         let successful = create_model_connection(
@@ -4497,17 +4649,17 @@ mod tests {
     #[sqlx::test(migrations = "./migrations")]
     #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
     async fn model_proxy_rewrites_vision_requests_to_the_vision_model(pool: PgPool) {
-        let captured = Arc::new(std::sync::Mutex::new(None::<TestModelGatewayEnvelope>));
+        let captured = Arc::new(std::sync::Mutex::new(None::<Bytes>));
         let captured_route = Arc::clone(&captured);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let app = Router::new().route(
-                "/internal/v1/responses",
-                post(move |Json(envelope): Json<TestModelGatewayEnvelope>| {
+                "/v1/responses",
+                post(move |body: Bytes| {
                     let captured_route = Arc::clone(&captured_route);
                     async move {
-                        *captured_route.lock().unwrap() = Some(envelope);
+                        *captured_route.lock().unwrap() = Some(body);
                         Json(json!({ "status": "completed" }))
                     }
                 }),
@@ -4517,11 +4669,13 @@ mod tests {
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
         sqlx::query(
             "UPDATE model_connections
-             SET allowed_model_ids = ARRAY['runtime-claim-model', 'vision-claim-model'],
+             SET base_url = $2,
+                 allowed_model_ids = ARRAY['runtime-claim-model', 'vision-claim-model'],
                  vision_model_id = 'vision-claim-model'
              WHERE id = $1",
         )
         .bind(fixture.model_connection_id)
+        .bind(format!("http://{address}"))
         .execute(&fixture.state.pool)
         .await
         .unwrap();
@@ -4538,8 +4692,7 @@ mod tests {
         .execute(&fixture.state.pool)
         .await
         .unwrap();
-        let mut state = (*fixture.state).clone();
-        state.model_gateway_url = format!("http://{address}");
+        let state = (*fixture.state).clone();
         let app = build_router(state);
 
         let request = axum::http::Request::builder()
@@ -4559,8 +4712,8 @@ mod tests {
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let envelope = captured.lock().unwrap().take().expect("gateway captured");
-        let forwarded: Value = serde_json::from_slice(&decode_gateway_body(&envelope)).unwrap();
+        let body = captured.lock().unwrap().take().expect("upstream captured");
+        let forwarded: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(forwarded["model"], "vision-claim-model");
         assert_eq!(forwarded["input"], json!([]));
         assert_eq!(forwarded["stream"], json!(false));

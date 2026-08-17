@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 本文件记录 Agent Hub 各正式版本面向使用者的变化。
 
+## [0.4.0] - 2026-08-17
+
+### Changed
+
+- 移除内部 Model Gateway（Go/Bifrost 协议转换层）：Hub 直连上游模型端点，只做认证改写与安全头过滤，请求体原样透传，不再做任何协议转换。
+- Pi 按 Run Binding 的 API 类型原生直连 `openai-responses` / `openai-completions` / `anthropic-messages`（Anthropic 使用根 URL，避免 `/v1/v1/messages`）。
+- 用量/错误记账扩展三协议：Chat Completions（`finish_reason` + `prompt_tokens`，流式等 `[DONE]` 后落账）、Anthropic Messages（`message_start`/`message_delta`/`message_stop`，`cache_creation`/`cache_read` 计入 input）；终态映射与 Pi 一致（`content_filter`/`network_error`/`refusal`/`sensitive`/未知值记为失败）。
+- 会话标题生成与模型连接测试按协议构造请求并解析响应/usage。
+- 模型代理路径与 Run Binding 协议强制一致（不匹配 fail closed）；无法表示为 HTTP 头的凭据拒绝发送（fail closed），认证头标记 sensitive。
+- 采样覆盖（`temperature`/`top_p`）随网关移除停用（前端禁用并提示）；`max_completion_tokens`/`max_tokens` 仍作为 Pi 的 maxTokens 上限。
+
 ## [0.3.13] - 2026-08-16
 
 ### Fixed

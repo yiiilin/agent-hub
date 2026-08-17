@@ -31,7 +31,6 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::authorize_run_stream;
-use crate::extract_model_usage;
 use crate::insert_hub_native_session_tx;
 use crate::load_agent_for_user;
 use crate::load_run_for_user;
@@ -41,15 +40,15 @@ use crate::load_widget_scoped_session_tx;
 use crate::missing_secret_grants;
 use crate::model_connection_scope_name;
 use crate::model_request_settings_value;
-use crate::model_response_status;
-use crate::model_test_response_text;
+use crate::model_response_status_for;
+use crate::model_test_response_text_for;
 use crate::model_upstream_protocol_from_name;
 use crate::model_upstream_protocol_name;
 use crate::normalize_client_message_key;
 use crate::record_runtime_session_cleanup_tx;
-use crate::send_model_gateway_request;
+use crate::send_model_upstream_request;
 use crate::widget_session_locator;
-use crate::ModelGatewayForwardRequest;
+use crate::ModelUpstreamForwardRequest;
 use crate::ObservedModelUsage;
 use crate::MAX_ATTACHMENT_BYTES_PER_SESSION;
 #[cfg(test)]
@@ -136,9 +135,6 @@ pub(crate) async fn generate_session_title_in_background(
         };
         let api_type =
             model_upstream_protocol_from_name(&model.get::<String, _>("api_type"));
-        if api_type != ModelUpstreamProtocol::OpenaiResponses {
-            return Ok(());
-        }
         let connection_id: Uuid = model.get("model_connection_id");
         let model_id: String = model.get("model_id");
         let base_url: String = model.get("base_url");
@@ -161,20 +157,20 @@ pub(crate) async fn generate_session_title_in_background(
             "根据用户的第一条消息，为这段对话生成一个简洁的中文标题（15 字以内），概括用户的意图或任务主题。\n要求：不要写问候语或自我介绍；不要写“我能做什么”之类的回应；直接输出标题本身；不要引号，不要解释。\n\n示例：\n用户消息：帮我看看如何排查网络延迟问题\n标题：网络延迟问题排查\n\n用户消息：你好\n标题：日常问候\n\n用户消息：帮我规划一下数据库备份策略\n标题：数据库备份策略规划\n\n用户消息：{}\n标题：",
             first_message.chars().take(400).collect::<String>()
         );
-        let request_body = serde_json::to_vec(&json!({
-            "model": model_id,
-            "input": prompt,
-            "max_output_tokens": 64,
-            "temperature": 0.3
-        }))?;
+        let request_body = build_model_request_body(
+            &model_id,
+            &prompt,
+            64,
+            0.3,
+            api_type,
+        )?;
         let request_id = Uuid::new_v4();
-        let response = send_model_gateway_request(
+        let response = send_model_upstream_request(
             &state,
-            ModelGatewayForwardRequest {
-                request_id,
+            ModelUpstreamForwardRequest {
                 upstream_protocol: api_type,
-                request_settings: &request_settings,
                 upstream_url: &base_url,
+                path: api_type.upstream_path(),
                 query: None,
                 headers: &HeaderMap::new(),
                 body: &request_body,
@@ -186,12 +182,13 @@ pub(crate) async fn generate_session_title_in_background(
         let body = response.bytes().await?;
         let value = serde_json::from_slice::<Value>(&body)?;
         if status.is_success() {
-            if let Some(usage) = extract_model_usage(&value) {
+            if let Some(usage) = extract_model_usage_for(&value, api_type) {
                 record_session_title_usage(
                     &state,
                     request_id,
                     &value,
                     usage,
+                    api_type,
                     connection_id,
                     &connection_scope,
                     &connection_name,
@@ -203,7 +200,7 @@ pub(crate) async fn generate_session_title_in_background(
                 )
                 .await?;
             }
-            if let Some(text) = model_test_response_text(&value) {
+            if let Some(text) = model_test_response_text_for(&value, api_type) {
                 let title = sanitize_session_title(&text);
                 if !title.is_empty() {
                     sqlx::query(
@@ -266,6 +263,7 @@ pub(crate) async fn record_session_title_usage(
     request_id: Uuid,
     response: &Value,
     usage: ObservedModelUsage,
+    api_type: ModelUpstreamProtocol,
     connection_id: Uuid,
     connection_scope: &ModelConnectionScope,
     connection_name: &str,
@@ -280,7 +278,7 @@ pub(crate) async fn record_session_title_usage(
             .bind(user_id)
             .fetch_optional(&state.pool)
             .await?;
-    let response_status = model_response_status(Some(response), true);
+    let response_status = model_response_status_for(Some(response), true, api_type);
     sqlx::query(
         "INSERT INTO model_token_usage
              (id, request_id, response_status, model_connection_id,
