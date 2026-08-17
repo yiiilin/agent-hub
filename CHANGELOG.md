@@ -6,7 +6,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 本文件记录 Agent Hub 各正式版本面向使用者的变化。
 
+## [0.4.2] - 2026-08-17
+
+### Fixed
+
+- 修复 `tool_result_read` 工具失效：Pi 扩展的 `execute` 签名与 Pi API（`execute(toolCallId, params, signal)`）不匹配，导致 broker 请求缺少 `tool_call_id` 字段、截断的工具结果永远无法读取全文（部署日志"总是被截断"的根因）；新增源码级回归测试。
+
 ## [0.4.1] - 2026-08-17
+
 
 ### Changed
 

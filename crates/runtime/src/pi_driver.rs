@@ -197,8 +197,11 @@ export default function registerAgentHubToolResultRead(pi) {
       },
       required: ["tool_call_id", "mode"],
     },
-    async execute(args, { signal }) {
-      const response = await callBroker(args, signal);
+    // Pi 的 AgentTool.execute 签名：execute(toolCallId, params, signal, onUpdate)。
+    // 第一个参数是 toolCallId 字符串，第二个参数才是工具参数对象（含 tool_call_id 字段）。
+    // 禁止写成 execute(args, …) —— 那会把 toolCallId 当参数对象展开，broker 收不到 tool_call_id。
+    async execute(_toolCallId, params, signal) {
+      const response = await callBroker(params, signal);
       if (response.error) throw new Error(response.error);
       return {
         content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
@@ -4172,5 +4175,26 @@ if [ "$$" -ne 1 ] && IFS= read -r _ < /proc/1/maps; then exit 31; fi
             })
             .count();
         assert_eq!(deltas, 1, "only the delta before the cap is streamed");
+    }
+
+    #[test]
+    fn tool_result_read_extension_uses_the_pi_execute_signature() {
+        // Pi 的 AgentTool.execute 签名是 execute(toolCallId, params, signal, onUpdate)：
+        // 第一个参数是 toolCallId 字符串，第二个参数才是工具参数对象。
+        // 扩展必须把 params（含 tool_call_id 字段）传给 broker；
+        // 曾误写 execute(args, …) 导致 JSON.stringify 展开字符串、broker 报 missing field tool_call_id。
+        assert!(
+            PI_TOOL_RESULT_EXTENSION_SOURCE.contains("async execute(_toolCallId, params, signal)"),
+            "tool_result_read 扩展 execute 签名必须与 Pi API 对齐"
+        );
+        assert!(
+            !PI_TOOL_RESULT_EXTENSION_SOURCE.contains("async execute(args, { signal })"),
+            "禁止把 toolCallId 当作参数对象（会丢失 tool_call_id 字段）"
+        );
+        // skill_exec 扩展已使用正确签名，保持一致。
+        assert!(
+            SKILL_EXEC_EXTENSION_SOURCE.contains("async execute(_toolCallId, params, signal)"),
+            "skill_exec 扩展签名应保持正确基线"
+        );
     }
 }
