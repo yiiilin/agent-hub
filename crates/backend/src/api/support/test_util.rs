@@ -2,11 +2,7 @@
 //! 供各域测试复用（cfg(test) 下经 api::support re-export 回 main.rs）。
 
 use super::*;
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use agent_hub_backend::ModelSecretCipher;
 use agent_hub_shared::*;

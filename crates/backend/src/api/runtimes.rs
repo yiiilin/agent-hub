@@ -5394,7 +5394,10 @@ impl std::fmt::Display for ModelUpstreamSendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidAuthHeader => {
-                write!(f, "model connection credential cannot be represented as an HTTP header")
+                write!(
+                    f,
+                    "model connection credential cannot be represented as an HTTP header"
+                )
             }
             Self::Request(error) => write!(f, "model upstream request failed: {error}"),
         }
@@ -5537,8 +5540,9 @@ pub(crate) async fn proxy_model_request_to_upstream_with_options(
                         upstream_http_status: None,
                         error_kind: "transport".into(),
                         error_code: None,
-                        message: "model connection credential cannot be represented as an HTTP header"
-                            .into(),
+                        message:
+                            "model connection credential cannot be represented as an HTTP header"
+                                .into(),
                     }),
                 };
                 persist_model_proxy_observation(&state.pool, accounting, observation).await;
@@ -5899,7 +5903,8 @@ impl ModelResponseObserver {
                 ModelProxyObserverProtocol::ChatCompletions => {
                     if self.sse_event_data.as_slice() == b"[DONE]" {
                         self.finish_chat_stream();
-                    } else if let Ok(value) = serde_json::from_slice::<Value>(&self.sse_event_data) {
+                    } else if let Ok(value) = serde_json::from_slice::<Value>(&self.sse_event_data)
+                    {
                         self.push_chat_sse_event(&value);
                     }
                 }
@@ -5917,13 +5922,21 @@ impl ModelResponseObserver {
     }
 
     fn push_chat_sse_event(&mut self, value: &Value) {
-        if value.get("error").filter(|error| !error.is_null()).is_some() {
+        if value
+            .get("error")
+            .filter(|error| !error.is_null())
+            .is_some()
+        {
             if let Some(terminal) = chat_terminal_from_value(value, None) {
                 self.terminal = Some(terminal);
             }
             return;
         }
-        if value.get("usage").filter(|usage| !usage.is_null()).is_some() {
+        if value
+            .get("usage")
+            .filter(|usage| !usage.is_null())
+            .is_some()
+        {
             if let Some(usage) = extract_chat_usage(value) {
                 self.chat_usage = Some(usage);
             }
@@ -5974,13 +5987,12 @@ impl ModelResponseObserver {
                 }
             }
             Some("message_delta") => {
-                if let Some(stop) = value
-                    .pointer("/delta/stop_reason")
-                    .and_then(Value::as_str)
-                {
+                if let Some(stop) = value.pointer("/delta/stop_reason").and_then(Value::as_str) {
                     self.anthropic_stop_reason = Some(stop.to_owned());
                 }
-                if let Some(output) = value.pointer("/usage/output_tokens").and_then(Value::as_i64)
+                if let Some(output) = value
+                    .pointer("/usage/output_tokens")
+                    .and_then(Value::as_i64)
                 {
                     self.anthropic_output_tokens = output;
                 }
@@ -6030,7 +6042,10 @@ impl ModelResponseObserver {
                 });
             }
             Some("error") => {
-                let error = value.get("error").filter(|error| !error.is_null()).unwrap_or(value);
+                let error = value
+                    .get("error")
+                    .filter(|error| !error.is_null())
+                    .unwrap_or(value);
                 self.terminal = Some(ModelProxyTerminal {
                     response_status: "failed".into(),
                     usage: None,
@@ -6185,7 +6200,9 @@ fn model_proxy_terminal_from_value_for(
         ModelProxyObserverProtocol::Responses => {
             model_proxy_terminal_from_value_responses(value, event_type, fallback_status)
         }
-        ModelProxyObserverProtocol::ChatCompletions => chat_terminal_from_value(value, fallback_status),
+        ModelProxyObserverProtocol::ChatCompletions => {
+            chat_terminal_from_value(value, fallback_status)
+        }
         ModelProxyObserverProtocol::AnthropicMessages => {
             anthropic_terminal_from_value(value, fallback_status)
         }
@@ -6861,7 +6878,9 @@ mod tests {
         observer.push(
             b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
         );
-        observer.push(b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n");
+        observer.push(
+            b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        );
         assert!(!observer.has_terminal());
         // message_delta 两次：output_tokens 为累计值，覆盖语义 → 最终 5。
         observer.push(
@@ -6923,11 +6942,15 @@ mod tests {
             br#"{"id":"c1","choices":[{"message":{"role":"assistant","content":null},"finish_reason":"content_filter"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}"#,
         );
         let observation = observer.finish(StatusCode::OK, None, None);
-        let (status, usage) = observation.usage.expect("usage is still recorded for failed terminal");
+        let (status, usage) = observation
+            .usage
+            .expect("usage is still recorded for failed terminal");
         assert_eq!(status, "failed");
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 2);
-        let error = observation.error.expect("error recorded for content_filter");
+        let error = observation
+            .error
+            .expect("error recorded for content_filter");
         assert_eq!(error.response_status, "failed");
         assert_eq!(error.error_kind, "provider_failed");
     }
@@ -6942,7 +6965,9 @@ mod tests {
         let observation = observer.finish(StatusCode::OK, None, None);
         let (status, _) = observation.usage.expect("usage recorded");
         assert_eq!(status, "failed");
-        let error = observation.error.expect("error recorded for unknown finish_reason");
+        let error = observation
+            .error
+            .expect("error recorded for unknown finish_reason");
         assert_eq!(error.error_kind, "provider_failed");
     }
 
@@ -6954,7 +6979,9 @@ mod tests {
             br#"{"id":"m1","type":"message","role":"assistant","content":[],"stop_reason":"refusal","usage":{"input_tokens":10,"output_tokens":2}}"#,
         );
         let observation = observer.finish(StatusCode::OK, None, None);
-        let (status, usage) = observation.usage.expect("usage is still recorded for failed terminal");
+        let (status, usage) = observation
+            .usage
+            .expect("usage is still recorded for failed terminal");
         assert_eq!(status, "failed");
         assert_eq!(usage.input_tokens, 10);
         assert_eq!(usage.output_tokens, 2);
@@ -6963,9 +6990,7 @@ mod tests {
         assert_eq!(error.error_kind, "provider_failed");
     }
     #[sqlx::test(migrations = "./migrations")]
-    async fn send_model_upstream_request_fails_closed_on_unrepresentable_credentials(
-        pool: PgPool,
-    ) {
+    async fn send_model_upstream_request_fails_closed_on_unrepresentable_credentials(pool: PgPool) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -7009,7 +7034,9 @@ mod tests {
             body: b"{}",
             api_key: "bad\nkey",
         };
-        let error = send_model_upstream_request(&state, bad_openai).await.unwrap_err();
+        let error = send_model_upstream_request(&state, bad_openai)
+            .await
+            .unwrap_err();
         assert!(matches!(error, ModelUpstreamSendError::InvalidAuthHeader));
 
         // 非法 Anthropic key（含回车）→ 同样明确拒绝。
@@ -7022,7 +7049,9 @@ mod tests {
             body: b"{}",
             api_key: "bad\rkey",
         };
-        let error = send_model_upstream_request(&state, bad_anthropic).await.unwrap_err();
+        let error = send_model_upstream_request(&state, bad_anthropic)
+            .await
+            .unwrap_err();
         assert!(matches!(error, ModelUpstreamSendError::InvalidAuthHeader));
 
         // 合法 key 正常发出（含 Anthropic 认证头路径）。

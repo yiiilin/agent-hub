@@ -2613,8 +2613,14 @@ mod tests {
 
     #[test]
     fn model_upstream_protocol_maps_pi_api_and_upstream_path() {
-        assert_eq!(ModelUpstreamProtocol::OpenaiResponses.pi_api_name(), "openai-responses");
-        assert_eq!(ModelUpstreamProtocol::OpenaiResponses.upstream_path(), "responses");
+        assert_eq!(
+            ModelUpstreamProtocol::OpenaiResponses.pi_api_name(),
+            "openai-responses"
+        );
+        assert_eq!(
+            ModelUpstreamProtocol::OpenaiResponses.upstream_path(),
+            "responses"
+        );
         assert!(!ModelUpstreamProtocol::OpenaiResponses.is_anthropic());
 
         assert_eq!(
@@ -2631,7 +2637,10 @@ mod tests {
             ModelUpstreamProtocol::AnthropicMessages.pi_api_name(),
             "anthropic-messages"
         );
-        assert_eq!(ModelUpstreamProtocol::AnthropicMessages.upstream_path(), "messages");
+        assert_eq!(
+            ModelUpstreamProtocol::AnthropicMessages.upstream_path(),
+            "messages"
+        );
         assert!(ModelUpstreamProtocol::AnthropicMessages.is_anthropic());
     }
 

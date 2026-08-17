@@ -4031,9 +4031,7 @@ async fn start_model_proxy(
     let app = Router::new()
         .route(
             "/v1/{*path}",
-            post(local_model_proxy_request).layer(DefaultBodyLimit::max(
-                MODEL_PROXY_BODY_LIMIT,
-            )),
+            post(local_model_proxy_request).layer(DefaultBodyLimit::max(MODEL_PROXY_BODY_LIMIT)),
         )
         .with_state(Arc::clone(&state));
     let handle = tokio::spawn(async move {

@@ -604,14 +604,9 @@ pub(crate) async fn test_model_connection(
         request_settings: &request_settings,
         user: &user,
     };
-    let request_body = build_model_request_body(
-        model_id,
-        message,
-        256,
-        1.0,
-        connection.dto.api_type,
-    )
-    .map_err(|_| ApiError::internal("failed to encode Model Connection test request"))?;
+    let request_body =
+        build_model_request_body(model_id, message, 256, 1.0, connection.dto.api_type)
+            .map_err(|_| ApiError::internal("failed to encode Model Connection test request"))?;
     let request_headers = HeaderMap::new();
     let started_at = Instant::now();
     let response = send_model_upstream_request(
@@ -1196,7 +1191,7 @@ pub(crate) fn extract_model_usage(response: &Value) -> Option<ObservedModelUsage
         && observed.total_tokens == observed.input_tokens + observed.output_tokens
         && (0..=observed.input_tokens).contains(&observed.cached_tokens)
         && (0..=observed.output_tokens).contains(&observed.reasoning_tokens))
-        .then_some(observed)
+    .then_some(observed)
 }
 
 /// Chat Completions usage：`prompt_tokens` / `completion_tokens` / `total_tokens`。
@@ -1221,13 +1216,13 @@ pub(crate) fn extract_chat_usage(response: &Value) -> Option<ObservedModelUsage>
         && total_tokens == input_tokens + output_tokens
         && (0..=input_tokens).contains(&cached_tokens)
         && (0..=output_tokens).contains(&reasoning_tokens))
-        .then_some(ObservedModelUsage {
-            input_tokens,
-            output_tokens,
-            total_tokens,
-            cached_tokens,
-            reasoning_tokens,
-        })
+    .then_some(ObservedModelUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        cached_tokens,
+        reasoning_tokens,
+    })
 }
 
 /// Anthropic Messages usage：总 input = input_tokens + cache_creation + cache_read，
@@ -1253,13 +1248,13 @@ pub(crate) fn extract_anthropic_usage(response: &Value) -> Option<ObservedModelU
         && output_tokens >= 0
         && (0..=input_tokens).contains(&read)
         && (0..=output_tokens).contains(&reasoning_tokens))
-        .then_some(ObservedModelUsage {
-            input_tokens,
-            output_tokens,
-            total_tokens: input_tokens + output_tokens,
-            cached_tokens: read,
-            reasoning_tokens,
-        })
+    .then_some(ObservedModelUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens: input_tokens + output_tokens,
+        cached_tokens: read,
+        reasoning_tokens,
+    })
 }
 
 pub(crate) fn model_response_status(response: Option<&Value>, http_success: bool) -> &'static str {
@@ -2389,15 +2384,7 @@ mod tests {
         assert_ne!(usage.0, Uuid::nil());
         assert_eq!(
             (usage.1, usage.2, usage.3, usage.4, usage.5, usage.6, usage.7),
-            (
-                "completed".into(),
-                11,
-                7,
-                18,
-                3,
-                5,
-                fixture.agent_id
-            )
+            ("completed".into(), 11, 7, 18, 3, 5, fixture.agent_id)
         );
         for table_and_column in [
             ("run_model_bindings", "model_settings->'request_settings'"),
@@ -2849,27 +2836,28 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let captured_request = Arc::clone(&captured);
-        let server =
-            tokio::spawn(async move {
-                let app = Router::new().route(
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
                 "/rotated/v1/responses",
-                post(move |uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
-                    let captured_request = Arc::clone(&captured_request);
-                    async move {
-                        *captured_request.lock().unwrap() = Some((headers, uri, body));
-                        Json(json!({
-                            "status": "completed",
-                            "usage": {
-                                "input_tokens": 3,
-                                "output_tokens": 2,
-                                "total_tokens": 5
-                            }
-                        }))
-                    }
-                }),
+                post(
+                    move |uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
+                        let captured_request = Arc::clone(&captured_request);
+                        async move {
+                            *captured_request.lock().unwrap() = Some((headers, uri, body));
+                            Json(json!({
+                                "status": "completed",
+                                "usage": {
+                                    "input_tokens": 3,
+                                    "output_tokens": 2,
+                                    "total_tokens": 5
+                                }
+                            }))
+                        }
+                    },
+                ),
             );
-                axum::serve(listener, app).await.unwrap();
-            });
+            axum::serve(listener, app).await.unwrap();
+        });
         let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
         let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
         let main_binding_id = model_binding_id(&claim, "main");
@@ -3330,10 +3318,7 @@ mod tests {
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
-                Router::new().route(
-                    "/v1/responses",
-                    post(model_upstream_never_sends_headers),
-                ),
+                Router::new().route("/v1/responses", post(model_upstream_never_sends_headers)),
             )
             .await
             .unwrap();
@@ -4061,76 +4046,76 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let upstream = Router::new().fallback(
             |headers: HeaderMap, uri: axum::http::Uri, body: Bytes| async move {
-                    if headers
-                        .get(header::AUTHORIZATION)
-                        .and_then(|value| value.to_str().ok())
-                        != Some("Bearer provider-secret")
+                if headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    != Some("Bearer provider-secret")
+                {
+                    return StatusCode::UNAUTHORIZED.into_response();
+                }
+                if uri.path().starts_with("/ok") {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    if body.get("model").and_then(Value::as_str) != Some("test-model")
+                        || body.get("input").and_then(Value::as_str) != Some("hi")
+                        || body.get("max_output_tokens").and_then(Value::as_u64) != Some(256)
                     {
-                        return StatusCode::UNAUTHORIZED.into_response();
-                    }
-                    if uri.path().starts_with("/ok") {
-                        let body: Value = serde_json::from_slice(&body).unwrap();
-                        if body.get("model").and_then(Value::as_str) != Some("test-model")
-                            || body.get("input").and_then(Value::as_str) != Some("hi")
-                            || body.get("max_output_tokens").and_then(Value::as_u64) != Some(256)
-                        {
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                Json(json!({ "error": { "code": "bad_test_request" } })),
-                            )
-                                .into_response();
-                        }
                         return (
-                            StatusCode::OK,
-                            Json(json!({
-                                "id": "resp_test",
-                                "object": "response",
-                                "status": "completed",
-                                "output": [{
-                                    "type": "message",
-                                    "role": "assistant",
-                                    "content": [{
-                                        "type": "output_text",
-                                        "text": "Hello from the model"
-                                    }]
-                                }],
-                                "usage": {
-                                    "input_tokens": 11,
-                                    "output_tokens": 7,
-                                    "total_tokens": 18,
-                                    "input_tokens_details": { "cached_tokens": 3 },
-                                    "output_tokens_details": { "reasoning_tokens": 5 }
-                                }
-                            })),
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({ "error": { "code": "bad_test_request" } })),
                         )
                             .into_response();
                     }
-                    if uri.path().starts_with("/fail") {
-                        return (
-                            StatusCode::TOO_MANY_REQUESTS,
-                            Json(json!({
-                                "error": {
-                                    "code": "rate_provider-secret_limit",
-                                    "message": "provider provider-secret rejected the request"
-                                }
-                            })),
-                        )
-                            .into_response();
-                    }
-                    let stream = async_stream::stream! {
-                        yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
-                            br#"{"id":"partial""#,
-                        ));
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        yield Err(std::io::Error::other("upstream body failed"));
-                    };
-                    let mut response = Response::new(Body::from_stream(stream));
-                    response.headers_mut().insert(
-                        header::CONTENT_TYPE,
-                        HeaderValue::from_static("application/json"),
-                    );
-                    response
-                },
+                    return (
+                        StatusCode::OK,
+                        Json(json!({
+                            "id": "resp_test",
+                            "object": "response",
+                            "status": "completed",
+                            "output": [{
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{
+                                    "type": "output_text",
+                                    "text": "Hello from the model"
+                                }]
+                            }],
+                            "usage": {
+                                "input_tokens": 11,
+                                "output_tokens": 7,
+                                "total_tokens": 18,
+                                "input_tokens_details": { "cached_tokens": 3 },
+                                "output_tokens_details": { "reasoning_tokens": 5 }
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+                if uri.path().starts_with("/fail") {
+                    return (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        Json(json!({
+                            "error": {
+                                "code": "rate_provider-secret_limit",
+                                "message": "provider provider-secret rejected the request"
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+                let stream = async_stream::stream! {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                        br#"{"id":"partial""#,
+                    ));
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    yield Err(std::io::Error::other("upstream body failed"));
+                };
+                let mut response = Response::new(Body::from_stream(stream));
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                response
+            },
         );
         let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
 
