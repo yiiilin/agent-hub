@@ -12,7 +12,7 @@ on schedule — all on infrastructure you control.
 [![Release](https://img.shields.io/github/v/release/yiiilin/agent-hub?style=flat)](https://github.com/yiiilin/agent-hub/releases)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-[Getting started](#get-started) · [Self-hosting](#self-hosting) · [Architecture](#architecture) · [Docs](docs/) · [API](https://github.com/yiiilin/agent-hub/blob/main/docs/api.md) · [License](#license)
+[Getting started](#get-started) · [Self-hosting](#self-hosting) · [Architecture](#architecture) · [Docs](docs/) · [License](#license)
 
 </div>
 
@@ -30,8 +30,10 @@ connected to the same session.
 - **Runtime** — an independent execution node powered by [Pi](https://github.com/earendil-works/pi).
   Each session gets its own sandboxed workspace (`/workspace`), temp dir (`/tmp`), and engine
   state; a crashed runtime can be reclaimed and its workspace salvaged back to the Hub.
-- **Model Gateway** — protocol translation (Responses / Chat Completions / Anthropic Messages)
-  with per-connection API keys, optional vision models, and token usage history.
+- **Model proxy** — Hub authorizes every run-scoped request, then forwards it straight to the
+  configured upstream (Responses / Chat Completions / Anthropic Messages), rewriting auth and
+  filtering security headers while passing the body through verbatim — no protocol translation.
+  Per-connection API keys, optional vision models, and per-protocol usage/error history.
 
 ## Talk to the agents.
 
@@ -89,11 +91,11 @@ docker compose -p agent-hub-dev -f compose.dev.yml up -d --build
 
 ## Self-hosting
 
-- `compose.yml` — production stack: Hub, Runtime, Model Gateway, PostgreSQL, MinIO.
+- `compose.yml` — production stack: Hub, Runtime (optional profile), PostgreSQL, MinIO.
 - `compose.maintenance.yml` — optional maintenance override that binds the built-in
   `agent-hub-maintenance` skill to a private agent.
-- Images are published to GHCR (`ghcr.io/yiiilin/agent-hub`, `agent-hub-runtime`,
-  `agent-hub-gateway`); the CLI (`agent-hub-cli`) is attached to each GitHub release.
+- Images are published to GHCR (`ghcr.io/yiiilin/agent-hub`, `agent-hub-runtime`); the CLI
+  (`agent-hub-cli`) is attached to each GitHub release.
 
 Runtime nodes do not need to run on the same machine: enroll a node anywhere and it pulls work
 from the Hub over the network.
@@ -101,26 +103,27 @@ from the Hub over the network.
 ## Architecture
 
 ```
-┌────────────────────────────┐      ┌───────────────────────┐
-│        Hub (Rust)          │ ───► │ Model Gateway / models │
-│  HTTP API · auth · sessions│      │ protocol translation  │
-│  React console · Responses │      └───────────┬───────────┘
-│  proxy · usage accounting  │                  │ provider API
-└──────────┬─────────────────┘          ┌───────▼───────────┐
-           │ POST / heartbeat /         │ Model providers    │
-           │ claim / events             └───────────────────┘
-┌──────────▼─────────────────┐
+┌────────────────────────────┐
 │       Runtime (Rust)       │
 │  Pi standalone per session │
 │  sandboxed workspace       │
-└────────────────────────────┘
+└──────────┬─────────────────┘
+           │ model requests / heartbeat /
+           │ claim / events
+┌──────────▼─────────────────┐      ┌──────────────────────┐
+│        Hub (Rust)          │ ───► │   Model providers    │
+│  HTTP API · auth · sessions│      │  Responses / Chat    │
+│  React console · model     │      │  Completions /       │
+│  proxy · usage accounting  │      │  Anthropic Messages  │
+└────────────────────────────┘      └──────────────────────┘
 ```
 
 The Hub never calls runtimes directly: runtimes poll for work, stream events, upload session
 bundles, and acknowledge state changes. The Hub is the single source of truth for sessions;
-runtimes are disposable executors. Runtime model requests go through the Hub Responses proxy;
-the Hub authorizes the Run, decrypts the provider credential, and forwards the request to the
-internal Model Gateway.
+runtimes are disposable executors. Runtime model requests go through the Hub model proxy: the
+Hub authorizes the active Run binding, decrypts the provider credential, and forwards the
+request straight to the upstream endpoint — rewriting auth and filtering security headers
+while passing the body through verbatim. No protocol translation happens anywhere.
 
 ## Building & testing
 
