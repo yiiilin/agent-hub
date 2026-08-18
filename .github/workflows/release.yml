@@ -255,6 +255,17 @@ jobs:
           ref: ${{ inputs.release_tag || github.ref }}
           persist-credentials: false
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Build and pack browser SDK
+        run: |
+          cd sdk/typescript
+          npm ci
+          npm pack
+
       - name: Build CLI for linux/amd64
         run: |
           docker run --rm -v "$PWD":/workspace -w /workspace rust:1.91-bookworm \
@@ -273,8 +284,9 @@ jobs:
           mkdir -p dist
           cp target/release/agent-hub-cli dist/agent-hub-cli-linux-amd64
           cp target/aarch64-unknown-linux-gnu/release/agent-hub-cli dist/agent-hub-cli-linux-arm64
+          cp sdk/typescript/agent-hub-client-*.tgz dist/
           chmod +x dist/agent-hub-cli-*
-          (cd dist && sha256sum agent-hub-cli-* > SHA256SUMS.txt)
+          (cd dist && sha256sum agent-hub-cli-* agent-hub-client-*.tgz > SHA256SUMS.txt)
 
       - name: Upload assets to release
         env:
