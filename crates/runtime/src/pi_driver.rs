@@ -2716,6 +2716,8 @@ struct PiRunState {
     events: Vec<AppendRunEventRequest>,
     streamed_events: usize,
     final_status: String,
+    /** 失败详情（模型/执行错误人类可读信息）；终态 failed 时随 error 事件上送 Hub。 */
+    failure_message: Option<String>,
     done: bool,
     saw_agent_start: bool,
     saw_agent_end: bool,
@@ -2751,6 +2753,7 @@ impl PiRunState {
             events: Vec::new(),
             streamed_events: 0,
             final_status: "completed".into(),
+            failure_message: None,
             done: false,
             saw_agent_start: false,
             saw_agent_end: false,
@@ -2918,6 +2921,9 @@ impl PiRunState {
                     Some("error") => "failed".into(),
                     _ => anyhow::bail!("Pi assistant error has an unsupported reason"),
                 };
+                if self.failure_message.is_none() {
+                    self.failure_message = Some(pi_error_message(event));
+                }
             }
             _ => anyhow::bail!("Pi emitted an unsupported assistant event: {event_type}"),
         }
@@ -3237,7 +3243,21 @@ impl PiRunState {
         Ok(())
     }
 
-    fn finish(self) -> EngineRunResult {
+    fn finish(mut self) -> EngineRunResult {
+        if self.final_status == "failed" {
+            // 终态失败：把失败详情作为 error 事件上送 Hub（Hub 广播给前端，前端已支持渲染）。
+            // 仅透传受控枚举合成的安全中文文案（runtime 无 Hub 脱敏工具，不透传上游原文）。
+            if let Some(message) = self.failure_message.take() {
+                self.events.push(AppendRunEventRequest {
+                    event_id: uuid::Uuid::new_v4(),
+                    event_type: "error".into(),
+                    role: Some("assistant".into()),
+                    content: Some(message.chars().take(MAX_RUNTIME_ERROR_EVENT_CHARS).collect()),
+                    payload: json!({ "source": "runtime", "status": "failed" }),
+                    waiting_tool: None,
+                });
+            }
+        }
         EngineRunResult {
             events: self.events,
             final_status: self.final_status,
@@ -3553,6 +3573,27 @@ fn pi_message_text(message: &Value) -> String {
                 .join("")
         })
         .unwrap_or_default()
+}
+
+/** 单条失败详情上送长度上限（字符），防止异常长文案撑爆事件包。 */
+const MAX_RUNTIME_ERROR_EVENT_CHARS: usize = 512;
+
+/**
+ * 按受控枚举生成安全的失败描述。
+ * 注意：不透传 Pi/上游的任意 message 原文——runtime 没有 Hub 的 `sanitize_model_proxy_text`，
+ * 直接透传可能泄露上游地址/凭据；真实 provider 文本由 Hub 依据已脱敏的 model_call_errors 注入。
+ */
+fn pi_error_message(event: &serde_json::Map<String, Value>) -> String {
+    let reason = event.get("reason").and_then(Value::as_str).unwrap_or("error");
+    let label = match reason {
+        "error" => "模型执行失败",
+        "aborted" => "执行已中断",
+        "timeout" => "执行超时",
+        "length" => "输出长度超限",
+        "invalid_request" | "bad_request" => "请求参数错误",
+        _ => "执行失败",
+    };
+    label.to_owned()
 }
 
 fn pi_tool_identity(value: &Value) -> anyhow::Result<(&str, &str)> {

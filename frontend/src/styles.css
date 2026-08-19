@@ -1037,8 +1037,14 @@ textarea {
 .session-live-steps { display: flex; flex-direction: column; gap: 6px; padding: 2px 0 6px; }
 .session-live-activity { display: flex; gap: 8px; align-items: flex-start; color: var(--text-secondary); font-size: 12px; }
 .session-live-activity-icon { margin-top: 2px; }
-.session-live-activity-heading { display: flex; align-items: center; gap: 6px; }
-.session-live-activity-heading code { background: transparent; color: var(--text-secondary); }
+.session-live-activity-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 6px; }
+.session-live-activity-heading strong {
+  /* 标签（如中文"执行命令"）的 CJK min-content 只有 1 个字符：长命令摘要挤占空间时
+     会被 flex 收缩成逐字竖排。固定为不可收缩 + nowrap，标签永远单行。 */
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+.session-live-activity-heading code { min-width: 0; overflow-wrap: anywhere; background: transparent; color: var(--text-secondary); }
 .session-live-activity-output { margin: 4px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text-tertiary); font-size: 11px; }
 .session-activity-output { min-width: 0; display: grid; gap: 3px; border-left: 2px solid #d7d7d7; padding-left: 8px; }
 .session-activity-output > span { color: #77777c; font-size: 10px; font-weight: 650; }

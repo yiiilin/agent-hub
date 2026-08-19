@@ -14524,7 +14524,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persistent_pi_rpc_process_reports_failed_terminal_state_without_error_details() {
+    async fn persistent_pi_rpc_process_reports_failed_terminal_state_with_error_event() {
         let temp = tempfile::tempdir().unwrap();
         let pid_file = temp.path().join("pi-failure.pid");
         let pi_bin = write_fake_pi_wrapper(&temp, &pid_file, &["FAKE_PI_DISABLE_MODEL=1"]);
@@ -14547,11 +14547,28 @@ mod tests {
 
         let result = process.execute(&claim, None).unwrap();
         assert_eq!(result.final_status, "failed");
-        let serialized = serde_json::to_string(&result.events).unwrap();
-        assert!(!serialized.contains("errorMessage"));
-        assert!(result.events.iter().any(|event| {
-            event.event_type == "status" && event.content.as_deref() == Some("failed")
-        }));
+        let error_events: Vec<_> = result
+            .events
+            .iter()
+            .filter(|event| event.event_type == "error")
+            .collect();
+        assert_eq!(
+            error_events.len(),
+            1,
+            "失败终态应上送一条 error 事件（由 Hub 透传给前端）"
+        );
+        let message = error_events[0]
+            .content
+            .as_deref()
+            .expect("error 事件应带非空内容");
+        // 必须是受控枚举生成、完全确定的安全中文文案——不透传任何 Pi/上游原文。
+        assert_eq!(message, "模型执行失败");
+        assert!(
+            result.events.iter().any(|event| {
+                event.event_type == "status" && event.content.as_deref() == Some("failed")
+            }),
+            "应保留 failed 终态 status 事件"
+        );
         drop(process);
         assert_process_group_reaped_or_clean_up(&pid_file);
     }

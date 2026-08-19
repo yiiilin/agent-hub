@@ -1048,6 +1048,34 @@ test('conversation streams replies, folds readable activity, steers, stops, and 
   await expect(detail.getByRole('textbox', { name: 'Message' })).toHaveCount(0);
 });
 
+test.describe('live command heading layout', () => {
+  test.use({ viewport: { width: 390, height: 844 }, locale: 'zh-CN' });
+
+  test('command label stays on one line with a long unbroken command', async ({ page }) => {
+    const longCommand = 'cat /var/lib/agent-hub-runtime/sessions/969cdea0-5954-4a6e-a576-a63804a8b9fd/engine-state/.pi/agent/skills/software-shelves-web-9bf2ca3427e0ec1e/operations-config.md';
+    const liveCommand = { seq: 7, run_id: 'run-active', event_type: 'item', role: null, content: null, payload: { item_id: 'command-long', item_type: 'commandExecution', phase: 'started', command: longCommand }, created_at: '2026-07-17T10:00:05.000Z' };
+    await installSessionApi(page, {
+      activeEvents: [
+        { seq: 1, run_id: 'run-active', event_type: 'status', role: null, content: null, payload: { status: 'running' }, created_at: '2026-07-17T10:00:01.000Z' },
+        liveCommand
+      ],
+      activeStreamEvents: [liveCommand]
+    });
+    await page.goto('/sessions');
+
+    const label = page.locator('.session-live-activity-heading strong').first();
+    await expect(label).toHaveText('执行命令');
+    const lineTops = await label.evaluate((element) => {
+      const range = document.createRange();
+      range.selectNodeContents(element);
+      return [...new Set(Array.from(range.getClientRects()).map((rect) => Math.round(rect.top)))];
+    });
+    // CJK 标签在长命令挤占 flex 空间时曾塌缩为逐字竖排；必须保持单行。
+    expect(lineTops).toHaveLength(1);
+    expect(await label.evaluate((element) => Math.round(element.getBoundingClientRect().width))).toBeGreaterThan(30);
+  });
+});
+
 test('assistant messages render Streamdown Markdown while user messages stay literal text', async ({ page }) => {
   const diagnostics: string[] = [];
   page.on('pageerror', (error) => diagnostics.push(`page: ${error.message}`));

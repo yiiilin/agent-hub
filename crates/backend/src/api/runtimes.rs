@@ -4930,6 +4930,50 @@ pub(crate) async fn runtime_reject_claimed_run(
     Ok(Json(run))
 }
 
+/**
+ * complete_run 以 failed 收尾时调用：按 run_id 从 model_call_errors 取该 run 的
+ * 已脱敏错误详情（message/error_kind/error_code/upstream_http_status），插入一条
+ * error 事件；必须在 status 事件之前插入，保证客户端 SSE 的 last_seq 顺序。
+ * 无记录时返回 None（保留 history/兜底文案原行为）。
+ */
+async fn inject_run_failure_error_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    run_id: Uuid,
+) -> Result<Option<RunEventDto>, ApiError> {
+    let row: Option<(String, Option<String>, Option<String>, Option<i32>)> = sqlx::query_as(
+        "SELECT message, error_kind, error_code, upstream_http_status
+         FROM model_call_errors
+         WHERE run_id = $1
+         ORDER BY occurred_at DESC, id DESC
+         LIMIT 1",
+    )
+    .bind(run_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| ApiError::internal(format!("load model call error for run failed: {error}")))?;
+    let Some((message, error_kind, error_code, upstream_http_status)) = row else {
+        return Ok(None);
+    };
+    // 内容与详情已在上游写入 model_call_errors 时脱敏（sanitize_model_proxy_text）；
+    // 再经 insert_run_event_tx 的控制字符清洗与限长后推给客户端。
+    let event = insert_run_event_tx(
+        tx,
+        run_id,
+        "error".into(),
+        Some("assistant".into()),
+        Some(message.chars().take(2000).collect()),
+        json!({
+            "source": "hub",
+            "status": "failed",
+            "error_kind": error_kind,
+            "error_code": error_code,
+            "upstream_http_status": upstream_http_status,
+        }),
+    )
+    .await?;
+    Ok(Some(event))
+}
+
 pub(crate) async fn runtime_complete_run(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -5031,7 +5075,14 @@ pub(crate) async fn runtime_complete_run(
     .fetch_one(&mut *tx)
     .await?;
     let _: Uuid = updated.get("id");
-    insert_run_event_tx(
+    // 失败终态：按 run_id 从 model_call_errors 取已脱敏错误详情，先于 status 插入 error 事件，
+    // 保证客户端 SSE 的 last_seq 顺序（先 error、后 status，status 必达、busy 正常复位）。
+    let injected_error = if status == "failed" {
+        inject_run_failure_error_tx(&mut tx, run_id).await?
+    } else {
+        None
+    };
+    let status_event = insert_run_event_tx(
         &mut tx,
         run_id,
         "status".into(),
@@ -5150,6 +5201,11 @@ pub(crate) async fn runtime_complete_run(
     .await?;
     let run = load_run_public_tx(&mut tx, run_id).await?;
     tx.commit().await?;
+    // 按 seq 顺序实时广播：error 先于 status 插入，先推 error 再推 status。
+    if let Some(error_event) = injected_error {
+        state.run_event_bus.publish(run_id, error_event, true);
+        state.run_event_bus.publish(run_id, status_event, true);
+    }
     Ok(Json(run))
 }
 
@@ -5239,6 +5295,8 @@ pub(crate) struct ResolvedModelProxyRequest {
 #[derive(Clone)]
 pub(crate) struct ModelProxyAccountingContext {
     request_id: Uuid,
+    /** 本次模型调用所属的 run；终态失败时据此把脱敏错误详情推给对应前端。 */
+    run_id: Uuid,
     model_connection_id: Uuid,
     model_connection_scope: String,
     model_connection_name: String,
@@ -5342,6 +5400,7 @@ pub(crate) async fn resolve_model_proxy_request(
         api_key,
         accounting: ModelProxyAccountingContext {
             request_id: Uuid::new_v4(),
+            run_id,
             model_connection_id: row.get("model_connection_id"),
             model_connection_scope: row.get("model_connection_scope"),
             model_connection_name: row.get("model_connection_name"),
@@ -6450,7 +6509,7 @@ pub(crate) async fn try_persist_model_proxy_observation(
     if let Some(error) = observation.error {
         sqlx::query(
             "INSERT INTO model_call_errors
-                 (id, request_id, response_status, upstream_http_status,
+                 (id, request_id, run_id, response_status, upstream_http_status,
                   error_kind, error_code, message, model_connection_id,
                   model_connection_scope_snapshot, model_connection_name_snapshot,
                   model_id_snapshot, api_type_snapshot,
@@ -6459,17 +6518,18 @@ pub(crate) async fn try_persist_model_proxy_observation(
                   subject_type, subject_user_id, subject_display_name_snapshot,
                   source_integration_app_id, source_integration_app_name_snapshot)
              VALUES (
-                 $1, $2, $3, $4, $5, $6, $7,
-                 (SELECT id FROM model_connections WHERE id = $8),
-                 $9, $10, $11, $12, $13,
-                 (SELECT id FROM agents WHERE id = $14), $15,
-                 $16, (SELECT id FROM users WHERE id = $17), $18,
-                 (SELECT id FROM oauth_apps WHERE id = $19), $20
+                 $1, $2, $3, $4, $5, $6, $7, $8,
+                 (SELECT id FROM model_connections WHERE id = $9),
+                 $10, $11, $12, $13, $14,
+                 (SELECT id FROM agents WHERE id = $15), $16,
+                 $17, (SELECT id FROM users WHERE id = $18), $19,
+                 (SELECT id FROM oauth_apps WHERE id = $20), $21
              )
              ON CONFLICT (request_id) DO NOTHING",
         )
         .bind(Uuid::new_v4())
         .bind(context.request_id)
+        .bind(context.run_id)
         .bind(error.response_status)
         .bind(error.upstream_http_status.map(i32::from))
         .bind(error.error_kind)
@@ -10047,6 +10107,69 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(event_count, 1);
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn runtime_complete_failed_injects_sanitized_model_error_before_status(pool: PgPool) {
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        // 预置一条该 run 的模型调用错误（写入时已脱敏；这里直接插入已脱敏文案）。
+        let message = "Service temporarily unavailable";
+        sqlx::query(
+            "INSERT INTO model_call_errors
+               (id, request_id, run_id, response_status, error_kind, message,
+                model_connection_scope_snapshot, model_connection_name_snapshot,
+                model_id_snapshot, api_type_snapshot, request_settings_snapshot,
+                subject_type)
+             VALUES (gen_random_uuid(), gen_random_uuid(), $1, 'failed', 'provider_failed', $2,
+                     'global', 'conn', 'model', 'openai_responses',
+                     '{\"protocol\":\"openai_responses\"}', 'integration_app')",
+        )
+        .bind(claim.run.id)
+        .bind(message)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+
+        let run = runtime_complete_run(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(claim.run.id),
+            runtime_write_generation(
+                1,
+                CompleteRunRequest {
+                    status: "failed".into(),
+                    native_session_id: Some("native-fail".into()),
+                    work_dir_ref: Some("workdir-fail".into()),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(run.status, "failed");
+
+        // error 事件内容为该 run 的已脱敏详情，且来自 Hub 注入（source=hub）。
+        let (error_seq, error_content,): (i64, Option<String>) = sqlx::query_as(
+            "SELECT seq, content FROM run_events
+             WHERE run_id = $1 AND event_type = 'error' AND payload->>'source' = 'hub'",
+        )
+        .bind(claim.run.id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert_eq!(error_content.as_deref(), Some(message));
+        // status(failed) 事件 seq 必须晚于 error，保证 SSE 侧 last_seq 顺序不丢 status。
+        let (status_seq,): (i64,) = sqlx::query_as(
+            "SELECT seq FROM run_events
+             WHERE run_id = $1 AND event_type = 'status' AND content = 'failed'",
+        )
+        .bind(claim.run.id)
+        .fetch_one(&fixture.state.pool)
+        .await
+        .unwrap();
+        assert!(status_seq > error_seq, "status 事件 seq 应晚于 error 事件");
     }
 
     #[sqlx::test(migrations = "./migrations")]
