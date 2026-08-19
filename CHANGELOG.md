@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 本文件记录 Agent Hub 各正式版本面向使用者的变化。
 
+## [0.4.4] - 2026-08-18
+
+### Added
+
+- 失败终态错误透传：Run 以 failed 收尾时，后端按 run_id 从 `model_call_errors` 取已脱敏错误详情，在 `status` 事件前注入一条 `error` 事件透传前端；运行时失败终态以受控文案“模型执行失败”上送 `error` 事件。
+- 迁移 0016：`model_call_errors` 增加 `run_id` 列与 `(run_id, occurred_at DESC, id DESC)` 索引，按 run 关联错误详情。
+
+### Fixed
+
+- 对话 live 活动步标签（如中文"执行命令"）在窄容器下被长命令摘要挤成逐字竖排：标签固定为不可收缩 + nowrap，保持单行；新增 390px zh-CN 回归测试。
+
 ## [0.4.3] - 2026-08-18
 
 ### Added
@@ -300,7 +311,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Release 工作流在 GHCR 鉴权和发布前完成全历史与镜像凭证扫描，且不上传原始扫描报告。
 - LDAP QA 私钥改为测试环境启动时临时生成，不再保存在 Git 中。
 
-[Unreleased]: https://github.com/yiiilin/agent-hub/compare/v0.4.3...HEAD
+[Unreleased]: https://github.com/yiiilin/agent-hub/compare/v0.4.4...HEAD
+[0.4.4]: https://github.com/yiiilin/agent-hub/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/yiiilin/agent-hub/compare/68b916945db80b75bab3a28d5ed5499f3be60851...v0.4.3
 [0.3.8]: https://github.com/yiiilin/agent-hub/compare/v0.3.7...v0.3.8
 [0.3.1]: https://github.com/yiiilin/agent-hub/compare/v0.3.0...v0.3.1

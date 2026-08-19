@@ -3252,7 +3252,12 @@ impl PiRunState {
                     event_id: uuid::Uuid::new_v4(),
                     event_type: "error".into(),
                     role: Some("assistant".into()),
-                    content: Some(message.chars().take(MAX_RUNTIME_ERROR_EVENT_CHARS).collect()),
+                    content: Some(
+                        message
+                            .chars()
+                            .take(MAX_RUNTIME_ERROR_EVENT_CHARS)
+                            .collect(),
+                    ),
                     payload: json!({ "source": "runtime", "status": "failed" }),
                     waiting_tool: None,
                 });
@@ -3584,7 +3589,10 @@ const MAX_RUNTIME_ERROR_EVENT_CHARS: usize = 512;
  * 直接透传可能泄露上游地址/凭据；真实 provider 文本由 Hub 依据已脱敏的 model_call_errors 注入。
  */
 fn pi_error_message(event: &serde_json::Map<String, Value>) -> String {
-    let reason = event.get("reason").and_then(Value::as_str).unwrap_or("error");
+    let reason = event
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("error");
     let label = match reason {
         "error" => "模型执行失败",
         "aborted" => "执行已中断",

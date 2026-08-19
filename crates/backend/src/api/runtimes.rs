@@ -4940,7 +4940,7 @@ async fn inject_run_failure_error_tx(
     tx: &mut Transaction<'_, Postgres>,
     run_id: Uuid,
 ) -> Result<Option<RunEventDto>, ApiError> {
-    let row: Option<(String, Option<String>, Option<String>, Option<i32>)> = sqlx::query_as(
+    let row = sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<i32>)>(
         "SELECT message, error_kind, error_code, upstream_http_status
          FROM model_call_errors
          WHERE run_id = $1
@@ -4950,7 +4950,9 @@ async fn inject_run_failure_error_tx(
     .bind(run_id)
     .fetch_optional(&mut **tx)
     .await
-    .map_err(|error| ApiError::internal(format!("load model call error for run failed: {error}")))?;
+    .map_err(|error| {
+        ApiError::internal(format!("load model call error for run failed: {error}"))
+    })?;
     let Some((message, error_kind, error_code, upstream_http_status)) = row else {
         return Ok(None);
     };
@@ -5201,11 +5203,11 @@ pub(crate) async fn runtime_complete_run(
     .await?;
     let run = load_run_public_tx(&mut tx, run_id).await?;
     tx.commit().await?;
-    // 按 seq 顺序实时广播：error 先于 status 插入，先推 error 再推 status。
+    // 按 seq 顺序实时广播：error 事件（若有）先推，随后无条件推终态 status。
     if let Some(error_event) = injected_error {
         state.run_event_bus.publish(run_id, error_event, true);
-        state.run_event_bus.publish(run_id, status_event, true);
     }
+    state.run_event_bus.publish(run_id, status_event, true);
     Ok(Json(run))
 }
 
@@ -10151,7 +10153,7 @@ mod tests {
         assert_eq!(run.status, "failed");
 
         // error 事件内容为该 run 的已脱敏详情，且来自 Hub 注入（source=hub）。
-        let (error_seq, error_content,): (i64, Option<String>) = sqlx::query_as(
+        let (error_seq, error_content): (i64, Option<String>) = sqlx::query_as(
             "SELECT seq, content FROM run_events
              WHERE run_id = $1 AND event_type = 'error' AND payload->>'source' = 'hub'",
         )
@@ -10170,6 +10172,88 @@ mod tests {
         .await
         .unwrap();
         assert!(status_seq > error_seq, "status 事件 seq 应晚于 error 事件");
+    }
+
+    #[sqlx::test(migrations = "./migrations")]
+    #[ignore = "requires DATABASE_URL and PostgreSQL CREATE DATABASE privilege"]
+    async fn runtime_complete_always_broadcasts_terminal_status_and_error_before_status(
+        pool: PgPool,
+    ) {
+        // 无注入错误（无 model_call_errors 行）的 failed：仍必须广播终态 status，客户端 busy 才能复位。
+        let fixture =
+            runtime_claim_fixture(pool.clone(), "workspace-write", "workspace-write").await;
+        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        let mut rx = fixture.state.run_event_bus.subscribe(claim.run.id);
+        let run = runtime_complete_run(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(claim.run.id),
+            runtime_write_generation(
+                1,
+                CompleteRunRequest {
+                    status: "failed".into(),
+                    native_session_id: Some("native-fail".into()),
+                    work_dir_ref: Some("workdir-fail".into()),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(run.status, "failed");
+        let status = rx.recv().await.unwrap();
+        assert!(status.persisted);
+        assert_eq!(status.event.event_type, "status");
+        assert_eq!(status.event.content.as_deref(), Some("failed"));
+
+        // 含 model_call_errors 的 failed：先实时广播 error、再广播 status（SSE last_seq 顺序保证 status 不丢、busy 复位）。
+        let fixture = runtime_claim_fixture(pool, "workspace-write", "workspace-write").await;
+        let claim = claim_runtime_run(&fixture.state, &fixture.runtime_token).await;
+        let message = "Service temporarily unavailable";
+        sqlx::query(
+            "INSERT INTO model_call_errors
+               (id, request_id, run_id, response_status, error_kind, message,
+                model_connection_scope_snapshot, model_connection_name_snapshot,
+                model_id_snapshot, api_type_snapshot, request_settings_snapshot,
+                subject_type)
+             VALUES (gen_random_uuid(), gen_random_uuid(), $1, 'failed', 'provider_failed', $2,
+                     'global', 'conn', 'model', 'openai_responses',
+                     '{\"protocol\":\"openai_responses\"}', 'integration_app')",
+        )
+        .bind(claim.run.id)
+        .bind(message)
+        .execute(&fixture.state.pool)
+        .await
+        .unwrap();
+        let mut rx = fixture.state.run_event_bus.subscribe(claim.run.id);
+        let run = runtime_complete_run(
+            State(fixture.state.clone()),
+            bearer_headers(&fixture.runtime_token),
+            Path(claim.run.id),
+            runtime_write_generation(
+                1,
+                CompleteRunRequest {
+                    status: "failed".into(),
+                    native_session_id: Some("native-fail".into()),
+                    work_dir_ref: Some("workdir-fail".into()),
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(run.status, "failed");
+        let error = rx.recv().await.unwrap();
+        assert!(error.persisted);
+        assert_eq!(error.event.event_type, "error");
+        assert_eq!(
+            error.event.payload.get("source").and_then(Value::as_str),
+            Some("hub")
+        );
+        assert_eq!(error.event.content.as_deref(), Some(message));
+        let status = rx.recv().await.unwrap();
+        assert_eq!(status.event.event_type, "status");
+        assert_eq!(status.event.content.as_deref(), Some("failed"));
     }
 
     #[sqlx::test(migrations = "./migrations")]
